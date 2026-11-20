@@ -47,3 +47,23 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         "attention_backend": sm100_default_attn_backend,
         "page_size": 64 if sm100_default_attn_backend == "trtllm_mha" else 1,
     }
+
+
+@_register_for(
+    "Qwen3NextForCausalLM",
+    "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+)
+def _qwen3_5_xpu_linear_attn_backend_override(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if cfg._linear_attn_backend_explicitly_set or not get_platform().is_xpu:
+        return {}
+    try:
+        from sglang.srt.layers.attention.linear.kernels.gdn_xpu import (  # noqa: F401
+            XpuGDNKernel,
+        )
+    except ImportError:
+        return {}
+    return {"linear_attn_backend": "intel_xpu"}
