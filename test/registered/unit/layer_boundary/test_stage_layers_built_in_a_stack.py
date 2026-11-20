@@ -12,7 +12,7 @@ register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 _PACKAGE = ("sglang", "srt", "models")
 # Calls that build layers inside a stack of their own.
-_STACK_BUILDERS = ("make_layers", "make_pp_layers")
+_STACK_BUILDERS = ("make_layers", "make_pp_layers", "make_vpp_layers")
 
 
 def _call_name(func):
@@ -276,6 +276,9 @@ class TestStageLayersBuiltInAStack(CustomTestCase):
             "        self.layers = make_layers(2, get_layer)\n"
             "        layer_class = LAYERS['draft']\n"
             "        self.extra = layer_class()\n"
+            "class Interleaved:\n"
+            "    def __init__(self, layout):\n"
+            "        self.layers = make_vpp_layers(layout, 0, lambda idx, prefix: DraftLayer())\n"
         )
         root = Path("models")
         trees = {

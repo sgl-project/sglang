@@ -128,7 +128,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix
-from sglang.srt.layers.utils.layer_list import make_pp_layers
+from sglang.srt.layers.utils.layer_list import make_pp_layers, make_vpp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -787,6 +787,7 @@ if TYPE_CHECKING:
         Fp8GridActivation,
         Mxfp8Activation,
     )
+    from sglang.srt.distributed.vpp_layout import VPPLayout
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
         LateLayerTail,
@@ -3910,16 +3911,28 @@ class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    vpp_layout: Optional[VPPLayout] = None
 
     def __init__(
         self,
         config: DeepSeekV4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        vpp_layout: Optional[VPPLayout] = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_parallel().pp_group
+        parallel = get_parallel()
+        self.pp_group = parallel.pp_group
+        self.vpp_layout = vpp_layout
+        self.vpp_stages = ()
+        if vpp_layout is not None:
+            if vpp_layout.num_hidden_layers != config.num_hidden_layers:
+                raise ValueError("VPP layout layer count must match the model")
+            if vpp_layout.physical_size != parallel.pp_size:
+                raise ValueError("VPP layout physical size must match the PP group")
+            self.vpp_stages = vpp_layout.stages_for_rank(parallel.pp_rank)
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3975,9 +3988,9 @@ class DeepseekV4Model(nn.Module):
             else None
         )
         self.engram_layout = EngramLayout.from_config(config)
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: DeepseekV4DecoderLayer(
+
+        def layer_fn(idx, prefix):
+            return DeepseekV4DecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -3986,14 +3999,28 @@ class DeepseekV4Model(nn.Module):
                 engram_layout=self.engram_layout,
                 hc_stats_stream=self.hc_stats_stream,
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
-            ),
+            )
+
+        layer_options = dict(
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
             stage_facts=functools.partial(hc_boundary.stages, config)
             if _is_cuda
             else None,
         )
-        self.layer_ids = tuple(range(self.start_layer, self.end_layer))
+        if vpp_layout is None:
+            self.layers, self.start_layer, self.end_layer = make_pp_layers(
+                config.num_hidden_layers, layer_fn, **layer_options
+            )
+            self.layer_ids = tuple(range(self.start_layer, self.end_layer))
+        else:
+            self.layers = make_vpp_layers(
+                vpp_layout, parallel.pp_rank, layer_fn, **layer_options
+            )
+            self.layer_ids = vpp_layout.layer_ids_for_rank(parallel.pp_rank)
+            # Compatibility envelope only; VPP execution must use vpp_stages.
+            self.start_layer = self.vpp_stages[0].start_layer
+            self.end_layer = self.vpp_stages[-1].end_layer
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4596,6 +4623,11 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.vpp_layout is not None:
+            raise NotImplementedError(
+                "DSV4 VPP layer construction is available, but logical-stage "
+                "forward and scheduling are not wired yet"
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4832,6 +4864,8 @@ class DeepseekV4ForCausalLM(
         config: DeepSeekV4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        vpp_layout: Optional[VPPLayout] = None,
     ) -> None:
         super().__init__()
         # DeepseekV4 enables, by default, the CK w8a8-block GEMM (MLA proj) and the
@@ -4885,7 +4919,10 @@ class DeepseekV4ForCausalLM(
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
         self.model = DeepseekV4Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            vpp_layout=vpp_layout,
         )
         self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
@@ -4915,7 +4952,9 @@ class DeepseekV4ForCausalLM(
             }
         )
 
-        # Expose local layer ownership and the existing PP range.
+        # Expose local ownership; the VPP range is only a compatibility envelope.
+        self.vpp_layout = self.model.vpp_layout
+        self.vpp_stages = self.model.vpp_stages
         self.layer_ids = self.model.layer_ids
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
@@ -5260,10 +5299,7 @@ class DeepseekV4ForCausalLM(
         if is_nextn:
             layers = [self.model.decoder]
         else:
-            layers = [
-                self.model.layers[layer_id]
-                for layer_id in self.model.layer_ids
-            ]
+            layers = [self.model.layers[layer_id] for layer_id in self.model.layer_ids]
         for layer in layers:
             attn = layer.self_attn
             G = attn.n_local_groups
