@@ -42,15 +42,21 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: Optional[torch.Tensor] = None
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
             output_ids (torch.Tensor): The output tokens.
+            req_indices (Optional[torch.Tensor]): The batch row of each token.
+                None means one token per row, in batch order.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+            penalizer.cumulate_output_tokens(
+                output_ids=output_ids, req_indices=req_indices
+            )
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -209,11 +215,15 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: Optional[torch.Tensor] = None
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        if req_indices is None:
+            req_indices = torch.arange(len(output_ids), device=output_ids.device)
+        self._cumulate_output_tokens(output_ids=output_ids, req_indices=req_indices)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,9 +261,11 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         """
-        Cumulate the output tokens.
+        Cumulate the output tokens; output_ids[j] belongs to batch row req_indices[j].
         Orchestrator will call this function to feed the output tokens to the penalizer.
         """
         pass

@@ -1295,9 +1295,10 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
     # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # This is a relaxed version of penalties for speculative decoding: every
+    # draft row of a round shares the penalties as of the round's start.
     if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
+        batch.cumulate_penalty_spec_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()

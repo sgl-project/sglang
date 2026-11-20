@@ -502,6 +502,8 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Leading output_ids already fed to the batch's penalizers (spec decode).
+        self.penalty_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -1530,6 +1532,8 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
+        # The re-prefill batch starts the penalizers from zero.
+        self.penalty_cumulated_len = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
@@ -3272,6 +3276,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ).to(self.device, non_blocking=True)
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             latest_output_ids
+        )
+
+    def cumulate_penalty_spec_output_tokens(self):
+        # A verify round commits a variable number of tokens per request, so
+        # feed every output token since the last call. Under overlap, the
+        # round in flight is not in output_ids yet and is fed on the next call.
+        output_ids, req_indices = [], []
+        for i, req in enumerate(self.reqs):
+            new_tokens = req.output_ids[req.penalty_cumulated_len :]
+            output_ids.extend(new_tokens)
+            req_indices.extend([i] * len(new_tokens))
+            req.penalty_cumulated_len = len(req.output_ids)
+        if not output_ids:
+            return
+        output_ids, req_indices = torch.tensor(
+            [output_ids, req_indices],
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            output_ids, req_indices
         )
 
     def prepare_for_decode(self):
