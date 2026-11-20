@@ -6,8 +6,9 @@
 
 use serde_json::{json, Value};
 
-use super::{error_type, new_id, scrub_message, stop_reason, usage_from_chat, EchoContext};
+use super::{error_type, stop_reason, usage_from_chat, EchoContext};
 use crate::protocol::sse::{data_payload, write_event, Data, LineBuffer, SseTransducer};
+use crate::protocol::{new_id, upstream_error};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -62,15 +63,8 @@ impl MessagesStream {
             }
             Some(Data::Json(chunk)) => chunk,
         };
-        if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
-            let message = err
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| err.as_str())
-                .unwrap_or("upstream error");
-            let status = err.get("code").and_then(Value::as_u64);
-            let status = status.and_then(|c| u16::try_from(c).ok()).unwrap_or(500);
-            self.emit_error(error_type(status), &scrub_message(message, status), out);
+        if let Some((status, message)) = upstream_error(&chunk) {
+            self.emit_error(error_type(status), &message, out);
             return;
         }
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
