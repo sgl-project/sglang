@@ -19,8 +19,7 @@ use sglang_processor::dynamo_protocols::types::{
 };
 
 use super::super::auth::DeclaredRoute;
-use super::super::dp_relay::HintRoute;
-use super::pd_routing::PDRoutingFields;
+use super::pd_routing::{HintRoute, PDRoutingFields};
 use super::{
     AppState, LoggedJson, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
