@@ -1327,9 +1327,8 @@ class AiterAttnBackend(AttentionBackend):
         return "fp8_e4m3"
 
     def _mla_ps_kernel_enabled(self) -> bool:
-        """Whether this instance plans and launches decode and target verify on the
-        persistent asm kernel (SGLANG_AITER_MLA_PERSIST after the __init__ shape gates);
-        draft extend reads _use_mla_ps_kernel directly."""
+        """Whether decode and target verify use the persistent asm kernel after the __init__ gates;
+        draft extend still reads the module-level _use_mla_ps_kernel."""
         return _use_mla_ps_kernel
 
     def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3863,7 +3862,6 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and (self._mla_ps_kernel_enabled() or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
