@@ -59,6 +59,7 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -1440,9 +1441,15 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight.to(torch.float32).T,
                 )
             elif use_intel_amx_backend(lm_head):
+                # A tied head keeps its embedding weight unpacked and a packed copy beside it.
+                packed_weight = (
+                    lm_head.packed_weight
+                    if isinstance(quant_method, UnquantizedEmbeddingMethod)
+                    else lm_head.weight
+                )
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
-                    lm_head.weight,
+                    packed_weight,
                     None,  # bias
                     True,  # is_vnni
                 )

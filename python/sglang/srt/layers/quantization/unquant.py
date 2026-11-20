@@ -20,6 +20,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
+    amx_process_weight_after_loading,
+    dim_is_supported,
+    dtype_is_supported,
 )
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -941,6 +944,19 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # The weight still serves the embedding lookup, so pack a separate copy for the head.
+        if (
+            _is_cpu
+            and _is_cpu_amx_available
+            and layer.is_tied_lm_head
+            and layer.weight.device == torch.device("cpu")
+            and dtype_is_supported(layer.weight)
+            and dim_is_supported(layer.weight)
+        ):
+            layer.packed_weight = amx_process_weight_after_loading(layer.weight.data)
+            layer.use_intel_amx_backend = True
 
     def apply(
         self,

@@ -314,6 +314,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
 
         self.quant_method: QuantizeMethodBase = quant_method
+        # Set by a model whose tied lm_head is this embedding.
+        self.is_tied_lm_head = False
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
