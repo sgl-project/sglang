@@ -65,13 +65,19 @@ POST /v1/classify
 - `data`: Array of classification results
   - `index`: Index of the result
   - `label`: Top class for single-label models, or an array of classes at or above `threshold` for multi-label models. Token models return one such entry per token.
-  - `probs`: Scores in class ID order, with one row per token for supported `*ForTokenClassification` architectures. The checkpoint's `problem_type` selects sigmoid for multi-label classification, raw scores for regression, and softmax otherwise.
+  - `probs`: Scores in class ID order, with one row per token for supported `*ForTokenClassification` architectures.
   - `num_classes`: Total number of classes
 - `usage`: Token usage information
   - `prompt_tokens`: Number of input tokens
   - `total_tokens`: Total number of tokens
   - `completion_tokens`: Number of completion tokens (always 0 for classification)
   - `prompt_tokens_details`: Additional token details (optional)
+
+### Multi-label classification
+
+When the model's `config.json` sets `"problem_type": "multi_label_classification"`, `/v1/classify` applies an elementwise sigmoid to the logits and returns an independent probability for each class in `probs`. These probabilities do not need to sum to one. For example, logits `[2.0, 2.0]` produce approximately `[0.880797, 0.880797]`, so both classes can be positive.
+
+With the default `threshold` of 0.5, `label` includes both classes in this example. At 0.9, it is empty. Token classifiers apply the threshold separately to each token. Models configured for regression return raw scores. Single-label models and those with an unspecified `problem_type` use softmax.
 
 ## Example Usage
 
