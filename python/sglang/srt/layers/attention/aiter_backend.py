@@ -80,6 +80,7 @@ try:
         "equal_seqlen_q" in inspect.signature(unified_attention).parameters
     )
     # aiter before ROCm/aiter#6107 has no fast_mode at launch; its launch plan ignores it.
+    # Drop this probe once every AITER pinned in docker/rocm.Dockerfile includes #6107.
     _mla_decode_fwd_has_fast_mode = (
         "fast_mode" in inspect.signature(mla_decode_fwd).parameters
     )
@@ -223,9 +224,9 @@ _MLA_FP8_Q_ASM_DECODE_BACKEND = "asm_fp8q"
 _MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
 
 
+# Exactly gfx950 (MI350X/MI355X), not any gfx95x; False off HIP.
 @functools.cache
 def _is_gfx950() -> bool:
-    """Exactly gfx950 (MI350X/MI355X), not any gfx95x; False off HIP."""
     from sglang.kernels.arch import current_arch
 
     hip = current_arch().hip
@@ -241,7 +242,6 @@ def _fp8_q_asm_mla_skip_reason(
     is_draft_worker: bool,
     verify_qlen: int,
 ) -> Optional[str]:
-    """Why the fp8-query ASM MLA route does not apply here, or None when it does."""
     if not gfx950:
         return "the kernel is gfx950 only"
     if not zero_padded_h12_fp8:
