@@ -136,6 +136,97 @@ class TestEncodeRequestInputEdges(CustomTestCase):
         }
         self.assertIsNotNone(validate_encode_request(request))
 
+    def test_qwen_audio_batch_and_partial_cache_miss_match_native_features(self):
+        from transformers import WhisperFeatureExtractor
+
+        extractor = WhisperFeatureExtractor()
+        waves = [np.ones(3201, np.float32), np.zeros(16017, np.float32)]
+        for model_type, padding, truncate in (
+            ("qwen2_audio", "max_length", True),
+            ("qwen3_asr", "max_length", False),
+            ("qwen3_omni_moe", True, False),
+        ):
+            with self.subTest(model=model_type):
+                p = EncoderPreprocessor.__new__(EncoderPreprocessor)
+                p.model_type = model_type
+                p.model_audio_sr = 16000
+                p.audio_processor = SimpleNamespace(feature_extractor=extractor)
+                p.use_image_processor_gpu = False
+                p._build_vision_config(None)
+                p.preproc_executor = None
+                p._model_preprocessor = None
+                p._flatten_and_load_audios = AsyncMock(return_value=waves)
+                prepared = asyncio.run(p.process_mm_items(["a", "b"], Modality.AUDIO))
+                native = extractor(
+                    waves,
+                    sampling_rate=16000,
+                    return_tensors="pt",
+                    return_attention_mask=True,
+                    padding=padding,
+                    truncation=truncate,
+                )
+                features = prepared.mm_inputs["input_features"]
+                torch.testing.assert_close(
+                    features, native.input_features, rtol=0, atol=0
+                )
+                self.assertEqual(
+                    prepared.grid_thw.tolist(), native.attention_mask.sum(-1).tolist()
+                )
+
+                # Only the second clip misses the encoder cache. Passing both
+                # masks (or both output lengths) here corrupts a partial batch.
+                enc = MMEncoder.__new__(MMEncoder)
+                enc.model_type = model_type
+                enc.cache_namespace = "sha256:" + "12" * 32
+                (missing,) = enc._build_model_mm_items(
+                    features, prepared, [1], Modality.AUDIO
+                )
+                torch.testing.assert_close(missing.feature, features[1:2])
+                torch.testing.assert_close(
+                    missing.feature_attention_mask, native.attention_mask[1:2]
+                )
+                self.assertEqual(
+                    missing.audio_feature_lens.tolist(), prepared.token_counts[1:]
+                )
+
+    def test_qwen2_audio_binds_lengths_to_each_native_item(self):
+        from sglang.srt.multimodal.processors.qwen_audio import (
+            Qwen2AudioMultimodalProcessor,
+        )
+
+        lengths = torch.tensor([4, 7, 3])
+        items = [
+            SimpleNamespace(offsets=[(1, 4)]),
+            SimpleNamespace(offsets=[(7, 13), (16, 18)]),
+        ]
+        Qwen2AudioMultimodalProcessor._bind_audio_feature_lengths(items, lengths)
+        self.assertEqual(items[0].audio_feature_lens.tolist(), [4])
+        self.assertEqual(items[1].audio_feature_lens.tolist(), [7, 3])
+
+    def test_dots_audio_encoder_preserves_native_waveforms_and_offsets(self):
+        from sglang.srt.models.dots3_common.dots_omni_audio import OmniAudioConfig
+        from sglang.srt.models.dots3_common.dots_omni_towers import (
+            get_audio_token_string,
+        )
+
+        config = OmniAudioConfig()
+        p = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        p.model_type = "dots3_note"
+        p.audio_processor = config
+        p._model_preprocessor = None
+        waves = [np.ones(16000, np.float32), np.zeros(24000, np.float32)]
+        p._flatten_and_load_audios = AsyncMock(return_value=waves)
+        prepared = asyncio.run(p.process_mm_items(["a", "b"], Modality.AUDIO))
+        counts = [
+            get_audio_token_string(wave.size, config).count(config.audio_comp_span)
+            for wave in waves
+        ]
+        self.assertEqual(prepared.grid_thw.tolist(), counts)
+        self.assertEqual(prepared.token_counts, counts)
+        for item, wave, count in zip(prepared.mm_inputs.mm_items, waves, counts):
+            torch.testing.assert_close(item.feature, torch.from_numpy(wave))
+            self.assertEqual(item.offsets, [(0, count - 1)])
+
     def test_convert_leaves_an_empty_list_alone(self):
         self.assertEqual(_convert([]), [])
 
@@ -247,6 +338,7 @@ class TestStagedNativeTransfer(CustomTestCase):
         model_type="qwen3_vl",
         *,
         video_processor=True,
+        audio_processor=False,
         video_decoder=True,
         send_sockets=(),
     ):
@@ -262,6 +354,8 @@ class TestStagedNativeTransfer(CustomTestCase):
         enc.model_type = model_type
         enc.model = SimpleNamespace(
             visual=Mock(),
+            get_audio_feature=Mock(),
+            _is_multimodal=True,
             _encoder_processor=SimpleNamespace(temporal_compression_ratio=1),
         )
         enc.transfer_backend = backend
@@ -279,6 +373,8 @@ class TestStagedNativeTransfer(CustomTestCase):
             )
         )
         enc.preprocessor._supported_modalities = {Modality.IMAGE}
+        if audio_processor:
+            enc.preprocessor._supported_modalities.add(Modality.AUDIO)
         if video_processor:
             enc.preprocessor._supported_modalities.add(Modality.VIDEO)
         enc.preprocessor.image_processor = SimpleNamespace(merge_size=2)
@@ -288,7 +384,7 @@ class TestStagedNativeTransfer(CustomTestCase):
         else:
             enc.delivery = encoder_server.ZmqDelivery(enc, cleanup_receive_state=True)
 
-        enc._embedding_dims = {Modality.IMAGE: 4, Modality.VIDEO: 4}
+        enc._embedding_dims = {Modality.IMAGE: 4, Modality.VIDEO: 4, Modality.AUDIO: 2}
         enc._embedding_dtype = tensor.dtype
         enc._element_size = tensor.element_size()
 
@@ -296,6 +392,11 @@ class TestStagedNativeTransfer(CustomTestCase):
             item_grids, counts, aux = grids, [1, 2], {}
             if model_type in {"kimi_k3", "kimi_k31"} and modality == Modality.IMAGE:
                 aux["original_image_sizes"] = [[32, 48], [80, 27]]
+            if modality == Modality.AUDIO:
+                # Both Qwen audio architectures use one row for each of
+                # these short clips. Ordinary EPD reports the input frames.
+                feature_lengths = [4, 5] if model_type.startswith("qwen") else [1, 1]
+                item_grids, counts = torch.tensor(feature_lengths), [1, 1]
             if modality == Modality.VIDEO:
                 item_grids, counts = [[2, 2, 2], [3, 2, 2]], [2, 3]
                 if model_type == "muse_spark":
@@ -333,9 +434,11 @@ class TestStagedNativeTransfer(CustomTestCase):
 
         video_tensor = torch.arange(20, dtype=tensor.dtype).reshape(5, 4) + 100
         enc._compute_embedding = AsyncMock(
-            side_effect=lambda ctx, **kwargs: (
-                tensor if ctx.modality == Modality.IMAGE else video_tensor
-            )
+            side_effect=lambda ctx, **kwargs: {
+                Modality.IMAGE: tensor,
+                Modality.VIDEO: video_tensor,
+                Modality.AUDIO: torch.tensor([[51, 52], [61, 62]], dtype=tensor.dtype),
+            }[ctx.modality]
         )
         enc._prepare_encode_context_on_all_ranks = AsyncMock(side_effect=prepare)
         cfg = SimpleNamespace(encoder_transfer_backend=enc.transfer_backend)
@@ -624,6 +727,77 @@ class TestStagedNativeTransfer(CustomTestCase):
                 for images in ([], ["i1", "i2"]):
                     with self.subTest(model=model, backend=backend, mixed=bool(images)):
                         asyncio.run(run(backend, model, images))
+
+    def test_staged_audio_preserves_native_rows_and_mixed_widths(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder import nixl
+
+        async def run(model, images, videos):
+            with self.native_encoder("nixl", model, audio_processor=True) as (
+                svc,
+                enc,
+                *_,
+            ):
+                info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
+                self.assertEqual(info.staged_audio_model_type, model)
+                self.assertEqual(info.supports_staged_images, images)
+                req = pb.StageRequest(
+                    request_id="audio", audio_urls=["first", "second"]
+                )
+                if images:
+                    req.mm_items.extend(["i1", "i2"])
+                if videos:
+                    req.video_urls.extend(["v1", "v2"])
+                transfer = (await svc.Stage(req, Mock())).transfer
+                self.assertEqual(transfer.version, 4)
+                self.assertEqual(transfer.native_model_type, model)
+                self.assertEqual(
+                    [a.feature_length for a in transfer.audios],
+                    [4, 5] if model.startswith("qwen") else [1, 1],
+                )
+                self.assertEqual([a.embedding_rows for a in transfer.audios], [1, 1])
+                self.assertEqual([a.embedding_width for a in transfer.audios], [2, 2])
+                self.assertNotEqual(
+                    transfer.audios[0].identity, transfer.audios[1].identity
+                )
+                width = 4 if images else 2
+                self.assertEqual(transfer.embedding_width, width)
+                if images:
+                    self.assertEqual(
+                        [x.embedding_rows for x in transfer.images], [1, 2]
+                    )
+                if videos:
+                    self.assertEqual(
+                        [x.embedding_rows for x in transfer.videos], [2, 3]
+                    )
+                with patch.object(
+                    nixl, "write_embedding", new_callable=AsyncMock
+                ) as write:
+                    await svc.Deliver(
+                        pb.DeliverRequest(transfer=transfer, nixl_target=b"dest"),
+                        Mock(),
+                    )
+                    packed = write.await_args.args[0]
+                    self.assertEqual(
+                        tuple(packed.shape),
+                        ((3 if images else 0) + (5 if videos else 0) + 2, width),
+                    )
+                    torch.testing.assert_close(
+                        packed[-2:, :2], torch.tensor([[51.0, 52.0], [61.0, 62.0]])
+                    )
+                    self.assertFalse(packed[-2:, 2:].any())
+                self.assertFalse(enc.req_states)
+
+        for model, images, videos in (
+            ("qwen2_audio", False, False),
+            ("qwen3_asr", False, False),
+            ("qwen3_omni_moe", True, True),
+            ("dots3_note", True, False),
+            ("mimo_v2", True, True),
+            ("muse_spark", True, True),
+        ):
+            with self.subTest(model=model):
+                asyncio.run(run(model, images, videos))
 
     def test_staged_native_model_layout(self):
         from sglang.encoder.v1 import encoder_pb2 as pb
@@ -1047,7 +1221,7 @@ class TestStagedNativeTransfer(CustomTestCase):
                             context,
                         )
                     context.abort.assert_awaited_once_with(
-                        grpc.StatusCode.DEADLINE_EXCEEDED, "image staging timed out"
+                        grpc.StatusCode.DEADLINE_EXCEEDED, "media staging timed out"
                     )
 
                 async with enc.encode_dispatch_lock:

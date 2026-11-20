@@ -284,6 +284,10 @@ message GetServerInfoResponse {
   bool supports_staged_video = 18;
   // Native model type accepted by this listener's version-3 handoff.
   string native_model_type = 19;
+  // Nonempty when this language worker accepts v4 audio layouts for the model.
+  string staged_audio_model_type = 20;
+  // Older staged listeners that do not set this field are image-capable.
+  optional bool supports_staged_images = 21;
 }
 
 message DeploymentInfo {

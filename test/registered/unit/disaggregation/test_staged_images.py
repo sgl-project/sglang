@@ -38,7 +38,7 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
             capacity=2,
         )
 
-    async def encode_images(self, rid, images, videos):
+    async def encode_images(self, rid, images, videos, audios):
         self.encoded.append((rid, images))
         self.parts[rid] = [image.encode() for image in images]
         self.encoding.set()
@@ -46,10 +46,14 @@ class FakeEncoder(StagedImageService, rpc.SglangEncoderServicer):
             await asyncio.Event().wait()
         if images == ["fail"]:
             raise RuntimeError("encoder forward failed")
-        return [
-            pb.ImageLayout(t=1, h=2, w=2, identity=hashlib.sha256(data).hexdigest())
-            for data in self.parts[rid]
-        ], []
+        return (
+            [
+                pb.ImageLayout(t=1, h=2, w=2, identity=hashlib.sha256(data).hexdigest())
+                for data in self.parts[rid]
+            ],
+            [],
+            [],
+        )
 
     async def release_images(self, rid):
         self.parts.pop(rid, None)
@@ -244,6 +248,17 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
                 pb.DeliverRequest(transfer=transfer, receive_url="late")
             ),
         )
+
+    async def test_audio_must_be_advertised_before_staging_mixed_requests(self):
+        await self.error(
+            grpc.StatusCode.FAILED_PRECONDITION,
+            self.peers[0].Stage(
+                pb.StageRequest(request_id="mixed", mm_items=["i"], audio_urls=["a"])
+            ),
+        )
+        self.backends[0]._info.supports_staged_images = False
+        await self.error(grpc.StatusCode.FAILED_PRECONDITION, self.stage(0))
+        self.assertFalse(self.backends[0].encoded)
 
     async def test_video_requires_capability_and_nonempty_inputs(self):
         peer = self.peers[0]

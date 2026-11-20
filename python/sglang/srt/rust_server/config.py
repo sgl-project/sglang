@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.encoder.native_handoff import (
     NATIVE_IMAGE_MODEL_TYPES,
     NATIVE_VIDEO_MODEL_TYPES,
+    STAGED_AUDIO_MODEL_TYPES,
     STAGED_VIDEO_MODEL_TYPES,
 )
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
@@ -511,6 +512,23 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
         info["accepts_encoder_handoff"] = True
         model_type = scheduler.model_config.hf_config.model_type
+        info["supports_staged_images"] = (
+            model_type in NATIVE_IMAGE_MODEL_TYPES | STAGED_VIDEO_MODEL_TYPES
+        )
+        audio_supported = model_type in STAGED_AUDIO_MODEL_TYPES
+        if model_type == "muse_spark":
+            from sglang.srt.multimodal.processors.muse_spark_omni import (
+                muse_audio_delimiters,
+            )
+
+            audio_supported = None not in muse_audio_delimiters(scheduler.tokenizer)
+        elif model_type == "mimo_v2":
+            audio_supported = (
+                getattr(scheduler.model_config.hf_config, "audio_config", None)
+                is not None
+            )
+        if audio_supported:
+            info["staged_audio_model_type"] = model_type
         if model_type in NATIVE_IMAGE_MODEL_TYPES:
             info["native_model_type"] = model_type
         info["supports_staged_video"] = model_type in (

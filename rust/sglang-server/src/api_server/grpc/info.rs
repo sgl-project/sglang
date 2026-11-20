@@ -74,6 +74,14 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("internal_states are not JSON: {error}"))?;
     Ok(api::GetServerInfoResponse {
+        supports_staged_images: launch_fields
+            .get("supports_staged_images")
+            .and_then(serde_json::Value::as_bool),
+        staged_audio_model_type: launch_fields
+            .get("staged_audio_model_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         native_model_type: launch_fields
             .get("native_model_type")
             .and_then(serde_json::Value::as_str)

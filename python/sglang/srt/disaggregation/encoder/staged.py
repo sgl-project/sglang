@@ -75,15 +75,29 @@ class StagedImageService:
     async def Stage(self, request, context):
         await self._check_config(context)
         images, videos = list(request.mm_items), list(request.video_urls)
+        audios = list(request.audio_urls)
         if (
             not request.request_id
-            or not (images or videos)
+            or not (images or videos or audios)
             or not all(images)
             or not all(videos)
+            or not all(audios)
         ):
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "request_id and nonempty media are required",
+            )
+        if (
+            images
+            and self._info.HasField("supports_staged_images")
+            and not self._info.supports_staged_images
+        ):
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "staged images are unavailable"
+            )
+        if audios and not self._info.staged_audio_model_type:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "staged audio is unavailable"
             )
         if videos and not self._info.supports_staged_video:
             await context.abort(
@@ -100,13 +114,17 @@ class StagedImageService:
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self._stage_timeout
-            image_layouts, video_layouts = await asyncio.wait_for(
-                self._encode(part_id, images, videos), self._stage_timeout
+            image_layouts, video_layouts, audio_layouts = await asyncio.wait_for(
+                self._encode(part_id, images, videos, audios), self._stage_timeout
             )
             if loop.time() >= deadline:
                 raise asyncio.TimeoutError
-            if len(image_layouts) != len(images) or len(video_layouts) != len(videos):
-                raise ValueError("staged grid count differs from media count")
+            if (len(image_layouts), len(video_layouts), len(audio_layouts)) != (
+                len(images),
+                len(videos),
+                len(audios),
+            ):
+                raise ValueError("staged layout count differs from media count")
             transfer = pb.StagedImageTransfer(
                 version=2 if videos else 1,
                 request_id=request.request_id,
@@ -117,28 +135,36 @@ class StagedImageService:
                 image_count=len(images),
                 images=image_layouts,
                 videos=video_layouts,
+                audios=audio_layouts,
             )
-            if self._info.native_model_type:
+            native_type = (
+                self._info.staged_audio_model_type
+                if audios
+                else self._info.native_model_type
+            )
+            if native_type:
                 shape = self._describe(part_id).shape
                 rows = sum(
-                    item.embedding_rows for item in (*image_layouts, *video_layouts)
+                    item.embedding_rows
+                    for item in (*image_layouts, *video_layouts, *audio_layouts)
                 )
                 if len(shape) != 2 or shape[0] != rows or shape[1] <= 0:
                     raise RuntimeError(
                         "Native staged layout does not match its embedding"
                     )
-                transfer.version = 3
-                transfer.native_model_type = self._info.native_model_type
+                transfer.version = 4 if audios else 3
+                transfer.native_model_type = native_type
                 transfer.embedding_width = shape[1]
             response = pb.StageResponse(transfer=transfer)
             expiry = loop.call_later(self._ttl, self._expire, transfer_id)
             self._leases[transfer_id] = _Lease(transfer, expiry)
             logger.debug(
-                "Stage complete request_id=%s part_id=%s images=%d videos=%d",
+                "Stage complete request_id=%s part_id=%s images=%d videos=%d audios=%d",
                 transfer.request_id,
                 part_id,
                 transfer.image_count,
                 len(transfer.videos),
+                len(transfer.audios),
             )
             return response
         except asyncio.CancelledError:
@@ -147,7 +173,7 @@ class StagedImageService:
         except asyncio.TimeoutError:
             await asyncio.shield(self._start_retirement(part_id))
             await context.abort(
-                grpc.StatusCode.DEADLINE_EXCEEDED, "image staging timed out"
+                grpc.StatusCode.DEADLINE_EXCEEDED, "media staging timed out"
             )
         except Exception as exc:
             await asyncio.shield(self._start_retirement(part_id))
@@ -243,7 +269,7 @@ class StagedImageService:
                 else:
                     await self._send(lease.transfer.part_id, request.receive_url)
         except asyncio.TimeoutError:
-            send_error = "staged image delivery timed out"
+            send_error = "staged media delivery timed out"
         except Exception as exc:
             send_error = str(exc)
         finally:

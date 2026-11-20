@@ -46,6 +46,10 @@ message GetEncoderInfoResponse {
   StagedMediaPolicy staged_media_policy = 5;
   // Present when this encoder emits the model-specific v3 handoff.
   string native_model_type = 6;
+  // Nonempty when this native processor can emit version-4 audio handoffs.
+  string staged_audio_model_type = 7;
+  // Older encoders that do not set this field are image-capable.
+  optional bool supports_staged_images = 8;
 }
 
 message StagedMediaPolicy {
@@ -58,6 +62,7 @@ message StageRequest {
   string request_id = 1;
   repeated string mm_items = 2; // image URLs in prompt order
   repeated string video_urls = 3; // video URLs in prompt order, requires supports_staged_video
+  repeated string audio_urls = 4; // audio URLs in prompt order, requires staged_audio_model_type
 }
 
 message ImageLayout {
@@ -81,6 +86,13 @@ message VideoLayout {
   uint32 embedding_rows = 7; // v3: exact rows in the packed output
 }
 
+message AudioLayout {
+  string identity = 1;
+  uint32 feature_length = 2; // native EPD audio grid supplied to the language processor
+  uint32 embedding_rows = 3; // measured output rows for this clip
+  uint32 embedding_width = 4; // native width before padding to the packed visual width
+}
+
 message StagedImageTransfer {
   uint32 version = 1;
   string request_id = 2;  // router request, shared by E, P and D
@@ -97,6 +109,9 @@ message StagedImageTransfer {
   // time, height and width. A two-dimensional image grid has t = 1.
   string native_model_type = 10;
   uint32 embedding_width = 11;
+  // Version 4 appends audio rows after images and videos. Original prompt
+  // token IDs preserve interleaving across modalities.
+  repeated AudioLayout audios = 12;
 }
 
 message StageResponse { StagedImageTransfer transfer = 1; }

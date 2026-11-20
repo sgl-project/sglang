@@ -633,11 +633,17 @@ class RustServer:
         if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
             from sglang.srt.disaggregation.encoder.native_handoff import (
                 NATIVE_IMAGE_MODEL_TYPES,
+                STAGED_AUDIO_MODEL_TYPES,
                 STAGED_VIDEO_MODEL_TYPES,
             )
 
             model_type = model_config.hf_config.model_type
-            if model_type not in STAGED_VIDEO_MODEL_TYPES | NATIVE_IMAGE_MODEL_TYPES:
+            if (
+                model_type
+                not in STAGED_VIDEO_MODEL_TYPES
+                | NATIVE_IMAGE_MODEL_TYPES
+                | STAGED_AUDIO_MODEL_TYPES
+            ):
                 raise RuntimeError(f"No staged encoder layout for {model_type!r}")
             return
         if model_config.is_multimodal and rust_mm_family_of(model_config) is None:
@@ -1103,6 +1109,7 @@ class RustServer:
             for modality, count in (
                 ("image", obj.encoder_handoff.image_count),
                 ("video", len(obj.encoder_handoff.videos)),
+                ("audio", len(obj.encoder_handoff.audios)),
             ):
                 limit = self._external_media_limits.get(modality)
                 if limit is not None and count > limit:

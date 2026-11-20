@@ -371,12 +371,15 @@ def handle_encoder_disaggregation(server_args: Any):
             )
         from sglang.srt.disaggregation.encoder.native_handoff import (
             NATIVE_IMAGE_MODEL_TYPES,
+            STAGED_AUDIO_MODEL_TYPES,
             STAGED_VIDEO_MODEL_TYPES,
         )
 
         if (
             hf_config.model_type
-            not in STAGED_VIDEO_MODEL_TYPES | NATIVE_IMAGE_MODEL_TYPES
+            not in STAGED_VIDEO_MODEL_TYPES
+            | NATIVE_IMAGE_MODEL_TYPES
+            | STAGED_AUDIO_MODEL_TYPES
         ):
             raise ValueError(f"Staged NIXL embeddings do not support {model_arch}")
     if cfg.encoder_transfer_backend == "auto":
@@ -421,7 +424,11 @@ def handle_encoder_disaggregation(server_args: Any):
         or (cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get())
     ):
         supported_architectures.extend(
-            ("Glm4vForConditionalGeneration", "Glm4vMoeForConditionalGeneration")
+            (
+                "Glm4vForConditionalGeneration",
+                "Glm4vMoeForConditionalGeneration",
+                "Qwen3ASRForConditionalGeneration",
+            )
         )
     if (
         cfg.encoder_only or cfg.language_only

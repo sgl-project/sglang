@@ -219,26 +219,42 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         )
         super().__init__(hf_config, server_args, processor, transport_mode, **kwargs)
 
-    def get_staged_media_layout(self, prompt, img_grid_thw):
-        """Expand each image pad inside the tokenized Dots image delimiters."""
-        token_id = self.mm_token_ids["im_token_id"]
-        if prompt.count(token_id) != len(img_grid_thw):
-            raise ValueError("Dots image placeholders differ from the encoder layout")
+    def get_staged_media_layout(
+        self, prompt, img_grid_thw=None, audio_feature_lens=None
+    ):
+        """Expand the native image and audio pads within their original delimiters."""
+        image_token = self.mm_token_ids["im_token_id"]
+        audio_token = self.mm_token_ids.get("audio_token_id")
+        grids = [] if img_grid_thw is None else img_grid_thw
+        audio_lengths = [] if audio_feature_lens is None else audio_feature_lens
+        if prompt.count(image_token) != len(grids) or prompt.count(audio_token) != len(
+            audio_lengths
+        ):
+            raise ValueError("Dots media placeholders differ from the encoder layout")
+        grids = iter(grids)
+        audio_lengths = iter(audio_lengths)
         ids = []
         items = []
         for token in prompt:
-            if token != token_id:
+            if token == image_token:
+                grid = next(grids)
+                count = int(grid.prod()) // self.image_preprocessor.merge_size**2
+                modality = Modality.IMAGE
+                metadata = {"image_grid_thw": grid.reshape(1, 3)}
+            elif token == audio_token:
+                count = int(next(audio_lengths))
+                modality = Modality.AUDIO
+                metadata = {}
+            else:
                 ids.append(token)
                 continue
-            grid = img_grid_thw[len(items)]
-            count = int(grid.prod()) // self.image_preprocessor.merge_size**2
             start = len(ids)
-            ids.extend([token_id] * count)
+            ids.extend([token] * count)
             items.append(
                 MultimodalDataItem(
-                    modality=Modality.IMAGE,
+                    modality=modality,
                     offsets=[(start, len(ids) - 1)],
-                    model_specific_data={"image_grid_thw": grid.reshape(1, 3)},
+                    model_specific_data=metadata,
                 )
             )
         return MultimodalProcessorOutput(

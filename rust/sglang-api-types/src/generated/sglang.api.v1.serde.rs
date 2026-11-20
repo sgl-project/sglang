@@ -24445,6 +24445,14 @@ impl ::serde::Serialize for GetServerInfoResponse {
             "native_model_type",
             &self.native_model_type,
         )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "staged_audio_model_type",
+            &self.staged_audio_model_type,
+        )?;
+        if let Some(v) = &self.supports_staged_images {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "supports_staged_images", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24480,6 +24488,8 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_accepts_encoder_handoff = None;
                 let mut f_supports_staged_video = None;
                 let mut f_native_model_type = None;
+                let mut f_staged_audio_model_type = None;
+                let mut f_supports_staged_images = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24630,6 +24640,23 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             f_native_model_type =
                                 Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
+                        "staged_audio_model_type" => {
+                            if f_staged_audio_model_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "staged_audio_model_type",
+                                ));
+                            }
+                            f_staged_audio_model_type =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "supports_staged_images" => {
+                            if f_supports_staged_images.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "supports_staged_images",
+                                ));
+                            }
+                            f_supports_staged_images = Some(map.next_value::<Option<bool>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24656,6 +24683,8 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     accepts_encoder_handoff: f_accepts_encoder_handoff.unwrap_or_default(),
                     supports_staged_video: f_supports_staged_video.unwrap_or_default(),
                     native_model_type: f_native_model_type.unwrap_or_default(),
+                    staged_audio_model_type: f_staged_audio_model_type.unwrap_or_default(),
+                    supports_staged_images: f_supports_staged_images.flatten(),
                 })
             }
         }

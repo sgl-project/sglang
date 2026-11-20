@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.encoder.native_handoff import (
     GLM_VIDEO_MODEL_TYPES,
     NATIVE_IMAGE_MODEL_TYPES,
     NATIVE_VIDEO_MODEL_TYPES,
+    STAGED_AUDIO_MODEL_TYPES,
     STAGED_VIDEO_MODEL_TYPES,
     TIMED_VIDEO_MODEL_TYPES,
 )
@@ -121,13 +122,22 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             or getattr(encoder.model, "visual", None) is not None
         )
         qwen = encoder.model_type in STAGED_VIDEO_MODEL_TYPES
+        images_enabled = (qwen or native) and encoder.preprocessor.supports_modality(
+            Modality.IMAGE
+        )
+        feature_model = getattr(encoder.model, "thinker", encoder.model)
+        audio_enabled = (
+            encoder.model_type in STAGED_AUDIO_MODEL_TYPES
+            and encoder.preprocessor.supports_modality(Modality.AUDIO)
+            and callable(getattr(feature_model, "get_audio_feature", None))
+            and (encoder.model_type != "mimo_v2" or feature_model._is_multimodal)
+        )
         parallel = get_parallel()
         if (
             encoder.transfer_backend in ("zmq_to_scheduler", "nixl")
             and parallel.num_dp_ranks == parallel.pp_size == parallel.nnodes == 1
             and len(send_sockets) == parallel.tp_size - 1
-            and (qwen or native)
-            and encoder.preprocessor.supports_modality(Modality.IMAGE)
+            and (images_enabled or audio_enabled)
         ):
             model = get_model().model_path
             domains, max_mb, _, _ = media_url_security_config()
@@ -138,6 +148,8 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
                 tokenizer_path=get_serving().tokenizer_path or model,
                 served_model_name=get_serving().served_model_name or model,
                 native_model_type=encoder.model_type if native else "",
+                supports_staged_images=images_enabled,
+                staged_audio_model_type=encoder.model_type if audio_enabled else "",
                 supports_staged_video=(
                     (qwen or encoder.model_type in NATIVE_VIDEO_MODEL_TYPES)
                     and encoder.preprocessor.supports_modality(Modality.VIDEO)
@@ -163,37 +175,68 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get(),
         )
 
-    async def _stage_media(self, part_id, images, videos):
-        # The existing encoder batches one modality at a time. Only the root
-        # part is published, so both transports can deliver a single tensor.
+    async def _stage_media(self, part_id, images, videos, audios):
+        # The native encoder batches one modality at a time. Publish one lease
+        # for the entire request in image/video/audio order.
+        groups = [
+            (modality, sources)
+            for modality, sources in (
+                (Modality.IMAGE, images),
+                (Modality.VIDEO, videos),
+                (Modality.AUDIO, audios),
+            )
+            if sources
+        ]
+        layouts = {
+            modality: []
+            for modality in (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
+        }
+        tensors = []
+        root = None
         async with self.encoder.encode_dispatch_lock:
-            if not images:
-                video = await self._encode_modality(part_id, videos, Modality.VIDEO)
-                return [], self._video_layouts(video)
-
-            image = await self._encode_modality(part_id, images, Modality.IMAGE)
-            image_layouts = self._image_layouts(image)
-            if not videos:
-                return image_layouts, []
-
-            video_id = f"{part_id}_video"
-            try:
-                video = await self._encode_modality(video_id, videos, Modality.VIDEO)
-                video_layouts = self._video_layouts(video)
-                if image.dtype != video.dtype or image.shape[1:] != video.shape[1:]:
-                    raise RuntimeError("Incompatible image and video embedding formats")
-                packed = torch.cat((image.embedding, video.embedding))
-                image.embedding = packed
-                image.shape = list(packed.shape)
+            for index, (modality, sources) in enumerate(groups):
+                name = part_id if index == 0 else f"{part_id}_{modality.name.lower()}"
+                try:
+                    data = await self._encode_modality(name, sources, modality)
+                    if root is None:
+                        root = data
+                    if modality == Modality.IMAGE:
+                        layouts[modality] = self._image_layouts(
+                            data, explicit_rows=bool(audios)
+                        )
+                    elif modality == Modality.VIDEO:
+                        layouts[modality] = self._video_layouts(
+                            data, explicit_rows=bool(audios)
+                        )
+                    else:
+                        layouts[modality] = self._audio_layouts(data)
+                    tensor = data.embedding
+                    if tensor.dtype != root.dtype or tensor.ndim != 2:
+                        raise RuntimeError("Incompatible staged embedding formats")
+                    if tensor.shape[1] != root.shape[1]:
+                        if (
+                            modality != Modality.AUDIO
+                            or tensor.shape[1] > root.shape[1]
+                        ):
+                            raise RuntimeError("Incompatible staged embedding widths")
+                        # DeepStack vision includes auxiliary channels. Restore
+                        # the original audio width from AudioLayout on P/PD.
+                        tensor = torch.nn.functional.pad(
+                            tensor, (0, root.shape[1] - tensor.shape[1])
+                        )
+                    tensors.append(tensor)
+                finally:
+                    if index:
+                        await await_task_completion_on_cancel(
+                            asyncio.create_task(self._release_staged_part(name)),
+                            f"Retire staged {modality.name.lower()} {name}",
+                        )
+            if len(tensors) > 1:
+                packed = torch.cat(tensors)
+                root.embedding = packed
+                root.shape = list(packed.shape)
                 await meta_registry.publish(part_id, packed.nbytes, *packed.shape)
-            finally:
-                # Cancellation can arrive after preprocessing published the
-                # temporary video state, or during its global-cache cleanup.
-                await await_task_completion_on_cancel(
-                    asyncio.create_task(self._release_staged_part(video_id)),
-                    f"Retire staged video {video_id}",
-                )
-            return image_layouts, video_layouts
+        return layouts[Modality.IMAGE], layouts[Modality.VIDEO], layouts[Modality.AUDIO]
 
     async def _encode_modality(self, part_id, items, modality):
         request = {
@@ -227,8 +270,8 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
         )
         return zip(grids, self.encoder.slice_embedding(data.embedding, counts))
 
-    def _image_layouts(self, data):
-        native = bool(self._info.native_model_type)
+    def _image_layouts(self, data, *, explicit_rows=False):
+        native = explicit_rows or bool(self._info.native_model_type)
         original_sizes = getattr(data, "original_image_sizes", None)
         if self.encoder.model_type in {"kimi_k3", "kimi_k31"} and (
             original_sizes is None or len(original_sizes) != len(data.get_grid())
@@ -259,7 +302,23 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             modality=modality, precomputed_embeddings=tensor
         ).cache_key.hex()
 
-    def _video_layouts(self, data):
+    def _audio_layouts(self, data):
+        layouts = []
+        for feature_length, tensor in self._item_embeddings(data):
+            length = int(feature_length)
+            if length <= 0 or tensor.ndim != 2 or min(tensor.shape) <= 0:
+                raise ValueError("Empty audio or invalid audio embedding")
+            layouts.append(
+                encoder_pb2.AudioLayout(
+                    identity=self._item_identity(Modality.AUDIO, tensor),
+                    feature_length=length,
+                    embedding_rows=tensor.shape[0],
+                    embedding_width=tensor.shape[1],
+                )
+            )
+        return layouts
+
+    def _video_layouts(self, data, *, explicit_rows=False):
         timestamps = getattr(data, "video_timestamps", None)
         seconds = getattr(data, "second_per_grid_ts", None)
         timed_grid = self.encoder.model_type in TIMED_VIDEO_MODEL_TYPES
@@ -310,7 +369,7 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             if min(t, h, w) <= 0 or tensor.shape[0] % frames:
                 raise RuntimeError("Invalid staged video grid or embedding length")
             layout = encoder_pb2.VideoLayout(t=t, h=h, w=w)
-            if self._info.native_model_type:
+            if explicit_rows or self._info.native_model_type:
                 layout.embedding_rows = tensor.shape[0]
             if requires_timestamps or (
                 optional_timestamps

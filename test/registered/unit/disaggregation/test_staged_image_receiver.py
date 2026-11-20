@@ -99,13 +99,17 @@ async def staged_encoder(
     """Only the model forward is represented by a deterministic CPU tensor."""
     calls, held = [], set()
 
-    async def encode(part_id, images, videos):
+    async def encode(part_id, images, videos, audios):
         calls.append(("encode", images, videos))
         held.add(part_id)
-        return [
-            pb.ImageLayout(t=t, h=h, w=w, identity=identity.hex())
-            for (t, h, w), identity in zip(grids, identities)
-        ], video_layouts
+        return (
+            [
+                pb.ImageLayout(t=t, h=h, w=w, identity=identity.hex())
+                for (t, h, w), identity in zip(grids, identities)
+            ],
+            video_layouts,
+            [],
+        )
 
     async def send(part_id, receive_url):
         assert part_id in held
@@ -204,13 +208,15 @@ class TestStagedImageReceiver(unittest.TestCase):
             mm_tokens=SimpleNamespace(image_token_id=10, video_token_id=10),
         )
         rust.bind_external_encoder_processor(glm)
-        self.assertEqual(rust._external_media_markers.counts([10, 11, 11]), (1, 2))
+        self.assertEqual(rust._external_media_markers.counts([10, 11, 11]), (1, 2, 0))
         glm.accepts_staged_expanded_spans = True
         rust.bind_external_encoder_processor(glm)
-        self.assertEqual(rust._external_media_markers.counts([10, 10]), (None, None))
+        self.assertEqual(
+            rust._external_media_markers.counts([10, 10]), (None, None, None)
+        )
         kimi = SimpleNamespace(mm_tokens=SimpleNamespace(image_token_id=163605))
         rust.bind_external_encoder_processor(kimi)
-        self.assertEqual(rust._external_media_markers.counts([163605]), (1, 0))
+        self.assertEqual(rust._external_media_markers.counts([163605]), (1, 0, 0))
         muse = SimpleNamespace(
             patch_id=30,
             video_id=31,

@@ -524,6 +524,16 @@ def _optional_token_id(tokenizer, token: str) -> Optional[int]:
         return None
 
 
+def muse_audio_delimiters(tokenizer):
+    """A Muse checkpoint supports audio only if its tokenizer defines both spans."""
+    if tokenizer is None:
+        return None, None
+    return (
+        _optional_token_id(tokenizer, "<|soft_audio_start|>"),
+        _optional_token_id(tokenizer, "<|soft_audio_end|>"),
+    )
+
+
 def _encode(tokenizer, text: str) -> list[int]:
     try:
         return list(tokenizer.encode(text, add_special_tokens=False))
@@ -712,8 +722,7 @@ class MuseSpark1xOmniMultimodalProcessor(
         # The published Muse-Spark-1.2-OSS tokenizer keeps <|audio|> but leaves the
         # soft-audio delimiters as reserved placeholders. Treat them as optional so
         # a text/image/video server still starts; audio input fails loudly instead.
-        self.audio_start_id = _optional_token_id(tokenizer, "<|soft_audio_start|>")
-        self.audio_end_id = _optional_token_id(tokenizer, "<|soft_audio_end|>")
+        self.audio_start_id, self.audio_end_id = muse_audio_delimiters(tokenizer)
         self.audio_supported = (
             self.audio_start_id is not None and self.audio_end_id is not None
         )

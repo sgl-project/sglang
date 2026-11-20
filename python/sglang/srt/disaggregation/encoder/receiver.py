@@ -1344,9 +1344,12 @@ class WaitingStagedImage(WaitingZmqRequest):
 
     def _embedding_shape(self):
         handoff = self.recv_req.encoder_handoff
-        if handoff.version == 3:
+        if handoff.version >= 3:
             return (
-                sum(item.embedding_rows for item in (*handoff.images, *handoff.videos)),
+                sum(
+                    item.embedding_rows
+                    for item in (*handoff.images, *handoff.videos, *handoff.audios)
+                ),
                 handoff.embedding_width,
             )
         merge = self.mm_processor.spatial_merge_size
@@ -1371,7 +1374,7 @@ class WaitingStagedImage(WaitingZmqRequest):
             or recv_obj.req_id != handoff.part_id
         ):
             return False  # A stale frame from an earlier user of this port.
-        packed_modality = Modality.IMAGE if handoff.images else Modality.VIDEO
+        packed_modality = handoff.packed_modality
         if (recv_obj.num_parts, recv_obj.part_idx, recv_obj.modality) != (
             1,
             0,
@@ -1395,29 +1398,41 @@ class WaitingStagedImage(WaitingZmqRequest):
         return True
 
     def _finish_assemble(self, recv_embedding):
-        # One lease owns a contiguous tensor: image rows first, then video rows.
-        # The processor's spans run in prompt order, possibly interleaving both.
+        # The transfer groups rows by modality. The rebuilt request interleaves
+        # media in prompt order, so each modality has its own read cursor.
         handoff = self.recv_req.encoder_handoff
         (packed,) = recv_embedding.values()
-        if handoff.version == 3:
+        if handoff.version >= 3:
             image_rows = sum(item.embedding_rows for item in handoff.images)
         else:
             merge = self.mm_processor.spatial_merge_size
             image_rows = sum(
                 v.t * (v.h // merge) * (v.w // merge) for v in handoff.images
             )
-        offsets = {Modality.IMAGE: 0, Modality.VIDEO: image_rows}
+        audio_start = packed.shape[0] - sum(a.embedding_rows for a in handoff.audios)
+        ends = {
+            Modality.IMAGE: image_rows,
+            Modality.VIDEO: audio_start,
+            Modality.AUDIO: packed.shape[0],
+        }
+        offsets = {
+            Modality.IMAGE: 0,
+            Modality.VIDEO: image_rows,
+            Modality.AUDIO: audio_start,
+        }
+        audios = iter(handoff.audios)
         mm = self.staged_layout
         for item in mm.mm_items:
             cursor = offsets[item.modality]
             offsets[item.modality] = cursor + sum(
                 end - start + 1 for start, end in item.offsets
             )
-            item.precomputed_embeddings = packed[cursor : offsets[item.modality]]
-        if (
-            offsets[Modality.IMAGE] != image_rows
-            or offsets[Modality.VIDEO] != packed.shape[0]
-        ):
+            tensor = packed[cursor : offsets[item.modality]]
+            if item.modality == Modality.AUDIO:
+                # DeepStack visual rows can have several times the audio width.
+                tensor = tensor[:, : next(audios).embedding_width].contiguous()
+            item.precomputed_embeddings = tensor
+        if offsets != ends:
             raise ValueError("staged media rows differ from rebuilt prompt")
         self._bind_pool_slot_to_mm_inputs(mm)
         self._publish_layout()
@@ -1492,8 +1507,12 @@ class WaitingStagedNixlImage(WaitingStagedImage):
                     self.rid,
                     1,
                     0,
-                    None,
-                    Modality.IMAGE if handoff.images else Modality.VIDEO,
+                    (
+                        torch.tensor([a.feature_length for a in handoff.audios])
+                        if handoff.packed_modality == Modality.AUDIO
+                        else None
+                    ),
+                    handoff.packed_modality,
                     embedding=tensor,
                 )
                 self.recv_embedding_data = _aggregate_embedding_part(
@@ -2586,14 +2605,23 @@ class MMReceiverBase(ABC):
                 error_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 try:
                     if handoff is not None:
-                        if (
-                            handoff.version == 3
-                            and handoff.embedding_width
-                            != self.scheduler.model_config.hidden_size
-                        ):
-                            raise ValueError(
-                                "staged embedding width differs from the language model"
-                            )
+                        if handoff.version >= 3:
+                            hidden_size = self.scheduler.model_config.hidden_size
+                            expected_width = hidden_size
+                            if handoff.native_model_type == "qwen3_omni_moe" and (
+                                handoff.images or handoff.videos
+                            ):
+                                vision = self.mm_processor.hf_config.vision_config
+                                expected_width *= 1 + len(
+                                    getattr(vision, "deepstack_visual_indexes", None)
+                                    or ()
+                                )
+                            if handoff.embedding_width != expected_width or any(
+                                a.embedding_width != hidden_size for a in handoff.audios
+                            ):
+                                raise ValueError(
+                                    "staged embedding width differs from the language model"
+                                )
                         mm = handoff.build_layout(
                             self.mm_processor,
                             recv_req.input_ids,

@@ -3925,6 +3925,12 @@ pub struct GetServerInfoResponse {
     /// Native model type accepted by this listener's version-3 handoff.
     #[prost(string, tag = "19")]
     pub native_model_type: ::prost::alloc::string::String,
+    /// Nonempty when this language worker accepts v4 audio layouts for the model.
+    #[prost(string, tag = "20")]
+    pub staged_audio_model_type: ::prost::alloc::string::String,
+    /// Older staged listeners that do not set this field are image-capable.
+    #[prost(bool, optional, tag = "21")]
+    pub supports_staged_images: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

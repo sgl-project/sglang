@@ -11,20 +11,24 @@ class GetEncoderInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class GetEncoderInfoResponse(_message.Message):
-    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy", "native_model_type")
+    __slots__ = ("model_path", "tokenizer_path", "served_model_name", "supports_staged_video", "staged_media_policy", "native_model_type", "staged_audio_model_type", "supports_staged_images")
     MODEL_PATH_FIELD_NUMBER: _ClassVar[int]
     TOKENIZER_PATH_FIELD_NUMBER: _ClassVar[int]
     SERVED_MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_STAGED_VIDEO_FIELD_NUMBER: _ClassVar[int]
     STAGED_MEDIA_POLICY_FIELD_NUMBER: _ClassVar[int]
     NATIVE_MODEL_TYPE_FIELD_NUMBER: _ClassVar[int]
+    STAGED_AUDIO_MODEL_TYPE_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_STAGED_IMAGES_FIELD_NUMBER: _ClassVar[int]
     model_path: str
     tokenizer_path: str
     served_model_name: str
     supports_staged_video: bool
     staged_media_policy: StagedMediaPolicy
     native_model_type: str
-    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ..., native_model_type: _Optional[str] = ...) -> None: ...
+    staged_audio_model_type: str
+    supports_staged_images: bool
+    def __init__(self, model_path: _Optional[str] = ..., tokenizer_path: _Optional[str] = ..., served_model_name: _Optional[str] = ..., supports_staged_video: _Optional[bool] = ..., staged_media_policy: _Optional[_Union[StagedMediaPolicy, _Mapping]] = ..., native_model_type: _Optional[str] = ..., staged_audio_model_type: _Optional[str] = ..., supports_staged_images: _Optional[bool] = ...) -> None: ...
 
 class StagedMediaPolicy(_message.Message):
     __slots__ = ("allowed_domains", "max_bytes", "timeout_secs")
@@ -37,14 +41,16 @@ class StagedMediaPolicy(_message.Message):
     def __init__(self, allowed_domains: _Optional[_Iterable[str]] = ..., max_bytes: _Optional[int] = ..., timeout_secs: _Optional[float] = ...) -> None: ...
 
 class StageRequest(_message.Message):
-    __slots__ = ("request_id", "mm_items", "video_urls")
+    __slots__ = ("request_id", "mm_items", "video_urls", "audio_urls")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     MM_ITEMS_FIELD_NUMBER: _ClassVar[int]
     VIDEO_URLS_FIELD_NUMBER: _ClassVar[int]
+    AUDIO_URLS_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     mm_items: _containers.RepeatedScalarFieldContainer[str]
     video_urls: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, request_id: _Optional[str] = ..., mm_items: _Optional[_Iterable[str]] = ..., video_urls: _Optional[_Iterable[str]] = ...) -> None: ...
+    audio_urls: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, request_id: _Optional[str] = ..., mm_items: _Optional[_Iterable[str]] = ..., video_urls: _Optional[_Iterable[str]] = ..., audio_urls: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ImageLayout(_message.Message):
     __slots__ = ("t", "h", "w", "identity", "embedding_rows", "original_size")
@@ -80,8 +86,20 @@ class VideoLayout(_message.Message):
     embedding_rows: int
     def __init__(self, t: _Optional[int] = ..., h: _Optional[int] = ..., w: _Optional[int] = ..., identities: _Optional[_Iterable[str]] = ..., timestamps: _Optional[_Iterable[float]] = ..., second_per_grid_ts: _Optional[float] = ..., embedding_rows: _Optional[int] = ...) -> None: ...
 
+class AudioLayout(_message.Message):
+    __slots__ = ("identity", "feature_length", "embedding_rows", "embedding_width")
+    IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    FEATURE_LENGTH_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_ROWS_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDING_WIDTH_FIELD_NUMBER: _ClassVar[int]
+    identity: str
+    feature_length: int
+    embedding_rows: int
+    embedding_width: int
+    def __init__(self, identity: _Optional[str] = ..., feature_length: _Optional[int] = ..., embedding_rows: _Optional[int] = ..., embedding_width: _Optional[int] = ...) -> None: ...
+
 class StagedImageTransfer(_message.Message):
-    __slots__ = ("version", "request_id", "transfer_id", "part_id", "part_idx", "num_parts", "image_count", "images", "videos", "native_model_type", "embedding_width")
+    __slots__ = ("version", "request_id", "transfer_id", "part_id", "part_idx", "num_parts", "image_count", "images", "videos", "native_model_type", "embedding_width", "audios")
     VERSION_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TRANSFER_ID_FIELD_NUMBER: _ClassVar[int]
@@ -93,6 +111,7 @@ class StagedImageTransfer(_message.Message):
     VIDEOS_FIELD_NUMBER: _ClassVar[int]
     NATIVE_MODEL_TYPE_FIELD_NUMBER: _ClassVar[int]
     EMBEDDING_WIDTH_FIELD_NUMBER: _ClassVar[int]
+    AUDIOS_FIELD_NUMBER: _ClassVar[int]
     version: int
     request_id: str
     transfer_id: str
@@ -104,7 +123,8 @@ class StagedImageTransfer(_message.Message):
     videos: _containers.RepeatedCompositeFieldContainer[VideoLayout]
     native_model_type: str
     embedding_width: int
-    def __init__(self, version: _Optional[int] = ..., request_id: _Optional[str] = ..., transfer_id: _Optional[str] = ..., part_id: _Optional[str] = ..., part_idx: _Optional[int] = ..., num_parts: _Optional[int] = ..., image_count: _Optional[int] = ..., images: _Optional[_Iterable[_Union[ImageLayout, _Mapping]]] = ..., videos: _Optional[_Iterable[_Union[VideoLayout, _Mapping]]] = ..., native_model_type: _Optional[str] = ..., embedding_width: _Optional[int] = ...) -> None: ...
+    audios: _containers.RepeatedCompositeFieldContainer[AudioLayout]
+    def __init__(self, version: _Optional[int] = ..., request_id: _Optional[str] = ..., transfer_id: _Optional[str] = ..., part_id: _Optional[str] = ..., part_idx: _Optional[int] = ..., num_parts: _Optional[int] = ..., image_count: _Optional[int] = ..., images: _Optional[_Iterable[_Union[ImageLayout, _Mapping]]] = ..., videos: _Optional[_Iterable[_Union[VideoLayout, _Mapping]]] = ..., native_model_type: _Optional[str] = ..., embedding_width: _Optional[int] = ..., audios: _Optional[_Iterable[_Union[AudioLayout, _Mapping]]] = ...) -> None: ...
 
 class StageResponse(_message.Message):
     __slots__ = ("transfer",)

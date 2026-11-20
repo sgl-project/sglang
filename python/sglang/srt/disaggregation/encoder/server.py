@@ -1007,8 +1007,12 @@ class MMEncoder:
         audio_cfg = getattr(thinker_cfg, "audio_config", None) or getattr(
             hf_cfg, "audio_config", None
         )
-        if audio_cfg is not None:
-            for attr in ("output_dim", "d_model"):
+        # Qwen2-Audio projects the tower's d_model to the language hidden size.
+        if (
+            audio_cfg is not None
+            and getattr(hf_cfg, "model_type", None) != "qwen2_audio"
+        ):
+            for attr in ("output_dim", "out_hidden_size", "d_model"):
                 val = getattr(audio_cfg, attr, None)
                 if val and int(val) > 0:
                     dims[Modality.AUDIO] = int(val)
@@ -1158,7 +1162,12 @@ class MMEncoder:
             if key in _mm_feature_attrs.get(modality, []):
                 continue
             value = _convert(value)
-            if key in _mm_grid_attrs.get(modality, []):
+            if modality == Modality.AUDIO and key in {
+                "audio_feature_lens",
+                "feature_attention_mask",
+            }:
+                mm_items[0].set(key, value[indices])
+            elif key in _mm_grid_attrs.get(modality, []):
                 if split_kimi_k3_images:
                     for mm_item, idx in zip(mm_items, indices):
                         mm_item.set(key, value[idx : idx + 1])
