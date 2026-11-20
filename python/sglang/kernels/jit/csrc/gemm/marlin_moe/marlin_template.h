@@ -55,7 +55,10 @@ template <
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
-    const bool kHasBias                  // has per-expert bias
+    const bool kHasBias,                 // has per-expert bias
+    const bool kExpertIdsAreSorted,      // sorted block expert IDs
+    const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
+    const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 __global__ void Marlin(
     const int4* __restrict__ A,                              // fp16 input matrix of shape mxk
@@ -86,6 +89,27 @@ __global__ void Marlin(
 }  // namespace device::marlin_moe
 
 #else
+
+template <bool kExpertIdsAreSorted, int kMoeBlockSize>
+__device__ __forceinline__ void zero_inactive_output_rows(
+    int4* __restrict__ output,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    int num_blocks,
+    int num_routes,
+    int row_vectors) {
+  for (int block = blockIdx.x; block < num_blocks; block += gridDim.x) {
+    if constexpr (!kExpertIdsAreSorted) {
+      if (expert_ids[block] != -1) continue;
+    }
+    for (int offset = threadIdx.x; offset < kMoeBlockSize * row_vectors; offset += blockDim.x) {
+      int route = sorted_token_ids[block * kMoeBlockSize + offset / row_vectors];
+      if (route < num_routes) {
+        output[static_cast<int64_t>(route) * row_vectors + offset % row_vectors] = {0, 0, 0, 0};
+      }
+    }
+  }
+}
 
 // m16n8k16 tensor core mma instruction with fp16 inputs and fp32
 // output/accumulation.
@@ -298,7 +322,10 @@ template <
                                          // with a separate quantization scale
     const bool is_zp_float,              // is zero point of float16 type?
     const bool kIsEP,                    // expert parallelism
-    const bool kHasBias                  // has per-expert bias
+    const bool kHasBias,                 // has per-expert bias
+    const bool kExpertIdsAreSorted,      // sorted block expert IDs
+    const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
+    const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -381,19 +408,71 @@ __global__ void Marlin(
       is_zp_float ? prob_n * prob_k / group_size / 8 : prob_n * prob_k / group_size / (pack_factor * 4);
   const int b_bias_expert_stride = prob_n / 8;
 
-  int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  static_assert(!kHasInactivePrefixCount || (kExpertIdsAreSorted && !kIsEP));
+  int num_tokens_past_padded;
+  int inactive_prefix_blocks = 0;
+  if constexpr (kHasInactivePrefixCount) {
+    // One aligned transaction publishes both quantities without a dependent head-ID load.
+    const int2 counts = __ldg(reinterpret_cast<const int2*>(num_tokens_past_padded_ptr));
+    num_tokens_past_padded = counts.x;
+    inactive_prefix_blocks = counts.y;
+  } else {
+    num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  }
   int parallel = num_tokens_past_padded / moe_block_size;
-  // Every warp counts the same inactive blocks without a serial per-thread scan.
-  int num_invalid_blocks = 0;
-  for (int i = threadIdx.x % 32; i < parallel; i += 32) {
-    num_invalid_blocks += expert_ids_ptr[i] == -1;
-  }
-#pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
-  }
-  parallel -= num_invalid_blocks;
   if (parallel == 0) return;
+  int num_invalid_blocks = 0;
+  if constexpr (kHasInactivePrefixCount) {
+    if (inactive_prefix_blocks > 0) {
+      if constexpr (kZeroInactiveOutput) {
+        zero_inactive_output_rows<true, moe_block_size>(
+            C, sorted_token_ids_ptr, expert_ids_ptr, inactive_prefix_blocks, prob_m * top_k, prob_n / 8);
+      }
+      parallel -= inactive_prefix_blocks;
+      if (parallel == 0) return;
+      expert_ids_ptr += inactive_prefix_blocks;
+      sorted_token_ids_ptr += inactive_prefix_blocks * moe_block_size;
+    }
+  } else if constexpr (kExpertIdsAreSorted) {
+    if (expert_ids_ptr[0] < 0) {
+      // Only the used prefix is sorted; allocated tail entries are undefined.
+      int first = 0;
+      int last = parallel;
+      while (first < last) {
+        int middle = first + (last - first) / 2;
+        if (expert_ids_ptr[middle] < 0)
+          first = middle + 1;
+        else
+          last = middle;
+      }
+      if constexpr (kZeroInactiveOutput) {
+        // Preserve the original route table until its inactive destinations are written.
+        zero_inactive_output_rows<true, moe_block_size>(
+            C, sorted_token_ids_ptr, expert_ids_ptr, first, prob_m * top_k, prob_n / 8);
+      }
+      parallel -= first;
+      if (parallel == 0) return;
+      expert_ids_ptr += first;
+      sorted_token_ids_ptr += first * moe_block_size;
+    }
+  } else {
+    // Generic and EP callers may have scattered inactive blocks.
+    for (int i = threadIdx.x % 32; i < parallel; i += 32) {
+      num_invalid_blocks += expert_ids_ptr[i] == -1;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
+    }
+    if constexpr (kZeroInactiveOutput) {
+      if (num_invalid_blocks > 0) {
+        zero_inactive_output_rows<false, moe_block_size>(
+            C, sorted_token_ids_ptr, expert_ids_ptr, parallel, prob_m * top_k, prob_n / 8);
+      }
+    }
+    parallel -= num_invalid_blocks;
+    if (parallel == 0) return;
+  }
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
@@ -521,22 +600,27 @@ __global__ void Marlin(
     if (par_id >= parallel) return;
 
     old_expert_id = expert_id;
-    if (num_invalid_blocks > 0) {
-      int skip_count = block_id == -1 ? par_id : 0;
-      block_id++;
-      for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
-        expert_id = expert_ids_ptr[i];
-        if (expert_id != -1) {
-          if (skip_count == 0) {
-            block_id = i;
-            break;
-          };
-          skip_count--;
-        };
-      }
-    } else {
+    if constexpr (kExpertIdsAreSorted) {
       block_id = par_id;
       expert_id = expert_ids_ptr[block_id];
+    } else {
+      if (num_invalid_blocks > 0) {
+        int skip_count = block_id == -1 ? par_id : 0;
+        block_id++;
+        for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
+          expert_id = expert_ids_ptr[i];
+          if (expert_id != -1) {
+            if (skip_count == 0) {
+              block_id = i;
+              break;
+            };
+            skip_count--;
+          };
+        }
+      } else {
+        block_id = par_id;
+        expert_id = expert_ids_ptr[block_id];
+      }
     }
 
     if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {

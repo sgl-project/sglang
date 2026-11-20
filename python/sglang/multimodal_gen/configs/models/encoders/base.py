@@ -27,6 +27,7 @@ class EncoderArchConfig(ArchConfig):
             AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.SAGE_ATTN_3,
+            AttentionBackendEnum.AMX_ATTN,
         }
     )
     output_hidden_states: bool = False
@@ -67,6 +68,13 @@ class ImageEncoderArchConfig(EncoderArchConfig):
 
 
 @dataclass
+class AudioEncoderArchConfig(EncoderArchConfig):
+    model_id: str = ""
+    sample_rate: int = 16000
+    video_rate: int = 30
+
+
+@dataclass
 class BaseEncoderOutput:
     last_hidden_state: torch.FloatTensor | None = None
     pooler_output: torch.FloatTensor | None = None
@@ -99,3 +107,8 @@ class TextEncoderConfig(EncoderConfig):
 @dataclass
 class ImageEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=ImageEncoderArchConfig)
+
+
+@dataclass
+class AudioEncoderConfig(EncoderConfig):
+    arch_config: ArchConfig = field(default_factory=AudioEncoderArchConfig)

@@ -28,6 +28,7 @@ from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_auto_parallel_decode_mode,
     should_use_spatial_shard_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
@@ -45,10 +46,10 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelZeroPad2d,
     causal_conv3d_cat_pad,
-    chunk_height_for_parallel_decode,
     disable_spatial_parallel_decode,
     gather_and_trim_height,
     gather_height_for_global_op,
+    spatial_parallel_decode_disabled,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import (
@@ -59,8 +60,13 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
 from sglang.multimodal_gen.runtime.models.vaes.resample import AvgDown3D
 from sglang.multimodal_gen.runtime.models.vaes.resample import DupUp3D as DupUp3DBase
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils import is_gfx1250_supported
 
-if current_platform.is_cuda() or current_platform.is_xpu():
+if (
+    current_platform.is_cuda()
+    or current_platform.is_xpu()
+    or (current_platform.is_rocm() and is_gfx1250_supported())
+):
     try:
         from sglang.kernels.ops.diffusion import (
             can_use_conv_bias_epilogue,
@@ -91,6 +97,7 @@ def _channels_last_3d_supported_by_platform() -> bool:
     return (
         current_platform.is_cuda()
         or current_platform.is_rocm()
+        or current_platform.is_cpu()
         or current_platform.is_xpu()
     )
 
@@ -119,6 +126,9 @@ def _fused_conv_cache_supported(conv: nn.Module, x: torch.Tensor) -> bool:
     return (
         cat_pad_channels_last_3d is not None
         and type(conv) is WanCausalConv3d
+        # ROCm's batched-Conv2D replacement patches ``forward``; the fused
+        # path would call the unpatched conv epilogue instead.
+        and not hasattr(conv, "_weight_2d")
         and x.dim() == 5
         and x.device.type in ("cuda", "xpu")
         and current_platform.is_amp_supported()
@@ -531,7 +541,9 @@ def residual_block_forward(self, x):
     return x
 
 
-def attention_block_forward(self, x):
+def attention_block_forward(self, x, rows: tuple[int, int] | None = None):
+    """``rows`` = (first, count) attends only those rows of the height as
+    queries (keys and values keep every row) and returns just them."""
     identity = x
     batch_size, channels, num_frames, height, width = x.size()
     x = x.permute(0, 2, 1, 3, 4).reshape(
@@ -544,8 +556,20 @@ def attention_block_forward(self, x):
     qkv = qkv.reshape(batch_size * num_frames, 1, channels * 3, -1)
     qkv = qkv.permute(0, 1, 3, 2).contiguous()
     q, k, v = qkv.chunk(3, dim=-1)
+    if rows is not None:
+        first, height = rows
+        q = q[:, :, first * width : (first + height) * width]
+        identity = identity[..., first : first + height, :]
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    if getattr(self, "_sgl_math_sdpa", False) and q.dtype == torch.float32:
+        # The math SDPA backend's ops minus ``_safe_softmax``'s fully-masked-row
+        # fixup (no mask here, so bit-identical), which on gfx1250 is a slow
+        # broadcast ``where`` over the [HW, HW] scores.
+        s = (q.size(-1) ** -0.5) ** 0.5
+        attn = torch.matmul(q * s, k.transpose(-2, -1) * s)
+        x = torch.matmul(torch.softmax(attn, dim=-1), v)
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
     x = (
         x.squeeze(1)
@@ -838,14 +862,21 @@ class WanAttentionBlock(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
-        if self.world_size > 1:
-            x = gather_height_for_global_op(
-                x, parallel_group=self.parallel_group
-            ).contiguous()
-        x = attention_block_forward(self, x)
-        if self.world_size > 1:
-            x = chunk_height_for_parallel_decode(x, parallel_group=self.parallel_group)
-        return x
+        if self.world_size == 1 or spatial_parallel_decode_disabled():
+            return attention_block_forward(self, x)
+        x = gather_height_for_global_op(
+            x, parallel_group=self.parallel_group
+        ).contiguous()
+        # each rank attends only its own height shard's rows (the tensor_split
+        # chunk the full-frame output was cut to) over the whole frame
+        rank = (
+            self.parallel_group.rank_in_group
+            if self.parallel_group is not None
+            else get_decode_parallel_rank()
+        )
+        rows = torch.tensor_split(torch.arange(x.shape[-2]), self.world_size)[rank]
+        first = int(rows[0]) if rows.numel() else 0
+        return attention_block_forward(self, x, rows=(first, rows.numel())).contiguous()
 
 
 class WanMidBlock(nn.Module):
@@ -1564,6 +1595,110 @@ class AutoencoderKLWan(ParallelTiledVAE):
     _supports_gradient_checkpointing = False
     supports_decode_on_frames = True
 
+    # Official Wan2.1_VAE.pth key -> module key. No caller here; the Wan2.2-S2V
+    # overlay's _overlay/materialize.py uses it to convert the official VAE file.
+    @staticmethod
+    def _remap_official_state_key(key: str) -> str:
+        if key == "encoder.conv1.weight":
+            return "encoder.conv_in.weight"
+        if key == "encoder.conv1.bias":
+            return "encoder.conv_in.bias"
+        if key == "decoder.conv1.weight":
+            return "decoder.conv_in.weight"
+        if key == "decoder.conv1.bias":
+            return "decoder.conv_in.bias"
+        if key == "conv1.weight":
+            return "quant_conv.weight"
+        if key == "conv1.bias":
+            return "quant_conv.bias"
+        if key == "conv2.weight":
+            return "post_quant_conv.weight"
+        if key == "conv2.bias":
+            return "post_quant_conv.bias"
+
+        if key.startswith("encoder.downsamples."):
+            key = key.replace("encoder.downsamples.", "encoder.down_blocks.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("encoder.middle.0."):
+            key = key.replace("encoder.middle.0.", "encoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.middle.1."):
+            return key.replace(
+                "encoder.middle.1.", "encoder.mid_block.attentions.0.", 1
+            )
+
+        if key.startswith("encoder.middle.2."):
+            key = key.replace("encoder.middle.2.", "encoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.head.0.gamma"):
+            return key.replace("encoder.head.0.gamma", "encoder.norm_out.gamma", 1)
+        if key.startswith("encoder.head.2."):
+            return key.replace("encoder.head.2.", "encoder.conv_out.", 1)
+
+        if key.startswith("decoder.middle.0."):
+            key = key.replace("decoder.middle.0.", "decoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.middle.1."):
+            return key.replace(
+                "decoder.middle.1.", "decoder.mid_block.attentions.0.", 1
+            )
+
+        if key.startswith("decoder.middle.2."):
+            key = key.replace("decoder.middle.2.", "decoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.upsamples."):
+            parts = key.split(".")
+            flat_idx = int(parts[2])
+            block_idx = flat_idx // 4
+            block_offset = flat_idx % 4
+            if block_idx == 3:
+                block_offset = flat_idx - 12
+            prefix = f"decoder.up_blocks.{block_idx}."
+            suffix = ".".join(parts[3:])
+            if block_idx < 3 and block_offset == 3:
+                return prefix + "upsamplers.0." + suffix
+            res_idx = block_offset
+            key = prefix + f"resnets.{res_idx}." + suffix
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("decoder.head.0.gamma"):
+            return key.replace("decoder.head.0.gamma", "decoder.norm_out.gamma", 1)
+        if key.startswith("decoder.head.2."):
+            return key.replace("decoder.head.2.", "decoder.conv_out.", 1)
+
+        return key
+
     def __init__(
         self,
         config: WanVAEConfig,
@@ -1584,7 +1719,12 @@ class AutoencoderKLWan(ParallelTiledVAE):
         self.latents_std = list(config.latents_std)
         self.shift_factor = config.shift_factor
         self.use_parallel_encode = getattr(config, "use_parallel_encode", False)
-        self.use_parallel_decode = getattr(config, "use_parallel_decode", False)
+        # When auto declines spatial-shard (gfx1250), decode is single-rank and
+        # DecodingStage runs it on the main rank alone under cfg-parallel.
+        self.use_parallel_decode = config.use_parallel_decode and (
+            not is_auto_parallel_decode_mode(config.parallel_decode_mode)
+            or should_use_spatial_shard_parallel_decode(config)
+        )
 
         if config.load_encoder:
             self.encoder = WanEncoder3d(
@@ -1714,6 +1854,26 @@ class AutoencoderKLWan(ParallelTiledVAE):
             enc = ParallelTiledVAE.encode(self, x)
 
         return enc
+
+    def encode_video(self, x: torch.Tensor) -> torch.Tensor:
+        self.clear_cache()
+        if self.config.patch_size is not None:
+            x = patchify(x, patch_size=self.config.patch_size)
+        with forward_context(
+            feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+        ):
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            for i in range(iter_):
+                feat_idx.set(0)
+                if i == 0:
+                    out = self.encoder(x[:, :, :1, :, :])
+                else:
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
+                    out = torch.cat([out, out_], 2)
+        enc = self.quant_conv(out)
+        self.clear_cache()
+        return enc[:, : self.z_dim]
 
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
         with forward_context(first_frame_arg=first_frame):

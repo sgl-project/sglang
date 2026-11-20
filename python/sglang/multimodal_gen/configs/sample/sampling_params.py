@@ -235,6 +235,33 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+# Arbitrary upper bounds; upscaling_scale squares the pixel count.
+_FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
+_MAX_UPSCALING_SCALE = 8
+
+
+def _check_postprocess_controls(params: "SamplingParams") -> None:
+    scale = params.frame_interpolation_scale
+    low, high = _FRAME_INTERPOLATION_SCALE_RANGE
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not low <= scale <= high
+    ):
+        raise ValueError(
+            f"frame_interpolation_scale must be in [{low}, {high}], got {scale!r}"
+        )
+    up = params.upscaling_scale
+    if (
+        isinstance(up, bool)
+        or not isinstance(up, int)
+        or not 1 <= up <= _MAX_UPSCALING_SCALE
+    ):
+        raise ValueError(
+            f"upscaling_scale must be an int in [1, {_MAX_UPSCALING_SCALE}], got {up!r}"
+        )
+
+
 @dataclass
 class SamplingParams:
     """
@@ -266,6 +293,11 @@ class SamplingParams:
     image_path: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
+    # Audio conditioning stays in the signature: S2V output follows the audio,
+    # so two requests with different audio must not share a batch.
+    audio_path: str | None = None
+    pose_video_path: str | None = None
+    num_clip: int | None = None
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -434,6 +466,8 @@ class SamplingParams:
 
     # return output file paths directly to client
     return_file_paths_only: bool = True
+    # also return each image's encoded bytes, which are written to disk only when save_output
+    return_image_bytes: bool = False
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None
     max_sequence_length: int | None = None
@@ -699,6 +733,9 @@ class SamplingParams:
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
+        # scale bounds follow RIFE's supported range.
+        _check_postprocess_controls(self)
+
         # num_frames is already asserted in __post_init__, but keep a friendly error here too
         # (e.g., when validation is triggered from other code paths).
         if not isinstance(self.num_frames, int) or self.num_frames <= 0:
@@ -793,6 +830,11 @@ class SamplingParams:
             )
 
         RLRolloutArgs.validate_sampling_params(self)
+        if self.num_clip is not None:
+            if not isinstance(self.num_clip, int) or self.num_clip <= 0:
+                raise ValueError(
+                    f"num_clip must be a positive int, got {self.num_clip!r}"
+                )
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -832,6 +874,26 @@ class SamplingParams:
             and not task_type.accepts_video_input()
         ):
             raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+        if pipeline_config.task_type.requires_audio_input():
+            if self.audio_path is None:
+                raise ValueError(
+                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'audio_path' input, but none was provided"
+                )
+
+        if not pipeline_config.task_type.accepts_audio_input():
+            if self.audio_path is not None:
+                raise ValueError(
+                    f"audio_path is not supported for {pipeline_config.task_type.name} models."
+                )
+
+        if (
+            self.pose_video_path is not None
+            and not pipeline_config.task_type.accepts_audio_input()
+        ):
+            raise ValueError(
+                f"pose_video_path is not supported for {pipeline_config.task_type.name} models."
+            )
 
     def resolve_task_type(self, pipeline_config) -> ModelTaskType:
         resolver = getattr(pipeline_config, "resolve_task_type", None)
@@ -902,7 +964,6 @@ class SamplingParams:
             except ImportError:
                 self.guidance_scale = 1.0
         self.return_frames = False
-        self.return_video = False
         self.num_frames = 1
         self.adjust_frames = False
         if self.save_output and not server_args.comfyui_mode:
@@ -953,7 +1014,10 @@ class SamplingParams:
         else:
             self.enable_sequence_shard = False
 
-        if self.enable_sequence_shard:
+        if (
+            self.enable_sequence_shard
+            and pipeline_config.task_type != ModelTaskType.S2V
+        ):
             self.adjust_frames = False
             logger.info(
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
@@ -979,7 +1043,9 @@ class SamplingParams:
                 self.num_frames,
             )
 
-            if self.adjust_frames:
+            # Wan S2V trims one frame and shards its own padded sequence, so the
+            # generic per-GPU latent-frame alignment does not apply to it.
+            if self.adjust_frames and pipeline_config.task_type != ModelTaskType.S2V:
                 new_num_frames = align_num_frames_for_num_gpus(
                     self.num_frames,
                     num_gpus=server_args.num_gpus,
@@ -1411,7 +1477,7 @@ class SamplingParams:
             "--true-cfg-scale",
             type=float,
             dest="true_cfg_scale",
-            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image, FLUX.1)",
         )
         add_argument(
             "--guidance-rescale",
@@ -1574,6 +1640,21 @@ class SamplingParams:
                 "Frame rate used for action token temporal mRoPE positions. "
                 "Defaults to the video fps when not set."
             ),
+        )
+        add_argument(
+            "--audio-path",
+            type=str,
+            help="Path to the input audio file for speech-driven video generation.",
+        )
+        add_argument(
+            "--pose-video-path",
+            type=str,
+            help="Optional pose guidance video for speech-driven video generation.",
+        )
+        add_argument(
+            "--num-clip",
+            type=int,
+            help="Optional clip repeat/count override for speech-driven video generation.",
         )
         add_argument(
             "--moba-config-path",

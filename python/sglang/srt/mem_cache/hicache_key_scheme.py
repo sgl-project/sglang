@@ -43,7 +43,10 @@ import logging
 
 import msgspec
 
-from sglang.srt.mem_cache.pool_host.page_unified import PAGE_UNIFIED_OBJECT_LAYOUT
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    PAGE_UNIFIED_OBJECT_LAYOUT,
+    PageUnifiedLayout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +151,30 @@ def _validate_grid(namespace: KVCacheNamespace) -> None:
         )
 
 
+def resolve_head_group_num(local_kv_heads: int) -> int:
+    """How many head groups this rank's page_unified pool is cut into.
+
+    The pool has to be allocated before any storage backend attaches, so the
+    cut is read from the server args here rather than from the attach-time
+    plan; plan_unified_kv() re-derives the same number from the same argument
+    and the two are checked against each other when the backend attaches.
+    """
+    from sglang.srt.runtime_context import get_memory
+
+    memory = get_memory()
+    if memory.hicache_storage_key_scheme != "unified":
+        return 1
+    head_group = memory.hicache_storage_head_partition
+    if head_group is None:
+        return 1
+    if local_kv_heads % head_group != 0:
+        raise ValueError(
+            f"--hicache-storage-head-partition {head_group} must divide this rank's "
+            f"{local_kv_heads} kv heads."
+        )
+    return local_kv_heads // head_group
+
+
 def normalize_dtype(dtype: object) -> str:
     """``torch.bfloat16`` -> ``"bfloat16"``."""
     return str(dtype).removeprefix("torch.")
@@ -176,6 +203,23 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     def head_group_num(self) -> int:
         return len(self.head_ranges)
 
+    def chunk_spans(self, layout: PageUnifiedLayout) -> list[tuple[int, int]]:
+        """Byte ``(offset, length)`` of each suffix's chunk in one page block.
+
+        Plan head group ``j`` is pool head group ``j``: both cut the rank's
+        heads into equal groups in head order.
+        """
+        if layout.head_group_num != self.head_group_num:
+            raise ValueError(
+                f"the unified plan cuts {self.head_group_num} head groups but "
+                f"the page block holds {layout.head_group_num}."
+            )
+        return [
+            layout.chunk_span(layer_range=layer_range, head_group=head_group)
+            for layer_range in self.layer_ranges
+            for head_group in range(self.head_group_num)
+        ]
+
 
 def plan_unified_kv(
     *,
@@ -199,13 +243,11 @@ def plan_unified_kv(
     grid would write objects a reader cannot reassemble, and the symptom would
     be silently wrong KV rather than a miss.
     """
-    if attn_cp_size > 1:
-        raise NotImplementedError(
-            "the unified key scheme does not support attention context "
-            "parallelism yet: NSA-CP ranks hold sub-page slices (needs the "
-            "token-granule extension) and replicated-CP needs writer election. "
-            "Use --hicache-storage-key-scheme rank-suffix."
-        )
+    # Prefill CP replicates full KV pages across its ranks. Its size does not
+    # change object identity; the controller elects CP rank 0 to write each
+    # attention-TP shard. DCP's token slices are rejected during configuration.
+    if attn_cp_size < 1:
+        raise ValueError(f"attn_cp_size must be positive: {attn_cp_size}")
     if not 0 <= start_layer < end_layer:
         raise ValueError(f"invalid layer range [{start_layer}, {end_layer}).")
 
@@ -279,7 +321,7 @@ def _resolve_head_group(
             # An explicit head_group is the operator attesting it is sharding.
             raise NotImplementedError(
                 "the unified key scheme cannot derive a namespace at 1 kv head "
-                "per rank; set --hicache-storage-head-group, or use "
+                "per rank; set --hicache-storage-head-partition, or use "
                 "--hicache-storage-key-scheme rank-suffix."
             )
         if local_kv_heads != total_kv_heads:
@@ -287,7 +329,7 @@ def _resolve_head_group(
             # digest and misses everything. Nothing else reports this -- the
             # symptom is a 0% hit rate against a populated store.
             logger.warning(
-                "unified key scheme: --hicache-storage-head-group is unset, so "
+                "unified key scheme: --hicache-storage-head-partition is unset, so "
                 "this namespace is keyed to this rank's %d of %d kv heads and "
                 "can only share objects with deployments at attn-TP %d. Set it "
                 "to total_kv_heads / lcm of the fleet's attn-TP sizes to share "

@@ -12,12 +12,17 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+    TransferIntent,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+FOREGROUND = TransferIntent.FOREGROUND
+
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
@@ -79,9 +84,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         self.assertEqual(
             manager.engine.batch_transfer_sync.call_args_list,
             [
-                call("session", [1000, 2000], [5100, 6200], [20, 40]),
-                call("session", [1020, 2040], [5120, 6240], [20, 40]),
-                call("session", [1040, 2080], [5140, 6280], [10, 20]),
+                call("session", [1000, 2000], [5100, 6200], [20, 40], FOREGROUND),
+                call("session", [1020, 2040], [5120, 6240], [20, 40], FOREGROUND),
+                call("session", [1040, 2080], [5140, 6280], [10, 20], FOREGROUND),
             ],
         )
 
@@ -97,6 +102,7 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                     [1000, 2000],
                     [5100, 6200],
                     [50, 100],
+                    FOREGROUND,
                 )
 
     def test_stops_after_first_failed_index_batch(self):
@@ -118,9 +124,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         self.assertEqual(
             manager.engine.batch_transfer_sync.call_args_list,
             [
-                call("session", [1000, 2000], [5100, 6400], [20, 40]),
-                call("session", [1020, 2040], [5120, 6440], [20, 40]),
-                call("session", [1040, 2080], [5140, 6480], [10, 20]),
+                call("session", [1000, 2000], [5100, 6400], [20, 40], FOREGROUND),
+                call("session", [1020, 2040], [5120, 6440], [20, 40], FOREGROUND),
+                call("session", [1040, 2080], [5140, 6480], [10, 20], FOREGROUND),
             ],
         )
 
@@ -132,8 +138,8 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         self.assertEqual(manager.engine.batch_transfer_sync.call_count, 2)
         manager.engine.batch_transfer_sync.assert_has_calls(
             [
-                call("session", [1000], [5100], [50]),
-                call("session", [2000], [6200], [100]),
+                call("session", [1000], [5100], [50], FOREGROUND),
+                call("session", [2000], [6200], [100], FOREGROUND),
             ],
             any_order=True,
         )
@@ -143,7 +149,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
     def test_index_truncates_but_dense_rejects_mismatched_page_lists(self):
         """Legacy index transfers copy the common prefix; incomplete dense KV must fail."""
 
-        def copy_bytes(session, sources, destinations, lengths):
+        def copy_bytes(session, sources, destinations, lengths, intent=None):
             for src, dst, length in zip(sources, destinations, lengths, strict=True):
                 ctypes.memmove(dst, src, length)
             return 0
@@ -350,6 +356,189 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
             self.assertFalse(dst_buffers[1000000].any())
 
 
+class TestDcpCollapsedDraftPack(CustomTestCase):
+    def test_collapsed_draft_is_packed_with_the_target_rows(self):
+        """A DCP-collapsed draft must reach the decode in page runs, not one block per token."""
+        page_size, dcp, tokens, width = 4, 2, 8, 8
+        src_pages = np.array([1, 3], dtype=np.int32)
+        draft = np.arange(16 * width, dtype=np.uint8)
+        buffers = {
+            10000: np.zeros(16 * width, dtype=np.uint8),
+            20000: draft,
+            500000: np.zeros(4 * tokens * width, dtype=np.uint8),
+            1000000: np.zeros(16 * width, dtype=np.uint8),
+            2000000: np.zeros(16 * width, dtype=np.uint8),
+        }
+
+        def view(addr, size):
+            base = max(b for b in buffers if b <= addr)
+            return buffers[base][addr - base : addr - base + size]
+
+        def pack(
+            *, kv_data_ptrs, src_token_indices, token_item_lens, pack_offset_bytes, **_
+        ):
+            ptrs = []
+            addr = 500000 + pack_offset_bytes
+            for ptr, item_len in zip(kv_data_ptrs, token_item_lens):
+                ptrs.append(addr)
+                for row in src_token_indices:
+                    view(addr, item_len)[:] = view(ptr + int(row) * item_len, item_len)
+                    addr += item_len
+            return ptrs, np.arange(src_token_indices.size, dtype=np.int64)
+
+        draft_blocks = []
+
+        def transfer(session, blocks):
+            draft_blocks.extend(block for block in blocks if block[1] >= 2000000)
+            for src, dst, size in blocks:
+                view(dst, size)[:] = view(src, size)
+            return 0
+
+        manager = SimpleNamespace(
+            is_mla_backend=True,
+            kv_args=SimpleNamespace(
+                page_size=page_size,
+                kv_layer_ids=[],
+                kv_data_ptrs=[10000, 20000],
+                num_draft_entries=1,
+                engine_rank=0,
+            ),
+            attn_tp_size=1,
+            max_transfer_batch_indices=0,
+            enable_custom_mem_pool=False,
+            _transfer_data=transfer,
+            get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.try_pack_dcp_src",
+                side_effect=lambda **kwargs: pack(**{"pack_offset_bytes": 0, **kwargs}),
+            ),
+            concurrent.futures.ThreadPoolExecutor() as executor,
+        ):
+            result = MooncakeKVManager.send_kvcache_dcp(
+                manager,
+                "session",
+                src_pages,
+                [1000000, 2000000],
+                np.array([2], dtype=np.int32),
+                dcp_token_item_lens=[width, width],
+                dst_dcp_size=dcp,
+                dst_dcp_rank=1,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=tokens,
+                executor=executor,
+                dst_layer_ids=[],
+                pack_buffer=object(),
+                draft_rows_collapsed=True,
+            )
+        self.assertEqual(result, 0)
+        owned = np.arange(1, tokens, dcp)
+        src_rows = src_pages[owned // page_size] * page_size + owned % page_size
+        np.testing.assert_array_equal(
+            buffers[2000000].reshape(-1, width)[
+                2 * page_size : 2 * page_size + owned.size
+            ],
+            draft.reshape(-1, width)[src_rows],
+        )
+        self.assertEqual(len(draft_blocks), 1)
+
+
+class TestDcpDsaIndexKTransfer(unittest.TestCase):
+    def test_moves_keys_and_scales_to_owner_rows(self):
+        page_size, value_bytes, scale_bytes, dcp = 64, 8, 4, 8
+        page_bytes = page_size * (value_bytes + scale_bytes)
+        tokens = 300
+        src_pages = np.array([1, 3, 4, 7, 9], dtype=np.int32)
+        logical = np.arange(tokens)
+        src_rows = src_pages[logical // page_size] * page_size + logical % page_size
+        keys = (np.arange(tokens * value_bytes) % 251).astype(np.uint8)
+        keys = keys.reshape(tokens, value_bytes)
+        scales = (np.arange(tokens * scale_bytes) % 241 + 1).astype(np.uint8)
+        scales = scales.reshape(tokens, scale_bytes)
+
+        def write(buf, rows, k, sc):
+            pages = buf.reshape(-1, page_bytes)
+            for row, key, scale in zip(rows, k, sc):
+                page, off = divmod(int(row), page_size)
+                pages[page, off * value_bytes : (off + 1) * value_bytes] = key
+                start = page_size * value_bytes + off * scale_bytes
+                pages[page, start : start + scale_bytes] = scale
+
+        for dst_rank in range(dcp):
+            with self.subTest(dst_rank=dst_rank):
+                layers = {500000: None, 600000: None}
+                src_buffers = {10000: np.zeros(1024 * 8, dtype=np.uint8)}
+                for base in layers:
+                    src = np.zeros(16 * page_bytes, dtype=np.uint8)
+                    write(src, src_rows, keys, scales)
+                    src_buffers[base] = src
+                dst_buffers = {
+                    base: np.zeros(8 * page_bytes, dtype=np.uint8)
+                    for base in (1000000, 5000000, 6000000)
+                }
+
+                def transfer(session, blocks):
+                    for src, dst, size in blocks:
+                        src_base = max(b for b in src_buffers if b <= src)
+                        dst_base = max(b for b in dst_buffers if b <= dst)
+                        dst_buffers[dst_base][
+                            dst - dst_base : dst - dst_base + size
+                        ] = src_buffers[src_base][
+                            src - src_base : src - src_base + size
+                        ]
+                    return 0
+
+                manager = SimpleNamespace(
+                    is_mla_backend=False,
+                    kv_args=SimpleNamespace(
+                        page_size=page_size,
+                        kv_layer_ids=[],
+                        kv_data_ptrs=[10000],
+                        num_draft_entries=0,
+                        engine_rank=0,
+                        dsa_index_k_token_bytes=(value_bytes, scale_bytes),
+                    ),
+                    attn_tp_size=8,
+                    max_transfer_batch_indices=0,
+                    enable_custom_mem_pool=False,
+                    _transfer_data=transfer,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
+                    get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
+                )
+                manager._dsa_index_k_dcp_params = lambda *args, **kwargs: (
+                    MooncakeKVManager._dsa_index_k_dcp_params(manager, *args, **kwargs)
+                )
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    result = MooncakeKVManager.send_kvcache_dcp(
+                        manager,
+                        "session",
+                        src_pages,
+                        [1000000],
+                        np.array([2], dtype=np.int32),
+                        dcp_token_item_lens=[8],
+                        dst_dcp_size=dcp,
+                        dst_dcp_rank=dst_rank,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=tokens,
+                        executor=executor,
+                        dst_layer_ids=[],
+                        dsa_index_k=([500000, 600000], [5000000, 6000000], page_bytes),
+                    )
+                self.assertEqual(result, 0)
+                owned = np.arange(dst_rank, tokens, dcp)
+                expected = np.zeros(8 * page_bytes, dtype=np.uint8)
+                write(
+                    expected, 2 * page_size + owned // dcp, keys[owned], scales[owned]
+                )
+                for base in (5000000, 6000000):
+                    np.testing.assert_array_equal(dst_buffers[base], expected)
+
+
 class TestDcpPackLifetime(CustomTestCase):
     def test_failed_transfer_drains_before_pack_buffer_reuse(self):
         """A failed layer must not release the pack buffer while another transfer reads it."""
@@ -418,11 +607,14 @@ class TestMooncakeEarlySend(CustomTestCase):
             with self.subTest(last=last):
                 ready = MagicMock()
                 manager = MagicMock()
-                sender = SimpleNamespace(
+                sender = object.__new__(MooncakeKVSender)
+                vars(sender).update(
                     kv_mgr=manager,
                     bootstrap_room=1,
                     aux_index=0,
                     trace_ctx=MagicMock(),
+                    conclude_state=None,
+                    _transfer_start_time=None,
                     _early_send_wait_event=ready,
                     _prepare_send_indices=lambda ids, state: (
                         ids,
@@ -432,15 +624,17 @@ class TestMooncakeEarlySend(CustomTestCase):
                     ),
                     _record_transfer_indices=MagicMock(),
                 )
-                MooncakeKVSender.send(sender, [0])
-                self.assertIs(
-                    manager.add_transfer_request.call_args.kwargs["wait_event"], ready
-                )
+                indices_ready = MagicMock()
+                sender.send([0], indices_event=indices_ready)
+                kwargs = manager.add_transfer_request.call_args.kwargs
+                self.assertIs(kwargs["wait_event"], ready)
+                self.assertIs(kwargs["indices_event"], indices_ready)
                 ready.synchronize.assert_not_called()
-                MooncakeKVSender.send(sender, [1])
-                self.assertIsNone(
-                    manager.add_transfer_request.call_args.kwargs["wait_event"]
-                )
+                indices_ready.synchronize.assert_not_called()
+                sender.send([1])
+                kwargs = manager.add_transfer_request.call_args.kwargs
+                self.assertIsNone(kwargs["wait_event"])
+                self.assertIsNone(kwargs["indices_event"])
 
     def test_manager_preserves_event_in_queued_chunk(self):
         queue = SimpleQueue()
@@ -451,12 +645,24 @@ class TestMooncakeEarlySend(CustomTestCase):
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
         )
+        indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
-            manager, 1, [0], slice(0, 1), False, wait_event=ready
+            manager,
+            1,
+            [0],
+            slice(0, 1),
+            False,
+            wait_event=ready,
+            indices_event=indices_ready,
         )
-        self.assertIs(queue.get_nowait().wait_event, ready)
+        chunk = queue.get_nowait()
+        self.assertIs(chunk.wait_event, ready)
+        self.assertIs(chunk.indices_event, indices_ready)
         ready.synchronize.assert_not_called()
+        indices_ready.synchronize.assert_not_called()
 
     def _worker(self, event):
         chunk = TransferKVChunk(
@@ -477,6 +683,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
             dst_attn_tp_size=1,
+            dst_aux_ptrs=[2000],
+            dst_aux_item_lens=[16],
         )
         manager = SimpleNamespace(
             enable_trace=False,
@@ -498,7 +706,9 @@ class TestMooncakeEarlySend(CustomTestCase):
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
             _maybe_ack_drained_abort=MagicMock(),
+            validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
+            note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue
@@ -563,6 +773,26 @@ class TestMooncakeEarlySend(CustomTestCase):
         manager, queue = self._worker(None)
         MooncakeKVManager.transfer_worker(manager, queue, MagicMock())
         manager.send_kvcache.assert_called_once()
+
+    def test_worker_waits_before_the_staging_gather(self):
+        """The staged path gathers the pages into the staging buffer before the
+        RDMA post, so a wait covering only the post ships partially written KV."""
+        order = []
+        manager, queue = self._worker(
+            SimpleNamespace(synchronize=lambda: order.append("wait"))
+        )
+        manager.enable_staging = True
+
+        def stop_at_strategy(_staging_buffer):
+            order.append("gather")
+            raise SystemExit
+
+        manager._try_create_staging_strategy = stop_at_strategy
+        with self.assertRaises(SystemExit):
+            MooncakeKVManager.transfer_worker(
+                manager, queue, MagicMock(), staging_buffer=object()
+            )
+        self.assertEqual(order, ["wait", "gather"])
 
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):

@@ -6,7 +6,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import OmniOpenAITestMixin, TestOpenAIMLLMServerBase
 
-register_cuda_ci(est_time=220, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=239, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestQwen3OmniServer(OmniOpenAITestMixin):
@@ -16,7 +16,8 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
     model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     extra_args = [  # workaround to fit into H100
         "--mem-fraction-static=0.90",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--image-processor-backend=pil",
         "--grammar-backend=none",
     ]

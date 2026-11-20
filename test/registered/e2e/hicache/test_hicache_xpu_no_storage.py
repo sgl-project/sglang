@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_xpu_ci(est_time=400, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=400, suite="extra-test-1-gpu-xpu")
 
 
 class _NoStorageServer(CustomTestCase):

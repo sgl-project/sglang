@@ -9,7 +9,7 @@ These are investigation hints, not a list of changes to apply.
 
 | Observed output | Where to investigate | Decision to verify |
 |---|---|---|
-| HF warning printed in two formats | `utils/common.py`, HF logger handlers and propagation | A library handler plus root propagation can emit the same record twice. Keep one timestamped copy, including before full server logging setup. |
+| HF warning printed in two formats | `utils/log_utils.py`, HF logger handlers and propagation | A library handler plus root propagation can emit the same record twice. Keep one timestamped copy, including before full server logging setup. |
 | `Skipping import of cpp extensions due to incompatible torch version` | `torchao/__init__.py`; imports through `hf_transformers_patches.py` and transformers quantizers | Determine whether torchao is needed for the requested model before proposing narrow import-time suppression. |
 | `torch_dtype` is deprecated | Model code, loader, and HF utilities accessing `config.torch_dtype` | Prefer `config.dtype` where supported; change and verify only affected, tested models. |
 | `BaseImageProcessorFast` is deprecated | Multimodal processor imports and type checks | Check the installed transformers replacement and compatible `isinstance` behavior. |

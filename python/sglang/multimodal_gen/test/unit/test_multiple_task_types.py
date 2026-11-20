@@ -5,6 +5,7 @@ import argparse
 import io
 import pickle
 from dataclasses import dataclass, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -15,11 +16,13 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_S2V_14B_Config
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     MAX_FRAME_INTERPOLATION_EXP,
     SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.wan import Wan2_2_S2V_14B_SamplingParam
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.configs.task_type import ModelTaskType as Task
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, utils, video_api
@@ -61,10 +64,8 @@ def make_args(config, output=None):
 
 
 def test_legacy_enums_and_capabilities():
-    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-    from sglang.multimodal_gen.configs.sample.sampling_params import (
-        DataType as OldDataType,
-    )
+    from sglang.multimodal_gen.configs.task_type import DataType as OldDataType
+    from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
     assert ModelTaskType is Task
     assert OldDataType is DataType
@@ -207,9 +208,7 @@ def http_client(monkeypatch, tmp_path, request):
 
     async def generate(client, req, **kwargs):
         admitted.append(req)
-        path = req.output_file_path()
-        Image.new("RGB", (64, 64)).save(path)
-        return [path], OutputBatch()
+        return [req.output_file_path()], OutputBatch(output_image_bytes=[png_bytes()])
 
     async def upload(paths):
         return [None] * len(paths)
@@ -223,7 +222,7 @@ def http_client(monkeypatch, tmp_path, request):
         return complete_dispatch()
 
     monkeypatch.setattr(image_api, "process_generation_batch", generate)
-    monkeypatch.setattr(image_api, "_upload_and_cleanup_images", upload)
+    monkeypatch.setattr(image_api.cloud_storage, "upload_all_and_cleanup", upload)
     monkeypatch.setattr(video_api, "_dispatch_job_async", dispatch)
     app = FastAPI()
     app.include_router(image_api.router)
@@ -349,6 +348,49 @@ def test_video_transports_keep_selected_task(http_client, multipart):
     assert config.task_type == Task.T2V
 
 
+@pytest.mark.parametrize(
+    "http_client",
+    [(Wan2_2_S2V_14B_Config, Wan2_2_S2V_14B_SamplingParam)],
+    indirect=True,
+)
+@pytest.mark.parametrize("multipart", [False, True])
+def test_wan_s2v_rejects_cache_flags_it_would_ignore(
+    http_client, multipart, monkeypatch
+):
+    """The S2V DiT has no TeaCache/Spectrum hooks, so an accepted flag ran every step
+    uncached while the caller believed it was on; it must be refused at admission."""
+    client, admitted, _ = http_client
+    # The fixture's from_pretrained returns the base class; the registry resolves the
+    # S2V model to its own, whose __post_init__ holds the check.
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **kw: Wan2_2_S2V_14B_SamplingParam()),
+    )
+    payload = {
+        "prompt": "a woman sings",
+        "size": "1024x704",
+        "audio_path": "/tmp/talk.wav",
+        "enable_teacache": "true" if multipart else True,
+    }
+    if multipart:
+        response = client.post(
+            "/v1/videos",
+            data=payload,
+            files={"input_reference": ("ref.png", png_bytes(), "image/png")},
+        )
+    else:
+        response = client.post(
+            "/v1/videos", json={**payload, "input_reference": "/tmp/ref.png"}
+        )
+    assert response.status_code == 400, response.text
+    assert "enable_teacache" in response.json()["detail"]
+    assert admitted == []
+    # Spectrum is not an HTTP field; it reaches the same check from the CLI/Python API.
+    with pytest.raises(ValueError, match="enable_spectrum"):
+        Wan2_2_S2V_14B_SamplingParam(enable_spectrum=True)
+
+
 def test_http_rejects_invalid_tasks_before_model_execution(http_client):
     client, admitted, _ = http_client
     for endpoint, payload in [
@@ -384,6 +426,48 @@ def test_http_rejects_out_of_range_frame_interpolation_exp(http_client, multipar
     assert response.status_code == 400, response.text
     assert "frame_interpolation_exp" in response.text
     assert admitted == []
+
+
+@pytest.mark.parametrize(
+    "endpoint,field",
+    [
+        ("images/generations", "upscaling_model_path"),
+        ("videos", "upscaling_model_path"),
+        ("videos", "frame_interpolation_model_path"),
+    ],
+)
+def test_http_rejects_url_postprocess_model_paths(http_client, endpoint, field):
+    """A client-supplied URL must not make the server fetch it (SSRF)."""
+    client, admitted, _ = http_client
+    response = client.post(
+        "/v1/" + endpoint,
+        json={"prompt": "p", "size": "64x64", field: "http://169.254.169.254/x.pth"},
+    )
+    assert response.status_code == 400, response.text
+    assert field in response.text
+    assert admitted == []
+
+
+def test_http_cloud_upload_failure_is_502_and_temp_output_is_removed(
+    http_client, monkeypatch, tmp_path
+):
+    """A failed upload is a server error, and with no output_path the generated
+    file must not outlive the request in a leaked temp directory."""
+    client, admitted, _ = http_client
+    image_api.get_global_server_args().output_path = None
+    monkeypatch.setattr(image_api.cloud_storage, "enabled", True)
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+    monkeypatch.setattr(utils.tempfile, "tempdir", str(temp_root))
+    response = client.post(
+        "/v1/images/generations",
+        json={"prompt": "p", "size": "64x64", "response_format": "url"},
+    )
+    assert response.status_code == 502, response.text
+    generated = Path(admitted[0].output_file_path())
+    assert temp_root in generated.parents
+    assert not generated.exists()
+    assert not any(temp_root.iterdir())
 
 
 def test_http_accepts_max_frame_interpolation_exp(http_client):

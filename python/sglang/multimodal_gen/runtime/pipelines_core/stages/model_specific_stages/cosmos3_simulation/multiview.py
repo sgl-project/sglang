@@ -15,7 +15,6 @@ image anchors ride the I2V velocity mask.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +34,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     closest_multiview_aspect_ratio,
     multiview_canvas,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -155,10 +155,6 @@ COSMOS3_JOINT_EMPHASIS = (
 # Caption augmentors of the transfer training data.
 DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
-INVERSE_DURATION_TEMPLATE = (
-    "The video is not {duration:.1f} seconds long and is not of {fps:.0f} FPS."
-)
-INVERSE_RESOLUTION_TEMPLATE = "This video is not of {height}x{width} resolution."
 
 # Rates and frame counts outside these bounds are allowed with a warning.
 COSMOS3_MULTIVIEW_RECOMMENDED_FPS_RANGE = (10.0, 30.0)
@@ -452,36 +448,6 @@ def apply_metadata_templates(
     if not parts:
         return ""
     return ". ".join(parts) + "."
-
-
-def format_json_caption(
-    prompt: str,
-    *,
-    num_frames: int,
-    fps: float,
-    height: int,
-    width: int,
-    aspect_ratio: str | None,
-) -> str | None:
-    """Inject training-time metadata into a JSON-object caption; None if not JSON."""
-    try:
-        caption = json.loads(prompt)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(caption, dict):
-        return None
-    metadata: dict[str, Any] = {}
-    if num_frames > 1:
-        duration_seconds = int(num_frames / fps) if fps > 0 else 0
-        metadata.update({"duration": f"{duration_seconds}s", "fps": float(fps)})
-    else:
-        caption.pop("duration", None)
-        caption.pop("fps", None)
-    metadata["resolution"] = {"H": int(height), "W": int(width)}
-    if aspect_ratio is not None:
-        metadata["aspect_ratio"] = aspect_ratio
-    caption.update(metadata)
-    return json.dumps(caption)
 
 
 def _camera_identity(camera: str) -> str:
@@ -1118,7 +1084,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         for view in range(num_views):
             clip = pixels[:, :, view * frames_per_view : (view + 1) * frames_per_view]
             clip = clip.to(device=device, dtype=vae_dtype).div(127.5).sub(1.0)
-            with torch.no_grad():
+            with torch.no_grad(), use_gpu_conditioning_hash():
                 latent = self.vae.encode(clip).mode()
             latent = (latent - mean.to(latent)) / std.to(latent)
             latents.append(latent.to(dtype))

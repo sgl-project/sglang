@@ -74,9 +74,11 @@ pipeline does not serve the separate FLUX.3 Action robot policy.
 | [Klein Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) | undistilled | 50 | 3.5 | fine-tuning, LoRA training, research |
 
 Each repository ships its BF16 DiT with FP8 (`fp8r`) and NVFP4 variants,
-together with the text encoder and image autoencoder. Quantization and caching
-are separate fidelity/latency tradeoffs, not lossless substitutes for the
-selected checkpoint.
+together with the text encoder and image autoencoder. The default
+[conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache)
+reuses prompt encodings, including the Base model's negative prompt. It does
+not skip denoising steps or change the checkpoint. Cache-DiT, described below,
+is a separate approximation.
 
 | Task | Endpoint | Conditioning |
 | --- | --- | --- |
@@ -153,7 +155,9 @@ Explicit `guidance_scale=1` uses scale 1, not the package default;
 Each repo ships quantized DiTs under `variants/`: select one with
 `--model-variant fp8r` or `--model-variant nvfp4` and keep `--model-path`
 pointing at the repo root. Text encoder and VAE precision follow their own
-package settings; quantizing the DiT does not quantize them. The quantization
+package settings; quantizing the DiT does not quantize them. An explicit
+`--component-precisions.vae bf16` overrides the package dtype for both
+reference-image encoding and output decoding. The quantization
 comes from the variant's `hf_quant_config.json`, so do not also pass
 `--quantization`.
 
@@ -233,6 +237,10 @@ on several GPUs. Preserve headroom for the longest prompt, references and output
 size you intend to serve; a successful small request is not a capacity guarantee.
 </Note>
 
+The VAE decoder runs unsharded by default even with multiple GPUs.
+`--vae-sp true` splits decoding along the image height when a decode-parallel
+group is available; it does not shard reference-image encoding.
+
 For FP32 VAE attention above 1 MP, `quality="lossless"` can use dense-layout,
 full-context memory-efficient SDPA; `quality="exact"` retains the original path.
 It does not prune attention or reduce precision, but reduction order can change
@@ -241,6 +249,19 @@ GB300 peak allocated memory fell from 54.3 to 29.5 GiB; latency was effectively
 unchanged. GB300/H200 image SSIM was 0.9951-0.9992 against the exact path across
 four samples. This is allocated memory, not total device usage: a 32 GB card
 still needs offload or quantization headroom for that reference size.
+
+### Disaggregated serving
+
+You can deploy the prompt encoder, reference-image VAE encoder, DiT, and VAE
+decoder as separate worker pools behind the same image API. Both T2I and i2i
+are supported. Use the [split encoding deployment guide](/docs/sglang-diffusion/disaggregation#flux3-split-encoding)
+for the four-role commands, or keep the existing three-role topology with a
+combined encoder. This separates resources and scaling; it adds transfer hops
+and does not imply lower single-request latency.
+T2I skips the image encoder; editing keeps reference padding/crop semantics.
+Each pool can have a different number of workers. Keep the package variant and
+numerical settings consistent across workers; the guide includes the required
+transfer dependency, network ports, and same-node validation scope.
 
 ## 5. Cache-DiT
 
