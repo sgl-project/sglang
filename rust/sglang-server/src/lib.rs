@@ -29,7 +29,6 @@ pub use api_server::http::pre_generate::abortable_before_generate;
 #[cfg(feature = "test-support")]
 pub mod test_support {
     pub use crate::api_server::http::pre_generate::test_support::*;
-    pub use crate::multi_modality::encoded::test_support::*;
     pub use crate::utils::runtime::test_support::*;
 }
 pub use message::config::{

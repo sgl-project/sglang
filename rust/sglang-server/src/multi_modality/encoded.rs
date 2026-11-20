@@ -118,7 +118,7 @@ impl MmEncodedEntry {
             if cfg!(debug_assertions) && item.identity.is_some() {
                 assert_eq!(
                     Ok(identity),
-                    item.identity_from_digest(&check_digest(&item.feature.data)),
+                    item.identity_from_digest(&feature_digest(&item.feature.data)),
                     "a processor-supplied identity must match the item's feature"
                 );
             }
@@ -179,66 +179,7 @@ impl<'a> MmMeta<'a> {
 /// compute this however it likes (e.g. `blake3::Hasher::update_rayon`) and
 /// derive the identity with [`MmEncodedItem::identity_from_digest`].
 pub fn feature_digest(data: &TensorData) -> [u8; 32] {
-    #[cfg(feature = "test-support")]
-    test_support::FEATURE_DIGESTS
-        .lock()
-        .unwrap()
-        .push(feature_bytes(data).len());
     blake3::hash(feature_bytes(data)).into()
-}
-
-/// [`feature_digest`] for the debug check of a processor-supplied identity,
-/// which tests count apart from the passes a release build makes.
-fn check_digest(data: &TensorData) -> [u8; 32] {
-    #[cfg(feature = "test-support")]
-    test_support::CHECK_DIGESTS
-        .lock()
-        .unwrap()
-        .push(feature_bytes(data).len());
-    blake3::hash(feature_bytes(data)).into()
-}
-
-/// What a processor's tests count the passes over its features with, and the
-/// worker's identity step to run its output through.
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    use std::sync::Mutex;
-
-    use super::MmEncodedEntry;
-
-    /// The byte length of every feature [`feature_digest`](super::feature_digest)
-    /// read, so a test can count the passes over one feature while other tests
-    /// hash concurrently.
-    pub(super) static FEATURE_DIGESTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-    /// Likewise for the debug check of processor-supplied identities.
-    pub(super) static CHECK_DIGESTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
-    /// How many times [`feature_digest`](super::feature_digest) read a
-    /// feature of `len` bytes: the worker hashing an identity its processor
-    /// left unset, or a processor's own call.
-    pub fn feature_digests(len: usize) -> usize {
-        count(&FEATURE_DIGESTS, len)
-    }
-
-    /// How many times a debug build re-read a feature of `len` bytes to check
-    /// the identity its processor supplied.
-    pub fn identity_check_digests(len: usize) -> usize {
-        count(&CHECK_DIGESTS, len)
-    }
-
-    fn count(lengths: &Mutex<Vec<usize>>, len: usize) -> usize {
-        lengths
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|&&l| l == len)
-            .count()
-    }
-
-    /// The worker's last step before publication: each item's identity.
-    pub fn resolve_identities(entry: &mut MmEncodedEntry) -> Result<(), String> {
-        entry.resolve_identities()
-    }
 }
 
 fn feature_bytes(data: &TensorData) -> &[u8] {
