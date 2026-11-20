@@ -353,6 +353,27 @@ pub struct CacheArgs {
     #[arg(long)]
     pub cache_pending_prefix_max_followers: Option<u64>,
 
+    /// Remember where each chat with images was routed, and on its next turns
+    /// prefer that worker and DP rank, for this many milliseconds after its last
+    /// turn. KV events confirm such a chat only up to its first image (the engine
+    /// derives image token ids from pixels the router never sees), so without
+    /// this its later turns tie on the shared prefix and scatter by load. A
+    /// remembered placement counts only where it is deeper than every confirmed
+    /// match. Without one (another replica routed the previous turn), the tied
+    /// workers are ordered by a rendezvous hash of the conversation, so every
+    /// replica picks the same one; that preference is worth one block, within
+    /// --cache-switch-margin-tokens, so the pressure guard still overrides it
+    /// for a materially more loaded worker. A chat with a remembered placement
+    /// is exempt from --cache-affinity-min-matched-tokens (it counts prompt
+    /// tokens only, none of the image's KV), its tied peers included, so short
+    /// image chats keep their worker and the pressure guard keeps an
+    /// alternative; the match-ratio floor still applies. Under --dp-aware the
+    /// remembered rank is preferred the same way, and the rendezvous rank only
+    /// breaks a tie among equally loaded ranks. 0 or unset disables it.
+    /// Requires the radix_tree provider.
+    #[arg(long)]
+    pub cache_media_affinity_ttl_ms: Option<u64>,
+
     /// Confirmed-first pending prefixes: a stake counts only where it is
     /// strictly deeper than the confirmed KV-event match, and the pending
     /// store is consulted and staked only while the confirmed match covers
@@ -927,6 +948,12 @@ impl CacheArgs {
             "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
         );
         ensure!(
+            self.cache_media_affinity_ttl_ms.is_none_or(|ttl| ttl == 0)
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--cache-media-affinity-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
+        );
+        ensure!(
             self.cache_pending_prefix_max_followers.is_none()
                 || self.cache_pending_prefix_ttl_ms.is_some(),
             "--cache-pending-prefix-max-followers requires --cache-pending-prefix-ttl-ms"
@@ -980,6 +1007,7 @@ impl CacheArgs {
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
             pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
             pending_prefix_max_followers: self.cache_pending_prefix_max_followers.unwrap_or(0),
+            media_affinity_ttl_ms: self.cache_media_affinity_ttl_ms.unwrap_or(0),
             pending_prefix_consult_below: self.cache_pending_prefix_consult_below,
         }))
     }
