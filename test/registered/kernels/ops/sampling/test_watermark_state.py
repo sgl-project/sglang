@@ -364,9 +364,12 @@ def test_speculative_tree_paths_match_tensor_reference():
     assert torch.equal(
         states[2].num_watermarked_contexts, states[0].num_watermarked_contexts
     )
-    assert torch.equal(
-        states[2].watermarked_context_hashes, states[0].watermarked_context_hashes
-    )
+    # Slots past each row's count are uninitialized (torch.empty).
+    for row, count in enumerate(states[0].num_watermarked_contexts.tolist()):
+        assert torch.equal(
+            states[2].watermarked_context_hashes[row, :count],
+            states[0].watermarked_context_hashes[row, :count],
+        )
 
 
 @pytest.mark.parametrize("block_verification", [False, True])
@@ -466,6 +469,62 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
         state.watermarked_context_hashes[0, :2],
         reference.watermarked_context_hashes[0, :2],
     )
+
+
+def test_chain_record_matches_explicit_accept_index():
+    draft_token_num = 4
+    req_pool_indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((2, 1), device="cuda"),
+        top_ks=torch.tensor([64, 64], dtype=torch.int32, device="cuda"),
+        top_ps=torch.ones(2, device="cuda"),
+        min_ps=torch.zeros(2, device="cuda"),
+        max_top_k=64,
+    )
+    draft_tokens = torch.tensor(
+        [[30, 31, 32, 33], [40, 41, 42, 43]], dtype=torch.int64, device="cuda"
+    )
+    logits = torch.randn(
+        (2 * draft_token_num, 64),
+        generator=torch.Generator("cuda").manual_seed(7),
+        device="cuda",
+    )
+    rows = _server_rows(2, 2)
+    states = []
+    for accept_index in (
+        None,
+        torch.arange(2 * draft_token_num, dtype=torch.int32, device="cuda").view(
+            2, draft_token_num
+        ),
+    ):
+        state = WatermarkState(
+            max_num_reqs=3, context_window=2, max_contexts_per_req=8, device="cuda"
+        )
+        state.init_from_prompt(req_pool_indices, [[10, 11], [20, 21]])
+        verify = GumbelEngine(state, _FEATURES).bind_verify(rows, full_mask=False)
+        verify.apply(
+            logits.clone(),
+            sampling_info=sampling_info,
+            req_pool_indices=req_pool_indices,
+            draft_tokens=draft_tokens,
+            positions=torch.arange(2, 6, device="cuda").repeat(2, 1),
+            draft_token_num=draft_token_num,
+            custom_mask=None,
+            keep_logits=False,
+        )
+        verify.record(
+            accept_index, torch.tensor([3, 2], dtype=torch.int32, device="cuda")
+        )
+        states.append(state)
+
+    counts = states[1].num_watermarked_contexts.tolist()
+    assert counts == [2, 0, 3]
+    assert states[0].num_watermarked_contexts.tolist() == counts
+    for row, count in enumerate(counts):
+        assert torch.equal(
+            states[0].watermarked_context_hashes[row, :count],
+            states[1].watermarked_context_hashes[row, :count],
+        )
 
 
 if __name__ == "__main__":

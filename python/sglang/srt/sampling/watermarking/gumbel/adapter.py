@@ -351,6 +351,7 @@ class GumbelVerify:
         self.full_mask = full_mask
         # (req_pool_indices, context_hashes, selected) of the applied verify.
         self._forced: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        self._chain_width: Optional[int] = None
 
     def apply(
         self,
@@ -367,6 +368,7 @@ class GumbelVerify:
         if keep_logits:
             logits = logits.clone()
         if custom_mask is None:
+            self._chain_width = draft_token_num
             batch_size = draft_tokens.shape[0]
             custom_mask = self.state.chain_mask(draft_token_num)[:batch_size].reshape(
                 -1
@@ -410,9 +412,10 @@ class GumbelVerify:
     ) -> None:
         req_pool_indices, context_hashes, selected = self._forced
         if accept_index is None:
+            assert self._chain_width is not None
             accept_index = torch.arange(
                 selected.numel(), dtype=torch.int32, device=selected.device
-            ).view(accept_lens.shape[0], -1)
+            ).view(-1, self._chain_width)
         self.record_speculative(
             req_pool_indices, context_hashes, selected, accept_index, accept_lens
         )
