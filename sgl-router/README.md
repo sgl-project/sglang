@@ -130,8 +130,22 @@ Worker mutations require `--worker-management-api-key` and a matching
 `Authorization: Bearer <key>` header; without the flag they are unavailable.
 They return `202`. `GET /workers/{id}` exposes the operation and runtime state,
 including discovery IDs that contain `/`. `PUT` and `DELETE` require the current
-revision in `If-Match`; workers created by static or Kubernetes discovery are
+revision in `If-Match`. This revision is the Worker control record's version,
+not an HTTP entity tag; read it from the JSON response. A missing or invalid
+revision returns `400`; a non-current revision returns `409` with
+`stale_revision`. Workers created by static or Kubernetes discovery are
 read-only.
+
+Worker control state is local to one Router process. It is not persisted or
+replicated, so a Router restart loses API-created records and each Router
+replica has independent state. Follow-up `GET`, `PUT`, and `DELETE` requests
+must reach the same replica; an ordinary load-balanced Service cannot guarantee
+that without a per-replica endpoint or sticky routing.
+
+A failed create remains queryable under its assigned ID and keeps its URL
+reserved. Retry it with `PUT` using the same ID, URL, and current revision, or
+delete it before creating a new record. If discovery has restored a worker for
+that URL, retry and create requests conflict until discovery releases it.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
