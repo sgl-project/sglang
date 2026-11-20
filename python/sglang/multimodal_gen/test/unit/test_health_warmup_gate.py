@@ -94,6 +94,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
             port = occupied.bind_to_random_port("tcp://127.0.0.1")
             args = SimpleNamespace(
                 enable_metrics=False,
+                media_gateway_key_file=None,
                 warmup_mode="off",
                 progress_endpoint=None,
                 cancel_endpoint=None,
@@ -131,6 +132,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
         client = AsyncSchedulerClient()
         args = SimpleNamespace(
             enable_metrics=False,
+            media_gateway_key_file=None,
             pipeline_config=mock.Mock(
                 supports_action_endpoint=lambda: False,
                 supports_openpi_endpoint=lambda: False,
