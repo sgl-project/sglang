@@ -10,7 +10,11 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_kimi_k31,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -30,6 +34,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.page_table import write_graph_block_table
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -63,6 +68,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     next_power_of_2,
 )
+from sglang.srt.utils.nvtx_utils import profile_range
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -464,6 +470,18 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager,
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        hf_config = model_runner.model_config.hf_config
+        is_k31_target = not self.is_draft_worker and is_kimi_k31(hf_config)
+        is_dflash2_mla_draft = (
+            self.is_draft_worker
+            and self.use_mla
+            and "DFlash2DraftModel" in (getattr(hf_config, "architectures", None) or ())
+        )
+        self._fuse_dflash_graph_block_table = (
+            (is_k31_target or is_dflash2_mla_draft)
+            and self.dcp_size == 1
+            and envs.SGLANG_RAGGED_VERIFY_MODE.get() == "static"
+        )
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -651,6 +669,15 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
+            fuse_block_table=(
+                self._fuse_dflash_graph_block_table
+                and not in_capture
+                and not self.is_hybrid_swa
+                and not self.use_sliding_window_kv_pool
+                and forward_batch.forward_mode.is_target_verify()
+                and _is_dflash_verify(forward_batch.spec_info)
+                and getattr(forward_batch, "ragged_verify_layout", None) is None
+            ),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1252,12 +1279,14 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
+        fuse_block_table: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
+        block_table_max_len = None
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1318,13 +1347,7 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.swa_mask[bs:, :, :].fill_(True)
 
             if not self.dense_mla_dcp_target:
-                metadata.block_tables[:bs, :max_seq_pages].copy_(
-                    self.req_to_token[
-                        req_pool_indices[:bs], 0 : max_len : self.page_size
-                    ]
-                    // self.page_size
-                )
-                metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+                block_table_max_len = max_len
         elif max_seq_len_host is not None and not self.dense_mla_dcp_target:
             # Mirrorless replay (e.g. DSA models): the scheduler publishes the
             # host-side max of the page-aligned allocated seq lens (>= committed
@@ -1337,12 +1360,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 # draft-extend (and any other spec mode) sees base + draft block
                 max_len = max_seq_len_host + self.speculative_num_draft_tokens
-            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-            metadata.block_tables[:bs, :max_seq_pages].copy_(
-                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-                // self.page_size
-            )
-            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            block_table_max_len = max_len
         elif not self.dense_mla_dcp_target:
             total_pages = min(
                 metadata.block_tables.shape[1],
@@ -1356,6 +1374,36 @@ class AscendAttnBackend(AttentionBackend):
                 // self.page_size
             )
             metadata.block_tables[:bs, total_pages:].fill_(0)
+
+        block_table_written_by_kernel = False
+        if block_table_max_len is not None:
+            max_seq_pages = (block_table_max_len + self.page_size - 1) // self.page_size
+            # Reuse the capture-bound table and preserve the existing batch-wide
+            # page bound, including rows backed by the padding request slot.
+            block_table_written_by_kernel = (
+                fuse_block_table
+                and block_table_max_len >= 0
+                and block_table_max_len <= self.req_to_token.shape[1]
+                and max_seq_pages <= metadata.block_tables.shape[1]
+                and bs <= req_pool_indices.numel()
+            )
+            if block_table_written_by_kernel:
+                write_graph_block_table(
+                    self.req_to_token,
+                    req_pool_indices,
+                    metadata.block_tables,
+                    bs,
+                    max_seq_pages,
+                    self.page_size,
+                )
+            else:
+                metadata.block_tables[:bs, :max_seq_pages].copy_(
+                    self.req_to_token[
+                        req_pool_indices[:bs], 0 : block_table_max_len : self.page_size
+                    ]
+                    // self.page_size
+                )
+                metadata.block_tables[:bs, max_seq_pages:].fill_(0)
 
         if self.dense_mla_dcp_target:
             assert seq_lens_cpu is not None, "MLA DCP requires seq_lens_cpu"
@@ -1420,7 +1468,8 @@ class AscendAttnBackend(AttentionBackend):
                 dcp_pages = dcp_block_tables.shape[1]
                 metadata.dcp_block_tables[:bs, :dcp_pages].copy_(dcp_block_tables)
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
+        if not block_table_written_by_kernel:
+            metadata.block_tables[bs:, :].fill_(0)
 
         if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
             self.graph_mode = True
@@ -1473,7 +1522,12 @@ class AscendAttnBackend(AttentionBackend):
                     kv_lens = seq_lens_cpu[:bs]
                 else:
                     kv_lens = device_kv_lens[:bs]
-                metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
+                if kv_lens.device.type == "npu":
+                    with profile_range("npu.attn_metadata.seq_lens.d2h"):
+                        kv_lens = kv_lens.cpu()
+                else:
+                    kv_lens = kv_lens.cpu()
+                metadata.seq_lens_cpu_list = kv_lens.int().tolist()
         if not self.dense_mla_dcp_target:
             metadata.seq_lens[:bs].copy_(device_kv_lens[:bs])
 
