@@ -501,6 +501,9 @@ class SchedulerWeightUpdaterManager:
         for tag in tags:
             self.offload_tags.add(tag)
 
+        # pause() unmaps without waiting for the device: drain in-flight work.
+        torch.get_device_module().synchronize()
+
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 # Held requests keep no KV and wait out the release.
@@ -522,6 +525,8 @@ class SchedulerWeightUpdaterManager:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
+            # The export's D2H copies must land before their pages are unmapped.
+            torch.get_device_module().synchronize()
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 

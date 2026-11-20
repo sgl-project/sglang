@@ -112,7 +112,10 @@ class TestNpuDeviceBarrier(CustomTestCase):
 
         self.assertEqual(
             [kind for kind, _ in events],
-            ["export", "barrier", "pause", "sync", "barrier"],
+            # A drain precedes every pause: once before the tag loop (kv_cache),
+            # once after the static-state export (weights). The trailing sync is
+            # still there, so the return only happens on an idle device.
+            ["sync", "export", "sync", "barrier", "pause", "sync", "barrier"],
         )
 
     def test_resume_orders_restore_after_barrier(self):
