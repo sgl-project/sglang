@@ -102,6 +102,8 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 # (128 KiB of payload at world_size 8).
 _FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
 _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+# aiter's custom all-reduce fuses add + RMSNorm up to half its 128 MiB pool.
+_CUSTOM_AR_FUSION_MAX_BYTES = 8 * 1024 * 8192
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -853,7 +855,21 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        """Attempt fused all-reduce + RMSNorm. ROCm/HIP only.
+
+        QuickReduce through aiter's FlyDSL dispatcher is asked first, then
+        custom all-reduce, which cannot take payloads above its 64 MiB pool.
+        """
+        qr_comm = self.qr_comm
+        if qr_comm is not None and not qr_comm.disabled:
+            should_fuse = getattr(qr_comm, "should_fused_allreduce_rmsnorm", None)
+            if should_fuse is not None and should_fuse(input_, residual_inp_, weight_):
+                return qr_comm.fused_allreduce_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+        if input_.numel() * input_.element_size() > _CUSTOM_AR_FUSION_MAX_BYTES:
+            return None
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None

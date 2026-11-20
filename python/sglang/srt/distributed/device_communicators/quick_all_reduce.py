@@ -16,7 +16,15 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     is_weak_contiguous,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import (
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    print_info_once,
+    print_warning_once,
+    temp_set_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +94,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self._flydsl_int4 = None
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -203,11 +212,66 @@ class QuickAllReduce:
                     "lead to error or degradation to custom allreduce or rccl."
                 )
             qr_max_size = qr_max_size * MB
+        if (
+            envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.get()
+            and self.qr_quant_level == QuickReduceRegime.INT4
+            and is_gfx95_supported()
+            and self._init_flydsl_int4(qr_max_size)
+        ):
+            return
         # If qr_max_size is None, then 2GB is used by default.
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        logger.info(
+            "QuickReduce %s uses the HIP kernel (max %d MiB)",
+            self.qr_quant_level.name,
+            self.qr_max_size // MB,
+        )
+
+    def _init_flydsl_int4(self, qr_max_size: int) -> bool:
+        # Go through aiter's QuickAllReduce dispatcher, its stable entry point; the
+        # FlyDSL kernel classes behind it get renamed and reworked. The dispatcher
+        # builds the FlyDSL engines, agrees on them across ranks, preloads them
+        # before graph capture, and serves each payload with FlyDSL or with its own
+        # HIP INT4 kernel. It reads AITER_* variables, the quantization already at
+        # import, and AITER_FLY_AR also switches aiter's custom all-reduce, so they
+        # are set only while the dispatcher is imported and built.
+        with temp_set_env(
+            AITER_QUICK_REDUCE_QUANTIZATION=self.qr_quant_level.name,
+            AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=self.use_fp16_kernels,
+            AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB=qr_max_size // MB,
+            AITER_FLY_AR=1,
+        ):
+            try:
+                from aiter.dist.device_communicators.quick_all_reduce import (
+                    QuickAllReduce as AiterQuickAllReduce,
+                )
+            except ImportError as e:
+                print_warning_once(
+                    "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter has no "
+                    f"QuickAllReduce dispatcher ({e}); QuickReduce INT4 uses the HIP kernel."
+                )
+                return False
+            dispatcher = AiterQuickAllReduce(group=self.group, device=self.device)
+        if dispatcher.disabled:
+            dispatcher.close()
+            print_warning_once(
+                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter's QuickAllReduce "
+                "dispatcher is disabled; QuickReduce INT4 uses the HIP kernel."
+            )
+            return False
+
+        self._flydsl_int4 = dispatcher
+        self.qr_max_size = dispatcher.qr_max_size
+        self.disabled = False
+        logger.info(
+            "QuickReduce INT4 uses aiter's QuickAllReduce dispatcher: FlyDSL where "
+            "its policy serves the payload, its HIP INT4 kernel otherwise (max %d MiB)",
+            self.qr_max_size // MB,
+        )
+        return True
 
     def create_shared_buffer(self):
         """
@@ -229,7 +293,7 @@ class QuickAllReduce:
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         # the JIT build behind SGLANG_ROCM_QUICK_ALL_REDUCE_JIT reduces bf16 only
-        if not ops.qr_supports(self._ptr, inp.dtype):
+        if self._flydsl_int4 is None and not ops.qr_supports(self._ptr, inp.dtype):
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom quick allreduce requires input byte size to be
@@ -238,14 +302,16 @@ class QuickAllReduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        dtype = inp.dtype
+        if not self._min_size(inp.dtype) <= inp_size <= self.qr_max_size:
+            return False
+        return self._flydsl_int4 is None or self._flydsl_int4.should_quick_allreduce(
+            inp
+        )
+
+    def _min_size(self, dtype: torch.dtype) -> int:
         if self.use_fp16_kernels:
             dtype = torch.float16
-        return (
-            inp_size <= self.qr_max_size
-            and inp_size
-            >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
-        )
+        return self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
@@ -253,12 +319,51 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if self._flydsl_int4 is not None:
+            return self._flydsl_int4.quick_all_reduce(inp, out=out)
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
 
+    def fused_rmsnorm_max_size(self) -> int:
+        """Largest all-reduce the dispatcher can fuse with add + RMSNorm, else 0.
+
+        The FlyDSL fused kernel stages through the QuickReduce workspace, not
+        the 64 MiB custom all-reduce pool, so a whole prefill chunk can fuse.
+        """
+        if self._flydsl_int4 is None or not hasattr(
+            self._flydsl_int4, "should_fly_allreduce_rmsnorm"
+        ):
+            return 0
+        return self.qr_max_size
+
+    def should_fused_allreduce_rmsnorm(
+        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+    ) -> bool:
+        """Whether the dispatcher's FlyDSL kernel fuses this all-reduce with add + RMSNorm."""
+        if not self.fused_rmsnorm_max_size() or not self.should_quick_allreduce(inp):
+            return False
+        return bool(
+            self._flydsl_int4.should_fly_allreduce_rmsnorm(inp, residual, weight)
+        )
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(rmsnorm(allreduce(inp) + residual), allreduce(inp) + residual)``."""
+        print_info_once("FlyDSL fused all-reduce + add + RMSNorm serves a prefill call")
+        return self._flydsl_int4.fly_allreduce_rmsnorm(inp, residual, weight, eps)
+
     def close(self):
+        if self._flydsl_int4 is not None:
+            self._flydsl_int4.close()
+            self._flydsl_int4 = None
+            self.disabled = True
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
