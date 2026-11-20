@@ -48,6 +48,11 @@ ENV HSA_ENABLE_DXG_DETECTION=1
 RUN python3 -c "import torch; print('torch', torch.__version__); assert torch.version.hip" \
     && test -x /opt/rocm/bin/hipcc
 
+# SGLang's ROCm detector needs the AMD SMI Python package.
+RUN python3 -m pip install --no-cache-dir --no-build-isolation --no-deps /opt/rocm/share/amd_smi \
+    && cd / \
+    && python3 -c "import amdsmi; print('[amdsmi]', amdsmi.__file__)"
+
 # =============================================================================
 # Stage 2: SGLang on top of the gfx1151 ROCm stack.
 # =============================================================================

@@ -435,7 +435,7 @@ When requests target more adapters than fit in the pool, requests for additional
 
 ## LoRA with DP attention
 
-SGLang supports LoRA serving with [data parallel attention (DPA)](/docs/advanced_features/dp_dpa_smg_guide). The model architecture must support DPA, and you must currently select the Triton LoRA backend. Other built-in LoRA backends reject this configuration at startup.
+SGLang supports LoRA serving with [data parallel attention (DPA)](/docs/advanced_features/dp_dpa_router_guide). The model architecture must support DPA, and you must currently select the Triton LoRA backend. Other built-in LoRA backends reject this configuration at startup.
 
 The following NVIDIA CUDA example uses four attention-DP ranks:
 
