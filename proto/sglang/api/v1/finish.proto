@@ -30,12 +30,12 @@ message MatchedTokens {
 // `FINISH_MATCHED_TOKEN` / `FINISH_MATCHED_STR` / `FINISHED_MATCHED_REGEX` —
 // all three report `type: "stop"`, matching the OpenAI API's value.
 message FinishStop {
-  optional Matched matched = 1;
+  optional Matched matched = 1 [(sglang.json.v1.field_json).emit_null_when_absent = true];
 }
 
 // `FINISH_LENGTH` — hit `max_new_tokens` (or the context limit).
 message FinishLength {
-  optional uint64 length = 1;
+  optional uint64 length = 1 [(sglang.json.v1.field_json).emit_null_when_absent = true];
 }
 
 // The `FINISH_ABORT` payload. Python emits all three keys, nulls included.

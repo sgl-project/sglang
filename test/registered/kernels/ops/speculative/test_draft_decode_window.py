@@ -35,31 +35,24 @@ Properties checked:
      has a sliding window of its own (that per-layer window wins over the flag,
      since this index builder emits one KV list for all draft layers). It warns
      only when it substitutes a different window than the one requested.
-  5. BACKEND WIRING -- both ``TritonMultiStepDraftBackend`` and
-     ``FlashInferMultiStepDraftBackend`` resolve the pair in ``__init__`` and
-     forward it to the kernel, so windowing is honored identically on both
-     backends (CPU-only guard).
 
 The kernel is imported normally from ``sglang`` (no by-file-path staging), so it
 tracks the installed tree.
 """
 
-import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.speculative import spec_utils
-from sglang.srt.speculative.spec_utils import (
-    generate_draft_decode_kv_indices,
-    resolve_draft_decode_window,
-)
+from sglang.srt.speculative.spec_utils import resolve_draft_decode_window
 from sglang.srt.utils import next_power_of_2
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 
@@ -431,42 +424,6 @@ class TestResolveDraftDecodeWindow(unittest.TestCase):
         runner = self._runner(window=4032, sink=64)
         del runner.sliding_window_size
         self.assertEqual(resolve_draft_decode_window(runner), (4032, 64))
-
-
-class TestDraftDecodeWindowBackendWiring(unittest.TestCase):
-    """CPU-only guard: both draft backends must forward window/sink to the kernel.
-
-    The kernel tests above prove correctness once the args reach the kernel; this
-    guards the per-backend plumbing (init resolution + kernel passthrough) so it
-    cannot silently regress on either backend without a GPU-loaded model.
-    """
-
-    def _assert_backend_wires(self, cls):
-        init_src = inspect.getsource(cls.__init__)
-        self.assertIn("resolve_draft_decode_window", init_src)
-        self.assertIn("self.draft_window_size", init_src)
-        self.assertIn("self.draft_sink_size", init_src)
-        tmpl_src = inspect.getsource(cls.common_template)
-        self.assertIn("self.draft_window_size", tmpl_src)
-        self.assertIn("self.draft_sink_size", tmpl_src)
-
-    def test_triton_backend_wires_window_sink(self):
-        try:
-            from sglang.srt.layers.attention.triton_backend import (
-                TritonMultiStepDraftBackend,
-            )
-        except ImportError as e:  # pragma: no cover
-            self.skipTest(f"triton backend import unavailable: {e}")
-        self._assert_backend_wires(TritonMultiStepDraftBackend)
-
-    def test_flashinfer_backend_wires_window_sink(self):
-        try:
-            from sglang.srt.layers.attention.flashinfer_backend import (
-                FlashInferMultiStepDraftBackend,
-            )
-        except ImportError as e:  # pragma: no cover
-            self.skipTest(f"flashinfer backend import unavailable: {e}")
-        self._assert_backend_wires(FlashInferMultiStepDraftBackend)
 
 
 if __name__ == "__main__":

@@ -16,12 +16,8 @@ from sglang.kernels.ops.attention.flash_attn.cute.cute_dsl_utils import (
 )
 from sglang.kernels.ops.attention.flash_attn.cute.pack_gqa import pack_gqa_layout
 from sglang.kernels.ops.attention.flash_attn.cute.seqlen_info import SeqlenInfoQK
-from sglang.kernels.ops.attention.flash_attn.cute.tile_scheduler import (
-    ParamsBase,
-    SingleTileScheduler,
-    SingleTileVarlenScheduler,
-    TileSchedulerArguments,
-)
+from sglang.kernels.ops.attention.flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from quack.cute_dsl_utils import ParamsBase
 from sglang.kernels.ops.attention.flash_attn.cute.utils import get_batch_from_cu_tensor
 
 

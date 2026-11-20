@@ -1,7 +1,6 @@
 //! Parser names SGLang ports from Python, where Dynamo's parsers split output
 //! differently. Every other name goes to Dynamo.
 
-mod deepseek_v4;
 mod kimi_k3;
 mod qwen3_coder;
 
@@ -11,21 +10,7 @@ use super::ToolDetector;
 
 /// The detector a `--tool-call-parser` name selects, over the request's tools.
 pub(crate) fn tool_detector(tool_parser: &str, tools: &[Value]) -> Option<Box<dyn ToolDetector>> {
-    let tool_names = || {
-        tools
-            .iter()
-            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
-            .collect()
-    };
     Some(match tool_parser {
-        "deepseekv4" => Box::new(deepseek_v4::DsmlDetector::new(
-            deepseek_v4::DSML_TAGS,
-            tool_names(),
-        )),
-        "deepseekv41" => Box::new(deepseek_v4::DsmlDetector::new(
-            deepseek_v4::DSML_TAGS_V41,
-            tool_names(),
-        )),
         // `KimiK3Detector` keeps calls to tools the request does not list.
         "kimi_k3" => Box::new(kimi_k3::KimiK3Detector::default()),
         // Typed argument values follow the tool schemas.

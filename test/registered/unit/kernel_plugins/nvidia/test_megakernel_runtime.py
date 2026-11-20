@@ -70,12 +70,15 @@ class TestMegakernelRuntime(CustomTestCase):
         registry.register(architecture=ARCH, path="_fakes:SPEC")
         publish(server_args(enable_nvidia_megakernel=True), role="test")
         self.addCleanup(reset_context)
-        # the running forward's view reads its attention backend, which tests lack
+        # forward_view and finish_step read the attention backend, which tests lack
         view_patch = patch.object(
             MegakernelBinding, "forward_view", return_value="view"
         )
         view_patch.start()
         self.addCleanup(view_patch.stop)
+        finish_patch = patch.object(MegakernelBinding, "finish_step")
+        finish_patch.start()
+        self.addCleanup(finish_patch.stop)
 
     def _install_spec(self, spec, **kw):
         with patch.object(binding, "find_spec", return_value=(spec, "")):
@@ -185,8 +188,12 @@ class TestMegakernelRuntime(CustomTestCase):
         the batch sizes that capture its variants are those rows over the width."""
         labels = SimpleNamespace(capture_labels=("short", "long"))
         lm = Lm()
-        lm.__dict__["_megakernel"] = SimpleNamespace(
-            widths=(7, 14), graph_variants={"target_verify": labels}
+        lm.__dict__["_megakernel"] = binding._InstalledMegakernel(
+            built=SimpleNamespace(
+                widths=(7, 14), graph_variants={"target_verify": labels}
+            ),
+            binding=None,
+            prepare=None,
         )
         self.assertEqual(
             binding.megakernel_verify_variants(

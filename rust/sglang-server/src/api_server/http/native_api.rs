@@ -12,30 +12,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
-use super::generate_hook::{GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook};
+use super::auth::DeclaredRoute;
+use super::generate_hook::{
+    GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateTerminal,
+};
+use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
-use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, HealthStatus};
-use crate::api_server::handlers::{CoreCall, recv_indexed};
+use crate::api_server::core::{
+    CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
+    STREAM_INVALID_REQUEST_ERROR,
+};
+use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
 #[cfg(test)]
 use crate::message::ids::Rid;
 #[cfg(test)]
 use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
-use crate::message::response::CustomizedInfo;
+use crate::message::response::{CustomizedInfo, RequestStats};
 use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
-    response::{error_response, error_value},
+    response::{error_response, error_value, sse_error_response, sse_response},
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::{get, post},
 };
 use sglang_api_types::api::v1 as api;
@@ -57,8 +61,12 @@ pub(super) struct RequestTiming {
 
 impl RequestTiming {
     pub(super) fn new() -> Self {
+        Self::starting_at(Instant::now())
+    }
+
+    fn starting_at(created_at: Instant) -> Self {
         Self {
-            created_at: Instant::now(),
+            created_at,
             time_to_first_token: None,
             e2e_latency: None,
         }
@@ -72,6 +80,16 @@ impl RequestTiming {
     fn finish(&mut self) {
         self.e2e_latency
             .get_or_insert_with(|| self.created_at.elapsed());
+    }
+
+    /// The terminal output arrived; when no output came before it, it is
+    /// also the first, at the same instant: Python's TokenizerManager reuses
+    /// the first output's arrival time as the finish time, so a request that
+    /// finishes in its first output has no decode interval.
+    fn observe_terminal_output(&mut self) {
+        let now = self.created_at.elapsed();
+        self.time_to_first_token.get_or_insert(now);
+        self.e2e_latency.get_or_insert(now);
     }
 
     fn terminal_latencies(&self) -> Option<(Duration, Duration)> {
@@ -95,6 +113,12 @@ pub(super) struct RequestState {
     /// `SGLANG_FORCE_STREAM_INTERVAL` tokens late, not when its first token
     /// was sampled.
     scheduler_decode_latency: Option<Duration>,
+    /// Metrics are on, so the terminal frame reports the decode throughput
+    /// after the scheduler's request stats, as Python's TokenizerManager does.
+    report_decode_throughput: bool,
+    /// The output token logprobs the request has returned so far, for the
+    /// hook's terminal view.
+    output_token_logprobs: usize,
     customized_info: CustomizedInfoState,
     hook: Option<RequestHook>,
 }
@@ -106,14 +130,22 @@ struct RequestHook {
 }
 
 impl RequestState {
-    pub(super) fn new(state: &AppState, request: &GenerateRequest, timing: RequestTiming) -> Self {
+    pub(super) fn new(
+        state: &AppState,
+        request: &GenerateRequest,
+        headers: &HeaderMap,
+        client_sampling_params: Option<&serde_json::Map<String, serde_json::Value>>,
+        timing: RequestTiming,
+    ) -> Self {
         Self {
             timing,
             scheduler_decode_latency: None,
+            report_decode_throughput: state.server_args.metrics.is_some(),
+            output_token_logprobs: 0,
             customized_info: CustomizedInfoState::default(),
             hook: state.generate_hook.as_ref().map(|hook| RequestHook {
                 hook: hook.clone(),
-                frames: hook.start(&request.sampling_params),
+                frames: hook.start(request, headers, client_sampling_params),
             }),
         }
     }
@@ -123,12 +155,28 @@ impl RequestState {
     fn observe(&mut self, output: &mut CoreOutput) {
         self.timing.observe_first_output();
         self.customized_info.observe(output.take_customized_info());
+        self.count_output_token_logprobs(output);
     }
 
     fn finish(&mut self, terminal: &mut CoreOutput) {
-        self.observe(terminal);
-        self.timing.finish();
+        self.customized_info
+            .observe(terminal.take_customized_info());
+        self.timing.observe_terminal_output();
         self.scheduler_decode_latency = terminal.scheduler_decode_latency();
+        self.count_output_token_logprobs(terminal);
+    }
+
+    fn count_output_token_logprobs(&mut self, delta: &CoreOutput) {
+        if let Some(extras) = delta.extras.as_deref() {
+            self.output_token_logprobs += extras.out_lp_val.len();
+        }
+    }
+
+    fn fail(&mut self, error: &CoreError) {
+        self.timing.finish();
+        if let Some(RequestHook { frames, .. }) = &mut self.hook {
+            frames.failed(error.http_status(), &error.to_string());
+        }
     }
 
     /// From the first token to the terminal output, as Python's
@@ -141,11 +189,11 @@ impl RequestState {
 
     /// One frame as the client receives it, from `output`: the request's
     /// cumulative output, or one step's delta in an incremental stream. The
-    /// schema's keys, then the `customized_info` keys it reports, then the
-    /// hook's keys.
+    /// schema's keys, then a finished request's stats, then the
+    /// `customized_info` keys it reports, then the hook's keys.
     fn frame(
         &mut self,
-        output: CoreOutput,
+        mut output: CoreOutput,
         mode: FrameMode,
         id: &str,
         index: Option<u32>,
@@ -157,6 +205,13 @@ impl RequestState {
         } else {
             None
         };
+        let mut request_stats = output.take_request_stats();
+        if self.report_decode_throughput
+            && let Some(RequestStats(stats)) = request_stats.as_mut()
+            && let Some(throughput) = decode_throughput(decode_latency, output.completion_tokens)
+        {
+            stats.insert("decode_throughput".into(), throughput.into());
+        }
         let frame = output.frame(id, index, e2e_latency);
         let mut keys = None;
         if let Some(RequestHook { frames, .. }) = &mut self.hook {
@@ -172,11 +227,13 @@ impl RequestState {
         }
         let hook = self.hook.as_ref().map(|request| &request.hook);
         let hook_keys = keys.as_deref().map(|keys| &keys.meta_info);
+        let stats_keys = request_stats.as_ref().map(|RequestStats(stats)| stats);
         let customized_info = self.customized_info.report(mode, |key| {
             if hook.is_some_and(|hook| hook.consumes_customized_info_key(key)) {
                 return false;
             }
             let repeated = SCHEMA_META_INFO_KEYS.contains(&key)
+                || stats_keys.is_some_and(|stats| stats.contains_key(key))
                 || hook_keys.is_some_and(|keys| keys.contains_key(key));
             if repeated && !REPEATED_KEY_WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -186,12 +243,32 @@ impl RequestState {
             }
             !repeated
         });
+        if finished
+            && let (Some(RequestHook { frames, .. }), Some(meta_info)) =
+                (&mut self.hook, frame.meta_info.as_ref())
+        {
+            frames.finished(&GenerateTerminal {
+                meta_info,
+                request_stats: request_stats.as_ref().map(|RequestStats(stats)| stats),
+                decode_latency,
+                output_token_logprobs: self.output_token_logprobs,
+            });
+        }
         NativeFrame {
             frame,
+            request_stats,
             customized_info,
             keys,
         }
     }
+}
+
+/// Python's `get_decode_throughput`: one over the time per output token after
+/// the first, for a request with more than one and a positive decode latency.
+fn decode_throughput(decode_latency: Option<Duration>, completion_tokens: u64) -> Option<f64> {
+    let decode_latency = decode_latency?.as_secs_f64();
+    (completion_tokens > 1 && decode_latency > 0.0)
+        .then(|| 1.0 / (decode_latency / (completion_tokens - 1) as f64))
 }
 
 /// The keys `api::GenerateMetaInfo` writes. A `customized_info` key of the
@@ -217,6 +294,8 @@ const SCHEMA_META_INFO_KEYS: &[&str] = &[
     "image_tokens",
     "audio_tokens",
     "video_tokens",
+    "cached_tokens_details",
+    "dp_rank",
 ];
 
 /// A repeated key has been logged once.
@@ -337,11 +416,12 @@ impl serde::Serialize for ReportedCustomizedInfo {
 }
 
 /// One native `/generate` frame: the `api.v1` frame, then in its `meta_info`
-/// the request's `customized_info` keys and the keys a model package's hook
-/// added.
+/// a finished request's stats, the request's `customized_info` keys and the
+/// keys a model package's hook added.
 #[derive(Debug)]
 pub(super) struct NativeFrame {
     frame: api::GenerateResponse,
+    request_stats: Option<RequestStats>,
     customized_info: ReportedCustomizedInfo,
     keys: Option<Box<GenerateFrameKeys>>,
 }
@@ -356,12 +436,15 @@ impl serde::Serialize for NativeFrame {
             #[serde(flatten)]
             schema: &'a T,
             #[serde(flatten)]
+            request_stats: Option<&'a RequestStats>,
+            #[serde(flatten)]
             customized_info: &'a ReportedCustomizedInfo,
             #[serde(flatten)]
             added: &'a serde_json::Map<String, serde_json::Value>,
         }
 
-        if self.keys.is_none() && self.customized_info.0.is_empty() {
+        if self.request_stats.is_none() && self.keys.is_none() && self.customized_info.0.is_empty()
+        {
             return self.frame.serialize(serializer);
         }
         let no_keys = GenerateFrameKeys::default();
@@ -382,6 +465,7 @@ impl serde::Serialize for NativeFrame {
         if let Some(meta_info) = meta_info {
             let meta_info = WithKeys {
                 schema: meta_info,
+                request_stats: self.request_stats.as_ref(),
                 customized_info: &self.customized_info,
                 added: &keys.meta_info,
             };
@@ -406,18 +490,36 @@ impl serde::Serialize for NativeFrame {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/generate", post(generate))
+        // Python takes PUT as well as POST, with the same handler.
+        .declared_route("/generate", post(generate).put(generate))
         .merge(health_routes())
 }
 
 /// native api error response: unary → `code` plus the JSON `body`,
-/// streaming → 200 with one SSE error frame + `[DONE]`.
+/// streaming → 200 with one SSE error frame + `[DONE]`. A message-only error
+/// is a request the handler refused before it reached the core, which Python
+/// raises as a `ValueError`, so its stream frame is `invalid_request_error`
+/// and not retryable (see [`CoreError::stream_error`]).
 pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Response {
-    error_response(code, error_value(code.as_u16(), message), stream)
+    if !stream {
+        return error_response(code, error_value(code.as_u16(), message), false);
+    }
+    let body = api::ErrorBody {
+        message: message.to_owned(),
+        code: u32::from(code.as_u16()),
+        r#type: Some(STREAM_INVALID_REQUEST_ERROR.to_owned()),
+        retryable: Some(false),
+    };
+    sse_error_response(serde_json::json!({ "error": body }))
 }
 
 fn native_core_error(error: CoreError, stream: bool) -> Response {
-    native_error(error.http_status(), &error.to_string(), stream)
+    if !stream {
+        return native_error(error.http_status(), &error.to_string(), false);
+    }
+    sse_error_response(
+        serde_json::to_value(error.stream_error(None)).expect("an error item is JSON"),
+    )
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -425,8 +527,9 @@ fn native_core_error(error: CoreError, stream: bool) -> Response {
 /// restart. The deep-probe handler is built once with
 /// `SGLANG_HEALTH_CHECK_TIMEOUT` frozen in and serves `/health_generate`
 /// always; `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` (default true, mirroring
-/// Python) decides whether `/health` shares it or, after startup warmup, is a
-/// plain 200 (routing the request proves the frontend is up).
+/// Python) decides whether `/health` shares it or is a plain 200 once startup
+/// warmup finishes and a multimodal model's MM processor is installed (routing
+/// the request proves the frontend is up).
 fn health_routes() -> Router<Arc<AppState>> {
     let timeout = std::time::Duration::from_secs(
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
@@ -438,12 +541,12 @@ fn health_routes() -> Router<Arc<AppState>> {
     };
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout, true));
     Router::new()
-        .route("/health", health)
-        .route("/health_generate", probe)
+        .declared_route("/health", health)
+        .declared_route("/health_generate", probe)
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.core.is_ready() {
+    if state.core.is_serving() && !state.core.is_draining() {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -483,7 +586,7 @@ async fn health_generate(
             }
             response
         }
-        Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
+        Ok(HealthStatus::NotReady | HealthStatus::Stalled | HealthStatus::Draining) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(CoreError::Unavailable) => native_error(
@@ -505,11 +608,13 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
+    start: Option<Extension<crate::RequestStart>>,
+    held: Option<Extension<HeldGeneration>>,
     headers: HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
+    request: axum::extract::Request,
 ) -> Response {
-    let mut body = match body {
-        Ok(Json(body)) => body,
+    let (mut body, raw_body) = match json_body(&state, request).await {
+        Ok(body) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary -- as Python's does (FastAPI rejects before its
         // handler runs).
@@ -517,11 +622,30 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    if state.server_args.enable_request_header_overrides
-        && let Err(error) = apply_header_overrides(&mut body, &headers)
-    {
-        return native_error(StatusCode::BAD_REQUEST, &error, false);
-    }
+    let overrides = if state.server_args.enable_request_header_overrides {
+        match apply_header_overrides(&mut body, &headers) {
+            Ok(applied) => Some(applied),
+            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error, false),
+        }
+    } else {
+        None
+    };
+    // What the client sent as `sampling_params` (an object, or one per batch
+    // item), for a package's hook, before anything fills in beneath it.
+    let client_sampling_params = state
+        .generate_hook
+        .as_ref()
+        .and_then(|_| body.get("sampling_params").cloned());
+    // The request log and crash dump show the body as the client sent it:
+    // the defaults merged below go into a copy, as Python does.
+    let raw_body = RawBody {
+        bytes: raw_body,
+        overrides,
+    };
+    let received = ReceivedAs::Body {
+        snapshot: state.core.snapshot_body(&body, Some(raw_body), &headers),
+        started_at: start.map(|Extension(crate::RequestStart(at))| at),
+    };
     let (payloads, is_batch) = match generate_requests(&state, body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
@@ -530,20 +654,95 @@ async fn generate(
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
-    // and every downstream stage are still ahead of us.
-    let timing = RequestTiming::new();
+    // and every downstream stage are still ahead of us. An HTTP layer that did
+    // some of that work before this handler ran set where it started.
+    let timing = RequestTiming::starting_at(received.created_at());
     // Shared core admission performs media I/O (URL downloads, file reads)
     // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
-        let payload = payloads
+        let mut payload = payloads
             .into_iter()
             .next()
             .expect("into_requests yields >=1 payload");
-        generate_single(&state, payload, stream, timing).await
+        let held = held
+            .and_then(|Extension(held)| held.take())
+            .map(|held| held.claim(&mut payload));
+        let client_sampling_params = item_sampling_params(client_sampling_params.as_ref(), 0);
+        let request = RequestState::new(&state, &payload, &headers, client_sampling_params, timing);
+        generate_single(&state, payload, held, stream, request, received).await
     } else {
-        generate_batch(&state, payloads, stream, timing).await
+        let requests = payloads
+            .iter()
+            .enumerate()
+            .map(|(item, payload)| {
+                let client_sampling_params =
+                    item_sampling_params(client_sampling_params.as_ref(), item);
+                RequestState::new(
+                    &state,
+                    payload,
+                    &headers,
+                    client_sampling_params,
+                    timing.clone(),
+                )
+            })
+            .collect();
+        generate_batch(&state, payloads, stream, requests, received).await
     }
+}
+
+/// Whether Python reads `sampling_logprobs_mode` as set: any value but `null`,
+/// or for a batch of `n` prompts a list naming a mode for one of them (Python
+/// reads no entry past them; an empty list is set, being no per-prompt list).
+fn sampling_logprobs_mode_set(mode: &serde_json::Value, batch: Option<usize>) -> bool {
+    match (mode, batch) {
+        (serde_json::Value::Null, _) => false,
+        (serde_json::Value::Array(modes), Some(n)) => {
+            modes.is_empty() || modes.iter().take(n).any(|mode| !mode.is_null())
+        }
+        _ => true,
+    }
+}
+
+/// Batch item `item`'s share of the `sampling_params` the client sent: the
+/// object itself, or the item's entry of a list.
+fn item_sampling_params(
+    sent: Option<&serde_json::Value>,
+    item: usize,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match sent? {
+        serde_json::Value::Array(items) => items.get(item)?.as_object(),
+        sent => sent.as_object(),
+    }
+}
+
+/// The body exactly as axum's `Json<Value>` extracts it (the same content-type
+/// check, body limit and rejections), with its raw bytes, which a crash dump
+/// keeps as they came rather than serializing the body again.
+async fn json_body<S: Send + Sync>(
+    state: &S,
+    request: axum::extract::Request,
+) -> Result<(serde_json::Value, bytes::Bytes), JsonRejection> {
+    use axum::extract::FromRequest;
+
+    if !json_content_type(request.headers()) {
+        return Err(axum::extract::rejection::MissingJsonContentType::default().into());
+    }
+    let raw = bytes::Bytes::from_request(request, state).await?;
+    let Json(body) = Json::<serde_json::Value>::from_bytes(&raw)?;
+    Ok((body, raw))
+}
+
+/// axum's `Json` content-type rule: `application/json` or `application/*+json`.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|mime| {
+            mime.type_() == "application"
+                && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+        })
 }
 
 /// Decode a `/generate` body under the launch-time defaults into its requests and
@@ -570,6 +769,8 @@ pub(super) fn generate_requests(
     if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
     }
+    // Outside the schema, so decoding drops it; checked below.
+    let sampling_logprobs_mode = body.get("sampling_logprobs_mode").cloned();
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
     let body: api::GenerateRequest = match serde_json::from_value(body) {
@@ -580,8 +781,18 @@ pub(super) fn generate_requests(
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
     // Request normalization only returns validation failures.
-    let (mut requests, is_batch) = into_requests(body, &state.generation_policy)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string(), stream))?;
+    let (mut requests, is_batch) = into_requests(body, &state.generation_policy).map_err(|e| {
+        tracing::warn!(error = %e, "rejected request");
+        (StatusCode::BAD_REQUEST, e.to_string(), stream)
+    })?;
+    // Python refuses a mode without `return_sampling_mask=true`, and
+    // `into_requests` refused the mask.
+    let batch = is_batch.then_some(requests.len());
+    if sampling_logprobs_mode.is_some_and(|mode| sampling_logprobs_mode_set(&mode, batch)) {
+        let message = "sampling_logprobs_mode can only be set when return_sampling_mask=true.";
+        tracing::warn!(error = %message, "rejected request");
+        return Err((StatusCode::BAD_REQUEST, message.into(), stream));
+    }
     client_max_new_tokens.mark(&mut requests);
     Ok((requests, is_batch))
 }
@@ -591,13 +802,18 @@ pub(super) fn generate_requests(
 async fn generate_single(
     state: &AppState,
     req: GenerateRequest,
+    held: Option<PendingGeneration>,
     stream: bool,
-    timing: RequestTiming,
+    request: RequestState,
+    received: ReceivedAs,
 ) -> Response {
-    let request = RequestState::new(state, &req, timing);
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // the frame builder just reads them — no tokenizer needed here.
-    let mut call = match state.core.generate(req).await {
+    let call = match held {
+        Some(held) => state.core.generate_pending(req, received, held).await,
+        None => state.core.generate(req, received).await,
+    };
+    let mut call = match call {
         Ok(call) => call,
         Err(error) => return native_core_error(error, stream),
     };
@@ -611,7 +827,7 @@ async fn generate_single(
         use futures::StreamExt;
         let s = generation_event_stream(vec![(call, request)], incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         // Unary: fold to the terminal and respond once. `CoreCall` disarms
         // itself on a terminal item; truncation leaves it armed for drop cleanup.
@@ -641,7 +857,7 @@ pub(super) async fn drain_unary(
         Ok(frame) => (StatusCode::OK, GenerateItem::Frame(Box::new(frame))),
         Err(error) => (
             error.http_status(),
-            GenerateItem::Error(error.stream_error(None)),
+            GenerateItem::Error(error.item_error(None)),
         ),
     }
 }
@@ -672,7 +888,7 @@ pub(super) async fn drain_unary_frame(
                 ));
             }
             CoreEvent::Failed(error) => {
-                request.timing.finish();
+                request.fail(&error);
                 return Err(error);
             }
         }
@@ -687,21 +903,20 @@ pub(super) async fn drain_unary_frame(
 /// or (streaming) multiplex their streams into one SSE response, each frame carrying
 /// its `index`.
 /// Each submitted call owns its own cancellation. A failed unary item is its
-/// own `{ "error": … }` entry; the batch response is 200.
+/// own `{ "error": … }` entry; the batch response is 200. This differs from
+/// Python on purpose: there, one item failing validation fails the whole batch
+/// with a single 400.
 async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
-    timing: RequestTiming,
+    request_states: Vec<RequestState>,
+    received: ReceivedAs,
 ) -> Response {
-    let request_states: Vec<RequestState> = requests
-        .iter()
-        .map(|request| RequestState::new(state, request, timing.clone()))
-        .collect();
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state.core.generate_batch(requests).await {
+    let calls = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return native_core_error(error, stream),
     };
@@ -713,7 +928,7 @@ async fn generate_batch(
         let incremental = state.server_args.incremental_streaming_output;
         let s = generation_event_stream(calls, incremental, true)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         // Unary: poll every item concurrently, as Python's gather does. `join_all`
         // preserves input order for the final JSON array, while each drain observes
@@ -804,7 +1019,7 @@ pub(super) fn generation_event_stream_with(
                         terminal = Some(out);
                     }
                     CoreEvent::Failed(error) => {
-                        requests[i].timing.finish();
+                        requests[i].fail(&error);
                         failed = Some(error);
                     }
                 }
@@ -865,10 +1080,9 @@ fn e2e_latency(timing: &RequestTiming) -> f64 {
 }
 
 /// One incremental streaming frame's output: this step's delta with the
-/// cumulative token count in `meta_info` (matching Python).
-fn delta_output(mut delta: CoreOutput, accumulated: &CoreOutput) -> CoreOutput {
-    delta.completion_tokens = accumulated.completion_tokens;
-    delta
+/// cumulative counts in `meta_info` (see [`CoreOutput::with_cumulative_counts`]).
+fn delta_output(delta: CoreOutput, accumulated: &CoreOutput) -> CoreOutput {
+    delta.with_cumulative_counts(accumulated)
 }
 
 /// The SSE `data` text of one `api.v1` item (a frame or an error).
@@ -933,6 +1147,8 @@ mod tests {
                     e2e_latency: None,
                 },
                 scheduler_decode_latency: None,
+                report_decode_throughput: false,
+                output_token_logprobs: 0,
                 customized_info: CustomizedInfoState::default(),
                 hook: None,
             },
@@ -953,9 +1169,13 @@ mod tests {
                     startup_ready: false,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -969,6 +1189,96 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// The generation-free `/health` of a multimodal model answers 503 until
+    /// its MM processor is installed, even with startup warmup skipped, since
+    /// a generation sent earlier would wait in admission.
+    #[tokio::test]
+    async fn generation_free_health_waits_for_the_mm_processor() {
+        struct NoMedia;
+        impl crate::multi_modality::worker::MmProcessor for NoMedia {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<
+                crate::multi_modality::worker::MmProcessOutput,
+                crate::multi_modality::worker::MediaError,
+            > {
+                unreachable!("no request carries media")
+            }
+        }
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                flume::unbounded().0,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: true,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+
+        let response = health_without_generation(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.core.set_mm_processor(Arc::new(NoMedia)));
+        let response = health_without_generation(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `/health` answers 503 while Python runs `--warmups` through the
+    /// listener, though startup warmup already finished, so the router sends
+    /// no traffic before the warmups compiled what they exist to compile.
+    #[tokio::test]
+    async fn health_waits_for_custom_warmups() {
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                flume::unbounded().0,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        state.core.hold_for_custom_warmups();
+
+        let response = health_without_generation(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        state.core.finish_custom_warmups();
+        let response = health_without_generation(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A healthy `/health_generate` carries the configured metadata headers;
@@ -997,9 +1307,13 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -1025,8 +1339,9 @@ mod tests {
         assert!(response.headers().get("x-custom-header").is_none());
     }
 
-    #[tokio::test]
-    async fn unary_http_generate_round_trips_through_frontend_handle() {
+    /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's
+    /// timing, so `e2e_latency` covers the layer's work too.
+    async fn assert_native_http_rid_echo(client_rid: &str, stream: bool) {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let core = crate::api_server::handlers::CoreHandle::new(
@@ -1038,9 +1353,13 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1052,6 +1371,7 @@ mod tests {
             openai_chat: None,
         });
 
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let responder = tokio::spawn(async move {
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
             else {
@@ -1063,16 +1383,29 @@ mod tests {
             };
             assert_eq!(generate.input_ids.as_deref(), Some([1, 2].as_slice()));
             let rid = request.rid.clone();
+            if stream {
+                request
+                    .sink
+                    .try_send(ResponseItem::Frame(ChunkEvent {
+                        rid: rid.clone(),
+                        text: "o".into(),
+                        prompt_tokens: 2,
+                        completion_tokens: 1,
+                        ..Default::default()
+                    }))
+                    .unwrap();
+                finish_rx.await.unwrap();
+            }
             request
                 .sink
                 .try_send(ResponseItem::Done(ChunkEvent {
                     rid,
-                    text: "ok".into(),
+                    text: if stream { "k" } else { "ok" }.into(),
                     prompt_tokens: 2,
-                    completion_tokens: 1,
+                    completion_tokens: if stream { 1 } else { 2 },
                     finish_reason: serde_json::from_value(serde_json::json!({
                         "type": "length",
-                        "length": 1
+                        "length": 2
                     }))
                     .unwrap(),
                     ..Default::default()
@@ -1080,27 +1413,80 @@ mod tests {
                 .unwrap();
         });
 
+        let layer_work = Duration::from_secs(5);
         let request = Request::builder()
             .method("POST")
             .uri("/generate")
             .header("content-type", "application/json")
+            .extension(crate::RequestStart(
+                Instant::now().checked_sub(layer_work).unwrap(),
+            ))
             .body(Body::from(
-                r#"{"rid":"client-rid","input_ids":[1,2],"sampling_params":{"max_new_tokens":1}}"#,
+                serde_json::to_vec(&serde_json::json!({
+                    "rid": client_rid,
+                    "input_ids": [1, 2],
+                    "sampling_params": {"max_new_tokens": 2},
+                    "stream": stream,
+                }))
+                .unwrap(),
             ))
             .unwrap();
         let response = routes().with_state(state).oneshot(request).await.unwrap();
-        responder.await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut body_stream = response.into_body().into_data_stream();
+        let mut body = Vec::new();
+        if stream {
+            // Read the first SSE frame before Done, avoiding cumulative coalescing.
+            body.extend_from_slice(&body_stream.next().await.unwrap().unwrap());
+            finish_tx.send(()).unwrap();
+        }
+        while let Some(chunk) = body_stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        responder.await.unwrap();
+        let values: Vec<serde_json::Value> = if stream {
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect()
+        } else {
+            vec![serde_json::from_slice(&body).unwrap()]
+        };
+        assert!(!values.is_empty());
+        if stream {
+            assert!(
+                values.len() >= 2,
+                "stream must carry intermediate and terminal frames"
+            );
+        }
+        for value in &values {
+            assert_eq!(value["meta_info"]["id"], client_rid);
+        }
+        let value = values.last().unwrap();
         assert_eq!(value["text"], "ok");
-        assert_eq!(value["meta_info"]["id"], "client-rid");
+        assert_eq!(value["meta_info"]["id"], client_rid);
         assert_eq!(value["meta_info"]["prompt_tokens"], 2);
-        assert_eq!(value["meta_info"]["completion_tokens"], 1);
+        assert_eq!(value["meta_info"]["completion_tokens"], 2);
+        let e2e_latency = value["meta_info"]["e2e_latency"].as_f64().unwrap();
+        assert!(e2e_latency >= layer_work.as_secs_f64(), "{e2e_latency}");
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unary_http_generate_round_trips_through_frontend_handle() {
+        assert_native_http_rid_echo("client-rid", false).await;
+    }
+
+    #[tokio::test]
+    async fn long_rids_round_trip_through_unary_and_streaming_http() {
+        for client_rid in ["x".repeat(200), "é".repeat(128)] {
+            for stream in [false, true] {
+                assert_native_http_rid_echo(&client_rid, stream).await;
+            }
+        }
     }
 
     /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
@@ -1120,9 +1506,13 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1161,6 +1551,195 @@ mod tests {
         let response = routes().with_state(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         responder.await.unwrap()
+    }
+
+    /// A body `/generate` refuses before the core sees it is answered with the
+    /// bare message, as Python's `ValueError` text, in the shape the client
+    /// asked for (a 400, or one in-stream error frame), and logged with the
+    /// reason, as Python's `[http_server] Error:` line is.
+    #[tokio::test]
+    async fn refused_bodies_answer_and_log_the_bare_reason() {
+        let core = crate::api_server::handlers::CoreHandle::new(
+            flume::unbounded().0,
+            flume::unbounded().0,
+            crate::api_server::handlers::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                multimodal: false,
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
+                metrics: None,
+                peer_endpoints: Vec::new(),
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        let server_args = crate::message::config::ServerArgs::default();
+        let state = Arc::new(AppState {
+            core,
+            generation_policy: GenerationPolicy::from(&server_args),
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        let app = routes().with_state(state.clone());
+        for (body, message) in [
+            (
+                serde_json::json!({"text": "hi", "input_ids": [1]}),
+                "provide either `text` or `input_ids`, not both",
+            ),
+            (
+                serde_json::json!({"text": "hi", "custom_logit_processor": "cls"}),
+                "custom_logit_processor is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": "hi", "sampling_logprobs_mode": "support"}),
+                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+            ),
+            (
+                serde_json::json!({"text": "hi", "sampling_logprobs_mode": [null]}),
+                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, "support"]}),
+                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+            ),
+            (
+                serde_json::json!({
+                    "text": "hi",
+                    "return_sampling_mask": true,
+                    "sampling_logprobs_mode": "support",
+                }),
+                "return_sampling_mask is not supported by the Rust server",
+            ),
+        ] {
+            for stream in [false, true] {
+                let mut body = body.clone();
+                body["stream"] = stream.into();
+                let logs = crate::utils::logging::capture_logs();
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let error = if stream {
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    let frame = text
+                        .strip_prefix("data: ")
+                        .and_then(|rest| rest.strip_suffix("\n\ndata: [DONE]\n\n"))
+                        .unwrap_or_else(|| panic!("one error frame then [DONE]: {text}"));
+                    parse(frame)
+                } else {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                    parse(text)
+                };
+                assert_eq!(error["error"]["message"], message, "{body}");
+                assert_eq!(error["error"]["code"], 400, "{body}");
+                // Python's stream frame names the error's type and that a
+                // retry won't help; its unary body has neither.
+                if stream {
+                    assert_eq!(error["error"]["type"], "invalid_request_error", "{body}");
+                    assert_eq!(error["error"]["retryable"], false, "{body}");
+                } else {
+                    assert!(error["error"].get("type").is_none(), "{body}");
+                    assert!(error["error"].get("retryable").is_none(), "{body}");
+                }
+                let rejections = logs.rejections();
+                assert!(
+                    matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(message)),
+                    "{rejections:?}"
+                );
+            }
+        }
+        // A mode Python reads as unset passes.
+        for body in [
+            serde_json::json!({"text": "hi", "sampling_logprobs_mode": null}),
+            serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null, "support"]}),
+        ] {
+            assert!(generate_requests(&state, body.clone()).is_ok(), "{body}");
+        }
+        // A body the schema refuses is refused as such first, unlogged, as
+        // Python's contract check is.
+        let logs = crate::utils::logging::capture_logs();
+        let body = serde_json::json!({
+            "text": "hi",
+            "stream": true,
+            "sampling_params": {"unknown": 1},
+            "sampling_logprobs_mode": "support",
+        });
+        let (status, message, _) = generate_requests(&state, body).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("unknown"), "{message}");
+        assert!(logs.rejections().is_empty());
+    }
+
+    /// `/generate` checks the DP rank a body names as Python does: a rank
+    /// outside the deployment is a 400 with Python's message, logged once.
+    #[tokio::test]
+    async fn generate_refuses_a_routed_dp_rank_out_of_range() {
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                flume::unbounded().0,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            ),
+            generation_policy: GenerationPolicy::default(),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        let (body, rank) = (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3);
+        let logs = crate::utils::logging::capture_logs();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let message = format!("routed_dp_rank={rank} out of range [0, 1)");
+        assert_eq!(
+            parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
+            message
+        );
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
+            "{rejections:?}"
+        );
     }
 
     /// An item whose `sampling_params` name no `max_new_tokens` is marked
@@ -1287,24 +1866,60 @@ mod tests {
             Some((recorded_ttft, e2e_latency)),
             "later terminal handling must not overwrite E2E latency"
         );
+
+        let mut first_is_terminal = RequestTiming::new();
+        first_is_terminal.observe_terminal_output();
+        assert_eq!(
+            first_is_terminal.decode_latency(),
+            Some(Duration::ZERO),
+            "a request that finishes in its first output has no decode interval"
+        );
     }
 
     /// A model package's hook: the request's `top_p` on every frame, a
     /// top-level key on its first frame, and the decode latency on its last.
-    #[derive(Debug)]
-    struct TopPHook;
+    /// It logs what it saw of each request's start and end.
+    #[derive(Clone, Debug, Default)]
+    struct TopPHook {
+        log: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
 
     struct TopPFrames {
         top_p: f64,
         first: bool,
+        /// What the hook saw at the start: the rid, a header, the submitted
+        /// `top_k` and the client's own sampling params.
+        started: serde_json::Value,
+        log: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl TopPFrames {
+        fn logging(log: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> Box<Self> {
+            Box::new(Self {
+                top_p: 0.0,
+                first: true,
+                started: serde_json::Value::Null,
+                log: log.clone(),
+            })
+        }
     }
 
     impl crate::GenerateHook for TopPHook {
-        fn start(&self, sampling_params: &crate::SamplingParams) -> Box<dyn GenerateFrameHook> {
-            Box::new(TopPFrames {
-                top_p: sampling_params.top_p,
-                first: true,
-            })
+        fn start(
+            &self,
+            request: &GenerateRequest,
+            headers: &HeaderMap,
+            client_sampling_params: Option<&serde_json::Map<String, serde_json::Value>>,
+        ) -> Box<dyn GenerateFrameHook> {
+            let mut frames = TopPFrames::logging(&self.log);
+            frames.top_p = request.sampling_params.top_p;
+            frames.started = serde_json::json!({
+                "rid": request.rid.client_facing(),
+                "header": headers.get("x-test").map(|v| v.to_str().unwrap()),
+                "top_k": request.sampling_params.top_k,
+                "client": client_sampling_params,
+            });
+            frames
         }
     }
 
@@ -1321,20 +1936,102 @@ mod tests {
                 keys.frame.insert("first".into(), serde_json::json!(true));
             }
         }
+
+        fn finished(&mut self, terminal: &GenerateTerminal<'_>) {
+            self.log.lock().unwrap().push(serde_json::json!({
+                "started": self.started,
+                "completion_tokens": terminal.meta_info.completion_tokens,
+                "queue_time": terminal.request_stats.map(|stats| stats["queue_time"].clone()),
+                "decode_latency": terminal.decode_latency.map(|latency| latency.as_secs_f64()),
+                "output_token_logprobs": terminal.output_token_logprobs,
+            }));
+        }
+
+        fn failed(&mut self, status: StatusCode, message: &str) {
+            self.log.lock().unwrap().push(serde_json::json!({
+                "started": self.started,
+                "failed": [status.as_u16(), message],
+            }));
+        }
     }
 
-    /// A hook's keys reach every native frame of every batch item — unary,
-    /// cumulative and incremental streams — each item's hook started from its
-    /// own sampling params, with the scheduler's decode latency for a unary
-    /// item and this frontend's for a streamed one; without a hook the frames
-    /// are the schema's.
+    /// The launch's generate validator refuses at every ingress before
+    /// anything is submitted, a batch's valid items included: native
+    /// `/generate` with its 400 (a stream's error frame), and the OpenAI
+    /// routes with their 400, unary even for a stream, as Python answers the
+    /// tokenizer manager's `ValueError` before the stream starts.
     #[tokio::test]
-    async fn generate_hook_keys_reach_every_frame() {
-        for (stream, incremental, hook) in [
-            (false, false, true),
-            (true, false, true),
-            (true, true, true),
-            (true, true, false),
+    async fn generate_validator_refuses_every_ingress_before_submission() {
+        let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
+        let native_stream = serde_json::json!({
+            "code": 400,
+            "message": "top_logprobs_num 2",
+            "type": "invalid_request_error",
+            "retryable": false,
+        });
+        let openai = serde_json::json!({
+            "object": "error",
+            "message": "top_logprobs_num 2",
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400,
+        });
+        let generate = |text: serde_json::Value, top_logprobs_num, stream| {
+            serde_json::json!({
+                "text": text,
+                "stream": stream,
+                "return_logprob": true,
+                "top_logprobs_num": top_logprobs_num,
+            })
+        };
+        let completion = |stream| {
+            serde_json::json!({
+                "model": "m",
+                "prompt": [1, 2],
+                "logprobs": 2,
+                "max_tokens": 1,
+                "stream": stream,
+            })
+        };
+        for (uri, body, status, error) in [
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    false,
+                ),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    true,
+                ),
+                StatusCode::OK,
+                &native_stream,
+            ),
+            (
+                "/generate",
+                generate(serde_json::json!("x"), serde_json::json!(2), false),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/v1/completions",
+                completion(false),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
+            (
+                "/v1/completions",
+                completion(true),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
@@ -1346,27 +2043,144 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
-                    peer_endpoints: Vec::new(),
+                    multimodal: false,
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    peer_endpoints: Vec::new(),
+                    generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                    abort_hook: None,
                 },
             );
             let state = Arc::new(AppState {
                 core,
                 server_args: Arc::new(crate::message::config::ServerArgs {
-                    incremental_streaming_output: incremental,
+                    served_model_name: "m".into(),
                     ..Default::default()
                 }),
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
-                generate_hook: hook.then(|| Arc::new(TopPHook) as Arc<dyn crate::GenerateHook>),
+                generate_hook: None,
                 openai_chat: None,
             });
-            // Both items' delta, then both terminals: an incremental stream
-            // emits two frames per item.
+            let case = format!("{uri} {body}");
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = routes()
+                .merge(super::super::openai::routes())
+                .with_state(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            let first = body
+                .strip_prefix("data: ")
+                .unwrap_or(body)
+                .lines()
+                .next()
+                .unwrap();
+            assert_eq!(&parse(first)["error"], error, "{case}");
+            assert!(
+                intake_rx.is_empty(),
+                "{case}: an item reached the scheduler"
+            );
+        }
+    }
+
+    /// A hook's keys reach every native frame of every request — unary,
+    /// cumulative and incremental streams, single and batch — each request's
+    /// hook started from its own sampling params, with the scheduler's decode
+    /// latency for a unary request and this frontend's for a streamed one;
+    /// without a hook the frames are the schema's. A finished request's stats
+    /// reach its terminal frame only, after the schema's keys and before the
+    /// hook's, with the decode throughput when metrics are on; a request whose
+    /// terminal output carries no stats (an older scheduler) reports neither.
+    /// The hook starts from each item's request, the HTTP headers and the
+    /// sampling params the client sent for it (without the launch-time
+    /// preferred ones), and sees each terminal frame once. An HTTP layer's
+    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
+    /// but neither decode latency. Every frame carries the listener's DP rank
+    /// (null without data parallelism), a status abort's terminal stream frame
+    /// included.
+    #[tokio::test]
+    async fn generate_hook_keys_reach_every_frame() {
+        for (stream, incremental, hook, batch, metrics) in [
+            (false, false, true, true, true),
+            (false, false, false, false, false),
+            (true, false, true, true, false),
+            (true, false, false, false, true),
+            (true, true, true, true, true),
+            (true, true, false, false, true),
+        ] {
+            // A hooked case also runs as DP rank 1, which frames report; the
+            // rest without DP, whose frames report null.
+            let dp_rank: u32 = if hook { 1 } else { 0 };
+            let server_args = crate::message::config::ServerArgs {
+                incremental_streaming_output: incremental,
+                metrics: metrics.then(|| crate::message::config::MetricsConfig {
+                    multiproc_dir: String::new(),
+                    labels: Default::default(),
+                    priority_label: false,
+                    bucket_time_to_first_token: None,
+                    bucket_inter_token_latency: None,
+                    bucket_e2e_request_latency: None,
+                    bucket_prompt_tokens: None,
+                    bucket_generation_tokens: None,
+                }),
+                preferred_sampling_params: Some(crate::message::config::PreferredSamplingParams(
+                    serde_json::json!({"top_k": 7}),
+                )),
+                deployment_info: crate::message::config::DeploymentInfo {
+                    dp_size: if hook { 2 } else { 1 },
+                    dp_rank: Some(dp_rank),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            );
+            let top_p_hook = TopPHook::default();
+            let state = Arc::new(AppState {
+                core,
+                server_args: Arc::new(server_args),
+                generation_policy: GenerationPolicy::default(),
+                chat_formatter: None,
+                generate_hook: hook
+                    .then(|| Arc::new(top_p_hook.clone()) as Arc<dyn crate::GenerateHook>),
+                openai_chat: None,
+            });
+            let items = if batch { 2 } else { 1 };
+            // Every item's delta, then every terminal: a stream emits two
+            // frames per item. The first item's terminal output carries its
+            // stats.
             let responder = tokio::spawn(async move {
                 let mut sinks = Vec::new();
-                for _ in 0..2 {
+                for _ in 0..items {
                     let TmEvent::Intake { request, admission } =
                         intake_rx.recv_async().await.unwrap()
                     else {
@@ -1375,40 +2189,84 @@ mod tests {
                     assert!(admission.try_accept());
                     sinks.push((request.rid.clone(), request.sink.clone()));
                 }
+                // One output token logprob per output.
+                let logprob = || crate::message::response::ChunkExtras {
+                    out_lp_val: vec![-0.5],
+                    out_lp_idx: vec![1],
+                    ..Default::default()
+                };
                 for (rid, sink) in &sinks {
                     let ResponseItem::Frame(mut chunk) = frame(0, "a") else {
                         unreachable!()
                     };
                     chunk.rid = rid.clone();
+                    chunk.extras = Some(Box::new(logprob()));
                     sink.try_send(ResponseItem::Frame(chunk)).unwrap();
                 }
-                for (rid, sink) in &sinks {
+                // A streamed item's decode latency runs from this frontend's
+                // first output, so let the stream take that first.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                for (item, (rid, sink)) in sinks.iter().enumerate() {
                     let ResponseItem::Done(mut chunk) = done(0, "b") else {
                         unreachable!()
                     };
                     chunk.rid = rid.clone();
-                    // The scheduler times non-streaming requests only.
-                    chunk.extras = (!stream).then(|| {
-                        Box::new(crate::message::response::ChunkExtras {
-                            decode_latency: Some(0.25),
-                            ..Default::default()
-                        })
-                    });
+                    // A streamed batch's second item ends on a status abort,
+                    // still a frame.
+                    if stream && item == 1 {
+                        chunk.finish_reason = serde_json::from_value(serde_json::json!({
+                            "type": "abort",
+                            "message": "Aborted",
+                            "status_code": 500,
+                            "err_type": null
+                        }))
+                        .unwrap();
+                    }
+                    let mut stats = serde_json::Map::new();
+                    stats.insert("num_retractions".into(), serde_json::json!(1));
+                    stats.insert("queue_time".into(), serde_json::json!(0.5));
+                    let extras = crate::message::response::ChunkExtras {
+                        // The scheduler times non-streaming requests only.
+                        decode_latency: (!stream).then_some(0.25),
+                        request_stats: (item == 0).then(|| RequestStats(stats)),
+                        ..logprob()
+                    };
+                    chunk.extras = Some(Box::new(extras));
                     sink.try_send(ResponseItem::Done(chunk)).unwrap();
                 }
             });
+            let (text, sampling_params) = if batch {
+                (
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([{"top_p": 0.5}, {"top_p": 0.25}]),
+                )
+            } else {
+                (serde_json::json!("x"), serde_json::json!({"top_p": 0.5}))
+            };
             let body = serde_json::json!({
-                "text": ["x", "y"],
+                "rid": "r",
+                "text": text,
                 "stream": stream,
-                "sampling_params": [{"top_p": 0.5}, {"top_p": 0.25}],
+                "sampling_params": sampling_params,
             });
+            let layer_work = Duration::from_secs(5);
             let request = Request::builder()
                 .method("POST")
                 .uri("/generate")
                 .header("content-type", "application/json")
+                .header("x-test", "v")
+                .extension(crate::RequestStart(
+                    Instant::now().checked_sub(layer_work).unwrap(),
+                ))
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let response = routes().with_state(state).oneshot(request).await.unwrap();
+            if stream {
+                assert_eq!(
+                    response.headers()["content-type"],
+                    crate::utils::response::SSE_CONTENT_TYPE
+                );
+            }
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .unwrap();
@@ -1420,18 +2278,66 @@ mod tests {
                     .filter(|data| *data != "[DONE]")
                     .map(parse)
                     .collect()
-            } else {
+            } else if batch {
                 parse(body).as_array().unwrap().clone()
+            } else {
+                vec![parse(body)]
             };
 
-            let case = format!("stream={stream} incremental={incremental} hook={hook}");
-            assert_eq!(frames.len(), if incremental { 4 } else { 2 }, "{case}");
+            let case = format!(
+                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics} dp_rank={dp_rank}"
+            );
+            // A stream takes each delta before its terminal output arrives.
+            assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
             let mut seen = [0usize; 2];
             for (position, frame) in frames.iter().enumerate() {
-                // A unary batch is an array in request order, without `index`.
-                let index = frame["index"].as_u64().map_or(position, |i| i as usize);
-                let meta = &frame["meta_info"];
+                // A unary batch is an array in request order, without `index`;
+                // a single request has none either.
+                let index = frame["index"]
+                    .as_u64()
+                    .map_or(if batch { position } else { 0 }, |i| i as usize);
+                let meta = frame["meta_info"].as_object().unwrap();
                 let terminal = !meta["finish_reason"].is_null();
+                assert_eq!(
+                    meta.get("dp_rank"),
+                    Some(&serde_json::json!(hook.then_some(dp_rank))),
+                    "{case}"
+                );
+                let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+                let e2e_latency = meta.get("e2e_latency").and_then(serde_json::Value::as_f64);
+                assert_eq!(e2e_latency.is_some(), terminal, "{case}");
+                if let Some(e2e_latency) = e2e_latency {
+                    assert!(
+                        e2e_latency >= layer_work.as_secs_f64(),
+                        "{case}: {e2e_latency}"
+                    );
+                }
+                let stats = terminal && index == 0;
+                assert_eq!(meta.get("num_retractions").is_some(), stats, "{case}");
+                assert_eq!(
+                    meta.get("decode_throughput").is_some(),
+                    stats && metrics,
+                    "{case}"
+                );
+                if stats {
+                    let at = keys
+                        .iter()
+                        .position(|key| *key == "num_retractions")
+                        .unwrap();
+                    assert_eq!(
+                        keys[at..at + 2],
+                        ["num_retractions", "queue_time"],
+                        "{case}"
+                    );
+                    assert_eq!(meta["queue_time"], 0.5, "{case}");
+                    if metrics {
+                        assert_eq!(keys[at + 2], "decode_throughput", "{case}");
+                        // Two tokens, 0.25 s apart by the scheduler's clock.
+                        if !stream {
+                            assert_eq!(meta["decode_throughput"], 4.0, "{case}");
+                        }
+                    }
+                }
                 if !hook {
                     assert!(meta.get("top_p").is_none() && frame.get("first").is_none());
                     continue;
@@ -1442,7 +2348,54 @@ mod tests {
                 if terminal && !stream {
                     assert_eq!(meta["decode_s"], 0.25, "{case}");
                 }
+                // A streamed request's decode latency runs from its first
+                // output, which the layer's work came before.
+                if terminal && stream {
+                    let decode_s = meta["decode_s"].as_f64().unwrap();
+                    assert!(
+                        e2e_latency.unwrap() - decode_s >= layer_work.as_secs_f64(),
+                        "{case}: {e2e_latency:?} - {decode_s}"
+                    );
+                }
+                if stats {
+                    let stats_at = keys.iter().position(|key| *key == "num_retractions");
+                    let hook_at = keys.iter().position(|key| *key == "top_p");
+                    assert!(stats_at < hook_at, "{case}");
+                }
                 seen[index] += 1;
+            }
+            let mut log = std::mem::take(&mut *top_p_hook.log.lock().unwrap());
+            if !hook {
+                assert!(log.is_empty(), "{case}");
+                continue;
+            }
+            log.sort_by_key(|entry| entry["started"]["rid"].as_str().unwrap().to_owned());
+            assert_eq!(log.len(), items, "{case}");
+            for (item, entry) in log.iter().enumerate() {
+                let rid = if batch {
+                    format!("r_{item}")
+                } else {
+                    "r".into()
+                };
+                let client = if batch {
+                    sampling_params[item].clone()
+                } else {
+                    sampling_params.clone()
+                };
+                let expected = serde_json::json!({
+                    "started": {"rid": rid, "header": "v", "top_k": 7, "client": client},
+                    // Two tokens, one per output.
+                    "completion_tokens": 2,
+                    "queue_time": (item == 0).then_some(0.5),
+                    "decode_latency": entry["decode_latency"],
+                    // Both outputs', though an incremental terminal frame
+                    // carries only its own.
+                    "output_token_logprobs": 2,
+                });
+                assert_eq!(entry, &expected, "{case}");
+                if !stream {
+                    assert_eq!(entry["decode_latency"], 0.25, "{case}");
+                }
             }
         }
     }
@@ -1454,7 +2407,12 @@ mod tests {
     struct ProbeFrames;
 
     impl crate::GenerateHook for ProbeConsumer {
-        fn start(&self, _: &crate::SamplingParams) -> Box<dyn GenerateFrameHook> {
+        fn start(
+            &self,
+            _: &GenerateRequest,
+            _: &HeaderMap,
+            _: Option<&serde_json::Map<String, serde_json::Value>>,
+        ) -> Box<dyn GenerateFrameHook> {
             Box::new(ProbeFrames)
         }
 
@@ -1673,9 +2631,10 @@ mod tests {
         assert_eq!(meta["seen"], json!({"probe": [2], "aux": ["y"]}));
     }
 
-    /// A `customized_info` key that repeats a key the schema or the hook
-    /// writes gives way, so `meta_info` never has a key twice; the hook still
-    /// sees it. `SCHEMA_META_INFO_KEYS` names every key the schema writes.
+    /// A `customized_info` key that repeats a key the schema, the request's
+    /// stats or the hook writes gives way, so `meta_info` never has a key
+    /// twice; the hook still sees it. `SCHEMA_META_INFO_KEYS` names every key
+    /// the schema writes.
     #[tokio::test]
     async fn repeated_customized_info_keys_give_way() {
         use serde_json::json;
@@ -1701,6 +2660,8 @@ mod tests {
             image_tokens: Some(1),
             audio_tokens: Some(1),
             video_tokens: Some(1),
+            cached_tokens_details: Some(Default::default()),
+            dp_rank: Some(0),
         };
         let keys: Vec<String> = serde_json::to_value(&every)
             .unwrap()
@@ -1713,29 +2674,53 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(1);
         let (mut call, mut request) = timed_call(1, rx);
-        let sampling_params: crate::SamplingParams = serde_json::from_value(json!({})).unwrap();
+        let submitted = GenerateRequest {
+            sampling_params: serde_json::from_value(json!({})).unwrap(),
+            ..Default::default()
+        };
+        let hook = TopPHook::default();
         request.hook = Some(RequestHook {
-            hook: Arc::new(TopPHook),
-            frames: TopPHook.start(&sampling_params),
+            frames: hook.start(&submitted, &HeaderMap::new(), None),
+            hook: Arc::new(hook),
         });
         let info = [
             ("id", json!([1])),
             ("top_p", json!([2])),
+            ("queue_time", json!([4])),
             ("kept", json!([3])),
         ];
-        tx.send(customized(1, &info, true)).await.unwrap();
+        let ResponseItem::Done(mut terminal) = customized(1, &info, true) else {
+            unreachable!()
+        };
+        let stats = serde_json::Map::from_iter([("queue_time".into(), json!(0.5))]);
+        terminal.extras.as_mut().unwrap().request_stats = Some(RequestStats(stats));
+        tx.send(ResponseItem::Done(terminal)).await.unwrap();
         let (_, item) = drain_unary(&mut call, "rid", request).await;
         let text = json_string(&item);
         assert_eq!(text.matches(r#""id":"#).count(), 1, "{text}");
         assert_eq!(text.matches(r#""top_p":"#).count(), 1, "{text}");
+        assert_eq!(text.matches(r#""queue_time":"#).count(), 1, "{text}");
         let meta = &parse(&text)["meta_info"];
         assert_eq!(meta["id"], "rid");
         assert_eq!(meta["top_p"], 1.0);
+        assert_eq!(meta["queue_time"], 0.5);
         assert_eq!(meta["kept"], json!([3]));
     }
 
-    /// The hook-aware serializer writes the generated one's keys, in its
-    /// order, before the hook's.
+    /// As Python's `get_time_per_output_token`, a request reports no decode
+    /// throughput without a second token or without a positive decode
+    /// latency (its first output was also its last).
+    #[test]
+    fn decode_throughput_needs_two_tokens_and_a_decode_latency() {
+        let latency = Some(Duration::from_millis(250));
+        assert_eq!(decode_throughput(latency, 3), Some(8.0));
+        assert_eq!(decode_throughput(latency, 1), None);
+        assert_eq!(decode_throughput(Some(Duration::ZERO), 3), None);
+        assert_eq!(decode_throughput(None, 3), None);
+    }
+
+    /// The serializer writes the generated one's keys, in its order, then a
+    /// finished request's stats, then the hook's.
     #[test]
     fn native_frame_keeps_the_schema_keys_first() {
         let schema = api::GenerateResponse {
@@ -1752,6 +2737,7 @@ mod tests {
         let expected = json_string(&schema);
         let empty = NativeFrame {
             frame: schema.clone(),
+            request_stats: Some(RequestStats::default()),
             customized_info: ReportedCustomizedInfo::default(),
             keys: Some(Box::default()),
         };
@@ -1760,12 +2746,18 @@ mod tests {
         let mut keys = GenerateFrameKeys::default();
         keys.meta_info.insert("m".into(), serde_json::json!(1));
         keys.frame.insert("f".into(), serde_json::json!({"k": "v"}));
+        let mut stats = serde_json::Map::new();
+        stats.insert("num_retractions".into(), serde_json::json!(0));
+        stats.insert("queue_time".into(), serde_json::json!(0.5));
         let added = NativeFrame {
             frame: schema,
+            request_stats: Some(RequestStats(stats)),
             customized_info: ReportedCustomizedInfo::default(),
             keys: Some(Box::new(keys)),
         };
         let mut with_meta: serde_json::Value = parse(&expected);
+        with_meta["meta_info"]["num_retractions"] = serde_json::json!(0);
+        with_meta["meta_info"]["queue_time"] = serde_json::json!(0.5);
         with_meta["meta_info"]["m"] = serde_json::json!(1);
         with_meta["f"] = serde_json::json!({"k": "v"});
         assert_eq!(json_string(&added), with_meta.to_string());
@@ -1791,7 +2783,12 @@ mod tests {
     }
 
     impl crate::GenerateHook for Recorded {
-        fn start(&self, _: &crate::SamplingParams) -> Box<dyn GenerateFrameHook> {
+        fn start(
+            &self,
+            _: &GenerateRequest,
+            _: &HeaderMap,
+            _: Option<&serde_json::Map<String, serde_json::Value>>,
+        ) -> Box<dyn GenerateFrameHook> {
             Box::new(self.clone())
         }
     }
@@ -1925,6 +2922,8 @@ mod tests {
         let request = RequestState {
             timing,
             scheduler_decode_latency: None,
+            report_decode_throughput: false,
+            output_token_logprobs: 0,
             customized_info: CustomizedInfoState::default(),
             hook: None,
         };
@@ -2014,13 +3013,110 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
+    /// A core failure before the stream starts is one SSE frame with Python's
+    /// `type` and `retryable` for its kind; unary, it's the bare native body.
+    #[tokio::test]
+    async fn core_error_frames_name_type_and_retryable() {
+        for (error, code, error_type, retryable) in [
+            (CoreError::Unavailable, 503, "invalid_request_error", false),
+            (
+                CoreError::Internal("bug".into()),
+                500,
+                "internal_error",
+                true,
+            ),
+        ] {
+            let message = error.to_string();
+            let streamed = native_core_error(error.clone(), true);
+            assert_eq!(streamed.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let frame = text
+                .strip_prefix("data: ")
+                .and_then(|rest| rest.strip_suffix("\n\ndata: [DONE]\n\n"))
+                .unwrap_or_else(|| panic!("one error frame then [DONE]: {text}"));
+            assert_eq!(
+                parse(frame),
+                serde_json::json!({"error": {
+                    "message": message, "code": code, "type": error_type, "retryable": retryable,
+                }})
+            );
+
+            let unary = native_core_error(error, false);
+            assert_eq!(unary.status().as_u16(), code);
+            let bytes = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                parse(std::str::from_utf8(&bytes).unwrap()),
+                serde_json::json!({"error": {"message": message, "code": code}})
+            );
+        }
+    }
+
+    /// The Rust server answers the failures Python's handler answered in
+    /// `testdata/error_frames.json` (built by `build_rust_error_frames_fixture`
+    /// in `test_rust_server_error_frames.py`): the same stream frame, and the
+    /// same unary status and body, which Rust extends with `code` only.
+    #[tokio::test]
+    async fn error_frames_match_python_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/error_frames.json")).unwrap();
+        for (name, case) in fixture.as_object().unwrap() {
+            let message = case["message"].as_str().unwrap().to_owned();
+            let error = match name.as_str() {
+                "invalid_argument" => CoreError::InvalidArgument(message),
+                "status_503" => CoreError::Overloaded(message),
+                other => panic!("no Rust failure for fixture case {other}"),
+            };
+
+            let streamed = native_core_error(error.clone(), true);
+            assert_eq!(
+                streamed.status().as_u16(),
+                case["stream"]["status"],
+                "{name}"
+            );
+            let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let frame = text
+                .strip_prefix("data: ")
+                .and_then(|rest| rest.strip_suffix("\n\ndata: [DONE]\n\n"))
+                .unwrap_or_else(|| panic!("one error frame then [DONE]: {text}"));
+            assert_eq!(parse(frame), case["stream"]["frame"], "{name}");
+
+            let unary = native_core_error(error, false);
+            assert_eq!(unary.status().as_u16(), case["unary"]["status"], "{name}");
+            let bytes = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let mut body = parse(std::str::from_utf8(&bytes).unwrap());
+            assert_eq!(body["error"]["code"], case["unary"]["status"], "{name}");
+            body["error"].as_object_mut().unwrap().remove("code");
+            assert_eq!(body, case["unary"]["body"], "{name}");
+        }
+    }
+
     /// A per-item error is surfaced with its `index` and doesn't end the batch;
     /// `[DONE]` still waits for the other item.
     #[tokio::test]
     async fn per_item_error_carries_index() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let calls = vec![timed_call(10, rx0), timed_call(11, rx1)];
+        let log = Arc::default();
+        let calls: Vec<_> = [timed_call(10, rx0), timed_call(11, rx1)]
+            .into_iter()
+            .map(|(call, mut request)| {
+                request.hook = Some(RequestHook {
+                    hook: Arc::new(TopPHook::default()),
+                    frames: TopPFrames::logging(&log),
+                });
+                (call, request)
+            })
+            .collect();
         let stream = generation_event_stream(calls, false, true);
         futures::pin_mut!(stream);
 
@@ -2030,12 +3126,18 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 0);
         assert_eq!(v["error"]["code"], 400);
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["retryable"], false);
 
         tx1.send(done(11, "ok")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 1);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        // A package's hook hears of the failure, and of the other item's end.
+        let log = log.lock().unwrap();
+        assert_eq!(log[0]["failed"], serde_json::json!([400, "bad"]));
+        assert_eq!(log[1]["completion_tokens"], 1);
     }
 
     /// A scheduler abort that carried an error status ends a stream on a
@@ -2085,18 +3187,43 @@ mod tests {
     }
 
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
-    /// but `meta_info.completion_tokens` stays cumulative (matching Python).
+    /// but `meta_info.completion_tokens` stays cumulative (matching Python), and
+    /// so does the cached-token split, which a scheduler abort does not carry.
     #[tokio::test]
     async fn incremental_emits_deltas_with_cumulative_count() {
+        use crate::message::response::{CachedTokensDetails, ChunkExtras};
+
         let (tx, rx) = mpsc::channel(8);
         let calls = vec![timed_call(10, rx)];
         let stream = generation_event_stream(calls, true, true);
         futures::pin_mut!(stream);
+        let with_extras = |item: ResponseItem, extras: ChunkExtras| {
+            let (ResponseItem::Frame(mut chunk) | ResponseItem::Done(mut chunk)) = item else {
+                unreachable!()
+            };
+            chunk.cached_tokens = 3;
+            chunk.extras = Some(Box::new(extras));
+            chunk
+        };
+        let split = serde_json::json!({"device": 1, "host": 2});
 
-        tx.send(frame(10, "Hello")).await.unwrap();
+        let hello = with_extras(
+            frame(10, "Hello"),
+            ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 1,
+                    host: 2,
+                    storage: None,
+                    storage_backend: None,
+                }),
+                ..Default::default()
+            },
+        );
+        tx.send(ResponseItem::Frame(hello)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "Hello");
         assert_eq!(v["meta_info"]["completion_tokens"], 1);
+        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
         assert!(v["meta_info"].get("e2e_latency").is_none());
 
         tx.send(frame(10, " world")).await.unwrap();
@@ -2108,11 +3235,19 @@ mod tests {
         );
         assert!(v["meta_info"].get("e2e_latency").is_none());
 
-        tx.send(done(10, "!")).await.unwrap();
+        let aborted = with_extras(
+            done(10, "!"),
+            ChunkExtras {
+                abort_output: true,
+                ..Default::default()
+            },
+        );
+        tx.send(ResponseItem::Done(aborted)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
@@ -2210,6 +3345,99 @@ mod tests {
                 v["meta_info"]["completion_tokens"], n,
                 "count stays cumulative"
             );
+        }
+    }
+
+    /// `json_body` accepts and rejects exactly what `Json<Value>` does, with
+    /// the same rejection text, and hands back the bytes it was sent.
+    #[tokio::test]
+    async fn json_body_matches_the_json_extractor() {
+        use axum::extract::FromRequest;
+
+        let request = |content_type: Option<&str>, body: &'static str| {
+            let mut builder = http::Request::builder().method("POST").uri("/generate");
+            if let Some(content_type) = content_type {
+                builder = builder.header(http::header::CONTENT_TYPE, content_type);
+            }
+            builder.body(axum::body::Body::from(body)).unwrap()
+        };
+        let body = "{ \"text\": \"hi\",  \"rid\": \"r\" }";
+        for (content_type, body) in [
+            (Some("application/json"), body),
+            (Some("application/json; charset=utf-8"), body),
+            (Some("application/vnd.api+json"), body),
+            (Some("text/plain"), body),
+            (None, body),
+            (Some("application/json"), "{\"text\": "),
+            (Some("application/json"), "[1, 2"),
+        ] {
+            let ours = json_body(&(), request(content_type, body)).await;
+            let axums =
+                Json::<serde_json::Value>::from_request(request(content_type, body), &()).await;
+            match (ours, axums) {
+                (Ok((value, raw)), Ok(Json(expected))) => {
+                    assert_eq!(value, expected);
+                    assert_eq!(raw, body.as_bytes(), "the bytes as sent");
+                }
+                (Err(ours), Err(axums)) => {
+                    assert_eq!(ours.status(), axums.status(), "{content_type:?} {body}");
+                    assert_eq!(ours.body_text(), axums.body_text());
+                }
+                (ours, axums) => panic!(
+                    "{content_type:?} {body}: ours ok={}, axum ok={}",
+                    ours.is_ok(),
+                    axums.is_ok()
+                ),
+            }
+        }
+    }
+
+    /// Python takes `PUT /generate` as well as POST, with the same handler:
+    /// a malformed body is the same 400 on both verbs.
+    #[tokio::test]
+    async fn generate_takes_put_like_post() {
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
+        let (intake_tx, _intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                metrics: None,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        for method in ["POST", "PUT"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text": 5}"#))
+                .unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
         }
     }
 }

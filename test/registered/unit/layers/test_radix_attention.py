@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
@@ -30,11 +30,17 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 @contextmanager
-def attention_scope(batch, backend, *, full_graph=False, raw_num_tokens=None):
+def attention_scope(
+    batch, backend, *, full_graph=False, raw_num_tokens=None, zero_padded_tail=True
+):
     with (
         forward_context(ForwardContext(backend)),
         set_forward_batch(batch),
-        prefill_graph_scope(full_graph=full_graph, raw_num_tokens=raw_num_tokens),
+        prefill_graph_scope(
+            full_graph=full_graph,
+            raw_num_tokens=raw_num_tokens,
+            zero_padded_tail=zero_padded_tail,
+        ),
     ):
         yield
 
@@ -176,7 +182,9 @@ def test_direct_backend_dispatch(sparse):
     batch = make_batch()
     q = torch.zeros(4, 2, 3)
     result = object()
-    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    backend = SimpleNamespace(
+        forward=lambda *args, **kwargs: result, plans_padded_extend_rows=False
+    )
     with (
         attention_scope(batch, backend),
         patch(
@@ -186,6 +194,45 @@ def test_direct_backend_dispatch(sparse):
     ):
         kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
         assert layer(q, q, q, batch, **kwargs) is result
+
+
+@pytest.mark.parametrize("breakable", [False, True])
+@pytest.mark.parametrize("tokens", [0, 2])
+@pytest.mark.parametrize("zero_padded_tail", [False, True])
+def test_prefill_padding_policy_preserves_real_rows_and_idle_zeroing(
+    breakable, tokens, zero_padded_tail
+):
+    layer = RadixAttention(1, 2, 1.0, 1, 0)
+    batch = make_batch(tokens=tokens)
+    q = torch.zeros(4, 1, 2)
+    output = torch.full_like(q, float("nan"))
+    backend = SimpleNamespace(
+        forward=lambda query, *args, **kwargs: torch.ones_like(query)
+    )
+    with (
+        attention_scope(
+            batch,
+            backend,
+            full_graph=not breakable,
+            raw_num_tokens=tokens,
+            zero_padded_tail=zero_padded_tail,
+        ),
+        patch(
+            "sglang.srt.layers.radix_attention.is_in_breakable_cuda_graph",
+            return_value=breakable,
+        ),
+        patch(
+            "sglang.srt.layers.radix_attention.allocate_attention_outputs",
+            return_value=(output, None),
+        ),
+    ):
+        result = layer(q, q, q, batch)
+    assert result is output
+    assert torch.all(output[:tokens] == 1)
+    if zero_padded_tail or tokens == 0:
+        assert torch.count_nonzero(output[tokens:]) == 0
+    else:
+        assert torch.isnan(output[tokens:]).all()
 
 
 def test_output_dtype_follows_values():
@@ -221,9 +268,10 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
 
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
-        cuda_graph=graph,
-        _end_current_segment=lambda: None,
-        _begin_new_segment=lambda: None,
+        end_current_segment=lambda: None,
+        begin_next_segment=lambda: None,
+        register_eager_call=graph._break_fns.append,
+        retain_for_replay=lambda value: value,
     )
     backend = SimpleNamespace(forward=attention)
     with (
@@ -233,12 +281,9 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
             return_value=True,
         ),
     ):
-        token = bcg._current_capture_var.set(capture)
-        try:
+        with bcg.use_breakable_capture_recorder(capture):
             kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
             result = layer(q, q, q, captured_batch, **kwargs)
-        finally:
-            bcg._current_capture_var.reset(token)
     index_output = None
     if sparse:
         index_output, output = result

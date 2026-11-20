@@ -200,6 +200,10 @@ class PipelineConfig:
     image_encoder_precision: str = "fp32"
     image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
+    # Audio encoder configuration
+    audio_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
+    audio_encoder_precision: str = "fp32"
+
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
@@ -222,7 +226,6 @@ class PipelineConfig:
     )
 
     # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
     STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
@@ -575,6 +578,10 @@ class PipelineConfig:
         slices[dim] = slice(orig_len)
         return tensor[tuple(slices)]
 
+    def prepare_decoding_latents(self, batch, server_args=None, vae=None):
+        del server_args, vae
+        return batch.latents
+
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         return self._gather_sp_tensor(latents, dim=2)
@@ -781,6 +788,10 @@ class PipelineConfig:
         return latents
 
     def post_decoding(self, frames, server_args):
+        return frames
+
+    def postprocess_decoded_batch(self, frames, batch, server_args):
+        del batch, server_args
         return frames
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):

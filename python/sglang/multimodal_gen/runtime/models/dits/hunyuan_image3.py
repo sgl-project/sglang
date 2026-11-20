@@ -46,6 +46,8 @@ from .hunyuan_image3_utils import (
     HunYuanRotary2DEmbedder,
     ImageKVCacheManager,
     create_hunyuan_image_attention_meta,
+    pad_prefix_rows,
+    split_suffix_inputs,
     timestep_embedding,
 )
 
@@ -850,9 +852,17 @@ class HunyuanImage3Model(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # CLA followers reuse the master layer's K/V instead of their own, which
+        # the per-layer prefix cache does not track; those configs run in full.
+        self.prefix_cache_supported = _get_cla_factor(config) == 1
 
     def get_input_embeddings(self, input_ids):
         return self.embed_tokens(input_ids)
+
+    def clear_prefix_kv_cache(self):
+        """Release per-layer prefix K/V tensors held for the active generation."""
+        for layer in self.layers:
+            layer.self_attn.image_attn.clear()
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
@@ -888,12 +898,63 @@ class HunyuanImage3Model(nn.Module):
         attn_meta=None,
         num_image_tokens=None,
         first_step=False,
+        prefix_len=None,
+        cache_slot=0,
+        attn_segments=None,
     ):
+        if prefix_len is not None and self.prefix_cache_supported:
+            return self._forward_block_prefix_cached(
+                hidden_states,
+                attention_mask,
+                custom_pos_emb,
+                num_image_tokens=num_image_tokens,
+                first_step=first_step,
+                prefix_len=prefix_len,
+                cache_slot=cache_slot,
+                attn_segments=attn_segments,
+            )
         if attn_meta is None:
             attn_meta = create_hunyuan_image_attention_meta(
                 attention_mask, num_image_tokens, first_step
             )
+            attn_meta.attn_segments = attn_segments
+        return self._run_layers(
+            hidden_states, attention_mask, custom_pos_emb, attn_meta
+        )
 
+    def _forward_block_prefix_cached(
+        self,
+        hidden_states,
+        attention_mask,
+        custom_pos_emb,
+        num_image_tokens,
+        first_step,
+        prefix_len,
+        cache_slot,
+        attn_segments,
+    ):
+        """Step 0 runs the full sequence and caches each layer's prefix K/V.
+        Later steps run only the suffix (the noisy image and timestep rows).
+        """
+        bs = attention_mask.shape[0]
+        attn_meta = create_hunyuan_image_attention_meta(
+            attention_mask, num_image_tokens, first_step
+        )
+        attn_meta.prefix_len = prefix_len
+        attn_meta.cache_slot = cache_slot
+        attn_meta.attn_segments = attn_segments
+        if first_step:
+            return self._run_layers(
+                hidden_states, attention_mask, custom_pos_emb, attn_meta
+            )
+        suffix_hidden, suffix_mask, suffix_pos = split_suffix_inputs(
+            hidden_states, attention_mask, custom_pos_emb, prefix_len
+        )
+        attn_meta.query_lens = [suffix_mask.shape[2]] * bs
+        suffix_out = self._run_layers(suffix_hidden, suffix_mask, suffix_pos, attn_meta)
+        return pad_prefix_rows(suffix_out, bs, prefix_len)
+
+    def _run_layers(self, hidden_states, attention_mask, custom_pos_emb, attn_meta):
         residual = None
         cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
@@ -1014,6 +1075,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         num_image_tokens=None,
         first_step=False,
         timestep=None,
+        prefix_len=None,
+        cache_slot=0,
+        attn_segments=None,
     ):
         # TeaCache gate: skip similar steps and reuse the cached residual;
         # one decision covers the packed CFG batch.
@@ -1028,6 +1092,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             custom_pos_emb,
             num_image_tokens=num_image_tokens,
             first_step=first_step,
+            prefix_len=prefix_len,
+            cache_slot=cache_slot,
+            attn_segments=attn_segments,
         )
 
         if timestep is not None:
@@ -1126,16 +1193,8 @@ class HunyuanImage3ForCausalMM(CachableDiT):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set = set()
-        _ckpt_dtype_logged = False
 
         for name, loaded_weight in weights:
-            if not _ckpt_dtype_logged:
-                logger.info(
-                    "  checkpoint weight dtype: %s (param dtype: %s)",
-                    loaded_weight.dtype,
-                    next(iter(params_dict.values())).dtype if params_dict else "?",
-                )
-                _ckpt_dtype_logged = True
             if any(keyword in name for keyword in UNEXPECTED_KEYWORDS):
                 continue
             if "rotary_emb.inv_freq" in name:
@@ -1217,9 +1276,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             is_found = False
             found_num = 0
             if _is_moe(self.config) and "mlp.experts" in name:
-                if not getattr(self, "_expert_ckpt_logged", False):
-                    logger.info("  expert ckpt key sample: %s", name)
-                    self._expert_ckpt_logged = True
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     offset = 0
@@ -1285,36 +1341,6 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
-        all_param_names = set(params_dict.keys())
-        missing = all_param_names - loaded_params
-        if missing:
-            significant_missing = [
-                n for n in missing if not any(k in n for k in ["rotary_emb", "lm_head"])
-            ]
-            if significant_missing:
-                logger.warning(
-                    "Weight loading: %d/%d params loaded, %d MISSING:",
-                    len(loaded_params),
-                    len(all_param_names),
-                    len(significant_missing),
-                )
-                for n in sorted(significant_missing)[:30]:
-                    logger.warning("  MISSING: %s", n)
-                if len(significant_missing) > 30:
-                    logger.warning("  ... and %d more", len(significant_missing) - 30)
-            else:
-                logger.info(
-                    "Weight loading: %d/%d params loaded (all accounted for)",
-                    len(loaded_params),
-                    len(all_param_names),
-                )
-        else:
-            logger.info(
-                "Weight loading: %d/%d params loaded (complete)",
-                len(loaded_params),
-                len(all_param_names),
-            )
 
         return loaded_params
 

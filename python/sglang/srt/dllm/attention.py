@@ -16,10 +16,11 @@ from sglang.kernels.ops.attention.flash_attn.cute.interface import (
 )
 from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
+    WindowRail,
     update_sliding_window_buffer,
 )
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
@@ -166,10 +167,6 @@ class DllmFlashAttention:
         if in_capture:
             self.init_graph_state(bs, tokens)
             capacity = batch.max_seq_len_override or backend.max_context_len
-            swa = (
-                backend.sliding_window_size is not None
-                and backend.sliding_window_size > 0
-            )
             self._prefill_graph_metadata[key] = ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -182,27 +179,25 @@ class DllmFlashAttention:
                 qo_indptr=torch.zeros(bs + 1, dtype=torch.int32, device=backend.device),
                 custom_mask=None,
                 mask_indptr=None,
-                window_kv_indptr=torch.zeros(
-                    bs + 1, dtype=torch.int32, device=backend.device
-                )
-                if swa
-                else None,
-                window_kv_indices=torch.empty(
-                    bs * backend.sliding_window_size,
-                    dtype=torch.int64,
-                    device=backend.device,
-                )
-                if swa
-                else None,
-                window_num_kv_splits=None,
-                window_kv_offsets=torch.empty(
-                    bs, dtype=torch.int64, device=backend.device
-                )
-                if swa
-                else None,
-                swa_out_cache_loc=torch.empty_like(batch.out_cache_loc)
-                if backend.use_sliding_window_kv_pool
-                else None,
+                windows={
+                    name: WindowRail(
+                        kv_indptr=torch.zeros(
+                            bs + 1, dtype=torch.int32, device=backend.device
+                        ),
+                        kv_indices=torch.empty(
+                            bs * window, dtype=torch.int64, device=backend.device
+                        ),
+                        kv_offsets=torch.empty(
+                            bs, dtype=torch.int64, device=backend.device
+                        ),
+                        out_cache_loc=(
+                            torch.empty_like(batch.out_cache_loc)
+                            if name in backend.window_write_sub_pools
+                            else None
+                        ),
+                    )
+                    for name, window in backend.window_lengths.items()
+                },
             )
         metadata = self._prefill_graph_metadata[key]
         backend._fill_kv_indptr_and_indices(
@@ -215,24 +210,23 @@ class DllmFlashAttention:
         )
         metadata.qo_indptr[0].zero_()
         torch.cumsum(batch.extend_seq_lens, dim=0, out=metadata.qo_indptr[1:])
-        if metadata.window_kv_indices is not None:
+        for name, rail in metadata.windows.items():
             _, _, _, offsets = update_sliding_window_buffer(
-                metadata.window_kv_indptr,
+                rail.kv_indptr,
                 backend.runner_ids,
                 batch.iteration_ids,
                 batch.req_pool_indices,
-                backend.sliding_window_size,
+                backend.window_lengths[name],
                 batch.extend_prefix_lens,
                 bs,
                 backend.device,
                 backend.token_to_kv_pool,
-                window_kv_indices=metadata.window_kv_indices,
+                window_kv_indices=rail.kv_indices,
+                kind=name,
             )
-            metadata.window_kv_offsets.copy_(offsets)
-        if metadata.swa_out_cache_loc is not None:
-            metadata.swa_out_cache_loc.copy_(
-                backend.runner_ids.write_ids(batch, IdSpaceKind.SLIDING_WINDOW)
-            )
+            rail.kv_offsets.copy_(offsets)
+            if rail.out_cache_loc is not None:
+                rail.out_cache_loc.copy_(backend.runner_ids.write_ids(batch, name))
         backend.forward_metadata = metadata
 
     def can_run_prefill_cuda_graph(self, batch):
