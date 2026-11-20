@@ -848,6 +848,19 @@ def handle_model_capability_adjustments(server_args: Any):
             "_handle_model_capability_adjustments",
             chunked_prefill_size=-1,
         )
+    # JinaForRanking finds its marker tokens in each prompt at run time, which a
+    # prefill graph captured at a padded bucket size cannot replay.
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.family == "jina_ranking"
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
     # Encoder-only embedding models run one bidirectional prefill per request,
     # so the KV pool is never read back; the FA backend then uses raw K/V.
     if (
