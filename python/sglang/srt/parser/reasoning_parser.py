@@ -444,6 +444,29 @@ class IQuestQ1ReasoningDetector(BaseReasoningFormatDetector):
         )
 
 
+class Step5Detector(BaseReasoningFormatDetector):
+    """Step5 always reasons first; ``<tool_call>`` also ends the reasoning."""
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
     Detector for Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
@@ -2384,6 +2407,7 @@ class ReasoningParser:
         "nanbeige": Qwen3Detector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
+        "step5": Step5Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
         "granite_thinking_parser": GraniteThinkingDetector,

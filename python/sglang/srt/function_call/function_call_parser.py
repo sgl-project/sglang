@@ -112,6 +112,7 @@ class FunctionCallParser:
         "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "step5": Qwen3CoderDetector,
         "xing4_0": Xing4_0Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,

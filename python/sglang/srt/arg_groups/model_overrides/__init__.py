@@ -46,4 +46,5 @@ from sglang.srt.arg_groups.model_overrides import qwen3_5  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen4_exp  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import step5  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2  # noqa: F401

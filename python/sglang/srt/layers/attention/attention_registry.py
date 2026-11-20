@@ -436,8 +436,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         is_minimax_sparse,
         uses_minimax_m3_nvfp4_native_stack,
     )
+    from sglang.srt.configs.step5 import Step5Config
 
-    if isinstance(runner.model_config.hf_text_config, Dots3Config):
+    if isinstance(runner.model_config.hf_text_config, (Dots3Config, Step5Config)):
         return runner.model_config.hf_text_config.wrap_attention_backend(
             runner, full_attn_backend
         )
