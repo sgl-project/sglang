@@ -99,7 +99,10 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 else device
             )
             with torch.device("meta"):
-                vae = Flux3ImageVAE(Flux3ImageVAEConfig()).to(
+                vae_config = Flux3ImageVAEConfig(
+                    use_parallel_decode=bool(server_args.pipeline_config.vae_sp)
+                )
+                vae = Flux3ImageVAE(vae_config).to(
                     dtype=precision_to_dtype(package.config.vae.dtype)
                 )
             load_model_state_dict(

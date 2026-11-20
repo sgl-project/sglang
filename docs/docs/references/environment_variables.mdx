@@ -1139,6 +1139,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NVTX_SCHEDULER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Emit the scheduler stages (<code>scheduler.recv_requests</code>, <code>scheduler.run_batch</code>, ...) as NVTX ranges for Nsight Systems. Requires the <code>nvtx</code> package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NVTX_OPERATIONS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Emit the batch-overlap operations as NVTX ranges for Nsight Systems. Requires the <code>nvtx</code> package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_NVTX_FORWARD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Emit the per-step forward span (<code>step[EXTEND bs=8 toks=4096]</code>, <code>step[DECODE bs=48]</code>, <code>step[VERIFY bs=48]</code>, ...) and the speculative-decoding draft stage spans (<code>draft</code>, <code>draft_extend</code>) as NVTX ranges for Nsight Systems. Requires the <code>nvtx</code> package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config BatchSpanProcessor.schedule_delay_millis if tracing is enabled</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`500`</td>
@@ -2347,6 +2362,11 @@ MPS and does not read them.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CRASH_ON_NUMA_BIND_FAILURE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Crash if NUMA binding fails instead of warning.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLE_THP</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Turn off transparent huge pages in each scheduler process (Linux, <code>prctl(PR_SET_THP_DISABLE)</code>; processes it starts inherit this). With THP on, a first touch of an eligible region zeroes a whole huge page in the faulting thread, and khugepaged collapses pages while holding the process's mmap lock. On kernels with 64K base pages (some Arm servers) a huge page is 512 MB, so either can stall a scheduler for tens of milliseconds, and with DP attention every rank waits for it. Also stops THP for host buffers SGLang marks <code>MADV_HUGEPAGE</code> (hugetlbfs pages from <code>SGLANG_HUGEPAGE_SIZE</code> are not affected).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>

@@ -522,6 +522,10 @@ fn native_core_error(error: CoreError, stream: bool) -> Response {
     )
 }
 
+/// Sent by the PD decode bootstrap heartbeat (`CommonKVManager` in Python), whose
+/// 3 s timeout a generation probe on a busy prefill exceeds.
+const BOOTSTRAP_HEARTBEAT_HEADER: &str = "x-sglang-bootstrap-heartbeat";
+
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
 /// router build (server startup) — changing them on a live process needs a
 /// restart. The deep-probe handler is built once with
@@ -535,7 +539,15 @@ fn health_routes() -> Router<Arc<AppState>> {
         environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
     );
     let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
-        get(move |state: State<Arc<AppState>>| health_generate(state, timeout, false))
+        get(
+            move |state: State<Arc<AppState>>, headers: HeaderMap| async move {
+                if headers.contains_key(BOOTSTRAP_HEARTBEAT_HEADER) {
+                    health_without_generation(state).await
+                } else {
+                    health_generate(state, timeout, false).await
+                }
+            },
+        )
     } else {
         get(health_without_generation)
     };
@@ -1337,6 +1349,51 @@ mod tests {
         let response = health_generate(State(state), Duration::from_secs(5), false).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get("x-custom-header").is_none());
+    }
+
+    /// The PD decode heartbeat on `/health` never waits on the scheduler:
+    /// a busy prefill must not miss it and get dropped by decode.
+    #[tokio::test]
+    async fn bootstrap_heartbeat_health_sends_no_probe() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: true,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        let request = Request::get("/health")
+            .header(BOOTSTRAP_HEARTBEAT_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            health_routes().with_state(state).oneshot(request),
+        )
+        .await
+        .expect("the heartbeat must not wait on the scheduler")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(intake_rx.try_recv().is_err());
     }
 
     /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's

@@ -5,10 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.attention.sinks_attention import (
-    attention_sinks_prefill_triton,
-    attention_sinks_triton,
-)
+from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
@@ -2050,9 +2047,27 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.reshape(
                 k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
             )
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if getattr(self.token_to_kv_pool, "layer_shard_enabled", False):
+                # The split pool caches the CP-gathered full-sequence copy on
+                # non-owner ranks, skipping the get-time owner broadcast.
+                # Only safe when this write covers the whole read range: a
+                # cached prefix leaves earlier scratch rows stale, and those
+                # reads must keep the owner broadcast.
+                prefix_lens = forward_batch.extend_prefix_lens_cpu
+                no_prefix = prefix_lens is not None and all(n == 0 for n in prefix_lens)
+                use_cp = dsa_use_prefill_cp(forward_batch)
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    k_rope,
+                    cp_gathered_full=(use_cp and no_prefix),
+                    cp_gathered_chunk=(use_cp and not no_prefix),
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -2166,6 +2181,29 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
+                # npu_sparse_flash_attention requires the GQA group size
+                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
+                # has 96 q heads / 32 kv heads (group size 3), so pad the query
+                # heads to the next power of two by duplicating the last head
+                # and slice the padding off the output.
+                num_q_heads = q_nope.shape[1]
+                pad_heads = next_power_of_2(num_q_heads)
+                if pad_heads != num_q_heads:
+                    extra = pad_heads - num_q_heads
+                    q_nope = torch.cat(
+                        (
+                            q_nope,
+                            q_nope[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
+                    q_pe = torch.cat(
+                        (
+                            q_pe,
+                            q_pe[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                     query=q_nope,
                     key=k_nope,
@@ -2188,6 +2226,8 @@ class AscendAttnBackend(AttentionBackend):
                     attention_mode=2,
                     return_softmax_lse=False,
                 )
+                if pad_heads != num_q_heads:
+                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
@@ -2532,7 +2572,7 @@ class AscendAttnBackend(AttentionBackend):
                         )
 
                 else:
-                    attn_out = attention_sinks_prefill_triton(
+                    attn_out = attention_sinks_prefill(
                         q,
                         k_cache,
                         v_cache,
@@ -3922,7 +3962,7 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-                attn_out = attention_sinks_triton(
+                attn_out = attention_sinks(
                     q,
                     k_cache,
                     v_cache,
@@ -4330,7 +4370,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
-                    attn_out = attention_sinks_triton(
+                    attn_out = attention_sinks(
                         q,
                         k_cache,
                         v_cache,

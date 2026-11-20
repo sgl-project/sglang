@@ -206,7 +206,7 @@ class Gemma4Router(nn.Module):
             self.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
         self._scale_fused = False

@@ -10,7 +10,9 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu OE operators.
+    from sgl_kernel_npu.operators.embedding import (
+        compute_n_gram_ids as compute_n_gram_ids_npu,
+    )
 else:
     from sglang.kernels.ops.embeddings.ngram_embedding import compute_n_gram_ids
 
@@ -176,7 +178,7 @@ class NgramEmbedding(torch.nn.Module):
             context = context.masked_fill(
                 (cols < 0) | ((context == self.eos_token_id) & (lookback != 0)), -1
             ).contiguous()
-            result = torch.ops.npu.compute_n_gram_ids(
+            result = compute_n_gram_ids_npu(
                 self.oe_weights,
                 self.oe_mods,
                 self.exclusive_oe_embedder_size_sums,

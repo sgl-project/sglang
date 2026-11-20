@@ -569,9 +569,18 @@ POSITIONAL_FIELD_ORDER = (
     "indexer_kv_cache_dtype",
     "enable_flashmla_prefill_token_packing",
     "decode_state_free_radix_default",
+    "disable_multimodal",
     "gc_freeze_on_idle_secs",
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
+    "uniboost_gamma",
+    "enable_uniboost_gamma_ada",
+    "watermark_algorithm",
+    "watermark_keys",
+    "watermark_ngram_len",
+    "watermark_num_candidates",
+    "watermark_context_history_size",
+    "watermark_skip_first_ngram_calls",
 )
 # fmt: on

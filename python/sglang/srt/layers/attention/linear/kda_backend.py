@@ -35,9 +35,7 @@ from sglang.srt.utils.log_utils import rank0_log
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
 if is_npu():
-    from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
-
-    causal_conv1d_update = causal_conv1d_update_npu
+    from sgl_kernel_npu.operators.mamba import causal_conv1d_update
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 

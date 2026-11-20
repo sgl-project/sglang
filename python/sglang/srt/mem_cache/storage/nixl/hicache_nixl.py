@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import HiCacheL3Cleaner
+from sglang.srt.utils.aiter import pin_aiter_hip_runtime
 
 from .nixl_registry import NixlRegistry
 from .nixl_utils import NixlBackendConfig, NixlBackendSelection, NixlFileManager
@@ -118,6 +119,7 @@ class HiCacheNixl(HiCacheStorage):
         )
         agent_config = nixl_agent_config(backends=[])
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
+        pin_aiter_hip_runtime()
         self.agent = nixl_agent(self.agent_name, agent_config)
         bind_cfg = nixlBind.nixlAgentConfig()
         bind_cfg.useProgThread = agent_config.enable_pthread

@@ -52,7 +52,6 @@ def _fake_group() -> SimpleNamespace:
 def _make_receiver() -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
-        recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,

@@ -52,8 +52,11 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     60000,
     "--disable-radix-cache",
     "--trust-remote-code",
+    # Peak concurrency stays near the stable 1P GPQA case (20): the torch_npu
+    # pinned host allocator never releases cached blocks, so 64 concurrent
+    # 3.5k-token prompts exhaust pinned host memory (NPU error 207001).
     "--max-running-requests",
-    64,
+    24,
     "--max-mamba-cache-size",
     74,
     "--mem-fraction-static",
@@ -102,7 +105,8 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
     accuracy = 0.878
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
-    eval_batch_size = 16
+    # Smaller eval batches keep pinned host memory spikes low.
+    eval_batch_size = 8
     generation_config = {
         "max_tokens": 81920,
         "temperature": 0,

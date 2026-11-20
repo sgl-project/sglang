@@ -891,13 +891,14 @@ at::Tensor fused_experts_cpu(
     bool is_vnni,
     const std::optional<std::string>& activation) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
-  // the int8 and int4 kernels hardcode silu in their fused store step
-  const bool is_int_quant =
-      moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8;
+  // The int8 kernel only supports SiLU; int4 supports SiLU and GELU.
   TORCH_CHECK(
-      !is_int_quant || act_func == CPUActMethod::silu_and_mul,
-      "fused_experts_cpu: INT8_W8A8 and INT4_W4A8 support activation='silu' only, got: ",
-      activation.value_or("silu"));
+      !(moe_comp_method == CPUQuantMethod::INT8_W8A8) || act_func == CPUActMethod::silu_and_mul,
+      "fused_experts_cpu: INT8_W8A8 supports activation='silu' only");
+  TORCH_CHECK(
+      moe_comp_method != CPUQuantMethod::INT4_W4A8 || act_func == CPUActMethod::silu_and_mul ||
+          act_func == CPUActMethod::gelu_and_mul,
+      "fused_experts_cpu: INT4_W4A8 supports activation='silu' or 'gelu'");
 
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
@@ -1189,7 +1190,8 @@ at::Tensor fused_experts_cpu(
           K,
           E,
           topk,
-          num_tokens_post_pad);
+          num_tokens_post_pad,
+          act_func);
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));

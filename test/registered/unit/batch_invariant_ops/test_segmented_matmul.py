@@ -66,6 +66,8 @@ class TestSegmentedMatmul(CustomTestCase):
         launches = [
             (32, 64, 4, 2, True),
             (64, 64, 4, 2, True),
+            (32, 128, 4, 3, True),
+            (64, 128, 8, 3, True),
             (128, 128, 8, 3, True),
             (32, 64, 4, 1, False),
             (128, 128, 8, 1, False),
