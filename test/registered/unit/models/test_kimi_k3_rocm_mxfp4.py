@@ -233,20 +233,29 @@ class TestLatentMXFP4Runtime(CustomTestCase):
             latent_mxfp4_aiter_hip,
             "pack",
             side_effect=[
-                (torch.ones(1), torch.ones(1)),
-                (torch.ones(1), torch.ones(1)),
-                (torch.full((1,), 2.0), torch.ones(1)),
-                (torch.full((1,), 3.0), torch.ones(1)),
+                (torch.ones(1), torch.full((1,), 10.0)),
+                (torch.ones(1), torch.full((1,), 11.0)),
+                (torch.full((1,), 2.0), torch.full((1,), 12.0)),
+                (torch.full((1,), 3.0), torch.full((1,), 13.0)),
             ],
         ):
             projections.prepare(down_weight=down, up_weight=up)
             # A reload refills the copies captured CUDA graphs already point at.
-            buffers = (projections.down_weight, projections.up_weight)
+            buffers = (
+                projections.down_weight,
+                projections.down_scale,
+                projections.up_weight,
+                projections.up_scale,
+            )
             projections.prepare(down_weight=down, up_weight=up)
         self.assertIs(projections.down_weight, buffers[0])
-        self.assertIs(projections.up_weight, buffers[1])
+        self.assertIs(projections.down_scale, buffers[1])
+        self.assertIs(projections.up_weight, buffers[2])
+        self.assertIs(projections.up_scale, buffers[3])
         self.assertEqual(projections.down_weight.item(), 2.0)
+        self.assertEqual(projections.down_scale.item(), 12.0)
         self.assertEqual(projections.up_weight.item(), 3.0)
+        self.assertEqual(projections.up_scale.item(), 13.0)
         self.assertFalse(projections.can_run(num_tokens=2047))
         self.assertTrue(projections.can_run(num_tokens=2048))
         self.assertEqual(dict(projections.state_dict()), {})
