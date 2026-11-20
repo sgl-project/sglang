@@ -206,6 +206,17 @@ def test_request_steps(override, steps):
             },
             "no finite log-prob",
         ),
+        # a window that names the last step asks for the same log-prob
+        (
+            {
+                "rollout": True,
+                "num_inference_steps": 6,
+                "rollout_sde_type": "cps",
+                "rollout_noise_level": 0.8,
+                "rollout_sde_step_indices": [4, 5],
+            },
+            "no finite log-prob",
+        ),
     ],
 )
 def test_invalid_image_requests_fail_at_constructor(override, match):
