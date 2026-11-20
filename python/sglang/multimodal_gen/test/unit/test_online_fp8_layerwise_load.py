@@ -73,8 +73,9 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
                     )
 
                 reference = load(WeightLoadPlan(checkpoint_load_device=device), False)
+                # reshape(-1): per-tensor scales are 0-dim, which view() rejects.
                 expected = {
-                    name: value.detach().cpu().contiguous().view(torch.uint8)
+                    name: value.detach().cpu().reshape(-1).view(torch.uint8)
                     for name, value in reference.state_dict().items()
                 }
                 del reference
@@ -113,7 +114,7 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
                     self.assertEqual(tensor.device.type, "cpu")
                 for name, value in model.state_dict().items():
                     torch.testing.assert_close(
-                        value.detach().contiguous().view(torch.uint8),
+                        value.detach().reshape(-1).view(torch.uint8),
                         expected[name],
                         rtol=0,
                         atol=0,

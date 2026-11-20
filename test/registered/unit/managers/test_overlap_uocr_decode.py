@@ -338,6 +338,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "grammar_manager",
             "metrics_reporter",
             "invariant_checker",
+            "gc_freezer",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None

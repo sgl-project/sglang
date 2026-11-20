@@ -63,6 +63,7 @@ _TRITON_KERNELS = [
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
+    ("beam_shared_context", "shared_context_attention"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -766,3 +767,25 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
+for _op, _module in (
+    ("finish_prefill_indexer_topk", "fp4_indexer"),
+    ("select_candidate_block_ids_triton", "candidate_blocks"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.{_module}:{_op}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _op, _module

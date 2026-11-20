@@ -306,11 +306,35 @@ def _joint_attention(
     hidden: torch.Tensor,
     *,
     kv_slot: CosmosDreamsKVSlot,
+    clean_frame_ranges: tuple[tuple[int, int, int], ...] | None = None,
     **write_kwargs: Any,
 ) -> torch.Tensor:
     batch_size, seq_len = hidden.shape[:2]
     q = _write_chunk_kv(attention, hidden, kv_slot=kv_slot, **write_kwargs)
-    out = attention.attn(q, kv_slot.keys, kv_slot.values)
+    keys, values = kv_slot.keys, kv_slot.values
+    if clean_frame_ranges is None:
+        out = attention.attn(q, keys, values)
+    else:
+        # Batch the projections, but keep attention frame-causal. Each frame
+        # reads text + sinks and its own sliding window, including itself.
+        tokens = seq_len // len(clean_frame_ranges)
+        outputs = []
+        for frame, (sink_end, window_start, frame_end) in enumerate(clean_frame_ranges):
+            if window_start <= sink_end:
+                frame_k, frame_v = keys[:, :frame_end], values[:, :frame_end]
+            else:
+                frame_k = torch.cat(
+                    [keys[:, :sink_end], keys[:, window_start:frame_end]], dim=1
+                )
+                frame_v = torch.cat(
+                    [values[:, :sink_end], values[:, window_start:frame_end]], dim=1
+                )
+            outputs.append(
+                attention.attn(
+                    q[:, frame * tokens : (frame + 1) * tokens], frame_k, frame_v
+                )
+            )
+        out = torch.cat(outputs, dim=1)
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out
 
@@ -557,8 +581,13 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
         null_action_frame_indexes: Sequence[int] = (),
+        clean_frame_ranges: tuple[tuple[int, int, int], ...] | None = None,
     ) -> None:
-        """Clean-refresh one chunk into ``kv_slots``, a control clip exactly like a clean frame."""
+        """Clean-refresh one chunk into ``kv_slots``, a control clip exactly like a clean frame.
+
+        ``clean_frame_ranges`` makes the chunk's attention frame-causal, one
+        ``(sink_end, window_start, frame_end)`` token range per frame in the slot block.
+        """
         hidden, layer_kwargs = self._prepare_chunk(
             hidden_states,
             None,
@@ -577,7 +606,12 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             if layer_idx == last_layer_idx:
                 layer.write_kv(hidden, kv_slot=kv_slot, **layer_kwargs)
             else:
-                hidden = layer(hidden, kv_slot=kv_slot, **layer_kwargs)
+                hidden = layer(
+                    hidden,
+                    kv_slot=kv_slot,
+                    clean_frame_ranges=clean_frame_ranges,
+                    **layer_kwargs,
+                )
 
     def _patch_count(self, latent_h: int, latent_w: int) -> int:
         grid_h, grid_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)

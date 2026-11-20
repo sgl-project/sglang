@@ -1,10 +1,9 @@
-"""DSA canonical CLI flags, env vars, and the deprecated "nsa" registry key."""
+"""DSA canonical CLI flags, env vars, and the attention registry key."""
 
 import argparse
 import os
 import sys
 import unittest
-import warnings
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../python"))
 
@@ -77,47 +76,14 @@ class TestCLICanonicalFlags(unittest.TestCase):
         args = self._parse(["--attention-backend", "dsa"])
         self.assertEqual(args.attention_backend, "dsa")
 
-    def test_attention_backend_nsa_still_accepted(self):
-        """attention_backend='nsa' still parses without error (registry handles the deprecation)."""
-        args = self._parse(["--attention-backend", "nsa"])
-        self.assertEqual(args.attention_backend, "nsa")
-
 
 class TestAttentionRegistry(unittest.TestCase):
-    """Registry: 'dsa' key creates backend; 'nsa' key emits DeprecationWarning."""
+    """Registry: the 'dsa' key creates the backend."""
 
     def test_dsa_key_registered(self):
         from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 
         self.assertIn("dsa", ATTENTION_BACKENDS)
-
-    def test_nsa_key_still_registered(self):
-        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-
-        self.assertIn("nsa", ATTENTION_BACKENDS, "nsa must remain as deprecated alias")
-
-    def test_nsa_key_emits_deprecation_warning(self):
-        """Calling the nsa factory should emit DeprecationWarning."""
-        from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-
-        nsa_factory = ATTENTION_BACKENDS.get("nsa")
-        self.assertIsNotNone(nsa_factory)
-
-        class _FakeRunner:
-            server_args = type("S", (), {"attention_backend": "nsa"})()
-
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            try:
-                nsa_factory(_FakeRunner())
-            except Exception:
-                pass  # import errors OK; we only care about DeprecationWarning
-            dep_warns = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            self.assertTrue(
-                len(dep_warns) > 0,
-                "Expected DeprecationWarning when using 'nsa' registry key",
-            )
-            self.assertIn("deprecated", str(dep_warns[0].message).lower())
 
 
 class TestEnvVarAliases(unittest.TestCase):

@@ -40,6 +40,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     multiview_canvas,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -1310,7 +1311,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             # Cast on the device: 0..255 is exact in the VAE dtype, and the
             # upload stays one byte per value.
             clip = clip.to(device).to(vae_dtype).div(127.5).sub(1.0)
-            with torch.no_grad():
+            with torch.no_grad(), use_gpu_conditioning_hash():
                 latent = self.vae.encode(clip, **encode_kwargs).mode()
             latent = (latent - mean.to(latent)) / std.to(latent)
             latents.append(latent.to(dtype))

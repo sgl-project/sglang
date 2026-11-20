@@ -34,6 +34,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
     CosmosDreamsTransferHistoryProfile,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -433,7 +434,7 @@ def encode_control_latent(
         dtype=vae_dtype,
         float32_first=float32_normalization,
     )
-    with torch.no_grad():
+    with torch.no_grad(), use_gpu_conditioning_hash():
         latent = vae.encode(pixels).mode()
     return _normalized_latent(vae, latent)
 
