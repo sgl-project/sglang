@@ -3,7 +3,7 @@
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
 use crate::message::config::{HiddenStatesMode, ServerArgs};
-use crate::message::request::{GenerateRequest, TokenizeInput};
+use crate::message::request::{GenerateRequest, GenerationPolicy, TokenizeInput, into_requests};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
 use crate::multi_modality::worker::MediaError;
@@ -1010,6 +1010,103 @@ fn negative_and_logprob_token_ids_rejected() {
         Err(_) | Ok(DetokMsg::Deregister { .. }) => {}
         Ok(_) => panic!("out-of-vocab token_ids_logprob must not be admitted"),
     }
+}
+
+fn into_intake(g: GenerateRequest) -> Request {
+    let (tx, _rx) = mpsc::channel(8);
+    Request {
+        rid: g.rid.clone(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tx),
+        kind: RequestKind::Generate(Box::new(g)),
+    }
+}
+
+fn logprob_req(id: u64, return_logprob: bool, top_logprobs_num: i64) -> Request {
+    let mut req = generate_req(id, SamplingParams::default());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.return_logprob = return_logprob;
+    g.top_logprobs_num = top_logprobs_num;
+    req
+}
+
+fn top_logprobs_num(req: &Request) -> i64 {
+    let RequestKind::Generate(g) = &req.kind else {
+        unreachable!()
+    };
+    g.top_logprobs_num
+}
+
+/// A logprob request's `top_logprobs_num` must lie in `[0, vocab_size]`: a
+/// negative count corrupts the scheduler's logprob batch, and one past the
+/// vocab fails `torch.topk` (Python `_validate_top_logprobs_num`).
+#[test]
+fn top_logprobs_num_outside_vocab_is_rejected() {
+    let limits = test_limits();
+    let vocab = limits.vocab_size as i64;
+    for k in [-1, i64::MIN, vocab + 1, i64::MAX] {
+        let err = validate(&mut logprob_req(41, true, k), &limits).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{k}: {err}");
+        assert!(
+            err.to_string().contains(&format!(
+                "top_logprobs must be an integer in [0, {vocab}], got {k}."
+            )),
+            "{err}"
+        );
+    }
+    for k in [0, vocab] {
+        let mut req = logprob_req(42, true, k);
+        assert!(validate(&mut req, &limits).is_ok(), "{k}");
+        assert_eq!(top_logprobs_num(&req), k, "an accepted count is sent as is");
+    }
+}
+
+/// Without `return_logprob` the count is not checked, and the scheduler gets 0:
+/// its logprob batch gathers every request's count, disabled ones included.
+#[test]
+fn disabled_logprobs_send_zero_top_logprobs_num() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    intake.drive(logprob_req(43, false, -1));
+    intake.drive(logprob_req(44, false, 1001));
+    let pushed = consumer.drain(16);
+    assert_eq!(pushed.len(), 2, "must reach the scheduler");
+    for req in &pushed {
+        let header = rmpv::decode::read_value(&mut &req.header[..]).unwrap();
+        let header = header.as_array().unwrap();
+        assert_eq!(header[9].as_bool(), Some(false), "return_logprob");
+        assert_eq!(header[11].as_i64(), Some(0), "top_logprobs_num");
+    }
+}
+
+/// A batch is checked item by item, after a list splits or a scalar
+/// broadcasts: only the items that request logprobs are bounded.
+#[test]
+fn batch_top_logprobs_num_is_checked_per_item() {
+    let items = |body: &str| -> Vec<Request> {
+        let body = serde_json::from_str(body).unwrap();
+        let (requests, is_batch) = into_requests(body, &GenerationPolicy::default()).unwrap();
+        assert!(is_batch);
+        requests.into_iter().map(into_intake).collect()
+    };
+    let limits = test_limits();
+
+    let mut split = items(
+        r#"{"text": ["a", "b", "c"], "return_logprob": [true, false, true],
+            "top_logprobs_num": [1000, 1001, 1001]}"#,
+    );
+    assert!(validate(&mut split[0], &limits).is_ok());
+    assert_eq!(top_logprobs_num(&split[0]), 1000);
+    assert!(validate(&mut split[1], &limits).is_ok());
+    assert_eq!(top_logprobs_num(&split[1]), 0);
+    assert!(validate(&mut split[2], &limits).is_err());
+
+    let mut broadcast =
+        items(r#"{"text": ["a", "b"], "return_logprob": [false, true], "top_logprobs_num": -1}"#);
+    assert!(validate(&mut broadcast[0], &limits).is_ok());
+    assert_eq!(top_logprobs_num(&broadcast[0]), 0);
+    assert!(validate(&mut broadcast[1], &limits).is_err());
 }
 
 #[test]
