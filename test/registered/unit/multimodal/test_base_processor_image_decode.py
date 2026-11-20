@@ -134,7 +134,7 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         Execute torchvision's real decoder on CPU at the CUDA boundary, so
         CPU CI checks the selected color mode and resulting pixels together.
         """
-        from torchvision.io import decode_jpeg, ImageReadMode
+        from torchvision.io import ImageReadMode, decode_jpeg
 
         def decode_on_cpu(data, **kwargs):
             self.assertEqual(kwargs.pop("device"), "cuda")
