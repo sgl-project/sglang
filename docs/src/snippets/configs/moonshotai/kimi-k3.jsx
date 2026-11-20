@@ -986,10 +986,10 @@ export const config = {
         // dispatch. Env var, not a flag, so it emits via env/stripEnv.
         id: "kdaFusedDecode", title: "Fused KDA Decode (AMD gfx950)",
         showWhen: (b) => ["mi350x", "mi355x"].includes(b.hw),
-        stripEnv: ["SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND"],
+        stripEnv: ["SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND"],
         options: [
           { id: "off",   label: "Off" },
-          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter"] },
+          { id: "aiter", label: "On (AITER fused boundary)", env: ["SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND=aiter"] },
         ],
       },
       {
@@ -1288,7 +1288,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -1318,7 +1318,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2062,7 +2062,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
@@ -2090,7 +2090,7 @@ export const config = {
       verificationStatus: "in-progress",
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_AITER_K3_OPT=1",
+        "SGLANG_OPT_HIP_K3_AITER=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
       ],
