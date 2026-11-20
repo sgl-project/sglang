@@ -75,7 +75,7 @@ if envs.SGLANG_FOO.get():
 
 | Method | Use |
 |---|---|
-| `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. |
+| `.get()` | Read value (parsed). Returns `default` if unset, or `None` if explicitly set to None. Raises `ValueError` naming the variable when the value does not parse; server startup parses every set variable first (`validate_env_values`). |
 | `.set(value)` | Set value. `set(None)` flips the internal `_set_to_none` flag so the next `.get()` returns `None`, not `default`. |
 | `.clear()` | Unset entirely. Next `.get()` returns `default`. |
 | `.is_set()` | True iff the key is present in `os.environ` (regardless of value, including the explicit-None case). |

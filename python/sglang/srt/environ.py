@@ -5,7 +5,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 
 @functools.lru_cache(maxsize=1)
@@ -79,7 +79,7 @@ class EnvField:
         try:
             return self.parse(value)
         except ValueError as e:
-            raise ValueError(f"Invalid value for {self.name}: {e}") from e
+            raise ValueError(f"Invalid value for {self.name}: {e}") from None
 
     def is_set(self):
         return self.name in os.environ
@@ -132,10 +132,15 @@ class EnvJSON(EnvField):
     def parse(self, value: str | None) -> list | dict | None:
         if not value:
             return None
-        if os.path.exists(value):
-            with open(value) as f:
-                return json.load(f)
-        return json.loads(value)
+        try:
+            if os.path.exists(value):
+                with open(value) as f:
+                    return json.load(f)
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f'"{value}" is not valid JSON, inline or in the file it names ({e})'
+            )
 
 
 class EnvBool(EnvField):
@@ -2671,15 +2676,24 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+def _registered_fields() -> Iterator[EnvField]:
+    return (value for value in vars(Envs).values() if isinstance(value, EnvField))
+
+
 def exportable_env_vars() -> dict[str, str]:
     return {
         field.name: _exportable_value(os.environ[field.name])
-        for field in sorted(
-            (value for value in vars(Envs).values() if isinstance(value, EnvField)),
-            key=lambda field: field.name,
-        )
+        for field in sorted(_registered_fields(), key=lambda field: field.name)
         if not field.secret and field.name in os.environ
     }
+
+
+def validate_env_values() -> None:
+    """Parse every registered variable that is set, so a malformed value stops
+    startup instead of failing at its first read, which may be mid-serving."""
+    for field in _registered_fields():
+        if field.is_set():
+            field.get()
 
 
 def _exportable_value(value: str) -> str:
