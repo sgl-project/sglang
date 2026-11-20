@@ -528,6 +528,8 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+    # Set by `maybe_init_disagg_decode_prebuilt_queue`; read on every role.
+    disagg_decode_prebuilt_queue: Optional[IndexedReqList] = None
 
     def __init__(
         self,
@@ -1635,6 +1637,7 @@ class Scheduler(
         )
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        self.disagg_decode_prebuilt_queue = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
@@ -1737,6 +1740,7 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
                 draft_kv_ring=draft_kv_ring,
             )
+            self.maybe_init_disagg_decode_prebuilt_queue()
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -1942,6 +1946,24 @@ class Scheduler(
                 self.truncation_align_size, chunk_size
             )
 
+    def maybe_init_disagg_decode_prebuilt_queue(self):
+        """The transferred requests of a decode server that also prefills
+        locally; waiting_queue then holds only the requests prefilled here."""
+        if get_disagg().disaggregation_decode_enable_local_prefill:
+            self.disagg_decode_prebuilt_queue = IndexedReqList(
+                ListKind.PD_PREBUILT, abort=self._abort_prebuilt
+            )
+
+    def _abort_prebuilt(self, recv_req: AbortReq) -> None:
+        # Like a waiting PD decode request: its transferred KV is checkpointed.
+        for req in [
+            r for r in self.disagg_decode_prebuilt_queue if recv_req.matches(r.rid)
+        ]:
+            self.request_retirer.abort(
+                req, finished_reason=recv_req.finished_reason, checkpoint=True
+            )
+            logger.debug(f"Abort prebuilt queue request. {req.rid=}")
+
     def check_truncation_align_fits_chunk(self):
         """A chunk shorter than the alignment truncates to zero tokens, so a prompt
         longer than the chunk would wait in the queue forever."""
@@ -1949,8 +1971,11 @@ class Scheduler(
         chunk = self.chunked_prefill_size
         if align is None or chunk is None or chunk >= align:
             return
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            # A decode server never prefills a prompt.
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and not get_disagg().disaggregation_decode_enable_local_prefill
+        ):
+            # A decode server without local prefill never prefills a prompt.
             return
         attn_dp_size = get_parallel().attn_dp_size
         dp_note = (
@@ -2930,6 +2955,9 @@ class Scheduler(
             get_chunked_req=lambda: self.chunked_req,
             get_request_lists=self.request_lists,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
+            get_decode_local_prefill=lambda: (
+                self.disagg_decode_prebuilt_queue is not None
+            ),
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
             ),
@@ -3416,6 +3444,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                disagg_local_prefill=recv_req.disagg_local_prefill,
                 kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
@@ -3450,7 +3479,15 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
-                if (
+                error_msg = None
+                if req.disagg_local_prefill:
+                    if self.disagg_decode_prebuilt_queue is None:
+                        error_msg = (
+                            f"Invalid request: disagg_local_prefill requires a "
+                            f"decode server with "
+                            f"--disaggregation-decode-enable-local-prefill. {req.rid=}"
+                        )
+                elif (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
                 ):
@@ -3458,6 +3495,7 @@ class Scheduler(
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
                     )
+                if error_msg is not None:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.request_retirer.retire_unadmitted(req)
@@ -3906,7 +3944,10 @@ class Scheduler(
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
-        if self.disaggregation_mode == DisaggregationMode.NULL:
+        if self.disaggregation_mode == DisaggregationMode.NULL or (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and req.disagg_local_prefill
+        ):
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -4028,7 +4069,10 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            for req in self.waiting_queue:
+            for req in (
+                *self.waiting_queue,
+                *(self.disagg_decode_prebuilt_queue or ()),
+            ):
                 entry_time = req.time_stats.wait_queue_entry_time
                 if 0 < entry_time < deadline:
                     aborts.append(
@@ -5053,6 +5097,8 @@ class Scheduler(
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
+        if self.disagg_decode_prebuilt_queue is not None:
+            lists[ListKind.PD_PREBUILT] = self.disagg_decode_prebuilt_queue
         if self.dllm_config is not None:
             # It also holds the requests the current round runs.
             lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
@@ -6131,7 +6177,7 @@ class Scheduler(
 
         lists = self.request_lists()
         if for_health_check:
-            busy_lists = {ListKind.CHUNKED, ListKind.WAITING}
+            busy_lists = {ListKind.CHUNKED, ListKind.WAITING, ListKind.PD_PREBUILT}
             if not self.pause_state.paused:
                 busy_lists.add(ListKind.PD_RETRACTED)
         else:
@@ -6685,6 +6731,8 @@ class Scheduler(
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
             retract_reqs += [r for r in self.waiting_queue if r.kv.holds_kv]
+            if self.disagg_decode_prebuilt_queue is not None:
+                retract_reqs += list(self.disagg_decode_prebuilt_queue)
 
         # The chunked, a staged or a dLLM request may also sit in a batch.
         retract_reqs = list(dict.fromkeys(retract_reqs))
@@ -6712,10 +6760,14 @@ class Scheduler(
             if req in reqs_to_abort:
                 # retract_all recorded the reason and freed any member rows.
                 self.request_retirer.abort_retracted(req, reason=req.to_finish)
-            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            elif (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and not req.disagg_local_prefill
+            ):
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
+                # A request this decode server prefilled is prefilled again here.
                 self._add_request_to_queue(req)
 
     def _publish_paused_state(self):

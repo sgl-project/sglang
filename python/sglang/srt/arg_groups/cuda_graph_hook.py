@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
+    runs_prefill_of,
 )
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
@@ -600,7 +601,7 @@ def apply_cuda_graph_disaggregation_roles(server_args: Any):
                     cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
                 ),
             )
-    elif cfg.disaggregation_mode == "decode":
+    elif not runs_prefill_of(cfg):
         if (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked:
             declare_resolution(
                 server_args,

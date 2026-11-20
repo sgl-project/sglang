@@ -66,6 +66,7 @@ class _FakeReq(SimpleNamespace):
     """A request stand-in compared and hashed by identity, like Req."""
 
     owner_list = None
+    disagg_local_prefill = False
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 

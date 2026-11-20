@@ -591,6 +591,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         scheduler = SimpleNamespace(
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
             waiting_queue=waiting_queue,
+            disagg_decode_prebuilt_queue=None,
             running_reqs=KeyedReqList(ListKind.DECODING),
             enable_priority_scheduling=False,
             req_to_token_pool=SimpleNamespace(size=4),

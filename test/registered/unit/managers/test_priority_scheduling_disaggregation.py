@@ -102,6 +102,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         )
         req.priority = priority
         req.rid = "req"
+        req.disagg_local_prefill = False
         req.output_ids = []
         req.weight_version_events = []
         req.time_stats = MagicMock()

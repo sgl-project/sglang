@@ -116,8 +116,9 @@ class RequestRetirer:
             self.hisparse_coordinator.release_request(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
-        # that will rebootstrap passes offload_kv=False to skip the copy.
-        if get_disagg().disaggregation_mode != "decode":
+        # that will rebootstrap passes offload_kv=False to skip the copy. A request
+        # this decode server prefilled itself is prefilled again here instead.
+        if get_disagg().disaggregation_mode != "decode" or req.disagg_local_prefill:
             resumable = req.resumable_by_reprefill
         elif offload_kv:
             resumable = backup_kv_cache(

@@ -248,6 +248,27 @@ gated requests could never start. A request that expires or loses its
 client while waiting has its prefill aborted; requests with a caller-set `rid`
 and fan-out requests go to decode at once.
 
+### Local prefill on decode
+
+In multi-turn and agentic traffic, the decode worker that served the previous
+turn holds that turn's prompt and output in its radix cache, so the next turn
+needs only a short prefill. `--pd-local-prefill-max-uncached-tokens N` sends
+such a request to that decode worker alone, with `disagg_local_prefill: true`
+and no bootstrap fields, when the local KV-event tree shows a healthy decode
+worker holding its prefix with at most N uncached tokens left; the worker
+prefills the suffix itself, and the route credits it in the pending-prefix
+tier. Where several decode workers qualify, the deepest prefix wins. Other
+requests take the prefill-then-decode path, so one decode pool serves both.
+
+The decode engines must run `--disaggregation-decode-enable-local-prefill`,
+with `--disaggregation-decode-enable-radix-cache` and KV events, or they
+reject the marked request with 400. The router needs a tokenizer for the
+decision and builds the local KV-event tree from the engines'
+`--kv-events-config` publishers under any policy; an external indexer, batched
+prompts, fan-out requests, the gRPC client path and reorg chat routing always
+go through prefill. `sgl_router_pd_local_prefill_total{outcome}` counts the decisions:
+`routed`, `no_prefix` and `uncached_over_limit`.
+
 ### Retries
 
 `--retry-max-attempts N` (default 1, which disables retries; 3 is typical) lets

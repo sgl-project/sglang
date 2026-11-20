@@ -460,6 +460,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        disagg_local_prefill: bool = False,
         kv_hints: Optional[KvHintsEnvelope] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
@@ -790,7 +791,13 @@ class Req(ReqDllmMixin):
         if time_stats is not None:
             self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
         else:
-            self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
+            self.time_stats = SchedulerReqTimeStats(
+                # A request prefilled on the decode server is staged like an
+                # aggregated one: queue, prefill, then decode.
+                disagg_mode=(
+                    DisaggregationMode.NULL if disagg_local_prefill else disagg_mode
+                )
+            )
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
@@ -813,6 +820,8 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # PD decode prefills this request itself; it has no prefill peer.
+        self.disagg_local_prefill: bool = disagg_local_prefill
         # Orchestrator KV hints, forwarded to the HiCache storage backends.
         self.kv_hints: Optional[KvHintsEnvelope] = kv_hints
 

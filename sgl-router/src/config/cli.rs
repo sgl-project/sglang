@@ -185,6 +185,15 @@ pub struct ServerArgs {
     #[arg(long)]
     pub decode_dispatch_limit: Option<NonZeroU32>,
 
+    /// PD: send a request only to a decode worker whose KV cache holds its
+    /// prefix, marked `disagg_local_prefill`, when the uncached suffix is at
+    /// most N tokens; that worker prefills the suffix itself. Builds the local
+    /// KV-event tree from the engines' --kv-events-config publishers; the decode
+    /// engines need --disaggregation-decode-enable-local-prefill. Legacy chat
+    /// routing only.
+    #[arg(long, value_name = "N")]
+    pub pd_local_prefill_max_uncached_tokens: Option<u64>,
+
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
     /// after streaming starts, it aborts the body without changing the HTTP status.
@@ -723,6 +732,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
+                local_prefill_max_uncached_tokens: self.server.pd_local_prefill_max_uncached_tokens,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,

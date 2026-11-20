@@ -473,6 +473,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
+    # Set in __init__; a stand-in built without it does no local prefill.
+    local_prefill: bool = False
+
     _defer_publish: bool = False
 
     def __init__(
@@ -538,6 +541,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = parallel.pp_rank
         self.pp_size = parallel.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
+        # The scheduler then also prefills requests marked disagg_local_prefill.
+        self.local_prefill = get_disagg().disaggregation_decode_enable_local_prefill
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue = IndexedReqList(
@@ -1754,6 +1759,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             }
             running_loras.update(req.lora_id for req in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
+            if self.local_prefill:
+                running_loras.update(
+                    req.lora_id for req in self.scheduler.disagg_decode_prebuilt_queue
+                )
 
         # Then, preallocate the remaining requests if possible
         self.host_pool_blocked = False
@@ -2731,6 +2740,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             len(self.scheduler.running_batch.reqs)
             + num_device_transfer_reqs
             + len(self.scheduler.waiting_queue)
+            + (
+                len(self.scheduler.disagg_decode_prebuilt_queue)
+                if self.local_prefill
+                else 0
+            )
             + extra_reserved_reqs
         )
 
@@ -2839,6 +2853,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             allocatable_tokens -= full_required
 
         allocatable_tokens -= hicache_reserved_tokens
+        if (
+            self.local_prefill
+            and (chunked_req := self.scheduler.chunked_req) is not None
+        ):
+            # A local chunked prefill keeps the pages of its remaining chunks.
+            allocatable_tokens -= (
+                len(chunked_req.full_untruncated_fill_ids) - chunked_req.extend_end
+            )
         return allocatable_tokens
 
     @capacity_decision
@@ -4058,6 +4080,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
 
+def _prebuilt_reqs(
+    *, prebuilt_queue: Optional[IndexedReqList], waiting_queue: ReqList
+) -> ReqList:
+    """Where transferred requests wait for a slot: their own list when the
+    server also prefills locally, else waiting_queue."""
+    return waiting_queue if prebuilt_queue is None else prebuilt_queue
+
+
+def _num_local_prefill_reqs_joining(
+    *, last_batch: Optional[ScheduleBatch], chunked_req: Optional[Req]
+) -> int:
+    joining = set()
+    if last_batch is not None and last_batch.forward_mode.is_extend():
+        joining.update(last_batch.reqs)
+    if chunked_req is not None:
+        joining.add(chunked_req)
+    return len(joining)
+
+
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -4081,13 +4122,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
             self.cur_batch_for_debug = batch
             self._flush_staging_scatters()
 
@@ -4142,13 +4180,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             plan = self.get_next_disagg_decode_batch_to_run(
-                running_batch=self.running_batch
+                running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
-            batch = self.ngram_embedding_manager.prepare_for_forward(
-                batch, chunked_req=self.chunked_req
-            )
             self.cur_batch_for_debug = batch
             self._flush_staging_scatters()
 
@@ -4205,13 +4240,28 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch] = None,
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        num_joining_reqs = (
+            0
+            if self.disagg_decode_prebuilt_queue is None
+            else _num_local_prefill_reqs_joining(
+                last_batch=last_batch, chunked_req=self.chunked_req
+            )
+        )
+        new_prebuilt_batch = self.get_new_prebuilt_batch(
+            running_batch=running_batch, num_joining_reqs=num_joining_reqs
+        )
         if new_prebuilt_batch:
-            assert self.chunked_req is None
+            # Only a local prefill leaves a chunked request on a decode server.
+            assert (
+                self.chunked_req is None
+                or self.disagg_decode_prebuilt_queue is not None
+            )
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
@@ -4224,6 +4274,13 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
 
+        if self.disagg_decode_prebuilt_queue is not None:
+            # Local prefill runs through the aggregated scheduling path, which
+            # merges the last prefill batch, runs the next chunk or decodes.
+            return self.get_next_batch_to_run(
+                running_batch=running_batch, last_batch=last_batch
+            )
+
         # Schedule decode batch
         if running_batch.is_empty():
             ret = None
@@ -4232,14 +4289,19 @@ class SchedulerDisaggregationDecodeMixin:
             ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
+        ret = self.ngram_embedding_manager.prepare_for_forward(
+            ret, chunked_req=self.chunked_req
+        )
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_new_prebuilt_batch(
-        self, running_batch: ScheduleBatch
+        self, running_batch: ScheduleBatch, num_joining_reqs: int = 0
     ) -> Optional[ScheduleBatch]:
-        batch = self._get_new_prebuilt_batch(running_batch)
+        batch = self._get_new_prebuilt_batch(
+            running_batch=running_batch, num_joining_reqs=num_joining_reqs
+        )
         if batch is None:
             return None
         nonblocking = self._nonblocking_admit_in_scope(batch)
@@ -4378,7 +4440,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _get_new_prebuilt_batch(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, running_batch: ScheduleBatch, num_joining_reqs: int = 0
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -4386,12 +4448,16 @@ class SchedulerDisaggregationDecodeMixin:
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if len(self.waiting_queue) == 0:
+        prebuilt_reqs = _prebuilt_reqs(
+            prebuilt_queue=self.disagg_decode_prebuilt_queue,
+            waiting_queue=self.waiting_queue,
+        )
+        if len(prebuilt_reqs) == 0:
             return None
 
         if self.enable_priority_scheduling:
-            self.waiting_queue.reorder(
-                self.policy.calc_priority(self.waiting_queue, running_batch)
+            prebuilt_reqs.reorder(
+                self.policy.calc_priority(prebuilt_reqs, running_batch)
             )
 
         host_restore = get_disagg().disaggregation_decode_host_receive_threshold < 1
@@ -4400,16 +4466,17 @@ class SchedulerDisaggregationDecodeMixin:
             self._start_host_restores()
             restores_ready = self._host_restores_ready()
 
-        curr_batch_size = running_batch.batch_size()
+        # Local prefill requests joining the running batch this step hold slots too.
+        curr_batch_size = running_batch.batch_size() + num_joining_reqs
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
 
-        # pop req from waiting queue
+        # pop req from the prebuilt queue
         can_run_list: List[Req] = []
 
-        for req in self.waiting_queue:
+        for req in prebuilt_reqs:
             # we can only add at least `num_not_used_batch` new batch to the running queue;
             # a request restored from host memory waits until its copy has finished
             if len(can_run_list) < num_not_used_batch and (
@@ -4464,7 +4531,12 @@ class SchedulerDisaggregationDecodeMixin:
         every rank that shares it (`_host_restores_ready`), so the scheduler does
         not wait for a copy on the host; under PP, admission waits for it there."""
         reqs = [
-            req for req in self.waiting_queue if req.kv.retraction_backup is not None
+            req
+            for req in _prebuilt_reqs(
+                prebuilt_queue=self.disagg_decode_prebuilt_queue,
+                waiting_queue=self.waiting_queue,
+            )
+            if req.kv.retraction_backup is not None
         ]
         if not reqs:
             return
@@ -4511,7 +4583,12 @@ class SchedulerDisaggregationDecodeMixin:
         (`finish_restore_kv_cache`) waits for the copy on the host, as the
         synchronous restore did, so every stage admits the same requests."""
         pending = [
-            req for req in self.waiting_queue if req.kv.restore_done_event is not None
+            req
+            for req in _prebuilt_reqs(
+                prebuilt_queue=self.disagg_decode_prebuilt_queue,
+                waiting_queue=self.waiting_queue,
+            )
+            if req.kv.restore_done_event is not None
         ]
         if not pending:
             return set()
@@ -4555,7 +4632,11 @@ class SchedulerDisaggregationDecodeMixin:
         self.disagg_decode_transfer_queue.publish_pending_metadata()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        self.disagg_decode_prealloc_queue.move_resumed(self.waiting_queue)
+        prebuilt_reqs = _prebuilt_reqs(
+            prebuilt_queue=self.disagg_decode_prebuilt_queue,
+            waiting_queue=self.waiting_queue,
+        )
+        self.disagg_decode_prealloc_queue.move_resumed(prebuilt_reqs)
         # if there are still retracted requests, we do not allocate new requests;
         # transfers already hold their pages and are still polled, so they can finish
         has_retracted = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
@@ -4578,7 +4659,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self._preallocate_new_requests()
             # The requests whose KV has arrived.
             transferred_reqs = self.disagg_decode_transfer_queue.move_transferred(
-                self.waiting_queue
+                prebuilt_reqs
             )
             if self.enable_hisparse:
                 for req in transferred_reqs:
