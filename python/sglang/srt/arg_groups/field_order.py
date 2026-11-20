@@ -577,5 +577,6 @@ POSITIONAL_FIELD_ORDER = (
     "uniboost_gamma",
     "enable_uniboost_gamma_ada",
     "watermark_algorithm",
+    "_prefill_delayer_max_delay_passes_explicitly_set",
 )
 # fmt: on

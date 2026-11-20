@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
-DEFAULT_MAX_DELAY_PASSES = 30
-
 logger = logging.getLogger(__name__)
 
 
@@ -78,18 +76,18 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        max_delay_passes: Optional[int],
+        max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         debug_log_enabled: bool = True,
     ):
+        self._max_delay_passes = max_delay_passes
         # Only an explicit max_delay_passes bounds queue-triggered delays;
         # otherwise they are bounded by max_delay_ms alone.
-        self._queue_max_delay_passes = max_delay_passes
-        self._max_delay_passes = (
+        self._queue_max_delay_passes = (
             max_delay_passes
-            if max_delay_passes is not None
-            else DEFAULT_MAX_DELAY_PASSES
+            if get_schedule()._prefill_delayer_max_delay_passes_explicitly_set
+            else None
         )
         self._token_usage_low_watermark = token_usage_low_watermark
         self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled

@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.fields.schedule import Schedule
 from sglang.srt.managers.prefill_delayer import (
-    DEFAULT_MAX_DELAY_PASSES,
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
@@ -118,6 +118,9 @@ class TestPrefillDelayerClockSkew(CustomTestCase):
                     self.assertEqual(kwargs["queue_timeout_expired"], local_expired)
 
 
+_DEFAULT_MAX_DELAY_PASSES = Schedule().prefill_delayer_max_delay_passes
+
+
 def _gather_on_one_rank(output, local, group=None):
     output.copy_(local)
 
@@ -149,6 +152,9 @@ class TestPrefillDelayerQueueTrigger(CustomTestCase):
                 enable_prefill_delayer=True,
                 prefill_delayer_queue_min_ratio=queue_min_ratio,
                 prefill_max_requests=prefill_max_requests,
+                _prefill_delayer_max_delay_passes_explicitly_set=(
+                    max_delay_passes is not None
+                ),
             )
         )
         stack.enter_context(
@@ -163,7 +169,12 @@ class TestPrefillDelayerQueueTrigger(CustomTestCase):
             )
         )
         delayer = PrefillDelayer(
-            max_delay_passes=max_delay_passes, token_usage_low_watermark=None
+            max_delay_passes=(
+                _DEFAULT_MAX_DELAY_PASSES
+                if max_delay_passes is None
+                else max_delay_passes
+            ),
+            token_usage_low_watermark=None,
         )
         delayer.skip_first_delayer = False
         return delayer
@@ -206,7 +217,7 @@ class TestPrefillDelayerQueueTrigger(CustomTestCase):
 
     def test_queue_delay_outlasts_default_max_delay_passes(self):
         delayer = self.make_delayer()
-        for _ in range(DEFAULT_MAX_DELAY_PASSES + 5):
+        for _ in range(_DEFAULT_MAX_DELAY_PASSES + 5):
             self.assertEqual(self.negotiate(delayer), (False, "delay"))
 
     def test_explicit_max_delay_passes_caps_queue_delay(self):

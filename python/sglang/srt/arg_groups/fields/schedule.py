@@ -252,11 +252,14 @@ class Schedule(msgspec.Struct):
         bool, "Enable prefill delayer for DP attention to reduce idle time."
     ] = False
     prefill_delayer_max_delay_passes: A[
-        Optional[int],
-        "Maximum forward passes to delay prefill; defaults to 30 if unset. "
-        "Queue-triggered delays are bounded by --prefill-delayer-max-delay-ms, "
-        "and by this only when it is set.",
-    ] = None
+        int,
+        "Maximum forward passes to delay prefill. Queue-triggered delays are "
+        "bounded by --prefill-delayer-max-delay-ms, and by this only when it "
+        "is set explicitly.",
+    ] = 30
+    # The value alone cannot distinguish the default from an explicit 30,
+    # which also bounds queue-triggered delays.
+    _prefill_delayer_max_delay_passes_explicitly_set: A[bool, Arg(no_cli=True)] = False
     prefill_delayer_token_usage_low_watermark: A[
         Optional[float], "Token usage low watermark for prefill delayer."
     ] = None

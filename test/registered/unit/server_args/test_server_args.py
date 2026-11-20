@@ -483,6 +483,19 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
+    def test_prefill_delayer_max_delay_passes_explicitness_is_preserved(self):
+        base = ["--model-path", "dummy"]
+        omitted = prepare_server_args(base)
+        separated = prepare_server_args(
+            base + ["--prefill-delayer-max-delay-passes", "30"]
+        )
+        joined = prepare_server_args(base + ["--prefill-delayer-max-delay-passes=30"])
+
+        self.assertFalse(omitted._prefill_delayer_max_delay_passes_explicitly_set)
+        self.assertTrue(separated._prefill_delayer_max_delay_passes_explicitly_set)
+        self.assertTrue(joined._prefill_delayer_max_delay_passes_explicitly_set)
+        self.assertEqual(omitted.prefill_delayer_max_delay_passes, 30)
+
     def test_monokernel_flags_in_config_and_cli(self):
         """--enable-amd-monokernel and --enable-nvidia-megakernel parse the same
         from the command line and from a config file."""

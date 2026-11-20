@@ -791,9 +791,18 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
         for arg in argv
     )
 
+    prefill_delayer_max_delay_passes_explicitly_set = any(
+        arg == "--prefill-delayer-max-delay-passes"
+        or arg.startswith("--prefill-delayer-max-delay-passes=")
+        for arg in argv
+    )
+
     raw_args = parser.parse_args(argv)
     raw_args._radix_eviction_policy_explicitly_set = (
         radix_eviction_policy_explicitly_set
+    )
+    raw_args._prefill_delayer_max_delay_passes_explicitly_set = (
+        prefill_delayer_max_delay_passes_explicitly_set
     )
 
     # Set up basic logging before ServerArgs.__post_init__ so that
