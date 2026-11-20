@@ -87,7 +87,7 @@ def independent_draft_reservation_bytes(kvc):
         raise ValueError(
             "Independent draft storage requires an explicit --max-running-requests"
         )
-    owners = 1
+    owners = spec.speculative_draft_cohort_size
     requests = max(1, requested // kvc.attn_dp_size)
     config = kvc.spec_aux_config.draft_model_config
     mixed = spec.speculative_draft_kv_layout == "hybrid"
@@ -282,7 +282,13 @@ def allocate_independent_draft_cache(worker, target_requests, *, mixed):
         raise ValueError(
             "Hybrid DFlash requires a single native window plus full-attention layers"
         )
-    owners = 1
+    cohort = worker._cohort
+    owners = cohort.owner_count if cohort is not None else 1
+    if cohort is not None:
+        sizes = cohort.group.all_gather_object(target_requests.size)
+        if len(set(sizes)) != 1:
+            raise ValueError("Draft cohort members must agree on request-slot capacity")
+        cohort.owner_slots = target_requests.size
     layout = DraftSlotLayout(
         slots=target_requests.size * owners,
         context_length=worker.model_runner.model_config.context_len,
@@ -348,7 +354,9 @@ def allocate_independent_draft_cache(worker, target_requests, *, mixed):
         requests=requests,
         allocator=allocator,
         device=worker.device,
-        local_slot_offset=(0),
+        local_slot_offset=(
+            target_requests.size * cohort.owner_rank if cohort is not None else 0
+        ),
     )
     # Every request slot already reserves its entire model context in this
     # private slab. Report capacity in the target allocator's token units:

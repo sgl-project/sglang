@@ -306,6 +306,19 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "Independent DFlash KV and the native draft KV ring are mutually exclusive"
         )
 
+    cohort = cfg.speculative_draft_cohort_size
+    if cohort < 1 or cfg.attn_dp_size % cohort:
+        raise ValueError(
+            "DFLASH draft cohort size must be a positive divisor of attention DP size."
+        )
+    if cohort > 1:
+        if cfg.speculative_draft_kv_layout == "shared":
+            raise ValueError("DFLASH cohorts require independent draft cache.")
+        if cfg.enable_nvidia_megakernel:
+            raise ValueError(
+                "Eager DFLASH cohorts do not yet support the megakernel execution path."
+            )
+
     if cfg.speculative_draft_kv_layout != "shared":
         if cfg.max_running_requests is None:
             raise ValueError(

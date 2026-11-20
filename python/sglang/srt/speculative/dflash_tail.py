@@ -78,6 +78,8 @@ def forward_target_only_tail(worker, batch, *, on_publish=None, grammar_barrier=
         if idle
         else batch.spec_info.bonus_tokens.reshape(count, 1)
     )
+    if worker._cohort is not None:
+        tokens = worker._cohort.propose(batch, prefix_lens=prefix, target_only=True)
     positions = (
         torch.empty((0,), dtype=torch.int64, device=device)
         if idle
@@ -175,7 +177,9 @@ def forward_target_only_tail(worker, batch, *, on_publish=None, grammar_barrier=
     else:
         bonus = torch.empty((0,), dtype=torch.int64, device=device)
         hidden = None
-    if count:
+    if worker._cohort is not None:
+        worker._cohort.commit(hidden, commits if count else None)
+    elif count:
         slots = batch.req_pool_indices
         full, window, _ = worker._independent_cache.locations(slots, positions, commits)
         worker._append_target_hidden_to_draft_kv_by_loc(
