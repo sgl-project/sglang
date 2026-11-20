@@ -668,7 +668,6 @@ _PREFILL_TILE_Q = 256
 def _zero_pad_heads(
     x: torch.Tensor, num_heads: int, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Append zero heads to x [tokens, heads, dim] up to num_heads, cast to dtype."""
     out = x.new_empty((x.shape[0], num_heads, *x.shape[2:]), dtype=dtype)
     out[:, : x.shape[1]].copy_(x)
     out[:, x.shape[1] :].zero_()
@@ -880,11 +879,9 @@ class AiterAttnBackend(AttentionBackend):
             and get_exec().kernel.mla_fp8_prefill_extended
             and not model_runner.is_draft_worker
         )
-        # The asm fp8 prefill reduces through mla_reduce_v1, which only has
-        # instantiations for the head shapes in _MLA_REDUCE_V1_HEADS (or, on the
-        # extended paths, the ones the compiled AITER reports); anything else is
-        # padded up to one it does carry, or falls back to flash_attn_varlen_func
-        # when the table has nothing to reach.
+        # mla_reduce_v1 has instances only for _MLA_REDUCE_V1_HEADS (plus what
+        # AITER reports on the extended paths);
+        # other head counts pad up to one, or fall back to flash_attn_varlen_func.
         self.fp8_prefill_num_head = (
             self.check_fp8_prefill_num_head(
                 num_head=self.num_head,
@@ -2809,10 +2806,8 @@ class AiterAttnBackend(AttentionBackend):
         total_q = q.shape[0]
         nhead = layer.tp_q_head_num
         v_head_dim = layer.v_head_dim
-        # mla_reduce_v1 dispatches on the head count, so a model it has no
-        # instantiation for runs on the next one up, with the extra output columns
-        # sliced back off. The extended paths pad with zero heads straight into fp8;
-        # the others tile the query heads to fill.
+        # A head count without an mla_reduce_v1 instance runs on the next one up and slices the extra columns off;
+        # the extended paths pad zero heads straight into fp8, the others tile the query heads.
         head_pad = self.fp8_prefill_num_head - nhead
         if head_pad and self.mla_fp8_prefill_extended:
             nhead = self.fp8_prefill_num_head

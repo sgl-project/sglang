@@ -32,7 +32,6 @@ KIMI_K3_TP8_HEADS = 12
 
 
 def _backend(num_heads, q_lens, extended=True):
-    """The backend with mla_fp8_prefill_extended as a model override declares it."""
     backend = object.__new__(AiterAttnBackend)
     backend.device = torch.device("cuda")
     backend.input_dtype = torch.bfloat16
@@ -86,7 +85,7 @@ def _cat_k(k_nope, k_pe):
 
 
 def _reference(q, k, v, q_lens, kv_lens, fp8_inputs=True):
-    """fp32 non-causal attention per request over the (fp8-rounded) inputs."""
+    # fp32 non-causal attention per request over the (fp8-rounded) inputs.
     in_dtype = fp8_dtype if fp8_inputs else q.dtype
     q, k, v = (t.to(in_dtype).float() for t in (q, k, v))
     out = torch.zeros(q.shape[0], q.shape[1], V_HEAD, device=q.device)
