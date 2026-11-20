@@ -23,31 +23,37 @@ class TestKTailSafeTiling(CustomTestCase):
     def test_narrows_a_tail_in_an_unfilled_stage(self):
         # Two K blocks in three stages: the tail lands in a never-filled stage.
         self.assertEqual(
-            k_tail.k_tail_safe_tiling(1024, k=1536, num_stages=3), (512, 3)
+            k_tail.k_tail_safe_tiling(block_k=1024, k=1536, num_stages=3), (512, 3)
         )
         # No power of two >= 128 divides 2880; six blocks of 512 put the tail in a filled stage.
         self.assertEqual(
-            k_tail.k_tail_safe_tiling(1024, k=2880, num_stages=3), (512, 3)
+            k_tail.k_tail_safe_tiling(block_k=1024, k=2880, num_stages=3), (512, 3)
         )
         # A block wider than K is shrunk to K's next power of two first, as the kernel wrapper does.
-        self.assertEqual(k_tail.k_tail_safe_tiling(2048, k=768, num_stages=3), (256, 3))
+        self.assertEqual(
+            k_tail.k_tail_safe_tiling(block_k=2048, k=768, num_stages=3), (256, 3)
+        )
 
     def test_keeps_a_tail_in_a_filled_stage(self):
         # Kimi-K3 TP8 dense down_proj: five blocks in three stages keep AITER's block (128 is 1.7x slower).
         self.assertEqual(
-            k_tail.k_tail_safe_tiling(1024, k=4224, num_stages=3), (1024, 3)
+            k_tail.k_tail_safe_tiling(block_k=1024, k=4224, num_stages=3), (1024, 3)
         )
         # The boundary: one block more than stages.
         self.assertEqual(
-            k_tail.k_tail_safe_tiling(1024, k=3136, num_stages=3), (1024, 3)
+            k_tail.k_tail_safe_tiling(block_k=1024, k=3136, num_stages=3), (1024, 3)
         )
-        self.assertEqual(k_tail.k_tail_safe_tiling(512, k=1088, num_stages=2), (512, 2))
+        self.assertEqual(
+            k_tail.k_tail_safe_tiling(block_k=512, k=1088, num_stages=2), (512, 2)
+        )
 
     def test_drops_stages_when_the_minimum_block_is_not_enough(self):
         # Three blocks of the minimum 128 in three stages.
-        self.assertEqual(k_tail.k_tail_safe_tiling(256, k=320, num_stages=3), (128, 2))
+        self.assertEqual(
+            k_tail.k_tail_safe_tiling(block_k=256, k=320, num_stages=3), (128, 2)
+        )
         # One masked block cannot share a stage with a full one.
-        self.assertIsNone(k_tail.k_tail_safe_tiling(256, k=96, num_stages=3))
+        self.assertIsNone(k_tail.k_tail_safe_tiling(block_k=256, k=96, num_stages=3))
 
 
 class TestKTailSafeConfig(CustomTestCase):
