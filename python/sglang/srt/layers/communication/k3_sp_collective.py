@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-_SUPPORTED_WORLD_SIZES = (4, 8, 16)
+_SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 
 # Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
 # must resolve the same (buffer, offset) for these, which a per-forward
@@ -104,7 +104,7 @@ def _create_state(group: GroupCoordinator, buffers: Sequence[str]) -> Optional[_
     has_multicast = lease is not None and lease.has_multicast
     if not has_multicast:
         message = (
-            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "K3 SP collective requires SM100/SM103, TP2/TP4/TP8/TP16, "
             "MegaMoE/DeepEP, and a multicast symmetric workspace; using NCCL "
             "(group=%s, sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
             % (
@@ -548,7 +548,7 @@ _SP_BLOCK_SIZE = 1024
 def _sp_multicast() -> bool:
     ready = (
         k3_ar_fusion.enabled()
-        and get_parallel().tp_group.world_size in _SUPPORTED_WORLD_SIZES
+        and get_parallel().tp_group.world_size in (4, 8, 16)
         and k3_ar_fusion.register_sp_collective_comm()
     )
     logger.info(
