@@ -60,6 +60,31 @@ def test_mha_v4_needs_the_aiter_race_fix(racy):
         assert (backend._load_mha_v4() is None) == racy
 
 
+def test_one_live_sequence_keeps_the_varlen_kernel_off_gfx950():
+    """The batch kernel and the key split were only measured on gfx950."""
+    impl = _build(4, 4)
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    rows = 8
+    q = torch.randn(rows, 4, HEAD_SIZE)
+    bounds = (0, rows)
+    with (
+        patch.object(backend, "USE_AITER_GFX95", False),
+        patch.object(
+            backend.aiter, "flash_attn_varlen_func", lambda **kwargs: kwargs["q"] + 1
+        ),
+    ):
+        out = impl.forward_varlen(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+            max_seqlen=rows,
+            cu_seqlens_host=bounds,
+        )
+    torch.testing.assert_close(out, q + 1)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
 @pytest.mark.parametrize("pad", [0, 24])
 def test_one_live_sequence_matches_the_varlen_kernel(pad):
@@ -67,14 +92,16 @@ def test_one_live_sequence_matches_the_varlen_kernel(pad):
     on strided q/k/v: its live rows get the bytes of the same kernel on
     contiguous inputs, match the varlen kernel (its bytes under fmha v3), and
     the padding rows are zero."""
-    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
-
     impl = _impl_cls()(
         num_heads=4,
         head_size=HEAD_SIZE,
         softmax_scale=HEAD_SIZE**-0.5,
         packed_trailing_padding=True,
     )
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    if not backend.USE_AITER_GFX95:
+        pytest.skip("the batch kernel path is gfx950-only")
     torch.manual_seed(0)
     total = 4096
     used = total - pad
@@ -109,6 +136,8 @@ def test_tail_rows_with_split_keys_match_one_launch():
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
 
+    if not backend.USE_AITER_GFX95:
+        pytest.skip("the key split is gfx950-only")
     heads, device = 7, torch.device("cuda", torch.cuda.current_device())
     rows = 4 * backend._num_cus(device.index) // heads * 256 + 300
     total = rows + 64
