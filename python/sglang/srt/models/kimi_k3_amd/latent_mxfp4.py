@@ -55,6 +55,11 @@ class LatentMXFP4Projections(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        # weight_updater reads this: direct updates skip post_load_weights, which refills the copies.
+        self._direct_weight_update_error = (
+            "load_format='direct' does not refresh the Kimi-K3 latent MXFP4 copies "
+            "(--enable-kimi-k3-latent-mxfp4); update weights with the default load format."
+        )
         self.register_buffer("down_weight", None, persistent=False)
         self.register_buffer("down_scale", None, persistent=False)
         self.register_buffer("up_weight", None, persistent=False)

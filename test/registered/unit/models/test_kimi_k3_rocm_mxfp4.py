@@ -11,6 +11,9 @@ from torch.nn import functional as F
 
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
 from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3_amd import latent_mxfp4
 from sglang.srt.models.kimi_k3_amd import moe as kimi_k3_moe_hip
@@ -247,6 +250,29 @@ class TestLatentMXFP4Runtime(CustomTestCase):
         self.assertFalse(projections.can_run(num_tokens=2047))
         self.assertTrue(projections.can_run(num_tokens=2048))
         self.assertEqual(dict(projections.state_dict()), {})
+
+    def test_direct_weight_update_is_rejected_before_any_write(self):
+        model = nn.Sequential(nn.Linear(2, 2, bias=False))
+        model[0]._latent_mxfp4 = LatentMXFP4Projections()
+        original = model[0].weight.detach().clone()
+        loaded = []
+        model.load_weights = loaded.append
+        stub = SimpleNamespace(
+            get_model=lambda: model,
+            device="cpu",
+            custom_weight_loaders={},
+            _assert_weight_cache_inactive=lambda _: None,
+        )
+        update = WeightUpdater.update_weights_from_tensor
+        weights = [("0.weight", torch.zeros_like(original))]
+        ok, message = update(stub, weights, load_format="direct")
+        self.assertFalse(ok)
+        self.assertIn("latent MXFP4", message)
+        self.assertTrue(torch.equal(model[0].weight, original))
+        self.assertEqual(loaded, [])
+        with get_parallel().override(tp_rank=0):
+            self.assertTrue(update(stub, weights, load_format=None)[0])
+        self.assertEqual(len(loaded), 1)
 
     def test_prepare_raises_on_weights_it_cannot_pack(self):
         """The user asked for MXFP4, so a checkpoint whose latent weights are not
