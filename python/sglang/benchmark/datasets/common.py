@@ -54,9 +54,21 @@ class BaseDataset(ABC):
 
 
 def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
-    # full_len=0 is valid for embedding benchmarks where no output tokens are generated
+    """Draw one length per request in ``[max(int(full_len * range_ratio), 1), full_len]``.
+
+    ``range_ratio`` is the share of ``full_len`` each length may fall to, so it
+    belongs to ``[0, 1]``: 0 leaves every length free and 1 pins them all to
+    ``full_len``. Above 1 the lower bound passes the upper one, and every draw
+    fails inside numpy with a message that names neither the flag nor the value.
+    """
     if full_len <= 0:
+        # full_len=0 is valid for embedding benchmarks where no output tokens are generated
         return [0] * num
+    if not 0.0 <= range_ratio <= 1.0:
+        raise ValueError(
+            f"range_ratio must be in [0, 1], got {range_ratio!r}; it is the share "
+            "of the requested length that each sampled length may fall to"
+        )
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
         full_len + 1,
