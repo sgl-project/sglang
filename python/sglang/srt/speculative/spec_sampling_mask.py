@@ -30,6 +30,17 @@ def sampling_output_requires_exact_accept_thresholds(
     return not spec_algorithm.is_dflash_family() or spec_algorithm.is_dflash()
 
 
+def _verifies_with_eagle_sample(spec_algorithm: SpeculativeAlgorithm) -> bool:
+    """Whether target verify is eagle_sample, the verify that
+    verify_commits_argmax_for_sampled_rows describes."""
+    return (
+        spec_algorithm.is_eagle()
+        or spec_algorithm.is_standalone()
+        or spec_algorithm.is_ngram()
+        or spec_algorithm.is_uno()
+    )
+
+
 def validate_spec_sampling_mask_request(
     req: Req, spec_algorithm: SpeculativeAlgorithm
 ) -> Optional[str]:
@@ -59,13 +70,20 @@ def validate_spec_sampling_mask_request(
                 "return_sampling_logprobs or return_sampling_mask with non-greedy "
                 "DFlash decoding requires sampling verification support."
             )
-    elif not spec_algorithm.is_dflash_family():
+    elif _verifies_with_eagle_sample(spec_algorithm):
         if non_greedy and verify_commits_argmax_for_sampled_rows():
             return (
                 "return_sampling_logprobs or return_sampling_mask with non-greedy "
                 "speculative decoding is not supported on this platform: "
                 "verification commits the argmax token instead of sampling."
             )
+    elif not spec_algorithm.is_dflash_family():
+        # A plugin algorithm brings its own verify; nothing here shows that its
+        # committed tokens are draws from the target distribution.
+        return (
+            "return_sampling_logprobs or return_sampling_mask is not supported "
+            "with this speculative decoding algorithm."
+        )
 
     if not req.captures_sampling:
         return None

@@ -24,6 +24,8 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative import eagle_utils
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
@@ -93,11 +95,7 @@ def _handle_request(mode, req):
 
 
 def _spec_algorithm(name):
-    return SimpleNamespace(
-        is_none=lambda: name == "none",
-        is_dflash=lambda: name == "dflash",
-        is_dflash_family=lambda: name in ("dflash", "dspark"),
-    )
+    return SpeculativeAlgorithm[name.upper()]
 
 
 def _sampling_req(sampling_params, *, logprobs=False, mask=False):
@@ -191,6 +189,47 @@ class TestSamplingCapture(CustomTestCase):
                     self.assertIn("argmax", error_msg)
                 else:
                     self.assertIsNone(error_msg)
+
+    def test_speculative_decoding_refuses_plugin_algorithms(self):
+        """A plugin algorithm verifies with its own worker, which may commit argmax
+        or relax acceptance. Neither flag may be admitted for it, even for an
+        unfiltered request, while every in-tree algorithm that verifies through
+        eagle_sample is."""
+        unfiltered = _sampling_req({"temperature": 0.7}, logprobs=True, mask=True)
+        with (
+            patch.multiple(eagle_utils, _is_cpu=False, _is_xpu=False, _is_hip=False),
+            patch(
+                "sglang.srt.speculative.spec_sampling_mask."
+                "is_dflash_sampling_verify_available",
+                return_value=True,
+            ),
+            get_context().override_server_args(
+                speculative_accept_threshold_single=1.0,
+                speculative_accept_threshold_acc=1.0,
+            ),
+        ):
+            self.assertIn(
+                "this speculative decoding algorithm",
+                validate_spec_sampling_mask_request(
+                    unfiltered, CustomSpecAlgo("PLUGIN", lambda server_args: object)
+                ),
+            )
+            for name in (
+                "eagle",
+                "eagle3",
+                "frozen_kv_mtp",
+                "standalone",
+                "ngram",
+                "uno",
+                "dflash",
+                "dspark",
+            ):
+                with self.subTest(algorithm=name):
+                    self.assertIsNone(
+                        validate_spec_sampling_mask_request(
+                            unfiltered, _spec_algorithm(name)
+                        )
+                    )
 
     def test_threshold_update_is_refused_where_admission_required_one(self):
         """A request admitted because both acceptance thresholds were 1.0 must not
