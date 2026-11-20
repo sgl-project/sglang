@@ -34,7 +34,7 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
-from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.lora_config import LoRAConfig, get_normalized_target_modules
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
@@ -42,7 +42,6 @@ from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
     LoRAType,
     auto_detect_lora_target_modules,
-    get_normalized_target_modules,
     get_target_module_name,
     replace_submodule,
     warn_if_adapter_targets_embeddings,
