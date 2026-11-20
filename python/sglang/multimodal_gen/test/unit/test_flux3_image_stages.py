@@ -1,28 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, pack
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
     Flux3ImageDenoiseStage,
+    Flux3ImageTextEncodeStage,
     build_timesteps,
     crop_output,
     denoise_flow_map,
     denoise_packed,
+    exact_vae_convolutions,
     latent_ids,
     load_references,
     noise_tokens,
     output_size,
+    resolve_sequential_cfg,
     scaled_ids,
     validate_generation,
 )
@@ -49,7 +59,60 @@ def _text_mean_velocity(packed):
     }
 
 
+def _sequential_cfg_worker(mode):
+    if mode == "tp":
+        maybe_init_distributed_environment_and_model_parallel(tp_size=2, sp_size=1)
+    else:
+        maybe_init_distributed_environment_and_model_parallel(
+            tp_size=1, sp_size=2, ulysses_degree=2
+        )
+    rank = dist.get_rank()
+    packed = _pack(
+        (torch.zeros(2, 2), torch.zeros(2, 4)),
+        [(torch.zeros(1, 3), torch.zeros(1, 4))] * 2,
+    )
+    free = (1 << 30, 1 << 20)[rank]
+    with (
+        mock.patch.object(torch.cuda, "is_available", return_value=True),
+        mock.patch.object(torch.cuda, "mem_get_info", return_value=(free, free)),
+    ):
+        sequential = resolve_sequential_cfg(packed, guidance=3.5)
+    decisions = [None, None]
+    dist.all_gather_object(decisions, sequential)
+    assert decisions == [True, True], decisions
+    dist.destroy_process_group()
+
+
 class TestFlux3PackedConditioning(unittest.TestCase):
+    @unittest.skipIf(
+        torch.version.hip is not None,
+        "ROCm builds query GPU 0 while importing sglang, which fails with the "
+        "GPUs hidden for these CPU workers",
+    )
+    def test_sequential_cfg_is_agreed_across_ranks(self):
+        for mode in ("tp", "sp"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "torch.distributed.run",
+                        "--standalone",
+                        "--nproc-per-node=2",
+                        __file__,
+                    ],
+                    env={
+                        **os.environ,
+                        "CUDA_VISIBLE_DEVICES": "",
+                        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "cpu",
+                        "FLUX3_SEQUENTIAL_CFG_WORKER": mode,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_image_ids_use_zero_time_and_sequence_axes(self):
         ids = latent_ids(2, 3)
         self.assertTrue(torch.equal(ids[:, 0], torch.zeros(6)))
@@ -247,5 +310,87 @@ class TestFlux3PackedSampler(unittest.TestCase):
                     self.assertEqual(stage._cache_dit_requested(), sp_size == 1)
 
 
+class _CountingTextEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.batches = []
+
+    def encode_batch(self, texts):
+        self.batches.append(list(texts))
+        return [
+            (torch.full((2, 3), float(len(text))), torch.zeros(2, 4)) for text in texts
+        ]
+
+
+class TestFlux3TextConditioningCache(unittest.TestCase):
+    @torch.no_grad()
+    def test_negative_prompt_is_encoded_once_across_requests(self):
+        stage = Flux3ImageTextEncodeStage.__new__(Flux3ImageTextEncodeStage)
+        stage.text_encoder = encoder = _CountingTextEncoder().eval()
+        with ConditioningCache(1 << 20).scope():
+            first = stage._encode(["", "a cat"], {""})
+            second = stage._encode(["", "a dog"], {""})
+        # cold: one bucketed call for both prompts; warm: only the new prompt
+        self.assertEqual(encoder.batches, [["", "a cat"], ["a dog"]])
+        torch.testing.assert_close(second[0][0], first[0][0], rtol=0, atol=0)
+        self.assertEqual(second[1][0][0, 0].item(), 5.0)
+
+    @torch.no_grad()
+    def test_without_a_cache_grouped_prompts_stay_one_call(self):
+        stage = Flux3ImageTextEncodeStage.__new__(Flux3ImageTextEncodeStage)
+        stage.text_encoder = encoder = _CountingTextEncoder().eval()
+        encoded = stage._encode(["", "p", "", "qq"], {""})
+        self.assertEqual(encoder.batches, [["", "p", "qq"]])
+        self.assertEqual(
+            [item[0][0, 0].item() for item in encoded], [0.0, 1.0, 0.0, 2.0]
+        )
+
+
+class TestFlux3ExactVaeConvolutions(unittest.TestCase):
+    def _flags(self):
+        return torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark
+
+    def _run(self, *, hip: bool, exact: bool, fail: bool = False):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            flux3_image as stages,
+        )
+
+        cudnn = torch.backends.cudnn
+        saved = self._flags()
+        cudnn.deterministic, cudnn.benchmark = False, True
+        try:
+            with mock.patch.object(
+                stages, "current_platform", SimpleNamespace(is_hip=lambda: hip)
+            ):
+                try:
+                    with exact_vae_convolutions(exact):
+                        inside = self._flags()
+                        if fail:
+                            raise RuntimeError("vae failed")
+                except RuntimeError:
+                    pass
+            return inside, self._flags()
+        finally:
+            cudnn.deterministic, cudnn.benchmark = saved
+
+    def test_exact_on_rocm_pins_deterministic_kernels_and_restores(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                inside, after = self._run(hip=True, exact=True, fail=fail)
+                self.assertEqual(inside, (True, False))
+                self.assertEqual(after, (False, True))
+
+    def test_other_tiers_and_platforms_are_untouched(self):
+        for hip, exact in ((True, False), (False, True), (False, False)):
+            with self.subTest(hip=hip, exact=exact):
+                inside, after = self._run(hip=hip, exact=exact)
+                self.assertEqual(inside, (False, True))
+                self.assertEqual(after, (False, True))
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if mode := os.environ.get("FLUX3_SEQUENTIAL_CFG_WORKER"):
+        _sequential_cfg_worker(mode)
+    else:
+        unittest.main()

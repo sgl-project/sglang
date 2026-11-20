@@ -16,16 +16,6 @@ VALID_BOT_TASKS = {
     "none",
 }
 
-SYSTEM_PROMPT_PRESETS = {
-    "none",
-    "en_unified",
-    "en_vanilla",
-    "en_recaption",
-    "en_think_recaption",
-    "dynamic",
-    "auto",
-}
-
 
 @dataclass
 class HunyuanImage3SamplingParams(SamplingParams):
@@ -38,7 +28,7 @@ class HunyuanImage3SamplingParams(SamplingParams):
     # no bot prefix in gen_image mode.
     bot_task: str = "image"
 
-    # Preset name (see SYSTEM_PROMPT_PRESETS) or raw custom text.
+    # Preset name (see hunyuan_image3/prompts.py) or raw custom text.
     system_prompt: str | None = "en_unified"
 
     # Pre-generated CoT text from AR stage (think/recaption output)
@@ -64,6 +54,10 @@ class HunyuanImage3SamplingParams(SamplingParams):
             (1280, 720),  # 16:9 landscape
         ]
     )
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"bot_task", "system_prompt", "cot_text"})
 
     def _adjust(self, server_args):
         # Pre-aligning each dimension to a 16-px grid here would distort the

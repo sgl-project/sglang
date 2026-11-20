@@ -213,6 +213,7 @@ impl AppContext {
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
+                    aliases: Vec::new(),
                     id: "stub-model".into(),
                     tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
@@ -221,6 +222,7 @@ impl AppContext {
                     decode_policy: Default::default(),
                     dp_aware: false,
                     dp_rank_policy: Default::default(),
+                    decode_dp_rank_policy: None,
                     bucket_config: None,
                     reorg_buckets: None,
                     reorg_admission: Default::default(),

@@ -861,7 +861,12 @@ class DsparkStepObservers:
                 forward_ct=forward_ct,
                 rids=[req.rid for req in reqs],
                 draft_tokens=draft_tokens,
-                corrected_logits=draft_block.corrected_logits,
+                # Only rank 0 records, so it cannot gather a sharded vocab.
+                corrected_logits=(
+                    None
+                    if draft_block.vocab_shard is not None
+                    else draft_block.corrected_logits
+                ),
                 draft_temperatures=draft_block.temperatures,
                 greedy_mask=draft_block.greedy_mask,
                 target_logits=target_logits,

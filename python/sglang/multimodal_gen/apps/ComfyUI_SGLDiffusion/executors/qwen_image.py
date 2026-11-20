@@ -84,10 +84,27 @@ class QwenImageEditAdapter(QwenImageAdapter):
         context,
         attention_mask=None,
         ref_latents=None,
+        ref_latents_method=None,
         additional_t_cond=None,
         transformer_options=None,
         **kwargs,
     ) -> PackedForward:
+        # The worker has no path for these; forwarding would silently ignore them.
+        if attention_mask is not None:
+            raise ValueError(
+                "QwenImageEditAdapter does not forward ComfyUI's attention_mask "
+                "to the worker; it would silently run without it."
+            )
+        if additional_t_cond is not None:
+            raise ValueError(
+                "QwenImageEditAdapter does not forward ComfyUI's "
+                "additional_t_cond to the worker; it would be silently ignored."
+            )
+        if ref_latents_method is not None and ref_latents_method != "index":
+            raise ValueError(
+                f"QwenImageEditAdapter does not support ref_latents_method="
+                f"{ref_latents_method!r}; the worker always uses 'index'."
+            )
         packed = super().pack(x, timestep, context, **kwargs)
         if ref_latents:
             packed_refs = []

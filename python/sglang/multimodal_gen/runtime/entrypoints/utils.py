@@ -1,12 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-"""
-DiffGenerator module for sglang-diffusion.
-
-This module provides a consolidated interface for generating videos using
-diffusion models.
-"""
+"""Shared entrypoint helpers: build a Req from SamplingParams and materialize/save generated images, videos and actions."""
 
 import atexit
 import io
@@ -14,9 +9,11 @@ import json
 import mmap
 import os
 import queue
+import struct
 import subprocess
 import tempfile
 import threading
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -33,16 +30,8 @@ try:
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
-    expand_request_outputs as expand_request_outputs,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
-    normalize_output_seeds as normalize_output_seeds,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
@@ -263,10 +252,6 @@ def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
     # 2. Handle (C, L) -> (L, C)
     if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
         audio_np = audio_np.transpose(1, 0)
-
-    # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
-    if audio_np.ndim == 2 and audio_np.shape[1] > 256 and audio_np.shape[0] == 1:
-        audio_np = audio_np.flatten()
 
     return audio_np
 
@@ -1068,9 +1053,10 @@ def attach_audio_to_video_sample(
     sample: Any,
     audio: Any,
     output_idx: int,
+    num_outputs: int,
 ) -> Any:
     """Attach per-sample audio for video outputs when available."""
-    audio = select_output_audio(audio, output_idx)
+    audio = select_output_audio(audio, output_idx, num_outputs)
     if audio is None:
         return sample
     if not (isinstance(sample, (tuple, list)) and len(sample) == 2):
@@ -1078,12 +1064,20 @@ def attach_audio_to_video_sample(
     return sample
 
 
-def select_output_audio(audio: Any, output_idx: int) -> Any:
-    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-        return audio[output_idx] if audio.shape[0] > output_idx else None
-    if isinstance(audio, np.ndarray) and audio.ndim >= 2:
-        return audio[output_idx] if audio.shape[0] > output_idx else None
-    return audio
+def select_output_audio(
+    audio: Any, output_idx: int, num_outputs: int | None = None
+) -> Any:
+    """Audio of output ``output_idx``.
+
+    A leading dim is indexed as the output dim for 3D+ audio. 2D audio is indexed
+    only when ``num_outputs`` is unknown or equals ``shape[0]``; otherwise it is one
+    track (``(C, L)`` or ``(L, C)``, e.g. stereo) and kept whole.
+    """
+    if not isinstance(audio, (torch.Tensor, np.ndarray)) or audio.ndim < 2:
+        return audio
+    if audio.ndim == 2 and num_outputs is not None and audio.shape[0] != num_outputs:
+        return audio
+    return audio[output_idx] if audio.shape[0] > output_idx else None
 
 
 def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
@@ -1266,6 +1260,38 @@ def save_materialized_output(
     return image_bytes
 
 
+# PNG color type by channel count: gray, gray + alpha, RGB, RGBA
+_PNG_COLOR_TYPES = {1: 0, 2: 4, 3: 2, 4: 6}
+
+
+def _png_chunk(tag: bytes, data) -> bytes:
+    crc = zlib.crc32(data, zlib.crc32(tag))
+    return b"".join((struct.pack(">I", len(data)), tag, data, struct.pack(">I", crc)))
+
+
+def _encode_png_stored(frame: np.ndarray) -> bytes:
+    """an 8-bit PNG of frame with unfiltered rows in stored (uncompressed) deflate blocks
+
+    PIL still filters every row at compress_level 0, which cannot shrink stored
+    blocks; skipping the filter writes the same pixels over ten times faster
+    """
+    height, width = frame.shape[:2]
+    channels = 1 if frame.ndim == 2 else frame.shape[2]
+    rows = np.zeros((height, 1 + width * channels), np.uint8)
+    rows[:, 1:] = frame.reshape(height, width * channels)
+    header = struct.pack(
+        ">IIBBBBB", width, height, 8, _PNG_COLOR_TYPES[channels], 0, 0, 0
+    )
+    return b"".join(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            _png_chunk(b"IHDR", header),
+            _png_chunk(b"IDAT", zlib.compress(rows, 0)),
+            _png_chunk(b"IEND", b""),
+        )
+    )
+
+
 def _encode_image_frame(
     frame: np.ndarray, path: str, output_compression: int | None
 ) -> bytes:
@@ -1278,6 +1304,8 @@ def _encode_image_frame(
             compress_level = max(0, min(9, round(output_compression / 100 * 9)))
         if frame.ndim == 3 and frame.shape[-1] == 1:
             frame = frame[..., 0]
+        if compress_level == 0 and frame.dtype == np.uint8:
+            return _encode_png_stored(frame)
         buffer = io.BytesIO()
         Image.fromarray(frame).save(buffer, format="PNG", compress_level=compress_level)
         return buffer.getvalue()
@@ -1327,7 +1355,7 @@ def save_outputs(
     output_paths: list[str] = []
     samples = (
         [
-            attach_audio_to_video_sample(sample, audio, idx)
+            attach_audio_to_video_sample(sample, audio, idx, len(outputs))
             for idx, sample in enumerate(outputs)
         ]
         if data_type == DataType.VIDEO
@@ -1393,7 +1421,7 @@ def save_outputs(
                     if samples_out is not None:
                         samples_out.append(sample)
                     if audios_out is not None:
-                        audios_out.append(select_output_audio(audio, idx))
+                        audios_out.append(select_output_audio(audio, idx, len(outputs)))
                     output_paths.append(save_file_path)
                     logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
                     continue
@@ -1421,7 +1449,7 @@ def save_outputs(
             samples_out.append(sample)
         if audios_out is not None:
             if data_type == DataType.VIDEO:
-                audios_out.append(select_output_audio(audio, idx))
+                audios_out.append(select_output_audio(audio, idx, len(outputs)))
             else:
                 audios_out.append(audio)
         if frames_out is not None:

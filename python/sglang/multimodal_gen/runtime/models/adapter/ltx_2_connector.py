@@ -612,6 +612,11 @@ class LTX2TextConnectors(nn.Module, LayerwiseOffloadableModuleMixin):
     ) -> torch.Tensor:
         return x * math.sqrt(target_dim / source_dim)
 
+    @property
+    def output_mask_is_all_valid(self) -> bool:
+        """Learned registers replace every padded text token, so the returned mask is all ones"""
+        return self.video_connector.learnable_registers is not None
+
     def forward(
         self,
         text_encoder_hidden_states: torch.Tensor,

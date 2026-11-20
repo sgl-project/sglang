@@ -43,8 +43,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 # SSCP convolution constants (no longer in config.json, never varied across models)
 _SSCP_INPUT_FEAT_SIZE = 128

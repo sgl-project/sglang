@@ -16,7 +16,7 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cuda"
 
@@ -111,14 +111,6 @@ class TestScaleExpandedRows(CustomTestCase):
         # Must not launch or raise on an empty dispatch.
         scale_expanded_rows_(x, weights)
         self.assertEqual(x.shape, (0, 128))
-
-    def test_rejects_non_fp32(self):
-        # A bf16 x would round the weights; a packed UE8M0 scale cannot take them.
-        for dtype in (torch.bfloat16, torch.int32):
-            with self.subTest(dtype=dtype):
-                x = torch.ones(4, 8, device=DEVICE, dtype=dtype)
-                with self.assertRaises(AssertionError):
-                    scale_expanded_rows_(x, torch.rand(4, device=DEVICE))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import pytest
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
 )
@@ -15,7 +16,15 @@ from sglang.srt.speculative import base_spec_worker as spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _kv_pool(state_pool):
+    """A KV pool whose router binds ``state_pool`` as the recurrent state."""
+    return SimpleNamespace(
+        layer_router=SimpleNamespace(part_view=lambda part: state_pool),
+        state_pool=state_pool,
+    )
 
 
 def _worker(monkeypatch, draft_config, target_pool, draft_pools):
@@ -24,13 +33,13 @@ def _worker(monkeypatch, draft_config, target_pool, draft_pools):
     )
     target = SimpleNamespace(
         spec_algorithm=SpeculativeAlgorithm.EAGLE,
-        req_to_token_pool=SimpleNamespace(mamba_pool=target_pool),
+        token_to_kv_pool=_kv_pool(target_pool),
     )
     runners = tuple(
         SimpleNamespace(
             model_config=draft_config,
-            token_to_kv_pool=object(),
-            req_to_token_pool=SimpleNamespace(mamba_pool=pool),
+            token_to_kv_pool=_kv_pool(pool),
+            runner_ids=SimpleNamespace(is_fused_draft=False),
         )
         for pool in draft_pools
     )
@@ -75,7 +84,7 @@ def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path, local_
             draft_model_idx=depth,
         )
         assert layer_info.num_effective_layers == 1
-        assert layer_info.is_hybrid_swa_mtp_draft
+        assert layer_info.draft_owns_its_depth
         assert layer_info.swa_attention_layer_ids == (
             [depth] if depth in local_drafts else []
         )
@@ -99,7 +108,7 @@ def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path, local_
     assert plan.device_pools == tuple(r.token_to_kv_pool for r in runners)
     assert target.mtp_draft_device_pools == plan.device_pools
     assert target.mtp_draft_mamba_pools == tuple(
-        r.req_to_token_pool.mamba_pool for r in runners
+        r.token_to_kv_pool.state_pool for r in runners
     )
 
 
@@ -124,6 +133,66 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
     )
     with pytest.raises(AssertionError, match="target Mamba slot|separate state"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+def _dsa_draft_worker(monkeypatch, *, nextn_layers, dcp_replicated, dcp_size=4):
+    monkeypatch.setattr(
+        spec, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=dcp_size)
+    )
+    worker, _, runners = _worker(
+        monkeypatch,
+        SimpleNamespace(num_nextn_predict_layers=nextn_layers),
+        None,
+        (None,),
+    )
+    monkeypatch.setattr(
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True, enable_unified_cache_external_linker=False
+        ),
+    )
+    pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+    pool.dcp_replicated = dcp_replicated
+    runners[0].token_to_kv_pool = pool
+    return worker
+
+
+@pytest.mark.parametrize(
+    "nextn_layers, dcp_replicated, error",
+    [
+        (1, True, "replicated across the DCP group"),
+        (0, False, "DCP-sharded"),
+    ],
+)
+def test_dcp_rejects_a_dsa_draft_layout_the_plan_would_misread(
+    monkeypatch, nextn_layers, dcp_replicated, error
+):
+    worker = _dsa_draft_worker(
+        monkeypatch, nextn_layers=nextn_layers, dcp_replicated=dcp_replicated
+    )
+    with pytest.raises(NotImplementedError, match=error):
+        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+@pytest.mark.parametrize(
+    "nextn_layers, dcp_replicated, dcp_size, mode",
+    [
+        (1, False, 4, spec.HiCacheDraftMode.PACKED),
+        (0, True, 4, spec.HiCacheDraftMode.SIDECAR),
+        (1, True, 1, spec.HiCacheDraftMode.PACKED),
+    ],
+)
+def test_dsa_draft_layout_matching_the_plan_is_kept(
+    monkeypatch, nextn_layers, dcp_replicated, dcp_size, mode
+):
+    worker = _dsa_draft_worker(
+        monkeypatch,
+        nextn_layers=nextn_layers,
+        dcp_replicated=dcp_replicated,
+        dcp_size=dcp_size,
+    )
+    assert spec.BaseSpecWorker._build_hicache_draft_plan(worker).mode == mode
 
 
 if __name__ == "__main__":

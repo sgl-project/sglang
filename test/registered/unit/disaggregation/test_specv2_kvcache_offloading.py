@@ -23,15 +23,20 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
 
 def _make_mock_req(
@@ -43,8 +48,7 @@ def _make_mock_req(
     origin_len: int = 0,
 ):
     """Create a mock Req with the KV cache state needed for testing."""
-    req = MagicMock()
-    req.rid = rid
+    req = MagicMock(rid=rid, owner_list=None)
     req.extra_key = None  # base traffic: storage hashes chain from tokens alone
     req.cache_salt = None
     req.origin_input_ids = list(range(origin_len))
@@ -55,6 +59,7 @@ def _make_mock_req(
     )
     req.prefix_len = prefix_len
     req.owned_kv_len = lambda: req.kv.kv_committed_len
+    req.exit_via = None
     return req
 
 
@@ -98,21 +103,26 @@ def _make_manager(pool_size: int, page_size: int = 1):
     tree_cache.protected_size_ = 0
     tree_cache.req_to_token_pool = req_to_token_pool
     tree_cache.token_to_kv_pool_allocator = allocator
+    tree_cache.logical_page_size = allocator.page_size
     tree_cache.free_kv_row = lambda owner, ranges: BasePrefixCache.free_kv_row(
         tree_cache, owner, ranges
     )
+    tree_cache.claim_kv_row.return_value = False
 
     # Bypass __init__ entirely and set attributes directly
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
     manager.kv_cache = MagicMock()
+    manager._unified_window = False
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
     manager.offload_inflight = WeakKeyDict()
+    manager.offloading_reqs = IndexedReqList(ListKind.PD_OFFLOADING)
+    manager.request_retirer = release_only_retirer(tree_cache)
 
     return manager, freed_indices
 
@@ -124,6 +134,11 @@ class _FinishedEvent:
 
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
+
+    def setUp(self):
+        super().setUp()
+        # The release reads the published spec and serving config.
+        enter_scope(self, published_topology())
 
     def test_decode_offload_hash_chain_matches_prefill(self):
         """Decode pages must keep the prefill namespace across offload chunks."""
@@ -170,6 +185,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertTrue(manager.offload_kv_cache(old_req))
         old_req.finished.return_value = True
+        manager.finalize_release_on_finish(old_req)
 
         # A completed request leaves the API before its asynchronous D2H copy
         # necessarily finishes, so a caller can reuse the same rid here.
@@ -213,12 +229,14 @@ class TestReleaseFinishedReq(unittest.TestCase):
             HiCacheAck(None, _FinishedEvent(), [8])
         ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager.finalize_release_on_finish(req)
 
         manager._check_offload_progress(1)
 
         self.assertEqual(freed, [])
         manager.req_to_token_pool.free.assert_not_called()
         self.assertEqual(manager.offload_inflight[req], 1)
+        self.assertIn(req, manager.offloading_reqs)
 
     def test_finished_request_releases_all_committed_slots_after_last_offload_ack(
         self,
@@ -246,17 +264,42 @@ class TestReleaseFinishedReq(unittest.TestCase):
             HiCacheAck(None, _FinishedEvent(), [9])
         ]
         manager._trigger_backup = MagicMock(return_value="last_hash")
+        manager.finalize_release_on_finish(req)
 
         manager._check_offload_progress(1)
 
+        self.assertNotIn(req, manager.offloading_reqs)
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
         self.assertNotIn(req, manager.offloaded_state)
         self.assertNotIn(req, manager.offload_inflight)
 
+    def test_streaming_session_keeps_the_row_of_a_finished_turn(self):
+        """A finished offloaded turn is released through the session hook, so a
+        streaming session keeps its KV row for the next turn."""
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20)
+        req.finished.return_value = True
+
+        def keep_row(req):
+            req.kv = ReqKvInfo()  # `req.detach_kv()`: the session's slot keeps the row.
+            return True
+
+        manager.tree_cache.claim_kv_row.side_effect = keep_row
+
+        manager.finalize_release_on_finish(req)
+
+        manager.tree_cache.claim_kv_row.assert_called_once_with(req)
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+
 
 class TestSamplingMaskAbortOffload(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology())
+
     def test_abort_waits_for_existing_offload_before_reusing_slots(self):
         """An abort must not recycle slots while a previous D2H copy reads them."""
         for inflight in (False, True):
@@ -293,8 +336,6 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 self.assertEqual(len(freed), 1)
                 self.assertTrue(torch.equal(freed[0], torch.arange(20)))
                 self.assertIsNone(req.kv.req_pool_idx)
-                manager.finalize_release_on_finish(req)
-                self.assertEqual(len(freed), 1)
 
 
 if __name__ == "__main__":

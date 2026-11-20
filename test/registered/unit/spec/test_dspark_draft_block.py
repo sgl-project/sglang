@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.kernel_plugins.nvidia import dspark_binding
 from sglang.srt.models.dspark import (
     GatedMarkovHead,
     Nemotron35VanillaMarkov,
@@ -19,7 +20,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 VOCAB, RANK, HIDDEN, BS, GAMMA = 211, 8, 16, 4, 5
 
@@ -104,6 +105,41 @@ class TestSampleDraftBlock(CustomTestCase):
         self.assertIsNone(block.corrected_logits)
         self.assertTrue(block.greedy_draft)
 
+    def test_one_row_greedy_draft_keeps_the_step_logit_transforms(self):
+        """A one-row greedy draft must pick the argmax of the softcapped, vocab-limited
+        step logits: never a token past the limit, and the first of a softcap tie."""
+        limit = VOCAB - 11
+        tail = torch.zeros(VOCAB)
+        tail[limit:] = 100.0
+        tie = torch.zeros(VOCAB)
+        # Both cap to 1.0 in fp32; the uncapped argmax is token 1.
+        tie[0], tie[1] = 20.0, 21.0
+        cases = (
+            ("vocab_limit", dict(step_vocab_limit=limit), tail, limit - 1),
+            ("softcap", dict(step_softcap=1.0), tie, 0),
+        )
+        for name, transforms, logits, max_token in cases:
+            with self.subTest(name):
+                head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK)
+                head = head.to(torch.bfloat16)
+                with torch.no_grad():
+                    head.markov_w2.weight.zero_()
+                self.assertIsNotNone(head.greedy_w2_weight())
+                for attr, value in transforms.items():
+                    setattr(head, attr, value)
+                block = sample_draft_block(
+                    base_logits=logits.expand(1, GAMMA, VOCAB).to(torch.bfloat16),
+                    anchor_tokens=torch.zeros(1, dtype=torch.long),
+                    draft_hidden=None,
+                    sampling_info=None,
+                    markov_head=head,
+                    noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
+                    device="cpu",
+                    tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
+                    greedy_draft=True,
+                )
+                self.assertTrue(bool((block.draft_tokens <= max_token).all()))
+
 
 class TestFusedGreedyEligibility(CustomTestCase):
     def test_only_the_plain_w2_gemv_head_fuses(self):
@@ -147,9 +183,9 @@ def _folded_draft_model():
 def _build(model, *, greedy_draft, factory=None, agree=None):
     """maybe_build_draft_sampler, with factory as the megakernel's draft sampler."""
     with (
-        patch.object(ds, "megakernel_draft_sampler", return_value=factory),
-        patch.object(ds, "megakernel_agree", agree or Mock()),
-        patch.object(ds, "get_dp_tp_group", return_value="draft tp group"),
+        patch.object(dspark_binding, "megakernel_draft_sampler", return_value=factory),
+        patch.object(dspark_binding, "megakernel_agree", agree or Mock()),
+        patch.object(dspark_binding, "get_dp_tp_group", return_value="draft tp group"),
     ):
         return ds.maybe_build_draft_sampler(
             draft_model=model,
@@ -198,6 +234,17 @@ class TestMegakernelDraftSampler(CustomTestCase):
             sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
         stock.assert_called_once()
         self.assertTrue(sampler.out[: BS * GAMMA].eq(7).all())
+
+    def test_absent_provider_uses_the_always_present_stock_strategy(self):
+        tokens = torch.full((BS, GAMMA), 11)
+        input_ids = torch.arange(BS * GAMMA)
+        with patch.object(
+            ds, "draft_markov_block", return_value=(tokens, None)
+        ) as stock:
+            sampler = _build(_folded_draft_model(), greedy_draft=True)
+            sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
+        stock.assert_called_once()
+        self.assertTrue(sampler.out[: BS * GAMMA].eq(11).all())
 
 
 class TestDraftParamsRestage(CustomTestCase):

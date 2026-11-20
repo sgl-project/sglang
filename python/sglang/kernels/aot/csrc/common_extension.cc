@@ -155,6 +155,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
+  m.def("apply_gguf_moe_weights(Tensor! outputs, Tensor weights, Tensor ids) -> ()");
+  m.impl("apply_gguf_moe_weights", torch::kCUDA, &apply_gguf_moe_weights);
+
   // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the CUDA gate/topk path
   // now routes through the unified Triton router
   // (python/sglang/kernels/ops/moe/moe_fused_gate.py).
