@@ -1918,10 +1918,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        else:
+            results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+
+        expected_bytes = [
+            sum(size) if isinstance(size, Sequence) else size for size in buffer_sizes
+        ]
+        if len(results) != len(expected_bytes):
+            return [-1] * len(expected_bytes)
+        # Mooncake returns total bytes read per key (summed across sub-buffers
+        # in batch_get_into_multi_buffers). A positive count smaller than the
+        # destination size is a short read, and 0-byte objects stay misses.
+        return [
+            result if result < 0 or (result == size and size > 0) else -1
+            for result, size in zip(results, expected_bytes)
+        ]
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
