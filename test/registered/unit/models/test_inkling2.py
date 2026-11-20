@@ -469,7 +469,9 @@ def test_expert_placement_hook_and_rejections(monkeypatch):
         )
 
     runtime([0, 1, 2, 3])
-    assert moe._expert_placement(0, 4) is None
+    # Layers are constructed under the loader's default device, not the CPU.
+    with torch.device("meta"):
+        assert moe._expert_placement(0, 4) is None
     for online, redundant in [(True, 0), (False, 4)]:
         runtime([0, 1, 2, 3], online, redundant)
         with pytest.raises(ValueError, match="without online EPLB"):

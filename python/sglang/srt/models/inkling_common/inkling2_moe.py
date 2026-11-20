@@ -1022,7 +1022,8 @@ def _expert_placement(layer_id, num_experts):
     if metadata is None:
         return None
     placement = metadata.physical_to_logical_map_cpu[layer_id]
-    order = torch.arange(num_experts, dtype=placement.dtype)
+    # Models are built under a CUDA default device; the map stays on the CPU.
+    order = torch.arange(num_experts, dtype=placement.dtype, device=placement.device)
     if not torch.equal(placement.sort().values, order):
         raise ValueError(
             f"Layer {layer_id} expert placement must hold each of its "
