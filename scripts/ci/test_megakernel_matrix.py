@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only checks for model selection and the GPU-runner allowlist."""
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +13,10 @@ from megakernel_matrix import LEGACY, build_matrix
 
 class TestMegakernelMatrix(unittest.TestCase):
     def test_routing_selection_and_fail_closed_inputs(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
             root = Path(directory)
             for name in (
                 *LEGACY["deepseek_v41"]["tests"],
@@ -22,6 +27,15 @@ class TestMegakernelMatrix(unittest.TestCase):
             self.assertEqual(
                 build_matrix(root, [])["include"][0]["runner"], "4-gpu-gb300"
             )
+            self.assertEqual(
+                output.getvalue().splitlines(),
+                [
+                    f"::warning::{name} is not listed in ci_models.yaml"
+                    for name in ("test_kimi.py", "test_qwen.py")
+                ],
+            )
+            output.seek(0)
+            output.truncate()
             models = {
                 **LEGACY,
                 "kimi": {"gpu": "B300", "gpus": 8, "tests": ["test_kimi.py"]},
@@ -30,6 +44,13 @@ class TestMegakernelMatrix(unittest.TestCase):
             manifest = root / "ci_models.yaml"
             manifest.write_text(yaml.safe_dump(models))
             entries = build_matrix(root, [])["include"]
+            self.assertEqual(
+                output.getvalue().strip(),
+                "::notice::qwen requires 8 GB300 GPUs; no configured runner; "
+                "not covered by this run",
+            )
+            output.seek(0)
+            output.truncate()
             self.assertEqual(
                 {row["runner"] for row in entries}, {"4-gpu-gb300", "8-gpu-b300"}
             )
@@ -43,6 +64,7 @@ class TestMegakernelMatrix(unittest.TestCase):
                     }
                 ],
             )
+            self.assertEqual(output.getvalue(), "")
             for requested in (["missing"], ["qwen"]):
                 with self.subTest(requested=requested), self.assertRaises(ValueError):
                     build_matrix(root, requested)
