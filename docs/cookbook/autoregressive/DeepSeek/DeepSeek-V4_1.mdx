@@ -230,6 +230,8 @@ The Write policy knob controls the GPU → CPU write and defaults to `write_thro
 
 The card is not offered on MI355X: hierarchical cache has not been validated on ROCm for this model yet.
 
+For PD disaggregation, enable HiCache on the prefill role only. Decode-side radix caching for paged sliding-window attention does not support HiCache, and current V4.1 builds also reject decode radix caching on the paged KV layout. The Playground omits HiCache when you select the decode role. Use the unified cache external linker on the prefill role only on builds without paged decode radix support.
+
 Only the L2 tier is exposed here. For the storage (L3) tier and the canonical flag set, see the [HiCache best-practices recipe](../../../docs/advanced_features/hicache_best_practices) and the [HiCache documentation](../../../docs/advanced_features/hicache).
 
 ### 3.6 Agentic Long-Context on MI355X (FP4, DSpark)

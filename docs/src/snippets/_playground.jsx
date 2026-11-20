@@ -34,7 +34,7 @@
 // config.playgroundExclusiveGroups declares {axes, when, note} groups whose
 // Enable controls turn each other off for matching selections.
 //   pdDisagg     — role + transfer backend + IB device + optional router
-//   hicache     — enable + backend + write policy
+//   hicache     — enable + backend + write policy; excludesPdModes gates unsupported roles
 //   hisparse    — enable + host ratio (decode-only)
 //   flagSelects — generic: a config-declared LIST of single-selects, each with
 //                 its own title + strip-prefixes + options (no per-feature code)
@@ -1425,6 +1425,26 @@ export const Playground = ({ config }) => {
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
         if (fc.excludesHw && sel && fc.excludesHw.includes(sel.hw)) return { flags, env };
+        const backendOptions = fc.backends || [];
+        const ownedHeads = [
+          ...HICACHE_HEADS,
+          ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
+          ...backendOptions.flatMap((o) => (o.flags || []).map((f) => f.split(/\s/)[0])),
+        ];
+        const ownedEnvKeys = [
+          ...(fc.requiredEnv || []),
+          ...backendOptions.flatMap((o) => o.env || []),
+        ].map((e) => e.split("=")[0]);
+        // The selected role is resolved before the axes compose. Do not let
+        // a stale Enable choice, or an inherited recipe, reintroduce HiCache
+        // on a role that the model explicitly excludes.
+        const livePdMode = sel?.pdMode || h.findFlagArg(flags, "--disaggregation-mode") || "off";
+        if ((fc.excludesPdModes || []).includes(livePdMode)) {
+          return {
+            flags: h.stripFlagsByFirstToken(flags, ownedHeads),
+            env: h.stripEnvByPrefix(env, ownedEnvKeys),
+          };
+        }
         // When the Deploy panel owns enablement (`showWhen`), the base already
         // carries a complete, verified hicache recipe. Rebuilding it from this
         // axis's own defaults would silently swap ratio/layout/io-backend, so
@@ -1446,16 +1466,6 @@ export const Playground = ({ config }) => {
           || (value.writePolicy && value.writePolicy !== "auto");
         if (!hasOverride) return { flags, env };
 
-        const backendOptions = fc.backends || [];
-        const ownedHeads = [
-          ...HICACHE_HEADS,
-          ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
-          ...backendOptions.flatMap((o) => (o.flags || []).map((f) => f.split(/\s/)[0])),
-        ];
-        const ownedEnvKeys = [
-          ...(fc.requiredEnv || []),
-          ...backendOptions.flatMap((o) => o.env || []),
-        ].map((e) => e.split("=")[0]);
         flags = h.stripFlagsByFirstToken(flags, ownedHeads);
         if (ownedEnvKeys.length) env = h.stripEnvByPrefix(env, ownedEnvKeys);
 
@@ -1528,6 +1538,18 @@ export const Playground = ({ config }) => {
 
       render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect, derived }) => {
         if (fc.excludesHw && fc.excludesHw.includes(base.hw)) return null;
+        if ((fc.excludesPdModes || []).includes(base.pdMode)) {
+          return (
+            <div key={axisId} style={s.card}>
+              <div style={s.compactRow}>
+                <span style={s.axisTitle}>HiCache</span>
+                <span role="note" style={{ fontSize: 11, opacity: 0.75 }}>
+                  Not supported on the selected PD role. The generated command omits HiCache.
+                </span>
+              </div>
+            </div>
+          );
+        }
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         const hasBackends = (fc.backends || []).length > 0;
         const hasPolicies = (fc.writePolicies || []).length > 0;
