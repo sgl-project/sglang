@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import io
 import logging
 import pickle
+import struct
 import threading
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
 
@@ -437,9 +439,37 @@ class RustMmProcessor:
         )
 
 
+def _tensor_from_bytes(data, dtype, shape):
+    import torch
+
+    return torch.from_numpy(data).view(dtype).reshape(shape)
+
+
+class _OutOfBandPickler(pickle.Pickler):
+    """Hands each CPU tensor's bytes to the buffer callback, in place of torch's
+    own pickling, which copies them through `torch.save` while holding the GIL."""
+
+    def reducer_override(self, obj):
+        import torch
+
+        if (
+            type(obj) is torch.Tensor
+            and obj.device.type == "cpu"
+            and obj.layout == torch.strided
+            and not obj.is_quantized
+        ):
+            data = obj.detach().contiguous().reshape(-1).view(torch.uint8).numpy()
+            return _tensor_from_bytes, (data, obj.dtype, tuple(obj.shape))
+        return NotImplemented
+
+
 class PythonMmFallback:
     """Runs SGLang's Python MM processor on the Rust MM workers, for a model with
     no Rust pipeline."""
+
+    # Payload: u64 buffer count, u64 pickle length, u64 length per buffer, the
+    # pickle, then each out-of-band buffer at an offset aligned to this.
+    PAYLOAD_ALIGN = 64
 
     def __init__(
         self,
@@ -495,8 +525,37 @@ class PythonMmFallback:
         for item in output.mm_items:
             item.set_pad_value()
         ids = input_ids if output.input_ids is None else output.input_ids
-        return ids, pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
+        return ids, self.wrap(output)
 
-    @staticmethod
-    def unwrap(buffers):
-        return pickle.loads(memoryview(buffers["mm.feature.0"]).cast("B"))
+    @classmethod
+    def wrap(cls, output) -> bytes:
+        buffers = []
+        stream = io.BytesIO()
+        pickler = _OutOfBandPickler(stream, protocol=5, buffer_callback=buffers.append)
+        pickler.dump(output)
+        raws = [buffer.raw() for buffer in buffers]
+        lengths = (raw.nbytes for raw in raws)
+        header = struct.pack(f"<{2 + len(raws)}Q", len(raws), stream.tell(), *lengths)
+        parts = [header, stream.getbuffer()]
+        offset = len(header) + stream.tell()
+        for raw in raws:
+            pad = -offset % cls.PAYLOAD_ALIGN
+            parts += (bytes(pad), raw)
+            offset += pad + raw.nbytes
+        return b"".join(parts)
+
+    @classmethod
+    def unwrap(cls, buffers):
+        """Rebuilds the output with its tensors viewing the ring buffer: no copy
+        and no torch unpickling on the scheduler thread."""
+        payload = memoryview(buffers["mm.feature.0"]).cast("B")
+        count, pickle_len = struct.unpack_from("<2Q", payload)
+        lengths = struct.unpack_from(f"<{count}Q", payload, 16)
+        start = 16 + 8 * count
+        offset = start + pickle_len
+        oob = []
+        for length in lengths:
+            offset += -offset % cls.PAYLOAD_ALIGN
+            oob.append(payload[offset : offset + length])
+            offset += length
+        return pickle.loads(payload[start : start + pickle_len], buffers=oob)

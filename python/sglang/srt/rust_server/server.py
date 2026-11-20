@@ -214,6 +214,7 @@ class RustServer:
         self.http_port = http_port
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
+        self._python_mm_fallback = False
         self._mm_cache_namespace: Optional[str] = None
         self._max_per_poll = max_per_poll
         # The engine-level startup timings `/server_info` reports, set once
@@ -319,6 +320,7 @@ class RustServer:
         the Python processor when it resolved none."""
         workers = get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS
         if self.mm_spec is None:
+            self._python_mm_fallback = True
             self.server.start_python_mm_workers(
                 PythonMmFallback(
                     server_args=scheduler.server_args,
@@ -835,9 +837,11 @@ class RustServer:
         elapses. Without --sleep-on-idle, return at once, so the idle loop
         polls the ring without blocking as Python's polls its sockets: a parked
         thread starts each request's step on a cold core. A subclass that
-        holds drained requests back still parks on those.
+        holds drained requests back still parks on those. The Python MM
+        fallback always parks: its processor thread needs the GIL a polling
+        loop holds.
         """
-        if get_device().sleep_on_idle:
+        if get_device().sleep_on_idle or self._python_mm_fallback:
             self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
