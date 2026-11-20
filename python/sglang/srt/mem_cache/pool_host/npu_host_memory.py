@@ -332,6 +332,8 @@ def reserve_mla_split_host_memory(
     buffers: MLASplitBuffers,
 ) -> None:
     """Reserve the split MLA host buffers before allocating them."""
+    if not is_npu():
+        return
     backend = get_host_memory_backend()
     if backend is None:
         return
