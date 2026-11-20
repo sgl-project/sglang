@@ -10,7 +10,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -30,6 +29,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     make_post_verify_io,
+    post_verify_hook_applies,
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
@@ -485,7 +485,7 @@ class NGRAMWorker(BaseSpecWorker):
                 if self.model_runner.watermark is not None
                 else None
             )
-            if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+            if post_verify_hook_applies(batch.sampling_info):
                 post_verify_output = self._speculative_runtime_hooks.post_verify(
                     make_post_verify_io(
                         verify_input=verify_input,

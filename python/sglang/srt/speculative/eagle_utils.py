@@ -766,6 +766,7 @@ def eagle_sample(
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.layers.sampler import apply_custom_logit_processor
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
@@ -834,6 +835,14 @@ def eagle_sample(
     # Apply grammar mask if provided
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
+
+    # Last of the logit edits, as in ordinary sampling.
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=verify_input.draft_token_num,
+        )
 
     if watermark is not None:
         next_token_logits, sampling_info = watermark.apply(

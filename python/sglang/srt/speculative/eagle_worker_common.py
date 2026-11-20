@@ -254,6 +254,15 @@ def make_post_verify_io(
     )
 
 
+def post_verify_hook_applies(sampling_info: Any) -> bool:
+    """Whether verify runs through the runtime hooks; their sampling view carries
+    no custom logit processors, so a batch with one stays on eagle_sample."""
+    return (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and not sampling_info.has_custom_logit_processor
+    )
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -952,7 +961,7 @@ def run_eagle_verify(
         if watermark_engine is not None
         else None
     )
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+    if post_verify_hook_applies(batch.sampling_info):
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
         simulated_accept_length = None

@@ -69,6 +69,7 @@ def sampling_allows_vocab_shards(
         and info.acc_additive_penalties is None
         and info.acc_scaling_penalties is None
         and info.logit_bias is None
+        and not info.has_custom_logit_processor
         and (
             info.is_all_greedy
             or (
