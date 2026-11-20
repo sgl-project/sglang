@@ -71,6 +71,7 @@ _media_url_timeout: Optional[float] = None
 
 
 _allow_local_media_files = True
+_allowed_local_media_paths: Optional[frozenset[str]] = None
 
 
 def _normalize_media_domain(domain: str) -> str:
@@ -110,6 +111,7 @@ def configure_media_url_security(
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
     timeout: Optional[float] = None,
     allow_local_files: bool = True,
+    allowed_local_media_paths: Optional[Sequence[str]] = None,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
@@ -123,15 +125,29 @@ def configure_media_url_security(
     if timeout is not None and timeout <= 0:
         raise ValueError("media_url_timeout must be positive")
 
+    if allowed_local_media_paths is not None and any(
+        not isinstance(path, str) or not path.strip()
+        for path in allowed_local_media_paths
+    ):
+        raise ValueError("allowed_local_media_paths entries must be non-empty paths")
+
     normalized_domains = sorted(
         {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
     )
     global _allowed_media_domains, _media_url_max_file_size_bytes
-    global _media_url_timeout, _allow_local_media_files
+    global _media_url_timeout, _allow_local_media_files, _allowed_local_media_paths
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
     _media_url_timeout = timeout
     _allow_local_media_files = allow_local_files
+    _allowed_local_media_paths = (
+        None
+        if allowed_local_media_paths is None
+        else frozenset(
+            os.path.realpath(os.path.expanduser(path))
+            for path in allowed_local_media_paths
+        )
+    )
     return normalized_domains
 
 
@@ -142,6 +158,9 @@ def media_url_security_config() -> tuple:
         _media_url_max_file_size_bytes // (1024 * 1024),
         _media_url_timeout,
         _allow_local_media_files,
+        None
+        if _allowed_local_media_paths is None
+        else sorted(_allowed_local_media_paths),
     )
 
 
@@ -288,6 +307,18 @@ def shorten_media_source(value: str) -> str:
 def _open_local_media_file(path: str) -> BinaryIO:
     if not _allow_local_media_files:
         raise ValueError("Local media files are not allowed")
+    if _allowed_local_media_paths is not None:
+        real_path = os.path.realpath(os.path.expanduser(path))
+        if not any(
+            real_path == allowed or os.path.commonpath([real_path, allowed]) == allowed
+            for allowed in _allowed_local_media_paths
+        ):
+            raise ValueError(f"Local media path is not within allowed paths: {path!r}")
+        path = real_path
+    elif _allowed_media_domains:
+        raise ValueError(
+            "Local media access is disabled when allowed_media_domains is configured"
+        )
     try:
         # A FIFO opens at once instead of waiting for a writer; fstat rejects it.
         f = open(path, "rb", opener=lambda p, flags: os.open(p, flags | os.O_NONBLOCK))
