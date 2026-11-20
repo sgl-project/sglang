@@ -184,7 +184,7 @@ metatags:
   <Card
     title="Tencent"
     mode="card"
-    href="/cookbook/autoregressive/Tencent/Hy4-flash"
+    href="/cookbook/autoregressive/Tencent/Hy4"
     img="/cards/logos/tencent.png"
   />
   <Card
