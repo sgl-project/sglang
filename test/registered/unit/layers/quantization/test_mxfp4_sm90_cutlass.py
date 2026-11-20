@@ -734,11 +734,13 @@ def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
     [
         (4, 4, 256, 256, 2),
         (16, 8, 768, 384, 2),
+        (16, 17, 768, 384, 2),  # two full repack chunks and a tail
         (256, 8, 1024, 1024, 4),
     ],
 )
+@pytest.mark.parametrize("use_humming", [False, True])
 def test_dsv4_apply_matches_flashinfer_direct(
-    tokens, num_experts, hidden, inter, top_k, monkeypatch, stated_tp_group
+    tokens, num_experts, hidden, inter, top_k, use_humming, monkeypatch, stated_tp_group
 ):
     """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
     output must match a direct FlashInfer ``cutlass_fused_moe`` call with
@@ -747,6 +749,9 @@ def test_dsv4_apply_matches_flashinfer_direct(
 
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
+
+    if use_humming and not HAS_CORRECTED_HUMMING_API:
+        pytest.skip("requires corrected per-expert Humming API")
 
     # Bypass symmetric-memory / TP-group stack in the new fused-func module
     # (where DSv4 ``apply`` now dispatches the kernel call through).
@@ -771,7 +776,9 @@ def test_dsv4_apply_matches_flashinfer_direct(
     # plain SiLU * up — all three SwiGLU scalars None (no clamp configured).
     from sglang.srt.runtime_context import get_context
 
-    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+    with get_context().override_server_args(
+        flashinfer_mxfp4_moe_precision="fp8" if use_humming else "default"
+    ):
         method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
             SimpleNamespace(process_weights_after_loading=lambda layer: None),
             "test",
@@ -792,7 +799,10 @@ def test_dsv4_apply_matches_flashinfer_direct(
     layer.moe_ep_rank = 0
     method.runner.config.layer = layer
 
+    tensors = ("w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv")
+    input_ptrs = [getattr(layer, name).data_ptr() for name in tensors]
     method.process_weights_after_loading(layer)
+    assert [getattr(layer, name).data_ptr() for name in tensors] == input_ptrs
 
     with get_context().override_server_args():
         out_sglang = method.apply(
@@ -802,16 +812,34 @@ def test_dsv4_apply_matches_flashinfer_direct(
     # ---- Direct FlashInfer reference ----
     w13_s_u8 = w31_s.view(torch.uint8)
     w2_s_u8 = w2_s.view(torch.uint8)
-    ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
-        w31.view(torch.uint8).contiguous(), "fp4"
-    )
-    ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(
-        w2.view(torch.uint8).contiguous(), "fp4"
-    )
-    ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(
-        w13_s_u8, group_size=GROUP_SIZE
-    )
-    ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(w2_s_u8, group_size=GROUP_SIZE)
+    if use_humming:
+        ref_w13, ref_w13_s, ref_r13 = preprocess_humming(
+            w31.view(torch.uint8), w13_s_u8
+        )
+        ref_w2, ref_w2_s, ref_r2 = preprocess_humming(w2.view(torch.uint8), w2_s_u8)
+        ref_scales = [
+            ref_w13_s.view(torch.int32),
+            ref_r13 * 64.0,
+            torch.ones((), device="cuda"),
+            ref_w2_s.view(torch.int32),
+            ref_r2 * 64.0,
+        ]
+    else:
+        ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
+            w31.view(torch.uint8), "fp4"
+        )
+        ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(w2.view(torch.uint8), "fp4")
+        ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(
+            w13_s_u8, group_size=GROUP_SIZE
+        )
+        ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(
+            w2_s_u8, group_size=GROUP_SIZE
+        )
+        ref_scales = [ref_w13_s.view(torch.int32), ref_w2_s.view(torch.int32)]
+    assert torch.equal(layer.w13_weight, ref_w13)
+    assert torch.equal(layer.w2_weight, ref_w2)
+    assert torch.equal(layer.w13_weight_scale_inv, ref_w13_s)
+    assert torch.equal(layer.w2_weight_scale_inv, ref_w2_s)
 
     out_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device="cuda")
     cutlass_fused_moe(
@@ -821,13 +849,14 @@ def test_dsv4_apply_matches_flashinfer_direct(
         fc1_expert_weights=ref_w13,
         fc2_expert_weights=ref_w2,
         output_dtype=torch.bfloat16,
-        quant_scales=[ref_w13_s.view(torch.int32), ref_w2_s.view(torch.int32)],
+        quant_scales=ref_scales,
         fc1_expert_biases=None,
         fc2_expert_biases=None,
         swiglu_alpha=None,
         swiglu_beta=None,
         swiglu_limit=None,
         use_w4_group_scaling=True,
+        use_wfp4afp8_humming=use_humming,
         activation_type=ActivationType.Swiglu,
         output=out_ref,
     )
@@ -843,15 +872,23 @@ def test_dsv4_apply_matches_flashinfer_direct(
     not HAS_CORRECTED_HUMMING_API,
     reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
 )
-def test_dsv4_process_weights_humming_matches_flashinfer_direct():
+@pytest.mark.parametrize("num_experts", [4, 8, 17])
+def test_dsv4_process_weights_humming_matches_flashinfer_direct(num_experts):
     """DSv4's native [up; gate] layout must use the same #3738 transform."""
     from types import SimpleNamespace
 
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
     from sglang.srt.runtime_context import get_context
 
-    num_experts, hidden, inter = 4, 256, 256
+    hidden, inter = 256, 256
     w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
+    # Alternate narrow and clamped ranges, with different residuals per expert.
+    for scale in (w13_s, w2_s):
+        raw = scale.view(torch.uint8)
+        raw[1::2].remainder_(21).add_(110)
+        raw.add_(
+            torch.arange(num_experts, dtype=torch.uint8, device="cuda")[:, None, None]
+        )
     w1, w3 = w13.chunk(2, dim=1)
     w1_s, w3_s = w13_s.chunk(2, dim=1)
     w31 = torch.cat((w3, w1), dim=1).contiguous()
