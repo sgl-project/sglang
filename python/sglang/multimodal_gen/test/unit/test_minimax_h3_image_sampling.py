@@ -195,6 +195,17 @@ def test_request_steps(override, steps):
             },
             "at least one latent",
         ),
+        # every step is noisy by default, and cps has no noise on the last:
+        # with the Gaussian constants its log-prob comes back NaN
+        (
+            {
+                "rollout": True,
+                "num_inference_steps": 6,
+                "rollout_sde_type": "cps",
+                "rollout_noise_level": 0.8,
+            },
+            "no finite log-prob",
+        ),
     ],
 )
 def test_invalid_image_requests_fail_at_constructor(override, match):

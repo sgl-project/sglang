@@ -125,6 +125,7 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
                     "rollout_stop_step_index is not supported"
                 )
             self._reject_rollout_steps_off_the_grid()
+            self._reject_cps_constants_on_the_last_step()
         if self.quality not in ("exact", "lossless"):
             raise ValueError("MiniMax H3 image supports quality='exact' or 'lossless'")
         if (
@@ -155,6 +156,24 @@ class MiniMaxH3ImageSamplingParams(SamplingParams):
         ):
             raise ValueError(
                 "MiniMax H3 image rollout_return_step_indices must name at least one latent"
+            )
+
+    def _reject_cps_constants_on_the_last_step(self) -> None:
+        """The grid ends at sigma 0, where cps has no noise: its log-prob with the Gaussian constants is 0/0."""
+        steps = self.num_inference_steps
+        if (
+            steps is None
+            or self.rollout_sde_type != "cps"
+            or self.rollout_noise_level == 0.0
+            or self.rollout_log_prob_no_const
+        ):
+            return
+        noisy_steps = self.rollout_sde_step_indices
+        if noisy_steps is None or steps - 1 in noisy_steps:
+            raise ValueError(
+                "MiniMax H3 image cps rollout has no finite log-prob with the Gaussian "
+                f"constants on its last step: set rollout_log_prob_no_const, or leave step "
+                f"{steps - 1} out of rollout_sde_step_indices"
             )
 
     def _adjust(self, server_args) -> None:
