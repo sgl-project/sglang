@@ -40,6 +40,17 @@ def _op():
             "verify runs the unfused chain"
         )
         return None
+    missing = [
+        name
+        for name in ("state_dtypes", "max_tokens", "num_warps")
+        if not hasattr(flydsl_kda_verify_with_f_b, name)
+    ]
+    if missing:
+        print_warning_once(
+            "Kimi-K3 fused KDA verify unavailable (AITER's flydsl_kda_verify_with_f_b "
+            f"lacks {', '.join(missing)}); verify runs the unfused chain"
+        )
+        return None
     return flydsl_kda_verify_with_f_b
 
 

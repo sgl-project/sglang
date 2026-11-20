@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -413,6 +414,40 @@ class TestHipFusedDecodeArming(CustomTestCase):
         with mock.patch.object(kimi_k3, "print_warning_once") as warn:
             self.assertIsNone(KimiK3DeltaAttention._fused_decode_f_b_weight(attention))
         warn.assert_called_once()
+
+
+class TestFusedVerifyOp(CustomTestCase):
+    """The adapter is fail-closed: an AITER op that predates the metadata it reads
+    (state_dtypes, max_tokens, num_warps) must leave the fused verify unarmed."""
+
+    def _install_aiter(self, op) -> None:
+        module = "aiter.ops.flydsl.linear_attention_kernels"
+        stubs = {
+            "aiter": SimpleNamespace(),
+            "aiter.ops": SimpleNamespace(),
+            "aiter.ops.flydsl": SimpleNamespace(),
+            module: SimpleNamespace(flydsl_kda_verify_with_f_b=op),
+        }
+        patcher = mock.patch.dict(sys.modules, stubs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        kda_fused_verify_aiter_hip._op.cache_clear()
+        self.addCleanup(kda_fused_verify_aiter_hip._op.cache_clear)
+
+    def test_op_without_num_warps_is_not_used(self):
+        op = SimpleNamespace(state_dtypes=(), max_tokens=8)
+        self._install_aiter(op)
+
+        with mock.patch.object(
+            kda_fused_verify_aiter_hip, "print_warning_once"
+        ) as warn:
+            self.assertIsNone(kda_fused_verify_aiter_hip._op())
+        warn.assert_called_once()
+        self.assertIn("num_warps", warn.call_args.args[0])
+
+        op.num_warps = (4, 8)
+        kda_fused_verify_aiter_hip._op.cache_clear()
+        self.assertIs(kda_fused_verify_aiter_hip._op(), op)
 
 
 class TestFusedVerifyUnsupported(CustomTestCase):
