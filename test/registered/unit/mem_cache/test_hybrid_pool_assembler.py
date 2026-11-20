@@ -1677,8 +1677,8 @@ class TestHicacheMambaSize(CustomTestCase):
         )
 
     def test_unset_gives_every_packed_mamba_pool_its_device_share(self):
-        """Draft Mamba pools packed into the one Mamba host pool
-        add their device bytes to its share instead of dropping out of the split."""
+        """Draft Mamba pools are packed into the one Mamba host pool,
+        so their device bytes join its share instead of dropping out of the split."""
         self.assertEqual(
             self._split(
                 hicache_size=192,
