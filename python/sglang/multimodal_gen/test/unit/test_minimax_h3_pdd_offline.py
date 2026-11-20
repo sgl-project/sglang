@@ -353,7 +353,7 @@ class TestMiniMaxH3PDDHeadWeightUpdate(CustomTestCase):
             ),
         )
         for heads_path, name, update_tensor, expected_message in cases:
-            with self.subTest(expected_message=expected_message):
+            with self.subTest(name=name, expected_message=expected_message):
                 layers = _make_final_layers(heads_path, tp_size=1)
                 updater, _ = _make_transformer_updater(layers[0])
 

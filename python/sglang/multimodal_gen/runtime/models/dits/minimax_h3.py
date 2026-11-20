@@ -2211,8 +2211,8 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         self, named_weights: list[tuple[str, torch.Tensor]]
     ) -> list[tuple[str, torch.Tensor]]:
         prefix = MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX
-        # No parameter path holds the fused heads file's name, so one elsewhere
-        # in a weight name is a head stack that would be skipped.
+        # No parameter path holds the fused heads file's name;
+        # anywhere else in a weight name it is a head stack that would be skipped.
         misnamed = [
             name
             for name, _ in named_weights
