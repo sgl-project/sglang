@@ -186,33 +186,7 @@ def handle_load_format(server_args: Any):
             "Detected Mistral native format checkpoint, setting load_format='mistral'"
         )
 
-    if is_runai_obj_uri(cfg.model_path):
-        declare_resolution(
-            server_args,
-            "_handle_load_format",
-            load_format="runai_streamer",
-        )
-    elif is_remote_url(cfg.model_path):
-        declare_resolution(
-            server_args,
-            "_handle_load_format",
-            load_format="remote",
-        )
-
-    if (
-        cfg.speculative_draft_model_path is not None
-        and is_runai_obj_uri(cfg.speculative_draft_model_path)
-        and cfg.speculative_draft_load_format is None
-    ):
-        declare_resolution(
-            server_args,
-            "_handle_load_format",
-            speculative_draft_load_format="runai_streamer",
-        )
-
-    if cfg.custom_weight_loader is None:
-        declare_resolution(server_args, "_handle_load_format", custom_weight_loader=[])
-
+    # Resolve invalid remote-instance settings before applying URI defaults.
     if cfg.load_format == "remote_instance":
         if cfg.remote_instance_weight_loader_backend != "modelexpress" and (
             cfg.remote_instance_weight_loader_seed_instance_ip is None
@@ -250,6 +224,39 @@ def handle_load_format(server_args: Any):
                 "_handle_load_format",
                 load_format="auto",
             )
+
+    # Object-store metadata is prepared independently by handle_model_source_paths.
+    # The URI selects a weight loader only when no format has been selected.
+    if is_runai_obj_uri(cfg.model_path):
+        if cfg.load_format == "auto":
+            declare_resolution(
+                server_args,
+                "_handle_load_format",
+                load_format="runai_streamer",
+            )
+    elif is_remote_url(cfg.model_path):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            load_format="remote",
+        )
+
+    draft_load_format = cfg.speculative_draft_load_format
+    if draft_load_format is None:
+        draft_load_format = cfg.load_format
+    if (
+        cfg.speculative_draft_model_path is not None
+        and is_runai_obj_uri(cfg.speculative_draft_model_path)
+        and draft_load_format == "auto"
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            speculative_draft_load_format="runai_streamer",
+        )
+
+    if cfg.custom_weight_loader is None:
+        declare_resolution(server_args, "_handle_load_format", custom_weight_loader=[])
 
     # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
