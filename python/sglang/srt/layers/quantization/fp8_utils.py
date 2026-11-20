@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_gfx1250_supported,
     is_hip,
     is_musa,
+    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.common import torch_release
@@ -72,6 +73,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+_is_npu = is_npu()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -764,7 +766,7 @@ def dispatch_w8a8_block_fp8_linear(
         )
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
-    if weight_block_size is not None and weight_block_size[1] != 128:
+    if weight_block_size is not None and weight_block_size[1] != 128 and not _is_npu:
         if backend.is_deep_gemm():
             print_warning_once(
                 f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "

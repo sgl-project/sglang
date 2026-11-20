@@ -144,6 +144,12 @@ python -m sglang.launch_server \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code> / <code>safetensors</code> / <code>mistral</code> / <code>flash_rl</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>max_inflight_bytes</code> (int)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Limits how much checkpoint data the multithreaded loader reads ahead. The loader reads several safetensors shards in parallel before the model needs them; this sets the maximum total file size, in bytes, of those read-ahead shards. Use it to lower peak host RAM on memory-limited hosts, especially with <code>--weight-loader-disable-mmap</code>, where every read-ahead shard is fully held in memory. A smaller value uses less RAM but loads more slowly, because fewer shards are read in parallel. The loader always reads at least one shard, even one larger than the limit. Peak host RAM is about 2-3x the larger of this limit and your largest shard, because the shard being loaded into the model is not counted, and with <code>--weight-loader-disable-mmap</code> a shard briefly needs about twice its size while it is read. Applies only to safetensors checkpoints with multithreaded loading on (<code>enable_multithread_load</code>); otherwise it is ignored with a warning.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>None (no byte limit; up to <code>num_threads</code> + 1 shards)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>sharded_state</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>pattern</code> (str)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Filename pattern for per-rank shards.</td>

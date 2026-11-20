@@ -945,6 +945,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 
     indexer = SimpleNamespace(
         index_topk=2048,
+        fp4_index_k=False,
         num_init_tokens=0,
         num_local_tokens=0,
         logits_with_pp_recv=False,
