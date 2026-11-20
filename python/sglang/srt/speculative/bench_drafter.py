@@ -1,10 +1,13 @@
-"""SGLANG_BENCH_DRAFTER_TEMPERATURE: a benchmark-only fixed draft sampling temperature.
+"""The draft temperature DSpark and DFLASH-family drafters use in place of greedy drafting
+under simulated acceptance (SGLANG_SIMULATE_ACC_LEN).
 
-With simulated acceptance (SGLANG_SIMULATE_ACC_LEN) a greedy drafter's committed drafts
-collapse into short repeating loops, which keeps MoE routing on a small repeated set and
-makes the measured step time optimistic. A positive value makes the drafters that support
-it (DSpark and the DFLASH family) sample every draft row at this temperature, e.g. 1000
-(close to uniform), while the target still verifies greedily.
+Forced acceptance commits whatever the drafter proposes. A greedy drafter's proposals
+collapse into short repeating loops (DFLASH's default token mode even commits one fixed
+id), which keeps MoE routing on a small repeated set and makes the measured step time
+optimistic. So whenever simulated acceptance commits drafts, greedy draft rows sample at
+1000 (close to uniform) by default while the target still verifies greedily;
+SGLANG_BENCH_DRAFTER_TEMPERATURE sets the temperature, and 0 keeps greedy drafts. Sampled
+requests keep their own draft temperature.
 """
 
 from __future__ import annotations
@@ -18,8 +21,9 @@ import torch
 from sglang.srt.environ import envs
 
 ENV_NAME = "SGLANG_BENCH_DRAFTER_TEMPERATURE"
-GREEDY_REQUEST_ERROR = f"{ENV_NAME} requires greedy requests (temperature 0 / top_k 1)."
 SUPPORTED_ALGORITHMS = ("DFLASH", "DSPARK")
+# The draft temperature under simulated acceptance when the variable is unset.
+DEFAULT_TEMPERATURE = 1000.0
 # The request clamp: below it the draft kernels' value / temperature overflows.
 MIN_TEMPERATURE = 1e-5
 
@@ -29,35 +33,63 @@ _HEAD_NOISE_DOMAIN = 0x6B6E6F6973652D31
 GRAPH_STEP, EAGER_STEP = 0, 1
 
 
-@functools.cache
-def bench_drafter_temperature() -> float:
-    """SGLANG_BENCH_DRAFTER_TEMPERATURE, validated once per process; 0.0 when unset."""
-    value = float(envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.get())
+def requested_temperature() -> Optional[float]:
+    """SGLANG_BENCH_DRAFTER_TEMPERATURE as set, validated; None when unset."""
+    value = envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.get()
+    if value is None:
+        return None
+    value = float(value)
     if value != 0.0 and not (
         MIN_TEMPERATURE <= value <= torch.finfo(torch.float32).max
     ):
         raise ValueError(
-            f"{ENV_NAME} must be 0 (disabled) or a float32 temperature of at least "
-            f"{MIN_TEMPERATURE}, got {value!r}."
+            f"{ENV_NAME} must be 0 (greedy drafts) or a float32 temperature of at "
+            f"least {MIN_TEMPERATURE}, got {value!r}."
         )
     return value
+
+
+@functools.cache
+def bench_drafter_temperature() -> float:
+    """The draft temperature of greedy draft rows, read by the DSpark and DFLASH-family
+    draft paths only: the variable when set, else DEFAULT_TEMPERATURE whenever
+    simulated acceptance commits drafts (SGLANG_SIMULATE_ACC_LEN > 1), else 0."""
+    requested = requested_temperature()
+    if requested is not None:
+        return requested
+    if float(envs.SGLANG_SIMULATE_ACC_LEN.get()) > 1.0:
+        return DEFAULT_TEMPERATURE
+    return 0.0
 
 
 def bench_drafter_enabled() -> bool:
     return bench_drafter_temperature() > 0.0
 
 
+def opt_out_hint() -> str:
+    """Appended to refusals of the default, which the user did not ask for."""
+    if requested_temperature() is not None:
+        return ""
+    return (
+        f" ({ENV_NAME} defaults to {DEFAULT_TEMPERATURE:g} under SGLANG_SIMULATE_ACC_LEN;"
+        f" set {ENV_NAME}=0 to keep greedy drafts)"
+    )
+
+
 def validate_server_args(algorithm: Optional[str]) -> None:
     """Server-args gate, run on every launch before any weights load: a malformed
-    value, an algorithm whose drafts would ignore the override, or a benchmark
-    setting the drafters cannot honor fails here instead of mid-run."""
-    if not bench_drafter_enabled():  # also validates the value on every server
-        return
+    value, an explicit value on an algorithm whose drafts would ignore it, or a
+    setting the DSpark / DFLASH drafters cannot honor fails here instead of mid-run."""
+    requested = requested_temperature()  # validates the value on every server
     if algorithm not in SUPPORTED_ALGORITHMS:
-        raise ValueError(
-            f"{ENV_NAME} needs --speculative-algorithm "
-            f"{' / '.join(SUPPORTED_ALGORITHMS)}, got {algorithm}."
-        )
+        if requested:
+            raise ValueError(
+                f"{ENV_NAME} applies to --speculative-algorithm "
+                f"{' / '.join(SUPPORTED_ALGORITHMS)}, not {algorithm}."
+            )
+        return
+    if not bench_drafter_enabled():
+        return
     simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
     if not 0.0 < simulate_acc_len < math.inf:
         raise ValueError(
@@ -70,7 +102,9 @@ def validate_server_args(algorithm: Optional[str]) -> None:
     )
 
     if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
-        raise ValueError(f"{ENV_NAME} requires SGLANG_RAGGED_VERIFY_MODE=static.")
+        raise ValueError(
+            f"{ENV_NAME} requires SGLANG_RAGGED_VERIFY_MODE=static{opt_out_hint()}."
+        )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     platform_worker = SpeculativeAlgorithm.from_string(
@@ -79,28 +113,22 @@ def validate_server_args(algorithm: Optional[str]) -> None:
     if platform_worker is not None:
         raise ValueError(
             f"{ENV_NAME} is applied by the built-in {algorithm} worker only; this "
-            f"platform serves {algorithm} with {platform_worker.__name__}."
+            f"platform serves {algorithm} with {platform_worker.__name__}"
+            f"{opt_out_hint()}."
         )
-
-
-def require_greedy_requests(sampling_info) -> None:
-    """A sampled request would be accepted against drafts drawn at a temperature it
-    did not ask for; the benchmark keeps every request greedy (the scheduler rejects
-    others at admission)."""
-    if sampling_info is not None and not sampling_info.is_all_greedy:
-        raise ValueError(GREEDY_REQUEST_ERROR)
 
 
 def override_draft_sampling(
     temperatures: torch.Tensor, greedy_mask: torch.Tensor
 ) -> None:
-    """In place, when enabled: the given draft-only temperature / greedy-mask rows sample
-    at the benchmark temperature. Callers pass the ``[:bs]`` rows of buffers that only the
-    draft proposal reads, never ones the target verify reads."""
+    """In place, when enabled: the given draft-only rows that would draft greedily
+    sample at the benchmark temperature; sampled rows keep their own temperature.
+    Callers pass the resolved ``[:bs]`` rows of buffers that only the draft proposal
+    reads, never ones the target verify reads."""
     temperature = bench_drafter_temperature()
     if temperature <= 0.0:
         return
-    temperatures.fill_(temperature)
+    temperatures.masked_fill_(greedy_mask, temperature)
     greedy_mask.fill_(False)
 
 

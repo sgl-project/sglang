@@ -31,6 +31,7 @@ def _sampling_info(temperatures, top_ks):
 
 
 GREEDY = _sampling_info([0.0, 0.0, 0.0], [1, 1, 1])
+MIXED = _sampling_info([0.0, 0.7, 1.0], [1, 20, 1 << 30])
 
 
 @contextmanager
@@ -61,8 +62,19 @@ class _Case(CustomTestCase):
 
 
 class TestParse(_Case):
-    def test_unset_is_zero(self):
+    def test_unset_is_zero_without_simulated_acceptance(self):
         self.assertEqual(bd.bench_drafter_temperature(), 0.0)
+
+    def test_simulated_acceptance_defaults_to_1000(self):
+        for value, acc_len, expected in (
+            (None, "3.8", 1000.0),
+            (None, "1.0", 0.0),  # nothing committed past the bonus token
+            ("0", "3.8", 0.0),  # opted out: greedy drafts
+            ("250", "3.8", 250.0),
+        ):
+            with self.subTest(value=value, acc_len=acc_len):
+                with envs.SGLANG_SIMULATE_ACC_LEN.override(acc_len), _bench(value):
+                    self.assertEqual(bd.bench_drafter_temperature(), expected)
 
     def test_valid_values(self):
         for raw, value in (("1000", 1000.0), ("1e-5", 1e-5), ("0", 0.0)):
@@ -107,11 +119,22 @@ class TestValidateServerArgs(_Case):
             with self.subTest(algorithm=algorithm), self._benchmark():
                 bd.validate_server_args(algorithm)
 
+    def test_default_leaves_other_algorithms_alone(self):
+        for algorithm in (None, "EAGLE", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                with self._benchmark(None, mode="compact"):
+                    bd.validate_server_args(algorithm)
+
+    def test_a_refused_default_names_the_opt_out(self):
+        with self._benchmark(None, mode="compact"):
+            with self.assertRaisesRegex(ValueError, "=0 to keep greedy drafts"):
+                bd.validate_server_args("DSPARK")
+
     def test_refuses_unsupported_configs(self):
         cases = (
-            ("needs --speculative-algorithm", None, {}),
-            ("needs --speculative-algorithm", "EAGLE", {}),
-            ("needs --speculative-algorithm", "NGRAM", {}),
+            ("applies to --speculative-algorithm", None, {}),
+            ("applies to --speculative-algorithm", "EAGLE", {}),
+            ("applies to --speculative-algorithm", "NGRAM", {}),
             ("SGLANG_SIMULATE_ACC_LEN", "DSPARK", {"acc_len": "-1"}),
             ("SGLANG_SIMULATE_ACC_LEN", "DFLASH", {"acc_len": "inf"}),
             ("SGLANG_RAGGED_VERIFY_MODE", "DSPARK", {"mode": "compact"}),
@@ -409,6 +432,15 @@ class TestSelectorAndLiLiCorrStaging(_Case):
         sampler.stage_sampling_params(bs=3, sampling_info=GREEDY)
         self.assertTrue(bool(sampler.greedy_mask[:3].all()))
 
+    def test_selector_on_keeps_sampled_rows(self):
+        sampler = self._selector()
+        with _bench(1000):
+            sampler.stage_sampling_params(bs=3, sampling_info=MIXED)
+        self.assertTrue(
+            torch.allclose(sampler.temperatures[:3], torch.tensor([1000.0, 0.7, 1.0]))
+        )
+        self.assertFalse(bool(sampler.greedy_mask[:3].any()))
+
     def test_selector_on_samples_every_row(self):
         sampler = self._selector()
         with _bench(1000):
@@ -427,8 +459,16 @@ class TestSelectorAndLiLiCorrStaging(_Case):
                 sampling_enabled=True,
             )
             sampler.stage_sampling_params(bs=3, sampling_info=GREEDY)
+            staged = head.stage_draft_head_sampling.call_args.kwargs
+            self.assertTrue(
+                torch.equal(staged["temperatures"], torch.full((3,), 1000.0))
+            )
+            self.assertFalse(bool(staged["greedy_mask"].any()))
+            sampler.stage_sampling_params(bs=3, sampling_info=MIXED)
         staged = head.stage_draft_head_sampling.call_args.kwargs
-        self.assertTrue(torch.equal(staged["temperatures"], torch.full((3,), 1000.0)))
+        self.assertTrue(
+            torch.allclose(staged["temperatures"], torch.tensor([1000.0, 0.7, 1.0]))
+        )
         self.assertFalse(bool(staged["greedy_mask"].any()))
 
     def test_lilicorr_on_samples_every_row(self):
@@ -452,6 +492,11 @@ class TestDflashTokenMode(_Case):
             self.assertEqual(dfw._sim_acc_token_mode(), "fixed")
             with _bench(1000):
                 self.assertEqual(dfw._sim_acc_token_mode(), "real-draft-token")
+            # The default under simulated acceptance commits the drafts as well.
+            with envs.SGLANG_SIMULATE_ACC_LEN.override("3.8"), _bench(None):
+                self.assertEqual(dfw._sim_acc_token_mode(), "real-draft-token")
+            with envs.SGLANG_SIMULATE_ACC_LEN.override("3.8"), _bench("0"):
+                self.assertEqual(dfw._sim_acc_token_mode(), "fixed")
 
 
 def _dflash_worker(**overrides):
@@ -481,6 +526,13 @@ class TestDflashWorkerGuard(_Case):
         self._check(_dflash_worker(lilicorr=object(), _lilicorr_sampling_enabled=True))
         with patch.object(dfw, "SIMULATE_ACC_TOKEN_MODE", "fixed"):
             self._check(_dflash_worker(_target_tp_rank=0))
+
+    def test_a_refused_default_names_the_opt_out(self):
+        with envs.SGLANG_SIMULATE_ACC_LEN.override("3.8"), _bench(None):
+            with self.assertRaisesRegex(ValueError, "=0 to keep greedy drafts"):
+                dfw.DFlashWorkerV2._check_bench_drafter_temperature(
+                    _dflash_worker(_is_domino=True)
+                )
 
     def test_rejects_drafts_it_cannot_sample(self):
         cases = {

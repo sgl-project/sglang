@@ -39,10 +39,7 @@ class _BenchTemperature(CustomTestCase):
         bench_drafter_temperature.cache_clear()
 
     def _resolve(self, value, sampling_info, **kwargs):
-        if value is None:
-            return resolve_draft_params(
-                sampling_info=sampling_info, bs=3, device="cpu", **kwargs
-            )
+        # None leaves the variable unset (its default under simulated acceptance).
         with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override(value):
             bench_drafter_temperature.cache_clear()
             return resolve_draft_params(
@@ -87,6 +84,21 @@ class TestResolveDraftParams(_BenchTemperature):
         params = self._resolve(1000.0, None)
         self.assertTrue(torch.equal(params.step_temperatures, torch.full((3,), 1000.0)))
 
+    def test_sampled_rows_keep_their_temperature(self):
+        params = self._resolve(1000.0, MIXED)
+        self.assertTrue(
+            torch.allclose(params.step_temperatures, torch.tensor([1000.0, 0.7, 1.0]))
+        )
+
+    def test_simulated_acceptance_defaults_to_1000(self):
+        for acc_len, expected in (("3.8", 1000.0), ("1.0", 0.0)):
+            with self.subTest(acc_len=acc_len):
+                with envs.SGLANG_SIMULATE_ACC_LEN.override(acc_len):
+                    params = self._resolve(None, GREEDY)
+                self.assertTrue(
+                    torch.equal(params.step_temperatures, torch.full((3,), expected))
+                )
+
 
 class TestParse(_BenchTemperature):
     def test_unset_is_zero(self):
@@ -130,13 +142,6 @@ class TestWorkerGuard(_BenchTemperature):
         with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override(value):
             bench_drafter_temperature.cache_clear()
             DSparkWorkerV2._check_bench_drafter_temperature(worker)
-
-    def test_sampling_request_rejected_before_simulated_greedy_can_mask_it(self):
-        worker = _worker(_hosts_draft=True, _simulate_acc_greedy=True)
-        batch = SimpleNamespace(sampling_info=MIXED)
-        with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override("1000"):
-            with self.assertRaisesRegex(ValueError, "requires greedy requests"):
-                DSparkWorkerV2.forward_batch_generation(worker, batch)
 
     def test_off_accepts_anything(self):
         self._check(_worker(_simulate_acc_len=-1, _greedy_draft=True), "0")

@@ -30,10 +30,7 @@ from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
-from sglang.srt.speculative.bench_drafter import (
-    bench_drafter_temperature,
-    require_greedy_requests,
-)
+from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -802,10 +799,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
-        # Check the original request before simulated greedy decode can discard its
-        # sampling metadata or prefill can produce the first target token.
-        if bench_drafter_temperature() > 0.0:
-            require_greedy_requests(batch.sampling_info)
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,

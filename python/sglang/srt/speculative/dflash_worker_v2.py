@@ -93,8 +93,8 @@ from sglang.srt.speculative.bench_drafter import (
     bench_drafter_temperature,
     bench_head_noise,
     gumbel_argmax,
+    opt_out_hint,
     override_draft_sampling,
-    require_greedy_requests,
 )
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
@@ -496,9 +496,7 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
-        if self.sampling_enabled and bench_drafter_enabled():
-            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
-        elif sampling_info is None or not self.sampling_enabled:
+        if sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
         else:
@@ -512,6 +510,8 @@ class _SelectorDraftSampler:
                     bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
                 )
             )
+        if self.sampling_enabled:
+            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -567,9 +567,18 @@ class _MegakernelSelectorDraftSampler:
         if not self.sampling_enabled:
             return
         if self._bench_sampling:
+            temperatures = self._bench_temperatures[:bs]
+            if not _is_all_greedy(sampling_info):
+                # Greedy rows draft at the benchmark temperature, sampled rows at theirs.
+                temperatures = torch.where(
+                    resolve_greedy_mask(
+                        bs=bs, sampling_info=sampling_info, device=self.q_out.device
+                    )[:bs],
+                    temperatures,
+                    sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5),
+                )
             self._head.stage_draft_head_sampling(
-                temperatures=self._bench_temperatures[:bs],
-                greedy_mask=self._bench_greedy_mask[:bs],
+                temperatures=temperatures, greedy_mask=self._bench_greedy_mask[:bs]
             )
             return
         if _is_all_greedy(sampling_info):
@@ -1026,25 +1035,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._check_bench_drafter_temperature()
 
     def _check_bench_drafter_temperature(self) -> None:
-        """Refuse SGLANG_BENCH_DRAFTER_TEMPERATURE for drafts it cannot sample. The
-        env-only preconditions (simulated acceptance, static verify) are checked with
-        the server args, before any weights load."""
+        """Refuse the draft temperature (default under simulated acceptance) for drafts
+        it cannot sample. The env-only preconditions (simulated acceptance, static
+        verify) are checked with the server args, before any weights load."""
         temperature = bench_drafter_temperature()
         if temperature <= 0.0:
             return
         name = BENCH_DRAFTER_ENV
         if self._is_domino:
             raise ValueError(
-                f"{name} does not support Domino drafts (a sequential argmax rollout)."
+                f"{name} does not support Domino drafts (a sequential argmax "
+                f"rollout){opt_out_hint()}."
             )
         if self.selector is not None and not self._selector_sampling_enabled:
             raise ValueError(
-                f"{name} needs selector sampling, which this backend does not support."
+                f"{name} needs selector sampling, which this backend does not "
+                f"support{opt_out_hint()}."
             )
         if self.lilicorr is not None and not self._lilicorr_sampling_enabled:
             raise ValueError(
                 f"{name} with LiLiCorr requires SGLANG_ENABLE_LILICORR_SAMPLING=1, so "
-                "the draft graph captures its sampled walk."
+                f"the draft graph captures its sampled walk{opt_out_hint()}."
             )
         if self._target_tp_rank != 0:
             return
@@ -3891,8 +3902,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info = batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
             return
-        if bench_drafter_enabled():
-            require_greedy_requests(sampling_info)
 
         if self.selector is not None:
             if self._selector_sampling_enabled:

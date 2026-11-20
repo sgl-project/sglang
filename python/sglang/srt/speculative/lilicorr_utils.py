@@ -311,9 +311,7 @@ class LiLiCorrDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         if not self.sampling_enabled:
             return
-        if bench_drafter_enabled():
-            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
-        elif sampling_info is None:
+        if sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
         else:
@@ -327,6 +325,7 @@ class LiLiCorrDraftSampler:
                     bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
                 )
             )
+        override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         del input_ids

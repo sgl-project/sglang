@@ -398,10 +398,6 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.bench_drafter import (
-    GREEDY_REQUEST_ERROR,
-    bench_drafter_enabled,
-)
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -3920,16 +3916,6 @@ class Scheduler(
         # Every request the scheduler keeps owes its output from here; one rejected
         # at intake without being queued sends it in the call that built it.
         self.invariant_checker.expect_output(req)
-        if (
-            self.spec_algorithm.is_dflash_family()
-            # One already refused at intake keeps its own error and status.
-            and not req.finished()
-            and req.to_finish is None
-            and req.sampling_params.top_k != 1
-            and bench_drafter_enabled()
-        ):
-            self._reject_bad_request(req, GREEDY_REQUEST_ERROR)
-            return
         if not self._set_or_validate_priority(req):
             return
         if is_retracted:
