@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.linear.kernels import kda_triton
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 SLOTS = 40
 LOWER_BOUND = -5.0
