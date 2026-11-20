@@ -1175,7 +1175,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 if _kernel_writes_metadata(device):
-                    # Written by kernels instead of pinned host-to-device copies.
                     ret.extend_seq_lens = _host_ints_to_device(
                         extend_seq_lens, torch.int32, device
                     )
