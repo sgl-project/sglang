@@ -253,6 +253,18 @@ class ReqLogprob:
     )
     output_token_ids_logprobs_idx: Optional[list] = None
 
+    def reset_output_records(self) -> None:
+        """Empty the per-output-token records of a request that returns logprobs."""
+        # shape: (bs, 1)
+        self.output_token_logprobs_val = []
+        self.output_token_logprobs_idx = []
+        # shape: (bs, k)
+        self.output_top_logprobs_val = []
+        self.output_top_logprobs_idx = []
+        # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+        self.output_token_ids_logprobs_val = []
+        self.output_token_ids_logprobs_idx = []
+
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
@@ -704,15 +716,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
-            # shape: (bs, 1)
-            self.logprob.output_token_logprobs_val = []
-            self.logprob.output_token_logprobs_idx = []
-            # shape: (bs, k)
-            self.logprob.output_top_logprobs_val = []
-            self.logprob.output_top_logprobs_idx = []
-            # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
-            self.logprob.output_token_ids_logprobs_val = []
-            self.logprob.output_token_ids_logprobs_idx = []
+            self.logprob.reset_output_records()
         self.sampling_mask_rows: Optional[SamplingMaskRows] = (
             SamplingMaskRows() if return_sampling_mask else None
         )
