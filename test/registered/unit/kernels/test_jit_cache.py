@@ -18,8 +18,8 @@ import pytest
 from sglang.kernels.jit.utils import arch
 from sglang.kernels.jit.utils.arch import CompileArch
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
-from sglang.kernels.jit.utils.compile.flags import filter_hgcc_cuda_flags
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+from sglang.kernels.jit.utils.compile.sail_flags import filter_hgcc_flags
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -641,7 +641,7 @@ def test_hgcc_removes_nvcc_options_without_leaving_operands(option, operand, joi
     flags += [f"{option}={operand}"] if joined else [option, operand]
     flags += ["--fmad=false", "-O3", "-Xcompiler", "-fPIC"]
     original = flags.copy()
-    assert filter_hgcc_cuda_flags(flags) == [
+    assert filter_hgcc_flags(flags) == [
         "--ftz=false",
         "-DSGL_TOPK_MODE=1",
         "--fmad=false",
@@ -654,7 +654,7 @@ def test_hgcc_removes_nvcc_options_without_leaving_operands(option, operand, joi
 
 def test_hgcc_unsupported_warning_option_preserves_math_flags():
     """TileLang's v2 diagnostic switch is rejected by the HGCC 2.2 driver."""
-    assert filter_hgcc_cuda_flags(
+    assert filter_hgcc_flags(
         ["--ftz=false", "-Wno-deprecated-declarations", "--fmad=false"]
     ) == ["--ftz=false", "--fmad=false"]
 
@@ -672,7 +672,7 @@ def test_hgcc_mixed_nvcc_flags_preserve_math_option_order():
         "--fmad=false",
         "--expt-relaxed-constexpr",
     ]
-    assert filter_hgcc_cuda_flags(flags) == [
+    assert filter_hgcc_flags(flags) == [
         "--use_fast_math",
         "--ftz=false",
         "--fmad=false",

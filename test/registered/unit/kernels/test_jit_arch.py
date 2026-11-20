@@ -66,12 +66,12 @@ class TestJitTargetFlags(CustomTestCase):
                 )
                 flags = arch.get_default_target_flags(compile_arch)
                 if platform == "sail":
-                    self.assertEqual(flags, [*common_flags, "-DSGL_SAIL=1"])
+                    self.assertEqual(flags, [*common_flags, "-DUSE_SAIL=1"])
                 elif platform == "cuda":
                     self.assertEqual(flags, common_flags)
                 else:
                     self.assertIn("-DUSE_ROCM", flags)
-                    self.assertNotIn("-DSGL_SAIL=1", flags)
+                    self.assertNotIn("-DUSE_SAIL=1", flags)
 
 
 if __name__ == "__main__":

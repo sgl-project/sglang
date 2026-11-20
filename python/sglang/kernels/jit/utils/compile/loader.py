@@ -20,13 +20,13 @@ from sglang.kernels.jit.utils.arch import (
 )
 from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
-from sglang.kernels.jit.utils.compile.flags import (
-    filter_hgcc_cuda_flags as _filter_hgcc_cuda_flags,
-)
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
     DEFAULT_INCLUDE,
     DEFAULT_LDFLAGS,
+)
+from sglang.kernels.jit.utils.compile.sail_flags import (
+    filter_hgcc_flags as _filter_hgcc_flags,
 )
 from sglang.kernels.jit.utils.compile.sailify import convert_cuda_sources
 from sglang.kernels.jit.utils.compile.spec import BuildSpec, resolve_sources
@@ -151,7 +151,7 @@ def load_jit(
         resolved_cuda = list(resolve_sources(cuda_files))
         converted, sailify_flags = convert_cuda_sources(resolved_cuda, includes)
         cuda_files = converted  # absolute paths pass through resolve_sources below
-        extra_cuda_cflags = _filter_hgcc_cuda_flags(extra_cuda_cflags) + sailify_flags
+        extra_cuda_cflags = _filter_hgcc_flags(extra_cuda_cflags) + sailify_flags
 
     module_args = tuple(str(arg) for arg in args)
     compile_arch = resolve_compile_arch(cuda_arch_policy, module_args[0])
