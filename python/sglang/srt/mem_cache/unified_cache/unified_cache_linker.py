@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -349,9 +348,8 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
-        self._drop_superseded_mamba = (
-            envs.SGLANG_LINKER_DROP_SUPERSEDED_MAMBA.get()
-            and getattr(cache_linker, "supports_mamba_state_removal", False)
+        self._drop_superseded_mamba = getattr(
+            cache_linker, "supports_mamba_state_removal", False
         )
         # Mamba keys this rank stored and has not yet superseded.
         self._own_mamba_keys: set[str] = set()
