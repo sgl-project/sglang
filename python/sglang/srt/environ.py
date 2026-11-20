@@ -1844,7 +1844,7 @@ class Envs:
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     # KDA chain (topk 1) target verify: conv + gated delta rule in one launch
-    # (fused_kda_conv_recurrent_verify.py). Only read with --linear-attn-verify-backend triton.
+    # (fused_kda_conv_recurrent_verify.py). Only used with --linear-attn-verify-backend triton.
     SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPT_FUSED_KDA_VERIFY"
     )
