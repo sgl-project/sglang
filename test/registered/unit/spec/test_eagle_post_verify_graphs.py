@@ -13,11 +13,8 @@ the fused chain a replay takes and accept the forced lengths. With the NVIDIA
 megakernel's fused chain acceptance, eagle_sample's tail (greedy check, injected
 acceptance, accept lengths) must leave every output bitwise as the unfused tail does,
 greedy, compact top-k and dense sampled, at batch sizes up to 64, and the graphs must
-still match eager sampling. A round's retained outputs must survive the next round's
-replay, of the other slot or of another key, also when the body frees a temporary at
-the end of capture, and under Confidential Computing the async host copy of a sampled
-round, which nothing orders against that replay, must still read the round it was
-handed."""
+still match eager sampling. A round's outputs must survive the next round's replay,
+and the async host copy must read the round it was handed."""
 
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -824,10 +821,8 @@ class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestRetainedOutputsSurviveTheNextReplay(CustomTestCase):
-    """A round's retained outputs stay intact through the next round's replay, of
-    the other slot of the same key or of another key: the host copy may still read
-    them then. A body with a graph-internal temporary freed at the end of capture,
-    as sampled post-verify bodies have."""
+    """Round N's outputs sit outside the graph pool and survive round N+1's replay,
+    of the other slot of the same key or of another key."""
 
     def setUp(self):
         from sglang.srt.speculative.eagle_post_verify_graphs import _PostVerifyGraphs
@@ -860,8 +855,24 @@ class TestRetainedOutputsSurviveTheNextReplay(CustomTestCase):
         for _ in range(2 * eagle_post_verify_graphs._NUM_WARMUP + 2):
             self._round(bs)
 
+    def _assert_outside_the_graph_pool(self, tensor):
+        # independent of where the allocator places a capture's tensors
+        pool = self.post._pool
+        segments = torch.cuda.memory_snapshot()
+        self.assertTrue(any(s["segment_pool_id"] == pool for s in segments))
+        ptr = tensor.data_ptr()
+        (segment,) = [
+            s for s in segments if s["address"] <= ptr < s["address"] + s["total_size"]
+        ]
+        self.assertNotEqual(
+            segment["segment_pool_id"],
+            pool,
+            "a held output sits in the post-verify graph pool",
+        )
+
     def _check(self, held_bs, next_bs):
         held = self._round(held_bs)  # round N
+        self._assert_outside_the_graph_pool(held)
         torch.cuda.synchronize()
         self.assertEqual(held.tolist(), [7] * held_bs)
         self._round(next_bs)  # round N+1
@@ -894,18 +905,12 @@ class TestRetainedOutputsSurviveTheNextReplay(CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestAsyncHostCopyReadsItsOwnRound(CustomTestCase):
-    """Under Confidential Computing the scheduler hands a round's predict and
-    accept_lens to the async D2H worker, which copies them from its own thread and
-    stream; nothing orders that copy against the next round's post-verify replay,
-    which the overlap loop launches before it waits for the copy. Every copy must
-    still read the round it was handed: sampled rounds of one batch size, each the
-    other slot of the key, in the scheduler's order. In serving, the next round's
-    draft and verify forwards run before its replay; this test leaves them out, so
-    the unordered copy loses the race far more often than it would in production."""
+    """With the async D2H copy (Confidential Computing), every host copy of a sampled
+    round reads the round it was handed, in the overlap loop's order."""
 
     BS = 8
-    # enough rounds that main misread a copy on every run tried; fewer miss it on
-    # fast GPUs
+    # no forwards between replays, so the race is far likelier than in serving;
+    # enough rounds that main misread a copy on every run tried
     ROUNDS = 500
 
     def setUp(self):

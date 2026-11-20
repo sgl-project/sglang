@@ -521,7 +521,11 @@ def _copy_outputs(dsts: tuple, srcs: tuple) -> None:
     src_leaves, src_spec = tree_flatten(srcs)
     assert dst_spec == src_spec, "post-verify outputs changed structure"
     pairs = [(d, s) for d, s in zip(dst_leaves, src_leaves) if s is not None]
-    assert all(d.shape == s.shape and d.dtype == s.dtype for d, s in pairs)
+    for d, s in pairs:
+        assert d.shape == s.shape and d.dtype == s.dtype, (
+            f"post-verify output changed: {tuple(s.shape)} {s.dtype}, "
+            f"static buffer {tuple(d.shape)} {d.dtype}"
+        )
     _grouped_foreach_copy_([d for d, _ in pairs], [s for _, s in pairs])
 
 
