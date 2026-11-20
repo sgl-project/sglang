@@ -132,6 +132,13 @@ class TestLayerNormSPGating(CustomTestCase):
                 )
                 self.assertEqual(gather.called, gathered)
 
+    def test_runs_sp_honors_the_model_token_threshold(self):
+        """A model threshold (flags.sp.min_tokens) keeps smaller extends
+        replicated and takes precedence over --layernorm-sp-min-tokens."""
+        with get_flags().sp.override(enabled=True, min_tokens=4096):
+            self.assertFalse(layernorm_sp.runs_sp(ForwardMode.EXTEND, 4095))
+            self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 4096))
+
     def test_runs_sp_ignores_the_active_flag(self):
         """Regression: the exit gather must not key off ``sp_active``.
 
@@ -723,6 +730,62 @@ class TestNpuMc2FusedPaths(CustomTestCase):
         self.assertEqual(output.shape, (3, 4))  # padded // tp_size
         self.assertIs(gathered_full, full)
         self.assertIs(out, output)
+
+
+def _m3_parallel(*, ep_ranks=(0, 1)):
+    return SimpleNamespace(
+        tp_size=2,
+        attn_tp_size=2,
+        attn_cp_size=1,
+        pp_size=1,
+        moe_dense_tp_size=2,
+        tp_group=SimpleNamespace(ranks=[0, 1]),
+        moe_ep_group=SimpleNamespace(ranks=list(ep_ranks)),
+    )
+
+
+def _m3_exec(a2a_backend):
+    return SimpleNamespace(
+        moe=SimpleNamespace(moe_a2a_backend=a2a_backend),
+        graph=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED, bs=[])
+            )
+        ),
+        comm=SimpleNamespace(
+            flashinfer_allreduce_fusion_backend=None,
+            enable_quant_communications=False,
+        ),
+    )
+
+
+class TestMiniMaxM3SpGate(CustomTestCase):
+    def _unsupported(self, a2a_backend, *, cuda=True, **parallel):
+        with (
+            patch.object(
+                layernorm_sp, "get_parallel", return_value=_m3_parallel(**parallel)
+            ),
+            patch.object(layernorm_sp, "get_exec", return_value=_m3_exec(a2a_backend)),
+            patch.object(layernorm_sp, "is_cuda", return_value=cuda),
+        ):
+            return layernorm_sp._minimax_m3_sp_unsupported(4096)
+
+    def test_tp_moe_is_supported(self):
+        self.assertIsNone(self._unsupported("none"))
+
+    def test_megamoe_over_the_tp_ranks_is_supported(self):
+        self.assertIsNone(self._unsupported("megamoe"))
+
+    def test_megamoe_over_other_ranks_is_rejected(self):
+        self.assertIsNotNone(self._unsupported("megamoe", ep_ranks=(0, 1, 2, 3)))
+
+    def test_an_a2a_backend_is_rejected_before_the_moe_flags_are_seeded(self):
+        """SP must not turn on for an a2a MoE it cannot serve just because the
+        MoE runtime flags, seeded later in startup, still read as "none"."""
+        self.assertIsNotNone(self._unsupported("deepep"))
+
+    def test_non_cuda_devices_are_rejected(self):
+        self.assertIsNotNone(self._unsupported("none", cuda=False))
 
 
 if __name__ == "__main__":

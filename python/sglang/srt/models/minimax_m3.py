@@ -40,6 +40,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -56,6 +57,7 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import MXFP8_SWIZZLED
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     LinearParallelGroup,
@@ -120,6 +122,7 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
     get_stream,
@@ -676,7 +679,11 @@ class MiniMaxM3MoE(nn.Module):
                 reduce=sum_post_experts_output,
             )
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            final_hidden_states = torch.add(
+                final_hidden_states,
+                shared_output,
+                out=layernorm_sp.take_partial_sink(final_hidden_states),
+            )
         return final_hidden_states
 
     def _forward_router_experts(
@@ -1678,7 +1685,9 @@ class MiniMaxM3Attention(nn.Module):
             if self.idx_replica_size > 1:
                 idx_o = idx_o / self.idx_replica_size
             idx_output, _ = self.index_o_proj(idx_o)
-            return output + idx_output
+            return torch.add(
+                output, idx_output, out=layernorm_sp.take_partial_sink(output)
+            )
 
         q, k, v, forward_batch = inner_state
         attn_output = self.attn(q, k, v, forward_batch)
@@ -1787,6 +1796,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 reduce_results=False,
             )
 
+        # A MegaMoE layer (routed experts over EP, replicated shared experts)
+        # returns complete rows for the tokens this rank holds.
+        self.mlp_is_rank_local = (
+            self.is_layer_sparse and get_moe_a2a_backend().is_megamoe()
+        )
+
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
         if self.use_gemma_norm:
             self.input_layernorm = GemmaRMSNorm(
@@ -1803,6 +1818,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         # gfx950 norms quantize for the GEMMs that read them
         self._norm_quant = _hip.norm_quant(self) if _is_gfx95_supported else None
+        self.attn_input_quant_format = (
+            MXFP8_SWIZZLED if self._attn_takes_mxfp8_input() else ""
+        )
 
         options = {}
         if _uses_push_plane_fusion():
@@ -1814,6 +1832,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 defers_finalize=self.is_layer_sparse
                 and self.mlp.supports_deferred_finalize,
+                attn_input_mxfp8=self.attn_input_quant_format == MXFP8_SWIZZLED,
             )
         attn, ffn = self.stage_facts(config, layer_id)
         if self._norm_quant is not None:
@@ -1821,6 +1840,31 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm, options),
             (ffn, self.post_attention_layernorm, options),
+        )
+
+    def _attn_takes_mxfp8_input(self) -> bool:
+        if not _is_cuda:
+            return False
+        # LoRA wraps the projections after construction and takes bf16 input.
+        if get_lora().enable_lora or get_lora().lora_paths:
+            return False
+        try:
+            from sglang.kernels.ops.layernorm.fused_add_rmsnorm_mxfp8 import (
+                supports_fused_add_rmsnorm_mxfp8,
+            )
+        except ImportError:
+            return False
+
+        attn = self.self_attn
+        projections = [attn.qkv_proj]
+        if attn.is_sparse_attention_layer:
+            projections.append(attn.index_qkv_proj)
+        return (
+            self.use_gemma_norm
+            and supports_fused_add_rmsnorm_mxfp8(self.hidden_size)
+            # Subclasses (the DSpark draft) read their input differently.
+            and type(attn) is MiniMaxM3Attention
+            and all(accepts_mxfp8_swizzled_input(p) for p in projections)
         )
 
     @classmethod
@@ -1863,6 +1907,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             kwargs["quant_format"] = self._norm_quant.attn_quant_format(
                 positions.shape[-1]
             )
+        elif self.attn_input_quant_format:
+            kwargs["quant_format"] = self.attn_input_quant_format
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
@@ -1871,10 +1917,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         if _input_rows(hidden_states) != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+            hidden_states = _stage_compute(
+                lambda x: self.self_attn(
+                    positions=positions, hidden_states=x, forward_batch=forward_batch
+                ),
+                hidden_states,
             )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
@@ -1882,8 +1929,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if self.is_layer_sparse or _input_rows(hidden_states) != 0:
-                hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+                hidden_states = _stage_compute(
+                    lambda x: self.mlp(x, forward_batch=forward_batch),
+                    hidden_states,
+                    rank_local=self.mlp_is_rank_local,
+                )
         return ffn_exit.finish(hidden_states)
+
+
+def _stage_compute(compute, hidden_states: torch.Tensor, *, rank_local: bool = False):
+    if not get_forward().sp_active:
+        return compute(hidden_states)
+    if rank_local:
+        # The stage completes this rank's rows itself: nothing to gather or reduce.
+        with get_forward().scoped(sp_active=False):
+            return compute(hidden_states)
+    return layernorm_sp.sp_gathered_compute(compute, hidden_states)
 
 
 class MiniMaxM3Model(nn.Module):
@@ -2160,6 +2221,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+        aux_hidden_states = layernorm_sp.maybe_gather_aux_hidden_states(
+            aux_hidden_states,
+            input_ids=input_ids,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(

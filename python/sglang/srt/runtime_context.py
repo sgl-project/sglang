@@ -634,6 +634,8 @@ class SpFlags(_FlagGroupBase):
     config). See ``layers.layernorm_sp``."""
 
     enabled: bool = False
+    # Extends below this many tokens keep the replicated layout; 0 runs SP on every extend.
+    min_tokens: int = 0
 
 
 class Flags(_FlagGroupBase):
@@ -677,6 +679,9 @@ class Resources(_FlagGroupBase):
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
     trace_level: Any = None
+    # TP2 symmetric-memory row moves of the token-sharded prefill
+    # (layers.layernorm_sp._PushComm); None when that path is off.
+    layernorm_sp_push_comm: Any = None
 
 
 class LoRABatchLayout(Enum):
@@ -718,6 +723,9 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # Symmetric buffer the SP stage compute writes its final partial into
+        # (layernorm_sp.take_partial_sink); None outside sp_gathered_compute.
+        "sp_partial_sink": None,
         # This forward's MoE runs on attention-TP-local token slices (the
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.

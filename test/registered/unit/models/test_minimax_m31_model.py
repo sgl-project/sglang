@@ -30,7 +30,7 @@ from sglang.srt.models.minimax_m3 import (
     get_spec_layer_idx_from_weight_name,
 )
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.runtime_context import get_forward, override_platform
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -597,6 +597,38 @@ class TestMiniMaxM31Forward(CustomTestCase):
         self.assertFalse(stored_by_fusion(0.5, fp8))
         # a bf16 index cache ignores the scale on both paths
         self.assertTrue(stored_by_fusion(0.5, torch.bfloat16))
+
+
+class TestMiniMaxM31StageCompute(CustomTestCase):
+    def test_a_rank_local_stage_computes_on_the_shard_outside_the_sp_region(self):
+        shard = torch.ones(4, 8)
+        seen = []
+
+        def compute(x):
+            seen.append((x, get_forward().sp_active))
+            return x + 1
+
+        with (
+            get_forward().scoped(sp_active=True),
+            patch.object(minimax_m3.layernorm_sp, "sp_gathered_compute") as gathered,
+        ):
+            out = minimax_m3._stage_compute(compute, shard, rank_local=True)
+            self.assertTrue(get_forward().sp_active)
+        gathered.assert_not_called()
+        self.assertIs(seen[0][0], shard)
+        self.assertFalse(seen[0][1])
+        torch.testing.assert_close(out, torch.full((4, 8), 2.0))
+
+    def test_a_tp_partial_stage_is_gathered_under_sp(self):
+        shard = torch.ones(4, 8)
+        with (
+            get_forward().scoped(sp_active=True),
+            patch.object(
+                minimax_m3.layernorm_sp, "sp_gathered_compute", return_value=shard
+            ) as gathered,
+        ):
+            minimax_m3._stage_compute(lambda x: x, shard)
+        gathered.assert_called_once()
 
 
 class TestMiniMaxM31Nvfp4Backend(CustomTestCase):

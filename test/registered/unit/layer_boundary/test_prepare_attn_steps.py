@@ -16,7 +16,13 @@ from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import attn_input_fusions
 from sglang.srt.layers.layer_boundary.ops import keep_output
-from sglang.test.boundary_fixtures import prepare_input, stub_plan, stub_stage
+from sglang.srt.layers.layer_boundary.residual.add_norm import MXFP8_SWIZZLED
+from sglang.test.boundary_fixtures import (
+    prepare_attention,
+    prepare_input,
+    stub_plan,
+    stub_stage,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -177,6 +183,34 @@ class TestPrepareAttnSteps(CustomTestCase):
                     quant_format=quant_format,
                 )
                 self.assertIs(residual.residual, hidden_states)
+
+    def test_a_gathered_input_is_not_read_as_swizzled_mxfp8(self):
+        """Regression: an entry that gathers rows must read bf16; a swizzled
+        MXFP8 input comes out of the gather as a plain tuple."""
+        for gathers in (True, False):
+            with (
+                self.subTest(gathers=gathers),
+                platform(),
+                patch_communicator(
+                    "_update_and_read_residual_mxfp8_swizzled",
+                    return_value=("q", "r"),
+                ) as kernel,
+            ):
+                c = communicator(Norm())
+                if not gathers:
+                    path = c.paths[BatchVariant.ORDINARY]
+                    c.paths[BatchVariant.ORDINARY] = msgspec.structs.replace(
+                        path,
+                        entry=msgspec.structs.replace(path.entry, input_move=None),
+                    )
+                prepare_attention(
+                    stub_stage(c, StageKind.ATTENTION),
+                    torch.ones(2, 4),
+                    torch.zeros(2, 4),
+                    None,
+                    quant_format=MXFP8_SWIZZLED,
+                )
+                self.assertEqual(kernel.called, not gathers)
 
     def test_a_pending_sum_is_completed_once(self):
         for fusion in (False, True):
