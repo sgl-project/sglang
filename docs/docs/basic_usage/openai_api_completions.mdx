@@ -423,6 +423,8 @@ idx = np.frombuffer(
 
 The native `/generate` API takes the same two flags, with `return_logprob` in place of `logprobs`.
 
+On the MLX backend without `--mlx-enable-sampling` every token is the argmax, so a request with no filter set is refused for both flags.
+
 #### Returning Flat Sampling Masks
 
 With `return_sampling_mask: true`, set `return_flat_raw_sampling_mask: true` to receive the mask rows as flat arrays instead of one nested list per output token. The arrays arrive with the finished response only, so `stream: true` is not supported.

@@ -259,6 +259,37 @@ class TestSamplingMaskValidation(CustomTestCase):
                 else:
                     self._tokenize(sampling_params, watermarked=watermarked, **flags)
 
+    def test_unfiltered_sampling_output_is_refused_where_mlx_commits_argmax(self):
+        """Without --mlx-enable-sampling the MLX runner commits argmax whatever the
+        temperature is, so an unfiltered request's output logprobs and empty mask
+        rows would describe a draw that never happened."""
+        logprobs = {"return_logprob": True, "return_sampling_logprobs": True}
+        mask = {"return_sampling_mask": True}
+        for mlx, mlx_sampling, sampling_params, rejected in (
+            (True, False, {"temperature": 0.7}, True),
+            (True, True, {"temperature": 0.7}, False),
+            (False, False, {"temperature": 0.7}, False),
+            (True, False, {"top_k": 10}, False),
+        ):
+            for flags in (logprobs, mask):
+                with (
+                    self.subTest(
+                        mlx=mlx, mlx_sampling=mlx_sampling, params=sampling_params
+                    ),
+                    patch(
+                        "sglang.srt.managers.tokenizer_manager.use_mlx",
+                        return_value=mlx,
+                    ),
+                    get_context().override_server_args(
+                        mlx_enable_sampling=mlx_sampling
+                    ),
+                ):
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "mlx-enable-sampling"):
+                            self._tokenize(sampling_params, **flags)
+                    else:
+                        self._tokenize(sampling_params, **flags)
+
     def test_unfiltered_mask_is_refused_when_the_support_is_narrowed(self):
         """An unfiltered request's empty mask rows stand for the whole vocabulary.
         A grammar, a custom logit processor, logit_bias, min_new_tokens or strict

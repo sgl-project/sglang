@@ -71,6 +71,7 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
@@ -295,6 +296,12 @@ def _validate_unfiltered_sampling_output(
     logprob and an empty mask row, so both must describe what was sampled."""
     if sampling_params.filters_sampling() or not returns_sampling_output(obj):
         return
+    if use_mlx() and not get_device().mlx_enable_sampling:
+        raise ValueError(
+            "return_sampling_logprobs or return_sampling_mask without "
+            "top-k/top-p/min-p sampling is not supported on the MLX backend without "
+            "--mlx-enable-sampling: every token is the argmax, not a sample."
+        )
     if watermarked:
         raise ValueError(
             "return_sampling_logprobs or return_sampling_mask without "
