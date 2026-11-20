@@ -371,6 +371,8 @@ class _SubmissionLocal(threading.local):
     """
 
     statuses: Optional[List[TransferStatus]] = None
+    # Writes a coalescing submission has queued but not posted yet.
+    writes: Optional[List[Tuple[MemoryDesc, MemoryDesc, BatchTransferPlan]]] = None
 
 
 class MoriKVManager(CommonKVManager):
@@ -384,6 +386,7 @@ class MoriKVManager(CommonKVManager):
     # is tagged. Mori has always shipped the failure reason with it.
     kv_status_msg_tag = MORI_GUARD
     kv_status_msg_carries_reason = True
+    _coalesce_transfers = False
 
     def __init__(
         self,
@@ -408,6 +411,7 @@ class MoriKVManager(CommonKVManager):
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
         self._register_local_buffers()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._coalesce_transfers = envs.SGLANG_OPT_MORI_COALESCE_TRANSFERS.get()
             self._num_shards = max(1, envs.SGLANG_MORI_TRANSFER_SHARDS.get())
             self._transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(self._num_shards)
@@ -1280,18 +1284,39 @@ class MoriKVManager(CommonKVManager):
         if plan.empty():
             return []
 
-        transfer_uid = self.engine.allocate_transfer_uid()
+        writes = self._submission_local.writes
+        if writes is not None:
+            writes.append((src_desc, dst_desc, plan))
+            return []
+        return self._post_writes([(src_desc, dst_desc, plan)])
 
+    def _post_writes(
+        self, writes: List[Tuple[MemoryDesc, MemoryDesc, BatchTransferPlan]]
+    ) -> List[TransferStatus]:
         statuses = self.engine.batch_write(
-            [src_desc],
-            [plan.local_offsets],
-            [dst_desc],
-            [plan.remote_offsets],
-            [plan.sizes],
-            [transfer_uid],
+            [src_desc for src_desc, _, _ in writes],
+            [plan.local_offsets for _, _, plan in writes],
+            [dst_desc for _, dst_desc, _ in writes],
+            [plan.remote_offsets for _, _, plan in writes],
+            [plan.sizes for _, _, plan in writes],
+            [self.engine.allocate_transfer_uid() for _ in writes],
         )
         self._record_submitted_statuses(statuses)
         return statuses
+
+    def _post_coalesced_writes(self, room: int) -> List[TransferStatus]:
+        writes, self._submission_local.writes = self._submission_local.writes, None
+        if not writes:
+            return []
+        try:
+            return self._post_writes(writes)
+        except Exception:
+            # batch_write can raise after posting some entries, whose statuses
+            # are lost, so no drain can prove the room quiet.
+            if self.enable_deferred_decode_kv_release:
+                with self._abort_ack_lock:
+                    self.poison_deferred_ack_room(room)
+            raise
 
     def _record_submitted_statuses(self, statuses: List[TransferStatus]) -> None:
         active_statuses = self._submission_local.statuses
@@ -1858,17 +1883,13 @@ class MoriKVManager(CommonKVManager):
                 ]
 
             for src_offset, dst_offset, size in blocks:
-                transfer_uid = self.engine.allocate_transfer_uid()
-                batch_statuses = self.engine.batch_write(
-                    [src_desc],
-                    [[src_offset]],
-                    [dst_desc],
-                    [[dst_offset]],
-                    [[size]],
-                    [transfer_uid],
+                statuses.extend(
+                    self._submit_batch_transfer_plan(
+                        src_desc,
+                        dst_desc,
+                        BatchTransferPlan([src_offset], [dst_offset], [size]),
+                    )
                 )
-                self._record_submitted_statuses(batch_statuses)
-                statuses.extend(batch_statuses)
 
         return statuses
 
@@ -2073,6 +2094,9 @@ class MoriKVManager(CommonKVManager):
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
 
         result_statuses: List[TransferStatus] = []
+        if self._coalesce_transfers:
+            # Set on every submission, so a list left behind by a raise is never reused.
+            self._submission_local.writes = []
         for target in targets:
             info = target.info
             peer_info = target.peer_info
@@ -2108,6 +2132,11 @@ class MoriKVManager(CommonKVManager):
                     self.send_state(peer_info, state_indices, info.dst_state_indices)
                 )
 
+        if self._coalesce_transfers:
+            result_statuses.extend(self._post_coalesced_writes(bootstrap_room))
+
+        for target in targets:
+            info = target.info
             if (
                 is_last_chunk
                 and aux_index is not None
@@ -2116,7 +2145,7 @@ class MoriKVManager(CommonKVManager):
             ):
                 result_statuses.extend(
                     self.send_aux(
-                        peer_info, aux_index, info.dst_aux_index, bootstrap_room
+                        target.peer_info, aux_index, info.dst_aux_index, bootstrap_room
                     )
                 )
 
