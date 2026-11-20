@@ -117,6 +117,10 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     8192,
     "--max-prefill-tokens",
     65536,
+    # Cap the device KV pool so the 32k-token GSP workload overflows L1 and
+    # exercises the L2 host tier; one 32k prompt plus routing slack must fit.
+    "--max-total-tokens",
+    40960,
     "--context-length",
     220000,
     "--moe-a2a-backend",
@@ -158,7 +162,7 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     # Store setup blocks a scheduler for minutes; the 300s default would keep
     # dumping thread stacks instead of letting startup finish.
     "--watchdog-timeout",
-    3600,
+    9000,
 ]
 
 GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
@@ -260,18 +264,18 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         # storage backend. The Mooncake store config is one JSON passed through
         # --hicache-storage-backend-extra-config (once it carries
         # master_server_address the client ignores the MOONCAKE_* env vars).
-        # The master runs on the first prefill pod and the segment is requested
-        # per scheduler rank: 32 ranks make the registration slow and skewed,
-        # so keep it small (256 MiB). A large value also makes the Ascend
-        # driver reject the last rank's HalMemCreate and the prefill server
-        # dies with "Failed to setup Mooncake store". Only a plain byte count
-        # or a "gb" suffix is accepted; "mb" raises in the config parser.
+        # The master runs on the first prefill pod; each scheduler rank
+        # contributes global_segment_size to the pool, and the store needs
+        # room for whole 1024-token KV pages (a 256 MiB segment filled the
+        # store and every write-through acked 0 tokens). 2 GiB per rank is the
+        # smallest value that kept the write path healthy here. Only a plain
+        # byte count or a "gb" suffix is accepted; "mb" raises in the parser.
         l3_config = json.dumps(
             {
                 "master_server_address": get_mooncake_master_server_address(),
                 "metadata_server": "P2PHANDSHAKE",
                 "protocol": "ascend",
-                "global_segment_size": "268435456",
+                "global_segment_size": "2gb",
                 "local_hostname": resolve_local_ip(),
                 "extra_backend_tag": "pd-1p1d-glm5.3-w8a8-dcp",
             }
@@ -307,8 +311,10 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
 
     def test_npu_glm_5_3_w8a8_1p1d_32p_dcp_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
-        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        # 12 groups x 8 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question. The device pool is capped at 40960 tokens
+        # per rank (--max-total-tokens), so the 12 distinct prefixes cannot all
+        # stay in L1 and evictions reach L2.
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
@@ -317,8 +323,8 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
             input_len=32000,
             output_len=1024,
             max_concurrency=32,
-            gsp_num_groups=3,
-            gsp_prompts_per_group=32,
+            gsp_num_groups=12,
+            gsp_prompts_per_group=8,
             seed=100,
             warmup_requests=16,
             cache_report=True,
