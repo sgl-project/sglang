@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.kvcache.dsv41_window_layout import _window_layout_queries
 from sglang.srt.mem_cache.dsv41_request_window import (
     RequestWindowSpec,
     copy_packed_tokens,
@@ -73,6 +74,79 @@ class TestRequestWindowCopy(CustomTestCase):
                             sg, dg, sl, dl, page_size=page, layout=layout
                         )
                         torch.testing.assert_close(dg.cpu(), expected, rtol=0, atol=0)
+
+    def test_window_layout_dynamic_bounds_reuse_query_variant(self):
+        # Count query JIT variants, not history kernels or changes to the
+        # legitimate constexpr layout (strides and floor presence).
+        def compiled_variants():
+            caches = getattr(_window_layout_queries, "device_caches", None)
+            if caches is None:
+                return None
+            return sum(
+                len(v[0]) if isinstance(v, tuple) else len(v) for v in caches.values()
+            )
+
+        cases = (
+            ((1,), 1, 1),
+            ((16,), 1, 16),
+            ((9, 8), 2, 33),
+            ((1,) * 16, 16, 32),
+            ((2,) * 17, 20, 35),
+            ((300, 17, 1), 4, 320),
+        )
+
+        def cuda_strided(cpu, stride):
+            gpu = torch.empty(cpu.numel() * stride, dtype=cpu.dtype, device="cuda")[
+                ::stride
+            ]
+            gpu.copy_(cpu)
+            return gpu
+
+        for has_floor, strides in ((False, (1, 1, 1)), (True, (2, 3, 4))):
+            variants = None
+            for lens, groups, padded in cases:
+                with self.subTest(
+                    lens=lens, groups=groups, padded=padded, floor=has_floor
+                ):
+                    prefixes = [0, 147, 8191, (1 << 20) - 1024]
+                    starts = [prefixes[i % len(prefixes)] for i in range(len(lens))]
+                    req = torch.cat(
+                        [torch.full((n,), i + 1) for i, n in enumerate(lens)]
+                    )
+                    pos = torch.cat(
+                        [torch.arange(s, s + n) for s, n in zip(starts, lens)]
+                    )
+                    floor = (
+                        torch.cat(
+                            [
+                                torch.full((n,), max(0, s - 32))
+                                for s, n in zip(starts, lens)
+                            ]
+                        )
+                        if has_floor
+                        else None
+                    )
+                    kwargs = dict(zero_row=32768, num_groups=groups, padded_rows=padded)
+                    expected = window_layout(req, pos, floor=floor, **kwargs)
+                    actual = window_layout(
+                        cuda_strided(req, strides[0]),
+                        cuda_strided(pos, strides[1]),
+                        floor=cuda_strided(floor, strides[2]) if has_floor else None,
+                        **kwargs,
+                    )
+                    self.assertEqual(actual.size, expected.size)
+                    for field in expected.__struct_fields__:
+                        if field != "size":
+                            torch.testing.assert_close(
+                                getattr(actual, field).cpu(),
+                                getattr(expected, field),
+                                rtol=0,
+                                atol=0,
+                            )
+                    count = compiled_variants()
+                    if variants is not None:
+                        self.assertEqual(count, variants)
+                    variants = count
 
     def test_graph_replay_refreshes_locations(self):
         page, layout = 64, KVLayout.V41
