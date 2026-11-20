@@ -7,8 +7,8 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
-# pr-test-amd.yml passes scripts/ci/amd/partition-model-<runner_arch>-<rocm_version>.json
-# to this suite, so one file per lane needs no workflow change.
+# pr-test-amd.yml passes partition-model-<runner_arch>-<rocm_version>.json to this suite,
+# so adding one file per lane needs no workflow change.
 SUITE = "base-b-test-1-gpu-small-amd"
 REPOSITORY = "sgl-project/sglang"
 MODEL_DIR = Path(__file__).resolve().parent
