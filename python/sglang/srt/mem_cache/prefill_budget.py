@@ -309,6 +309,11 @@ class PrefillBudget:
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
 
+    def reserve_running_windows(self, req, max_new_tokens: float) -> None:
+        """Commit the window rows running request ``req`` may still add as it
+        decodes ``max_new_tokens`` more; pools of their own commit only its
+        token rows, which `total_offset` charges."""
+
 
 class SWAPrefillBudget(PrefillBudget):
     """Separate FULL/SWA partitions, including per-request SWA rings."""
@@ -1190,6 +1195,23 @@ class ChainPrefillBudget(PrefillBudget):
         for name, _ in self.windows:
             self.window_offsets[name] += committed.window_tokens[name]
             self.window_current_offsets[name] += now.window_tokens[name]
+
+    def reserve_running_windows(self, req, max_new_tokens: float) -> None:
+        """Commit to each window what running request ``req`` may still add to
+        it (`DemandPurpose.RUNNING`); this pass's forward rows are unchanged."""
+        if not self.windows:
+            return
+        # Window retirement slides over the rows past those the request may not
+        # free (`window_dead_lo`): they are window rows it holds, as a cached prefix.
+        held = max(0, req.kv.kv_allocated_len - req.kv.window_dead_lo(self.page_size))
+        growth = self.window_tokens(
+            0,
+            max_new_tokens,
+            purpose=DemandPurpose.RUNNING,
+            cached_tokens=held,
+        )
+        for name, tokens in growth.items():
+            self.window_offsets[name] += tokens
 
     def _load_back_demand(
         self,
