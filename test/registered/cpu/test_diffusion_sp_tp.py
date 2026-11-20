@@ -65,6 +65,7 @@ class TestDiffusionCPUParallel(CustomTestCase):
                 SGLANG_DIFFUSION_PLATFORM_OVERRIDE="cpu",
                 SGLANG_DIFFUSION_TARGET_DEVICE="cpu",
             )
+            env.pop("SGLANG_CPU_OMP_THREADS_BIND", None)
 
             with log_path.open("w", encoding="utf-8") as log:
                 process = subprocess.Popen(
