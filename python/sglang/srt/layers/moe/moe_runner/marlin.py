@@ -211,6 +211,7 @@ def fused_experts_none_to_marlin(
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
         no_combine=runner_config.no_combine,
+        paged_expert_info=runner_config.paged_expert_info,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

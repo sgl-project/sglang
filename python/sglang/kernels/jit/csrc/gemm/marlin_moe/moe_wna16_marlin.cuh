@@ -33,9 +33,9 @@ namespace sglang {
 namespace device::marlin_moe {
 
 #ifdef SGL_MARLIN_MOE_HOST_COPY
-__global__ void MarlinDefault(MARLIN_KERNEL_PARAMS, MARLIN_HOST_COPY_PARAMS){};
+__global__ void MarlinDefault(MARLIN_KERNEL_PARAMS, MARLIN_PAGED_EXPERT_PARAMS){};
 
-using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS, MARLIN_HOST_COPY_PARAMS);
+using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS, MARLIN_PAGED_EXPERT_PARAMS);
 #else
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
@@ -669,8 +669,8 @@ void marlin_mm(
     int64_t scales_host_delta,
     const void* scale2_host,
     const void* expert_slot,
-    int host_slots,
-    const void* host_count) {
+    int host_ids_start,
+    const void* missing_expert_count) {
 #else
     bool is_zp_float) {
 #endif
@@ -898,8 +898,8 @@ void marlin_mm(
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
 #ifdef SGL_MARLIN_MOE_HOST_COPY
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem,
-      B_host_delta, scales_host_delta, (const uint16_t*)scale2_host, (const int32_t*)expert_slot, host_slots,
-      (const int32_t*)host_count);
+      B_host_delta, scales_host_delta, (const uint16_t*)scale2_host, (const int32_t*)expert_slot, host_ids_start,
+      (const int32_t*)missing_expert_count);
 #else
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
 #endif
@@ -958,8 +958,8 @@ void moe_wna16_marlin_gemm(
     int64_t scales_host_delta,
     int64_t scale2_host,
     int64_t expert_slot,
-    int64_t host_slots,
-    int64_t host_count) {
+    int64_t host_ids_start,
+    int64_t missing_expert_count) {
 #else
     bool is_zp_float) {
 #endif
@@ -1215,8 +1215,8 @@ void moe_wna16_marlin_gemm(
           scales_host_delta,
           reinterpret_cast<const void*>(scale2_host),
           reinterpret_cast<const void*>(expert_slot),
-          static_cast<int>(host_slots),
-          reinterpret_cast<const void*>(host_count));
+          static_cast<int>(host_ids_start),
+          reinterpret_cast<const void*>(missing_expert_count));
 #else
           is_zp_float);
 #endif

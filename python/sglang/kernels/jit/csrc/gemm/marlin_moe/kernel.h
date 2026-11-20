@@ -15,9 +15,10 @@
 
 #ifdef SGL_MARLIN_MOE_HOST_COPY
 // Paged experts, fused host copy: the kernel also takes the host tables and the step's plan.
-#define MARLIN_HOST_COPY_PARAMS                                                              \
+#define MARLIN_PAGED_EXPERT_PARAMS                                                           \
   int64_t B_host_delta, int64_t scales_host_delta, const uint16_t *__restrict__ scale2_host, \
-      const int32_t *__restrict__ expert_slot_ptr, int host_slots, const int32_t *__restrict__ host_count_ptr
+      const int32_t *__restrict__ expert_slot_ptr, int host_ids_start,                       \
+      const int32_t *__restrict__ missing_expert_count_ptr
 #endif
 namespace sglang {
 
@@ -46,7 +47,7 @@ template <
     const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
 #ifdef SGL_MARLIN_MOE_HOST_COPY
-__global__ void Marlin(MARLIN_KERNEL_PARAMS, MARLIN_HOST_COPY_PARAMS);
+__global__ void Marlin(MARLIN_KERNEL_PARAMS, MARLIN_PAGED_EXPERT_PARAMS);
 #else
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 #endif

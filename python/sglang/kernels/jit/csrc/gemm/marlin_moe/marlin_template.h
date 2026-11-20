@@ -357,12 +357,13 @@ __global__ void Marlin(
     bool use_fp32_reduce,  // whether to use fp32 global reduce
 #ifdef SGL_MARLIN_MOE_HOST_COPY
     int max_shared_mem,
-    int64_t B_host_delta,                          // host weight table - B, in int4 units
-    int64_t scales_host_delta,                     // host scale table - scales_ptr, in int4 units
-    const uint16_t* __restrict__ scale2_host,      // host global scale table (NVFP4)
-    const int32_t* __restrict__ expert_slot_ptr,   // expert -> the slot it is paged into
-    int host_slots,                                // number of slots; ids from here on are on host
-    const int32_t* __restrict__ host_count_ptr) {  // [1] experts this launch reads from the host
+    int64_t B_host_delta,                         // host weight table - B, in int4 units
+    int64_t scales_host_delta,                    // host scale table - scales_ptr, in int4 units
+    const uint16_t* __restrict__ scale2_host,     // host global scale table (NVFP4)
+    const int32_t* __restrict__ expert_slot_ptr,  // expert -> the slot it is paged into
+    int host_ids_start,                           // number of slots; ids from here on are on host
+    // [1] experts this launch reads from the host
+    const int32_t* __restrict__ missing_expert_count_ptr) {
 #else
     int max_shared_mem) {
 #endif
@@ -494,7 +495,7 @@ __global__ void Marlin(
   int n_tiles = prob_n / 16 / thread_n_blocks;
   int iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
 #ifdef SGL_MARLIN_MOE_HOST_COPY
-  const int num_host_experts = host_count_ptr[0];  // experts this launch reads from the host
+  const int num_host_experts = missing_expert_count_ptr[0];  // experts this launch reads from the host
 #endif
 
   if constexpr (!has_act_order && group_blocks != -1) {
@@ -685,12 +686,12 @@ __global__ void Marlin(
     }
 
 #ifdef SGL_MARLIN_MOE_HOST_COPY
-    // An expert id of host_slots + e means expert e, which is not on the GPU yet: read its global scale, weights
+    // An expert id of host_ids_start + e means expert e, which is not on the GPU yet: read its global scale, weights
     // and scales from the host tables instead of a slot.
-    const bool on_host = expert_id >= host_slots;
-    const bool was_on_host = old_expert_id >= host_slots;
-    const int64_t row = on_host ? expert_id - host_slots : expert_id;
-    const int64_t old_row = was_on_host ? old_expert_id - host_slots : old_expert_id;
+    const bool on_host = expert_id >= host_ids_start;
+    const bool was_on_host = old_expert_id >= host_ids_start;
+    const int64_t row = on_host ? expert_id - host_ids_start : expert_id;
+    const int64_t old_row = was_on_host ? old_expert_id - host_ids_start : old_expert_id;
     if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
       uint16_t val = (on_host ? scale2_host : scale2_ptr)[row];
       global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
@@ -1186,7 +1187,7 @@ __global__ void Marlin(
   // Write the stage that has just landed in shared memory into the slot of the host expert it was read
   // from. The stage is `lead` tiles behind the fetch pointers.
   auto store_stage = [&](int pipe, int lead) {
-    if (expert_id < host_slots) return;
+    if (expert_id < host_ids_start) return;
     const int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 #pragma unroll
     for (int i = 0; i < b_sh_wr_iters; i++) {
@@ -1992,7 +1993,7 @@ __global__ void Marlin(
       }
 #ifdef SGL_MARLIN_MOE_HOST_COPY
     };
-    if (expert_id >= host_slots) {
+    if (expert_id >= host_ids_start) {
       run_tiles(std::true_type{});
     } else {
       run_tiles(std::false_type{});

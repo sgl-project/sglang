@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Optional
 
-import msgspec
 import torch
 
 from sglang.kernels.arch import current_arch
@@ -47,45 +46,21 @@ def _jit_moe_wna16_marlin_module(
     )
 
 
-class HostCopy(msgspec.Struct, frozen=True):
-    """Paged experts, fused host copy: every expert of one GEMM's slot tables in pinned host
-    memory, so that the kernel pages an expert in itself (marlin_template.h)."""
-
-    weight: int  # device address of the host table of packed weights
-    scales: int  # device address of the host table of block scales
-    global_scale: (
-        int  # device address of the host table of NVFP4 global scales; 0 without them
-    )
-    num_experts: int
-    expert_slot: torch.Tensor  # [E] int32: the slot each expert is paged into
-    count: torch.Tensor  # [1] int32: experts the current step pages in
-
-
-# By the address of the slot table of packed weights; set by sglang.srt.layers.moe.paged_experts.
-HOST_COPIES: Dict[int, HostCopy] = {}
-
-
-def host_expert_ids(b_q_weight: torch.Tensor) -> int:
-    """How many expert ids past its slots the routed entries of ``b_q_weight`` may use: with a host
-    copy an id of K + e is expert e, read from host memory; 0 without one."""
-    host = HOST_COPIES.get(b_q_weight.data_ptr()) if HOST_COPIES else None
-    return 0 if host is None else host.num_experts
-
-
-def _host_copy_args(
-    host: Optional[HostCopy], b_q_weight: torch.Tensor, b_scales: torch.Tensor
+def _paged_expert_kernel_args(
+    b_q_weight: torch.Tensor, b_scales: torch.Tensor, paged_expert_info: Optional[dict]
 ) -> tuple:
     """The fused-host-copy kernel's extra arguments: the host tables as offsets from the slot
-    tables in 16-byte units, then addresses and the slot count. None without a host copy."""
-    if host is None:
+    tables in 16-byte units, then addresses and the first host id (the number of slots). None
+    without ``paged_expert_info``."""
+    if paged_expert_info is None:
         return ()
     return (
-        (host.weight - b_q_weight.data_ptr()) // 16,
-        (host.scales - b_scales.data_ptr()) // 16,
-        host.global_scale,
-        host.expert_slot.data_ptr(),
+        (paged_expert_info["host_weight_address"] - b_q_weight.data_ptr()) // 16,
+        (paged_expert_info["host_scales_address"] - b_scales.data_ptr()) // 16,
+        paged_expert_info["host_global_scale_address"],
+        paged_expert_info["expert_slot"].data_ptr(),
         b_q_weight.shape[0],
-        host.count.data_ptr(),
+        paged_expert_info["missing_expert_count"].data_ptr(),
     )
 
 
@@ -160,6 +135,10 @@ def moe_wna16_marlin_gemm(
     expert_ids_are_sorted: bool = False,
     zero_inactive_output: bool = False,
     has_inactive_prefix_count: bool = False,
+    # Paged experts, fused host copy (marlin_template.h): the device addresses of the pinned
+    # host tables of b_q_weight, b_scales and global_scale (0 without one), the layer's
+    # expert -> slot table and its count of missing experts.
+    paged_expert_info: Optional[dict] = None,
 ) -> torch.Tensor:
     """Project routes, preserving inactive rows in a caller-provided output.
 
@@ -242,10 +221,9 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    host = HOST_COPIES.get(b_q_weight.data_ptr()) if HOST_COPIES else None
     load_module = (
         _jit_moe_wna16_marlin_module
-        if host is None
+        if paged_expert_info is None
         else _jit_moe_wna16_marlin_host_copy_module
     )
     module = load_module(
@@ -290,7 +268,11 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
-        *_host_copy_args(host=host, b_q_weight=b_q_weight, b_scales=b_scales),
+        *_paged_expert_kernel_args(
+            b_q_weight=b_q_weight,
+            b_scales=b_scales,
+            paged_expert_info=paged_expert_info,
+        ),
     )
 
     return c

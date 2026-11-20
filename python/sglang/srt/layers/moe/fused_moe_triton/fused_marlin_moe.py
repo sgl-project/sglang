@@ -20,10 +20,7 @@ if _is_cuda:
         silu_and_mul,
         silu_and_mul_with_activation_rounding,
     )
-    from sglang.kernels.ops.moe.moe_wna16_marlin import (
-        host_expert_ids,
-        moe_wna16_marlin_gemm,
-    )
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
 # Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
@@ -171,6 +168,7 @@ def fused_marlin_moe(
     activation: str = "silu",
     is_gated: bool = True,
     no_combine: bool = False,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -255,7 +253,10 @@ def fused_marlin_moe(
     if global_num_experts == -1:
         global_num_experts = E
     # Paged experts, fused host copy: ids past w1's slots are experts in host memory.
-    host_ids = host_expert_ids(w1)
+    w1_info, w2_info = (
+        paged_expert_info.info if paged_expert_info is not None else (None, None)
+    )
+    host_ids = w1_info["expert_slot"].numel() if w1_info else 0
     if host_ids:
         global_num_experts = max(global_num_experts, E + host_ids)
     if (
@@ -348,6 +349,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        paged_expert_info=w1_info,
     )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
@@ -413,6 +415,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        paged_expert_info=w2_info,
     ).view(-1, topk, K)
 
     if no_combine:
