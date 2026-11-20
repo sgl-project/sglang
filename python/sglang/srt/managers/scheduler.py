@@ -413,6 +413,7 @@ from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logging,
     configure_logger,
+    disable_transparent_hugepages,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -3287,11 +3288,15 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        # Only a cache whose events are taken prunes the table.
+        # The default event format namespaces only named LoRA keys, so a rank
+        # that binds hinted storage keys to event IDs needs the name as well.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            and self.tree_cache.supports_prefix_sharing()
-        ):
+            or (
+                req.kv_hints is not None
+                and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)
+            )
+        ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
@@ -3700,6 +3705,16 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if recv_req.token_ids_logprob_rows is not None:
+            scored = len(req.origin_input_ids) - req.logprob_start_len - 1
+            if len(recv_req.token_ids_logprob_rows) != scored:
+                req.set_finish_with_abort(
+                    f"token_ids_logprob_rows needs {scored} rows for the engine's input."
+                )
+                self._add_request_to_queue(req)
+                return
+            req.logprob.token_ids_logprob_rows = recv_req.token_ids_logprob_rows
+
         if (
             get_device().mlx_enable_sampling
             and req.return_logprob
@@ -3825,6 +3840,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -7121,6 +7137,8 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(gpu_id)
+    if envs.SGLANG_DISABLE_THP.get():
+        disable_transparent_hugepages()
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
