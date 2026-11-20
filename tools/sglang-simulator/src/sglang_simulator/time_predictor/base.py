@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang_simulator.simulation.types import SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
@@ -18,6 +19,7 @@ class ScheduleRequest:
 @dataclass
 class ScheduleBatch:
     reqs: list[ScheduleRequest] = field(default_factory=list)
+    forward_mode: str | None = None
 
     def __repr__(self) -> str:
         return f"batch_size={len(self.reqs)},reqs={[(req.extend_length, req.past_kv_length) for req in self.reqs]}"
@@ -56,6 +58,8 @@ class ScheduleBatch:
         return not self.is_decode()
 
     def is_decode(self) -> bool:
+        if self.forward_mode is not None:
+            return self.forward_mode == "DECODE"
         for req in self.reqs:
             if req.extend_length > 1:
                 return False
@@ -68,6 +72,15 @@ class ScheduleBatch:
     @property
     def num_gen_requests(self) -> int:
         return self.batch_size if self.is_decode() else 0
+
+
+class PredictorError(RuntimeError):
+    """Predictor failure with a stable machine-readable code."""
+
+    def __init__(self, code: str, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
 
 
 class InferTimePredictor(ABC):
