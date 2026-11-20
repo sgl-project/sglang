@@ -253,11 +253,8 @@ _MLA_REDUCE_V1_HEADS = {
 
 @functools.lru_cache(maxsize=None)
 def _aiter_has_mla_reduce_v1_instance(*, num_head: int, head_dim: int) -> bool:
-    # mla_reduce_v1 aborts the process on a shape it has no instance for,
-    # so ask the compiled AITER, as its own planner does (nh12_hd128 is ROCm/aiter#7087).
-    # A False only costs the padding _MLA_REDUCE_V1_HEADS already gives: an AITER without
-    # the query (ROCm/aiter#6107), or whose compiled module predates it, pads instead.
-    # Asked only for a model that declares mla_fp8_prefill_extended.
+    # mla_reduce_v1 aborts on a shape it lacks (nh12_hd128 is ROCm/aiter#7087), so ask AITER;
+    # one without the query (ROCm/aiter#6107) returns False and pads via _MLA_REDUCE_V1_HEADS.
     try:
         from aiter.ops.attention import mla_reduce_v1_supports
 
@@ -875,10 +872,7 @@ class AiterAttnBackend(AttentionBackend):
                 -1
             ]
 
-        # A model override declares mla_fp8_prefill_extended for the paths validated
-        # on it (Kimi-K3, #47035): native head counts the compiled AITER reports,
-        # zero-padding straight into fp8, prefix chunks that include requests without
-        # keys, and prefix K/V packed straight to fp8. It describes the target model,
+        # mla_fp8_prefill_extended describes the target model,
         # so a draft worker's backend keeps the default paths.
         self.mla_fp8_prefill_extended = (
             self.use_mla
