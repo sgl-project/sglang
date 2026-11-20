@@ -11,8 +11,65 @@ from sglang.srt.layers.layer_boundary.layout import Layout, SumGroup
 from sglang.srt.layers.layer_boundary.row_transport import TransportRows
 from sglang.srt.models.deepseek_common import moe_transport
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+class TestScatteredRowCounts(CustomTestCase):
+    def test_scatter_rebounds_live_rows_and_restores_outer_count(self):
+        """A compact replay tail must route its last rows, not mask them using
+        the full extend's shard count; graph padding must remain masked."""
+        for rows, real, expected in (
+            (128, 128, [32, 32, 32, 32]),
+            (130, 129, [33, 33, 32, 31]),
+            (256, 129, [64, 64, 1, 0]),
+            (128, 0, [0, 0, 0, 0]),
+        ):
+            for rank in range(4):
+                with self.subTest(rows=rows, real=real, rank=rank):
+                    old_count = torch.tensor(30, dtype=torch.int32)
+                    global_count = torch.tensor(real, dtype=torch.int32)
+                    batch = SimpleNamespace(
+                        global_num_token_non_padded=global_count,
+                        num_token_non_padded=old_count,
+                    )
+                    with (
+                        patch.object(
+                            moe_transport,
+                            "get_parallel",
+                            return_value=SimpleNamespace(
+                                attn_tp_size=4, attn_tp_rank=rank, attn_dp_size=1
+                            ),
+                        ),
+                        patch.object(
+                            moe_transport,
+                            "get_forward",
+                            return_value=SimpleNamespace(
+                                scoped=lambda **kwargs: nullcontext()
+                            ),
+                        ),
+                    ):
+                        call = moe_transport.MoeRowTransport(
+                            SimpleNamespace(),
+                            torch.ones(rows, 2),
+                            batch,
+                            None,
+                            None,
+                            use_cp=False,
+                            moe_gather=False,
+                            attn_scatter=True,
+                        )
+                        with self.assertRaisesRegex(RuntimeError, "expert failure"):
+                            with call.scope():
+                                self.assertEqual(
+                                    batch.num_token_non_padded.item(), expected[rank]
+                                )
+                                self.assertIs(
+                                    batch.global_num_token_non_padded, global_count
+                                )
+                                raise RuntimeError("expert failure")
+                        self.assertIs(batch.num_token_non_padded, old_count)
 
 
 class TestOverlappedTransport(unittest.TestCase):

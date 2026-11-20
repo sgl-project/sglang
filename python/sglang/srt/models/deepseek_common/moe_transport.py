@@ -68,6 +68,21 @@ def _every_row_routed(forward_batch, num_rows: int):
         ) = saved
 
 
+@contextmanager
+def _scattered_rows(forward_batch, *, offset: int, num_rows: int):
+    saved = forward_batch.num_token_non_padded
+    global_count = forward_batch.global_num_token_non_padded
+    if global_count is not None:
+        # Tail compaction changes the shard boundaries independently of MLP sync.
+        forward_batch.num_token_non_padded = torch.clamp(
+            global_count - offset, min=0, max=num_rows
+        )
+    try:
+        yield
+    finally:
+        forward_batch.num_token_non_padded = saved
+
+
 def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
     n_real = forward_batch.num_token_non_padded
     num_rows = local_hidden_states.shape[0]
@@ -208,6 +223,12 @@ class MoeRowTransport(ComputeTransport):
             if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
+        if _use_tp_attn_a2a_scatter:
+            gathered_rows = _scattered_rows(
+                forward_batch,
+                offset=sum(chunk.shape[0] for chunk in _a2a_scatter_chunks[:r]),
+                num_rows=hidden_states.shape[0],
+            )
         self.input = hidden_states
         self.input_ids, self.input_ids_global = input_ids, input_ids_global
         self.batch = forward_batch

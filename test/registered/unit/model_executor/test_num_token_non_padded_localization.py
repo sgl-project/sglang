@@ -29,6 +29,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.models.deepseek_v4_replay_tail as replay_tail
+from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -47,6 +48,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     RowBucketGraphRunner,
 )
+from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
@@ -496,6 +498,115 @@ class TestRowBucketMoeBound(CustomTestCase):
 
 
 class TestDecoderReplayTailMoeBound(CustomTestCase):
+    def test_busy_idle_peers_reuse_the_same_graph_key(self):
+        for sharded in (False, True):
+            with self.subTest(sharded=sharded):
+                peers = [
+                    replay_tail.DecoderReplayTail(
+                        model=SimpleNamespace(late_layer_vl_routing=False),
+                        layer_ids=range(1),
+                        row_step=128,
+                        max_rows=128,
+                    )
+                    for _ in range(2)
+                ]
+                for peer in peers:
+                    peer._break_context = lambda batch: nullcontext()
+                    peer.runner._capture = Mock(
+                        return_value=SimpleNamespace(
+                            graph=SimpleNamespace(replay=Mock()),
+                            num_token_non_padded=None,
+                            packed_token_counts=None,
+                            outputs=[torch.zeros(128, 1, 1), None],
+                        )
+                    )
+                for busy_states in (
+                    (True, True),
+                    (True, False),
+                    (False, True),
+                    (True, True),
+                ):
+                    for rank, busy in enumerate(busy_states):
+                        batch = _forward_batch(
+                            sharded=sharded,
+                            local=66 if busy else 0,
+                            glob=129 if busy else 0,
+                            forward_mode=ForwardMode.EXTEND
+                            if busy
+                            else ForwardMode.IDLE,
+                        )
+                        batch.global_num_token_non_padded_cpu = 129 if busy else 0
+                        original = (
+                            batch.num_token_non_padded,
+                            batch.global_num_token_non_padded,
+                        )
+                        backend = SimpleNamespace(
+                            forward_metadata=object(),
+                            tail_forward_metadata=SimpleNamespace(
+                                late_layer_tail=SimpleNamespace(
+                                    real_rows_count=None,
+                                    cp_metadata=None,
+                                    extend_seq_lens_cpu=[128],
+                                ),
+                                core_attn_metadata=SimpleNamespace(),
+                            ),
+                            _bcg_tail_num_token_non_padded=None,
+                            token_to_kv_pool=SimpleNamespace(request_window=None),
+                        )
+                        with (
+                            get_parallel().override(
+                                attn_dp_size=2,
+                                attn_dp_rank=rank,
+                                attn_tp_size=2,
+                                attn_tp_rank=0,
+                                attn_cp_size=1,
+                                tp_size=4,
+                            ),
+                            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+                            patch.object(
+                                deepseek_v4_backend,
+                                "get_local_dp_buffer_len",
+                                return_value=132,
+                            ),
+                            patch.object(
+                                deepseek_v4_backend, "set_local_dp_buffer_len"
+                            ),
+                            patch.object(
+                                replay_tail, "enter_late_layer_dp", return_value=None
+                            ),
+                            patch.object(replay_tail, "exit_late_layer_dp"),
+                            patch(
+                                "sglang.srt.model_executor.runner.row_bucket_graph_runner.graph_pool_replay_scope",
+                                side_effect=nullcontext,
+                            ),
+                        ):
+                            saved = None
+                            if busy:
+                                saved = deepseek_v4_backend.DeepseekV4AttnBackend.enter_late_layer_tail(
+                                    backend, batch
+                                )
+                            rows = 128 if busy else 0
+                            run = peers[rank].run if busy else peers[rank].run_idle
+                            run(
+                                state=HcState(torch.zeros(rows, 1, 1)),
+                                positions=torch.arange(rows),
+                                input_ids=torch.arange(rows),
+                                input_ids_global=None,
+                                forward_batch=batch,
+                                capture_dspark=False,
+                                dp_rows=[128 if state else 0 for state in busy_states],
+                            )
+                            if saved is not None:
+                                deepseek_v4_backend.DeepseekV4AttnBackend.exit_late_layer_tail(
+                                    backend, saved, batch
+                                )
+                            self.assertIs(batch.num_token_non_padded, original[0])
+                            self.assertIs(
+                                batch.global_num_token_non_padded, original[1]
+                            )
+                        self.assertEqual(peers[rank].runner._capture.call_count, 1)
+                        self.assertEqual(len(peers[rank].runner._graphs), 1)
+
     # GLOBAL is opted in only for the gathered, attention-TP-sharded layout.
     _CASES = (
         ("local", False, 3, 7, False, True),
