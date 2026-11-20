@@ -93,8 +93,8 @@ message StagedImageTransfer {
   // Versions 2 and 3 pack image embedding rows first, followed by video rows.
   // Within each modality, item order matches that of the original prompt.
   repeated VideoLayout videos = 9;
-  // Version 3 binds the layout to a native model processor. Grids use THW
-  // order; a native two-dimensional HW grid is represented with t = 1.
+  // Version 3 binds the layout to a native model processor. Grid dimensions are
+  // time, height and width. A two-dimensional image grid has t = 1.
   string native_model_type = 10;
   uint32 embedding_width = 11;
 }

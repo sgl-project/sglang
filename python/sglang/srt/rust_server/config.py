@@ -12,10 +12,10 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.disaggregation.encoder.handoff import STAGED_VIDEO_MODEL_TYPES
 from sglang.srt.disaggregation.encoder.native_handoff import (
     NATIVE_IMAGE_MODEL_TYPES,
     NATIVE_VIDEO_MODEL_TYPES,
+    STAGED_VIDEO_MODEL_TYPES,
 )
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.server_utils import (

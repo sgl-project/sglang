@@ -12,6 +12,7 @@ import msgspec
 import torch
 import torch.distributed as dist
 import zmq
+from test_staged_image_receiver import request, scheduler, staged_encoder
 
 from sglang.srt.disaggregation.encoder import receiver
 from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
@@ -19,7 +20,6 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
-from test_staged_image_receiver import request, scheduler, staged_encoder
 
 register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
