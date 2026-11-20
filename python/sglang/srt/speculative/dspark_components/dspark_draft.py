@@ -3,6 +3,7 @@ from __future__ import annotations
 import bisect
 import functools
 import logging
+import math
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import msgspec
@@ -132,6 +133,18 @@ def _zero(device: torch.device) -> torch.Tensor:
     return torch.zeros((), dtype=torch.float32, device=device)
 
 
+@functools.cache
+def bench_drafter_temperature() -> float:
+    """SGLANG_BENCH_DRAFTER_TEMPERATURE, validated once per process; 0.0 when unset."""
+    value = float(envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.get())
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "SGLANG_BENCH_DRAFTER_TEMPERATURE must be a finite non-negative float "
+            f"(0 disables it), got {value!r}."
+        )
+    return value
+
+
 def resolve_draft_params(
     *,
     sampling_info,
@@ -162,6 +175,18 @@ def resolve_draft_params(
         )
         torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
         torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
+    bench_temperature = bench_drafter_temperature()
+    if bench_temperature > 0.0:
+        # Benchmark mode: only the draft step temperature changes. temperatures and
+        # greedy_mask, which the verify reads, stay as resolved, so the target still
+        # verifies greedily; a sampled request would be accepted against step logits
+        # drawn at a temperature it did not ask for, hence greedy only.
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            raise ValueError(
+                "SGLANG_BENCH_DRAFTER_TEMPERATURE requires greedy requests "
+                "(temperature 0 / top_k 1)."
+            )
+        step_temperatures.fill_(bench_temperature)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 

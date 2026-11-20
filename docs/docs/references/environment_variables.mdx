@@ -1839,6 +1839,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sanitize NaN logits before sampling kernels and emit a throttled warning.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BENCH_DRAFTER_TEMPERATURE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Benchmark only. A positive value makes every DSpark draft row sample at this fixed temperature (for example <code>1000</code>, close to uniform), so simulated acceptance commits random drafts instead of the short repeating loops a greedy draft produces. Only the draft step temperature changes: requests must be greedy and the target still verifies greedily. Requires <code>SGLANG_SIMULATE_ACC_LEN</code>, static ragged verify and no online acceptance estimator; overrides <code>SGLANG_DSPARK_USE_GREEDY_DRAFT</code>. <code>0</code> disables it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 

@@ -54,6 +54,7 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    bench_drafter_temperature,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -374,6 +375,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
+        self._check_bench_drafter_temperature()
         markov_head = self.draft_model.markov_head
         self._sharded_accept = (
             is_hip()
@@ -646,6 +648,44 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise ValueError(
                 f"{type(self.draft_model).__name__} folds the static verify commit, "
                 "but its FULL KV slots are not the target's unremapped slots"
+            )
+
+    def _check_bench_drafter_temperature(self) -> None:
+        """Refuse SGLANG_BENCH_DRAFTER_TEMPERATURE outside the fixed-work benchmark.
+
+        Runs before anything reads ``self._greedy_draft``: the benchmark temperature
+        overrides SGLANG_DSPARK_USE_GREEDY_DRAFT."""
+        temperature = bench_drafter_temperature()
+        if temperature <= 0.0:
+            return
+        name = "SGLANG_BENCH_DRAFTER_TEMPERATURE"
+        if self._simulated_correct_len is None:
+            raise ValueError(
+                f"{name} requires SGLANG_SIMULATE_ACC_LEN > 0: real acceptance would "
+                "reject the drafts it samples."
+            )
+        if self._greedy_draft:
+            # The benchmark asks for sampled drafts; an argmax draft would undo it.
+            self._greedy_draft = False
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample "
+                    "at the benchmark temperature instead of taking the argmax.",
+                    name,
+                )
+        if self._verify_planner.mode_value != "static":
+            raise ValueError(f"{name} requires SGLANG_RAGGED_VERIFY_MODE=static.")
+        if self._acceptance_estimator is not None:
+            raise ValueError(
+                f"{name} does not support the online acceptance estimator, which "
+                "scores the draft step logits."
+            )
+        if self._target_tp_rank == 0:
+            logger.warning(
+                "BENCHMARK: DSpark drafts sample at temperature %s; acceptance is "
+                "simulated (SGLANG_SIMULATE_ACC_LEN=%s).",
+                temperature,
+                self._simulate_acc_len,
             )
 
     def init_attention_backends(self):
