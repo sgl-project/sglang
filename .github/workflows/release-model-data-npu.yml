@@ -96,13 +96,13 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - name: test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_mooncake_l3
+          - name: test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa_mooncake
             test_type: accuracy
             prefill_decode_deployment: separation
-            prefill_size: 1
-            decode_size: 1
+            prefill_size: 2
+            decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_mooncake_l3.py
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa_mooncake.py
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4

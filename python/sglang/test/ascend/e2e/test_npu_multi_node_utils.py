@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -46,6 +47,7 @@ BOOTSTRAP_INIT_PORT = 8995
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
 PD_WORKER_READY_TIMEOUT = 600
+MOONCAKE_MASTER_READY_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
 
@@ -340,6 +342,67 @@ def check_port_availability(host, port, timeout=3):
     except Exception as e:
         logger.error(f"Port check unexpected error for {host}:{port}: {e}")
         return False
+
+
+def _resolve_mooncake_master_address(args_list, default_address):
+    """Return the master address the server launched with ``args_list`` uses.
+
+    ``--hicache-storage-backend-extra-config`` wins over the ``MOONCAKE_MASTER``
+    environment variable, so its ``master_server_address`` is the endpoint to
+    poll when the case passes one; otherwise fall back to the environment form.
+
+    Args:
+        args_list (list): Server launch args.
+        default_address (str): Address set through ``MOONCAKE_MASTER``.
+
+    Returns:
+        str: ``<host>:<port>`` of the Mooncake master.
+    """
+    from sglang.test.ascend.test_ascend_utils import get_server_args_value
+
+    extra_config = get_server_args_value(
+        args_list, "--hicache-storage-backend-extra-config"
+    )
+    if extra_config:
+        try:
+            address = json.loads(extra_config).get("master_server_address")
+        except (json.JSONDecodeError, TypeError):
+            address = None
+        if address:
+            return address
+    return default_address
+
+
+def wait_for_mooncake_master(
+    address, timeout=MOONCAKE_MASTER_READY_TIMEOUT, poll_interval=2
+):
+    """Wait until the Mooncake master at ``address`` accepts connections.
+
+    Only the node that starts the master waits for its port locally (see
+    ``maybe_start_hicache_storage_service``). The other nodes of a multi-node
+    instance launch concurrently and can reach the store setup before the
+    master is listening; the store does not retry, so they wait here first.
+
+    Args:
+        address (str): ``<host>:<port>`` of the master.
+        timeout (int): Total timeout in seconds.
+        poll_interval (int): Interval between connection attempts.
+
+    Raises:
+        RuntimeError: If the master does not open its port within ``timeout``.
+    """
+    host, _, port = address.rpartition(":")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if check_port_availability(host, int(port)):
+            logger.info(f"Mooncake master {address} is ready")
+            return
+        logger.info(f"Mooncake master {address} is not ready yet, waiting ...")
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f"Mooncake master {address} did not open its port within {timeout}s"
+    )
 
 
 def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15):
@@ -726,10 +789,15 @@ def launch_pd_mix_node(model_config):
     )
 
     if get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
-        set_mooncake_master_env(master_node_ip)
+        master_address = set_mooncake_master_env(master_node_ip)
         # Each node registers its own address with the store instead of the
         # shared "localhost" default, which other nodes cannot reach.
         os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
+        # Nodes other than the one hosting the master start concurrently with
+        # it and would otherwise race its listen port.
+        wait_for_mooncake_master(
+            _resolve_mooncake_master_address(other_args, master_address)
+        )
 
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
@@ -949,10 +1017,15 @@ def launch_pd_separation_node(model_config):
     )
 
     if get_server_args_value(service_args, HICACHE_STORAGE_BACKEND_ARG) == "mooncake":
-        set_mooncake_master_env(master_prefill_ip)
+        master_address = set_mooncake_master_env(master_prefill_ip)
         # Each node registers its own address with the store instead of the
         # shared "localhost" default, which other nodes cannot reach.
         os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", resolve_local_ip())
+        # Nodes other than the one hosting the master start concurrently with
+        # it and would otherwise race its listen port.
+        wait_for_mooncake_master(
+            _resolve_mooncake_master_address(service_args, master_address)
+        )
 
     try:
         process = popen_launch_server(
