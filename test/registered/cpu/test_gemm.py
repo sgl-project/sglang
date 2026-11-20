@@ -219,6 +219,65 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
+    @parametrize(rows=[0, 1, 7], columns=[32, 96, 4096], strided=[False, True])
+    def test_per_token_quant_fp8(self, rows, columns, strided):
+        generator = torch.Generator().manual_seed(1234)
+        input = torch.randn(rows, columns, generator=generator).bfloat16()
+        input[:, ::4] *= 1e-4
+        if rows > 1:
+            input[0].zero_()
+            input[1] *= 1e-6
+        if strided:
+            storage = torch.empty(rows, columns + 32, dtype=torch.bfloat16)
+            storage[:, :columns] = input
+            input = storage[:, :columns]
+
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scales = input.float().abs().amax(dim=1) / fp8_max
+        inverse_scales = torch.where(scales == 0, 0, scales.reciprocal())
+        expected = (
+            (input.float() * inverse_scales.unsqueeze(1))
+            .clamp(-fp8_max, fp8_max)
+            .to(torch.float8_e4m3fn)
+        )
+        output, output_scales = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+        torch.testing.assert_close(output_scales, scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            output.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+        )
+
+    def test_per_token_quant_fp8_rounding_boundary(self):
+        """An FP16 intermediate must not move values across an E4M3 rounding midpoint."""
+        input = torch.full((2, 32), 2**-16, dtype=torch.bfloat16)
+        input[:, 0] = 1
+        input[1].neg_()
+        scales = input.float().abs().amax(dim=1) / 448
+        scaled = input.float() * scales.reciprocal().unsqueeze(1)
+        expected = scaled.to(torch.float8_e4m3fn)
+        self.assertFalse(
+            torch.equal(
+                expected.view(torch.uint8),
+                scaled.half().to(torch.float8_e4m3fn).view(torch.uint8),
+            )
+        )
+        output, output_scales = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+        torch.testing.assert_close(output_scales, scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            output.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+        )
+
+    def test_per_token_quant_fp8_rejects_invalid_input(self):
+        for input in (
+            torch.empty(32, dtype=torch.bfloat16),
+            torch.empty(1, 0, dtype=torch.bfloat16),
+            torch.empty(1, 48, dtype=torch.bfloat16),
+            torch.empty(1, 32, dtype=torch.float32),
+            torch.empty(32, 32, dtype=torch.bfloat16).t(),
+        ):
+            with self.subTest(shape=input.shape, dtype=input.dtype):
+                with self.assertRaises(RuntimeError):
+                    torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):
         prepack = True

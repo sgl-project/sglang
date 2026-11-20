@@ -24,7 +24,11 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
+from sglang.srt.sampling.watermarking.interface import (
+    WatermarkRows,
+    merge_watermark_rows,
+)
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import print_warning_once
 
@@ -156,11 +160,8 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
-    watermark_keys: Optional[torch.Tensor] = None
-    watermark_context_windows: Optional[torch.Tensor] = None
-    watermark_enabled: Optional[torch.Tensor] = None
-    watermark_candidates_host: Optional[List[bool]] = None
-    has_watermark_candidates: bool = False
+    # Per-row watermark policy; None unless some row is a watermark candidate.
+    watermark: Optional[WatermarkRows] = None
 
     # Device
     device: str = "cuda"
@@ -269,27 +270,11 @@ class SamplingBatchInfo:
         )
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
-        features = get_exec().features
-        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
-            watermark_config = build_watermark_batch_config(
-                reqs,
-                default_key=features.watermark_key,
-                default_context_window=features.watermark_context_window,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
-                device=device,
-            )
-            watermark_keys = watermark_config.keys
-            watermark_context_windows = watermark_config.context_windows
-            watermark_enabled = watermark_config.enabled
-            watermark_candidates_host = watermark_config.candidates_host
-            has_watermark_candidates = watermark_config.has_candidates
-        else:
-            watermark_keys = None
-            watermark_context_windows = None
-            watermark_enabled = None
-            watermark_candidates_host = None
-            has_watermark_candidates = False
+        watermark = (
+            build_watermark_rows(reqs, device)
+            if isinstance(batch, ScheduleBatch)
+            else None
+        )
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -363,11 +348,7 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
-            watermark_keys=watermark_keys,
-            watermark_context_windows=watermark_context_windows,
-            watermark_enabled=watermark_enabled,
-            watermark_candidates_host=watermark_candidates_host,
-            has_watermark_candidates=has_watermark_candidates,
+            watermark=watermark,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -532,19 +513,13 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
-            "watermark_keys",
-            "watermark_context_windows",
-            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
-        if self.watermark_candidates_host is not None:
-            self.watermark_candidates_host = [
-                self.watermark_candidates_host[index] for index in keep_indices
-            ]
-            self.has_watermark_candidates = any(self.watermark_candidates_host)
+        if self.watermark is not None:
+            self.watermark = self.watermark.filter(keep_indices, keep_indices_device)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -681,21 +656,15 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
-            "watermark_keys",
-            "watermark_context_windows",
-            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
-        if (
-            self.watermark_candidates_host is not None
-            and other.watermark_candidates_host is not None
-        ):
-            self.watermark_candidates_host.extend(other.watermark_candidates_host)
-            self.has_watermark_candidates = any(self.watermark_candidates_host)
+        self.watermark = merge_watermark_rows(
+            self.watermark, other.watermark, self_len, other_len
+        )
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
