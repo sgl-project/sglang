@@ -36,7 +36,7 @@ class TestSuffixLayout(CustomTestCase):
         q = torch.randn(3, 2, 64)
         k = v = torch.randn(4, 1, 1, 64)
         output, lse, scratch = torch.randn_like(q), torch.randn(2, 3), object()
-        layer = SimpleNamespace(scaling=0.125, logit_cap=0.0)
+        layer = SimpleNamespace(scaling=0.125, logit_cap=0.0, num_splits=None)
         for version, kwargs in ((4, {}), (3, {}), (4, {"sinks": torch.zeros(2)})):
             with self.subTest(version=version, modifiers=tuple(kwargs)):
                 fixed = version == 4 and not kwargs
