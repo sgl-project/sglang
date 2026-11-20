@@ -201,28 +201,6 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 _MERGED_K_GATE_MAX_M = 16
 
 
-def _gather_split_topk_rows(
-    tp_split: _IndexerTpSplit, rows: torch.Tensor, output: torch.Tensor
-) -> None:
-    """All-gather each rank's top-k rows into ``output`` in rank order."""
-    group = tp_split.group
-    pynccl_comm = group.pynccl_comm
-    if pynccl_comm is not None and pynccl_comm.available:
-        group.all_gatherv(rows, sizes=tp_split.rows_per_rank, output=output)
-        return
-    # Attention-TP subgroups under attention DP have no PyNCCL communicator, so
-    # pad every rank's slice to the largest one for an even all-gather.
-    sizes = tp_split.rows_per_rank
-    max_rows = max(sizes)
-    padded = rows.new_empty((max_rows, rows.shape[1]))
-    padded[: rows.shape[0]] = rows
-    gathered = group.all_gather(padded, dim=0)
-    start = 0
-    for rank, n in enumerate(sizes):
-        output[start : start + n] = gathered[rank * max_rows : rank * max_rows + n]
-        start += n
-
-
 class _IndexerTpSplit(NamedTuple):
     group: Any  # attn-TP GroupCoordinator
     row_lo: int
@@ -2124,7 +2102,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif tp_split is not None:
             # Rank order == row order, so the gather rebuilds rows [0, q_offset).
-            _gather_split_topk_rows(tp_split, dst, topk_result[:q_offset])
+            tp_split.group.all_gatherv(
+                dst, sizes=tp_split.rows_per_rank, output=topk_result[:q_offset]
+            )
         return topk_result
 
     def _prefill_lite_topk(
@@ -2205,7 +2185,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         group = get_parallel().attn_tp_group
         tp = group.world_size
         min_rows = max(tp, self.tp_split_min_rows)
-        if tp <= 1 or q_offset < min_rows:
+        if (
+            tp <= 1
+            or q_offset < min_rows
+            # the top-k gather is all_gatherv, which runs on PyNCCL only; aiter's
+            # (dsa_indexer_hip.tp_split_gather_topk) does not need it
+            or (
+                not _use_aiter_gfx95
+                and (group.pynccl_comm is None or not group.pynccl_comm.available)
+            )
+        ):
             return None
         bounds = self._indexer_tp_split_bounds(
             seq_lens_cpu=forward_batch.seq_lens_cpu,
