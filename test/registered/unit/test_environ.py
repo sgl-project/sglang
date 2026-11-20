@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -221,7 +222,7 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self.assertEqual(os.environ[new_name], "ABC")
 
 
-class TestRenamedEnvAliases(unittest.TestCase):
+class TestOptRenamedEnvAliases(CustomTestCase):
     """Pre-rename env names keep working with a FutureWarning."""
 
     RENAMED = (
