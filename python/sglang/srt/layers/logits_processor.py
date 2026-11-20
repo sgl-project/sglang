@@ -64,6 +64,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
@@ -250,8 +251,9 @@ class LogitsProcessorOutput:
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    # A per-row list, or one [#seq, k] tensor when every row has the same k.
+    next_token_top_logprobs_val: Optional[Union[List, torch.Tensor]] = None
+    next_token_top_logprobs_idx: Optional[Union[List, torch.Tensor]] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -371,7 +373,7 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -630,7 +632,7 @@ class LogitsProcessor(nn.Module):
 
         return (
             not (info.grammars and any(g is not None for g in info.grammars))
-            and not info.has_watermark_candidates
+            and info.watermark is None
             and sampling_allows_vocab_shards(
                 info,
                 return_logprob=forward_batch.return_logprob,
