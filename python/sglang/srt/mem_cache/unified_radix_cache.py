@@ -95,6 +95,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
+    unpack_device_kv_slots,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -1543,14 +1544,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def maybe_hand_to_session(self, req: Req) -> None:
         self.session.take(req)
 
-    def free_kv_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
+    def free_kv_row(
+        self,
+        kv: ReqKvInfo,
+        ranges: list[tuple[int, int]],
+        *,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         # A restore's host-to-device copy may still be writing this row's
         # pages; they must not return to the allocator before it finishes.
         self._finish_restore(kv)
         if len(self.window_slots()) > 1:
+            # Window pools never run under logical-page KV sharding, so no
+            # rotation base reaches this path.
             self.kv_storage().free_row(kv, ranges)
         else:
-            super().free_kv_row(kv, ranges)
+            super().free_kv_row(kv, ranges, rotation_base=rotation_base)
 
     def claim_kv_row(self, req: Req) -> bool:
         if (
@@ -1883,8 +1892,9 @@ class UnifiedRadixCache(BasePrefixCache):
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             storage = self.kv_storage()
-            for indices in action.indices:
-                storage.free_token_rows(indices)
+            for item in action.indices:
+                indices, rotation_base = unpack_device_kv_slots(item)
+                storage.free_token_rows(indices, rotation_base=rotation_base)
         elif isinstance(action, FreeDeviceKVFullOnly):
             storage = self.kv_storage()
             for indices in action.indices:

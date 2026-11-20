@@ -586,9 +586,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         state slots it needs from one take made ahead; nothing here."""
         return nullcontext()
 
-    def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
+    def free_kv_row(
+        self,
+        kv: Any,
+        ranges: list[tuple[int, int]],
+        *,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
+        ``rotation_base``: the row's rotation base under logical-page KV
+        sharding, which lets the allocator type each page's owner on the host.
         """
         from sglang.srt.mem_cache.common import free_kv_row_segments
         from sglang.srt.mem_cache.kv.advance import coalesce_ranges
@@ -603,6 +611,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             window_evicted_seqlen=kv.get_evicted_seqlen(window_sub_pool_of(allocator)),
             window_dead_lo=kv.window_dead_lo(global_page_size),
+            rotation_base=rotation_base,
         )
 
     @abstractmethod

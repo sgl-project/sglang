@@ -120,6 +120,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         self.free_group = None
         # Grouped free_segment() page ids, released at free_group_end().
         self.free_page_ids_group = []
+        self._reset_free_group_classes()
         # Neutralize the base single-list attributes: every consumer of this
         # allocator must go through the classed API (or fail loud on None),
         # never a stale flat free list.
@@ -397,17 +398,30 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         # belongs to the same free).
         self._free_pages(torch.unique(free_index.long() // self.page_size))
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ):
         """Fixed-shape free of ``kv_row[start_pos : start_pos + n]``.
 
         A page's tokens sit consecutively in the row and the start is
         page-aligned, so ``free_index[::ps]`` hits each page once: no
         ``torch.unique``. Contract (base): a page is freed by only one call
         per group.
+
+        With the row's host ``rotation_base`` the owner of position-page P is
+        ``(rotation_base + P) % N``, so each class's pages are a stride slice
+        of the page ids and its count is closed-form: no host sync. Without
+        it the owners come from the page ids, and splitting them into classes
+        reads the per-class counts back to the host, which waits on a stream
+        that may be queued behind a forward.
         """
         if free_index.numel() == 0:
             return
-        ps = self.page_size
+        ps, shard_size = self.page_size, self.shard_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
         # Integer division copies, so a group holds no req_to_token view.
         page_ids = free_index[::ps].long() // ps
@@ -416,14 +430,49 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
                 torch.sort(page_ids.cpu())[0],
                 torch.unique(free_index.cpu().long() // ps),
             )
-        if self.free_group is not None:
-            self.free_page_ids_group.append(page_ids)
+        if rotation_base is None:
+            if self.free_group is not None:
+                self.free_page_ids_group.append(page_ids)
+                return
+            self._free_pages(page_ids)
             return
-        self._free_pages(page_ids)
+
+        num_pages = -(-free_index.numel() // ps)
+        start_class = (rotation_base + start_pos // ps) % shard_size
+        if self.debug_mode:
+            # Host rotation phase vs loc-derived owners (syncs; debug only).
+            owners = (page_ids % shard_size).cpu()
+            expected = (torch.arange(num_pages) + start_class) % shard_size
+            assert torch.equal(owners, expected), (
+                f"rotation base {rotation_base} out of sync with the freed "
+                f"locs at start_pos {start_pos}: owners {owners.tolist()}, "
+                f"host phase says {expected.tolist()}"
+            )
+        in_group = self.free_group is not None
+        for k in range(min(num_pages, shard_size)):
+            cls = (start_class + k) % shard_size
+            pages = page_ids[k::shard_size]
+            count = len(range(k, num_pages, shard_size))
+            if in_group:
+                self.free_group_class_pages[cls].append(pages)
+                self.free_group_class_counts[cls] += count
+            else:
+                self._stage_class_pages(cls, [pages], count)
+        if not in_group and self.debug_mode:
+            self.debug_check_classes()
+
+    def free_group_begin(self):
+        super().free_group_begin()
+        self._reset_free_group_classes()
 
     def free_group_end(self):
         pending, self.free_group = self.free_group, None
         page_ids, self.free_page_ids_group = self.free_page_ids_group, []
+        class_pages, class_counts = (
+            self.free_group_class_pages,
+            self.free_group_class_counts,
+        )
+        self._reset_free_group_classes()
         if pending:
             merged = torch.cat(pending) if len(pending) > 1 else pending[0]
             page_ids.append(torch.unique(merged.long() // self.page_size))
@@ -432,6 +481,21 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             # stride samples, and the segment contract frees a page once per
             # group, so the union is distinct. One release covers the group.
             self._free_pages(torch.cat(page_ids) if len(page_ids) > 1 else page_ids[0])
+        if any(class_counts):
+            # Rotation-typed segments: one merge per class for the whole group.
+            for cls, parts in enumerate(class_pages):
+                if parts:
+                    self._stage_class_pages(cls, parts, class_counts[cls])
+            if self.debug_mode:
+                self.debug_check_classes()
+
+    def _reset_free_group_classes(self):
+        # Grouped rotation-typed free_segment() pages per owner class, with
+        # their host-side counts, released at free_group_end().
+        self.free_group_class_pages: List[List[torch.Tensor]] = [
+            [] for _ in range(self.shard_size)
+        ]
+        self.free_group_class_counts: List[int] = [0] * self.shard_size
 
     def _free_pages(self, pages: torch.Tensor) -> None:
         """Return distinct logical pages to their owner classes.
@@ -449,17 +513,23 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         )
         grouped = torch.split(pages[torch.argsort(owners, stable=True)], counts)
         for r, freed in enumerate(grouped):
-            if counts[r] == 0:
-                continue
-            if self.need_sort:
-                # Stage the split view; merge_and_sort_free concatenates.
-                self.class_staged_pages[r].append(freed)
-                self.class_num_staged_pages[r] += counts[r]
-            else:
-                self.class_free_pages[r] = torch.cat((freed, self.class_free_pages[r]))
+            if counts[r]:
+                self._stage_class_pages(r, [freed], counts[r])
 
         if self.debug_mode:
             self.debug_check_classes()
+
+    def _stage_class_pages(self, cls: int, parts: List[torch.Tensor], count: int):
+        """Return ``count`` distinct pages of owner class ``cls``, given as
+        ``parts``, to that class."""
+        if self.need_sort:
+            # Stage unsorted; merge_and_sort_free concatenates.
+            self.class_staged_pages[cls].append(
+                torch.cat(parts) if len(parts) > 1 else parts[0]
+            )
+            self.class_num_staged_pages[cls] += count
+        else:
+            self.class_free_pages[cls] = torch.cat((*parts, self.class_free_pages[cls]))
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
         raise NotImplementedError(

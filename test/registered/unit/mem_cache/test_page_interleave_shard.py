@@ -784,13 +784,13 @@ def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
     )
 
 
-def _make_allocator(pages_per_rank=32, need_sort=False):
+def _make_allocator(pages_per_rank=32, need_sort=False, device="cpu"):
     return PageInterleavePoolAllocator(
         size=pages_per_rank * PS,  # physical token slots of one rank
         physical_page_size=PS,
         shard_size=N,
         dtype=torch.bfloat16,
-        device="cpu",
+        device=device,
         kvcache=None,
         need_sort=need_sort,
     )
@@ -1123,6 +1123,136 @@ class TestClassedAllocator(CustomTestCase):
         with self.assertRaises(AssertionError):
             alloc.free_segment(out[1:], start_pos=1)
 
+    @staticmethod
+    def _class_page_sets(alloc):
+        return [
+            sorted(
+                torch.cat((alloc.class_free_pages[r], *alloc.class_staged_pages[r]))
+                .long()
+                .tolist()
+            )
+            for r in range(N)
+        ]
+
+    def test_free_segment_with_rotation_base_matches_loc_owners(self):
+        """The host rotation base types every page of the row, so the
+        sync-free path frees exactly the pages, per class, that the
+        loc-derived split would: aligned and mid-page tails, and runs longer
+        than one rotation."""
+        cases = [
+            (0, 6 * PS),
+            (2 * PS, 9 * PS + 3),
+            (PS, 7 * PS),
+            (3 * PS, 3 * PS + 9),
+            (4 * PS, 11 * PS),
+        ]
+        for need_sort in (False, True):
+            for start, end in cases:
+                with self.subTest(need_sort=need_sort, start=start, end=end):
+                    hinted = _make_allocator(need_sort=need_sort)
+                    reference = _make_allocator(need_sort=need_sort)
+                    hinted_row, reference_row = (
+                        _alloc_extend(alloc, 0, 11 * PS, rotation_base=3)
+                        for alloc in (hinted, reference)
+                    )
+                    with (
+                        unittest.mock.patch(
+                            "torch.unique", side_effect=AssertionError("deduped")
+                        ),
+                        unittest.mock.patch.object(
+                            hinted,
+                            "_free_pages",
+                            side_effect=AssertionError("loc-derived owners"),
+                        ),
+                    ):
+                        hinted.free_segment(
+                            hinted_row[start:end], start_pos=start, rotation_base=3
+                        )
+                    reference.free_segment(reference_row[start:end], start_pos=start)
+                    hinted.debug_check_classes()
+                    self.assertEqual(
+                        hinted.class_free_page_counts(),
+                        reference.class_free_page_counts(),
+                    )
+                    self.assertEqual(
+                        self._class_page_sets(hinted), self._class_page_sets(reference)
+                    )
+
+    def test_grouped_free_segment_with_rotation_base_holds_until_group_end(self):
+        # Chains on different bases land in every class; the group must merge
+        # each class's pages from all of them exactly once.
+        for need_sort in (False, True):
+            with self.subTest(need_sort=need_sort):
+                alloc = _make_allocator(need_sort=need_sort)
+                row = _alloc_extend(alloc, 0, 6 * PS, rotation_base=1)
+                other = _alloc_extend(alloc, 0, 3 * PS + 5, rotation_base=2)
+                before = alloc.class_free_page_counts()
+                alloc.free_group_begin()
+                alloc.free_segments(
+                    [(row[: 2 * PS], 0), (row[2 * PS :], 2 * PS)], rotation_base=1
+                )
+                alloc.free_segment(other, start_pos=0, rotation_base=2)
+                self.assertEqual(alloc.class_free_page_counts(), before)
+                # The pages were taken at the call: rewriting the rows is safe.
+                row.zero_()
+                other.zero_()
+                alloc.free_group_end()
+                self.assertEqual(alloc.class_free_page_counts(), [32] * N)
+                free_pages = alloc.get_all_free_pages()
+                self.assertEqual(len(torch.unique(free_pages)), free_pages.numel())
+                alloc.debug_check_classes()
+
+    def test_free_segment_with_a_stale_rotation_base_fails_loud_in_debug(self):
+        alloc = _make_allocator()
+        alloc.debug_mode = True
+        row = _alloc_extend(alloc, 0, 2 * PS, rotation_base=2)
+        with self.assertRaises(AssertionError):
+            alloc.free_segment(row, start_pos=0, rotation_base=3)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+class TestRotationFreeSegmentNoHostSync(CustomTestCase):
+    """A host sync in the free path waits on the scheduler stream, which may
+    be queued behind an in-flight forward. With the row's rotation base the
+    free must stay on the device."""
+
+    def _row(self, need_sort):
+        alloc = _make_allocator(need_sort=need_sort, device="cuda")
+        row = _alloc_extend(alloc, 0, 7 * PS + 3, rotation_base=2)
+        torch.cuda.synchronize()
+        return alloc, row
+
+    @contextmanager
+    def _sync_debug_error(self):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            yield
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+
+    def test_rotation_free_segment_issues_no_host_sync(self):
+        for need_sort in (False, True):
+            for grouped in (False, True):
+                with self.subTest(need_sort=need_sort, grouped=grouped):
+                    alloc, row = self._row(need_sort)
+                    if grouped:
+                        alloc.free_group_begin()
+                    with self._sync_debug_error():
+                        alloc.free_segments(
+                            [(row[: 3 * PS], 0), (row[3 * PS :], 3 * PS)],
+                            rotation_base=2,
+                        )
+                        if grouped:
+                            alloc.free_group_end()
+                    self.assertEqual(alloc.class_free_page_counts(), [32] * N)
+                    alloc.debug_check_classes()
+
+    def test_loc_derived_free_segment_syncs(self):
+        # Control: the check above would catch the sync the old path makes.
+        alloc, row = self._row(need_sort=False)
+        with self.assertRaises(RuntimeError), self._sync_debug_error():
+            alloc.free_segment(row, start_pos=0)
+
 
 class TestEvictUntilAllocatable(CustomTestCase):
     """The evict-then-allocate contract under min-class accounting: one
@@ -1308,6 +1438,98 @@ class TestShardedAllocationEviction(CustomTestCase):
         self.assertEqual(tree.full_evictable_size(), PS)
 
 
+class TestShardedFreesWithoutLocOwners(CustomTestCase):
+    """Request releases and tree-side frees (eviction, the insert walk's
+    duplicate pages) type each page's owner from the host rotation base or
+    node phase, so they never split the freed locs by owner on the device and
+    read the per-class counts back."""
+
+    def _tree(self, pages_per_rank=8):
+        allocator = _make_allocator(pages_per_rank=pages_per_rank)
+        req_pool = ReqToTokenPool(
+            size=8, max_context_len=256, device="cpu", enable_memory_saver=False
+        )
+        tree = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=PS,
+                eviction_policy="lru",
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
+                tree_core_backend="python",
+            )
+        )
+        return tree, allocator
+
+    @staticmethod
+    def _no_loc_owner_split(allocator):
+        return unittest.mock.patch.object(
+            allocator,
+            "_free_pages",
+            side_effect=AssertionError("loc-derived owners"),
+        )
+
+    def test_release_returns_the_partial_tail_page_to_its_class(self):
+        tree, allocator = self._tree()
+        n = 3 * PS + 5
+        req = _GraftReq(range(n))
+        req.kv_rotation_base = 2
+        req.last_node = tree.root_node_handle()
+        req_pool = tree.req_to_token_pool
+        req_pool.req_to_token[0, :n] = _alloc_extend(allocator, 0, n, rotation_base=2)
+        self.assertEqual(allocator.class_free_page_counts(), [7, 7, 7, 7])
+
+        allocator.free_group_begin()
+        with (
+            self._no_loc_owner_split(allocator),
+            unittest.mock.patch("torch.unique", side_effect=AssertionError("deduped")),
+        ):
+            tree.checkpoint(req, up_to=n)
+            tree.free_kv_row(
+                req.kv,
+                [(req.kv.cache_protected_len, n)],
+                rotation_base=req.kv_rotation_base,
+            )
+            allocator.free_group_end()
+
+        # Pages 0-2 stay cached; partial page 3 is owner (2 + 3) % N = 1.
+        self.assertEqual(allocator.class_free_page_counts(), [7, 8, 7, 7])
+        self.assertEqual(_match_len(tree, list(range(n))), 3 * PS)
+        allocator.debug_check_classes()
+
+    def test_dup_free_and_eviction_return_every_page_to_its_class(self):
+        tree, allocator = self._tree()
+        allocator.debug_mode = True
+        full = allocator.class_free_page_counts()
+        trunk = list(range(5 * PS))
+        branch = trunk[: 3 * PS] + [900 + i for i in range(2 * PS)]
+        with self._no_loc_owner_split(allocator):
+            _insert(
+                tree,
+                trunk,
+                rotation_base=3,
+                value=_alloc_extend(allocator, 0, len(trunk), rotation_base=3),
+            )
+            # The branch's own copies of the 3 shared pages are duplicates the
+            # walk frees; the split leaves the trunk tail at phase 3 + 3.
+            _insert(
+                tree,
+                branch,
+                rotation_base=3,
+                value=_alloc_extend(allocator, 0, len(branch), rotation_base=3),
+            )
+            trunk_tail = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", trunk)))
+            ).last_device_node
+            self.assertEqual(tree.tree_core.rotation_phase_of(trunk_tail), 3 + 3)
+            self.assertEqual(sum(full) - sum(allocator.class_free_page_counts()), 7)
+
+            tree.evict(EvictParams(num_tokens=7 * PS))
+        self.assertEqual(allocator.class_free_page_counts(), full)
+        allocator.debug_check_classes()
+
+
 @parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
 class TestUnifiedRotationBase(_TreeCoreBackendCase):
     """The host rotation base on UnifiedTreeNode: the one new piece of
@@ -1473,13 +1695,13 @@ class TestRotationGraftDecline(_TreeCoreBackendCase):
         real_free_segments = allocator.free_segments
         real_free_segment = allocator.free_segment
 
-        def spy_segments(segments):
+        def spy_segments(segments, **kwargs):
             freed.extend(torch.as_tensor(seg).clone() for seg, _start in segments)
-            return real_free_segments(segments)
+            return real_free_segments(segments, **kwargs)
 
-        def spy_segment(free_index, start_pos):
+        def spy_segment(free_index, start_pos, **kwargs):
             freed.append(torch.as_tensor(free_index).clone())
-            return real_free_segment(free_index, start_pos=start_pos)
+            return real_free_segment(free_index, start_pos=start_pos, **kwargs)
 
         allocator.free_segments = spy_segments
         allocator.free_segment = spy_segment

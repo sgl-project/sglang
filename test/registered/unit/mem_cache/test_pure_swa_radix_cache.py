@@ -57,10 +57,10 @@ class _FakeAllocator:
         self.skipped = []
         self.window_freed = []
 
-    def free_segment(self, indices, *, start_pos):
+    def free_segment(self, indices, *, start_pos, rotation_base=None):
         self.freed.extend(indices.tolist())
 
-    def free_segments(self, segments):
+    def free_segments(self, segments, *, rotation_base=None):
         for indices, start_pos in segments:
             self.free_segment(indices, start_pos=start_pos)
 

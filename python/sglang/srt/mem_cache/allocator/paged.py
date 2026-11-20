@@ -373,7 +373,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ):
         """Fixed-shape free(): page-aligned start plus contiguous per-page tokens
         make ``free_index[::page_size]`` hit each page once; no torch.unique sync."""
         if free_index.numel() == 0:

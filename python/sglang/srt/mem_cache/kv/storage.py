@@ -498,18 +498,30 @@ class KVStorage:
         """Give back rows `take_units` handed out."""
         self._band(sub_pool).free(ids)
 
-    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+    def free_units(
+        self,
+        sub_pool: str,
+        ids: torch.Tensor,
+        *,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         """Give back a sub-pool's rows the tree held, as page-exact segments of
         owner token ids: the owner's rows alone, or a window's rows of those
-        token ids."""
+        token ids. ``rotation_base`` types the owner rows' pages under
+        logical-page KV sharding (see ``free_segment``)."""
         if sub_pool in self._allocator.window_allocators:
             self._allocator.free_window_segment(sub_pool, ids, start_pos=0)
         else:
-            self._band(sub_pool).free_segment(ids, start_pos=0)
+            self._band(sub_pool).free_segment(
+                ids, start_pos=0, rotation_base=rotation_base
+            )
 
-    def free_token_rows(self, ids: torch.Tensor) -> None:
-        """Give back every sub-pool's rows of these owner token ids."""
-        self._allocator.free_segment(ids, start_pos=0)
+    def free_token_rows(
+        self, ids: torch.Tensor, *, rotation_base: Optional[int] = None
+    ) -> None:
+        """Give back every sub-pool's rows of these owner token ids;
+        ``rotation_base`` as in ``free_units``."""
+        self._allocator.free_segment(ids, start_pos=0, rotation_base=rotation_base)
 
     def free_owner_rows(self, ids: torch.Tensor) -> None:
         """Give back the owner's rows of token ids whose window rows went back

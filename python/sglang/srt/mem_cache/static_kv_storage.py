@@ -550,14 +550,24 @@ class StaticKVStorage:
     def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
         self._band(sub_pool).free(ids)
 
-    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+    def free_units(
+        self,
+        sub_pool: str,
+        ids: torch.Tensor,
+        *,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         if sub_pool == _WINDOW:
             self._allocator.free_swa_segment(ids, start_pos=0)
         else:
-            self._band(sub_pool).free_segment(ids, start_pos=0)
+            self._band(sub_pool).free_segment(
+                ids, start_pos=0, rotation_base=rotation_base
+            )
 
-    def free_token_rows(self, ids: torch.Tensor) -> None:
-        self._allocator.free_segment(ids, start_pos=0)
+    def free_token_rows(
+        self, ids: torch.Tensor, *, rotation_base: Optional[int] = None
+    ) -> None:
+        self._allocator.free_segment(ids, start_pos=0, rotation_base=rotation_base)
 
     def free_owner_rows(self, ids: torch.Tensor) -> None:
         self._allocator.free_full_segment(ids, start_pos=0)

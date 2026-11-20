@@ -261,7 +261,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         frees: List[Tuple[str, bool]] = []
 
-        def record_free(kv_info, ranges):
+        def record_free(kv_info, ranges, **kwargs):
             frees.append((req.rid, copy.done))
 
         # release_kv_cache: an unclaimed row is freed through free_kv_row, then

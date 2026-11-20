@@ -42,9 +42,11 @@ class _RecordingAllocator(SWATokenToKVPoolAllocator):
         self.freed.update(indices.tolist())
         return super().free_full(indices)
 
-    def free_segment(self, indices, *, start_pos):
+    def free_segment(self, indices, *, start_pos, rotation_base=None):
         self.freed.update(indices.tolist())
-        return super().free_segment(indices, start_pos=start_pos)
+        return super().free_segment(
+            indices, start_pos=start_pos, rotation_base=rotation_base
+        )
 
     def free_full_segment(self, indices, *, start_pos):
         self.freed.update(indices.tolist())

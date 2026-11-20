@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
+    device_kv_slots,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -165,6 +166,11 @@ class UnifiedTreeNode:
         # inserting request's host base, copied on split, read through
         # req.last_node at alloc time. None when sharding is off.
         self.rotation_base: Optional[int] = None
+        # rotation_base plus the node's first position-page: the owner of its
+        # first Full page is rotation_phase % shard_size. Kept per node (set at
+        # insert, advanced on split) so frees of the node's device value type
+        # its pages on the host without walking to the root.
+        self.rotation_phase: Optional[int] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -665,15 +671,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
         """Logical-page KV sharding: rotation_base plus the node's first
         position-page (host backups draw slots of the same owners)."""
-        node = self.node_by_id(node_id)
-        if node.rotation_base is None:
-            return None
-        prefix_len = 0
-        parent = node.parent
-        while parent is not None:
-            prefix_len += len(parent.key)
-            parent = parent.parent
-        return node.rotation_base + prefix_len // self.page_size
+        return self.node_by_id(node_id).rotation_phase
 
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -1533,7 +1531,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKVFullOnly([dup[:swa_already_freed]])
                 )
             if swa_already_freed < dup.numel():
-                state.pending_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
+                # The duplicates are the request's own pages, allocated under
+                # the insert's rotation base.
+                rotation_phase = None
+                if state.params.rotation_base is not None:
+                    rotation_phase = (
+                        state.params.rotation_base
+                        + (abs_start + swa_already_freed) // self.page_size
+                    )
+                state.pending_actions.append(
+                    FreeDeviceKV(
+                        [device_kv_slots(dup[swa_already_freed:], rotation_phase)]
+                    )
+                )
         self._finish_insert_walk_node(state, node, prefix_len)
 
     def _finish_insert_walk_node(
@@ -1570,6 +1580,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 priority=state.priority,
                 session_id=state.params.session_id,
                 rotation_base=state.params.rotation_base,
+                start_pos=state.total_prefix_length,
             )
             state.is_new_leaf = True
         else:
@@ -1656,6 +1667,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The rotation base is constant along a chain (position-page P keeps
         # owner (b + P) % N on both sides of the split).
         new_node.rotation_base = child.rotation_base
+        new_node.rotation_phase = child.rotation_phase
+        if child.rotation_phase is not None:
+            child.rotation_phase += split_len // self.page_size
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -1713,6 +1727,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         priority: int = 0,
         session_id: Optional[str] = None,
         rotation_base: Optional[int] = None,
+        start_pos: int = 0,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
@@ -1724,6 +1739,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # rotation, so stamping the inserting request's base keeps every node
         # on a root path carrying the same base.
         new_node.rotation_base = rotation_base
+        if rotation_base is not None:
+            new_node.rotation_phase = rotation_base + start_pos // self.page_size
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[

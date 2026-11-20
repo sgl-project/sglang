@@ -1242,6 +1242,7 @@ class HybridCacheController(BaseHiCacheController):
             "full_attn_allocator",
             self.mem_pool_device_allocator,
         )
+        start_class = None
         if caller_owned:
             assert len(device_indices) == len(host_indices)
         elif not need_load_kv:
@@ -1255,9 +1256,9 @@ class HybridCacheController(BaseHiCacheController):
             if isinstance(full_allocator, PageInterleavePoolAllocator):
                 # Loaded pages keep their host copies' owners; host slots share
                 # the device placement, so the first page id gives the class.
+                start_class = int(host_indices[0]) // full_allocator.page_size
                 device_indices = full_allocator.alloc_cyclic(
-                    start_class=int(host_indices[0]) // full_allocator.page_size,
-                    need_size=len(host_indices),
+                    start_class=start_class, need_size=len(host_indices)
                 )
             else:
                 device_indices = full_allocator.alloc(len(host_indices))
@@ -1276,6 +1277,10 @@ class HybridCacheController(BaseHiCacheController):
                 if self.kv_storage is not None:
                     _, give_back = self.kv_storage.owner_load_alloc()
                     give_back(device_indices)
+                elif start_class is not None:
+                    full_allocator.free_segment(
+                        device_indices, start_pos=0, rotation_base=start_class
+                    )
                 else:
                     full_allocator.free(device_indices)
             return None

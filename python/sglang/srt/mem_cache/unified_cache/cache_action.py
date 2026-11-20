@@ -4,7 +4,7 @@ Controller behavior.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
@@ -16,10 +16,39 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
+class RotatedKVSlots(msgspec.Struct, frozen=True):
+    """Device KV slots of one chain under logical-page KV sharding: a
+    page-aligned run whose page k is owned by class
+    ``(rotation_base + k) % shard_size``. Freeing them types each page's
+    owner on the host instead of reading the slots back."""
+
+    indices: torch.Tensor
+    rotation_base: int
+
+
+def device_kv_slots(
+    indices: torch.Tensor, rotation_base: Optional[int]
+) -> torch.Tensor | RotatedKVSlots:
+    """Tag a page-aligned run of device KV slots with the rotation base of its
+    first page; without sharding (None) keep the bare tensor."""
+    if rotation_base is None:
+        return indices
+    return RotatedKVSlots(indices, rotation_base)
+
+
+def unpack_device_kv_slots(
+    item: torch.Tensor | RotatedKVSlots,
+) -> tuple[torch.Tensor, Optional[int]]:
+    """The slots of a device free item and their rotation base (None untagged)."""
+    if isinstance(item, RotatedKVSlots):
+        return item.indices, item.rotation_base
+    return item, None
+
+
 class FreeDeviceKV(msgspec.Struct, frozen=True):
     """Free unreferenced device KV slots (a SWA-aware combined free)."""
 
-    indices: list[torch.Tensor]
+    indices: list[torch.Tensor | RotatedKVSlots]
 
 
 class FreeDeviceKVFullOnly(msgspec.Struct, frozen=True):
@@ -56,7 +85,7 @@ class UpdatePendingBackupOnNodeSplit(ComponentAction, frozen=True):
 class FreeComponentDeviceSlot(ComponentAction, frozen=True):
     """Free only the given ``component_type``'s device KV slots."""
 
-    indices: list[torch.Tensor]
+    indices: list[torch.Tensor | RotatedKVSlots]
     component_type: ComponentType
 
 

@@ -1713,7 +1713,13 @@ class Band:
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
         return free_index[::ps]
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ) -> None:
         """Fixed-shape counterpart of `free()`; see `_page_reps`. Contract: see
         base; a page must be freed by only one call per group.
         """
