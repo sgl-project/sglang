@@ -402,11 +402,16 @@ class _PersistentCompileDict(dict):
         return dict.get(self, key, default)
 
     def __setitem__(self, key, fn) -> None:
-        if _is_persistable(key):
-            self._persistent[key] = fn
-        else:
-            logger.info("CuTe DSL kernel stays process-local: %r", key)
         dict.__setitem__(self, key, fn)
+        if not _is_persistable(key):
+            logger.info("CuTe DSL kernel stays process-local: %r", key)
+            return
+        # Best-effort like FlashInfer's own disk cache: a value that cannot be
+        # exported (e.g. a function reloaded from an object file) stays in memory.
+        try:
+            self._persistent[key] = fn
+        except Exception as error:
+            logger.warning("CuTe DSL kernel stays process-local (%s): %r", error, key)
 
 
 def _is_persistable(key: CompileKeyType) -> bool:
