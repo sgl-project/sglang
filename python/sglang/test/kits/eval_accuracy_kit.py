@@ -5,7 +5,12 @@ import requests
 
 from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
-from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
+from sglang.test.test_utils import (
+    dump_metric,
+    is_in_amd_ci,
+    is_in_ci,
+    write_github_step_summary,
+)
 
 _THRESHOLD_NOT_SET = float("nan")
 
@@ -18,6 +23,7 @@ def _check_accept_length(test_case, base_url, threshold=None):
     except (KeyError, IndexError, requests.RequestException):
         return
     print(f"avg_spec_accept_length={val:.4f}")
+    dump_metric("avg_spec_accept_length", val)
     if threshold is not None:
         test_case.assertGreater(val, threshold)
 

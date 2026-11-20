@@ -157,6 +157,17 @@ def run_eval(args):
     print(f"Invalid: {invalid:.3f}")
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
+    from sglang.test.test_utils import dump_metric
+
+    metric_labels = {"eval": "few_shot_gsm8k", "num_shots": args.num_shots}
+    dump_metric("gsm8k_accuracy", acc, labels=metric_labels)
+    dump_metric("gsm8k_invalid", invalid, labels=metric_labels)
+    dump_metric("gsm8k_latency", latency, labels={**metric_labels, "unit": "s"})
+    dump_metric(
+        "gsm8k_output_throughput",
+        output_throughput,
+        labels={**metric_labels, "unit": "token/s"},
+    )
 
     # Dump results
     dump_state_text("tmp_output_gsm8k.txt", states)
