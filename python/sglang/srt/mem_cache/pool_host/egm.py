@@ -42,7 +42,7 @@ def _allocation_properties(device: int):
     prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
     prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
     prop.location.id = numa
-    prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
     granularity = int(
         _check(
             drv.cuMemGetAllocationGranularity(
@@ -56,19 +56,13 @@ def _allocation_properties(device: int):
 
 
 class EgmAllocation:
-    """Own one host-accessible FABRIC allocation and its local VMM mapping.
-
-    The caller must ensure all local and imported accesses have stopped before
-    close. Keeping a mapping alive does not protect individual KV pages from
-    being reused by their allocator.
-    """
+    """Own one host NUMA allocation and its local VMM mapping."""
 
     def __init__(self, nbytes: int, device: int):
         from cuda.bindings import driver as drv
 
         if nbytes <= 0:
             raise ValueError("allocation must be nonempty")
-        self.nbytes = nbytes
         self.address = None
         self.handle = None
         self.mapped = False
@@ -112,19 +106,6 @@ class EgmAllocation:
                 error.add_note(f"EGM allocation cleanup failed: {cleanup_error}")
             raise
 
-    def export(self) -> bytes:
-        from cuda.bindings import driver as drv
-
-        if self.handle is None:
-            raise RuntimeError("allocation is closed")
-        handle = _check(
-            drv.cuMemExportToShareableHandle(
-                self.handle, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
-            ),
-            "cuMemExportToShareableHandle",
-        )
-        return bytes(handle.data)
-
     def close(self):
         from cuda.bindings import driver as drv
 
@@ -140,7 +121,7 @@ class EgmAllocation:
 
 
 class EgmHostTensorAllocator(HostTensorAllocator):
-    """Allocate CPU tensors backed by exportable host NUMA memory."""
+    """Allocate CPU tensors backed by host NUMA memory."""
 
     def __init__(self):
         super().__init__()
@@ -161,21 +142,6 @@ class EgmHostTensorAllocator(HostTensorAllocator):
             ((length + granularity - 1) // granularity) * granularity
             for length in lengths
         ]
-
-    def export_buffer(self, tensor: torch.Tensor) -> tuple[bytes, int, int]:
-        """Return FABRIC handle, allocation size and buffer offset in bytes.
-
-        The host pool must retain the allocation and pin the relevant pages
-        until all readers have finished and unmapped their imports.
-        """
-        if tensor.device.type != "cpu" or not tensor.is_contiguous():
-            raise ValueError("EGM export requires a contiguous host tensor")
-        address = tensor.data_ptr()
-        length = tensor.numel() * tensor.element_size()
-        for base, alloc in self.allocations.items():
-            if base <= address and address + length <= base + alloc.nbytes:
-                return alloc.export(), alloc.size, address - base
-        raise ValueError("tensor does not belong to this EGM allocator")
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
         if device != "cpu":

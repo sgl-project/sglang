@@ -89,11 +89,6 @@ def test_egm_hicache_pool_round_trip(allocator_type, io_backend):
     )
     allocator = host.allocator
     try:
-        if allocator_type == "egm":
-            handle, size, offset = host.allocator.export_buffer(host.kv_buffer)
-            assert len(handle) == 64 and size >= host.kv_buffer.nbytes and offset == 0
-            _, _, offset = host.allocator.export_buffer(host.kv_buffer[1:2])
-            assert offset == host.kv_buffer[0].nbytes
         for layer, (k, v) in enumerate(zip(device.k_buffer, device.v_buffer)):
             k.fill_(layer + 3)
             v.fill_(layer + 7)
