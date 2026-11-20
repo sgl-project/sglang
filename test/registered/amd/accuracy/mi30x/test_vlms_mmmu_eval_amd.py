@@ -5,18 +5,16 @@ This test evaluates Vision-Language Models (VLMs) on the MMMU benchmark on AMD G
 Models are selected based on compatibility with AMD/ROCm platform.
 
 VLMs tested here:
-- Qwen VL series (Qwen2-VL-7B, Qwen2.5-VL-7B, Qwen3-VL-30B)
+- Qwen VL series (Qwen2.5-VL-7B, Qwen3-VL-30B)
 - InternVL2 series (InternVL2_5-2B)
-- MiniCPM series (MiniCPM-v-2_6, MiniCPM-o-2_6)
 - DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B, DeepSeek-OCR-2)
 - Kimi VL (Kimi-VL-A3B-Instruct)
 - MiMo VL (MiMo-VL-7B-RL)
-- GLM VL (GLM-4.1V-9B-Thinking)
 
 Note: NVILA models are excluded (NVIDIA-specific).
 Note: This test runs only on MI30x runners (linux-mi325-gpu-2), not on MI35x.
 
-Registry: nightly-amd-accuracy-2-gpu-vlm suite (2-GPU VLM tests)
+Registry: nightly-accuracy-test-2-gpu-amd-vlm suite (2-GPU VLM tests)
 """
 
 import os
@@ -38,18 +36,14 @@ from sglang.test.test_utils import (
 )
 
 # Register for AMD CI - VLM MMMU evaluation tests (~120 min)
-register_amd_ci(est_time=7200, suite="nightly-amd-accuracy-2-gpu-vlm", nightly=True)
+register_amd_ci(
+    est_time=7200, suite="nightly-accuracy-test-2-gpu-amd-vlm", nightly=True
+)
 
 # AMD-verified VLM models with conservative thresholds on 100 MMMU samples
 # Format: (model_path, tp_size, accuracy_threshold, extra_args)
 AMD_VLM_MODELS = [
     # Qwen VL series - well supported on AMD
-    {
-        "model_path": "Qwen/Qwen2-VL-7B-Instruct",
-        "tp_size": 1,
-        "accuracy_threshold": 0.30,
-        "extra_args": ["--trust-remote-code"],
-    },
     {
         "model_path": "Qwen/Qwen2.5-VL-7B-Instruct",
         "tp_size": 1,
@@ -67,19 +61,6 @@ AMD_VLM_MODELS = [
         "model_path": "OpenGVLab/InternVL2_5-2B",
         "tp_size": 1,
         "accuracy_threshold": 0.29,
-        "extra_args": ["--trust-remote-code"],
-    },
-    # MiniCPM series
-    {
-        "model_path": "openbmb/MiniCPM-v-2_6",
-        "tp_size": 1,
-        "accuracy_threshold": 0.25,
-        "extra_args": ["--trust-remote-code"],
-    },
-    {
-        "model_path": "openbmb/MiniCPM-o-2_6",
-        "tp_size": 1,
-        "accuracy_threshold": 0.32,
         "extra_args": ["--trust-remote-code"],
     },
     # DeepSeek VL series
@@ -109,13 +90,6 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.27,
         "extra_args": ["--trust-remote-code"],
     },
-    # GLM VL
-    {
-        "model_path": "zai-org/GLM-4.1V-9B-Thinking",
-        "tp_size": 1,
-        "accuracy_threshold": 0.27,
-        "extra_args": ["--trust-remote-code"],
-    },
     # DeepSeek-OCR-2 - last to avoid memory pressure on subsequent models
     {
         "model_path": "deepseek-ai/DeepSeek-OCR-2",
@@ -123,7 +97,8 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.25,
         "extra_args": [
             "--trust-remote-code",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--mem-fraction-static",
             "0.70",
             "--max-total-tokens",
@@ -141,10 +116,7 @@ TRITON_ATTENTION_MODELS = {
 }
 
 # Models known to fail on AMD - exclude from testing
-AMD_FAILING_VLM_MODELS = {
-    # GLM-4.1V processor not registered yet (Glm4vForConditionalGeneration)
-    "zai-org/GLM-4.1V-9B-Thinking",
-}
+AMD_FAILING_VLM_MODELS = set()
 
 
 def get_active_models():

@@ -5,6 +5,7 @@ from pathlib import Path
 MMLU_SHA256 = "2182319e74add5855b87c4abf4136310b900f8d2772460054681feadb7f2c52f"
 MODEL_PATH_ENVS = {
     "meta-llama/Llama-3.1-8B-Instruct": "PPU_CI_TARGET_MODEL_PATH",
+    "meta-llama/Llama-3.2-1B-Instruct": "PPU_CI_SMALL_MODEL_PATH",
     "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B": "PPU_CI_EAGLE3_MODEL_PATH",
     "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat": "PPU_CI_DFLASH_MODEL_PATH",
 }

@@ -181,13 +181,6 @@ def _get_k4_varlen_cu_co(cu_seqlens, chunk_offsets):
 _v_ct_cache = {}
 
 
-# Cache the (cu_for_k4, chunk_offsets_for_k4) pair keyed by id(cu_seqlens).
-# Both tensors are computed on-GPU with no host sync — replaces the previous
-# `cu_seqlens.cpu().tolist() + Python loop + torch.tensor` chain that forced
-# a 50-200us GPU->CPU stall on the K4 prep path every varlen call.
-_varlen_k4_input_cache = {}
-
-
 def _get_varlen_k4_inputs(cu_seqlens, BT):
     # Recomputed every call: the outputs depend on cu_seqlens VALUES, which
     # change batch-to-batch even when the tensor pointer is recycled, so no

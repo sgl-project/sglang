@@ -198,9 +198,9 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
         self.weight = nn.Parameter(torch.empty(height, width, dim))
         self.register_buffer(
             "time_weight",
-            torch.from_numpy(get_1d_sincos_pos_embed(dim, num_frames))
-            .float()
-            .unsqueeze(1),
+            torch.tensor(
+                get_1d_sincos_pos_embed(dim, num_frames), dtype=torch.float32
+            ).unsqueeze(1),
             persistent=False,
         )
 
@@ -425,15 +425,13 @@ class MoonViTEncoderLayer(nn.Module):
             implementation_backends = ()
         else:
             implementation_backends = (attention_backend,)
-        self.attention_backend_impls = nn.ModuleDict(
-            {
-                backend: QKV_BACKEND_IMPL[backend](
-                    use_data_parallel=True,
-                    workspace_buffer=attention_workspace,
-                )
-                for backend in implementation_backends
-            }
-        )
+        self.attention_backend_impls: dict[str, nn.Module] = {
+            backend: QKV_BACKEND_IMPL[backend](
+                use_data_parallel=True,
+                workspace_buffer=attention_workspace,
+            )
+            for backend in implementation_backends
+        }
 
     def _attention(
         self,

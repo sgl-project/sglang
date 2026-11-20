@@ -32,6 +32,12 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of running requests.",
     ] = None
+    # Recorded by the cache hook from the raw input: a value resolved for the model
+    # (DeepSeek-V4's default) leaves it False.
+    _max_running_requests_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -56,13 +62,13 @@ class Schedule(msgspec.Struct):
     prefill_decode_interval: A[
         Optional[int],
         Arg(
-            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. Without data-parallel attention, the interval is skipped while no request is decoding. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
             resolvable=True,
         ),
     ] = None
     prefill_decode_interval_min_bs: A[
         int,
-        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to always apply the interval.",
+        "Apply --prefill-decode-interval only while the running batch holds at least this many requests. Below it, prefill is admitted every round so the batch fills quickly. In data-parallel attention mode, each rank compares its own running batch. Set to 0 to apply the interval at any batch size.",
     ] = 0
     enable_dynamic_chunking: A[
         bool,
@@ -97,9 +103,22 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "uniboost",
             ],
         ),
     ] = "fcfs"
+    shortest_prefill_aging_factor: A[
+        float,
+        "With --schedule-policy shortest-prefill-first, each prefill token processed while a request waits lowers its rank by this many tokens, bounding its wait to about its uncached length divided by the factor, in processed tokens. 0 disables aging.",
+    ] = 0.0
+    uniboost_gamma: A[
+        float,
+        "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Must be > 0.",
+    ] = 10.0
+    enable_uniboost_gamma_ada: A[
+        bool,
+        "Adapt --uniboost-gamma online to the observed latency tail (gamma-Ada): a heavy tail lowers gamma, a flat tail raises it.",
+    ] = False
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

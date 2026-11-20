@@ -16,11 +16,11 @@
 from typing import Any, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.log_utils import create_log_targets, log_json
-from sglang.srt.utils.request_logger import (
+from sglang.srt.observability.request_logger import (
     _dataclass_to_string_truncated,
     _transform_data_for_logging,
 )
+from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 # Core generation knobs logged per record. Prompt text is logged separately,
 # gated by the level, so it is excluded here.

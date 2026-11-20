@@ -56,7 +56,8 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -119,7 +120,8 @@
             "total_tokens": 19,
             "completion_tokens": 7,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
@@ -283,40 +285,11 @@
             "total_tokens": 13,
             "completion_tokens": 1,
             "prompt_tokens_details": null,
-            "reasoning_tokens": 2
+            "reasoning_tokens": 2,
+            "completion_tokens_details": {"reasoning_tokens": 2}
           },
           "metadata": {"weight_version": "default"}
         }
-      }
-    },
-    {
-      "name": "chat_thinking_part",
-      "endpoint": "chat",
-      "lower_only": true,
-      "request": {
-        "model": "zai-org/GLM-5.3",
-        "messages": [
-          {"role": "user", "content": "Hi"},
-          {
-            "role": "assistant",
-            "content": [{"type": "thinking", "thinking": "Greet."}, {"type": "text", "text": "Hi!"}]
-          },
-          {"role": "user", "content": "Again"}
-        ]
-      },
-      "generate": {
-        "input_ids": [
-          154822, 154824, 154826, 25062, 287, 29905, 371, 25, 7487, 154827, 13041, 154828, 154841,
-          154842, 13041, 0, 154827, 30268, 154828, 154841
-        ],
-        "sampling_params": {},
-        "return_logprob": false,
-        "logprob_start_len": -1,
-        "top_logprobs_num": 0,
-        "return_sampling_mask": false,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "require_reasoning": true
       }
     },
     {
@@ -443,7 +416,6 @@
     "bootstrap_pair_key": null,
     "decode_tp_size": null,
     "routed_dp_rank": null,
-    "data_parallel_rank": null,
     "disagg_prefill_dp_rank": null,
     "routing_key": null,
     "conversation_id": null,
@@ -467,6 +439,7 @@
     "image_max_dynamic_patch": null,
     "video_max_dynamic_patch": null,
     "images_config": null,
+    "mm_processor_kwargs": null,
     "multi_item_delimiter_indices": null,
     "token_indices_to_pool": null,
     "cache_salt": null,

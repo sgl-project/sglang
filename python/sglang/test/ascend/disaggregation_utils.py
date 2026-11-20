@@ -8,11 +8,11 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.server_fixtures.disaggregation_fixture import popen_launch_sgl_router
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_with_error_check,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,24 +49,12 @@ class TestDisaggregationBase(CustomTestCase):
 
     @classmethod
     def launch_lb(cls):
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-        print("Starting load balancer:", " ".join(lb_command))
-        cls.process_lb = popen_with_error_check(lb_command)
-        cls.wait_server_ready(cls.lb_url + "/health")
+        cls.process_lb = popen_launch_sgl_router(
+            cls.model,
+            [cls.prefill_url, cls.decode_url],
+            host=cls.base_host,
+            port=cls.lb_port,
+        )
 
     @classmethod
     def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):

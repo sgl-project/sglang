@@ -28,6 +28,19 @@ class NPUSwiglu(BaseActivation):
         return torch.ops.npu.npu_swiglu(hidden_states), None
 
 
+class NPUSwigluWithLimit(BaseActivation):
+    """Clip gate/up before SiLU, keeping the floating output dtype."""
+
+    def __init__(self, limit: float):
+        self.limit = float(limit)
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        gate, up = hidden_states.float().chunk(2, dim=-1)
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return (F.silu(gate) * up).to(hidden_states.dtype), None
+
+
 class NPUSwigluQuant(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
@@ -80,13 +93,11 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         self.limit = limit
         self._use_oai = alpha is not None and limit is not None
         if self._use_oai:
-            from sgl_kernel_npu.activation.swiglu_oai_quant import (
-                swiglu_oai_quant,
-            )
+            from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
             self._kernel = swiglu_oai_quant
         else:
-            from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+            from sgl_kernel_npu.operators.activation import swiglu_quant
 
             self._kernel = swiglu_quant
 
@@ -124,7 +135,7 @@ class NPUSitu(BaseActivation):
         beta: float = 4.0,
         linear_beta: Optional[float] = 25.0,
     ):
-        from sgl_kernel_npu.activation.situ import situ
+        from sgl_kernel_npu.operators.activation import situ
 
         self.situ = situ
         self.need_quant = need_quant
@@ -148,10 +159,10 @@ class NPUSitu(BaseActivation):
 
 
 class NPUSituMXFP8Quant(BaseActivation):
-    """A5 AscendC grouped SiTU with valid-row MXFP8 quantization."""
+    """Ascend 950 AscendC grouped SiTU with valid-row MXFP8 quantization."""
 
     def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
-        from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant
+        from sgl_kernel_npu.operators.activation import situ_mxfp8_quant
 
         self.situ_mxfp8_quant = situ_mxfp8_quant
         self.beta = float(beta)
@@ -184,9 +195,9 @@ class NPUGeluAndMul(BaseActivation):
 
 class NPUSwigluOAI(BaseActivation):
     def __init__(self, moe_runner_config=None):
-        from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai_triton
+        from sgl_kernel_npu.operators.activation import swiglu_oai
 
-        self._kernel = swiglu_oai_triton
+        self._kernel = swiglu_oai
         self._moe_runner_config = moe_runner_config
 
     def _apply_activation(self, hidden_states: torch.Tensor):
@@ -246,7 +257,9 @@ class NPUSwigluMxfp8Quant(BaseActivation):
                 "swiglu_group_quant takes a per-expert count group list, got "
                 f"group_list_type={group_list_type}"
             )
-        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+        from sgl_kernel_npu.operators.activation import swiglu_group_quant
+
+        out, scale, _ = swiglu_group_quant(
             x=hidden_states,
             group_index=group_list,
             quant_mode=2,  # MX: one e8m0 scale per 32-element block

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
@@ -133,18 +134,6 @@ def swiglu_limit_func(
         up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
 
     output.copy_(F.silu(gate) * up)
-
-
-def swiglu_gpt_oss_sigmoid_alpha_contiguous(
-    output: torch.Tensor,
-    input: torch.Tensor,  # first half is gate, second half is up
-    gemm1_alpha: float,
-    gemm1_limit: float,
-) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d].clamp(max=gemm1_limit)
-    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
-    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -357,11 +346,12 @@ def fused_marlin_moe(
     if activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:
             raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
+        swiglu_oai_split(
             intermediate_cache1.view(-1, gemm1_n),
             gemm1_alpha,
+            1.0,
             clamp_limit,
+            out=intermediate_cache2,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(

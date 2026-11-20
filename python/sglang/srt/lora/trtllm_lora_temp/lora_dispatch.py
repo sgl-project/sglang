@@ -24,7 +24,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig

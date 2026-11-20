@@ -31,6 +31,34 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Direct linker prefetch
+
+Set common load options alongside Mooncake connection settings:
+
+```bash
+--enable-unified-cache-external-linker \
+--unified-cache-external-linker-config '{"load_mode":"prefetch","prefetch_policy":"timeout","master_server_address":"HOST:50051"}'
+```
+
+`load_mode` defaults to `layer_wise`. Prefetch starts at `_prefetch_kvcache()` on
+enqueue and reuses the load thread for concurrent requests. It supports
+Full/SWA/Mamba within existing linker layout limits and requires PP=1.
+All attention TP ranks read into private GPU slots; only complete KV confirmed
+successful by every rank joins the radix tree. Failed reads fall back to recomputation.
+
+Set `prefetch_policy` in the same JSON:
+
+- `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.
+- `wait_complete`: wait until every rank finishes.
+- `timeout` (default): wait from the first blocked admission poll for
+  `prefetch_timeout_base` + tokens / 1024 * `prefetch_timeout_per_ki_token` seconds.
+  These JSON options default to 1 and 0.25 respectively.
+
+Stopping the wait cancels queued reads. Running reads retain their private slots
+until every rank stops writing, then discard them without publishing. Pending
+slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
+The deprecated HiCache extra config is used only when linker JSON is omitted.
+
 ### Decode context parallelism (DCP)
 
 Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
@@ -40,8 +68,38 @@ with DCP.
 
 DCP keys separate TP/DCP/PP/CP sizes and logical page sizes. With TP=4/DCP=2,
 ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
-Use matching model settings. KV format and host layout are not yet in the keys;
-use different `extra_backend_tag` values when these differ.
+Use matching model settings. HiCache includes the server's resolved logical KV
+dtype and any `storage_format_tag` in the model prefix, for both DCP and non-DCP
+keys. FP8 E4M3 and E5M2 use different keys even when both are backed by `uint8`.
+This works with the default Mooncake master
+and leaves configured tenants unchanged. Existing keys become cold and are
+repopulated; there is no fallback to untyped objects. Other format differences
+still require different `extra_backend_tag` values.
+
+### GPU staging capacity
+
+For Linker deployments using a transport that stages GPU data through host memory
+(such as TCP), set `local_buffer_size` in the SGLang Mooncake JSON configuration or
+storage extra configuration. The value is a non-negative byte count and defaults
+to 16 MiB. Size it for concurrent reads and writes, including large recurrent
+state objects. This is per-client transient memory, separate from the shared
+`global_segment_size`; include both in the host memory budget.
+
+To keep the storage engine independent of a PD NVLink engine, set
+`SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`.
+
+### Unified L3 keys (cross-TP/PP reuse)
+
+With `--hicache-storage-key-scheme unified`, Mooncake stores each page as one
+object per chunk: a layer range by kv-head group, holding both K and V, keyed
+by its grid coordinates instead of by the writer's rank. Instances of one model
+share the cache across attention-TP and PP splits when they set the same
+`--hicache-storage-head-partition` and `--hicache-storage-layer-partition`, so
+that every local shard tiles the shared chunk grid. The scheme pins
+`--hicache-mem-layout page_unified` and `--hicache-io-backend kernel`, and a
+page is a hit only when all of its chunks are present. It supports a single
+MHA or MLA KV pool; composite caches, speculative decoding, and DCP are not
+supported.
 
 ## Install Mooncake
 
@@ -94,10 +152,12 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service` (Optional):**
 
 ```bash
-python -m mooncake.http_metadata_server
+python -m mooncake.http_metadata_server --host 127.0.0.1
 ```
 
 This service is responsible for centralized metadata management including internal connection status and related metadata.
+
+Since Mooncake 0.3.14, the metadata server refuses to bind a non-loopback address (such as the default `0.0.0.0`) without an authentication token. Bind `127.0.0.1` for a single-server setup. For a multi-server setup, set the same `MC_METADATA_HTTP_TOKEN` on the metadata server and on every SGLang server and store service.
 
 Deployment of the `metadata service` can be skipped in the following cases:
 * Mooncake supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
@@ -208,7 +268,7 @@ Mooncake loads configuration in the following priority order:
 2. If not, Mooncake checks whether the environment variable `DEFAULT_MOONCAKE_CONFIG_PATH_ENV` is set, and loads the JSON config file from that path.
 3. If neither of the above is provided, Mooncake falls back to environment variables.
 
-For multi-node deployments that attach Mooncake at runtime via `PUT /hicache/storage-backend`, omit `local_hostname` from the attach payload and set `MOONCAKE_LOCAL_HOSTNAME` (or `LOCAL_HOSTNAME`) per node before launching SGLang. Each rank resolves `local_hostname` from its own process environment instead of a shared default.
+For multi-node deployments that attach Mooncake at runtime via `PUT /hicache/storage-backend` (an admin endpoint: launch SGLang with `SGLANG_ADMIN_API_KEY=<key>` set or with `--admin-api-key <key>`, and send `Authorization: Bearer <key>`), omit `local_hostname` from the attach payload and set `MOONCAKE_LOCAL_HOSTNAME` (or `LOCAL_HOSTNAME`) per node before launching SGLang. Each rank resolves `local_hostname` from its own process environment instead of a shared default.
 
 When loading from a JSON config file, `local_hostname` follows the same per-process precedence: `MOONCAKE_LOCAL_HOSTNAME`, then `LOCAL_HOSTNAME`, then the value in the JSON file, then `"localhost"`.
 
@@ -337,7 +397,8 @@ For a comprehensive overview of HiCache-related parameters, please refer to [thi
 
 
 Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`,
-the regular Mooncake backend path still uses `page_first` or `page_first_direct`.
+the regular Mooncake backend path still uses `page_first` or `page_first_direct`;
+the unified key scheme uses `page_unified` instead.
 When HiSparse provides an MLA host KV pool or DeepSeek V4 C4 side pool with
 layer-first page metadata, Mooncake Store uses Mooncake's multi-buffer zero-copy
 APIs (`batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`) to store
@@ -475,10 +536,10 @@ python -m sglang.launch_server \
 **Router**:
 
 ```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill "http://127.0.0.1:30000" \
-    --decode "http://127.0.0.1:30001" \
+sgl-router \
+    --model-id [model_path] \
+    --no-tokenizer \
+    --worker-urls "http://127.0.0.1:30000" "http://127.0.0.1:30001" \
     --host 0.0.0.0 \
     --port 8000
 ```
