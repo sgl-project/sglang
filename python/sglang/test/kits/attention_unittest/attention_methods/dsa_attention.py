@@ -932,7 +932,12 @@ def build_dsa_sparse_attention_fixture(
     )
 
 
-def run_dsa_fixture_eager(fixture: DSAAttentionFixture, testcase) -> torch.Tensor:
+def run_dsa_fixture_eager(
+    fixture: DSAAttentionFixture,
+    testcase,
+    *,
+    require_mha: bool = False,
+) -> torch.Tensor:
     case = fixture.case
     input_parts = _split_by_lens(fixture.input_hidden, case.input_lens)
     kv_hidden = torch.cat(
@@ -947,6 +952,8 @@ def run_dsa_fixture_eager(fixture: DSAAttentionFixture, testcase) -> torch.Tenso
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         if not fixture.backend.use_mha:
+            if require_mha:
+                testcase.fail("DSA MHA_ONE_SHOT dense fallback was not selected.")
             testcase.skipTest("DSA MHA_ONE_SHOT dense fallback is not selected here.")
         attn_output = fixture.actual_module.attn(
             q,
@@ -1045,6 +1052,7 @@ def run_dsa_attention_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = DEFAULT_DEVICE,
     loc_layout: str = "shuffled_pages",
+    require_mha: bool = False,
 ) -> None:
     fixture = build_dsa_attention_fixture(
         testcase,
@@ -1056,7 +1064,11 @@ def run_dsa_attention_case(
         device=device,
         loc_layout=loc_layout,
     )
-    actual = run_dsa_fixture_eager(fixture, testcase)
+    actual = run_dsa_fixture_eager(
+        fixture,
+        testcase,
+        require_mha=require_mha,
+    )
     expected = expected_dsa_fixture_output(fixture)
     torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)
 
