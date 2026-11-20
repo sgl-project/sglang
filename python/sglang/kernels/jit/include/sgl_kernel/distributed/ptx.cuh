@@ -82,6 +82,23 @@ SGL_DEVICE void ld_relaxed_16B(V& x, const void* addr, int64_t vec_offset) {
   x = *reinterpret_cast<const V*>(&val);
 }
 
+/// `ld_relaxed_16B` at 32 B: one 256-bit load (`.v8` needs Blackwell).
+template <typename V>
+SGL_DEVICE void ld_relaxed_32B(V& x, const void* addr, int64_t vec_offset) {
+  static_assert(alignof(V) == 32 && sizeof(V) == 32);
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  addr = static_cast<const uint8_t*>(addr) + vec_offset * sizeof(V);
+  uint32_t val[8];
+  asm volatile(
+      "ld.relaxed.sys.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+      : "=r"(val[0]), "=r"(val[1]), "=r"(val[2]), "=r"(val[3]), "=r"(val[4]), "=r"(val[5]), "=r"(val[6]), "=r"(val[7])
+      : "l"(addr));
+  x = *reinterpret_cast<const V*>(val);
+#else
+  assert(false && "32 B loads are only supported on Blackwell or later architecture");
+#endif
+}
+
 template <typename V>
 SGL_DEVICE void st_relaxed_16B(const V& x, void* addr, int64_t vec_offset) {
   static_assert(alignof(V) == 16 && sizeof(V) == 16);
@@ -324,6 +341,15 @@ SGL_DEVICE void ld_relaxed_16B(V& x, const void* addr, int64_t vec_offset) {
   val = *reinterpret_cast<const volatile details::u32x4_t*>(ptr);
 #endif
   x = *reinterpret_cast<const V*>(&val);
+}
+
+/// Two `ld_relaxed_16B` (no 256-bit load here).
+template <typename V>
+SGL_DEVICE void ld_relaxed_32B(V& x, const void* addr, int64_t vec_offset) {
+  static_assert(alignof(V) == 32 && sizeof(V) == 32);
+  const auto half = reinterpret_cast<details::u32x4_t*>(&x);
+  ld_relaxed_16B(half[0], addr, 2 * vec_offset);
+  ld_relaxed_16B(half[1], addr, 2 * vec_offset + 1);
 }
 
 template <typename V>

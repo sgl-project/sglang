@@ -22,6 +22,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
     bind_dflash_runtime,
 )
@@ -80,6 +81,7 @@ from sglang.srt.speculative.dflash_draft_ring import (
     draft_kv_ring_is_paged,
     draft_kv_ring_rows_per_req_from_config,
 )
+from sglang.srt.speculative.dflash_fused_select import FusedSelect, build_fused_select
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -372,9 +374,11 @@ class _SelectorDraftSampler:
         device,
         sampling_enabled: bool,
         acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
+        fused_select: Optional[FusedSelect],
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
+        self.fused_select = fused_select
         self.block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
@@ -422,6 +426,21 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        if self.fused_select is not None:
+            gamma = self.block_size - 1
+            self.fused_select(
+                pred_hidden=hs,
+                anchor_ids=block_ids[:, 0],
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                uniforms=self.uniforms[:bs].uniform_(),
+                out=(
+                    self.out[: bs * gamma].view(bs, gamma),
+                    self.candidate_out[:bs],
+                    self.q_out[:bs],
+                ),
+            )
+            return
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -811,6 +830,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
         self._init_verify_planner()
+        self._fused_select = self._maybe_build_fused_select()
 
     def _init_verify_planner(self) -> None:
         """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
@@ -905,6 +925,47 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
+
+    def _maybe_build_fused_select(self) -> Optional[FusedSelect]:
+        """The fused selection (SM100), or None when it is off. Runs here: both models are loaded, and neither the
+        KV cache sizing nor any graph capture has happened yet (it merges the head's weights)."""
+        if self.selector is None or envs.SGLANG_DISABLE_DFLASH2_FUSED_SELECT.get():
+            return None
+        if megakernel_enabled():
+            # The megakernel was built on the target before this runs and may hold the head's
+            # weights, which the merge would move; it also brings its own draft selector head.
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "DFlash2 fused selection disabled: the NVIDIA megakernel serves DFLASH."
+                )
+            return None
+        if self._acceptance_estimator is not None:
+            # The confidence-scheduled verify scores each draft from the selector's lattice
+            # scores, which the fused kernels never write out.
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "DFlash2 fused selection disabled: SGLANG_RAGGED_VERIFY_MODE needs the selector scores."
+                )
+            return None
+        target_model = self._target_worker.model_runner.model
+        draft_config = self.draft_model.draft_config
+        fused_select, blocker = build_fused_select(
+            target_model=target_model,
+            lm_head=unwrap_lora_layer(target_model.lm_head),
+            selector=self.selector,
+            gamma=self.block_size - 1,
+            # Larger eager batches take the unfused path; the batch size is the same on every rank.
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs, default=0),
+            output_multiplier=draft_config.output_multiplier,
+            final_logit_softcapping=draft_config.final_logit_softcapping,
+            memory_saver_adapter=self._target_worker.model_runner.memory_saver_adapter,
+        )
+        if self._target_tp_rank == 0:
+            if blocker is None:
+                logger.info("DFlash2 fused selection enabled.")
+            else:
+                logger.warning("DFlash2 fused selection disabled: %s.", blocker)
+        return fused_select
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
@@ -1296,6 +1357,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
                 acceptance_estimator=self._acceptance_estimator,
+                fused_select=self._fused_select,
             )
         if self.lilicorr is not None:
             if not head_supported:
@@ -1906,9 +1968,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
         num_pred = pred_hidden.shape[1]
 
-        candidate_ids, scores = _selector_lattice(
-            draft_model, pred_hidden, anchor_token_ids
-        )
         device = pred_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
@@ -1921,13 +1980,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not self._selector_sampling_enabled
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
-        tokens, q_rows = self.selector.sample_path(
-            candidate_ids=candidate_ids,
-            scores=scores,
-            uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=device),
-            temperatures=temperatures,
-            greedy_mask=greedy_mask,
-        )
+        uniforms = torch.rand(bs, num_pred, dtype=torch.float32, device=device)
+        # bs is the same on every rank, so all ranks take the same branch (the fused kernels sync them).
+        if self._fused_select is not None and self._fused_select.fits(bs * num_pred):
+            tokens, candidate_ids, q_rows = self._fused_select(
+                pred_hidden=pred_hidden,
+                anchor_ids=anchor_token_ids,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                uniforms=uniforms,
+            )
+        else:
+            candidate_ids, scores = _selector_lattice(
+                draft_model, pred_hidden, anchor_token_ids
+            )
+            tokens, q_rows = self.selector.sample_path(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                uniforms=uniforms,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+            )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
         if self._acceptance_estimator is not None:

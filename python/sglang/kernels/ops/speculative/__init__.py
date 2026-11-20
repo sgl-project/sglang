@@ -99,4 +99,17 @@ register_kernel(
     )
 )
 
+# SM100 only: multicast push-plane publish (K1), clusters and st.async (K2).
+for _fn in ("dflash_local_topk", "dflash_select_walk"):
+    register_kernel(
+        KernelSpec(
+            op=f"speculative.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.speculative.dflash_select:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}
+            ),
+        )
+    )
+
 __all__ = []
