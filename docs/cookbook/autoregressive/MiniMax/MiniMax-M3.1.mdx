@@ -387,7 +387,7 @@ A man in a yellow shirt stands on the rear bumper of a yellow taxi, pressing clo
 
 **Supported topology**
 
-- **Same attention parallelism on both roles.** Prefill and decode must use the same `--tp` and `--attn-dp-size`. The sparse-index transfer cannot reshard across different attention TP sizes.
+- **Attention parallelism.** Prefill and decode may use different attention TP sizes, for example TP2 prefill servers behind a decode server with attention TP 1 (`--tp 8 --attn-dp-size 8`). Each prefill rank writes its KV heads into the decode page rows, and one prefill rank per decode rank sends the sparse index.
 - **Single pipeline stage.** PP must be 1, which DSpark also requires.
 - **Speculative decoding.** Run DSpark on both roles. DFlash2 is only supported in colocated serving.
 - **Transfer backend.** Mooncake over RDMA.

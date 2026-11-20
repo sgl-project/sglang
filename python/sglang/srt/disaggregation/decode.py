@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     pre_alloc_fill_len,
     prepare_abort,
     record_network_transfer,
+    setup_page_row_kv_args,
     setup_state_kv_args,
     state_indices_per_entry,
 )
@@ -906,6 +907,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+        setup_page_row_kv_args(
+            kv_args,
+            token_to_kv_pool=self.token_to_kv_pool,
+            transfer_backend=self.transfer_backend,
+        )
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
