@@ -22,7 +22,7 @@ if [ "$UNINSTALL_JIT_CACHE" = false ]; then
 fi
 
 if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
-    FLASHINFER_CACHE_DIR="${HOME}/.cache/flashinfer-wheels"
+    FLASHINFER_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/flashinfer-wheels"
     mkdir -p "${FLASHINFER_CACHE_DIR}"
 
     # The per-arch wheel names are unclaimed on PyPI, so resolve the whole set
