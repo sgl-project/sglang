@@ -20,7 +20,7 @@ elif is_hip():
     )
 elif is_npu():
     try:
-        from sgl_kernel_npu.sample import top_k_renorm_prob, top_p_renorm_prob
+        from sgl_kernel_npu.operators.sample import top_k_renorm_prob, top_p_renorm_prob
     except ImportError:
         top_k_renorm_prob = None
         top_p_renorm_prob = None

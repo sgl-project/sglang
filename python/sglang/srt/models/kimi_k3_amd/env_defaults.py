@@ -19,9 +19,6 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
     radix4_topk = envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK
     if not radix4_topk.is_set() and radix4_topk.deprecated_name not in os.environ:
         radix4_topk.set(True)
-    # every rank loads the TreeCore the gfx950 image bundles instead of building its own,
-    # so no two ranks run different implementations and diverge on HiCache reclaim
-    os.environ.setdefault("SGLANG_RUST_BUILD_MODE", "never")
     if "AITER_CONFIG_GEMM_BF16" not in os.environ:
         from sglang.srt.utils.aiter_tuned_tables import GEMM_BF16, install_intree_table
 
