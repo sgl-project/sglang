@@ -504,6 +504,8 @@ class WeightCacheDaemon:
             _TRANSFORMERS_MOE_LAYERS.clear()
             gc.collect()
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        for name, entry in self.state_entries.items():
+            entry["persistent"] = name in state_dict_names
 
         if self.transport_name == VMM_FD_BACKEND:
             # vmm_fd entries carry no handle blob: a client maps the packed
