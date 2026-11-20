@@ -10,11 +10,9 @@ import torch
 from msgspec.structs import replace
 
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
-from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding, kimi_k31_dflash_binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
-from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -332,26 +330,6 @@ class TestDFlashBinding(CustomTestCase):
             self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
         ):
             self.assertIsNone(self._bind(names, _selector_sampling_enabled=False))
-
-    def test_the_bench_drafter_temperature_runs_stock(self):
-        """SGLANG_BENCH_DRAFTER_TEMPERATURE samples the drafts in SGLang's round, which
-        the runtime would replace: declined on every rank, named once by TP rank 0."""
-        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
-        self.addCleanup(bench_drafter_temperature.cache_clear)
-        with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override("1000"):
-            bench_drafter_temperature.cache_clear()
-            with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
-                self.assertIsNone(self._bind(names))
-            with (
-                get_parallel().override(tp_rank=1),
-                self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
-            ):
-                self.assertIsNone(self._bind(names))
-        (warning,) = logs.output
-        self.assertIn("does not apply SGLANG_BENCH_DRAFTER_TEMPERATURE", warning)
-        self.assertIn("DFlash phases run stock", warning)
-        bench_drafter_temperature.cache_clear()
-        self.assertIsInstance(self._bind(names), FakeDFlashRuntime)
 
     def test_names_sglang_lacks_and_disagreeing_ranks_raise(self):
         names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")

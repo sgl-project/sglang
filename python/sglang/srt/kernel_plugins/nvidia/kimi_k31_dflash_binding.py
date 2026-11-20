@@ -44,8 +44,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
-from sglang.srt.speculative.bench_drafter import bench_drafter_enabled, opt_out_hint
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     resolve_enabled_components,
 )
@@ -223,8 +221,8 @@ def bind_dflash_runtime(
     worker: DFlashWorkerV2, target_model: torch.nn.Module
 ) -> Optional[DFlashRuntime]:
     """The runtime the target's build names, bound to ``worker``, or None for SGLang's
-    round (flag off, no build, a build naming none, SGLANG_BENCH_DRAFTER_TEMPERATURE on,
-    or a guard value that differs). Collective."""
+    round (flag off, no build, a build naming none, or a guard value that differs).
+    Collective."""
     if not megakernel_enabled():
         return None
     built = built_megakernel(target_model)
@@ -238,17 +236,6 @@ def bind_dflash_runtime(
             FLAG,
         )
     if not path:
-        return None
-    if bench_drafter_enabled():
-        # The draft temperature applies in SGLang's round, which the runtime replaces.
-        if tp0:
-            logger.warning(
-                "%s: %s does not apply %s; DFlash phases run stock%s",
-                FLAG,
-                path,
-                BENCH_DRAFTER_ENV,
-                opt_out_hint(),
-            )
         return None
 
     runtime_cls = pkgutil.resolve_name(path)

@@ -939,6 +939,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 name,
                 SIMULATE_ACC_TOKEN_MODE,
             )
+        if self._runtime is not None:
+            # TODO(next PR): the megakernel's DFlash runtime should sample its drafts
+            # at the benchmark temperature too; until then they stay greedy.
+            logger.warning(
+                "%s is not applied by the megakernel's DFlash runtime (%s) yet: the "
+                "drafts it samples stay greedy.",
+                name,
+                type(self._runtime).__name__,
+            )
+            return
         logger.warning(
             "BENCHMARK: DFLASH drafts sample at temperature %s; acceptance is "
             "simulated (SGLANG_SIMULATE_ACC_LEN=%s, real-draft-token mode).",

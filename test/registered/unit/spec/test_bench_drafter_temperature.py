@@ -548,6 +548,7 @@ def _dflash_worker(**overrides):
         _selector_sampling_enabled=True,
         lilicorr=None,
         _lilicorr_sampling_enabled=False,
+        _runtime=None,
         _target_tp_rank=1,
     )
     fields.update(overrides)
@@ -575,6 +576,15 @@ class TestDflashWorkerGuard(_Case):
                 dfw.DFlashWorkerV2._check_bench_drafter_temperature(
                     _dflash_worker(_is_domino=True)
                 )
+
+    def test_a_megakernel_runtime_keeps_running_and_is_named(self):
+        # Its drafts are its own until the runtime applies the temperature.
+        runtime = type("FakeDFlashRuntime", (), {})()
+        with self.assertLogs(dfw.logger, "WARNING") as logs:
+            self._check(_dflash_worker(_runtime=runtime, _target_tp_rank=0))
+        self.assertIn("not applied by the megakernel's DFlash runtime", logs.output[-1])
+        self.assertIn("FakeDFlashRuntime", logs.output[-1])
+        self.assertFalse(any("BENCHMARK:" in line for line in logs.output))
 
     def test_rejects_drafts_it_cannot_sample(self):
         cases = {
