@@ -56,10 +56,12 @@ class _ThreadGroup:
         return out
 
 
-def _rank_queries(*, rank: int, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _rank_queries(
+    *, rank: int, num_tokens: int, nope: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     gen = torch.Generator().manual_seed(rank)
     # The absorb BMM writes [H, B, nope]; the rope half is a slice of q_b_proj.
-    q_nope_out = torch.randn(_HEADS, num_tokens, _NOPE, generator=gen) * 64
+    q_nope_out = torch.randn(_HEADS, num_tokens, nope, generator=gen) * 64
     q = torch.randn(num_tokens, _HEADS, 128 + _ROPE, generator=gen) * 64
     # Past the e4m3 range and below its subnormals.
     q_nope_out[0, 0, :4] = torch.tensor([1e4, -1e4, 1e-9, -1e-9])
@@ -69,12 +71,12 @@ def _rank_queries(*, rank: int, num_tokens: int) -> tuple[torch.Tensor, torch.Te
     )
 
 
-def _run_ranks(fn, *, num_tokens: int):
+def _run_ranks(fn, *, num_tokens: int, nope: int):
     group = _ThreadGroup(_WORLD)
 
     def run(rank: int):
         group.bind(rank)
-        q_nope_out, q_pe = _rank_queries(rank=rank, num_tokens=num_tokens)
+        q_nope_out, q_pe = _rank_queries(rank=rank, num_tokens=num_tokens, nope=nope)
         return fn(q_nope_out=q_nope_out, q_pe=q_pe)
 
     with get_parallel().override(dcp_group=group):
@@ -87,8 +89,9 @@ class TestDcpFp8QueryGather(CustomTestCase):
         # The cprr verify kernel casts its query at unit scale;
         # the gather copies bytes, so casting first must give the same bytes per rank.
         for fp8_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            for num_tokens in (5, 260):
-                with self.subTest(dtype=fp8_dtype, num_tokens=num_tokens):
+            # 577 is an odd row width: the wire falls back from paired bf16 to uint8.
+            for num_tokens, nope in ((5, _NOPE), (260, _NOPE), (5, _NOPE + 1)):
+                with self.subTest(dtype=fp8_dtype, num_tokens=num_tokens, nope=nope):
 
                     def bf16_then_cast(*, q_nope_out, q_pe):
                         q_nope_out, q_pe = comm.all_gather_q_for_mla_decode(
@@ -103,12 +106,12 @@ class TestDcpFp8QueryGather(CustomTestCase):
                             q_nope_out=q_nope_out, q_pe=q_pe, fp8_dtype=fp8_dtype
                         )
 
-                    want = _run_ranks(bf16_then_cast, num_tokens=num_tokens)
-                    got = _run_ranks(fp8_gather, num_tokens=num_tokens)
+                    want = _run_ranks(bf16_then_cast, num_tokens=num_tokens, nope=nope)
+                    got = _run_ranks(fp8_gather, num_tokens=num_tokens, nope=nope)
                     for rank in range(_WORLD):
                         self.assertEqual(
                             got[rank].shape,
-                            (num_tokens, _HEADS * _WORLD, _NOPE + _ROPE),
+                            (num_tokens, _HEADS * _WORLD, nope + _ROPE),
                         )
                         self.assertTrue(got[rank].is_contiguous())
                         self.assertTrue(
