@@ -10,18 +10,37 @@
 //! other process's samples: this listener's `/metrics`, another DP rank's
 //! listener (which sums every rank's requests, as Python's single
 //! `TokenizerManager` counts them), and Python's own collector.
+//!
+//! A few families have no Python counterpart: golden signals for parts only
+//! this frontend has (its stage queues and media fetch slots). They carry the
+//! same labels, plus one of their own where noted:
+//!
+//! * `sglang:frontend_queue_depth` (gauge, `stage`): requests waiting in each
+//!   stage queue, read at each flush: `intake` (the request loop's inbox),
+//!   `tokenizer` and `mm` (the worker pools'), `scheduler` (the scheduler's
+//!   request ring);
+//! * `sglang:frontend_queue_full_total` (counter, `stage`): generations failed
+//!   as overloaded (503, or a 503 error item in a stream or batch) because a
+//!   stage queue was full: `tokenizer`, `mm` or `scheduler` (intake waits for
+//!   room instead);
+//! * `sglang:frontend_media_fetch_slot_wait_seconds` (histogram): how long a
+//!   media fetch waited for one of the process's fetch slots.
+//!
+//! The gauge is written as a prometheus_client `livesum` gauge, summed over
+//! processes like the counters.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::message::config::{DisaggregationMode, MetricsConfig};
 use crate::message::finish_reason::FinishReason;
 use crate::message::request::GenerateRequest;
 use crate::message::response::{CachedTokensSplit, ChunkEvent, RequestStats, ResponseItem};
+use crate::utils::error::{Error, QueueStage};
 use crate::utils::prometheus::{self, Entry};
 
 /// How often the frontend's files are rewritten for other readers of the
@@ -51,6 +70,9 @@ const TOKEN_COUNT_BUCKETS: &[f64] = &[
     800000.0, 1000000.0, 1100000.0,
 ];
 const GET_LOADS_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+const FETCH_SLOT_WAIT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
 /// The `cache_source` label of `sglang:cached_tokens_total`, by cache tier.
 const CACHE_SOURCES: [&str; 3] = ["device", "host", "storage"];
 
@@ -452,12 +474,18 @@ pub(crate) struct FrontendMetrics {
     time_per_output_token: HistogramFamily,
     e2e_request_latency: HistogramFamily,
     get_loads_duration: HistogramFamily,
+    queue_full: CounterFamily,
+    fetch_slot_wait: HistogramFamily,
+    /// The stage queues `sglang:frontend_queue_depth` reads at each flush,
+    /// once the runtime installs them (see [`Self::watch_queues`]).
+    queues: OnceLock<Vec<(&'static str, QueueLen)>>,
     by_label_set: RwLock<HashMap<LabelSetKey, Arc<RequestSeries>>>,
     dir: PathBuf,
     /// This process's files, named apart from the ones prometheus_client
     /// writes for the scheduler running in the same process.
     counter_file: String,
     histogram_file: String,
+    gauge_file: String,
     /// The bytes last written per file; an unchanged file is not rewritten.
     written: Mutex<BTreeMap<String, Vec<u8>>>,
     /// When [`Self::flush_or_warn`] last logged a failure.
@@ -473,7 +501,7 @@ impl FrontendMetrics {
             configured.clone().unwrap_or_else(|| default.to_vec())
         };
         let pid = std::process::id();
-        Ok(Self {
+        let metrics = Self {
             labels: config
                 .labels
                 .iter()
@@ -555,13 +583,32 @@ impl FrontendMetrics {
                 "Time spent serving /v1/loads requests (seconds).",
                 GET_LOADS_BUCKETS,
             )?,
+            queue_full: CounterFamily::new(
+                "sglang:frontend_queue_full_total",
+                "Generations the frontend failed as overloaded because a stage queue was full.",
+            ),
+            fetch_slot_wait: HistogramFamily::new(
+                "sglang:frontend_media_fetch_slot_wait_seconds",
+                "Time a media fetch waited for a frontend fetch slot in seconds.",
+                FETCH_SLOT_WAIT_BUCKETS,
+            )?,
+            queues: OnceLock::new(),
             by_label_set: RwLock::new(HashMap::new()),
             dir: PathBuf::from(&config.multiproc_dir),
             counter_file: format!("counter_rust-{pid}.db"),
             histogram_file: format!("histogram_rust-{pid}.db"),
+            gauge_file: format!("gauge_livesum_rust-{pid}.db"),
             written: Mutex::new(BTreeMap::new()),
             last_flush_warning: Mutex::new(None),
-        })
+        };
+        // Rates over these start from a zero series, not a missing one.
+        for stage in QueueStage::ALL {
+            metrics.queue_full(stage);
+        }
+        FETCH_SLOT_WAITS.lock().unwrap().push(Arc::downgrade(
+            &metrics.fetch_slot_wait.series(&metrics.labels),
+        ));
+        Ok(metrics)
     }
 
     /// Start observing one generation request, created at `created_at`.
@@ -692,9 +739,14 @@ impl FrontendMetrics {
         for histogram in EXTENSION_HISTOGRAMS.read().unwrap().iter() {
             histogram.0.entries(&mut histograms);
         }
+
+        self.queue_full.entries(&mut counters);
+        self.fetch_slot_wait.entries(&mut histograms);
+        let gauges = self.gauge_entries();
         for (file, entries) in [
             (&self.counter_file, counters),
             (&self.histogram_file, histograms),
+            (&self.gauge_file, gauges),
         ] {
             if entries.is_empty() {
                 continue;
@@ -753,6 +805,10 @@ impl RequestMetrics {
         match item {
             Some(ResponseItem::Frame(chunk)) => self.observe_output(chunk, false),
             Some(ResponseItem::Done(chunk)) => self.observe_output(chunk, true),
+            Some(ResponseItem::Error(Error::QueueFull(stage))) => {
+                self.terminal = true;
+                self.metrics.queue_full(*stage).inc(1);
+            }
             Some(_) | None => self.terminal = true,
         }
     }
@@ -933,6 +989,92 @@ impl RequestMetrics {
     }
 }
 
+/// Each server's `sglang:frontend_media_fetch_slot_wait_seconds` series. The
+/// fetch slots are the process's (see `prefetch`), so each wait is observed in
+/// every live server's series.
+static FETCH_SLOT_WAITS: Mutex<Vec<Weak<Histogram>>> = Mutex::new(Vec::new());
+
+/// A media fetch waited `wait` for a fetch slot.
+pub(crate) fn observe_fetch_slot_wait(wait: Duration) {
+    FETCH_SLOT_WAITS.lock().unwrap().retain(|series| {
+        series
+            .upgrade()
+            .map(|histogram| histogram.observe(wait.as_secs_f64()))
+            .is_some()
+    });
+}
+
+/// Reads how many items one stage queue holds.
+pub(crate) type QueueLen = Box<dyn Fn() -> usize + Send + Sync>;
+
+/// A [`QueueLen`] for the flume queue `sender` feeds. Held weakly, so the
+/// metrics never keep a queue open; a closed queue reads empty.
+pub(crate) fn queue_len<T: Send + 'static>(sender: flume::WeakSender<T>) -> QueueLen {
+    Box::new(move || sender.upgrade().map_or(0, |sender| sender.len()))
+}
+
+/// The Rust-native families (see the module docs).
+impl FrontendMetrics {
+    /// Read these stage queues into `sglang:frontend_queue_depth`, by `stage`
+    /// label, at each flush. The first installation stands.
+    pub(crate) fn watch_queues(&self, queues: Vec<(&'static str, QueueLen)>) {
+        let _ = self.queues.set(queues);
+    }
+
+    /// The `sglang:frontend_queue_full_total` series for `stage`.
+    fn queue_full(&self, stage: QueueStage) -> Arc<Counter> {
+        self.queue_full.series(&self.with_stage(stage.label()))
+    }
+
+    /// The base labels plus `stage`.
+    fn with_stage(&self, stage: &str) -> Labels {
+        let mut labels = self.labels.clone();
+        labels.push(("stage".into(), stage.into()));
+        labels
+    }
+
+    /// The gauge entries: each stage queue's depth, read now.
+    fn gauge_entries(&self) -> Vec<Entry> {
+        const NAME: &str = "sglang:frontend_queue_depth";
+        const HELP: &str = "Requests waiting in a frontend stage queue, by stage.";
+        let queues = self.queues.get().into_iter().flatten();
+        queues
+            .map(|(stage, len)| Entry {
+                key: prometheus::mmap_key(NAME, NAME, &self.with_stage(stage), HELP),
+                value: len() as f64,
+                timestamp: 0.0,
+            })
+            .collect()
+    }
+
+    /// The value `/metrics` renders for the first sample line starting with
+    /// `prefix` (the name, then the labels), after a flush.
+    #[cfg(test)]
+    pub(crate) fn exported(&self, prefix: &str) -> Option<f64> {
+        sample(&rendered(self, &self.dir), prefix)
+    }
+}
+
+/// What `/metrics` renders from `dir` after `metrics` flushes.
+#[cfg(test)]
+fn rendered(metrics: &FrontendMetrics, dir: &std::path::Path) -> String {
+    metrics.flush().unwrap();
+    let files = prometheus::read_dir_files(dir).unwrap();
+    prometheus::render(&prometheus::merge(
+        files
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice())),
+    ))
+}
+
+/// The value of the first sample line in `text` starting with `prefix`.
+#[cfg(test)]
+fn sample(text: &str, prefix: &str) -> Option<f64> {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,22 +1216,6 @@ mod tests {
             extras: Some(Box::new(extras)),
             ..chunk(tokens, finish_reason)
         }
-    }
-
-    fn rendered(metrics: &FrontendMetrics, dir: &std::path::Path) -> String {
-        metrics.flush().unwrap();
-        let files = prometheus::read_dir_files(dir).unwrap();
-        prometheus::render(&prometheus::merge(
-            files
-                .iter()
-                .map(|(name, data)| (name.as_str(), data.as_slice())),
-        ))
-    }
-
-    fn sample(text: &str, prefix: &str) -> Option<f64> {
-        text.lines()
-            .find(|line| line.starts_with(prefix))
-            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
     }
 
     /// The `collect_metrics` sequence: streaming TTFT on the first output,
@@ -1504,5 +1630,44 @@ mod tests {
             ),
             Some(3.0)
         );
+    }
+
+    /// A stage queue's depth is read at each flush, without keeping the queue
+    /// open, and a generation refused on a full queue counts under its stage,
+    /// every stage from zero.
+    #[test]
+    fn queue_depth_and_full_queue_refusals() {
+        let dir = temp_dir("queues");
+        let metrics = Arc::new(
+            FrontendMetrics::new(&config(&dir, BTreeMap::new()), DisaggregationMode::Null).unwrap(),
+        );
+        let (tx, rx) = flume::bounded::<u8>(4);
+        metrics.watch_queues(vec![("intake", queue_len(tx.downgrade()))]);
+        let depth = r#"sglang:frontend_queue_depth{stage="intake"}"#;
+        assert_eq!(metrics.exported(depth), Some(0.0));
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(metrics.exported(depth), Some(2.0));
+        rx.recv().unwrap();
+        assert_eq!(metrics.exported(depth), Some(1.0));
+        drop(tx);
+        assert!(rx.is_disconnected());
+
+        let refused = || {
+            QueueStage::ALL.map(|stage| {
+                metrics.exported(&format!(
+                    r#"sglang:frontend_queue_full_total{{stage="{}"}}"#,
+                    stage.label()
+                ))
+            })
+        };
+        assert_eq!(refused(), [Some(0.0); 3]);
+        let mut call = metrics.start_request(&request(false, None), Instant::now());
+        call.observe(Some(&ResponseItem::Error(Error::Disconnected)));
+        assert_eq!(refused(), [Some(0.0); 3]);
+        let mut call = metrics.start_request(&request(true, None), Instant::now());
+        call.observe(Some(&ResponseItem::Error(Error::QueueFull(QueueStage::Mm))));
+        assert_eq!(refused(), [Some(0.0), Some(1.0), Some(0.0)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
