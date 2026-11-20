@@ -17,7 +17,11 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_amd_ci(est_time=900, suite="base-b-disaggregation-test-large-8-gpu-amd-mi35x")
+register_amd_ci(
+    est_time=900,
+    suite="base-b-disaggregation-test-large-8-gpu-amd-mi35x",
+    disabled="Aborts with LLVM 'spirv-expand-step registered more than once' since the 2026-11-17 rocm10 image (#51119)",
+)
 
 
 class NixlTransferEngineBase(PDDisaggregationServerBase):
