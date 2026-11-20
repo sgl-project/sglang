@@ -7,7 +7,8 @@ model runs on a few repeated token ids, unlike real traffic, which can skew expe
 routing and cache locality. Whenever simulated acceptance commits drafts, greedy draft
 rows therefore sample at 1000 (close to uniform) by default, while the target still
 verifies greedily. SGLANG_BENCH_DRAFTER_TEMPERATURE sets the temperature; 0 keeps
-greedy drafts. Sampled requests keep their own temperature.
+greedy drafts. Rows that already sample their drafts keep their own temperature;
+plain DFLASH's argmax head drafts every row greedily, so all of its rows sample.
 """
 
 from __future__ import annotations
@@ -77,9 +78,11 @@ def opt_out_hint() -> str:
 
 
 def validate_server_args(algorithm: Optional[str]) -> None:
-    """Server-args gate, run on every launch before any weights load: a malformed
-    value, an explicit value on an algorithm whose drafts would ignore it, or a
-    setting the DSpark / DFLASH drafters cannot honor fails here instead of mid-run."""
+    """Server-args gate, run on every launch before any weights load: an out-of-range
+    value, an explicit value on an algorithm whose drafts would ignore it, or one
+    without forced acceptance fails here instead of mid-run. (A value that is not a
+    float warns and falls back to the default, like any SGLang env var.)"""
+    bench_drafter_temperature.cache_clear()  # this launch's variables, not a cached one
     requested = requested_temperature()  # validates the value on every server
     if algorithm not in SUPPORTED_ALGORITHMS:
         if requested:
@@ -90,20 +93,14 @@ def validate_server_args(algorithm: Optional[str]) -> None:
         return
     if not bench_drafter_enabled():
         return
+    # The default needs SGLANG_SIMULATE_ACC_LEN > 1; so does an explicit value: real
+    # acceptance would reject the sampled drafts, and a length of 1 commits none.
+    # (The DSpark and DFLASH workers refuse a verify schedule that is not verify-all.)
     simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
-    if not 0.0 < simulate_acc_len < math.inf:
+    if not 1.0 < simulate_acc_len < math.inf:
         raise ValueError(
-            f"{ENV_NAME} requires a finite SGLANG_SIMULATE_ACC_LEN > 0: real "
-            "acceptance would reject the drafts it samples."
-        )
-    from sglang.srt.speculative.ragged_verify import (
-        RaggedVerifyMode,
-        read_ragged_verify_mode,
-    )
-
-    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
-        raise ValueError(
-            f"{ENV_NAME} requires SGLANG_RAGGED_VERIFY_MODE=static{opt_out_hint()}."
+            f"{ENV_NAME} requires forced acceptance (a finite SGLANG_SIMULATE_ACC_LEN "
+            f"> 1), got SGLANG_SIMULATE_ACC_LEN={simulate_acc_len:g}."
         )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -198,8 +195,7 @@ def gumbel_argmax(
     draft call."""
     from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 
-    sample = MarkovSampleStep.triton if logits.is_cuda else MarkovSampleStep.torch
-    return sample(
+    return MarkovSampleStep.execute(
         base_logits=logits,
         bias=None,
         temperatures=temperatures,

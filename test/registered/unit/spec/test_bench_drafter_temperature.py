@@ -18,6 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 )
 from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -92,10 +93,13 @@ class TestParse(_Case):
                 with self.assertRaises(ValueError):
                     bd.bench_drafter_temperature()
 
-    def test_malformed_value_warns_and_stays_off(self):
-        with _bench("1e3x"):
-            with self.assertWarnsRegex(UserWarning, bd.ENV_NAME):
-                self.assertEqual(bd.bench_drafter_temperature(), 0.0)
+    def test_malformed_value_warns_and_falls_back_to_the_default(self):
+        # EnvField's fallback for any env var: the default, with a warning.
+        for acc_len, default in (("-1", 0.0), ("3.8", 1000.0)):
+            with self.subTest(acc_len=acc_len):
+                with envs.SGLANG_SIMULATE_ACC_LEN.override(acc_len), _bench("1e3x"):
+                    with self.assertWarnsRegex(UserWarning, bd.ENV_NAME):
+                        self.assertEqual(bd.bench_drafter_temperature(), default)
 
 
 class TestValidateServerArgs(_Case):
@@ -130,9 +134,29 @@ class TestValidateServerArgs(_Case):
                     bd.validate_server_args(algorithm)
 
     def test_a_refused_default_names_the_opt_out(self):
-        with self._benchmark(None, mode="compact"):
+        platform_worker = type("PlatformDSparkWorker", (), {})
+        with (
+            self._benchmark(None),
+            patch.object(
+                SpeculativeAlgorithm,
+                "get_platform_worker_cls",
+                return_value=platform_worker,
+            ),
+        ):
             with self.assertRaisesRegex(ValueError, "=0 to keep greedy drafts"):
                 bd.validate_server_args("DSPARK")
+
+    def test_the_verify_schedule_is_left_to_the_workers(self):
+        # They refuse SGLANG_SIMULATE_ACC_LEN > 1 without a verify-all schedule.
+        for mode in ("static", "compact"):
+            with self.subTest(mode=mode), self._benchmark(None, mode=mode):
+                bd.validate_server_args("DSPARK")
+
+    def test_each_launch_reads_the_variables_afresh(self):
+        self.assertEqual(bd.bench_drafter_temperature(), 0.0)  # cached while unset
+        with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override("1000"):
+            with self.assertRaisesRegex(ValueError, "forced acceptance"):
+                bd.validate_server_args("DFLASH")
 
     def test_refuses_unsupported_configs(self):
         cases = (
@@ -141,7 +165,7 @@ class TestValidateServerArgs(_Case):
             ("applies to --speculative-algorithm", "NGRAM", {}),
             ("SGLANG_SIMULATE_ACC_LEN", "DSPARK", {"acc_len": "-1"}),
             ("SGLANG_SIMULATE_ACC_LEN", "DFLASH", {"acc_len": "inf"}),
-            ("SGLANG_RAGGED_VERIFY_MODE", "DSPARK", {"mode": "compact"}),
+            ("SGLANG_SIMULATE_ACC_LEN=1", "DSPARK", {"acc_len": "1.0"}),
         )
         for reason, algorithm, overrides in cases:
             with self.subTest(reason=reason, algorithm=algorithm):
@@ -433,6 +457,32 @@ class TestPlainDflashGraphSampler(_Case):
         self.assertGreater(int(torch.unique(draws).numel()), VOCAB // 2)
         self.assertFalse(bool((draws == self.argmax).all()))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_graph_replays_draw_fresh_noise(self):
+        weight, hidden = self.weight.cuda(), self.hidden.cuda()
+        sampler = dfw._DflashDraftSampler(
+            weight=weight,
+            block_size=BLOCK,
+            num_org=VOCAB,
+            org_vocab_start=0,
+            max_bs=2,
+            bench_noise=_noise(),
+            bench_padded_width=VOCAB,
+        )
+        sampler(hidden)  # compile the kernels before capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            sampler(hidden)
+        sampler.bench_offset.zero_()
+        rows = hidden.view(2, BLOCK, HIDDEN)[:, 1:, :].reshape(-1, HIDDEN)
+        logits = (rows @ weight.T).cpu()
+        n = rows.shape[0]
+        for step in range(2):
+            graph.replay()
+            expected = _sample(logits, _noise(), offset=step)
+            self.assertTrue(torch.equal(sampler.out[:n].cpu(), expected))
+        self.assertEqual(int(sampler.bench_offset), 2)
+
 
 def _eager_worker(noise):
     worker = SimpleNamespace(
@@ -540,6 +590,48 @@ class TestDflashTokenMode(_Case):
             with envs.SGLANG_SIMULATE_ACC_LEN.override("3.8"), _bench("0"):
                 self.assertEqual(dfw._sim_acc_token_mode(), "fixed")
 
+    def test_the_accept_block_commits_the_drafts(self):
+        worker = SimpleNamespace(
+            _selector_sample=None,
+            _tp_sync=SimpleNamespace(sync=lambda site, tensor: None),
+            _use_triton_accept_bonus=False,
+            _simulated_acc_len_rng=simulated_acc_len_generator(17),
+            block_size=4,
+        )
+
+        def commit(value):
+            with _bench(value):
+                accept_len, _, _, out_tokens, _, _ = dfw.DFlashWorkerV2._accept_block(
+                    worker,
+                    candidates=torch.tensor([[9, 1, 2, 3]]),
+                    next_token_logits=torch.zeros(1, 4, 8),
+                    sampling_info=SimpleNamespace(is_all_greedy=True),
+                    draft_input=object(),
+                    prefix_lens=torch.tensor([3]),
+                    bs=1,
+                )
+            return int(accept_len[0]), out_tokens[0].tolist()
+
+        with (
+            patch.object(dfw, "SIMULATE_ACC_LEN", 4.0),
+            patch.object(dfw, "SIMULATE_ACC_TOKEN_MODE", "fixed"),
+        ):
+            accepted, tokens = commit("1000")
+            self.assertGreater(accepted, 0)
+            # The drafts, then the target's (argmax) bonus: no fixed token id.
+            self.assertEqual(tokens[:accepted], [1, 2, 3][:accepted])
+            self.assertEqual(tokens[accepted], 0)
+            _, tokens = commit("0")
+            self.assertEqual(set(tokens), {100})
+
+
+def _target_worker(rows_per_rank=4032):
+    shard = SimpleNamespace(num_org_elements_padded=rows_per_rank)
+    lm_head = SimpleNamespace(shard_indices=shard)
+    return SimpleNamespace(
+        model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=lm_head))
+    )
+
 
 def _dflash_worker(**overrides):
     fields = dict(
@@ -549,6 +641,7 @@ def _dflash_worker(**overrides):
         lilicorr=None,
         _lilicorr_sampling_enabled=False,
         _runtime=None,
+        _target_worker=_target_worker(),
         _target_tp_rank=1,
     )
     fields.update(overrides)
@@ -593,11 +686,21 @@ class TestDflashWorkerGuard(_Case):
                 selector=object(), _selector_sampling_enabled=False
             ),
             "SGLANG_ENABLE_LILICORR_SAMPLING": _dflash_worker(lilicorr=object()),
+            # A TP32 shard of a 128,832-row padded vocab starts at 4,026 on rank 1.
+            "multiples of 4 rows, got 4026": _dflash_worker(
+                _target_worker=_target_worker(rows_per_rank=4026)
+            ),
         }
         for reason, worker in cases.items():
             with self.subTest(reason=reason):
                 with self.assertRaisesRegex(ValueError, reason):
                     self._check(worker)
+        with patch.object(dfw, "_is_npu", True):
+            with self.assertRaisesRegex(ValueError, "on NPU"):
+                self._check(_dflash_worker())
+            self._check(
+                _dflash_worker(lilicorr=object(), _lilicorr_sampling_enabled=True)
+            )
 
 
 if __name__ == "__main__":

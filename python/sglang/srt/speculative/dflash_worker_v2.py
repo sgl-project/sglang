@@ -931,6 +931,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"{name} with LiLiCorr requires SGLANG_ENABLE_LILICORR_SAMPLING=1, so "
                 f"the draft graph captures its sampled walk{opt_out_hint()}."
             )
+        if self.selector is None and self.lilicorr is None:
+            # The plain argmax head samples with DSpark's fused Gumbel-max, whose
+            # NPU kernel does not take the bias-free draw.
+            if _is_npu:
+                raise ValueError(
+                    f"{name} does not support the plain DFLASH head on NPU"
+                    f"{opt_out_hint()}."
+                )
+            # Its noise covers global token ids in quads, so every TP shard must
+            # start on a multiple of 4; the shard size is alike on all ranks.
+            lm_head = unwrap_lora_layer(
+                getattr(self._target_worker.model_runner.model, "lm_head", None)
+            )
+            shard = getattr(lm_head, "shard_indices", None)
+            if shard is not None and int(shard.num_org_elements_padded) % 4:
+                raise ValueError(
+                    f"{name} needs the target lm_head's vocab shards in multiples of "
+                    f"4 rows, got {int(shard.num_org_elements_padded)} per TP rank"
+                    f"{opt_out_hint()}."
+                )
         if self._target_tp_rank != 0:
             return
         if SIMULATE_ACC_TOKEN_MODE != "real-draft-token":
