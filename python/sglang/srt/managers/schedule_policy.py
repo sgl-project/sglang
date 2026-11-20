@@ -46,16 +46,28 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Union,
+)
 
 import torch
 
+from sglang.srt.beam_search.batch_tail import beam_decode_budget
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
+from sglang.srt.managers.uniboost_gamma_ada import GammaAdaController
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -168,6 +180,10 @@ def estimate_prefill_extend_tile_metrics(
 BOUNDED_LPM_WINDOW_SIZE = 64
 
 
+# UniBoost re-matches this many requests at the head of the sorted queue each pass.
+UNIBOOST_MATCH_WINDOW_SIZE = 64
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -175,6 +191,7 @@ class CacheAwarePolicy(Enum):
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
+    UNIBOOST = "uniboost"  # tail-aware admission boosting (UniBoost)
 
 
 class CacheAgnosticPolicy(Enum):
@@ -198,6 +215,11 @@ class SchedulePolicy:
         schedule_low_priority_values_first: bool,
         shortest_prefill_aging_factor: float = 0.0,
         bounded_lpm_enabled: bool = True,
+        *,
+        uniboost_gamma: float = 10.0,
+        enable_uniboost_gamma_ada: bool = False,
+        uniboost_rank_invariant: bool = False,
+        uniboost_step_clock: Optional[Callable[[], int]] = None,
     ):
         self._lpm_gate_calls = 0
         self._on_bounded_state_change = None
@@ -232,6 +254,20 @@ class SchedulePolicy:
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
+
+        # UniBoost state; inert unless the schedule policy is "uniboost".
+        self.uniboost_gamma = uniboost_gamma
+        self.uniboost_alpha_s_per_token = (
+            envs.SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN.get() / 1e6
+        )
+        self.uniboost_rank_invariant = uniboost_rank_invariant
+        self.uniboost_gamma_ada: Optional[GammaAdaController] = None
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            self._init_uniboost(enable_uniboost_gamma_ada, uniboost_step_clock)
+        elif enable_uniboost_gamma_ada:
+            raise ValueError(
+                "enable_uniboost_gamma_ada requires schedule_policy=uniboost"
+            )
 
     def calc_priority(
         self,
@@ -321,6 +357,8 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
+        elif policy == CacheAwarePolicy.UNIBOOST:
+            self._sort_by_uniboost(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -467,10 +505,14 @@ class SchedulePolicy:
         bootstrap_queue: Iterable[Req] = (),
     ) -> None:
         # Head last, so LRU evicts in reverse admission order; cache-aware policies
-        # already touch while matching, and other eviction strategies ignore recency.
+        # already touch while matching (UniBoost only its head window), and other
+        # eviction strategies ignore recency.
         bootstrap_max = envs.SGLANG_WAITING_PREFIX_REFRESH_BOOTSTRAP_MAX.get()
         if (
-            isinstance(policy, CacheAwarePolicy)
+            (
+                isinstance(policy, CacheAwarePolicy)
+                and policy != CacheAwarePolicy.UNIBOOST
+            )
             or not (waiting_queue or (bootstrap_queue and bootstrap_max > 0))
             or not envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.get()
             or get_disagg().disaggregation_mode == "decode"
@@ -523,6 +565,10 @@ class SchedulePolicy:
         try:
             policy_enum = CacheAwarePolicy(policy)
             if getattr(tree_cache, "disable", True):
+                if policy_enum == CacheAwarePolicy.UNIBOOST:
+                    # UniBoost still works without a prefix cache: every
+                    # prompt token counts as uncached work.
+                    return policy_enum
                 if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                     raise ValueError(
                         "Experimental shortest-prefill-first requires prefix caching"
@@ -557,6 +603,13 @@ class SchedulePolicy:
             # The first of a shared-prefix group runs: make it the shortest, or a
             # short request waits behind a long one that SPF defers.
             candidates.sort(key=lambda c: self._shortest_prefill_work(c[0]))
+        elif policy == CacheAwarePolicy.UNIBOOST:
+            # Likewise, the group's leader is its highest-priority member.
+            candidates.sort(
+                key=lambda c: self._uniboost_phi(
+                    c[0], self._shortest_prefill_work(c[0])
+                )
+            )
 
         for r, key_ids in candidates:
             extra_key = r.extra_key
@@ -598,7 +651,8 @@ class SchedulePolicy:
         otherwise observed only when admission reaches a request, which a
         request still ranked by its unloaded prefix may never do."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.UNIBOOST)
             or not self.tree_cache.can_poll_prefetch_progress()
         ):
             return
@@ -613,14 +667,14 @@ class SchedulePolicy:
         )
         return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
 
-    def _shortest_prefill_rank(self, r: Req, processed_tokens: int) -> float:
+    def _prefill_rank(self, r: Req, work: int, processed_tokens: int) -> float:
+        """Admission rank under shortest-prefill-first or UniBoost; lower goes first."""
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            return self._uniboost_phi(r, work)
         # Aging lowers the rank by the prefill work done while the request
         # waited, bounding its wait to about work / factor processed tokens.
         waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
-        return (
-            self._shortest_prefill_work(r)
-            - self.shortest_prefill_aging_factor * waited_tokens
-        )
+        return work - self.shortest_prefill_aging_factor * waited_tokens
 
     def _sort_by_shortest_prefill(
         self,
@@ -633,7 +687,7 @@ class SchedulePolicy:
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                self._shortest_prefill_rank(r, processed_tokens),
+                self._prefill_rank(r, self._shortest_prefill_work(r), processed_tokens),
                 r.time_stats.wait_queue_entry_time,
             )
         )
@@ -647,15 +701,16 @@ class SchedulePolicy:
         *,
         processed_tokens: int,
     ) -> Optional[int]:
-        """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
+        """Cap the active prefill chunk to reserve tokens for waiting requests
+        that rank ahead of it under shortest-prefill-first or UniBoost."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.UNIBOOST)
             or budget < 2 * page_size
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
-        chunked_waited = max(0, processed_tokens - chunked_req.arrival_processed_tokens)
-        chunked_rank = remaining - self.shortest_prefill_aging_factor * chunked_waited
+        chunked_rank = self._prefill_rank(chunked_req, remaining, processed_tokens)
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
@@ -666,7 +721,7 @@ class SchedulePolicy:
             cached = len(req.origin_input_ids) + len(req.output_ids) - work
             charge += PrefillAdder._replay_len(req, cached)
             if (
-                self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
+                self._prefill_rank(req, work, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size
             ):
                 break
@@ -771,6 +826,85 @@ class SchedulePolicy:
                 x.priority * priority_sign,
                 x.time_stats.wait_queue_entry_time,
             )
+        )
+
+    def _init_uniboost(
+        self, enable_gamma_ada: bool, step_clock: Optional[Callable[[], int]]
+    ) -> None:
+        """``step_clock`` is a step counter identical on every rank; gamma-Ada
+        measures latency with it under rank invariance."""
+        gamma, alpha = self.uniboost_gamma, self.uniboost_alpha_s_per_token
+        if not (math.isfinite(gamma) and gamma > 0):
+            raise ValueError(f"uniboost_gamma must be finite and > 0, got {gamma}")
+        if not (math.isfinite(alpha) and alpha > 0):
+            raise ValueError(
+                "SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN must be finite and > 0, got "
+                f"{alpha * 1e6}"
+            )
+        # The largest boost, b(alpha) ~= -ln(gamma * alpha) / gamma, must be finite.
+        if not (gamma * alpha > 0 and math.isfinite(math.log(gamma * alpha) / gamma)):
+            raise ValueError(f"uniboost_gamma={gamma} is too small for alpha={alpha}")
+        if enable_gamma_ada:
+            self.uniboost_gamma_ada = GammaAdaController(
+                gamma,
+                step_clock=step_clock if self.uniboost_rank_invariant else None,
+            )
+        logger.info(
+            "UniBoost enabled: gamma=%.4g /s, alpha=%.1f us/token, gamma-Ada=%s, "
+            "arrival clock=%s",
+            self._uniboost_current_gamma(),
+            self.uniboost_alpha_s_per_token * 1e6,
+            "on" if enable_gamma_ada else "off",
+            "processed tokens" if self.uniboost_rank_invariant else "wall",
+        )
+
+    def _uniboost_phi(self, r: Req, work: int) -> float:
+        """``Phi = arrival - b(alpha * work)`` in seconds; lower is admitted first.
+
+        ``b(w) = ln(1 / (1 - e^(-gamma * w))) / gamma`` decays to 0 for long work,
+        so a long request keeps its FCFS place and is never starved.
+        """
+        if self.uniboost_rank_invariant:
+            # Processed prefill tokens advance identically on every rank.
+            arrival = self.uniboost_alpha_s_per_token * r.arrival_processed_tokens
+        else:
+            arrival = r.time_stats.wait_queue_entry_time
+        gamma = self._uniboost_current_gamma()
+        # A resumed chunk may have no work left; b(0) is unbounded.
+        gamma_w = gamma * self.uniboost_alpha_s_per_token * max(work, 1)
+        return arrival + math.log(-math.expm1(-gamma_w)) / gamma
+
+    def _uniboost_current_gamma(self) -> float:
+        if self.uniboost_gamma_ada is not None:
+            return self.uniboost_gamma_ada.gamma
+        return self.uniboost_gamma
+
+    def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
+        if self.uniboost_gamma_ada is not None:
+            self.uniboost_gamma_ada.stamp_first_seen(waiting_queue)
+
+        def phi(r: Req) -> float:
+            return self._uniboost_phi(r, self._shortest_prefill_work(r))
+
+        if self.tree_cache.disable:
+            waiting_queue.sort(key=phi)
+            return
+        if len(waiting_queue) > UNIBOOST_MATCH_WINDOW_SIZE:
+            # Past the head window, a request is matched only when first seen
+            # (new or retracted: last_node is None); its count may go stale.
+            for r in waiting_queue:
+                if r.last_node is None:
+                    match_kv_cache(r, self.tree_cache)
+            waiting_queue.sort(key=phi)
+        window = waiting_queue[:UNIBOOST_MATCH_WINDOW_SIZE]
+        deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.UNIBOOST)
+        window.sort(key=phi)
+        # As in LPM and SPF, a request sharing a leader's uncached prefix waits
+        # at the end of the queue until the leader has cached it.
+        waiting_queue[:] = (
+            [r for r in window if r.rid not in deprioritized]
+            + waiting_queue[UNIBOOST_MATCH_WINDOW_SIZE:]
+            + [r for r in window if r.rid in deprioritized]
         )
 
     @staticmethod
@@ -1040,12 +1174,13 @@ class PrefillAdder:
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
-        return (
+        return beam_decode_budget(
+            req,
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * ratio
+            * ratio,
         )
 
     @property
@@ -1061,9 +1196,12 @@ class PrefillAdder:
         the remaining-then-clip order of add_one_req's max_new: clip-then-subtract
         would zero out a request that has already generated >= CLIP tokens but
         still has a long decode ahead, under-reserving its window."""
-        return min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        return beam_decode_budget(
+            req,
+            min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            ),
         )
 
     def _check_prefill_budget(
@@ -1628,7 +1766,9 @@ class PrefillAdder:
             prefix_tokens,
             req.extend_len,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                beam_decode_budget(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
                 if not truncated
                 else 0
             ),
@@ -1642,7 +1782,9 @@ class PrefillAdder:
             cached_tokens=req.prefix_len,
             unfinished_input_len=cand_extend_input_len - new_len,
             deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                beam_decode_budget(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
                 if truncated
                 else 0
             ),
@@ -2220,7 +2362,11 @@ class PrefillAdder:
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
-            admission.max_new_tokens,
+            (
+                0
+                if admission.is_chunked
+                else beam_decode_budget(req, admission.max_new_tokens)
+            ),
             req.retracted_stain,
             state_slots=state_slots,
             request_rows=self._request_rows_for_req(req),
@@ -2236,7 +2382,9 @@ class PrefillAdder:
                 else 0
             ),
             deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                beam_decode_budget(
+                    req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                )
                 if admission.is_chunked
                 else 0
             ),
@@ -2265,7 +2413,7 @@ class PrefillAdder:
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
-            if r not in self.preempt_list and not r.finished()
+            if r not in self.preempt_list and not r.finished() and r.beam_group is None
         )
 
         sorted_valid_running_reqs = sorted(

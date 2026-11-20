@@ -4,7 +4,7 @@ This mirrors the production-style TP=4 launch recipe with EAGLE speculative
 decoding, overlap plan stream, FP8 KV cache, long context, and full GSM8K
 client pressure enabled.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4 suite
 """
 
 import ast
@@ -28,7 +28,7 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=3600,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4",
     nightly=True,
 )
 

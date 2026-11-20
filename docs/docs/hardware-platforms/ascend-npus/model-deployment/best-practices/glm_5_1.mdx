@@ -104,8 +104,7 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 32 \
-        --dp-size 16 \
-        --enable-dp-attention \
+        --attn-dp-size 16 \
         --chunked-prefill-size 65536 \
         --max-prefill-tokens 280000 \
         --trust-remote-code \
@@ -251,7 +250,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -296,9 +295,8 @@ do
         --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.85 \
         --max-running-requests 64 \
         --attention-backend ascend \
@@ -458,7 +456,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -497,9 +495,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \
@@ -666,7 +663,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -710,8 +707,7 @@ do
         --trust-remote-code \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
-        --enable-dp-attention \
+        --attn-dp-size 32 \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 64 \
@@ -873,7 +869,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --speculative-draft-model-quantization unquant \
         --enable-prefill-cp \
@@ -912,8 +908,7 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
-        --enable-dp-attention \
+        --attn-dp-size 32 \
         --ep-size 32 \
         --mem-fraction-static 0.85 \
         --max-running-requests 32 \
@@ -1077,7 +1072,7 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode normal \
         --disable-shared-experts-fusion \
-        --disable-cuda-graph \
+        --disable-decode-cuda-graph --disable-prefill-cuda-graph \
         --dtype bfloat16 \
         --dp-size 1 \
         --load-balance-method round_robin \
@@ -1116,9 +1111,8 @@ do
         --node-rank $i \
         --tp-size 32 \
         --nnodes 2 \
-        --dp-size 32 \
+        --attn-dp-size 32 \
         --ep-size 32 \
-        --enable-dp-attention \
         --mem-fraction-static 0.87 \
         --max-running-requests 96 \
         --attention-backend ascend \

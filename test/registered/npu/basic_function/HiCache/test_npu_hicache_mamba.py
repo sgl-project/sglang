@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-test-1-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3.5-0.8B": {
@@ -46,6 +46,11 @@ class TestNPUMambaHiCache(CustomTestCase):
             "0.20",
             "--mamba-ssm-dtype",
             "bfloat16",
+            # Level 3 checkpoints every prefill chunk. The default level 2 defers
+            # a running request's Mamba state until its end, so the 3072-token
+            # checkpoint this warm-hit scenario needs never reaches the tree.
+            "--hybrid-cache-checkpoints-level",
+            "3",
             "--chunked-prefill-size",
             "1024",
             "--page-size",

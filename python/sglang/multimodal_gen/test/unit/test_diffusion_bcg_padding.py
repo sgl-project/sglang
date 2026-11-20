@@ -1,5 +1,6 @@
 import dataclasses
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -422,6 +423,27 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 self.assertIs(self._qwen21_pad(kwargs), kwargs)
             kwargs = self._qwen21_kwargs(5)
             self.assertIs(self._qwen21_pad(kwargs, sp_world_size=2), kwargs)
+
+    def test_qwen21_packed_prefix_lives_with_request_and_replaces_bucket(self):
+        kwargs = self._qwen21_kwargs(5)
+        with self._patch_buckets(16, 32):
+            first = self._qwen21_pad(kwargs)
+            repeat = self._qwen21_pad(kwargs)
+            self.assertIs(first["prefix_kv"], repeat["prefix_kv"])
+            previous = weakref.ref(first["prefix_kv"])
+            del first, repeat
+            self.assertIsNotNone(previous())
+
+        with self._patch_buckets(32):
+            larger = self._qwen21_pad(kwargs)
+        self.assertIsNone(previous())
+        self.assertEqual(larger["prefix_kv"].shape[2], 32)
+        self.assertEqual(larger["prefix_pad"].item(), 27)
+        current = weakref.ref(larger["prefix_kv"])
+        del larger
+        self.assertIsNotNone(current())
+        del kwargs
+        self.assertIsNone(current())
 
     def test_longcat_keeps_its_fixed_512_token_prompt_shape(self):
         kwargs = {
