@@ -193,6 +193,21 @@ def _dsml(block: str, invoke: str = "invoke", parameter: str = "parameter"):
 
 _MINIMAX_NS = "]<]minimax[>["
 
+# thinkingmachines/Inkling-Small; inkling2 parses the same format.
+_INKLING = Sample(
+    calls=tuple(
+        f"<|message_model|>{name}<|content_invoke_tool_json|>"
+        + json.dumps({"name": name, "args": args}, separators=(",", ":"))
+        + "<|end_message|>"
+        for name, args in EXPECTED_CALLS
+    ),
+    special_tokens=(
+        "<|message_model|>",
+        "<|content_invoke_tool_json|>",
+        "<|end_message|>",
+    ),
+)
+
 SAMPLES = {
     # swiss-ai/Apertus-8B-Instruct-2509
     "apertus2509": Sample(
@@ -315,7 +330,6 @@ SAMPLES = {
         special_tokens=("<|tool_call>", "<tool_call|>", '<|"|>'),
     ),
     "glm": _GLM45,
-    "glm45": _GLM45,
     "glm47": _GLM47,
     "flint": _GLM47,
     # openai/gpt-oss-20b, as generated: the recipient is in the channel header.
@@ -357,20 +371,8 @@ SAMPLES = {
         suffix="\n</tool_calls>",
         special_tokens=_ARG_TAGS + ("<tool_calls>", "</tool_calls>", "<tool_sep>"),
     ),
-    # thinkingmachines/Inkling-Small
-    "inkling": Sample(
-        calls=tuple(
-            f"<|message_model|>{name}<|content_invoke_tool_json|>"
-            + json.dumps({"name": name, "args": args}, separators=(",", ":"))
-            + "<|end_message|>"
-            for name, args in EXPECTED_CALLS
-        ),
-        special_tokens=(
-            "<|message_model|>",
-            "<|content_invoke_tool_json|>",
-            "<|end_message|>",
-        ),
-    ),
+    "inkling": _INKLING,
+    "inkling2": _INKLING,
     # Detokenized with spaces_between_special_tokens, the server default.
     "interns1": Sample(
         calls=tuple(
@@ -589,7 +591,6 @@ SAMPLES = {
         suffix="]",
     ),
     "qwen": _HERMES,
-    "qwen25": _HERMES,
     "qwen3_coder": _QWEN3_CODER,
     "spark25": Sample(calls=_GLM47.calls),
     # stepfun-ai/step3
@@ -649,7 +650,6 @@ KNOWN_FAILURES = {
     ("deepseekv31", "both_calls_in_one_chunk"): "#42137",
     ("flint", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("glm", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("glm45", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("glm47", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("hermes", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
     ("hermes", "both_calls_in_one_chunk"): "`</tool_call>` leaks into content",
@@ -665,8 +665,6 @@ KNOWN_FAILURES = {
     ("mistral", "one_token_per_chunk"): "calls after the first go to content",
     ("qwen", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
     ("qwen", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
-    ("qwen25", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
-    ("qwen25", "both_calls_in_one_chunk"): _ONE_STEP_PER_CHUNK,
     ("step3", "one_call_per_chunk"): "section end discards buffered calls",
     ("step3", "both_calls_in_one_chunk"): "section end discards buffered calls",
     ("trinity", "one_call_per_chunk"): _ONE_STEP_PER_CHUNK,
