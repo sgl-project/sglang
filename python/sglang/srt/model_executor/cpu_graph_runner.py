@@ -21,6 +21,7 @@ import bisect
 import copy
 import itertools
 import logging
+import os
 import types
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -512,6 +513,16 @@ def set_torch_compile_config():
     torch._dynamo.config.assume_static_by_default = True
     register_inductor_fallback_ops()
     monkey_patch_torch_compile()
+
+    if (
+        envs.SGLANG_CPU_CPP_WRAPPER.get()
+        or os.environ.get("TORCHINDUCTOR_CPP_WRAPPER", "0") == "1"
+    ):
+        from sglang.srt.model_executor.runner_utils.cpu_c_shims import (
+            enable_cpu_cpp_wrapper,
+        )
+
+        enable_cpu_cpp_wrapper()
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
