@@ -142,6 +142,7 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
             _qkvgbfa_bs_limit=256,
             _qkvgbfa_layer=None,
             _qkvgbfa_in_qkvg_proj=False,
+            _qkvg_gate_float_shard=False,
             _bfa_f_b_w=self.f_b_w,
             _bfa_alt_stream=None,
             fused_qkvg_proj=SimpleNamespace(
@@ -225,6 +226,7 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
             _bfa_w=None,
             _qkvgbfa_sizes=None,
             _qkvgbfa_in_qkvg_proj=False,
+            _qkvg_gate_float_shard=False,
         )
         cls.exact = {
             name: getattr(split, name).dequant()
@@ -249,6 +251,7 @@ class TestKimiK3QuarkFp8KDAInProj(CustomTestCase):
             _qkvgbfa_layer=None,
             _qkvgbfa_bs_limit=256,
             _qkvgbfa_in_qkvg_proj=False,
+            _qkvg_gate_float_shard=False,
             _bfa_f_b_w=None,
             _derived_weight_cache_error=None,
         )
