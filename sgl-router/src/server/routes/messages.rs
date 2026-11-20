@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
+use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
@@ -21,21 +21,20 @@ use crate::protocol::anthropic::{
 use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::routes::chat::{
-    chat_completions, enforce_minimax_m31_thinking, MAX_CHAT_BODY_BYTES,
+use crate::server::routes::chat::{chat_completions, enforce_minimax_m31_thinking};
+use crate::server::routes::reply::{
+    is_sse, model_supports_inline_system, rebuild, MAX_REPLY_BYTES,
 };
-use crate::server::routes::tokenize::tokenizer_for;
-
-/// Upstream replies are buffered up to the same cap as requests.
-const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
+use crate::server::routes::tokenize::served_tokenizer;
 
 pub(crate) async fn messages(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let prepared = off_worker::run(|| {
-        let converted = parse(&body, false)?;
+    let inline_system = model_supports_inline_system(&ctx);
+    let prepared = off_worker::run_for_body(body.len(), || {
+        let converted = parse(&body, false, inline_system)?;
         let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
         Ok::<_, ApiError>((converted, chat_body))
     });
@@ -55,12 +54,14 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let mut converted = match off_worker::run(|| parse(&body, true)) {
-        Ok(c) => c,
-        Err(e) => return adapt(e.into_response(), None).await,
-    };
-    let model = ctx.config.model.served_name(&converted.echo.model);
-    if let Err(e) = tokenizer_for(&ctx, model) {
+    let inline_system = model_supports_inline_system(&ctx);
+    let mut converted =
+        match off_worker::run_for_body(body.len(), || parse(&body, true, inline_system)) {
+            Ok(c) => c,
+            Err(e) => return adapt(e.into_response(), None).await,
+        };
+    let model = ctx.config.model.id.as_str();
+    if let Err(e) = served_tokenizer(&ctx) {
         return adapt(e.into_response(), None).await;
     }
     if ctx.tokenizers.is_minimax_m31(model) {
@@ -83,23 +84,21 @@ pub(crate) async fn count_tokens(
     }
 }
 
-fn parse(body: &Bytes, count_only: bool) -> Result<anthropic::Converted, ApiError> {
+fn parse(
+    body: &Bytes,
+    count_only: bool,
+    inline_system: bool,
+) -> Result<anthropic::Converted, ApiError> {
     let req: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
-    anthropic::to_chat(req, count_only).map_err(ApiError::BadRequest)
+    anthropic::to_chat(req, count_only, inline_system).map_err(ApiError::BadRequest)
 }
 
 /// `echo` is `Some((echo, streaming))`, `None` on the error paths.
 async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Response<Body> {
     let (mut parts, body) = resp.into_parts();
-    let is_sse = parts
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/event-stream"));
-
     if let Some((echo, true)) = &echo {
-        if parts.status.is_success() && is_sse {
+        if parts.status.is_success() && is_sse(&parts) {
             parts.headers.remove(header::CONTENT_LENGTH);
             return Response::from_parts(
                 parts,
@@ -127,8 +126,8 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
         return Response::from_parts(parts, Body::from(bytes));
     };
     // A non-streaming reply can be as large as a request body.
-    off_worker::run(
-        || match serde_json::from_slice::<serde_json::Value>(&bytes) {
+    off_worker::run_for_body(bytes.len(), || {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(chat) => {
                 let body = serde_json::to_vec(&chat_to_message(&chat, &echo)).expect("serialize");
                 rebuild(parts, body)
@@ -141,8 +140,8 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
                     anthropic::error_body(502, "upstream reply is not a valid chat completion"),
                 )
             }
-        },
-    )
+        }
+    })
 }
 
 /// The body limit rejects oversized requests before the handler runs; give
@@ -161,13 +160,4 @@ pub(crate) async fn envelope_413(req: Request, next: Next) -> Response<Body> {
         parts,
         anthropic::error_body(413, "request body is too large"),
     )
-}
-
-fn rebuild(mut parts: axum::http::response::Parts, body: Vec<u8>) -> Response<Body> {
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    Response::from_parts(parts, Body::from(body))
 }

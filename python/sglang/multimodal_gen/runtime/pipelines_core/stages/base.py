@@ -85,6 +85,9 @@ class PipelineStage(StageDedupMixin, ABC):
     _progress_range: tuple[float, float] = (0.0, 1.0)
     # Profiling capability is independent of the role used for disaggregation.
     supports_denoising_step_profiling: bool = False
+    # MAIN_RANK_ONLY_AND_SEND_TO_OTHERS: move the received batch's device tensors,
+    # unpickled on the sender's device index, to the receiving rank's device.
+    relocate_broadcast_batch: bool = False
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -160,7 +163,7 @@ class PipelineStage(StageDedupMixin, ABC):
         Verify the input for the stage.
 
         Example:
-            from sglang.multimodal_gen.runtime.pipelines.stages.validators import V, VerificationResult
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import V, VerificationResult
 
             def verify_input(self, batch, server_args):
                 result = VerificationResult()
@@ -178,6 +181,9 @@ class PipelineStage(StageDedupMixin, ABC):
         Load the model for the stage.
         """
         pass
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable captured graphs whose weights changed; stages without graphs do nothing."""
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
@@ -401,7 +407,6 @@ class PipelineStage(StageDedupMixin, ABC):
             The updated batch information after this stage's processing.
         """
         stage_name = self._active_profile_stage_name()
-        # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification
         try:

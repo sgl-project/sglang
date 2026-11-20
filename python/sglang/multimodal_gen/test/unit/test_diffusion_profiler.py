@@ -14,7 +14,9 @@ from sglang.multimodal_gen.runtime.utils import profiler as profiler_module
 @pytest.fixture(autouse=True)
 def cpu_profiler(monkeypatch, tmp_path):
     # Exercise the real CPU profiler even on accelerator CI workers.
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        profiler_module.current_platform, "is_cuda_alike", lambda: False
+    )
     monkeypatch.setattr(profiler_module.current_platform, "is_npu", lambda: False)
     monkeypatch.setattr(
         profiler_module.envs, "SGLANG_DIFFUSION_TORCH_PROFILER_DIR", str(tmp_path)
@@ -191,3 +193,27 @@ def test_request_cancelled_before_denoising_never_starts_profiler(tmp_path):
     profiler.start()
     profiler.step_denoising_step()
     assert profiler_module.SGLDiffusionProfiler.get_instance() is None
+
+
+@pytest.mark.parametrize("dump_rank,expect_trace", [(None, True), (0, False)])
+def test_sampled_early_stop_respects_requested_dump_rank(
+    tmp_path, monkeypatch, dump_rank, expect_trace
+):
+    # Current single-request execution exports every rank, whereas grouped
+    # execution may request rank zero only. Early stop must preserve that choice.
+    monkeypatch.setattr(pipeline_executor, "get_world_rank", lambda: 1)
+    executor = _ProfilerTestExecutor()
+    with executor.profile_execution(_request(1, 1), dump_rank=dump_rank):
+        profiler = profiler_module.SGLDiffusionProfiler.get_instance()
+
+        def denoise():
+            _payload(0)
+            profiler.step_denoising_step()
+            assert profiler.has_stopped
+
+        _run_stage(executor, RoleType.DENOISER, denoise)
+    if expect_trace:
+        assert (tmp_path / "window-rank-1.trace.json.gz").is_file()
+        assert _recorded_payloads(tmp_path) == ["0"]
+    else:
+        assert not list(tmp_path.glob("*.trace.json.gz"))

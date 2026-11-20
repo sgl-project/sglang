@@ -8,16 +8,23 @@ cross-attends from noisy visual tokens to that cache at every denoising step.
 
 import math
 from collections.abc import Iterable, Iterator, Sequence
+from functools import cache
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
+)
+from sglang.kernels.ops.gemm.sm120_bf16 import (
+    Sm120Bf16Linear,
+    linear_bf16_cublaslt,
+    linear_bf16_quack,
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
@@ -61,12 +68,19 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.common import add_prefix
 
 logger = init_logger(__name__)
@@ -80,6 +94,7 @@ def _can_enable_t1_fused_qk_norm_rope(
     *,
     is_blackwell: bool,
     is_hopper: bool,
+    is_sm121: bool,
     hidden_act: str,
     tp_size: int,
     sp_size: int,
@@ -90,6 +105,11 @@ def _can_enable_t1_fused_qk_norm_rope(
         return False
     if is_blackwell:
         return True
+    if is_sm121:
+        shape = (hidden_act, hidden_size)
+        return (
+            tp_size == 1 and sp_size == 1 and shape in (("relu2", 2048), ("silu", 4096))
+        )
     if not is_hopper or sp_size != 1:
         return False
     if tp_size == 1:
@@ -777,6 +797,7 @@ class Cosmos3CrossAttention(nn.Module):
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
         supported_attention_backends: set | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -808,6 +829,7 @@ class Cosmos3CrossAttention(nn.Module):
             num_kv_heads=self.local_num_key_value_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
             prefix=add_prefix("attn", prefix),
             is_cross_attention=True,
         )
@@ -1013,6 +1035,51 @@ class Cosmos3UndDecoderLayer(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+@cache
+def _sm120_gemm_device_supported(index: int) -> bool:
+    prop = torch.cuda.get_device_properties(index)
+    return (prop.major, prop.minor, prop.multi_processor_count) == (12, 0, 188)
+
+
+class _Sm120LinearMethod(UnquantizedLinearMethod):
+    # Coarse M sweeps on 188-SM RTX PRO 6000, cuBLAS 13.1.1.3. Intervals
+    # are inclusive; gaps keep native GEMM where gains are small or negative.
+    # N/K describe the model's projections, not the shared kernel's contract.
+    _backend_ranges = {
+        (24576, 4096): ((64, 2048, linear_bf16_quack),),
+        (4096, 12288): ((64, 512, linear_bf16_quack),),
+        (6144, 4096): (
+            (193, 384, linear_bf16_quack),
+            (385, 448, linear_bf16_cublaslt),
+            (449, 640, linear_bf16_quack),
+            (1024, 2048, linear_bf16_quack),
+        ),
+        (4096, 4096): ((128, 2048, linear_bf16_quack),),
+    }
+
+    def __init__(self):
+        self._gemm = Sm120Bf16Linear()
+
+    def apply(self, layer, x, bias=None):
+        if (
+            not torch.compiler.is_compiling()
+            and request_allows_lossless()
+            and x.device.type == "cuda"
+            and x.ndim >= 2
+            and x.shape[-1] > 0
+        ):
+            m = x.numel() // x.shape[-1]
+            for lower, upper, backend in self._backend_ranges.get(
+                tuple(layer.weight.shape), ()
+            ):
+                if lower <= m <= upper and _sm120_gemm_device_supported(x.device.index):
+                    out = self._gemm(x, layer.weight, bias, backend=backend)
+                    if out is not None:
+                        return out
+                    break
+        return super().apply(layer, x, bias)
+
+
 class Cosmos3GenDecoderLayer(nn.Module):
     """Generation pathway decoder layer: cross-attention + MLP."""
 
@@ -1052,6 +1119,20 @@ class Cosmos3GenDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             quant_config=quant_config,
         )
+
+        if envs.SGLANG_OPT_COSMOS3_SM120_GEMM.get():
+            for projection in self.modules():
+                if (
+                    isinstance(projection, (ColumnParallelLinear, RowParallelLinear))
+                    and projection.tp_size == 1
+                    and type(projection.quant_method) is UnquantizedLinearMethod
+                ):
+                    projection.quant_method = _Sm120LinearMethod()
+                    wrap_method_with_debug_kernel_once(
+                        projection.quant_method,
+                        "apply",
+                        op_name="diffusion.quant_method._Sm120LinearMethod.apply",
+                    )
 
     def forward(
         self,
@@ -1778,6 +1859,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
+            is_sm121=(
+                current_platform.is_cuda()
+                and current_platform.get_device_capability() == (12, 1)
+            ),
             hidden_act=self.hidden_act,
             hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),

@@ -53,8 +53,7 @@ def test_profiler_window_contains_requested_steps(tmp_path, requested):
         num_inference_steps=6,
         log_dir=str(tmp_path),
     )
-    # Sampled profiling is bounded by the denoising stage, so the trace is
-    # collected inside that context and exported when the stage exits.
+    # Sampled profiling is bounded by the denoising stage.
     with profiler.profile_denoising_stage():
         for step in range(6):
             with torch.profiler.record_function(f"denoise_step_{step}"):

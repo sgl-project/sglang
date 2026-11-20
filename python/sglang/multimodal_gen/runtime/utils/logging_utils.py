@@ -520,8 +520,6 @@ def suppress_stdout():
             # C library calls that would normally print to stdout
             torch.distributed.new_group(ranks, backend="gloo")
     """
-    # Don't suppress if logging level is DEBUG
-
     stdout_fd = sys.stdout.fileno()
     stdout_dup = os.dup(stdout_fd)
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
