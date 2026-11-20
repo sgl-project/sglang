@@ -362,9 +362,15 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                     ("custom_tool_call", _, Some(Value::String(s))) => {
                         json!({ "input": s }).to_string()
                     }
-                    (_, Some(Value::String(s)), _) => s.clone(),
-                    (_, None | Some(Value::Null), _) => "{}".into(),
-                    (_, Some(other), _) => other.to_string(),
+                    // Like the engine, anything but a JSON object becomes `{}`;
+                    // the chat template's `json.loads` would 400 a truncated echo.
+                    (_, Some(Value::String(s)), _)
+                        if serde_json::from_str::<Value>(s).is_ok_and(|v| v.is_object()) =>
+                    {
+                        s.clone()
+                    }
+                    (_, Some(v @ Value::Object(_)), _) => v.to_string(),
+                    _ => "{}".into(),
                 };
                 pending.tool_calls.push(json!({
                     "id": call_id,
@@ -1304,5 +1310,25 @@ mod tests {
         assert_eq!(c["tool_choice"], "required");
         let err = to_chat(choice(json!([{"type": "function", "name": "zzz"}])), false).unwrap_err();
         assert!(err.contains("zzz"), "{err}");
+    }
+
+    /// Like the engine, anything but a JSON object becomes `{}`: the chat
+    /// template's unconditional `json.loads` would 400 a truncated echo.
+    #[test]
+    fn malformed_function_call_arguments_become_an_empty_object() {
+        let args = |a: Value| {
+            let c = chat(json!({"model": "m", "input": [
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": a},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            ]}));
+            c["messages"][0]["tool_calls"][0]["function"]["arguments"].clone()
+        };
+        assert_eq!(args(json!("{\"city\":\"bj\"}")), "{\"city\":\"bj\"}");
+        assert_eq!(args(json!({"city": "bj"})), "{\"city\":\"bj\"}");
+        assert_eq!(args(json!("{\"city\":")), "{}");
+        assert_eq!(args(json!("[1]")), "{}");
+        assert_eq!(args(json!("")), "{}");
+        assert_eq!(args(json!(5)), "{}");
+        assert_eq!(args(Value::Null), "{}");
     }
 }
