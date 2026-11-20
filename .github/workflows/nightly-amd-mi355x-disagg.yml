@@ -188,6 +188,7 @@ jobs:
 
       - name: Clean up prior Slurm jobs from this runner
         continue-on-error: true
+        shell: bash
         run: |
           # launch_mi355x.sh names the allocation
           #   mi355x-ci-<RUNNER_NAME>-<GITHUB_RUN_ID>-<config>
@@ -200,17 +201,22 @@ jobs:
           # what makes this selective, and that is unique per runner, so the
           # filter is equally precise without it.
           if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
-          STALE_JOBS=$(squeue --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '{print $1}' || true)
+          STALE_JOBS=$(squeue --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '$1 ~ /^[0-9]+$/ {print $1}' || true)
           if [ -n "$STALE_JOBS" ]; then
             echo "Cancelling stale jobs for ${RUNNER_NAME}: $STALE_JOBS"
             # Servers are detached (-d on spur) docker containers, so scancel
-            # alone leaves them holding GPU memory. Reap them by name first.
+            # alone leaves them holding GPU memory. Match the allocation label
+            # because a completed job's nodes may already have been reassigned.
             for job in $STALE_JOBS; do
-              NODES=$(scontrol show job "$job" 2>/dev/null | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+              if ! NODES=$(scontrol show job "$job" 2>/dev/null | tr ' ' '\n' | sed -n 's/^NodeList=//p' \
+                | python3 scripts/ci/slurm/expand_slurm_nodelist.py); then
+                echo "::warning::Could not resolve cleanup nodes for job $job"
+                NODES=""
+              fi
               for node in $NODES; do
                 ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$node" \
-                  'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
-                  >/dev/null 2>&1 || true
+                  "bash -o pipefail -c 'docker ps -aq --filter label=spur_job_id=$job | xargs -r docker rm -f'" \
+                  >/dev/null 2>&1 || echo "::warning::Container cleanup failed on $node for job $job"
               done
             done
             scancel $STALE_JOBS
