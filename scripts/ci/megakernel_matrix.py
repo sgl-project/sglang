@@ -84,7 +84,11 @@ if __name__ == "__main__":
     parser.add_argument("e2e", type=Path)
     parser.add_argument("--models", nargs="*", default=[])
     args = parser.parse_args()
-    matrix = json.dumps(build_matrix(args.e2e, args.models))
+    try:
+        matrix = json.dumps(build_matrix(args.e2e, args.models))
+    except ValueError as error:
+        print(f"::error::{error}")
+        raise SystemExit(1) from error
     print(matrix)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:

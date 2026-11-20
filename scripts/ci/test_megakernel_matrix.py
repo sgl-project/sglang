@@ -3,6 +3,8 @@
 
 import contextlib
 import io
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +80,21 @@ class TestMegakernelMatrix(unittest.TestCase):
                 manifest.write_text(yaml.safe_dump({"kimi": invalid}))
                 with self.subTest(model=invalid), self.assertRaises(ValueError):
                     build_matrix(root, ["kimi"])
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("megakernel_matrix.py")),
+                    str(root),
+                    "--models",
+                    "missing",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "::error::Unknown models: ['missing']\n")
+            self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":
