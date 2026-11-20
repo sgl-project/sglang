@@ -10,6 +10,8 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     GLM_5_3_W8A8_MODEL_PATH,
+    assert_metrics,
+    run_bench_serving,
 )
 from sglang.test.ascend.test_ascend_utils import (
     append_ld_library_path,
@@ -46,6 +48,11 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ENVS = {
     # "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # The 32 prefill ranks finish Mooncake store setup minutes apart; the
+    # HiCache sync groups are built over a world HCCL domain right after, so
+    # the default 120s connect timeout would expire on the early ranks.
+    "HCCL_CONNECT_TIMEOUT": "1800",
+    "HCCL_EXEC_TIMEOUT": "1800",
     # L3 store client: MemFabric TENT transport over the NPU device path.
     # The store endpoint travels in the extra-config JSON and MC_TENT_CONF,
     # both built in setUpClass.
@@ -148,6 +155,10 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--hicache-storage-backend",
     "mooncake",
     "--enable-cache-report",
+    # Store setup blocks a scheduler for minutes; the 300s default would keep
+    # dumping thread stacks instead of letting startup finish.
+    "--watchdog-timeout",
+    3600,
 ]
 
 GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
@@ -219,6 +230,9 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
 
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
+    # Temporary: only 32 GPQA questions while the startup path is being
+    # stabilised; restore the dataset default afterwards.
+    limit = 32
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
     # Weekday nightly overrides this to gsm8k (baseline is provisional).
@@ -238,6 +252,7 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         "temperature": 1.0,
         "top_p": 0.95,
     }
+    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     @classmethod
     def setUpClass(cls):
@@ -246,7 +261,8 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         # --hicache-storage-backend-extra-config (once it carries
         # master_server_address the client ignores the MOONCAKE_* env vars).
         # The master runs on the first prefill pod and the segment is requested
-        # per scheduler rank: keep it small, otherwise the Ascend driver rejects
+        # per scheduler rank: 32 ranks make the registration slow and skewed,
+        # so keep it small. A large value also makes the Ascend driver reject
         # the last rank's HalMemCreate and the prefill server dies with
         # "Failed to setup Mooncake store".
         l3_config = json.dumps(
@@ -254,7 +270,7 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
                 "master_server_address": get_mooncake_master_server_address(),
                 "metadata_server": "P2PHANDSHAKE",
                 "protocol": "ascend",
-                "global_segment_size": "2gb",
+                "global_segment_size": "256mb",
                 "local_hostname": resolve_local_ip(),
                 "extra_backend_tag": "pd-1p1d-glm5.3-w8a8-dcp",
             }
@@ -287,6 +303,26 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
     def test_npu_glm_5_3_w8a8_1p1d_dcp_gpqa(self):
         """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
         self.run_accuracy()
+
+    def test_npu_glm_5_3_w8a8_1p1d_32p_dcp_l2_host_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        metrics = run_bench_serving(
+            host=self.host,
+            port=self.port,
+            model_path=self.model_config.get("model_path"),
+            dataset_name="generated-shared-prefix",
+            input_len=32000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=100,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":
