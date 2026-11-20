@@ -816,12 +816,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 raise ValueError(kv_capability.unsupported_reason)
             assert kv_capability.kv_cache_dtype == dtype
         self.kv_capability = kv_capability
-        # True whenever the DSA main KV is the packed one-byte quantized record
-        # (latent | bf16 rope | scales).
-        self.dsa_kv_cache_store_fp8 = (
+        # C8 (8-bit cache): the DSA main KV is the packed one-byte quantized
+        # record (latent | bf16 rope | scales), FP8 on arch35 and INT8 on A2.
+        self.dsa_kv_cache_store_c8 = (
             kv_capability is not None and kv_capability.main_kv_packed
         )
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             assert dtype.itemsize == 1
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
             assert kv_cache_dim == (
@@ -835,10 +835,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.rope_dtype = modelslim_cache_layout.value_dtype
         else:
             self.rope_dtype = self.store_dtype
-        self.kv_cache_dim = (
-            kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
-        )
-        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.kv_cache_dim = kv_cache_dim if self.dsa_kv_cache_store_c8 else kv_lora_rank
+        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_c8 else qk_rope_head_dim
 
         # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache
         if (
@@ -860,18 +858,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_capability is not None and kv_capability.indexer_quant
         )
         if self.indexer_kv_store_int8:
-            self.index_k_kv_dtype = torch.int8
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
         else:
-            self.index_k_kv_dtype = (
+            index_k_dtype = (
                 dtype if kv_capability is None else kv_capability.indexer_kv_dtype
             )
-            # An unquantized indexer whose dtype differs from the main store
-            # keeps its own buffer dtype (BF16 under an INT8 main KV).
+            # A quantized indexer, or one whose dtype differs from the main KV
+            # (BF16 under an INT8 main KV), stores its own dtype.
             self.index_k_store_dtype = (
-                self.index_k_kv_dtype
-                if self.indexer_quant or self.index_k_kv_dtype != dtype
+                index_k_dtype
+                if self.indexer_quant or index_k_dtype != dtype
                 else self.store_dtype
             )
             self.index_k_scale_dtype = (
@@ -943,6 +940,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         self._finalize_allocation_log(size)
 
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        """``dsa_kv_cache_store_c8`` under the name the shared DSA pool
+        readers (host pool, routed and hybrid pool wrappers, attention
+        backends) query on every backend."""
+        return self.dsa_kv_cache_store_c8
+
     def _create_buffers(self):
         """Allocate the stacked (layer-first) KV / indexer cache buffers."""
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -964,7 +968,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
                 # Split views share the combined cache allocation.
                 self.k_buffer = self.kv_buffer[..., : self.kv_cache_dim]
-                self.v_buffer = self.kv_buffer[..., self.kv_cache_dim :]
+                if self.dsa_kv_cache_store_c8:
+                    # The packed record holds the rope, so there is no rope
+                    # slice. As in the split layout, MLAProlog gets an empty
+                    # BF16 rope cache, not a view of the one-byte record.
+                    self.v_buffer = torch.zeros(
+                        (*self.kv_buffer.shape[:-1], 0),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                else:
+                    self.v_buffer = self.kv_buffer[..., self.kv_cache_dim :]
             else:
                 self.k_buffer = torch.zeros(
                     (
@@ -987,7 +1001,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     dtype=(
                         torch.bfloat16
-                        if self.dsa_kv_cache_store_fp8
+                        if self.dsa_kv_cache_store_c8
                         else self.rope_dtype
                     ),
                     device=self.device,
@@ -1067,7 +1081,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 for buffer in (self.k_buffer, self.index_k_buffer)
                 if buffer is not None
             ),
-            packed_fp8=self.dsa_kv_cache_store_fp8,
+            packed_fp8=self.dsa_kv_cache_store_c8,
         )
 
     def _mla_native_buffers(self):
@@ -1214,9 +1228,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
-        if self.index_k_store_dtype != self.index_k_kv_dtype:
+        # Only an indexer that follows the main KV's byte store is viewed back
+        # to the KV dtype; one with its own dtype is returned as stored.
+        if self.index_k_store_dtype == self.store_dtype != self.dtype:
             return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.index_k_kv_dtype
+                self.dtype
             )
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
@@ -1264,7 +1280,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             (buffer, global_kv, layer_id)
             for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
         ]
-        if not self.dsa_kv_cache_store_fp8:
+        if not self.dsa_kv_cache_store_c8:
             entries += [
                 (buffer, global_kv, layer_id)
                 for buffer, layer_id in zip(self.v_buffer, kv_layer_ids, strict=True)
@@ -1346,7 +1362,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -1459,12 +1475,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             assert index_k.dtype == self.index_k_store_dtype, (
                 f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
             )
+        elif self.index_k_store_dtype != self.store_dtype:
+            # The indexer stores its own dtype, not the main KV's (BF16 under
+            # an INT8 main KV).
+            index_k = index_k.to(self.index_k_store_dtype)
         else:
-            if index_k.dtype != self.index_k_kv_dtype:
-                index_k = index_k.to(self.index_k_kv_dtype)
+            if index_k.dtype != self.dtype:
+                index_k = index_k.to(self.dtype)
 
-            if self.index_k_store_dtype != self.index_k_kv_dtype:
-                index_k = index_k.view(self.index_k_store_dtype)
+            if self.store_dtype != self.dtype:
+                index_k = index_k.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
@@ -1511,7 +1531,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
             if self.index_k_scale_buffer is not None:
                 buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             # Retraction copies opaque records; byte views also avoid FP8
             # advanced-indexing restrictions, without decoding/requantizing.
             buffers = [

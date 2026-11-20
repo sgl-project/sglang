@@ -219,7 +219,7 @@ class TestNpuMlaPoolLayout(CustomTestCase):
         """The INT8 indexer recipe stacks on the packed INT8 record: PD moves
         K (656 B rows), INT8 index K (128 B rows) and FP16 scales (2 B rows)."""
         pool = _build_pool(INT8, arch35=False, indexer_quant_mode=QUANT_MODE_TOKEN_INT8)
-        self.assertTrue(pool.dsa_kv_cache_store_fp8)
+        self.assertTrue(pool.dsa_kv_cache_store_c8)
         self.assertEqual(pool.k_buffer.dtype, INT8)
         self.assertEqual(pool.index_k_buffer.dtype, INT8)
         self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
@@ -258,6 +258,66 @@ class TestNpuMlaPoolLayout(CustomTestCase):
                 pool = _build_pool(dtype, start_layer=4, **kwargs)
                 self.assertLayerIdsAlign(pool, expected)
 
+    def test_combined_packed_buffer_gives_a_bf16_rope_placeholder(self):
+        """A combined buffer holds only the packed record. As in the split
+        layout, the rope cache handed to MLAProlog is an empty BF16 tensor,
+        not a zero-width view of the one-byte record."""
+        for dtype, arch35 in ((INT8, False), (FP8, True)):
+            with self.subTest(dtype=dtype):
+                pool = _build_pool(dtype, arch35=arch35, use_combined_kv_buffer=True)
+                # Shared readers query the C8 flag under its FP8-era name.
+                self.assertTrue(pool.dsa_kv_cache_store_c8)
+                self.assertTrue(pool.dsa_kv_cache_store_fp8)
+                self.assertEqual(pool.kv_buffer.shape[-1], PACKED_KV_CACHE_DIM)
+                k_cache, v_cache = pool.get_kv_buffer(0)
+                self.assertEqual(k_cache.dtype, dtype)
+                self.assertEqual(v_cache.dtype, torch.bfloat16)
+                self.assertEqual(v_cache.shape, (*k_cache.shape[:-1], 0))
+                # PD still moves only the combined record, one entry per layer.
+                self.assertLayerIdsAlign(pool, [0, 1])
+
+    def test_combined_unpacked_buffer_keeps_its_rope_slice(self):
+        """Without the packed record, the combined buffer's rope cache stays
+        a slice of the shared allocation."""
+        pool = _build_pool(torch.bfloat16, use_combined_kv_buffer=True)
+        self.assertEqual(pool.k_buffer.shape[-1], KV_LORA_RANK)
+        self.assertEqual(pool.v_buffer.shape[-1], QK_ROPE_HEAD_DIM)
+        self.assertEqual(
+            pool.v_buffer.data_ptr(), pool.kv_buffer[..., KV_LORA_RANK:].data_ptr()
+        )
+
+    def test_index_k_reads_and_writes_in_the_indexer_dtype(self):
+        """The indexer K cache is read and written in its own dtype; only an
+        indexer kept in the main KV's byte store (FP8 E5M2 as uint8) is viewed
+        back to the KV dtype."""
+        bf16, e5m2 = torch.bfloat16, torch.float8_e5m2
+        cases = (
+            # (kv dtype, arch35, indexer recipe, read dtype, stored dtype)
+            (bf16, False, None, bf16, bf16),
+            (bf16, False, QUANT_MODE_TOKEN_INT8, INT8, INT8),
+            (INT8, False, None, bf16, bf16),
+            (INT8, False, QUANT_MODE_TOKEN_INT8, INT8, INT8),
+            (FP8, True, None, FP8, FP8),
+            (e5m2, False, None, e5m2, torch.uint8),
+            (e5m2, False, QUANT_MODE_TOKEN_INT8, INT8, INT8),
+        )
+        for dtype, arch35, recipe, read_dtype, stored_dtype in cases:
+            with self.subTest(dtype=dtype, recipe=recipe):
+                pool = _build_pool(dtype, arch35=arch35, indexer_quant_mode=recipe)
+                self.assertEqual(pool.index_k_buffer.dtype, stored_dtype)
+                self.assertEqual(pool.get_index_k_buffer(0).dtype, read_dtype)
+                torch_npu = MagicMock(name="torch_npu")
+                with patch.object(memory_pool_npu, "torch_npu", torch_npu, create=True):
+                    pool.set_index_k_buffer(
+                        0,
+                        torch.tensor([1, 2]),
+                        torch.zeros(
+                            2, INDEX_HEAD_DIM, dtype=bf16 if recipe is None else INT8
+                        ),
+                    )
+                written = torch_npu.npu_scatter_nd_update_.call_args.args[2]
+                self.assertEqual(written.dtype, stored_dtype)
+
     def test_dsa_pool_rejects_fp8_on_a2(self):
         """A pool built without the configurator's check still refuses the
         unpacked FP8 layout that sparse attention would read as packed."""
@@ -273,6 +333,7 @@ class TestNpuMlaPoolLayout(CustomTestCase):
         for kwargs in ({}, {"modelslim_cache_layout": layout}):
             with self.subTest(kwargs=kwargs):
                 pool = _build_pool(FP8, index_head_dim=None, **kwargs)
+                self.assertFalse(pool.dsa_kv_cache_store_c8)
                 self.assertFalse(pool.dsa_kv_cache_store_fp8)
                 self.assertEqual(pool.k_buffer.shape[-1], KV_LORA_RANK)
                 self.assertEqual(pool.v_buffer.shape[-1], QK_ROPE_HEAD_DIM)
