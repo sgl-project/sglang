@@ -11,11 +11,13 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import (
+    aligned_new_empty,
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.attention.deep_select import get_input_stride_alignment_bytes
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .topk import plan_topk_v2, topk_transform_paged_v2
@@ -137,9 +139,13 @@ def amax_topk_blocks(
     # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2
     plan = plan_topk_v2(nblocks)
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
-    # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
-    keys = logits.new_empty(
-        rows, -(-max_seq_len // (4 * block)) * 4, dtype=torch.float32
+    # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0,
+    # DeepSelect under SGLANG_ENABLE_DETERMINISTIC_SPARSE_TOPK rows of 128 bytes)
+    keys = aligned_new_empty(
+        (rows, -(-max_seq_len // (4 * block)) * 4),
+        torch.float32,
+        logits.device,
+        alignment_bytes=get_input_stride_alignment_bytes(),
     )
     amax8_varlen(logits, seq_lens, out=keys)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
