@@ -379,7 +379,9 @@ def build_tree_kernel_efficient_func(
     tree_mask_mode: TreeMaskMode,
 ) -> None:
     if _is_npu:
-        torch.ops.npu.build_tree_kernel_efficient(
+        from sgl_kernel_npu.operators.speculative import build_tree
+
+        build_tree(
             parent_list.to(dtype=torch.int64),
             top_scores_index,
             seq_lens,
@@ -527,7 +529,7 @@ def verify_tree_greedy_func(
                 verify_ngram_tree_greedy as verify_tree_greedy,
             )
         else:
-            from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
+            from sgl_kernel_npu.operators.speculative import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,

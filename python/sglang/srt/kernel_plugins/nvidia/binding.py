@@ -536,9 +536,7 @@ def _ragged_verify(cfg: Any) -> bool:
 FEATURE_PROBES = {
     Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
     Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
-    Feature.DP_ATTENTION: lambda c: (
-        bool(c.enable_dp_attention) or (c.attn_dp_size or 1) > 1
-    ),
+    Feature.DP_ATTENTION: lambda c: (c.attn_dp_size or 1) > 1,
     Feature.EXPERT_PARALLEL: lambda c: (c.ep_size or 1) > 1,
     Feature.EPLB: lambda c: bool(c.enable_eplb),
     Feature.CONTEXT_PARALLEL: lambda c: (
@@ -725,7 +723,6 @@ def _kimi_build_widths(
         == parallel.attn_cp_size
         == parallel.dcp_size
         == 1
-        and not parallel.enable_dp_attention
         and disagg.disaggregation_mode == "null"
         and not disagg.enable_pd_role_switch
         and graph is not None

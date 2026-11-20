@@ -41,7 +41,8 @@ class TestAscendWarmups(CustomTestCase):
             "0.8",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
         cls.out_log_file = open("./out_log.txt", "w+", encoding="utf-8")
         cls.err_log_file = open("./err_log.txt", "w+", encoding="utf-8")

@@ -204,6 +204,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     )
     try:
         results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        if results is None:
+            raise RuntimeError("Generation produced no results. See the errors above.")
 
         prompt = sampling_params_kwargs.get("prompt")
         maybe_dump_performance(args, server_args, prompt, results)

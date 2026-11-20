@@ -107,6 +107,17 @@ message OptionalStringList {
   repeated OptionalString items = 1;
 }
 
+// A nullable double list element (e.g. a completion token logprob).
+message OptionalDouble {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional double value = 1;
+}
+
+message DoubleList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated double items = 1;
+}
+
 message OptionalInt64 {
   option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
   optional int64 value = 1;

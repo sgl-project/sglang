@@ -286,6 +286,8 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Like token_ids_logprob, but one list of token ids per scored input position.
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
@@ -673,6 +675,10 @@ class GenerateReqInput:
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
+        if self.token_ids_logprob_rows is not None:
+            raise ValueError(
+                "token_ids_logprob_rows scores one input_ids sequence per request."
+            )
         # Calculate expanded batch size
         if self.parallel_sample_num == 1:
             num = self.batch_size
@@ -1315,6 +1321,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
+    # See GenerateReqInput.token_ids_logprob_rows.
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -2653,6 +2661,15 @@ class FreezeGCReq(BaseReq, kw_only=True):
     gc_threshold: Optional[List[int]] = None
 
 
+class ControlAckOutput(BaseReq, kw_only=True):
+    """The reply for a control request whose handler returns nothing
+    (pause/continue generation, freeze_gc, configure_logging, close_session).
+    Sent only to the Rust frontend, which waits for one reply per control
+    request; the Python TokenizerManager fire-and-forgets these."""
+
+    success: bool = True
+
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
@@ -2735,7 +2752,7 @@ class ParseFunctionCallReq(BaseReq, kw_only=True):
         default_factory=list
     )  # A list of available function tools (name, parameters, etc.).
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # Specify the parser type, e.g. 'llama3', 'qwen', or 'mistral'. If not specified, tries all.
     )
 
 

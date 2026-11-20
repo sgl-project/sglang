@@ -173,6 +173,7 @@ NIGHTLY_SUITES = {
         "nightly-test-8-gpu-amd-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro",
         "nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark",
+        "nightly-accuracy-test-8-gpu-amd-mi35x-muse-spark-mmmu",
         "nightly-test-8-gpu-amd-mi35x-qwen38-mxfp4",
         "nightly-test-8-gpu-amd-mi35x-glm53-flash",
         "nightly-accuracy-test-8-gpu-amd-glm53",

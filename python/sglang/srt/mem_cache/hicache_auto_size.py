@@ -120,7 +120,11 @@ def auto_size_hicache(
     """
     fraction = get_memory().hicache_host_memory_fraction
     if not enabled or fraction is None:
-        yield
+        from sglang.srt.mem_cache.pool_host.rocm_budget import explicit_size_scope
+
+        # gfx950 pins only its TTM share: book explicit sizes against it; else no-op
+        with explicit_size_scope(enabled):
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
