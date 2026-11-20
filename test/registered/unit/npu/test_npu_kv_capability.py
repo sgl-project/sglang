@@ -760,6 +760,48 @@ class TestPackedKvWriteAndSparseRead(_MockedNpuOpsTestCase):
                 self.assertEqual(key.dtype, dtype)
                 self.assertEqual(key.shape[-1], PACKED_KV_CACHE_DIM)
 
+    def test_write_and_read_derive_from_the_pool_quant_block_size(self):
+        """The record-width check, the packer's tile and scale columns and the
+        sparse read's tile_size all derive from ``quant_block_size`` (default
+        128): a pool with another tile packs and reads a wider record."""
+        self.assertEqual(self.pool.quant_block_size, 128)
+
+        class _Tile64Pool(memory_pool_npu.NPUMLATokenToKVPool):
+            quant_block_size = 64
+
+        dim64 = KV_LORA_RANK + KV_LORA_RANK // 64 * 4 + QK_ROPE_HEAD_DIM * 2
+        capability = resolve_kv_capability(
+            kv_cache_dtype=INT8, is_arch35=False, soc_name="x"
+        )
+        parallel = SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0)
+        with (
+            get_context().override_server_args(enable_hierarchical_cache=False),
+            patch.object(memory_pool_npu, "get_parallel", return_value=parallel),
+        ):
+            pool = _Tile64Pool(
+                16,
+                page_size=4,
+                dtype=INT8,
+                kv_lora_rank=KV_LORA_RANK,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                index_head_dim=INDEX_HEAD_DIM,
+                index_size=16,
+                start_layer=0,
+                end_layer=2,
+                indexer_layer_ids=None,
+                kv_cache_dim=dim64,
+                kv_capability=capability,
+            )
+        quant_attn, _ = self._decode(pool)
+        latent = self.torch_npu.npu_dynamic_quant.call_args.args[0]
+        self.assertEqual(latent.shape[-1], 64)
+        written = self.torch_npu.npu_scatter_nd_update_.call_args.args[2]
+        self.assertEqual(written.shape[-1], dim64)
+        self.assertEqual(quant_attn.call_args.kwargs["tile_size"], 64)
+
     def _decode(self, pool):
         backend = object.__new__(AscendAttnBackend)
         backend.kv_lora_rank = KV_LORA_RANK

@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.kv_capability import DSA_KV_QUANT_BLOCK_SIZE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -434,6 +435,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_quant_sparse_flash_attention,
             )
 
+            # The DCP read (dsa_dcp) passes no tile_size.
             self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
@@ -1958,7 +1960,10 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=3,
             attention_mode=2,
             quant_scale_repo_mode=1,
-            tile_size=128,
+            # The pool's record tile, with a fallback for pool objects
+            # that do not carry the attribute.
+            tile_size=getattr(self.token_to_kv_pool, "quant_block_size", None)
+            or DSA_KV_QUANT_BLOCK_SIZE,
             rope_head_dim=self.qk_rope_head_dim,
         )
 

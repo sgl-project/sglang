@@ -16,6 +16,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Quantization block ("tile") of the packed DSA KV record: the latent is
+# quantized DSA_KV_QUANT_BLOCK_SIZE elements at a time, one FP32 scale per
+# block. It is the tile_size MLAProlog writes with and the sparse-attention
+# read takes; 128 is the only value the NPU operators validate today.
+DSA_KV_QUANT_BLOCK_SIZE = 128
+
 _NPU_NON_ARCH35_KV_CACHE_DTYPES = (
     "bf16, bfloat16, int8, or auto with a non-FP8 checkpoint"
 )
@@ -25,7 +31,7 @@ _NPU_ARCH35_KV_CACHE_DTYPES = "bf16, bfloat16, fp8_e4m3, or auto"
 class PackedQuantKvCapability(msgspec.Struct, frozen=True, kw_only=True):
     kv_cache_dtype: torch.dtype
     # Main MLA KV is stored as one packed record per token:
-    # quantized latent | bf16 rope | per-128-tile scales.
+    # quantized latent | bf16 rope | per-tile scales (DSA_KV_QUANT_BLOCK_SIZE).
     main_kv_packed: bool
     main_kv_scale_dtype: Optional[torch.dtype]
     # The DSA indexer K cache is quantized with a per-token scale buffer.

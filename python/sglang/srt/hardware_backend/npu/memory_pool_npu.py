@@ -6,6 +6,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.kv_capability import (
+    DSA_KV_QUANT_BLOCK_SIZE,
     PackedQuantKvCapability,
     resolve_npu_kv_capability,
 )
@@ -719,6 +720,13 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 class NPUMLATokenToKVPool(MLATokenToKVPool):
     rows_are_dcp_collapsed = False
 
+    # Quantization tile of the packed one-byte DSA record, under the name the
+    # CUDA DSATokenToKVPool exposes (pool wrappers forward it). The packer,
+    # the record-width check, MLAProlog's tile_size and the packed sparse read
+    # derive from it (the DCP read passes no tile_size); 128 is the only value
+    # the NPU operators validate today.
+    quant_block_size: int = DSA_KV_QUANT_BLOCK_SIZE
+
     def __init__(
         self,
         size: int,
@@ -823,10 +831,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         if self.dsa_kv_cache_store_c8:
             assert dtype.itemsize == 1
-            assert index_head_dim == 128 and kv_lora_rank % 128 == 0
+            assert index_head_dim == 128
+            assert kv_lora_rank % self.quant_block_size == 0
             assert kv_cache_dim == (
                 kv_lora_rank
-                + kv_lora_rank // 128 * kv_capability.main_kv_scale_dtype.itemsize
+                + kv_lora_rank
+                // self.quant_block_size
+                * kv_capability.main_kv_scale_dtype.itemsize
                 + qk_rope_head_dim * 2
             ), f"packed DSA KV cache needs kv_cache_dim, got {kv_cache_dim}"
             self.store_dtype = dtype
@@ -1332,7 +1343,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _pack_dsa_quant_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)
         quantized, scale = torch_npu.npu_dynamic_quant(
-            latent.reshape(-1, 128), dst_type=self.dtype
+            latent.reshape(-1, self.quant_block_size), dst_type=self.dtype
         )
         rows = latent.shape[0]
         # Opaque record: quantized latent | rope BF16 bytes | per-tile FP32 scales.
@@ -1344,7 +1355,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 .contiguous()
                 .view(torch.uint8),
                 scale.to(torch.float32)
-                .reshape(rows, self.kv_lora_rank // 128)
+                .reshape(rows, self.kv_lora_rank // self.quant_block_size)
                 .contiguous()
                 .view(torch.uint8),
             ),
