@@ -65,7 +65,11 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     read_gguf_tensor_meta,
     remap_gguf_tensor_meta,
 )
+from sglang.multimodal_gen.runtime.loader.ideogram_weights import (
+    inspect_ideogram_safetensors,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
     checkpoint_bytes,
     get_param_names_mapping,
     initialize_model,
@@ -658,6 +662,19 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         local_torch_device = get_local_torch_device()
         quant_config = model_config.quant_config
         param_dtype = PRECISION_TO_TYPE[dtype]
+        if (
+            "IdeogramQwen3VLTextEncoder" in model_config.arch_config.architectures
+            and not model_config.arch_config.ideogram_bnb_4bit_weight_only
+            and quant_config is None
+        ):
+            weight_files = _list_safetensors_files(
+                model_path, index_file=SAFE_WEIGHTS_INDEX_NAME
+            )
+            try:
+                layout = inspect_ideogram_safetensors(weight_files)
+            except ValueError as error:
+                raise ComponentCheckpointUnsupportedError(str(error)) from error
+            model_config.arch_config.ideogram_fp8_weight_only = layout == "fp8"
         if quant_config is not None:
             if param_dtype not in quant_config.get_supported_act_dtypes():
                 raise ValueError(

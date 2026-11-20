@@ -1284,3 +1284,93 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("layout", ["fp8", "bf16", "missing_scale", "bitsandbytes"])
+def test_ideogram_checkpoint_layout_before_construction(tmp_path, monkeypatch, layout):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.configs.models.encoders.ideogram import (
+        Ideogram4TextEncoderConfig,
+    )
+    from sglang.multimodal_gen.runtime.loader.component_loaders import (
+        text_encoder_loader as module,
+    )
+
+    config = Ideogram4TextEncoderConfig()
+    if layout == "bitsandbytes":
+        config.arch_config.quantization_config = {
+            "quant_method": "bitsandbytes",
+            "load_in_4bit": True,
+        }
+    config.post_diffusers_config_update()
+    weights = {
+        "language_model.layers.0.self_attn.q_proj.weight": torch.zeros(4, 8).to(
+            torch.bfloat16 if layout == "bf16" else torch.float8_e4m3fn
+        )
+    }
+    if layout == "fp8":
+        weights["language_model.layers.0.self_attn.q_proj.weight_scale"] = torch.ones(4)
+    save_file(weights, str(tmp_path / "model.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "model.safetensors" for name in weights}})
+    )
+    save_file(
+        {"unused.weight": torch.zeros(2, 2)}, str(tmp_path / "unused.safetensors")
+    )
+    initialize = mock.Mock(side_effect=RuntimeError("stop at construction"))
+    monkeypatch.setattr(module, "initialize_model", initialize)
+    monkeypatch.setattr(module, "get_local_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(module, "get_folding_tp_group", lambda config: None)
+    monkeypatch.setattr(
+        module, "use_tensor_parallel_group", lambda group: nullcontext()
+    )
+    if layout == "bitsandbytes":
+        monkeypatch.setattr(
+            module,
+            "inspect_ideogram_safetensors",
+            mock.Mock(side_effect=AssertionError("must preserve bitsandbytes loading")),
+        )
+    server_args = SimpleNamespace(
+        pipeline_config=None,
+        require_component_resident=mock.Mock(),
+        should_start_component_on_cpu=lambda name: False,
+    )
+    expected = "missing scale" if layout == "missing_scale" else "stop at construction"
+    error_type = (
+        ComponentCheckpointUnsupportedError
+        if layout == "missing_scale"
+        else RuntimeError
+    )
+    with pytest.raises(error_type, match=expected):
+        TextEncoderLoader().load_model(str(tmp_path), config, server_args, dtype="bf16")
+    if layout == "missing_scale":
+        initialize.assert_not_called()
+    else:
+        initialize.assert_called_once()
+        assert config.arch_config.ideogram_fp8_weight_only == (layout == "fp8")
+        assert initialize.call_args.args[2] == torch.bfloat16
+
+        if layout in ("fp8", "bf16"):
+            from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+                WeightOnlyFP8Linear,
+            )
+            from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
+                IdeogramQwen3VLTextEncoder,
+            )
+
+            config.arch_config.text_config = {
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 4,
+            }
+            monkeypatch.setattr("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
+            with torch.device("meta"):
+                model = IdeogramQwen3VLTextEncoder(config)
+            linear = model.language_model.layers[0].self_attn.q_proj
+            assert isinstance(linear, WeightOnlyFP8Linear) == (layout == "fp8")
+            assert (linear.weight.dtype == torch.float8_e4m3fn) == (layout == "fp8")

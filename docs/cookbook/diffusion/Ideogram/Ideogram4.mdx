@@ -49,6 +49,22 @@ Choose NF4 when memory is the primary constraint, FP8/NVFP4 for supported accele
 
 The fal repositories contain only the transformer component. When either model ID is passed directly to `--model-path`, SGLang loads the text encoder, tokenizer, VAE, and scheduler from the `ideogram-ai/ideogram-4-nf4-diffusers` revision referenced by fal's model cards, then runs the distilled transformer without the unconditional branch.
 
+### BF16 checkpoints
+
+You can use BF16-repackaged base Ideogram 4 weights in a local model directory
+that retains the matching pipeline configuration, tokenizer, scheduler, and VAE.
+Select the prepared directory with `--model-path`.
+
+SGLang inspects the safetensors headers of the transformer and text encoder
+independently before constructing their linear layers. A component whose tensors
+are all stored in BF16 uses ordinary floating-point linear layers. The official
+FP8 format uses weight-only FP8 linear layers and requires a row-wise
+`.weight_scale` tensor for each FP8 weight. The loader rejects unsupported
+layouts and missing or malformed scales before model construction.
+
+You can also select component weight files or directories through the
+[component checkpoint options](/docs/sglang-diffusion/quantization#quick-reference).
+
 ## 3. Serve the model
 
 NF4:
