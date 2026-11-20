@@ -130,11 +130,25 @@ class Inkling2AttnResState(msgspec.Struct):
             scaled_queries=self.attn_res.scaled_query("attn", layer_idx),
         )
 
-    def mlp_input(self, layer_idx: int, attn_output: torch.Tensor) -> torch.Tensor:
+    def mlp_input(
+        self,
+        layer_idx: int,
+        attn_output: torch.Tensor,
+        rows: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """The MoE input of every token, or of the (start, count) `rows`."""
         if self.attn_res.is_block_boundary(layer_idx):
             blocks, partial = [*self.blocks, self.partial], attn_output
         else:
             blocks, partial = self.blocks, (self.partial, attn_output)
+        if rows is not None:
+            window = slice(rows[0], rows[0] + rows[1])
+            blocks = [block[window] for block in blocks]
+            partial = (
+                tuple(source[window] for source in partial)
+                if isinstance(partial, tuple)
+                else partial[window]
+            )
         return block_attn_res(
             blocks,
             partial,
