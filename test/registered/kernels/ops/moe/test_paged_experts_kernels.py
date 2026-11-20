@@ -1372,8 +1372,6 @@ class TestFusedHostCopyTriton(CustomTestCase):
     _run = TestCompactedTritonCalls._run
 
     def setUp(self):
-        from sglang.kernels.ops.moe.fused_moe_triton_host_copy import HOST_COPIES
-
         torch.manual_seed(0)
         hidden, inter = 256, 128
         self.layer = _Layer(
@@ -1387,18 +1385,20 @@ class TestFusedHostCopyTriton(CustomTestCase):
             }
         )
         self.x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
-        self.host_copies = HOST_COPIES
 
-    def _register(self, state):
-        # What PagedExpertsMoEMethod._fuse_host_copy_triton does, keyed by slot table address.
-        for n in ("w13", "w2"):
-            ptr = self.layer.slots[n].data_ptr()
-            self.host_copies[ptr] = (
-                self.layer.store.host[n],
-                state.expert_slot,
-                state.count,
+    def _paged_expert_info(self, state):
+        # What PagedExpertsMoEMethod._fuse_host_copy puts on the layer's runner config.
+        w13, w2 = (
+            dict(
+                host_table=self.layer.store.host[n],
+                expert_slot=state.expert_slot,
+                missing_expert_count=state.count,
             )
-            self.addCleanup(self.host_copies.pop, ptr, None)
+            for n in ("w13", "w2")
+        )
+        paged_expert_info = torch.empty(0, device="cuda")
+        paged_expert_info.info = (w13, w2)
+        return {"paged_expert_info": paged_expert_info}
 
     def _copy_then_compute(self, topk, weights):
         state = _State()
@@ -1417,7 +1417,6 @@ class TestFusedHostCopyTriton(CustomTestCase):
 
     def _fused(self, topk, weights):
         state = _State()
-        self._register(state)
         ids, w = state.decide(topk.flatten(), weights.flatten(), host_ids=True)
         self.layer.reset()
         out = self._run(
@@ -1426,7 +1425,7 @@ class TestFusedHostCopyTriton(CustomTestCase):
             self.layer.slots["w2"],
             ids.view(topk.shape),
             w.view(topk.shape),
-            {},
+            self._paged_expert_info(state),
         )
         return out, state
 
@@ -1437,7 +1436,6 @@ class TestFusedHostCopyTriton(CustomTestCase):
                 weights = torch.rand(topk.shape, device="cuda")
                 want, _ = self._copy_then_compute(topk, weights)
                 got, state = self._fused(topk, weights)
-                self.host_copies.clear()  # the copy-then-compute call below must not see it
                 self.assertTrue(torch.equal(got, want))
                 self.layer.assert_slots_hold(self, state)
 
@@ -1463,9 +1461,7 @@ class TestFusedHostCopyTriton(CustomTestCase):
         self.layer.gather(state)
         want = self._run(x, w13, w2, slot_ids, weights, {})
         self.layer.reset()
-        self._register(state)
-        got = self._run(x, w13, w2, fused_ids, weights, {})
-        self.host_copies.clear()
+        got = self._run(x, w13, w2, fused_ids, weights, self._paged_expert_info(state))
         self.assertTrue(torch.equal(got, want))
         self.layer.assert_slots_hold(self, state)
 
@@ -1473,7 +1469,7 @@ class TestFusedHostCopyTriton(CustomTestCase):
         """decide + fused MoE captured once, replayed on new routings: each replay matches
         copy-then-compute and leaves every slot holding its expert."""
         state = _State()
-        self._register(state)
+        paged_expert_info = self._paged_expert_info(state)
         topk = torch.zeros(4, 2, dtype=torch.int32, device="cuda")
         weights = torch.ones(4, 2, device="cuda")
 
@@ -1485,7 +1481,7 @@ class TestFusedHostCopyTriton(CustomTestCase):
                 self.layer.slots["w2"],
                 ids.view(4, 2),
                 w.view(4, 2),
-                {},
+                paged_expert_info,
             )
 
         step()  # warm up (compiles) outside the capture
@@ -1504,8 +1500,6 @@ class TestFusedHostCopyTriton(CustomTestCase):
             # Every routed expert is now resident: the MoE kernel on slot ids, without the host copy,
             # must agree.
             slot_ids = state.expert_slot[topk.long()]
-            saved = dict(self.host_copies)
-            self.host_copies.clear()
             want = self._run(
                 self.x,
                 self.layer.slots["w13"],
@@ -1514,7 +1508,6 @@ class TestFusedHostCopyTriton(CustomTestCase):
                 weights,
                 {},
             )
-            self.host_copies.update(saved)
             self.assertTrue(torch.equal(out, want))
 
 
@@ -1588,23 +1581,24 @@ class TestFusedHostCopyMarlin(CustomTestCase):
         self.x = torch.randn(4, H, device="cuda", dtype=dtype) / 10
         self.workspace = lambda: marlin_make_workspace(self.x.device, 4)
 
-    def _register(self, state):
-        from sglang.kernels.ops.moe.moe_wna16_marlin import HOST_COPIES, HostCopy
-
+    def _paged_expert_info(self, state):
+        # What PagedExpertsMoEMethod._fuse_host_copy puts on the layer's runner config.
         ptr = lambda n: paged_experts_host_device_pointer(self.layer.store.host[n])
-        for w in ("w13_weight", "w2_weight"):
-            key = self.layer.slots[w].data_ptr()
-            HOST_COPIES[key] = HostCopy(
-                weight=ptr(w),
-                scales=ptr(f"{w}_scale"),
-                global_scale=ptr(f"{w}_scale_2"),
-                num_experts=E,
+        w13, w2 = (
+            dict(
+                host_weight_address=ptr(w),
+                host_scales_address=ptr(f"{w}_scale"),
+                host_global_scale_address=ptr(f"{w}_scale_2"),
                 expert_slot=state.expert_slot,
-                count=state.count,
+                missing_expert_count=state.count,
             )
-            self.addCleanup(HOST_COPIES.pop, key, None)
+            for w in ("w13_weight", "w2_weight")
+        )
+        paged_expert_info = torch.empty(0, device="cuda")
+        paged_expert_info.info = (w13, w2)
+        return paged_expert_info
 
-    def _run(self, ids, weights):
+    def _run(self, ids, weights, paged_expert_info):
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
@@ -1627,11 +1621,10 @@ class TestFusedHostCopyMarlin(CustomTestCase):
             is_k_full=True,
             activation="silu",
             is_gated=True,
+            paged_expert_info=paged_expert_info,
         )
 
     def test_both_paths_match_the_torch_moe(self):
-        from sglang.kernels.ops.moe.moe_wna16_marlin import HOST_COPIES
-
         for name, routing in ROUTINGS.items():
             with self.subTest(routing=name):
                 topk = torch.tensor(routing, dtype=torch.int32, device="cuda")
@@ -1639,11 +1632,13 @@ class TestFusedHostCopyMarlin(CustomTestCase):
                 ref = _torch_moe(self.x, self.ref13, self.ref2, topk, weights)
 
                 fused = _State()
-                self._register(fused)
                 ids, w = fused.decide(topk.flatten(), weights.flatten(), host_ids=True)
                 self.layer.reset()
-                fused_out = self._run(ids.view(topk.shape), w.view(topk.shape))
-                HOST_COPIES.clear()
+                fused_out = self._run(
+                    ids.view(topk.shape),
+                    w.view(topk.shape),
+                    self._paged_expert_info(fused),
+                )
 
                 torch.testing.assert_close(fused_out, ref, atol=5e-2, rtol=0)
                 self.layer.assert_slots_hold(self, fused)

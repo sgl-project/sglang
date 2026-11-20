@@ -12,9 +12,9 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.numerics import silu_approx_f32
 from sglang.kernels.ops.moe.fused_moe_triton_host_copy import (
-    host_copy_block,
-    host_copy_dot,
-    host_copy_kwargs,
+    matmul_with_host_expert,
+    paged_expert_kernel_kwargs,
+    spread_missing_expert_blocks,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -385,10 +385,10 @@ def fused_moe_kernel(
     SWIGLU_LIMIT: tl.constexpr = 0.0,
     HAS_SWIGLU_ALPHA: tl.constexpr = False,
     # Paged experts, fused host copy (fused_moe_triton_host_copy.py); off without b_host_ptr.
-    HOST_SLOTS: tl.constexpr = 0,
+    HOST_IDS_START: tl.constexpr = 0,
     b_host_ptr=None,
     expert_slot_ptr=None,
-    host_count_ptr=None,
+    missing_expert_count_ptr=None,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -450,8 +450,8 @@ def fused_moe_kernel(
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if b_host_ptr is not None:
-        pid_m = host_copy_block(
-            pid_m, num_tokens_post_padded, host_count_ptr, BLOCK_SIZE_M
+        pid_m = spread_missing_expert_blocks(
+            pid_m, num_tokens_post_padded, missing_expert_count_ptr, BLOCK_SIZE_M
         )
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
@@ -563,7 +563,7 @@ def fused_moe_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     if b_host_ptr is not None:
-        accumulator, K = host_copy_dot(
+        accumulator, K = matmul_with_host_expert(
             accumulator,
             a_ptrs,
             token_mask,
@@ -578,7 +578,7 @@ def fused_moe_kernel(
             stride_be,
             stride_bk,
             stride_bn,
-            HOST_SLOTS,
+            HOST_IDS_START,
             BLOCK_SIZE_K,
             even_Ks,
         )
@@ -868,6 +868,9 @@ def invoke_fused_moe_kernel(
     a_output_slices: int = 1,
     swiglu_alpha: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    # Paged experts, fused host copy (fused_moe_triton_host_copy.py): for B, its experts in
+    # pinned host memory, the layer's expert -> slot table and its count of missing experts.
+    paged_expert_info: Optional[dict] = None,
 ) -> None:
     """Skip inactive experts, including with filter_expert=False.
 
@@ -1024,6 +1027,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
+        assert paged_expert_info is None, (
+            "--paged-experts-fused-host-copy is not supported for GPTQ/AWQ kernels"
+        )
         group_size = block_shape[1]
         num_groups = triton.cdiv(A.shape[1], group_size)
         if B_scale.shape[2] != num_groups:
@@ -1100,9 +1106,13 @@ def invoke_fused_moe_kernel(
             if is_arch_support_pdl()
             else {}
         )
-        host_kwargs = host_copy_kwargs(
-            B=B,
-            plain=not b_use_tma and bias is None and B_scale is None and not swap_ab,
+        if paged_expert_info is not None:
+            assert not b_use_tma and bias is None and B_scale is None and not swap_ab, (
+                "--paged-experts-fused-host-copy supports only unquantized weights, "
+                "without bias, TMA or swapped operands"
+            )
+        paged_expert_kwargs = paged_expert_kernel_kwargs(
+            B=B, paged_expert_info=paged_expert_info
         )
         fused_moe_kernel[grid](
             A,
@@ -1159,7 +1169,7 @@ def invoke_fused_moe_kernel(
             SWIGLU_ALPHA=float(swiglu_alpha or 0.0),
             SWIGLU_LIMIT=float(swiglu_limit or 0.0),
             HAS_SWIGLU_ALPHA=swiglu_alpha is not None,
-            **host_kwargs,
+            **paged_expert_kwargs,
             **pdl_kwargs,
             **config,
         )

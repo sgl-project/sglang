@@ -176,6 +176,7 @@ class TritonRunnerCore(MoeRunnerCore):
             swiglu_limit=self.config.swiglu_limit,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
             w2_block_shape=quant_info.w2_block_shape,
+            paged_expert_info=self.config.paged_expert_info,
         )
 
         return TritonRunnerOutput(hidden_states=out)
@@ -263,6 +264,7 @@ def fused_experts_none_to_triton(
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
             w2_block_shape=quant_info.w2_block_shape,
+            paged_expert_info=runner_config.paged_expert_info,
         )
 
     return StandardCombineInput(
@@ -312,6 +314,7 @@ def pre_permute_standard_to_triton(
         per_channel_quant=quant_info.per_channel_quant,
         block_shape=quant_info.block_shape,
         w2_block_shape=quant_info.w2_block_shape,
+        paged_expert_info=runner_config.paged_expert_info,
     )
 
     running_state["config"] = config
