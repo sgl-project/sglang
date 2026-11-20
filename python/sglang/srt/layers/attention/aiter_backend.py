@@ -81,6 +81,7 @@ try:
         "equal_seqlen_q" in inspect.signature(unified_attention).parameters
     )
     # aiter before ROCm/aiter#6107 has no fast_mode at launch; its launch plan ignores it.
+    # Drop this probe once every AITER pinned in docker/rocm.Dockerfile includes #6107.
     _mla_decode_fwd_has_fast_mode = (
         "fast_mode" in inspect.signature(mla_decode_fwd).parameters
     )
@@ -216,18 +217,17 @@ _use_fp8_prefill_attn = (
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
-# SGLANG_AITER_MLA_DECODE_BACKEND value that runs decode and target verify on
-# aiter's persistent fp8-query ASM MLA kernel where _fp8_q_asm_mla_skip_reason allows.
+# SGLANG_AITER_MLA_DECODE_BACKEND value for the persistent fp8-query ASM MLA route,
+# taken where _fp8_q_asm_mla_skip_reason allows.
 _MLA_FP8_Q_ASM_DECODE_BACKEND = "asm_fp8q"
 # 2-4 token windows return wrong output at 16 padded heads (ROCm/aiter#7007);
 # 5-8 fold onto aiter's qlen-4 kernel, faster than Gluon on MI355X only past ~128K context.
 _MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
 
 
+# Exactly gfx950 (MI350X/MI355X), not any gfx95x; False off HIP.
 @functools.cache
 def _is_gfx950() -> bool:
-    """Exactly gfx950 (MI350X/MI355X), not any gfx95x: the fp8-Q ASM MLA route's
-    only arch. False off HIP."""
     from sglang.kernels.arch import current_arch
 
     hip = current_arch().hip
@@ -243,7 +243,6 @@ def _fp8_q_asm_mla_skip_reason(
     is_draft_worker: bool,
     verify_qlen: int,
 ) -> Optional[str]:
-    """Why the fp8-query ASM MLA route does not apply here, or None when it does."""
     if not gfx950:
         return "the kernel is gfx950 only"
     if not zero_padded_h12_fp8:
@@ -855,12 +854,11 @@ class AiterAttnBackend(AttentionBackend):
 
         self.dcp_world_size = get_parallel().attn_dcp_size
         mla_decode_backend_choice = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get()
-        # asm_fp8q is asm wherever its fp8-query route does not apply.
         fp8_q_asm_requested = (
             mla_decode_backend_choice.lower() == _MLA_FP8_Q_ASM_DECODE_BACKEND
         )
         self.mla_decode_backend = resolve_aiter_mla_decode_backend(
-            "asm" if fp8_q_asm_requested else mla_decode_backend_choice,
+            mla_decode_backend_choice,
             use_mla=self.use_mla,
             input_dtype=self.input_dtype,
             dcp_world_size=self.dcp_world_size,
@@ -1361,8 +1359,8 @@ class AiterAttnBackend(AttentionBackend):
                     "aiter MLA: aiter plans the KV splits "
                     "(SGLANG_AITER_MLA_AUTO_KV_SPLITS=1)"
                 )
-                # Draft extend reads the module modes; the fp8-Q opt-in alone must not
-                # flip them, it takes its own from _mla_decode_metadata_modes.
+                # Draft extend reads the module modes, so the fp8-Q opt-in must not flip them;
+                # it takes its own from _mla_decode_metadata_modes.
                 if use_module_mla_persist:
                     fast_mode = True
                     intra_batch_mode = False
@@ -1421,8 +1419,7 @@ class AiterAttnBackend(AttentionBackend):
         return "fp8_e4m3"
 
     def _mla_ps_kernel_enabled(self) -> bool:
-        """SGLANG_AITER_MLA_PERSIST, or this instance's fp8-Q opt-in for decode/verify;
-        draft extend reads _use_mla_ps_kernel and keeps the process default."""
+        # Draft extend reads _use_mla_ps_kernel and keeps the process default.
         return _use_mla_ps_kernel or self.use_mla_fp8_q_asm
 
     def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1497,7 +1494,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _mla_decode_metadata_modes(self) -> tuple[bool, bool]:
-        """(fast_mode, intra_batch_mode) for decode and non-cp verify metadata."""
         if self.use_mla_dcp_asm and self.dcp_world_size > 1:
             # Match the AITER/vLLM DCP path: persistent scheduling with the
             # gathered-head tensor folded internally to qh16.
@@ -1511,7 +1507,6 @@ class AiterAttnBackend(AttentionBackend):
     def _mla_verify_metadata_modes(
         self, use_asm_cprr_verify: bool
     ) -> tuple[bool, bool]:
-        """(fast_mode, intra_batch_mode) for target verify metadata."""
         if use_asm_cprr_verify:
             return self.cprr_fast_mode, self.cprr_intra_batch_mode
         return self._mla_decode_metadata_modes()
@@ -4047,7 +4042,6 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and (self._mla_ps_kernel_enabled() or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
