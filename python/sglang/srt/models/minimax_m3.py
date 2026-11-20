@@ -392,6 +392,9 @@ class MiniMaxM3MLP(nn.Module):
         return x
 
 
+_SHARED_OVERLAP_RESERVED_SMS = 16
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
 
@@ -592,6 +595,7 @@ class MiniMaxM3MoE(nn.Module):
             num_tokens=num_tokens,
             activation=self.experts._minimax_activation,
             activation_clamp=self.config.swiglu_limit,
+            min_reserved_num_sms=_SHARED_OVERLAP_RESERVED_SMS if fork_shared else 0,
         )
         return self._add_shared(output, shared, fork_shared)
 

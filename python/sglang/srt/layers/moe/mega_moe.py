@@ -67,8 +67,8 @@ def _mega_moe_mma_type(experts) -> str:
     return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
-@functools.lru_cache(maxsize=1)
-def _mega_moe_max_num_sms() -> Optional[int]:
+@functools.lru_cache(maxsize=4)
+def _mega_moe_max_num_sms(min_reserved_num_sms: int = 0) -> Optional[int]:
     if _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
@@ -77,13 +77,15 @@ def _mega_moe_max_num_sms() -> Optional[int]:
     # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
     # indexer reconfigure that process-wide, so reserving on top would compound.
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+    reserved_num_sms = max(
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), min_reserved_num_sms, 0
+    )
     return max(2, num_sms - reserved_num_sms)
 
 
 @contextmanager
-def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-    max_num_sms = _mega_moe_max_num_sms()
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm, min_reserved_num_sms: int = 0):
+    max_num_sms = _mega_moe_max_num_sms(min_reserved_num_sms)
     if max_num_sms is None:
         yield
         return
@@ -542,8 +544,10 @@ def run_mega_routed_experts(
     routing_in_buffer: bool = False,
     buf: Optional[SymmBuffer] = None,
     eplb_load_row: Optional[torch.Tensor] = None,
+    min_reserved_num_sms: int = 0,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
+    # min_reserved_num_sms: SMs to leave for kernels the caller overlaps on another stream.
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
@@ -693,7 +697,7 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm, min_reserved_num_sms):
         deep_gemm.fp8_fp4_mega_moe(
             y,
             experts.mega_l1_weights,
