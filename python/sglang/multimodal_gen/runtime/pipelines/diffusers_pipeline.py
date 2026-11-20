@@ -21,11 +21,13 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     resolve_diffusers_pipeline_offload,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -64,7 +66,7 @@ class DiffusersExecutionStage(PipelineStage):
         kwargs = self._build_pipeline_kwargs(batch)
 
         # Filter kwargs to only those supported by the pipeline, warn about ignored args
-        kwargs, _ = self._filter_pipeline_kwargs(kwargs)
+        kwargs = self._filter_pipeline_kwargs(kwargs)
 
         # Request tensor output for cleaner handling
         if "output_type" not in kwargs:
@@ -88,29 +90,19 @@ class DiffusersExecutionStage(PipelineStage):
 
         return batch
 
-    def _filter_pipeline_kwargs(
-        self, kwargs: dict[str, Any], *, strict: bool = False
-    ) -> tuple[dict[str, Any], list[str]]:
-        """Filter kwargs to those accepted by the pipeline's __call__.
-
-        Args:
-            kwargs: Arguments to filter
-            strict: If True, raise ValueError on unsupported args; otherwise warn
-
-        Returns:
-            Tuple of (filtered_kwargs, ignored_keys)
-        """
+    def _filter_pipeline_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Filter kwargs to those accepted by the pipeline's __call__, warning about the rest."""
         try:
             sig = inspect.signature(self.diffusers_pipe.__call__)
         except (ValueError, TypeError):
-            return kwargs, []
+            return kwargs
 
         params = sig.parameters
         accepts_var_kwargs = any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
         if accepts_var_kwargs:
-            return kwargs, []
+            return kwargs
 
         valid = set(params.keys()) - {"self"}
 
@@ -128,11 +120,9 @@ class DiffusersExecutionStage(PipelineStage):
                 f"Pipeline '{pipe_name}' does not support: {', '.join(sorted(ignored))}. "
                 "These arguments will be ignored."
             )
-            if strict:
-                raise ValueError(msg)
             logger.warning(msg)
 
-        return filtered, ignored
+        return filtered
 
     def _extract_output(self, output: Any) -> torch.Tensor | None:
         """Extract tensor output from pipeline result."""
@@ -143,6 +133,7 @@ class DiffusersExecutionStage(PipelineStage):
 
             result = self._convert_to_tensor(data)
             if result is not None:
+                result = self._to_output_layout(result, attr in ("frames", "video"))
                 logger.debug(
                     "Extracted output from '%s': shape=%s, dtype=%s",
                     attr,
@@ -155,7 +146,11 @@ class DiffusersExecutionStage(PipelineStage):
         return None
 
     def _convert_to_tensor(self, data: Any) -> torch.Tensor | None:
-        """Convert various data formats to a tensor."""
+        """Convert various data formats to a channels-first tensor.
+
+        Images come out as (B, C, H, W) and videos as (B, T, C, H, W);
+        _to_output_layout then maps them to the final output layout.
+        """
         if isinstance(data, torch.Tensor):
             return data
 
@@ -163,7 +158,7 @@ class DiffusersExecutionStage(PipelineStage):
             tensor = torch.from_numpy(data).float()
             if tensor.max() > 1.0:
                 tensor = tensor / 255.0
-            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, T, C, H, W)
+            # (B, H, W, C) -> (B, C, H, W), (B, T, H, W, C) -> (B, T, C, H, W)
             if tensor.ndim == 4:
                 tensor = tensor.permute(0, 3, 1, 2)
             elif tensor.ndim == 5:
@@ -206,6 +201,17 @@ class DiffusersExecutionStage(PipelineStage):
 
         return stacked
 
+    @staticmethod
+    def _to_output_layout(tensor: torch.Tensor, is_video: bool) -> torch.Tensor:
+        """Map a channels-first tensor to (B, C, H, W) or (B, C, T, H, W)."""
+        if tensor.dim() == 5:
+            # (B, T, C, H, W) -> (B, C, T, H, W)
+            return tensor.permute(0, 2, 1, 3, 4)
+        if is_video and tensor.dim() == 4:
+            # A single video, (T, C, H, W) -> (1, C, T, H, W)
+            return tensor.permute(1, 0, 2, 3).unsqueeze(0)
+        return tensor
+
     def _postprocess_output(self, output: torch.Tensor) -> torch.Tensor:
         """Post-process output tensor to ensure valid values and correct shape."""
         output = output.cpu().float()
@@ -231,18 +237,9 @@ class DiffusersExecutionStage(PipelineStage):
     def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
         """Fix tensor shape for downstream processing.
 
-        Expected: (B, C, H, W) for images or (B, C, T, H, W) for videos.
+        4D and 5D outputs are already in the final layout from
+        _to_output_layout; this only expands lower-rank images to (B, C, H, W).
         """
-        if output.dim() == 5:
-            # Video: (B, T, C, H, W) -> (B, C, T, H, W)
-            return output.permute(0, 2, 1, 3, 4)
-
-        if output.dim() == 4:
-            if output.shape[0] == 1 or output.shape[1] in [1, 3, 4]:
-                return output  # Already (B, C, H, W)
-            # (T, C, H, W) -> (1, C, T, H, W)
-            return output.unsqueeze(0).permute(0, 2, 1, 3, 4)
-
         if output.dim() == 3:
             c, h, w = output.shape
             if c > 4 and w <= 4:
@@ -534,18 +531,12 @@ class DiffusersPipeline(ComposedPipelineBase):
     def _apply_attention_backend(
         self, pipe: DiffusionPipeline, server_args: ServerArgs
     ) -> None:
-        """Apply attention backend setting from pipeline config or server_args.
+        """Apply the attention backend setting from server_args.
 
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
         backend = server_args.attention_backend
-
-        if backend is None:
-            backend = getattr(
-                server_args.pipeline_config, "diffusers_attention_backend", None
-            )
-
         if backend is None:
             return
 

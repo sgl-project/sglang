@@ -10,7 +10,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -41,7 +41,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = None
         scheduler.tree_cache = None
         scheduler.model_config = types.SimpleNamespace(
-            is_encoder_decoder=False, vocab_size=32
+            is_encoder_decoder=False, vocab_size=32, token_id_vocab_size=32
         )
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)

@@ -6,14 +6,14 @@ import torch
 from sglang.kernels.ops import diffusion
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNormScaleShift,
-    ScaleResidualRMSNormScaleShift,
+    ScaleResidualLayerNormScaleShift,
 )
 
 
 @pytest.mark.parametrize("hidden_size", [257, 8448])
 @pytest.mark.parametrize(
     "layer_cls,num_inputs",
-    [(RMSNormScaleShift, 3), (ScaleResidualRMSNormScaleShift, 5)],
+    [(RMSNormScaleShift, 3), (ScaleResidualLayerNormScaleShift, 5)],
 )
 def test_cuda_falls_back_for_unsupported_hidden_size(
     hidden_size, layer_cls, num_inputs

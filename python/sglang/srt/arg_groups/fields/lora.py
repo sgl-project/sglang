@@ -16,11 +16,35 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
 )
 from sglang.srt.arg_groups.argparse_actions import LoRAPathAction
+from sglang.srt.arg_groups.choices import LORA_BACKEND_CHOICES
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.utils.common import (
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-)
+
+SUPPORTED_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "q_a_proj",
+    "kv_a_proj_with_mqa",
+    "q_b_proj",
+    "kv_b_proj",
+    "wq_b",
+    "wk",
+    "weights_proj",
+    "gate_proj",
+    "self_attn.gate_proj",
+    "up_proj",
+    "down_proj",
+    "qkv_proj",
+    "gate_up_proj",
+    "embed_tokens",
+    "lm_head",
+    # Inkling attention projections (merged q/k/v/r and its row-parallel output).
+    "qkvr",
+    "wo_ud",
+]
+
+LORA_TARGET_ALL_MODULES = "all"
 
 
 class Lora(msgspec.Struct):
@@ -78,7 +102,7 @@ class Lora(msgspec.Struct):
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=["triton", "csgmv", "ascend", "torch_native", "triton_v2"],
+            choices=LORA_BACKEND_CHOICES,
         ),
     ] = "csgmv"
     max_lora_chunk_size: A[
@@ -108,5 +132,5 @@ class Lora(msgspec.Struct):
     ] = False
     lora_drain_wait_threshold: A[
         float,
-        "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        "For LoRA adapters whose requests wait longer than this threshold (seconds) and need a slot, selectively drain unpinned running adapters to make room. Draining is best effort: freed slots are not reserved and waiting time is not bounded. Set to 0 to disable draining (default).",
     ] = 0.0

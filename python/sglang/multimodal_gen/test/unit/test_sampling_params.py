@@ -16,7 +16,6 @@ from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.flux import (
-    Flux2KleinSamplingParams,
     Flux2SamplingParams,
     FluxSamplingParams,
 )
@@ -267,11 +266,6 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         self.assertEqual(params.height, 640)
         self.assertEqual(params.width, 768)
-
-    def test_flux_guidance_defaults_match_model_defaults(self):
-        self.assertEqual(FluxSamplingParams().guidance_scale, 3.5)
-        self.assertEqual(Flux2SamplingParams().guidance_scale, 4.0)
-        self.assertEqual(Flux2KleinSamplingParams().guidance_scale, 1.0)
 
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):

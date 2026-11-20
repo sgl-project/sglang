@@ -13,7 +13,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -21,7 +21,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=200, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=200, stage="extra-b", runner_config="4-gpu-b200")
 
 PAGE_SIZE = 64
 # trtllm_mla is the Blackwell MLA backend that supports KV sharding.

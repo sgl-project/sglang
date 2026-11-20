@@ -3,7 +3,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_inputs,
@@ -88,7 +88,9 @@ def test_spec_mrope_positions_graph(dtype, mixed):
         multimodal_inputs=mm_inputs, spec_info=SimpleNamespace(positions=positions)
     )
     runner = SimpleNamespace(device="cuda")
-    output = SimpleNamespace(seq_lens=torch.ones(3, device="cuda"))
+    output = SimpleNamespace(
+        seq_lens=torch.ones(3, device="cuda"), ragged_verify_layout=None
+    )
     ForwardBatch.compute_spec_mrope_positions(output, runner, batch)
     graph = torch.cuda.CUDAGraph()
     if not mixed:
@@ -146,10 +148,8 @@ def test_draft_extend_layout_graph(bs, width, mrope):
 @pytest.mark.parametrize("preallocated", [False, True])
 def test_chain_tree_graph(bs, depth, preallocated):
     from sglang.kernels.ops.speculative.eagle import build_chain_tree
-    from sglang.srt.speculative.eagle_utils import (
-        TreeMaskMode,
-        build_tree_kernel_efficient,
-    )
+    from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
 
     bonus = torch.arange(bs * 2, device="cuda", dtype=torch.int32)[::2]
     draft = torch.arange(bs * depth * 4, device="cuda", dtype=torch.int64).reshape(

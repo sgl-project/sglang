@@ -3,8 +3,8 @@
 A name is ``None`` where the platform has no kernel for it.
 """
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
-from sglang.utils import LazyImport
+from sglang._lazy_import import LazyImport
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 if is_cuda():
     # Resolved on first call: CUDA builds without FlashInfer must still import
@@ -20,11 +20,11 @@ elif is_hip():
     )
 elif is_npu():
     try:
-        from sgl_kernel_npu.sample import top_k_renorm_prob, top_p_renorm_prob
+        from sgl_kernel_npu.operators.sample import top_k_renorm_prob, top_p_renorm_prob
     except ImportError:
         top_k_renorm_prob = None
         top_p_renorm_prob = None
-elif is_musa():
+elif is_musa() or is_xpu():
     try:
         from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
     except Exception:

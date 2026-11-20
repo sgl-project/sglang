@@ -38,6 +38,10 @@ class MambaSlotAllocator:
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
 
+    def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
+        """Static slot ids already index physical storage."""
+        return slot_ids
+
     def available_size(self) -> int:
         return len(self.free_slots)
 
@@ -45,6 +49,10 @@ class MambaSlotAllocator:
         """Planner-facing free count. Same as ``available_size`` for a static pool;
         byte-coordinated allocators return their byte-limited view instead."""
         return self.available_size()
+
+    def slots_fit(self, count: int) -> bool:
+        """Whether ``count`` slots can be taken now."""
+        return self.schedulable_available_size() >= count
 
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch of slots for match_prefix to amortize overhead."""
@@ -76,7 +84,8 @@ class MambaSlotAllocator:
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, *, owned: bool = False):
+        # ``owned`` matters only to a deferred free; this one frees at once.
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))

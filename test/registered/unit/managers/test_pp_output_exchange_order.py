@@ -15,6 +15,7 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -25,17 +26,25 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.managers import scheduler_pp_mixin as pp_mod  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
-    """Device p2p ops one PP2 rank posts for one output exchange, in stream order."""
+def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
+    """Device p2p ops one PP2 rank posts for one output exchange, in stream order.
+
+    Fences on this rank's own forward show up as ("wait", "own-forward").
+    """
     ops = []
     scheduler = SchedulerPPMixin()
     scheduler._pp_spec_relay = spec_relay
+    scheduler.pp_group = SimpleNamespace(is_first_rank=pp_rank == 0)
+    scheduler.launch_event = "own-forward"
+    scheduler.pp_comm_stream_ctx = nullcontext()
     scheduler.schedule_stream = None
     scheduler.copy_stream = SimpleNamespace(
         wait_stream=lambda stream: None, wait_event=lambda event: None
@@ -43,7 +52,9 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
     scheduler.copy_stream_ctx = nullcontext()
     scheduler.device_module = SimpleNamespace(
         Event=lambda: SimpleNamespace(record=lambda stream: None),
-        current_stream=lambda: None,
+        current_stream=lambda: SimpleNamespace(
+            wait_event=lambda event: ops.append(("wait", event))
+        ),
     )
     scheduler._pp_prep_batch_result = lambda *args: SimpleNamespace(logits_output=None)
 
@@ -63,7 +74,9 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg):
         contains_last_prefill_chunk=True,
         return_logprob=True,
     )
-    with published_topology(role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2):
+    with published_topology(
+        role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2, **server_args
+    ):
         scheduler._pp_send_recv_and_preprocess_output_tensors(
             0, 1, [None, target], [None, None], deque(), None
         )
@@ -91,6 +104,56 @@ class TestPPOutputExchangeOrder(CustomTestCase):
                     )
                     streams[0].popleft()
                     streams[1].popleft()
+
+    def test_only_first_rank_fences_output_recv_on_its_forward(self):
+        """With the fence on, rank 0 must not post its output recv before its own
+        forward finishes: an early recv holds an SM through the forward and hangs
+        flashinfer MLA."""
+        with envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.override(True):
+            self.assertEqual(
+                _posted_output_ops(0, False, "relay", "output"),
+                [("send", "relay"), ("wait", "own-forward"), ("recv", "output")],
+            )
+            # Later ranks receive relays that already exist, the spec relay
+            # exchanges before its forward, and depth > 0 receives before launch.
+            for pp_rank, spec_relay, server_args in (
+                (1, False, {}),
+                (0, True, {}),
+                (0, False, {"pp_async_batch_depth": 1}),
+            ):
+                with self.subTest(
+                    pp_rank=pp_rank, spec_relay=spec_relay, **server_args
+                ):
+                    ops = _posted_output_ops(
+                        pp_rank, spec_relay, "relay", "output", **server_args
+                    )
+                    self.assertNotIn(("wait", "own-forward"), ops)
+
+
+class TestPPOutputSkipWhileCapturingRoutedExperts(CustomTestCase):
+    def test_middle_prefill_chunks_keep_their_output_message(self):
+        """The output message carries a chunk's routed experts to the first
+        stage; skipping it returns zeros for that chunk's tokens."""
+        middle_chunk = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[object()],
+            contains_last_prefill_chunk=False,
+            return_logprob=False,
+        )
+        with envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.override(True):
+            for capturing in (False, True):
+                features = SimpleNamespace(enable_return_routed_experts=capturing)
+                with (
+                    self.subTest(capturing=capturing),
+                    mock.patch.object(
+                        pp_mod,
+                        "get_exec",
+                        return_value=SimpleNamespace(features=features),
+                    ),
+                ):
+                    self.assertEqual(
+                        pp_mod._pp_can_skip_output_comm(middle_chunk), not capturing
+                    )
 
 
 if __name__ == "__main__":

@@ -111,6 +111,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     ffn_hidden_size: int = 14336
     latents_dim: int = 24
     audio_latents_dim: int = 32
+    # False for an image checkpoint without the audio input/output projections
+    # (audio_patch_proj, final_layer.audio_out); it serves no audio rows.
+    audio_enabled: bool = True
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_dim: int = 5120
     timestep_input_dim: int = 256
@@ -134,6 +137,10 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if type(self.audio_enabled) is not bool:
+            raise ValueError(
+                f"audio_enabled must be a bool, got {self.audio_enabled!r}"
+            )
         if isinstance(self.patch_size, list):
             self.patch_size = tuple(self.patch_size)
         if len(self.patch_size) != 3:

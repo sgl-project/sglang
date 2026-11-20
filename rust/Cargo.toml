@@ -7,6 +7,7 @@ members = [
     "sglang-grpc",
     "sglang-mm",
     "sglang-processor",
+    "sglang-runtime-v1-types",
     "sglang-server"
 ]
 exclude = ["sglang-radix-tree"]
@@ -57,6 +58,13 @@ lto = true
 strip = true
 opt-level = 3
 codegen-units = 1
+
+# CI test builds: release with thin LTO, which compiles faster but leaves the Rust
+# server's tokenization a few percent slower. Wheels and perf runs use release.
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
 
 [profile.dev]
 opt-level = 0

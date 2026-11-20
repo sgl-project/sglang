@@ -23,7 +23,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=420, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=420, stage="extra-b", runner_config="4-gpu-h100")
 
 # Per decode rank; a request survives when neither of the two ranks injects.
 _MISMATCH_PROB = 0.3

@@ -14,6 +14,7 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -198,3 +199,17 @@ def flip_first_byte_in_source(
     original_byte = int(flat[row, col].item())
     flat[row, col] = original_byte ^ 0xFF
     return row, col, original_byte
+
+
+def advance_delivered_counts(
+    counts: dict[str, int], recv_obj: BatchTokenIDOutput
+) -> None:
+    for index, rid in enumerate(recv_obj.rids):
+        if recv_obj.finished_reasons[index] is not None:
+            counts.pop(rid, None)
+        elif recv_obj.output_ids_flat is not None:
+            counts[rid] = (
+                counts.get(rid, 0)
+                + recv_obj.output_ids_offsets[index + 1]
+                - recv_obj.output_ids_offsets[index]
+            )

@@ -29,6 +29,10 @@ from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     ReportingTqdm,
     get_progress_reporter,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    is_request_cancel_enabled,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -79,6 +83,9 @@ class PipelineStage(StageDedupMixin, ABC):
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
     _progress_range: tuple[float, float] = (0.0, 1.0)
+    # MAIN_RANK_ONLY_AND_SEND_TO_OTHERS: move the received batch's device tensors,
+    # unpickled on the sender's device index, to the receiving rank's device.
+    relocate_broadcast_batch: bool = False
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -95,10 +102,6 @@ class PipelineStage(StageDedupMixin, ABC):
     def log_warning(self, msg, *args):
         """Logs a warning message with the stage name as a prefix."""
         logger.warning(f"[{self.__class__.__name__}] {msg}", *args)
-
-    def log_error(self, msg, *args):
-        """Logs an error message with the stage name as a prefix."""
-        logger.error(f"[{self.__class__.__name__}] {msg}", *args)
 
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
@@ -119,6 +122,7 @@ class PipelineStage(StageDedupMixin, ABC):
         # report even when the bar is hidden: the first rank of replica N>0 is
         # not world rank 0
         reporter = get_progress_reporter()
+        request_ids = []
         if (
             reporter is not None
             and batch is not None
@@ -126,24 +130,38 @@ class PipelineStage(StageDedupMixin, ABC):
             and not batch.is_warmup
         ):
             request_ids = batch.client_request_ids()
-            if request_ids:
-                return ReportingTqdm(
-                    iterable=iterable,
-                    total=total,
-                    disable=disable,
-                    reporter=reporter,
-                    request_ids=request_ids,
-                    progress_range=self._progress_range,
-                    **kwargs,
-                )
+        if request_ids:
+            return ReportingTqdm(
+                iterable=iterable,
+                total=total,
+                disable=disable,
+                reporter=reporter,
+                request_ids=request_ids,
+                progress_range=self._progress_range,
+                **kwargs,
+            )
         return tqdm(iterable=iterable, total=total, disable=disable, **kwargs)
+
+    def check_cancelled(self, batch: Req | list[Req]) -> None:
+        """Check between sampling steps, independently of progress reporting.
+
+        Every participating rank must reach this point in the same order.
+        Rank-only stages rely on the executor's stage boundaries instead.
+        """
+        if not is_request_cancel_enabled():
+            return
+        if self.parallelism_type_for(batch) not in (
+            StageParallelismType.MAIN_RANK_ONLY,
+            StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS,
+        ):
+            raise_if_cancelled(batch if isinstance(batch, list) else [batch])
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
         Verify the input for the stage.
 
         Example:
-            from sglang.multimodal_gen.runtime.pipelines.stages.validators import V, VerificationResult
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import V, VerificationResult
 
             def verify_input(self, batch, server_args):
                 result = VerificationResult()
@@ -161,6 +179,9 @@ class PipelineStage(StageDedupMixin, ABC):
         Load the model for the stage.
         """
         pass
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable captured graphs whose weights changed; stages without graphs do nothing."""
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs
@@ -384,7 +405,6 @@ class PipelineStage(StageDedupMixin, ABC):
             The updated batch information after this stage's processing.
         """
         stage_name = self._active_profile_stage_name()
-        # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification
         try:

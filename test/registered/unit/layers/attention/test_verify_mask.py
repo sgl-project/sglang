@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import trtllm_mha_backend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
@@ -13,7 +14,7 @@ from sglang.srt.layers.attention.verify_mask import (
     tree_mask_numel,
 )
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
+from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -189,7 +190,7 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
 
 class TestTrtllmMhaVerifyMask(CustomTestCase):
     """TRT-LLM MHA's target verify reads no tree mask. With
-    SGLANG_Q35MF_EDGE_CHAIN_TREE, a topk-1 target declares an unread mask, which
+    SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY, a topk-1 target declares an unread mask, which
     builds the chain without one; a tree, a draft runner, or a server without the
     switch keeps SGLang's default."""
 
@@ -205,7 +206,7 @@ class TestTrtllmMhaVerifyMask(CustomTestCase):
             speculative_num_draft_tokens=_DRAFT,
             device="cpu",
         )
-        with envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.override(chain_tree):
+        with envs.SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY.override(chain_tree):
             return backend._unread_verify_mask(_MAX_BS)
 
     def test_only_a_topk1_target_with_the_switch_declares_an_unread_mask(self):

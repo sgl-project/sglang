@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
     normalize_output_seeds,
 )

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
@@ -145,7 +146,7 @@ def moe_wna16_marlin_gemm(
 
     # Allocate c_tmp for fp32 reduce
     if use_fp32_reduce and not use_atomic_add:
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        sms = current_arch().num_sms
         # max num of threadblocks is sms * 4
         max_c_tmp_size = min(
             size_n * sorted_token_ids.size(0),

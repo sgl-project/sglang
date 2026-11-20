@@ -3,7 +3,7 @@ title: "Bench Serving Guide"
 metatags:
     description: "SGLang bench_serving: benchmark throughput, TTFT, ITL with random/sharegpt/image datasets. Multi-backend support."
 ---
-This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
+This guide explains how to benchmark online serving throughput and latency using `python -m sglang.benchmark.serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 
 ### What it does
 
@@ -39,7 +39,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --num-prompts 1000 \
@@ -49,7 +49,7 @@ python3 -m sglang.bench_serving \
 Or, using an OpenAI-compatible endpoint (completions):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm \
   --base-url http://127.0.0.1:8000 \
   --num-prompts 1000 \
@@ -62,7 +62,7 @@ Use the two embedding backends with the same model, tokenizer, input length, pro
 
 ```bash Command
 # Start either server on the same hardware and precision, then run one at a time.
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang-embedding \
   --model google/embeddinggemma-300m \
   --dataset-name random \
@@ -75,7 +75,7 @@ python3 -m sglang.bench_serving \
 
 ```bash Command
 # vLLM's cache reset endpoint requires VLLM_SERVER_DEV_MODE=1 at server startup.
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm-embedding \
   --model google/embeddinggemma-300m \
   --dataset-name random \
@@ -149,7 +149,7 @@ python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disabl
 ```
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --backend sglang-oai-chat \
     --dataset-name image \
     --num-prompts 500 \
@@ -166,7 +166,7 @@ python -m sglang.launch_server --model-path Qwen/Qwen2.5-3B-Instruct
 ```
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-name random \
     --num-prompts 3000 \
@@ -183,7 +183,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
 ```
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-name speed-bench \
     --dataset-path /path/to/throughput_1k.jsonl \
@@ -213,7 +213,8 @@ python3 -m sglang.bench_serving \
 - `--disable-ignore-eos`: pass through EOS behavior (varies by backend)
 - `--warmup-requests N`: run warmup requests with short output first (default 1)
 - `--flush-cache`: call `/flush_cache` (sglang) before main run
-- `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`)
+- `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`, and an admin key via `SGLANG_ADMIN_API_KEY` or `--admin-api-key`)
+- `--admin-api-key KEY`: the SGLang server's admin key (default: `SGLANG_ADMIN_API_KEY`); required by `--profile`, and sent by `--flush-cache` when given
 - `--lora-name name1 name2 ...`: randomly pick one per request and pass to backend (e.g., `lora_path` for sglang)
 - `--tokenize-prompt`: send integer IDs instead of text (currently supports `--backend sglang` only)
 
@@ -226,6 +227,8 @@ export OPENAI_API_KEY=sk-...yourkey...
 ```
 
 The script will add `Authorization: Bearer $OPENAI_API_KEY` automatically for OpenAI-compatible routes.
+
+SGLang's `/start_profile` and `/stop_profile` are admin endpoints: they only work when the server is launched with an admin key (`SGLANG_ADMIN_API_KEY` or `--admin-api-key`), so `--profile` needs the same key, read from `SGLANG_ADMIN_API_KEY` or passed as `--admin-api-key`. Once the server has an admin key, `/flush_cache` requires it too, and `--flush-cache` sends it the same way.
 
 ### Metrics explained
 
@@ -250,7 +253,7 @@ The script also retokenizes generated text with the configured tokenizer and rep
 Throughput counts every completed request, including the ones that came back too late to be useful. Pass service level objectives with `--goodput` to count only the requests that met them:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang --host 127.0.0.1 --port 30000 \
   --num-prompts 1000 --request-rate 16 \
   --goodput ttft:500 tpot:50 e2el:20000
@@ -285,7 +288,7 @@ With `--output-details`, an extended object also includes arrays:
 1) sglang native `/generate` (streaming):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -300,7 +303,7 @@ python3 -m sglang.bench_serving \
 2) OpenAI-compatible Completions (e.g., vLLM):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm \
   --base-url http://127.0.0.1:8000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -312,7 +315,7 @@ python3 -m sglang.bench_serving \
 3) OpenAI-compatible Chat Completions (streaming):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm-chat \
   --base-url http://127.0.0.1:8000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -324,7 +327,7 @@ python3 -m sglang.bench_serving \
 4) Images (VLM) with chat template:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
@@ -339,7 +342,7 @@ python3 -m sglang.bench_serving \
 4a) Images with custom resolution:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
@@ -354,7 +357,7 @@ python3 -m sglang.bench_serving \
 4b) 1080p images with PNG format and blank content:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
@@ -371,7 +374,7 @@ python3 -m sglang.bench_serving \
 5) Generated shared prefix (long system prompts + short questions):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -384,7 +387,7 @@ python3 -m sglang.bench_serving \
 Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -404,7 +407,7 @@ This flag controls prefix-popularity shape only. It does not by itself reproduce
 6) Tokenized prompts (ids) for strict length control (sglang only):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -416,7 +419,7 @@ python3 -m sglang.bench_serving \
 7) Profiling and cache flush (sglang):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -427,7 +430,7 @@ python3 -m sglang.bench_serving \
 8) TensorRT-LLM streaming endpoint:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend trt \
   --base-url http://127.0.0.1:8000 \
   --model your-trt-llm-model \
@@ -439,7 +442,7 @@ python3 -m sglang.bench_serving \
 9) Evaluating large-scale KVCache sharing with mooncake trace (sglang only):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model model-name \
@@ -464,7 +467,7 @@ python -m sglang.launch_server \
   --port 30001
 
 # Step 2: Run bench_serving with --fake-prefill
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30001 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -477,7 +480,7 @@ python3 -m sglang.bench_serving \
 Similarly, `bench_one_batch_server` also supports `--fake-prefill`:
 
 ```bash Command
-python3 -m sglang.bench_one_batch_server \
+python3 -m sglang.benchmark.one_batch_server \
   --base-url http://127.0.0.1:30001 \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --batch-size 32 --input-len 1024 --output-len 256 \

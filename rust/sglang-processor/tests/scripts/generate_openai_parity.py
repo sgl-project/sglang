@@ -39,12 +39,12 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers.common import get_context_length
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.hf_transformers.common import get_context_length
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/openai_parity"
 HANDLERS = {

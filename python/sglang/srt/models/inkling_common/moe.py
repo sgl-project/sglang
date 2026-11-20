@@ -39,6 +39,7 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.inkling_common.dense_mlp import (
@@ -58,7 +59,7 @@ from sglang.srt.models.inkling_common.util import (
 )
 from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 _FP32_GEMM_UPCAST = is_hip()
 
