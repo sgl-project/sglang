@@ -22,8 +22,20 @@ def runner_name(runner_arch):
 
 def parse_test_timings(log):
     timings = {}
+    block = None
     for line in log.splitlines():
         line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+        if "TIMINGS BEGIN" in line:
+            block = {}
+            continue
+        if "TIMINGS END" in line:
+            # An unterminated block (a job killed mid-summary) is discarded.
+            if block is not None:
+                timings.update(block)
+            block = None
+            continue
+        if block is None:
+            continue
         start = line.find("{")
         if start < 0:
             continue
@@ -53,7 +65,7 @@ def parse_test_timings(log):
             raise ValueError(f"Invalid elapsed time for {filename!r}: {elapsed!r}")
         if not math.isfinite(elapsed) or elapsed < 0:
             raise ValueError(f"Invalid elapsed time for {filename!r}: {elapsed!r}")
-        timings[filename] = max(float(elapsed), 1.0)
+        block[filename] = max(float(elapsed), 1.0)
     return timings
 
 

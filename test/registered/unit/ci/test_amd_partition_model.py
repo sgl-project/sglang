@@ -24,6 +24,16 @@ AMD_SUITES = load_script("amd_suites", "scripts/ci/amd_suites.py")
 RUNNER = MODEL.runner_name("mi300")
 
 
+def timing_log(*lines):
+    return "\n".join(
+        [
+            "2026-11-13T07:46:20Z ========== TIMINGS BEGIN ==========",
+            *lines,
+            "2026-11-13T07:46:21Z ========== TIMINGS END ==========",
+        ]
+    )
+
+
 def timing_line(*, filename, elapsed, passed=True):
     return "2026-11-13T07:46:20Z " + json.dumps(
         {"file": filename, "passed": passed, "elapsed": elapsed}
@@ -55,12 +65,15 @@ class TestAmdPartitionModel(CustomTestCase):
                 self.assertEqual(model["metadata"]["rocm_version"], rocm_version)
 
     def test_timings_ignore_failed_tests_and_unrelated_output(self):
-        filename = "/sglang-checkout/test/registered/example.py"
+        root = "/sglang-checkout/test/registered/"
         log = "\n".join(
             [
                 "not a metric",
-                timing_line(filename=filename, elapsed=12, passed=False),
-                timing_line(filename=filename, elapsed=8),
+                timing_line(filename=root + "outside.py", elapsed=999),
+                timing_log(
+                    timing_line(filename=root + "failed.py", elapsed=12, passed=False),
+                    timing_line(filename=root + "example.py", elapsed=8),
+                ),
             ]
         )
         self.assertEqual(
@@ -72,11 +85,13 @@ class TestAmdPartitionModel(CustomTestCase):
         for elapsed in [True, "30", -1, float("nan")]:
             with self.subTest(elapsed=elapsed), self.assertRaises(ValueError):
                 MODEL.parse_test_timings(
-                    timing_line(filename=filename, elapsed=elapsed)
+                    timing_log(timing_line(filename=filename, elapsed=elapsed))
                 )
         for filename in ["/tmp/test.py", "test/registered/../../secret.py"]:
             with self.subTest(filename=filename), self.assertRaises(ValueError):
-                MODEL.parse_test_timings(timing_line(filename=filename, elapsed=4))
+                MODEL.parse_test_timings(
+                    timing_log(timing_line(filename=filename, elapsed=4))
+                )
 
     def test_median_model_is_suite_scoped_and_preserves_sparse_samples(self):
         result = MODEL.build_model(
@@ -157,7 +172,7 @@ class TestAmdPartitionModel(CustomTestCase):
         ]
         responses = [
             {"jobs": jobs},
-            timing_line(filename="test/registered/example.py", elapsed=42),
+            timing_log(timing_line(filename="test/registered/example.py", elapsed=42)),
         ]
         with patch.object(MODEL, "github_api", side_effect=responses):
             result = MODEL.collect_run_timings(
@@ -175,7 +190,7 @@ class TestAmdPartitionModel(CustomTestCase):
         ]
         responses = [
             {"jobs": jobs},
-            timing_line(filename="test/registered/example.py", elapsed=42),
+            timing_log(timing_line(filename="test/registered/example.py", elapsed=42)),
         ]
         with patch.object(MODEL, "github_api", side_effect=responses):
             result = MODEL.collect_run_timings(
@@ -192,7 +207,9 @@ class TestAmdPartitionModel(CustomTestCase):
             }
             for part in range(2)
         ]
-        record = timing_line(filename="test/registered/example.py", elapsed=4)
+        record = timing_log(
+            timing_line(filename="test/registered/example.py", elapsed=4)
+        )
         with patch.object(
             MODEL, "github_api", side_effect=[{"jobs": jobs}, record, record]
         ):
