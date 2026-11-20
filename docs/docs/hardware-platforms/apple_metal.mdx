@@ -74,6 +74,18 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
 5. `SGLANG_MLX_FUSE_SWIGLU=1` - Enables the use of fused Swish-Gated Linear Unit kernel (disabled by default)
 6. `SGLANG_MLX_CLEAR_CACHE_STEPS=256` - Sets the number of decode steps before clearing the MLX cache (256 by default)
 
+## Qwen3.5 text generation on Torch MPS
+
+To serve text from a dense Qwen3.5 checkpoint on Apple Silicon, set
+`language_model_only` in the model configuration. The decoder uses Metal
+kernels for its Gated DeltaNet layers.
+
+```bash
+SGLANG_USE_MLX=0 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-0.8B --device mps --dtype bfloat16 \
+  --json-model-override-args '{"language_model_only":true}'
+```
+
 ## Quantization
 
 The MLX backend supports two quantization paths on Apple Silicon:

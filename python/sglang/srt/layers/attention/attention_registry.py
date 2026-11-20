@@ -26,12 +26,20 @@ from sglang.srt.runtime_context import (
     get_platform,
     get_spec,
 )
-from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu, is_sail
+from sglang.srt.utils import (
+    get_device_capability,
+    is_hip,
+    is_mps,
+    is_musa,
+    is_npu,
+    is_sail,
+)
 
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_sail = is_sail()
+_is_mps = is_mps()
 
 logger = logging.getLogger(__name__)
 
@@ -502,6 +510,10 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 flashinfer_gdn_prefill_default,
             )
 
+            if _is_mps:
+                from sglang.srt.hardware_backend.mps.gdn_backend import (
+                    MpsGDNAttnBackend as GDNAttnBackend,
+                )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
