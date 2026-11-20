@@ -1835,6 +1835,12 @@ class Envs:
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
+    # DFLASH sampled verify on each row's top-k support, all-gathered from the
+    # target's vocab shards instead of the full logits; batches the support
+    # cannot reproduce (max top_k > 64, top-p, penalties, ...) keep the dense path.
+    SGLANG_OPT_DFLASH_SPARSE_VERIFY = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.
