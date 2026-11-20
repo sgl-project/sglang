@@ -22,6 +22,7 @@ from sglang.srt.sampling.sampling_batch_info import (
     merge_bias_tensor,
 )
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermarking.gumbel.adapter import GumbelRows
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -47,6 +48,15 @@ def _make_info(batch_size=2, **overrides):
     )
     defaults.update(overrides)
     return SamplingBatchInfo(**defaults)
+
+
+def _watermark_rows(keys, candidates):
+    return GumbelRows(
+        keys=torch.tensor(keys, dtype=torch.int64),
+        context_windows=torch.full((len(keys),), 4, dtype=torch.int32),
+        enabled=torch.tensor(candidates, dtype=torch.bool),
+        candidates_host=list(candidates),
+    )
 
 
 def _serial_batched_fill(entries, vocab_mask):
@@ -589,6 +599,28 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([0], torch.tensor([0]))
         self.assertIsNone(info.sampling_seed)
         self.assertIsNone(info.rows_with_seed)
+
+    def test_watermark_rows_follow_rows_through_merge_and_filter(self):
+        # Rows first: the other side's 3 rows come in off, window 1.
+        info = _make_info(batch_size=2, watermark=_watermark_rows([11, 12], [True] * 2))
+        info.merge_batch(_make_info(batch_size=3))
+        self.assertEqual(info.watermark.keys.tolist(), [11, 12, 0, 0, 0])
+        self.assertEqual(info.watermark.context_windows.tolist(), [4, 4, 1, 1, 1])
+        self.assertEqual(info.watermark.enabled.tolist(), [True, True] + [False] * 3)
+
+        # No rows first: the 2 off rows are counted before the batch tensors grow.
+        info = _make_info(batch_size=2)
+        rows = _watermark_rows([11, 12, 13], [True, False, True])
+        info.merge_batch(_make_info(batch_size=3, watermark=rows))
+        self.assertEqual(info.watermark.keys.tolist(), [0, 0, 11, 12, 13])
+        self.assertEqual(
+            info.watermark.candidates_host, [False, False, True, False, True]
+        )
+
+        info.filter_batch([3, 4], torch.tensor([3, 4]))
+        self.assertEqual(info.watermark.keys.tolist(), [12, 13])
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.watermark)
 
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
