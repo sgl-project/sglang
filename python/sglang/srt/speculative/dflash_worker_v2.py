@@ -1,3 +1,4 @@
+import functools
 import logging
 import math
 import os
@@ -240,7 +241,6 @@ class _DflashDraftSampler:
         max_bs,
         tp_group=None,
         bench_noise=None,
-        bench_vocab_limit=None,
         bench_padded_width=None,
     ):
         self.weight = weight
@@ -256,9 +256,13 @@ class _DflashDraftSampler:
         # replaces the argmax; the in-graph offset advances the noise every replay.
         self.bench_noise = bench_noise
         if bench_noise is not None:
-            self.bench_vocab_limit = int(bench_vocab_limit)
             # The padded width gives every rank the same candidate shape to gather.
-            self.bench_width = int(bench_padded_width or self.num_org)
+            self.bench_width = int(bench_padded_width)
+            self.bench_gather = (
+                None
+                if self.tp_size == 1
+                else functools.partial(_gather_candidates, tp_group)
+            )
             self.bench_offset = torch.zeros(1, dtype=torch.int64, device=device)
             self.bench_temperatures = torch.full(
                 (max_tokens,),
@@ -306,8 +310,7 @@ class _DflashDraftSampler:
                     offset=self.bench_offset,
                     step=BENCH_GRAPH_STEP,
                     vocab_start=self.org_vocab_start,
-                    vocab_limit=self.bench_vocab_limit,
-                    gather=None if self.tp_size == 1 else self._gather_candidates,
+                    gather=self.bench_gather,
                 )
             )
             self.bench_offset.add_(1)
@@ -334,14 +337,16 @@ class _DflashDraftSampler:
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
 
-    def _gather_candidates(self, partial: torch.Tensor) -> torch.Tensor:
-        gathered = torch.empty(
-            (self.tp_size * partial.shape[0], partial.shape[1]),
-            dtype=partial.dtype,
-            device=partial.device,
-        )
-        self.tp_group.all_gather_into_tensor(gathered, partial)
-        return gathered
+
+def _gather_candidates(tp_group, partial: torch.Tensor) -> torch.Tensor:
+    """All-gathers every rank's Gumbel-max candidates, rank-major."""
+    gathered = torch.empty(
+        (tp_group.world_size * partial.shape[0], partial.shape[1]),
+        dtype=partial.dtype,
+        device=partial.device,
+    )
+    tp_group.all_gather_into_tensor(gathered, partial)
+    return gathered
 
 
 def _padded_org_width(lm_head) -> int:
@@ -548,37 +553,26 @@ class _MegakernelSelectorDraftSampler:
     def __init__(self, *, head, out, candidate_out, q_out, sampling_enabled):
         self.out, self.candidate_out, self.q_out = out, candidate_out, q_out
         self.sampling_enabled = sampling_enabled
-        self.max_bs = max(head.draft_head_requests)
+        # Staging goes to the megakernel head's own buffers, not ones sized here.
+        self.max_bs = None
         self._head = head
         self._staged_greedy = False
-        self._bench_sampling = sampling_enabled and bench_drafter_enabled()
-        if self._bench_sampling:
-            self._bench_temperatures = torch.full(
-                (self.max_bs,),
-                bench_drafter_temperature(),
-                dtype=torch.float32,
-                device=q_out.device,
-            )
-            self._bench_greedy_mask = torch.zeros(
-                self.max_bs, dtype=torch.bool, device=q_out.device
-            )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         if not self.sampling_enabled:
             return
-        if self._bench_sampling:
-            temperatures = self._bench_temperatures[:bs]
-            if not _is_all_greedy(sampling_info):
-                # Greedy rows draft at the benchmark temperature, sampled rows at theirs.
-                temperatures = torch.where(
-                    resolve_greedy_mask(
-                        bs=bs, sampling_info=sampling_info, device=self.q_out.device
-                    )[:bs],
-                    temperatures,
-                    sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5),
-                )
+        if bench_drafter_enabled():
+            greedy_mask = resolve_greedy_mask(
+                bs=bs, sampling_info=sampling_info, device=self.q_out.device
+            )[:bs]
+            temperatures = (
+                torch.ones(bs, dtype=torch.float32, device=self.q_out.device)
+                if sampling_info is None
+                else sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
+            )
+            override_draft_sampling(temperatures, greedy_mask)
             self._head.stage_draft_head_sampling(
-                temperatures=temperatures, greedy_mask=self._bench_greedy_mask[:bs]
+                temperatures=temperatures, greedy_mask=greedy_mask
             )
             return
         if _is_all_greedy(sampling_info):
@@ -798,9 +792,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
-        # SGLANG_BENCH_DRAFTER_TEMPERATURE on the plain argmax head; None when it is off.
+        # SGLANG_BENCH_DRAFTER_TEMPERATURE on the plain argmax head; None when off.
         self._bench_head_noise = bench_head_noise(
             random_seed=target_worker.random_seed,
+            vocab_limit=self.model_runner.model_config.token_id_vocab_size,
             output_multiplier=draft_config.output_multiplier,
             final_logit_softcapping=draft_config.final_logit_softcapping,
         )
@@ -1552,7 +1547,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampler = self._draft_sampler
         if sampler is None:
             return
-        if bs <= sampler.max_bs:
+        if sampler.max_bs is None or bs <= sampler.max_bs:
             sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
     def _maybe_attach_megakernel_head(self, lm_head):
@@ -1771,7 +1766,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
             bench_noise=self._bench_head_noise,
-            bench_vocab_limit=self._bench_vocab_limit(),
             bench_padded_width=_padded_org_width(lm_head),
         )
 
@@ -2324,7 +2318,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not self._selector_sampling_enabled
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
-        if bench_drafter_enabled():
+        if self._selector_sampling_enabled:
             override_draft_sampling(temperatures, greedy_mask)
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -2412,49 +2406,37 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH with a quantized target lm_head is only supported at "
                 f"tp=1, got tp_size={tp_size}."
             )
-
-        def gather(partial: torch.Tensor) -> torch.Tensor:
-            gathered = torch.empty(
-                (tp_size * partial.shape[0], partial.shape[1]),
-                dtype=partial.dtype,
-                device=partial.device,
-            )
-            tp_group.all_gather_into_tensor(gathered, partial)
-            return gathered
-
         width = None if quantized else _padded_org_width(lm_head)
-        num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        gather = (
+            None if tp_size == 1 else functools.partial(_gather_candidates, tp_group)
         )
-        for start in range(0, num_tokens, int(chunk_size)):
-            end = min(num_tokens, start + int(chunk_size))
-            hs = hidden_states[start:end]
+        chunk_size = int(chunk_size)
+        num_tokens = int(hidden_states.shape[0])
+        device = hidden_states.device
+        temperatures = torch.full(
+            (min(chunk_size, num_tokens),),
+            noise.temperature,
+            dtype=torch.float32,
+            device=device,
+        )
+        out_tokens = torch.empty((num_tokens,), dtype=torch.long, device=device)
+        for start in range(0, num_tokens, chunk_size):
+            hs = hidden_states[start : start + chunk_size]
             if quantized:
                 logits = lm_head.quant_method.apply(lm_head, hs, None)
             else:
                 logits = torch.matmul(hs.to(weight.dtype), weight[:width].T)
-            out_tokens[start:end] = gumbel_argmax(
+            out_tokens[start : start + hs.shape[0]] = gumbel_argmax(
                 logits,
                 noise=noise,
-                temperatures=torch.full(
-                    (end - start,),
-                    noise.temperature,
-                    dtype=torch.float32,
-                    device=hs.device,
-                ),
+                temperatures=temperatures[: hs.shape[0]],
                 offset=self._bench_eager_offset,
                 step=BENCH_EAGER_STEP,
                 vocab_start=0 if shard is None else int(shard.org_vocab_start_index),
-                vocab_limit=self._bench_vocab_limit(),
-                gather=None if tp_size == 1 else gather,
+                gather=gather,
             )
             self._bench_eager_offset.add_(1)
         return out_tokens
-
-    def _bench_vocab_limit(self) -> int:
-        # Ids past the token vocabulary are padding rows the target masks as well.
-        return int(self.model_runner.model_config.token_id_vocab_size)
 
     def _greedy_sample_from_quantized_head(
         self,

@@ -254,8 +254,8 @@ def _launch_partial(
 
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
-    the rank's padded shard ``base_logits``; ``bias=None`` adds none, and every
-    column counts (``vocab_limit`` can still mask the tail). Sharded, ``gather`` exchanges
+    the rank's padded shard ``base_logits``, or adds nothing when None (``vocab_limit``
+    still masks the tail). Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
     without ``gather_logits`` the kept logits stay on the shard.
     ``has_sampled_rows=False`` argmaxes every row."""

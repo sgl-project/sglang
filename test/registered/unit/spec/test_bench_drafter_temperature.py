@@ -1,6 +1,5 @@
-"""SGLANG_BENCH_DRAFTER_TEMPERATURE: the shared helper, the server-args gate, the
-DFLASH-family draft heads and the worker checks. DSpark's draft params are covered in
-test_dspark_bench_drafter_temperature.py."""
+"""SGLANG_BENCH_DRAFTER_TEMPERATURE: the shared helper, the server-args gate, the DSpark
+draft params, the DFLASH-family draft heads and the worker hooks."""
 
 import unittest
 from contextlib import contextmanager
@@ -12,6 +11,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.speculative import bench_drafter as bd
 from sglang.srt.speculative import dflash_worker_v2 as dfw
+from sglang.srt.speculative.dspark_components import dspark_worker_v2 as dsw
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftParams,
+    resolve_draft_params,
+)
 from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -170,23 +174,30 @@ class TestNoiseKey(_Case):
         self.assertTrue(all(0 <= key < 2**63 for key in keys))
 
     def test_head_noise_folds_the_target_transform(self):
-        self.assertIsNone(bd.bench_head_noise(random_seed=1))
+        self.assertIsNone(bd.bench_head_noise(random_seed=1, vocab_limit=100))
         with _bench(1000), _dp_rank(0):
-            plain = bd.bench_head_noise(random_seed=1)
+            plain = bd.bench_head_noise(random_seed=1, vocab_limit=100)
             scaled = bd.bench_head_noise(
-                random_seed=1, output_multiplier=0.25, final_logit_softcapping=20.0
+                random_seed=1,
+                vocab_limit=100,
+                output_multiplier=0.25,
+                final_logit_softcapping=20.0,
             )
-            other_seed = bd.bench_head_noise(random_seed=2)
-        self.assertEqual((plain.temperature, plain.softcap), (1000.0, None))
+            other_seed = bd.bench_head_noise(random_seed=2, vocab_limit=100)
+        self.assertEqual(
+            (plain.temperature, plain.softcap, plain.vocab_limit), (1000.0, None, 100)
+        )
         self.assertEqual((scaled.temperature, scaled.softcap), (4000.0, 80.0))
         self.assertNotEqual(plain.key, other_seed.key)
 
 
-def _noise(temperature=1000.0, key=7, softcap=None):
-    return bd.BenchHeadNoise(key=key, temperature=temperature, softcap=softcap)
+def _noise(temperature=1000.0, key=7, softcap=None, vocab_limit=1 << 20):
+    return bd.BenchHeadNoise(
+        key=key, temperature=temperature, softcap=softcap, vocab_limit=vocab_limit
+    )
 
 
-def _sample(logits, noise=None, offset=0, vocab_start=0, vocab_limit=None, gather=None):
+def _sample(logits, noise=None, offset=0, vocab_start=0, gather=None):
     noise = noise or _noise()
     return bd.gumbel_argmax(
         logits,
@@ -195,14 +206,11 @@ def _sample(logits, noise=None, offset=0, vocab_start=0, vocab_limit=None, gathe
         offset=torch.tensor([offset], dtype=torch.int64),
         step=bd.GRAPH_STEP,
         vocab_start=vocab_start,
-        vocab_limit=(
-            vocab_start + logits.shape[1] if vocab_limit is None else vocab_limit
-        ),
         gather=gather,
     )
 
 
-def _candidates(logits, *, offset, vocab_start, vocab_limit):
+def _candidates(logits, *, offset, vocab_start):
     """One rank's per-block Gumbel-max candidates, as its TP gather would send them."""
     captured = []
 
@@ -210,13 +218,7 @@ def _candidates(logits, *, offset, vocab_start, vocab_limit):
         captured.append(partial)
         return partial
 
-    _sample(
-        logits,
-        offset=offset,
-        vocab_start=vocab_start,
-        vocab_limit=vocab_limit,
-        gather=capture,
-    )
+    _sample(logits, offset=offset, vocab_start=vocab_start, gather=capture)
     return captured[0]
 
 
@@ -228,19 +230,13 @@ class TestGumbelArgmax(_Case):
         for offset in range(4):
             full = _sample(logits, offset=offset)
             parts = [
-                _candidates(
-                    logits[:, i : i + shard],
-                    offset=offset,
-                    vocab_start=i,
-                    vocab_limit=2048,
-                )
+                _candidates(logits[:, i : i + shard], offset=offset, vocab_start=i)
                 for i in (0, shard)
             ]
             # Rank 0 of a TP=2 draw: its shard, then every rank's gathered candidates.
             sharded = _sample(
                 logits[:, :shard],
                 offset=offset,
-                vocab_limit=2048,
                 gather=lambda partial: torch.cat(parts),
             )
             self.assertTrue(torch.equal(full, sharded))
@@ -263,7 +259,7 @@ class TestGumbelArgmax(_Case):
         logits = torch.zeros(64, 32)
         logits[:, 20:] = 50.0  # padding rows, which the target masks too
         picks = torch.cat(
-            [_sample(logits, offset=s, vocab_limit=20) for s in range(20)]
+            [_sample(logits, _noise(vocab_limit=20), offset=s) for s in range(20)]
         )
         self.assertLess(int(picks.max()), 20)
 
@@ -293,7 +289,7 @@ class TestGumbelArgmax(_Case):
         torch.manual_seed(0)
         cpu_logits = torch.randn(7, 3000).to(torch.bfloat16)
         logits = cpu_logits.cuda()
-        noise = _noise(1000.0, key=99)
+        noise = _noise(1000.0, key=99, vocab_limit=2999)
         temperatures = torch.full((7,), noise.temperature, device="cuda")
         offset = torch.zeros(1, dtype=torch.int64, device="cuda")
         out = torch.empty(7, dtype=torch.int64, device="cuda")
@@ -307,7 +303,6 @@ class TestGumbelArgmax(_Case):
                     offset=offset,
                     step=bd.GRAPH_STEP,
                     vocab_start=0,
-                    vocab_limit=2999,
                 )
             )
             offset.add_(1)
@@ -319,9 +314,84 @@ class TestGumbelArgmax(_Case):
         offset.zero_()
         for step in range(3):
             graph.replay()
-            expected = _sample(cpu_logits.float(), noise, offset=step, vocab_limit=2999)
+            expected = _sample(cpu_logits.float(), noise, offset=step)
             self.assertTrue(torch.equal(out.cpu(), expected))
         self.assertEqual(int(offset.item()), 3)
+
+
+class TestDSparkDraftParams(_Case):
+    def _resolve(self, value, sampling_info, **kwargs):
+        with _bench(value):
+            return resolve_draft_params(
+                sampling_info=sampling_info, bs=3, device="cpu", **kwargs
+            )
+
+    def test_off_keeps_the_request_temperatures(self):
+        for value in (None, "0"):
+            with self.subTest(value=value):
+                greedy = self._resolve(value, GREEDY)
+                self.assertTrue(torch.equal(greedy.step_temperatures, torch.zeros(3)))
+                mixed = self._resolve(value, MIXED)
+                self.assertTrue(
+                    torch.allclose(
+                        mixed.step_temperatures, torch.tensor([0.0, 0.7, 1.0])
+                    )
+                )
+
+    def test_on_changes_only_the_step_temperatures_of_greedy_rows(self):
+        baseline = self._resolve(None, MIXED)
+        params = self._resolve(1000.0, MIXED)
+        self.assertTrue(
+            torch.allclose(params.step_temperatures, torch.tensor([1000.0, 0.7, 1.0]))
+        )
+        # What the target verify reads is untouched: greedy rows verify greedily.
+        self.assertTrue(torch.equal(params.temperatures, baseline.temperatures))
+        self.assertTrue(torch.equal(params.greedy_mask, baseline.greedy_mask))
+        no_info = self._resolve(1000.0, None)
+        self.assertTrue(
+            torch.equal(no_info.step_temperatures, torch.full((3,), 1000.0))
+        )
+
+    def test_on_writes_only_the_batch_rows_of_static_buffers(self):
+        out = DraftParams(
+            temperatures=torch.full((5,), -1.0),
+            greedy_mask=torch.zeros(5, dtype=torch.bool),
+            step_temperatures=torch.full((5,), -1.0),
+        )
+        self._resolve(1000.0, GREEDY, out=out)
+        self.assertTrue(
+            torch.equal(out.step_temperatures, torch.tensor([1000.0] * 3 + [-1.0] * 2))
+        )
+
+    def test_simulated_acceptance_defaults_to_1000(self):
+        for acc_len, expected in (("3.8", 1000.0), ("1.0", 0.0)):
+            with self.subTest(acc_len=acc_len):
+                with envs.SGLANG_SIMULATE_ACC_LEN.override(acc_len):
+                    params = self._resolve(None, GREEDY)
+                self.assertTrue(
+                    torch.equal(params.step_temperatures, torch.full((3,), expected))
+                )
+
+
+class TestDSparkWorker(_Case):
+    def _apply(self, value="1000", **fields):
+        worker = SimpleNamespace(
+            **{"_simulate_acc_len": 3.8, "_greedy_draft": True, "_target_tp_rank": 1}
+            | fields
+        )
+        with _bench(value):
+            dsw.DSparkWorkerV2._apply_bench_drafter_temperature(worker)
+        return worker
+
+    def test_overrides_greedy_draft(self):
+        self.assertFalse(self._apply()._greedy_draft)
+        with self.assertLogs(dsw.logger, "WARNING") as logs:
+            self.assertFalse(self._apply(_target_tp_rank=0)._greedy_draft)
+        self.assertIn("overrides SGLANG_DSPARK_USE_GREEDY_DRAFT", logs.output[0])
+        self.assertIn("BENCHMARK: DSpark drafts sample at temperature", logs.output[1])
+
+    def test_off_keeps_greedy_draft(self):
+        self.assertTrue(self._apply("0")._greedy_draft)
 
 
 VOCAB, HIDDEN, BLOCK = 40, 8, 4
@@ -344,7 +414,6 @@ class TestPlainDflashGraphSampler(_Case):
             org_vocab_start=0,
             max_bs=2,
             bench_noise=noise,
-            bench_vocab_limit=VOCAB,
             bench_padded_width=VOCAB,
         )
 
@@ -369,11 +438,7 @@ def _eager_worker(noise):
     worker = SimpleNamespace(
         _bench_head_noise=noise,
         _bench_eager_offset=torch.zeros(1, dtype=torch.int64),
-        model_runner=SimpleNamespace(
-            model_config=SimpleNamespace(token_id_vocab_size=VOCAB)
-        ),
     )
-    worker._bench_vocab_limit = lambda: dfw.DFlashWorkerV2._bench_vocab_limit(worker)
     worker._bench_sample_from_head = lambda **kw: (
         dfw.DFlashWorkerV2._bench_sample_from_head(worker, **kw)
     )
@@ -449,7 +514,7 @@ class TestSelectorAndLiLiCorrStaging(_Case):
         self.assertFalse(bool(sampler.greedy_mask[:3].any()))
 
     def test_megakernel_selector_stages_the_benchmark_temperature(self):
-        head = Mock(draft_head_requests=[4])
+        head = Mock()
         with _bench(1000):
             sampler = dfw._MegakernelSelectorDraftSampler(
                 head=head,

@@ -376,7 +376,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
-        self._check_bench_drafter_temperature()
+        self._apply_bench_drafter_temperature()
         markov_head = self.draft_model.markov_head
         self._sharded_accept = (
             is_hip()
@@ -651,29 +651,27 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "but its FULL KV slots are not the target's unremapped slots"
             )
 
-    def _check_bench_drafter_temperature(self) -> None:
-        """SGLANG_BENCH_DRAFTER_TEMPERATURE overrides SGLANG_DSPARK_USE_GREEDY_DRAFT; runs
-        before anything reads ``self._greedy_draft``. The env-only preconditions
-        (simulated acceptance, static verify) are checked with the server args."""
+    def _apply_bench_drafter_temperature(self) -> None:
+        """SGLANG_BENCH_DRAFTER_TEMPERATURE overrides SGLANG_DSPARK_USE_GREEDY_DRAFT.
+        Runs before anything reads ``self._greedy_draft``."""
         temperature = bench_drafter_temperature()
         if temperature <= 0.0:
             return
-        if self._greedy_draft:
-            # The benchmark asks for sampled drafts; an argmax draft would undo it.
-            self._greedy_draft = False
-            if self._target_tp_rank == 0:
-                logger.warning(
-                    "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample "
-                    "at the benchmark temperature instead of taking the argmax.",
-                    BENCH_DRAFTER_ENV,
-                )
-        if self._target_tp_rank == 0:
+        overridden, self._greedy_draft = self._greedy_draft, False
+        if self._target_tp_rank != 0:
+            return
+        if overridden:
             logger.warning(
-                "BENCHMARK: DSpark drafts sample at temperature %s; acceptance is "
-                "simulated (SGLANG_SIMULATE_ACC_LEN=%s).",
-                temperature,
-                self._simulate_acc_len,
+                "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample at the "
+                "benchmark temperature instead of taking the argmax.",
+                BENCH_DRAFTER_ENV,
             )
+        logger.warning(
+            "BENCHMARK: DSpark drafts sample at temperature %s; acceptance is "
+            "simulated (SGLANG_SIMULATE_ACC_LEN=%s).",
+            temperature,
+            self._simulate_acc_len,
+        )
 
     def init_attention_backends(self):
         if not self._hosts_draft:

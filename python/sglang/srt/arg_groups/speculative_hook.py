@@ -183,8 +183,7 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             f"(--speculative-algorithm {cfg.speculative_algorithm})"
         )
 
-    # SGLANG_BENCH_DRAFTER_TEMPERATURE, validated on every launch before any weights
-    # load; an algorithm whose drafts would ignore it is refused.
+    # SGLANG_BENCH_DRAFTER_TEMPERATURE: validated on every launch, before weights load.
     from sglang.srt.speculative.bench_drafter import validate_server_args
 
     validate_server_args(cfg.speculative_algorithm)

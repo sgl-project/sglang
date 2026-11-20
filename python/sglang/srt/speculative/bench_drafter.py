@@ -1,13 +1,13 @@
-"""The draft temperature DSpark and DFLASH-family drafters use in place of greedy drafting
-under simulated acceptance (SGLANG_SIMULATE_ACC_LEN).
+"""Draft temperature for DSpark and DFLASH-family drafters under simulated acceptance
+(SGLANG_SIMULATE_ACC_LEN).
 
-Forced acceptance commits whatever the drafter proposes. A greedy drafter's proposals
-collapse into short repeating loops (DFLASH's default token mode even commits one fixed
-id), which keeps MoE routing on a small repeated set and makes the measured step time
-optimistic. So whenever simulated acceptance commits drafts, greedy draft rows sample at
-1000 (close to uniform) by default while the target still verifies greedily;
-SGLANG_BENCH_DRAFTER_TEMPERATURE sets the temperature, and 0 keeps greedy drafts. Sampled
-requests keep their own draft temperature.
+Forced acceptance commits whatever the drafter proposes. Greedy drafts collapse into
+short repeating loops (DFLASH's default token mode even commits one fixed id), so the
+model runs on a few repeated token ids, unlike real traffic, which can skew expert
+routing and cache locality. Whenever simulated acceptance commits drafts, greedy draft
+rows therefore sample at 1000 (close to uniform) by default, while the target still
+verifies greedily. SGLANG_BENCH_DRAFTER_TEMPERATURE sets the temperature; 0 keeps
+greedy drafts. Sampled requests keep their own temperature.
 """
 
 from __future__ import annotations
@@ -71,8 +71,8 @@ def opt_out_hint() -> str:
     if requested_temperature() is not None:
         return ""
     return (
-        f" ({ENV_NAME} defaults to {DEFAULT_TEMPERATURE:g} under SGLANG_SIMULATE_ACC_LEN;"
-        f" set {ENV_NAME}=0 to keep greedy drafts)"
+        f" ({ENV_NAME} defaults to {DEFAULT_TEMPERATURE:g} under "
+        f"SGLANG_SIMULATE_ACC_LEN; set {ENV_NAME}=0 to keep greedy drafts)"
     )
 
 
@@ -151,11 +151,14 @@ class BenchHeadNoise(NamedTuple):
     # m * softcap_{c / m}(x).
     temperature: float
     softcap: Optional[float]
+    # Ids from here on are padding rows, which the target masks as well.
+    vocab_limit: int
 
 
 def bench_head_noise(
     *,
     random_seed: int,
+    vocab_limit: int,
     output_multiplier: float = 1.0,
     final_logit_softcapping: Optional[float] = None,
 ) -> Optional[BenchHeadNoise]:
@@ -170,6 +173,7 @@ def bench_head_noise(
             if final_logit_softcapping is None
             else final_logit_softcapping / output_multiplier
         ),
+        vocab_limit=int(vocab_limit),
     )
 
 
@@ -181,17 +185,17 @@ def gumbel_argmax(
     offset: torch.Tensor,
     step: int,
     vocab_start: int,
-    vocab_limit: int,
     gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Global token ids sampled from ``softmax(logits / T)`` with DSpark's fused
     Gumbel-max (``MarkovSampleStep``): per-block (max, id) candidates, never a
     full-vocab score tensor. ``logits`` is the rank's padded vocab shard starting at
-    ``vocab_start``; ``vocab_limit`` masks padding ids; ``gather`` exchanges the
-    candidates across TP ranks. The noise is keyed by (row, ``step``, ``offset``,
-    global token id), so a shard draws exactly its slice of the full-vocab draw.
-    ``temperatures`` holds ``noise.temperature`` per row; ``offset`` is a 1-element
-    int64 device counter the caller advances once per draft call."""
+    ``vocab_start``; ids from ``noise.vocab_limit`` on are masked; ``gather``
+    exchanges the candidates across TP ranks. The noise is keyed by (row, ``step``,
+    ``offset``, global token id), so a shard draws exactly its slice of the
+    full-vocab draw. ``temperatures`` holds ``noise.temperature`` per row;
+    ``offset`` is a 1-element int64 device counter the caller advances once per
+    draft call."""
     from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 
     sample = MarkovSampleStep.triton if logits.is_cuda else MarkovSampleStep.torch
@@ -207,5 +211,5 @@ def gumbel_argmax(
         gather=gather,
         has_sampled_rows=True,
         softcap=noise.softcap,
-        vocab_limit=vocab_limit,
+        vocab_limit=noise.vocab_limit,
     )

@@ -169,10 +169,8 @@ def resolve_draft_params(
         torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
     bench_temperature = bench_drafter_temperature()
     if bench_temperature > 0.0:
-        # Greedy rows draft at the benchmark temperature instead of the argmax, and
-        # sampled rows keep theirs. Only the draft step temperature changes:
-        # temperatures and greedy_mask, which the verify reads, stay as resolved, so
-        # the target still verifies greedy rows greedily.
+        # Only the draft step temperature: the verify reads temperatures and
+        # greedy_mask, so the target still verifies greedy rows greedily.
         step_temperatures.masked_fill_(greedy_mask, bench_temperature)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
@@ -388,7 +386,8 @@ class DraftBlockProposer:
         self._sharded_accept = sharded_accept
         noise_key = draft_noise_key(random_seed)
         if bench_drafter_enabled():
-            # Every row draws at the benchmark temperature: keep DP groups apart.
+            # The noise dominates a draw at the benchmark temperature: DP groups get
+            # their own key so they do not draft the same tokens.
             noise_key = bench_noise_key(noise_key)
         self._noise = DraftNoise(
             key=noise_key,
