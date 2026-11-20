@@ -587,6 +587,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     # which own no server. Class-level to leave the frozen __init__ alone.
     _server_stop_hook: Optional[Callable[[], None]] = None
     _engine_state_changed_callback: Optional[Callable[[], None]] = None
+    # Set when a scheduler the subprocess watchdog cannot see has exited (see
+    # handle_scheduler_exit); requests are then rejected with 503. Engines may
+    # set it from another thread before scheduling handle_scheduler_exit.
+    scheduler_exit_error: Optional[str] = None
 
     def set_server_stop_hook(self, hook: Callable[[], None]) -> None:
         self._server_stop_hook = hook
@@ -853,7 +857,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def is_healthy(self) -> bool:
         """Return whether startup completed and the server is neither unhealthy nor shutting down."""
-        return not self.gracefully_exit and self.server_status == ServerStatus.Up
+        return (
+            not self.gracefully_exit
+            and self.server_status == ServerStatus.Up
+            and self.scheduler_exit_error is None
+        )
 
     def is_ready(self) -> bool:
         """Return whether this server should receive new requests."""
@@ -1037,6 +1045,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
+        if self.scheduler_exit_error is not None:
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                detail=self.scheduler_exit_error,
+            )
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
@@ -2300,7 +2313,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state.abort_sent and not state.dispatched:
             # Skipped by _skip_dispatch_if_aborted. Finish it here, once the
             # waiter holds its state, as the scheduler finishes a queued abort.
-            self._handle_abort_req(AbortReq(rid=obj.rid))
+            finished_reason = None
+            if self.scheduler_exit_error is not None:
+                finished_reason = {
+                    "type": "abort",
+                    "message": self.scheduler_exit_error,
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                }
+            self._handle_abort_req(
+                AbortReq(rid=obj.rid, finished_reason=finished_reason)
+            )
         return self._stream_one_response(obj=obj, state=state, request=request)
 
     async def _stream_one_response(
@@ -3923,6 +3945,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def force_exit_handler(self):
         """Put some custom force exit logic here."""
         pass
+
+    def handle_scheduler_exit(self, message: str) -> None:
+        """Fail every pending request with 503 and reject new ones.
+
+        For engines whose schedulers are not child processes of this one, so the
+        subprocess watchdog cannot see them exit. Must run on the handle loop.
+        """
+        self.scheduler_exit_error = message
+        self.server_status = ServerStatus.UnHealthy
+        finished_reason = {
+            "type": "abort",
+            "message": message,
+            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+        }
+        for rid, state in list(self.rid_to_state.items()):
+            if state.dispatched:
+                # Its waiter already holds the state, so finishing it here is safe.
+                self._handle_abort_req(
+                    AbortReq(rid=rid, finished_reason=finished_reason)
+                )
+            else:
+                # Its handler may be suspended before dispatch (in tokenization,
+                # at the pause gate) and will look the state up again. Leave the
+                # state; _skip_dispatch_if_aborted keeps the request from the
+                # scheduler and _wait_one_response fails it with 503.
+                state.abort_sent = True
 
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):

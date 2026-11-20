@@ -785,6 +785,10 @@ async def health_generate(request: Request) -> Response:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
 
+    # A scheduler outside this process tree (a Ray actor) has exited.
+    if _global_state.tokenizer_manager.scheduler_exit_error is not None:
+        return Response(status_code=503)
+
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
@@ -831,6 +835,11 @@ async def health_generate(request: Request) -> Response:
     tic = time.time()
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
+        if _global_state.tokenizer_manager.scheduler_exit_error is not None:
+            # Outputs sent before the exit must not mark the server Up again.
+            task.cancel()
+            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
+            return Response(status_code=503)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)

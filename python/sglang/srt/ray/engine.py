@@ -15,9 +15,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import threading
+import time
+import uuid
 from typing import Callable, List, Optional
 
 import ray
@@ -25,20 +28,31 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
     _calculate_rank_ranges,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 
 logger = logging.getLogger(__name__)
+
+# Bounds how long a stopped scheduler monitor keeps its thread alive; arbitrary.
+_SCHEDULER_MONITOR_POLL_S = 5.0
+# Same default as /health_generate's SGLANG_HEALTH_CHECK_TIMEOUT.
+_HEALTH_PROBE_TIMEOUT_S = 20.0
+# Arbitrary; sets how fast check_health returns once a scheduler answers.
+_HEALTH_PROBE_POLL_S = 0.1
 
 
 @dataclasses.dataclass
@@ -46,6 +60,17 @@ class RaySchedulerInitResult(SchedulerInitResult):
     """SchedulerInitResult that also holds Ray actor handles for cleanup."""
 
     scheduler_actors: list = dataclasses.field(default_factory=list)
+    # One ref per scheduler actor's run_event_loop; it resolves only when the loop
+    # returns or the actor dies.
+    event_loop_refs: list = dataclasses.field(default_factory=list)
+
+
+def _scheduler_exit_error(event_loop_ref: ray.ObjectRef) -> RuntimeError:
+    try:
+        ray.get(event_loop_ref)
+    except Exception as e:
+        return RuntimeError(f"SGLang scheduler actor died: {e}")
+    return RuntimeError("SGLang scheduler event loop exited")
 
 
 def _find_engine_bundle(
@@ -233,6 +258,8 @@ class RayEngine(Engine):
         # Set before super().__init__(): it launches the subprocesses, which need
         # the group to schedule the scheduler actors onto.
         self._placement_group = kwargs.pop("placement_group", None)
+        self._scheduler_monitor_stopped = threading.Event()
+        self._scheduler_exit_error: Optional[RuntimeError] = None
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
         # Schedulers are separate Ray actors; default to the Ray-backed
@@ -242,9 +269,98 @@ class RayEngine(Engine):
 
             kwargs["stat_loggers"] = build_ray_stat_loggers()
         super().__init__(server_args=ServerArgs(**kwargs))
+        threading.Thread(
+            target=self._monitor_schedulers, daemon=True, name="ray_scheduler_monitor"
+        ).start()
+
+    async def check_health(self, timeout_s: float = _HEALTH_PROBE_TIMEOUT_S) -> None:
+        """Raise if a scheduler exited or the schedulers stop answering.
+
+        Sends a one-token probe as /health_generate does: an idle scheduler runs
+        it, a busy one acknowledges it from its event loop, and any scheduler
+        output within ``timeout_s`` counts as an answer. A host such as a serving
+        framework calls this to decide whether to replace the engine.
+        """
+        if self._scheduler_exit_error is not None:
+            raise self._scheduler_exit_error
+        tokenizer_manager = self.tokenizer_manager
+        rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+        sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+        if tokenizer_manager.is_generation:
+            probe = GenerateReqInput(
+                rid=rid,
+                input_ids=[0],
+                sampling_params=sampling_params,
+                log_metrics=False,
+            )
+            if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+                probe.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                probe.bootstrap_room = 0
+        else:
+            probe = EmbeddingReqInput(
+                rid=rid,
+                input_ids=[0],
+                sampling_params=sampling_params,
+                log_metrics=False,
+            )
+        sent_at = time.time()
+        deadline = time.monotonic() + timeout_s
+
+        async def send_probe():
+            async for _ in tokenizer_manager.generate_request(probe):
+                break
+
+        task = asyncio.create_task(send_probe())
+        try:
+            while True:
+                # Checked on every poll: a scheduler that exits during the probe
+                # fails it even if outputs it sent earlier still arrive.
+                if self._scheduler_exit_error is not None:
+                    raise self._scheduler_exit_error
+                # Compared against real_time(), which is time.time().
+                if tokenizer_manager.last_receive_tstamp > sent_at:
+                    return
+                if task.done() and task.exception() is not None:
+                    raise task.exception()
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"SGLang schedulers did not answer a health probe in {timeout_s} s"
+                    )
+                await asyncio.sleep(_HEALTH_PROBE_POLL_S)
+        finally:
+            task.cancel()
+            tokenizer_manager.rid_to_state.pop(probe.rid, None)
+
+    def _monitor_schedulers(self) -> None:
+        """Report the first scheduler event loop to end, unless shutdown() ended it."""
+        refs = self._scheduler_init_result.event_loop_refs
+        done = []
+        # Poll so shutdown() and Ray teardown are not stuck behind a blocking wait.
+        while not done and not self._scheduler_monitor_stopped.is_set():
+            if not ray.is_initialized():
+                return
+            done, _ = ray.wait(refs, num_returns=1, timeout=_SCHEDULER_MONITOR_POLL_S)
+        if done and not self._scheduler_monitor_stopped.is_set():
+            self._handle_scheduler_exit(_scheduler_exit_error(done[0]))
+
+    def _handle_scheduler_exit(self, error: RuntimeError) -> None:
+        logger.error(f"{error}; failing pending and new requests")
+        self._scheduler_exit_error = error
+        tokenizer_manager = self.tokenizer_manager
+        # Set before reading event_loop. generate_request starts the handle loop
+        # and then checks this flag, so a request either sees the flag and gets
+        # 503, or has started the loop and is failed by handle_scheduler_exit.
+        tokenizer_manager.scheduler_exit_error = str(error)
+        loop = tokenizer_manager.event_loop
+        if loop is None:
+            # No request has started the handle loop, so none is pending.
+            return
+        # Request state belongs to the handle loop and is not thread-safe.
+        loop.call_soon_threadsafe(tokenizer_manager.handle_scheduler_exit, str(error))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
+        self._scheduler_monitor_stopped.set()
         for actor in self._scheduler_init_result.scheduler_actors:
             try:
                 ray.kill(actor)
@@ -416,6 +532,7 @@ class RayEngine(Engine):
                     scheduler_infos=scheduler_infos,
                     block_until_scheduler_exits=block_until_scheduler_exits,
                     scheduler_actors=scheduler_actors,
+                    event_loop_refs=event_loop_refs,
                 ),
                 None,
             )
@@ -499,4 +616,5 @@ class RayEngine(Engine):
             scheduler_infos=scheduler_infos,
             block_until_scheduler_exits=block_until_scheduler_exits,
             scheduler_actors=controller.scheduler_actors,
+            event_loop_refs=event_loop_refs,
         )
