@@ -156,6 +156,13 @@ class FakeShmBuffer:
         handle.unlink()
 
 
+def ring_words(payload: bytes) -> np.ndarray:
+    """The payload as the Rust worker parks it: zero-padded i64 words."""
+    words = np.zeros(-(-len(payload) // 8), dtype=np.int64)
+    words.view(np.uint8)[: len(payload)] = np.frombuffer(payload, dtype=np.uint8)
+    return words
+
+
 def segment_exists(name) -> bool:
     from multiprocessing import shared_memory
 
@@ -377,19 +384,17 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
     def test_drain_admits_python_fallback_items_bound_by_their_processor(self):
         """A Python processor binds its own cache fingerprint to each item; the
         drain must admit such an item, not reject it as another processor's."""
-        import pickle
-
         import torch
+
+        from sglang.srt.rust_server.multimodal import PythonMmFallback
 
         item = MultimodalDataItem(modality=Modality.IMAGE, feature=torch.zeros(2, 3))
         item.set_pad_value()
         item.bind_processor_fingerprint("sha256:" + "ab" * 32)
-        payload = pickle.dumps(MultimodalProcessorOutput(mm_items=[item]))
-        words = np.zeros(-(-len(payload) // 8), dtype=np.int64)
-        words.view(np.uint8)[: len(payload)] = np.frombuffer(payload, dtype=np.uint8)
+        payload = PythonMmFallback.wrap(MultimodalProcessorOutput(mm_items=[item]))
         buffers = {
             "input_ids": np.arange(4, dtype=np.int64),
-            "mm.feature.0": words,
+            "mm.feature.0": ring_words(payload),
             "mm.meta": np.frombuffer(msgspec.msgpack.encode({}), dtype=np.uint8),
         }
         server, errors = self._server(self._header("fallback"), buffers)
@@ -403,7 +408,6 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
         """An item the Python processor leaves unhashed must get the identity
         the Python frontend gives it (bind the processor namespace, then hash),
         so caches keyed by identity agree across the two servers."""
-        import pickle
         from types import MethodType
 
         import torch
@@ -448,8 +452,34 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
         expected = unhashed_item()
         expected.bind_processor_fingerprint(processor.processor_fingerprint)
         expected.set_pad_value()
-        (item,) = pickle.loads(payload).mm_items
+        (item,) = PythonMmFallback.unwrap(
+            {"mm.feature.0": ring_words(payload)}
+        ).mm_items
         self.assertEqual(item.identity, expected.identity)
+
+    def test_python_fallback_payload_rebuilds_tensors_in_the_ring_buffer(self):
+        """The fallback's payload must rebuild every tensor exactly, each a view
+        of the ring buffer, so the drain neither copies nor torch-unpickles it."""
+        import torch
+
+        from sglang.srt.rust_server.multimodal import PythonMmFallback
+
+        tensors = {
+            "feature": torch.randn(5, 6).t(),
+            "bf16": torch.randn(3, 2).to(torch.bfloat16),
+            "grid": torch.tensor([[1, 4, 6]]),
+            "scalar": torch.tensor(7),
+            "empty": torch.zeros(0, 3),
+        }
+        words = ring_words(PythonMmFallback.wrap({**tensors, "array": np.arange(5)}))
+        out = PythonMmFallback.unwrap({"mm.feature.0": words})
+        ring = range(words.ctypes.data, words.ctypes.data + words.nbytes)
+        for name, tensor in tensors.items():
+            self.assertEqual(out[name].dtype, tensor.dtype, name)
+            self.assertTrue(torch.equal(out[name], tensor), name)
+            if tensor.numel():
+                self.assertIn(out[name].data_ptr(), ring, name)
+        np.testing.assert_array_equal(out["array"], np.arange(5))
 
     def test_external_wrapper_never_touches_ownership(self):
         """An external package's `_wrap_mm_result` builds stubs from the
