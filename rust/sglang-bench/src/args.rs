@@ -131,12 +131,6 @@ pub struct Args {
     #[arg(long, default_value = "inf")]
     pub request_rate: String,
 
-    /// Gamma shape of the gaps between arrivals. 1.0 is the Poisson default;
-    /// larger values are smoother, smaller values burstier. The mean rate is
-    /// unchanged. Ignored when `--qps-fixed-interval` is set.
-    #[arg(long, default_value_t = 1.0)]
-    pub burstiness: f64,
-
     /// Pace arrivals at exactly `1 / --request-rate` instead of drawing gaps
     /// from the arrival distribution. Needs a finite `--request-rate`.
     #[arg(long)]
@@ -339,16 +333,6 @@ impl Args {
         Ok(rate)
     }
 
-    /// `--burstiness`, validated as a positive finite gamma shape.
-    pub fn parse_burstiness(&self) -> anyhow::Result<f64> {
-        anyhow::ensure!(
-            self.burstiness > 0.0 && self.burstiness.is_finite(),
-            "--burstiness must be a positive finite number, got {}",
-            self.burstiness
-        );
-        Ok(self.burstiness)
-    }
-
     /// The base URL the client posts to, `--base-url` or `http://host:port`.
     /// A bare IPv6 host is bracketed, as `resolve_base_url` does in Python.
     pub fn base_url(&self) -> String {
@@ -507,15 +491,9 @@ mod tests {
     }
 
     #[test]
-    fn burstiness_must_be_positive() {
-        assert_eq!(args(&[]).parse_burstiness().unwrap(), 1.0);
-        assert_eq!(
-            args(&["--burstiness", "20"]).parse_burstiness().unwrap(),
-            20.0
-        );
-        assert!(args(&["--burstiness", "0"]).parse_burstiness().is_err());
-        assert!(args(&["--burstiness=-1"]).parse_burstiness().is_err());
+    fn qps_fixed_interval_parses() {
         assert!(args(&["--qps-fixed-interval"]).qps_fixed_interval);
+        assert!(!args(&[]).qps_fixed_interval);
     }
 
     #[test]

@@ -51,7 +51,6 @@ pub fn run_blocking(args: Args) -> Result<serde_json::Value> {
 async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
     let base_url = args.base_url();
     let request_rate = args.parse_request_rate()?;
-    args.parse_burstiness()?;
     anyhow::ensure!(
         request_rate.is_finite() || !args.qps_fixed_interval,
         "--qps-fixed-interval needs a finite --request-rate"
@@ -212,52 +211,15 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
     Ok(result)
 }
 
-/// One arrival gap in seconds. Gamma with shape `burstiness` and mean `1/rate`;
-/// `fixed` returns the mean gap itself, which is what turns the arrival process
-/// from Poisson into constant.
-fn arrival_interval<R: Rng + ?Sized>(
-    rng: &mut R,
-    rate: f64,
-    burstiness: f64,
-    fixed: bool,
-) -> f64 {
+/// One arrival gap in seconds. `fixed` returns the mean gap itself, which turns
+/// the arrival process from Poisson into constant; otherwise the gap is the
+/// exponential draw with mean `1/rate` that the client has always used.
+fn arrival_interval<R: Rng + ?Sized>(rng: &mut R, rate: f64, fixed: bool) -> f64 {
     if fixed {
         return 1.0 / rate;
     }
-    if (burstiness - 1.0).abs() < f64::EPSILON {
-        let uniform: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-        return -uniform.ln() / rate;
-    }
-    gamma_sample(rng, burstiness) / (rate * burstiness)
-}
-
-/// Draws one `Gamma(shape, 1)` sample with the Marsaglia-Tsang method.
-///
-/// `rand` ships no gamma sampler and the client's dependency list is kept
-/// small, so the shape `>= 1` case is implemented directly and the `shape <
-/// 1` case is boosted to `shape + 1` and shrunk by `U^(1/shape)`.
-fn gamma_sample<R: Rng + ?Sized>(rng: &mut R, shape: f64) -> f64 {
-    if shape < 1.0 {
-        let u: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-        return gamma_sample(rng, shape + 1.0) * u.powf(1.0 / shape);
-    }
-    let d = shape - 1.0 / 3.0;
-    let c = 1.0 / (9.0 * d).sqrt();
-    loop {
-        // Box-Muller standard normal.
-        let u1: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-        let u2: f64 = rng.gen_range(0.0..1.0);
-        let x = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        let v = 1.0 + c * x;
-        if v <= 0.0 {
-            continue;
-        }
-        let v = v * v * v;
-        let u: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-        if u.ln() < 0.5 * x * x + d - d * v + d * v.ln() {
-            return d * v;
-        }
-    }
+    let uniform: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
+    -uniform.ln() / rate
 }
 
 /// Submit every request, pacing arrivals and capping concurrency.
@@ -299,12 +261,7 @@ async fn dispatch(
         }));
 
         if request_rate.is_finite() {
-            let interval = arrival_interval(
-                &mut rng,
-                request_rate,
-                args.burstiness,
-                args.qps_fixed_interval,
-            );
+            let interval = arrival_interval(&mut rng, request_rate, args.qps_fixed_interval);
             tokio::time::sleep(Duration::from_secs_f64(interval)).await;
         }
     }
@@ -785,29 +742,19 @@ mod tests {
     fn fixed_interval_is_the_mean_gap() {
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..100 {
-            assert_eq!(arrival_interval(&mut rng, 1.69, 1.0, true), 1.0 / 1.69);
+            assert_eq!(arrival_interval(&mut rng, 1.69, true), 1.0 / 1.69);
         }
     }
 
     #[test]
-    fn gamma_gaps_keep_the_mean_and_smooth_with_burstiness() {
+    fn default_gaps_keep_the_mean_rate() {
+        let mut rng = StdRng::seed_from_u64(11);
         let n = 200_000;
-        let moments = |burstiness: f64, seed: u64| {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let xs: Vec<f64> = (0..n)
-                .map(|_| arrival_interval(&mut rng, 1.0, burstiness, false))
-                .collect();
-            let m = xs.iter().sum::<f64>() / n as f64;
-            let v = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n as f64;
-            (m, v.sqrt() / m)
-        };
-        let (m1, cv1) = moments(1.0, 1);
-        let (m20, cv20) = moments(20.0, 2);
-        // The mean gap is 1/rate whatever the shape.
-        assert!((m1 - 1.0).abs() < 0.02, "shape 1 mean {m1}");
-        assert!((m20 - 1.0).abs() < 0.02, "shape 20 mean {m20}");
-        // Poisson gaps have CV 1; shape 20 approaches 1/sqrt(20) = 0.22.
-        assert!((cv1 - 1.0).abs() < 0.05, "shape 1 cv {cv1}");
-        assert!(cv20 < 0.35, "shape 20 cv {cv20}");
+        let total: f64 = (0..n)
+            .map(|_| arrival_interval(&mut rng, 1.0, false))
+            .sum();
+        let mean = total / n as f64;
+        // Exponential gaps with mean 1/rate, i.e. mean 1 at rate 1.
+        assert!((mean - 1.0).abs() < 0.02, "mean {mean}");
     }
 }
