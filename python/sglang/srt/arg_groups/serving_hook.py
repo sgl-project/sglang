@@ -351,6 +351,9 @@ def handle_environment_variables(server_args: Any):
     envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
         "1" if cfg.enable_deterministic_inference else "0"
     )
+    envs.SGLANG_ENABLE_EXACT_REDUCE_SCATTER.set(
+        "1" if cfg.enable_exact_reduce_scatter else "0"
+    )
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
     if cfg.debug_cuda_graph:
