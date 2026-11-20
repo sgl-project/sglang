@@ -428,7 +428,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.common import TypeBasedDispatcher, validate_forward_sleep_time
 from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -6918,9 +6918,11 @@ class Scheduler(
         return SendWeightsToRemoteInstanceReqOutput(success=success, message=message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
-        t = recv_req.forward_sleep_time
-        if t is not None and t <= 0:
-            t = None
+        try:
+            t = validate_forward_sleep_time(recv_req.forward_sleep_time)
+        except ValueError as e:
+            logger.warning(f"Ignoring invalid slow_down request: {e}")
+            return SlowDownReqOutput()
         self.forward_sleep_time = t
         return SlowDownReqOutput()
 

@@ -8,8 +8,12 @@ from unittest import mock
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import _load_image
-from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
+from sglang.srt.utils.common import (
+    flatten_arrays_to_int64_tensor,
+    validate_forward_sleep_time,
+)
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
     async_h2d_tensor,
@@ -304,6 +308,64 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+
+class TestValidateForwardSleepTime(CustomTestCase):
+    def test_none_and_non_positive_disable(self):
+        for value in (None, 0, 0.0, -1.5):
+            with self.subTest(value=value):
+                self.assertIsNone(validate_forward_sleep_time(value))
+
+    def test_valid_values_pass_through(self):
+        for value in (0.01, 1, 1.0, 60.0):
+            with self.subTest(value=value):
+                self.assertEqual(validate_forward_sleep_time(value), float(value))
+
+    def test_non_finite_rejected(self):
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be finite"):
+                    validate_forward_sleep_time(value)
+
+    def test_non_numeric_rejected(self):
+        for value in (True, "1.0"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be a number"):
+                    validate_forward_sleep_time(value)
+
+    def test_over_cap_rejected(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_MAX_FORWARD_SLEEP_TIME"):
+            validate_forward_sleep_time(3600.0)
+
+    def test_env_cap_override_and_disable(self):
+        with envs.SGLANG_MAX_FORWARD_SLEEP_TIME.override(5.0):
+            self.assertEqual(validate_forward_sleep_time(5.0), 5.0)
+            with self.assertRaisesRegex(ValueError, "at most 5.0"):
+                validate_forward_sleep_time(5.1)
+        with envs.SGLANG_MAX_FORWARD_SLEEP_TIME.override(-1.0):
+            self.assertEqual(validate_forward_sleep_time(3600.0), 3600.0)
+
+    def test_scheduler_ignores_invalid(self):
+        from sglang.srt.managers.io_struct import SlowDownReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        s = Scheduler.__new__(Scheduler)
+        s.forward_sleep_time = None
+
+        s.slow_down(SlowDownReqInput(forward_sleep_time=1.0))
+        self.assertEqual(s.forward_sleep_time, 1.0)
+
+        # Over the cap: ignored, previous setting kept.
+        s.slow_down(SlowDownReqInput(forward_sleep_time=3600.0))
+        self.assertEqual(s.forward_sleep_time, 1.0)
+
+        # Non-finite: ignored, previous setting kept.
+        s.slow_down(SlowDownReqInput(forward_sleep_time=float("nan")))
+        self.assertEqual(s.forward_sleep_time, 1.0)
+
+        # Zero disables, as before.
+        s.slow_down(SlowDownReqInput(forward_sleep_time=0.0))
+        self.assertIsNone(s.forward_sleep_time)
 
 
 if __name__ == "__main__":

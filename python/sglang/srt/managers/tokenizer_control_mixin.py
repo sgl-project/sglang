@@ -104,7 +104,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
 )
-from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.common import TypeBasedDispatcher, validate_forward_sleep_time
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
@@ -954,6 +954,7 @@ class TokenizerControlMixin:
         obj: SlowDownReqInput,
         request: Optional[fastapi.Request] = None,
     ):
+        validate_forward_sleep_time(obj.forward_sleep_time)
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
 
