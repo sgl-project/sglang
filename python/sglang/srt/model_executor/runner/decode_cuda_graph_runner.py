@@ -2281,7 +2281,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dtype=self.model_runner.dtype,
                     device=self.model_runner.device,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash_family():
+        elif self.model_runner.spec_algorithm.uses_block_verify():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,

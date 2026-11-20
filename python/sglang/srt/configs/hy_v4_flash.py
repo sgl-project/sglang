@@ -9,6 +9,7 @@ detection, MLA geometry, quantization) see them.
 from copy import deepcopy
 from typing import Any, Optional
 
+import msgspec
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.hy_v4 import HYV4VLVisionConfig
@@ -367,6 +368,72 @@ class HYV4FlashTextConfig(PretrainedConfig):
                 raise ValueError("engram_layer_ids are 1-based decoder layer numbers")
 
 
+class HYV4FlashDFlyConfig(msgspec.Struct, frozen=True, kw_only=True):
+    num_layers: int
+    mask_token_id: int
+    target_kv_layers: tuple[int, ...]
+    target_index_layers: tuple[int, ...]
+    target_index_topk: int
+    draft_index_topk: int
+    block_size: int
+
+
+def parse_dfly_config(
+    text_config: HYV4FlashTextConfig, block_size: int
+) -> HYV4FlashDFlyConfig:
+    def get(name, default=None):
+        return getattr(text_config, f"dfly_{name}", default)
+
+    num_layers = get("num_hidden_layers")
+    if type(num_layers) is not int or num_layers < 1:
+        raise ValueError("DFly requires a positive dfly_num_hidden_layers")
+    if get("mtp_fusion", "slot0") != "slot0":
+        raise ValueError("DFly requires slot0 fusion")
+    if get("enable_hidden_correction", True) is not True:
+        raise ValueError("DFly requires the hidden correction")
+    if get("enable_ihc", False) or get("mlp_type", "dense") != "dense":
+        raise ValueError("DFly requires dense FFNs without iHC")
+    if get("attn_causal", True) is not True:
+        raise ValueError("DFly requires causal attention")
+    if get("context_local_window") not in (None, 0):
+        raise ValueError("DFly context_local_window is not supported")
+    mask_token_id = get("mask_token_id")
+    if (
+        type(mask_token_id) is not int
+        or not 0 <= mask_token_id < text_config.vocab_size
+    ):
+        raise ValueError("DFly dfly_mask_token_id is outside the vocabulary")
+    topk = get("target_index_topk", text_config.index_topk)
+    if topk != text_config.index_topk:
+        raise ValueError("DFly target_index_topk disagrees with the target")
+    kv_layers = tuple(get("target_kv_layers") or ())
+    index_layers = get("target_index_layer")
+    if type(index_layers) is int:
+        index_layers = [index_layers] * num_layers
+    index_layers = tuple(index_layers or ())
+    n = text_config.num_hidden_layers
+    for name, layers in (("kv", kv_layers), ("index", index_layers)):
+        if len(layers) != num_layers or any(
+            type(i) is not int or not 1 <= i < n for i in layers
+        ):
+            raise ValueError(f"DFly needs one target {name} layer per draft layer")
+        if any(text_config.layer_types[i] != SPARSE_ATTENTION for i in layers):
+            raise ValueError("DFly target layers must be sparse attention layers")
+    if len(set(kv_layers)) != num_layers or len(set(index_layers)) != num_layers:
+        raise ValueError("DFly requires distinct target KV and index layers")
+    if not 2 <= block_size <= 17:
+        raise ValueError("DFly requires a draft block of 2..17 tokens")
+    return HYV4FlashDFlyConfig(
+        num_layers=num_layers,
+        mask_token_id=mask_token_id,
+        target_kv_layers=kv_layers,
+        target_index_layers=index_layers,
+        target_index_topk=topk,
+        draft_index_topk=-(-(topk + block_size) // 128) * 128,
+        block_size=block_size,
+    )
+
+
 @register_customized_processor(HYV4VLProcessor)
 class HYV4FlashConfig(PretrainedConfig):
     model_type = "hy_v4_flash"
@@ -420,6 +487,9 @@ class HYV4FlashConfig(PretrainedConfig):
                 setattr(self, key, getattr(self.text_config, key))
         if self.architectures:
             self.text_config.architectures = list(self.architectures)
+        for key, value in kwargs.items():
+            if key.startswith("dfly_"):
+                setattr(self.text_config, key, deepcopy(value))
 
     def _build_vision_config(self, vision_config) -> Optional[HYV4VLVisionConfig]:
         if vision_config is None:
@@ -440,4 +510,4 @@ class HYV4FlashConfig(PretrainedConfig):
         return self.text_config
 
 
-__all__ = ["HYV4FlashConfig", "HYV4FlashTextConfig"]
+__all__ = ["HYV4FlashConfig", "HYV4FlashDFlyConfig", "HYV4FlashTextConfig"]
