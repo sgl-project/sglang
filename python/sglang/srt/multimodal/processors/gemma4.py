@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
+from transformers.video_utils import VideoMetadata, make_batched_metadata
 
 from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
@@ -81,8 +82,10 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         first_stride = _SSCP_CONV_STRIDE_SIZES[0][0]
         return hop * first_stride
 
-    def _video_decoder_to_tensor(self, vdw: VideoDecoderWrapper) -> torch.Tensor:
-        """Convert a VideoDecoderWrapper to a (sampled_frames, C, H, W) uint8 tensor.
+    def _video_decoder_to_tensor(
+        self, vdw: VideoDecoderWrapper
+    ) -> tuple[torch.Tensor, VideoMetadata]:
+        """Return the sampled (frames, C, H, W) tensor and source frame metadata.
 
         SGLang's load_video returns VideoDecoderWrapper which the HF
         Gemma4VideoProcessor does not recognise (expects torch.Tensor or
@@ -101,7 +104,13 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         else:
             indices = torch.arange(0, total, total / num_frames).int().tolist()
         frames_np = vdw.get_frames_at(indices)  # (N, H, W, C)
-        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous()
+        fps = vdw.avg_fps
+        metadata = VideoMetadata(
+            total_num_frames=total,
+            fps=fps if fps and fps > 0 else None,
+            frames_indices=indices,
+        )
+        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous(), metadata
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -117,15 +126,28 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                 padded.append(a)
             audios = padded
         if videos:
-            videos = [
-                (
-                    self._video_decoder_to_tensor(v)
-                    if isinstance(v, VideoDecoderWrapper)
-                    else v
-                )
-                for v in videos
+            sampled = [
+                self._video_decoder_to_tensor(video)
+                if isinstance(video, VideoDecoderWrapper)
+                else (video, None)
+                for video in videos
             ]
+            videos, sampled_metadata = map(list, zip(*sampled))
             kwargs.setdefault("do_sample_frames", False)
+            if (
+                not kwargs["do_sample_frames"]
+                and "video_metadata" not in kwargs
+                and any(item is not None for item in sampled_metadata)
+            ):
+                kwargs.setdefault("videos_kwargs", {}).setdefault(
+                    "video_metadata",
+                    [
+                        item
+                        if item is not None
+                        else make_batched_metadata([video], None)[0]
+                        for video, item in zip(videos, sampled_metadata)
+                    ],
+                )
         return super().process_mm_data(
             input_text, images=images, videos=videos, audios=audios, **kwargs
         )
