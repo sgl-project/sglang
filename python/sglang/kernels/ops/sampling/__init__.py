@@ -51,6 +51,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="sampling.softmax_sample",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.sampling.softmax_jit:softmax_sample",
+        capabilities=frozenset({_JIT_SOFTMAX_CAPABILITY}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="sampling.argmax",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.sampling.argmax_jit:argmax",
@@ -103,6 +111,29 @@ def softmax(
         else:
             probs = torch.softmax(logits, dim=-1)
     return probs if out is None else out.copy_(probs)
+
+
+def can_softmax_sample(vocab_size: int) -> bool:
+    """Whether `softmax_sample` serves this vocabulary on the current device."""
+    if not _use_jit_softmax():
+        return False
+    from sglang.kernels.ops.sampling import softmax_jit
+
+    return softmax_jit.can_softmax_sample(vocab_size)
+
+
+def softmax_sample(
+    logits: torch.Tensor,
+    temperatures: Optional[torch.Tensor],
+    *,
+    top_ks: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused draft proposal: ``(probs, topk_p, topk_index)``; see
+    `softmax_jit.softmax_sample`. Callers check `can_softmax_sample` once beforehand."""
+    from sglang.kernels.ops.sampling import softmax_jit
+
+    return softmax_jit.softmax_sample(logits, temperatures, top_ks=top_ks, out=out)
 
 
 def argmax(logits: torch.Tensor) -> torch.Tensor:
@@ -162,7 +193,7 @@ register_kernel(
         op="sampling.softcap_row_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.softcap_row_argmax:softcap_row_argmax",
-        capabilities=CUDA_ONLY,
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
 register_kernel(
@@ -170,6 +201,14 @@ register_kernel(
         op="sampling.radix_topk",
         backend=KernelBackend.FLASHINFER,
         target="sglang.kernels.ops.sampling.topk:radix_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="sampling.snapshot_selection",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.beam_selection:snapshot_selection",
         capabilities=CUDA_ONLY,
     )
 )

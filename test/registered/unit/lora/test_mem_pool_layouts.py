@@ -369,6 +369,7 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         pool.experts_shared_outer_loras = False
         pool.strict_loading = False
         pool.lora_added_tokens_size = 0
+        pool.max_rank_spaced_layout = False
         # Tiny placeholder buffers; the mocked slicer raises before any of
         # this is read in the buffer-copy phase.
         pool.A_buffer = {

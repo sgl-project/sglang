@@ -1321,13 +1321,6 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 Internal attention metadata (such as `attn_mask_meta`) passed along to the attention layers.
 
         """
-        if (
-            joint_attention_kwargs is not None
-            and joint_attention_kwargs.get("scale", None) is not None
-        ):
-            logger.warning(
-                "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-            )
         hidden_states, _ = self.x_embedder(hidden_states)
 
         # Only pass guidance to time_text_embed if the model supports it
@@ -1390,16 +1383,6 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             else _rope_cos_sin_cache(singles_freqs_cis)
         )
         freqs_cis = hoisted_freqs_cis
-
-        if (
-            joint_attention_kwargs is not None
-            and "ip_adapter_image_embeds" in joint_attention_kwargs
-        ):
-            ip_adapter_image_embeds = joint_attention_kwargs.pop(
-                "ip_adapter_image_embeds"
-            )
-            ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
-            joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
         forward_batch = get_forward_context().forward_batch
         spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
