@@ -15,6 +15,17 @@ import { config } from "/src/snippets/configs/nvidia/nemotron-3.5-decision.jsx";
 
 <Deployment config={config} />
 
+### NVFP4
+
+The [NVFP4 checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-NVFP4) uses mixed NVFP4/FP8 projections on Blackwell GPUs. SGLang reads the quantization layout and scales from the checkpoint.
+
+```bash
+sglang serve \
+  --model-path nvidia/NVIDIA-Nemotron-3.5-Decision-8B-NVFP4
+```
+
+Use the NVFP4 model ID in the request’s `model` field when running the examples below.
+
 ## Playground
 
 The Playground lets you adjust tensor parallelism. The deployment recipes above use one GPU.
