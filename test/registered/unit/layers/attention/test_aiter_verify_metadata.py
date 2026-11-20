@@ -203,8 +203,14 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
         backend = self._init_graph_state(
             use_unified_verify=True, reads_flat_kv_indices=False
         )
+        backend.topk = 1
+        backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ
+        backend.speculative_num_steps = 1
+        batch = _verify_batch()
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
         with self.assertRaisesRegex(RuntimeError, "no flat CUDA-graph KV indices"):
-            backend._flat_graph_kv_indices()
+            backend.init_forward_metadata_out_graph(batch, in_capture=False)
+        self.assertEqual(self.kv_index_kernel.launches, 0)
 
 
 class _FakeKVPool:
