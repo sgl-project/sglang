@@ -5237,7 +5237,6 @@ class AiterAttnBackend(AttentionBackend):
 
                 # target_verify goes through unified_attention when topk == 1: a
                 # linear draft chain needs only the causal mask (none for ENCODER_ONLY).
-                # MLA and draft_extend still use the legacy extend_attention_fwd path.
                 if (
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
