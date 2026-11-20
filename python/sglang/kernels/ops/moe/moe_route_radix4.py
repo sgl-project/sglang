@@ -46,6 +46,10 @@ def supported_hardware() -> bool:
 @cache_once
 def build() -> Module:
     """Compile and load the kernel, raising if the toolchain cannot."""
+    if not supported_hardware():
+        raise RuntimeError(
+            "moe_route_radix4 targets gfx942/gfx950 (wave64, GFX9 DPP)"
+        )
     return load_jit(
         "moe_route_radix4",
         cuda_files=["moe/route_radix4_hip.cuh"],
