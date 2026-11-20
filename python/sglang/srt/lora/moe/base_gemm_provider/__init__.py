@@ -1,46 +1,15 @@
-"""Lazy selection of base-MoE providers."""
-
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProvider
 
-logger = logging.getLogger(__name__)
-
-# The first vendor is the default for each weight family.
-VENDORS = {
-    "bf16": ("cutedsl", "triton"),
-    "fp8": ("cutedsl", "triton"),
-    "nvfp4": ("marlin",),
-}
-
 
 def select_provider_cls(
-    base_gemm_rows: str, family: str, vendor: str | None = None
+    base_gemm_rows: str, family: str, vendor: str
 ) -> type[MoeBaseProvider]:
-    """Use the family default when the requested vendor cannot serve it.
-
-    Triton and Marlin use route-major rows for either requested row order.
-    """
-    if base_gemm_rows not in ("expert_major", "route_major"):
-        raise ValueError(
-            f"unknown MoE LoRA base-GEMM row order {base_gemm_rows!r}; "
-            "expected 'expert_major' or 'route_major'"
-        )
-    vendors = VENDORS[family]
-    if vendor not in vendors:
-        if vendor is not None:
-            logger.info(
-                "MoE LoRA base-GEMM vendor %r serves no %s layers; this layer "
-                "family uses its default vendor %r",
-                vendor,
-                family,
-                vendors[0],
-            )
-        vendor = vendors[0]
+    """Triton and Marlin keep raw pair rows for either plan layout."""
     expert_major = base_gemm_rows == "expert_major"
     match vendor, family:
         case "cutedsl", "bf16":
@@ -66,20 +35,30 @@ def select_provider_cls(
                 else CuteDslFp8ContiguousProvider
             )
         case "triton", "bf16":
-            from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
-                TritonBf16ContiguousProvider,
+            from sglang.srt.lora.moe.base_gemm_provider.triton import (
+                TritonBf16PairProvider,
             )
 
-            return TritonBf16ContiguousProvider
+            return TritonBf16PairProvider
         case "triton", "fp8":
-            from sglang.srt.lora.moe.base_gemm_provider.triton_fp8 import (
-                TritonFp8ContiguousProvider,
+            from sglang.srt.lora.moe.base_gemm_provider.triton import (
+                TritonFp8PairProvider,
             )
 
-            return TritonFp8ContiguousProvider
+            return TritonFp8PairProvider
         case "marlin", "nvfp4":
-            from sglang.srt.lora.moe.base_gemm_provider.marlin_nvfp4 import (
-                MarlinNvFp4ContiguousProvider,
+            from sglang.srt.lora.moe.base_gemm_provider.marlin import (
+                MarlinNvFp4PairProvider,
             )
 
-            return MarlinNvFp4ContiguousProvider
+            return MarlinNvFp4PairProvider
+        case "marlin", "mxfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.marlin import (
+                MarlinMxfp4PairProvider,
+            )
+
+            return MarlinMxfp4PairProvider
+        case _:
+            raise ValueError(
+                f"no {vendor} MoE LoRA base-GEMM provider for {family} layers"
+            )

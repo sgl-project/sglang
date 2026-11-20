@@ -1,5 +1,3 @@
-"""Real provider methods test admission, geometry, and finalization with GPU boundaries mocked."""
-
 from __future__ import annotations
 
 import sys
@@ -44,13 +42,13 @@ class TestNvFp4PreparedQuantInfo(CustomTestCase):
 
 class TestProviderGeometry(CustomTestCase):
     def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
-        from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
-            TritonBf16ContiguousProvider,
+        from sglang.srt.lora.moe.base_gemm_provider.triton import (
+            TritonBf16PairProvider,
         )
 
         # The FP8 provider shares the method; the stand-in below carries its
         # block shape and dtype tag.
-        config_for = TritonBf16ContiguousProvider._config_for
+        config_for = TritonBf16PairProvider._config_for
         module = types.ModuleType(
             "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config"
         )
@@ -69,6 +67,7 @@ class TestProviderGeometry(CustomTestCase):
             ),
             _config_dtype_tag="fp8_w8a8",
             _config_block_shape=[128, 128],
+            _config_per_channel_quant=False,
             _configs={},
         )
         with mock.patch.dict(sys.modules, {module.__name__: module}):
@@ -194,19 +193,28 @@ class TestRunnerAdmission(CustomTestCase):
             ):
                 MoeLoraRunner._admit(self._base_layer(**overrides))
 
-    def test_binding_surfaces_plan_validation(self):
+    def test_binding_checks_slices_with_or_without_a_plan(self):
         """A provider exposing one gate/up slice cannot serve a gated layer."""
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe import runner as runner_module
         from sglang.srt.lora.moe.runner import MoeLoraRunner
         from sglang.srt.runtime_context import get_context, get_flags
 
-        provider = SimpleNamespace(
-            hidden_size=2048,
-            intermediate_size=768,
-            num_local_experts=256,
-            gate_up_slices=1,
-            contract=SimpleNamespace(lora_delta_dtype=torch.bfloat16),
-        )
+        class QuantInfo:
+            @staticmethod
+            def from_layer(base_layer):
+                return None
+
+        class Provider:
+            contract = SimpleNamespace(quant_info_cls=QuantInfo)
+            hidden_size = 2048
+            intermediate_size = 768
+            num_local_experts = 256
+            gate_up_slices = 1
+
+            def __init__(self, quant_info):
+                self.quant_info = quant_info
+
         layer = SimpleNamespace(
             w2_weight=SimpleNamespace(
                 device=torch.device("cuda"), shape=(256, 2048, 768)
@@ -220,27 +228,37 @@ class TestRunnerAdmission(CustomTestCase):
         # from_layer reads the published MoE runner backend for its vendor.
         with (
             mock.patch.object(MoeLoraRunner, "_admit", return_value="bf16"),
-            mock.patch.object(MoeLoraRunner, "_build_provider", return_value=provider),
+            mock.patch.object(
+                runner_module, "select_provider_cls", return_value=Provider
+            ),
             get_context().override_server_args(),
             get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL),
-            self.assertRaisesRegex(ValueError, "gate/up slices"),
         ):
-            MoeLoraRunner.from_layer(
+            for rank in (None, 64):
+                with (
+                    self.subTest(physical_rank=rank),
+                    self.assertRaisesRegex(ValueError, "gate/up slices"),
+                ):
+                    MoeLoraRunner.from_layer(
+                        layer,
+                        workspace=object(),
+                        is_shared_outer=False,
+                        physical_rank=rank,
+                    )
+            Provider.gate_up_slices = 2
+            runner = MoeLoraRunner.from_layer(
                 layer, workspace=object(), is_shared_outer=False, physical_rank=64
             )
+        self.assertIs(runner.providers["expert_major"], runner.providers["route_major"])
 
 
 class TestLayerRunnerBackendResolution(CustomTestCase):
-    """The selected lora runner backend binds the new MoE runner and rebinds
-    run_moe_core."""
-
-    def test_v2_accepts_each_new_moe_runner(self):
+    @staticmethod
+    def _base_layer():
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
-        from sglang.srt.lora.layers import FusedMoEWithLoRA
-        from sglang.srt.lora.moe.runner import MoeLoraRunner
 
-        base_layer = SimpleNamespace(
+        return SimpleNamespace(
             quant_method=mock.MagicMock(),
             moe_runner_config=MoeRunnerConfig(
                 num_experts=8,
@@ -259,11 +277,24 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
             should_fuse_routed_scaling_factor_in_topk=False,
             moe_tp_size=1,
             moe_tp_rank=0,
+            hidden_size=64,
             intermediate_size_per_partition=32,
+            w2_weight=SimpleNamespace(device=torch.device("cuda")),
             runner=SimpleNamespace(runner_backend=MoeRunnerBackend.DEEP_GEMM),
             run_moe_core=mock.Mock(),
         )
-        backend = SimpleNamespace(name="triton_v2", lora_workspace=object())
+
+    def test_v2_binds_the_selected_moe_runner(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+        base_layer = self._base_layer()
+        backend = SimpleNamespace(
+            name="triton_v2",
+            lora_workspace=object(),
+            get_batch_info=mock.Mock(return_value=None),
+        )
         original_run_moe_core = base_layer.run_moe_core
         with (
             mock.patch(
@@ -288,6 +319,97 @@ class TestLayerRunnerBackendResolution(CustomTestCase):
         self.assertIs(layer._moe_lora_runner, bind.return_value)
         self.assertIs(layer._base_run_moe_core, original_run_moe_core)
         self.assertEqual(base_layer.run_moe_core, layer._run_moe_core_with_lora)
+        empty = SimpleNamespace(hidden_states=torch.empty(0, 64))
+        self.assertIs(
+            base_layer.run_moe_core(empty), bind.return_value.run_base_only.return_value
+        )
+        bind.return_value.run_base_only.assert_called_once_with(
+            empty, is_prefill=False, use_cuda_graph=False
+        )
+        original_run_moe_core.assert_not_called()
+        nonempty = SimpleNamespace(hidden_states=torch.empty(1, 64))
+        self.assertIs(
+            base_layer.run_moe_core(nonempty), original_run_moe_core.return_value
+        )
+        original_run_moe_core.assert_called_once_with(dispatch_output=nonempty)
+
+    def test_forward_without_metadata_reaches_the_runner_only_when_empty(self):
+        """A plan override can bind only route-major rows, but run_base_only
+        reads expert-major rows for a decode forward with tokens."""
+        from dataclasses import replace
+
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+        from sglang.srt.lora.moe import runner as runner_module
+        from sglang.srt.lora.moe.runner import MoeLoraRunner
+        from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+
+        class QuantInfo:
+            @staticmethod
+            def from_layer(base_layer):
+                return None
+
+        class Provider:
+            contract = SimpleNamespace(quant_info_cls=QuantInfo)
+            hidden_size = 64
+            intermediate_size = 32
+            num_local_experts = 8
+            gate_up_slices = 2
+            derived_base_weights = None
+
+            def __init__(self, quant_info):
+                self.quant_info = quant_info
+
+        resolve = runner_module.resolve_plans
+        base_layer = self._base_layer()
+        original_run_moe_core = base_layer.run_moe_core
+        backend = SimpleNamespace(
+            name="triton_v2",
+            lora_workspace=object(),
+            get_batch_info=mock.Mock(return_value=None),
+        )
+        outputs = []
+        with (
+            mock.patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+            mock.patch.object(MoeLoraRunner, "_admit", return_value="bf16"),
+            mock.patch.object(
+                runner_module, "select_provider_cls", return_value=Provider
+            ),
+            # An override table may serve both phases from route-major rows.
+            mock.patch.object(
+                runner_module,
+                "resolve_plans",
+                side_effect=lambda **kwargs: {
+                    phase: replace(sel, base_gemm_rows="route_major")
+                    for phase, sel in resolve(**kwargs).items()
+                },
+            ),
+            get_context().override_server_args(),
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL),
+            get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+        ):
+            layer = FusedMoEWithLoRA(
+                base_layer,
+                backend,
+                experts_shared_outer_loras=True,
+                max_lora_rank=16,
+            )
+            self.assertEqual(list(layer._moe_lora_runner.providers), ["route_major"])
+            for tokens in (0, 1):
+                dispatch = SimpleNamespace(
+                    hidden_states=torch.empty(tokens, 64, dtype=torch.bfloat16),
+                    topk_output=StandardTopKOutput(
+                        topk_weights=torch.empty(tokens, 2),
+                        topk_ids=torch.zeros(tokens, 2, dtype=torch.int32),
+                        router_logits=torch.empty(tokens, 8),
+                    ),
+                )
+                outputs.append(base_layer.run_moe_core(dispatch))
+        empty, nonempty = outputs
+        self.assertEqual(tuple(empty.hidden_states.shape), (0, 64))
+        self.assertIs(nonempty, original_run_moe_core.return_value)
+        original_run_moe_core.assert_called_once_with(dispatch_output=dispatch)
 
 
 if __name__ == "__main__":

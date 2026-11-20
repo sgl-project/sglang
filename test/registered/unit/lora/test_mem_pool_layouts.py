@@ -447,5 +447,75 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
                 )
 
 
+class TestLenientAdapterLoad(unittest.TestCase):
+    def test_copies_attention_weights_and_skips_unmatched_weights(self):
+        pool = _make_pool(tp_size=1, attn_tp_size=1, moe_tp_size=1)
+        pool.num_layer = 1
+        pool.max_lora_rank = 2
+        pool.target_modules = {"o_proj", "embed_tokens"}
+        pool.strict_loading = True
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.max_rank_spaced_layout = False
+        pool.base_model = object()
+        pool.base_hf_config.vocab_size = 16
+        a = torch.ones(2, 3)
+        b = torch.ones(5, 2)
+        pool.A_buffer = {"o_proj": [torch.zeros_like(a).unsqueeze(0)]}
+        pool.B_buffer = {"o_proj": [torch.zeros_like(b).unsqueeze(0)]}
+        embed_a = torch.full((2, 2, 17), 7.0)
+        embed_b = torch.full((2, 3, 2), 7.0)
+        extra = torch.full((2, 1, 3), 7.0)
+        pool.embedding_A_buffer = {"embed_tokens": embed_a}
+        pool.embedding_B_buffer = {"embed_tokens": embed_b}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {"input_embeddings": extra}
+        prefix = "model.layers.0.self_attn.o_proj"
+        adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=2, lora_added_tokens_size=0),
+            scaling=1.0,
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        f"{prefix}.lora_A.weight": a,
+                        f"{prefix}.lora_B.weight": b,
+                        "model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight": a,
+                    },
+                    pinned_weights={},
+                )
+            ],
+            embedding_layers={"model.lm_head.lora_A.weight": torch.ones(2, 3)},
+            pinned_embedding_layers={},
+            pinned_added_tokens_embeddings={},
+            added_tokens_embeddings={},
+        )
+        module = types.SimpleNamespace(
+            slice_lora_a_weights=torch.as_tensor, slice_lora_b_weights=torch.as_tensor
+        )
+        load_args = dict(
+            uid="all-linear",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[{prefix: module}],
+            lora_embed_tokens_module=module,
+            lora_lm_head_module=None,
+        )
+        with self.assertRaisesRegex(ValueError, "did not match any target module"):
+            _load_lora_weight_to_buffer(pool, **load_args)
+        for buffer in (embed_a, embed_b, extra):
+            self.assertTrue((buffer == 7).all())
+        self.assertFalse(pool.A_buffer["o_proj"][0].any())
+        self.assertFalse(pool.B_buffer["o_proj"][0].any())
+
+        pool.strict_loading = False
+        _load_lora_weight_to_buffer(pool, **load_args)
+        self.assertTrue(torch.equal(pool.A_buffer["o_proj"][0][0], a))
+        self.assertTrue(torch.equal(pool.B_buffer["o_proj"][0][0], b))
+        for buffer in (embed_a, embed_b, extra):
+            self.assertFalse(buffer[0].any())
+            self.assertTrue((buffer[1] == 7).all())
+
+
 if __name__ == "__main__":
     unittest.main()

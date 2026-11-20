@@ -540,5 +540,40 @@ class TestBlockScaledQuantArgs(CustomTestCase):
             launch.__getitem__.assert_not_called()
 
 
+class TestCompileCache(CustomTestCase):
+    def test_stage_constants_separate_compiled_code(self):
+        from sglang.srt.lora.moe.base_gemm_provider import cutedsl_common
+
+        weight = torch.zeros((2, 256, 128), dtype=torch.uint8)
+        build = mock.Mock(
+            side_effect=lambda *_: SimpleNamespace(
+                launch=mock.Mock(), compiled_fn=object()
+            )
+        )
+        provider = SimpleNamespace(
+            _ROW_MODE="masked",
+            _DTYPE_TAG="nvfp4",
+            quant_info=SimpleNamespace(num_local_experts=2),
+            _compiled={64: {}},
+            _stage_weight=lambda _: weight,
+            _stage_scale=lambda _: None,
+            _stage_constexprs=lambda stage: (
+                16,
+                True,
+                128 if stage == "gemm1" else 1 << 30,
+            ),
+            _prepare_dummy=build,
+            _as_dynamic_cute_tensor=lambda tensor, **_: tensor,
+        )
+        with mock.patch.dict(cutedsl_common._COMPILE_CACHE, clear=True):
+            for stage in ("gemm1", "gemm2", "gemm1"):
+                cutedsl_common.CuteDslTileMixin._compile_stage(
+                    provider, 64, stage, "tile"
+                )
+        calls = provider._compiled[64]
+        self.assertIsNot(calls["gemm1"].compiled_fn, calls["gemm2"].compiled_fn)
+        self.assertEqual(build.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

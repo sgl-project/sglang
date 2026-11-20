@@ -3,53 +3,56 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, cast
 
 import msgspec
 import torch
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.lora.common.route_view import RouteView
+    from sglang.kernels.ops.lora.moe.quant_blockscaled import BlockScaledRows
     from sglang.srt.lora.moe.plan import FinalizeFamily, MoeLoraLaunchConfig
     from sglang.srt.lora.workspace import LoraWorkspace
 
 
-# Token-count cutoff for the vectorized top-k gather.
 _SMALL_FINALIZE_MAX_TOKENS = 64
+
+# The row-state fields _input_buffers() returns beside the rows; None = left unset.
+RowBuffers = dict[str, Optional[torch.Tensor]]
 
 
 class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     key: str
     quant_info_cls: type
-    # Base output order; the LoRA delta is always [gate | up].
-    gate_first: bool
-    interleaved: bool
-    gate_up_output_dtype: torch.dtype
-    lora_delta_dtype: torch.dtype
-    lora_activation_dtype: torch.dtype
-    # Fuse FP8 quantization into activation for the down GEMM.
-    act_quant_group: int | None = None
 
 
 def expected_rows_per_expert(num_pairs: int, num_experts: int) -> int:
-    """Rounded-up mean rows per expert; use one for an empty batch."""
     return (num_pairs - 1) // num_experts + 1 if num_pairs else 1
 
 
-def prepare_buffer(workspace, name: str, shape, *, dtype, device) -> torch.Tensor:
+def prepare_buffer(
+    workspace, name: str, shape, *, dtype, device, zero_on_first_allocation=False
+) -> torch.Tensor:
     if workspace is not None:
-        return workspace.tensor(name, shape, dtype=dtype, device=device)
+        return workspace.tensor(
+            name,
+            shape,
+            dtype=dtype,
+            device=device,
+            zero_on_first_allocation=zero_on_first_allocation,
+        )
+    if zero_on_first_allocation:
+        return torch.zeros(shape, dtype=dtype, device=device)
     return torch.empty(shape, dtype=dtype, device=device)
 
 
 def admit_weight_layout(quant_info) -> int:
     """Validate [E, S*I, H] / [E, H, I] weights and return S."""
-    if quant_info.intermediate_size <= 0:
-        raise ValueError("intermediate_size must be positive")
+    pack = getattr(quant_info, "elements_per_byte", 1)
     expected_w2 = (
         quant_info.num_local_experts,
         quant_info.hidden_size,
-        quant_info.intermediate_size,
+        quant_info.intermediate_size // pack,
     )
     if quant_info.w2_weight.shape != expected_w2:
         raise ValueError(
@@ -58,7 +61,7 @@ def admit_weight_layout(quant_info) -> int:
     if (
         quant_info.w13_weight.ndim != 3
         or quant_info.w13_weight.shape[0] != quant_info.num_local_experts
-        or quant_info.w13_weight.shape[2] != quant_info.hidden_size
+        or quant_info.w13_weight.shape[2] != quant_info.hidden_size // pack
     ):
         raise ValueError(
             "w13_weight must be [num_local_experts, slices*intermediate, hidden]"
@@ -68,19 +71,15 @@ def admit_weight_layout(quant_info) -> int:
         raise ValueError(
             "w13 output width must be an integer multiple of intermediate_size"
         )
-    gate_up_slices = gateup_width // quant_info.intermediate_size
-    if gate_up_slices not in (1, 2):
-        raise ValueError(
-            "the base providers support one non-gated slice or two gated "
-            f"gate/up slices, got {gate_up_slices}"
-        )
-    return gate_up_slices
+    return gateup_width // quant_info.intermediate_size
 
 
 class MoeBaseProvider:
-    """One provider per layer; logical sizes come from quant_info."""
+    """Base GEMM provider bound to one layer's weights."""
 
     contract: MoeBaseProviderContract
+    # What binding derives from base weights; if set, online weight updates are refused.
+    derived_base_weights: str | None = None
 
     @property
     def num_local_experts(self) -> int:
@@ -88,7 +87,6 @@ class MoeBaseProvider:
 
     @property
     def intermediate_size(self) -> int:
-        """Logical intermediate width of one TP shard."""
         return self.quant_info.intermediate_size
 
     @property
@@ -112,8 +110,11 @@ class MoeBaseProvider:
     def gateup(self, row_state, out: torch.Tensor) -> None:
         raise NotImplementedError
 
-    def release_prepared_inputs(self, row_state) -> None:
-        raise NotImplementedError
+    def _act_quant_target(
+        self, row_state, *, fused_config: Mapping[str, int] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, int] | BlockScaledRows | None:
+        """Quantized down input to write. Fused activation only writes BlockScaledRows."""
+        return None
 
     def act_with_delta(
         self,
@@ -122,11 +123,27 @@ class MoeBaseProvider:
         gate_up_delta: torch.Tensor | None,
         topk_ids: torch.Tensor,
         act_out: torch.Tensor,
-        activation_lora_input: torch.Tensor,
+        activation_lora_input: torch.Tensor | None,
         *,
         activation: str = "silu",
     ) -> None:
-        raise NotImplementedError
+        from sglang.kernels.ops.lora.moe.activation_delta import act_delta
+
+        act_quant = self._act_quant_target(row_state)
+        act_delta(
+            gateup_out,
+            gate_up_delta,
+            act_out,
+            activation_lora_input,
+            row_state.pair_to_row,
+            topk_ids,
+            num_local_experts=self.num_local_experts,
+            gate_first=True,
+            interleaved=False,
+            activation=activation,
+            act_quant=act_quant,
+        )
+        self._set_act_quant_ready(row_state, act_quant is not None)
 
     def fused_act(
         self,
@@ -142,16 +159,44 @@ class MoeBaseProvider:
         b_gate_up: torch.Tensor | None = None,
         bridge_top_k: int = 1,
     ) -> None:
-        raise NotImplementedError(
-            f"{self.contract.key} has no fused-act implementation"
+        from sglang.kernels.ops.lora.moe.fused_act import fused_b_act
+
+        act_quant = cast(
+            "BlockScaledRows | None",
+            self._act_quant_target(row_state, fused_config=config),
         )
+        fused_b_act(
+            activation=activation,
+            base_gateup=base_gateup,
+            act_rows=act_rows,
+            act_pairs=act_pairs,
+            pair_to_row=row_state.pair_to_row,
+            routing=routing,
+            num_local_experts=self.num_local_experts,
+            gate_first=True,
+            interleaved=False,
+            config=config,
+            bridge_gateup=bridge_gateup,
+            b_gate_up=b_gate_up,
+            bridge_top_k=bridge_top_k,
+            act_quant=act_quant,
+        )
+        self._set_act_quant_ready(row_state, act_quant is not None)
+
+    @staticmethod
+    def _set_act_quant_ready(row_state, written: bool) -> None:
+        """Record if the activation wrote down()'s input; False clears a stale True."""
+        if hasattr(row_state, "act_quant_ready"):
+            row_state.act_quant_ready = written
 
     def down(
         self,
         row_state,
         act_out: torch.Tensor,
         out: torch.Tensor,
+        lora: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
+        """Only providers with ``supports_epilogue_down_lora`` receive ``lora``."""
         raise NotImplementedError
 
     def down_output(self, row_state, workspace: LoraWorkspace) -> torch.Tensor:
@@ -219,7 +264,6 @@ class MoeBaseProvider:
         workspace: LoraWorkspace,
         token_route: RouteView | None,
     ) -> None:
-        """Apply shared down-B with the plan's fused or staged finalize."""
         from sglang.srt.lora.moe.plan import FinalizeFamily, Site
 
         if topk_weights.dtype != torch.float32:
@@ -242,10 +286,6 @@ class MoeBaseProvider:
                 config=launch_config.shared_one_pass,
             )
             return
-        if family is not FinalizeFamily.SHARED_TOKEN_DELTA:
-            raise ValueError(f"not a shared-outer finalize family: {family}")
-        if token_route is None:
-            raise ValueError("shared token route was not constructed")
 
         num_tokens = output.shape[0]
         token_rank = workspace.tensor(
@@ -257,7 +297,7 @@ class MoeBaseProvider:
         token_delta = workspace.tensor(
             "finalize:shared_token_delta",
             (num_tokens, self.hidden_size),
-            dtype=self.contract.lora_delta_dtype,
+            dtype=torch.bfloat16,
             device=bridge.device,
         )
         from sglang.kernels.ops.lora.moe.finalize import (
