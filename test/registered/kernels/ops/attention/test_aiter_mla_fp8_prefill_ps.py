@@ -213,6 +213,30 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
                 self.assertFalse(merged.isnan().any())
                 torch.testing.assert_close(merged[keyless], other_out[keyless])
 
+    def test_all_keyless_prefix_chunk_packs_bf16(self):
+        """A chunk without PS metadata runs on bf16 varlen, so its K/V must not be packed to fp8."""
+        q_lens, chunk_lens = [130, 40, 260], [0, 0, 0]
+        backend = _backend(KIMI_K3_TP8_HEADS, q_lens)
+        chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=q_lens,
+            num_prefix_chunks=1,
+            prefix_chunk_idx=0,
+            prefix_chunk_seq_lens_cpu=chunk_lens_t,
+            prefix_chunk_has_zero_kv=[True],
+            prefix_chunk_cu_seq_lens=torch.zeros(
+                1, len(chunk_lens) + 1, dtype=torch.int32
+            ).cuda(),
+            prefix_chunk_num_tokens=[0],
+        )
+        backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
+        self.assertEqual(backend.forward_metadata.chunked_prefix_ps_metadatas, [None])
+
+        _, k_nope, k_pe, v = _qkv(KIMI_K3_TP8_HEADS, q_lens, [4, 0, 0])
+        k, packed_v = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
+        self.assertEqual((k.dtype, packed_v.dtype), (torch.bfloat16, torch.bfloat16))
+        self.assertTrue(torch.equal(k, _cat_k(k_nope, k_pe)))
+
     def test_keyless_prefix_chunk_stays_bf16_without_the_extension(self):
         """Keyless prefix chunks run on the asm fp8 prefill only where a model declares
         mla_fp8_prefill_extended; every other MLA model keeps such a chunk on bf16 varlen."""

@@ -4739,9 +4739,10 @@ class AiterAttnBackend(AttentionBackend):
         k_pe: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # With PS metadata every chunk runs the asm fp8 kernel at unit K/V scale,
-        # so one pass writes both in fp8; without it they stay bf16 for varlen.
-        if self.forward_metadata.chunked_prefix_ps_metadatas is not None:
+        # Only when every chunk has PS metadata do all of them run the asm fp8 kernel at unit K/V scale,
+        # so one pass writes both in fp8; otherwise they stay bf16 (the fp8 kernel path casts bf16 itself).
+        ps_metadatas = self.forward_metadata.chunked_prefix_ps_metadatas
+        if ps_metadatas is not None and all(ps is not None for ps in ps_metadatas):
             return mla_kv_pack_quantize_fp8(
                 k_nope=k_nope, k_pe=k_pe, v=v, fp8_dtype=fp8_dtype, enable_pdl=False
             )
