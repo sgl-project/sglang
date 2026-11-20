@@ -1047,6 +1047,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_logprobs and not request.return_meta_info:
             return "return_sampling_logprobs requires return_meta_info=true."
 
+        if request.return_sampling_logprobs and not request.logprobs:
+            return "return_sampling_logprobs requires logprobs=true."
+
         top_logprobs_error = self._top_logprobs_error(
             "top_logprobs", request.top_logprobs
         )
