@@ -12,9 +12,7 @@ tag: NEW
 
 For all install methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install).
 
-<Note>Inkling-2-Mini support is not in an SGLang release yet. Install from the `<PR_BRANCH>` branch, or use the `inkling-2-mini` images below.</Note>
-
-{/* TODO: Replace <PR_BRANCH> with the Inkling-2-Mini pull request branch. */}
+<Note>Inkling-2-Mini support is not in an SGLang release yet. Install from its pull request, [sgl-project/sglang#51926](https://github.com/sgl-project/sglang/pull/51926), or use the `inkling-2-mini` images below.</Note>
 
 <Tabs>
 
@@ -22,7 +20,7 @@ For all install methods and hardware platforms, see the [official SGLang install
 
 ```bash Command
 pip install --upgrade pip
-pip install 'git+https://github.com/sgl-project/sglang.git@<PR_BRANCH>#subdirectory=python'
+pip install 'git+https://github.com/sgl-project/sglang.git@refs/pull/51926/head#subdirectory=python'
 ```
 
 Then run the **Python** output of the command panel below.
