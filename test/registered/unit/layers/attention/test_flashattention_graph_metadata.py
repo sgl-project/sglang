@@ -446,7 +446,8 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
                 full[12:18] = 4
                 fb.seq_lens.copy_(torch.tensor([2 * ps, 0, 1], device=device))
             b.init_forward_metadata_out_graph(fb)
-            # A different graph bucket can overwrite the shared buffer before replay.
+            # Graph buckets share this buffer: the replay must rebuild it,
+            # not the prep above.
             metadata.page_table.fill_(-99)
             graph.replay()
             torch.cuda.synchronize()
