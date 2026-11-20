@@ -1756,6 +1756,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     [],
                 )
 
+    def test_nemotron_h_bf16_keeps_auto_runner_below_sm89(self):
+        # FlashInfer builds no CUTLASS MoE for SM80/SM86, so BF16 NemotronH
+        # there (e.g. A100) must keep the platform's auto MoE runner.
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            server_args, outer_config = self._nemotron_h_omni_args(architecture, None)
+            server_args._model_config.quantization = None
+            with (
+                self.subTest(architecture=architecture),
+                override_platform(is_blackwell=False),
+                override_platform(is_sm100=False),
+                override_platform(
+                    is_cuda=True, is_hip=False, is_sm90=False, device_capability=(8, 0)
+                ),
+            ):
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        architecture,
+                        server_args,
+                        outer_config,
+                    ),
+                    [],
+                )
+
     def test_nemotron_h_bf16_runner_on_sm90(self):
         # On Hopper, unquantized Nano Omni keeps auto (Triton), the runner it
         # had before it was registered; the other NemotronH architectures keep
@@ -1774,7 +1801,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.subTest(architecture=architecture),
                 override_platform(is_blackwell=False),
                 override_platform(is_sm100=False),
-                override_platform(is_cuda=True, is_hip=False, is_sm90=True),
+                override_platform(
+                    is_cuda=True, is_hip=False, is_sm90=True, device_capability=(9, 0)
+                ),
             ):
                 self.assertEqual(
                     collect_model_override_declarations(
@@ -1795,7 +1824,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with (
             override_platform(is_blackwell=False),
             override_platform(is_sm100=False),
-            override_platform(is_cuda=True, is_hip=False, is_sm90=False),
+            override_platform(
+                is_cuda=True, is_hip=False, is_sm90=False, device_capability=(8, 9)
+            ),
         ):
             self.assertEqual(
                 collect_model_override_declarations(

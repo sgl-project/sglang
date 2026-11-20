@@ -141,9 +141,9 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             # before it was registered here, which is faster than
             # flashinfer_cutlass for it today.
             pass
-        elif get_platform().is_cuda:
-            # FlashInfer is CUDA-only; elsewhere (ROCm BF16) keep the
-            # platform's own auto runner.
+        elif get_platform().is_cuda and get_platform().device_capability >= (8, 9):
+            # FlashInfer builds its CUTLASS MoE only for SM89 and newer CUDA
+            # GPUs; elsewhere (ROCm, SM80/SM86) keep the platform's auto runner.
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
     if get_platform().is_blackwell and is_attention_backend_not_set(cfg):
