@@ -95,6 +95,7 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
 
 logger = init_logger(__name__)
 
@@ -571,6 +572,10 @@ class ServerArgs(DisaggServerArgsMixin):
     http_graceful_shutdown_timeout: int | None = None
     enable_metrics: bool = False
 
+    # API key authentication
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
+
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
     webui_port: int | None = 12312
@@ -703,6 +708,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
         self._adjust_network_ports()
+        self._adjust_admin_api_key()
         # adjust parallelism before attention backend
         self._adjust_parallelism()
         self._adjust_attention_backend()
@@ -1662,6 +1668,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.master_port = self.settle_port(
                     self.master_port, 37, avoid=settled_ports
                 )
+
+    def _adjust_admin_api_key(self):
+        """`--admin-api-key` wins; without it the server takes `SGLANG_ADMIN_API_KEY`."""
+        if self.admin_api_key is None:
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get()
 
     def _adjust_parallelism(self):
         sp_unspecified = self.sp_degree is None
@@ -3179,6 +3190,24 @@ class ServerArgs(DisaggServerArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
             help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help=(
+                "Set admin API key for management endpoints. Sensitive ones "
+                "(weight updates, memory release/resume, profiling) are refused "
+                "unless it is set. When set, admin endpoints require this key and "
+                "do NOT accept --api-key. Defaults to SGLANG_ADMIN_API_KEY, which "
+                "the bundled clients also read."
+            ),
         )
         parser.add_argument(
             "--webui",

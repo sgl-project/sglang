@@ -117,6 +117,8 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
+- `--api-key {KEY}`: require `Authorization: Bearer {KEY}` on the inference HTTP and WebSocket endpoints (default: no key, inference endpoints are open). See [API key authentication](#api-key-authentication) for management endpoint rules.
+- `--admin-api-key {KEY}`: key for the management endpoints; weight update, memory release/resume, and profiling endpoints are refused unless it is set. Defaults to the `SGLANG_ADMIN_API_KEY` environment variable.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
@@ -504,6 +506,59 @@ check; it only validates its own routing loop and broker.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.
+
+### API key authentication
+
+Inference endpoints accept requests without a key by default. Set `--api-key`
+to protect them, and `--admin-api-key` to protect the management endpoints.
+Weight update, memory release/resume, and profiling endpoints require an admin
+key even when no inference key is configured. Clients send the key as
+`Authorization: Bearer <key>` on HTTP requests and on WebSocket handshakes.
+The rules are the same as the LLM server's.
+
+```bash Command
+export SGLANG_ADMIN_API_KEY="$ADMIN_KEY"
+
+sglang serve \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --api-key "$API_KEY" \
+  --port 30010
+```
+
+`SGLANG_ADMIN_API_KEY` sets the admin key when `--admin-api-key` is not given; the
+flag wins when both are set. Prefer the environment variable, because a flag value
+is visible in the process list.
+
+The key an endpoint requires depends on which keys the server has:
+
+| Endpoints | No key | `--api-key` only | Admin key only | Both keys |
+| --- | --- | --- | --- | --- |
+| Generation, model, job, and WebSocket endpoints | Open | API key | Open | API key |
+| `/v1/set_lora`, `/v1/merge_lora_weights`, `/v1/unmerge_lora_weights`, `/get_weights_checksum`, `/update_weights_from_tensor_checker` | Open | API key | Admin key | Admin key |
+| `/update_weights_from_disk`, `/update_weights_from_tensor`, `/release_memory_occupation`, `/resume_memory_occupation`, `/start_profile`, `/stop_profile` | `403` | `403` | Admin key | Admin key |
+
+A missing or wrong key returns `401`. An unauthorized WebSocket handshake is
+refused with `403` before the connection is accepted.
+
+<Note>
+The endpoints in the last row return `403` until the server has an admin key, and
+`--api-key` does not unlock them. Launch the server with an admin key before you
+update weights, release or resume memory, or profile over HTTP.
+</Note>
+
+`/liveness`, `/health`, `/health_generate`, `/metrics`, and CORS preflight requests
+never require a key, so probes and metric scrapers need no secret.
+
+The bundled benchmark client takes the same keys: pass `--api-key` (default:
+`OPENAI_API_KEY`) for a server started with `--api-key`, and `--admin-api-key`
+(default: `SGLANG_ADMIN_API_KEY`) when you use `--profile`.
+
+Browsers cannot set the `Authorization` header on a WebSocket handshake. To use a
+browser client such as the realtime web UI with `--api-key`, route it through a
+reverse proxy that adds the header.
+
+API keys protect the HTTP port only. Keep the internal scheduler ports on a
+trusted network, as described in [Model and runtime](#model-and-runtime).
 
 ### Cloud Storage
 

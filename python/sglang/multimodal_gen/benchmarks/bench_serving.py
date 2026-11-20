@@ -7,7 +7,7 @@ Usage:
 
     # T2V or T2I or any other multimodal generation model
     sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
-    # With profiling:
+    # With profiling (launch the server and this client with the same SGLANG_ADMIN_API_KEY):
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
          --backend sglang-image --dataset vbench --task image-to-image --num-prompts 5 --profile
 
@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.utils.auth import admin_auth_headers, bearer_auth_headers
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -526,6 +527,7 @@ class ProfileReqOutput:
 async def async_request_profile(
     api_url: str,
     session: Optional[aiohttp.ClientSession] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> ProfileReqOutput:
     """Send a profile start/stop request to the server."""
     output = ProfileReqOutput()
@@ -536,7 +538,7 @@ async def async_request_profile(
         close_session = True
 
     try:
-        async with session.post(api_url) as response:
+        async with session.post(api_url, headers=headers) as response:
             response_text = await response.text()
             if response.status == 200:
                 output.success = True
@@ -567,12 +569,17 @@ async def benchmark(args):
     if args.guidance_scale is not None:
         extra_body.setdefault("guidance_scale", args.guidance_scale)
 
+    auth_headers = bearer_auth_headers(args.api_key)
+    admin_headers = admin_auth_headers(args.admin_api_key)
+
     # Wait for service
     wait_for_service(args.base_url)
 
     # Fetch model info
     try:
-        resp = requests.get(f"{args.base_url}/v1/model_info", timeout=5)
+        resp = requests.get(
+            f"{args.base_url}/v1/model_info", headers=auth_headers, timeout=5
+        )
         if resp.status_code == 200:
             info = resp.json()
             if "model_path" in info and info["model_path"]:
@@ -662,7 +669,7 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=auth_headers) as session:
         # Run warmup requests
         warmup_pairs: List[tuple] = []
         if args.warmup_requests and requests_list:
@@ -696,7 +703,7 @@ async def benchmark(args):
         # Start profiler if --profile is enabled (after warmup)
         if args.profile:
             profile_output = await async_request_profile(
-                api_url=f"{args.base_url}/start_profile"
+                api_url=f"{args.base_url}/start_profile", headers=admin_headers
             )
             if profile_output.success:
                 logger.info(f"Profiler started: {profile_output.message}")
@@ -725,7 +732,7 @@ async def benchmark(args):
     if args.profile:
         logger.info("Stopping profiler and saving traces...")
         profile_output = await async_request_profile(
-            api_url=f"{args.base_url}/stop_profile"
+            api_url=f"{args.base_url}/stop_profile", headers=admin_headers
         )
         if profile_output.success:
             logger.info(f"Profiler stopped: {profile_output.message}")
@@ -810,6 +817,19 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost", help="Server host.")
     parser.add_argument("--port", type=int, default=30000, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=os.environ.get("OPENAI_API_KEY"),
+        help="The server's --api-key (default: OPENAI_API_KEY).",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
+    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -907,7 +927,8 @@ if __name__ == "__main__":
         "--profile",
         action="store_true",
         help="Enable full pipeline profiling. "
-        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
+        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR. "
+        "The server must be launched with an admin API key.",
     )
     parser.add_argument(
         "--log-level",

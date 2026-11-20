@@ -201,6 +201,7 @@ fn decide(
 ) -> Decision {
     // Probes and scrapes never carry a key.
     if method == Method::OPTIONS
+        || path == "/liveness"
         || path.starts_with("/health")
         || path.starts_with("/ready")
         || path.starts_with("/metrics")
