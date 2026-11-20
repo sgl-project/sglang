@@ -108,6 +108,8 @@ class MediaArtifactCacheMixin:
 
     artifact_modality: Optional[Modality] = None
     artifact_option_defaults: Mapping[str, Any] = {"detail": "auto"}
+    artifact_discard_alpha_channel: bool = True
+    smart_rgb_conversion: bool = False
 
     def artifact_preprocess_kwargs(
         self, source: Any, modality: Modality
@@ -171,9 +173,13 @@ class MediaArtifactCacheMixin:
 
     def _ensure_rgb_image(self, image: Any) -> Any:
         """Match the default legacy loader RGB conversion before processing."""
-        if not isinstance(image, Image.Image) or image.mode == "RGB":
+        if (
+            not self.artifact_discard_alpha_channel
+            or not isinstance(image, Image.Image)
+            or image.mode == "RGB"
+        ):
             return image
-        if getattr(self, "smart_rgb_conversion", False):
+        if self.smart_rgb_conversion:
             return smart_to_rgb(image)
         return image.convert("RGB")
 

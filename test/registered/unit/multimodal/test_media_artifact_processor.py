@@ -90,6 +90,40 @@ class _Processor(MediaArtifactCacheMixin):
 
 
 class TestMediaArtifactProcessor(CustomTestCase):
+    def test_kimi_k3_decoder_preserves_alpha_for_background_compositing(self):
+        """Cache misses must keep alpha for K3's post-resize background fill."""
+        import torch
+
+        from sglang.srt.multimodal.kimi_k3_image_processing import (
+            fill_transparent_bg,
+            to_chw_uint8,
+        )
+        from sglang.srt.multimodal.processors.kimi_common import unwrap_kimi_images
+        from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
+
+        processor = KimiK3ImageProcessor.__new__(KimiK3ImageProcessor)
+        processor.gpu_image_decode = False
+        for mode in ("RGBA", "LA", "P"):
+            image = Image.new("RGBA", (8, 8), (80, 160, 240, 0)).convert(mode)
+            if mode == "P":
+                image.info["transparency"] = 0
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            for source in (image, buf.getvalue()):
+                with self.subTest(mode=mode, direct=source is image):
+                    snapshot = snapshot_media(source)
+                    actual = processor.decode_media_snapshot(snapshot, Modality.IMAGE)
+                    self.assertEqual(actual.mode, mode)
+                    pixels = to_chw_uint8(actual).unsqueeze(0).float()
+                    self.assertEqual(pixels.shape[1], 4)
+                    uncached = processor._load_single_item(
+                        source, Modality.IMAGE, discard_alpha_channel=False
+                    )
+                    uncached = unwrap_kimi_images([uncached])[0]
+                    self.assertTrue(torch.equal(pixels[0], to_chw_uint8(uncached)))
+                    composited = fill_transparent_bg(pixels, {"pattern": "white"})
+                    self.assertTrue(torch.all(composited == 255).item())
+
     def test_default_image_decoder_rejects_lazy_pil_failure(self):
         malformed_png = base64.b64decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLJSwAAAABJRU5ErkJggg=="
