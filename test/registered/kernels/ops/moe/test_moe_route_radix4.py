@@ -737,13 +737,14 @@ def test_fused_sort_rejects_a_moe_buf_it_cannot_zero():
         )
 
 
-def test_fused_sort_rejects_an_empty_batch():
+@pytest.mark.parametrize("block_m", BLOCK_MS)
+def test_fused_sort_rejects_an_empty_batch(block_m):
     """An empty batch would leave num_valid_ids unset, so it has to fail."""
     scores = torch.empty((0, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(Exception):
         moe_route_radix4.route_radix4_with_sort(
-            scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+            scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), block_m=block_m
         )
 
 
