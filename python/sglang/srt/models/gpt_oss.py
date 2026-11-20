@@ -57,7 +57,7 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix
@@ -380,6 +380,9 @@ def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 class GptOssAttention(nn.Module):
+    rope_is_neox_style = True
+    attn_type = AttentionType.DECODER
+
     def __init__(
         self,
         hidden_size: int,
@@ -461,6 +464,7 @@ class GptOssAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            is_neox_style=self.rope_is_neox_style,
         )
 
         assert layer_type in {"sliding_attention", "full_attention"}
@@ -473,6 +477,7 @@ class GptOssAttention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
+            attn_type=self.attn_type,
         )
         self.layer_id = layer_id
 
@@ -488,7 +493,7 @@ class GptOssAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         extra_args = {}
-        if not _is_npu:
+        if not _is_npu and self.attn_type != AttentionType.ENCODER_ONLY:
             extra_args = {
                 "fused_set_kv_buffer_arg": (
                     create_fused_set_kv_buffer_arg(
@@ -511,7 +516,10 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=(
+                self.attn_type != AttentionType.ENCODER_ONLY
+                and not enable_fused_set_kv_buffer(forward_batch)
+            ),
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -531,6 +539,9 @@ class GptOssAttention(nn.Module):
 
 
 class GptOssDecoderLayer(nn.Module):
+    attention_cls = GptOssAttention
+    moe_cls = GptOssSparseMoeBlock
+
     def __init__(
         self,
         config: GptOssConfig,
@@ -556,7 +567,7 @@ class GptOssDecoderLayer(nn.Module):
         else:
             self.sliding_window_size = sliding_window_size
 
-        self.self_attn = GptOssAttention(
+        self.self_attn = self.attention_cls(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -579,7 +590,7 @@ class GptOssDecoderLayer(nn.Module):
         self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
-            self.mlp = GptOssSparseMoeBlock(
+            self.mlp = self.moe_cls(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
