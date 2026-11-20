@@ -30,6 +30,20 @@ On the other hand, if you see `token usage` very high and you frequently see war
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
 If you see `KV cache pool is full. Retract requests.` occasionally but not frequently (~1 time per minute), it is okay.
 
+How the value is used: the scheduler reserves KV for the tokens that running requests have yet to decode, estimated as
+`min(max_new_tokens - generated, SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION) * new_token_ratio` per request (the clip defaults to 4096).
+`new_token_ratio` starts at `min(SGLANG_INIT_NEW_TOKEN_RATIO * schedule_conservativeness, 1.0)` (0.7 by default),
+decays linearly over `SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS` (600) decode steps to `SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR` (0.14) times the initial value,
+and is reset or raised after a retraction.
+
+<Note>
+With DP attention (`--enable-dp-attention`), the server multiplies `--schedule-conservativeness` by 0.3 at startup,
+so the default 1.0 runs as 0.3 (initial `new_token_ratio` 0.21 instead of 0.7).
+The resolved value is the one printed in the startup `server_args` log.
+For example, `--schedule-conservativeness 3.33` resolves to about 1.0.
+Tune from the resolved value, not the value you passed.
+</Note>
+
 ### Tune `--mem-fraction-static` to increase KV cache pool capacity
 SGLang allocates memory as follows:
 
