@@ -751,6 +751,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
 
+    def has_bootstrapped_parked_chunk(self: Scheduler) -> bool:
+        """A bootstrapped request between two chunks that got no chunk in the
+        last admission pass: its extend_end stays at prefix_len."""
+        req = self.chunked_req
+        return (
+            req is not None
+            and not req.pending_bootstrap
+            and not is_aborted(req)
+            and req.extend_end == req.prefix_len
+        )
+
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
             not req.pending_bootstrap and not is_aborted(req)
@@ -1420,7 +1431,24 @@ class SchedulerDisaggregationPrefillMixin:
                     # Decode may have admitted different requests. Yield one
                     # slot so they can prefill, including peers still waiting
                     # for a metadata buffer in the bootstrap queue.
+                    # It also serves a refused admission pass: no second yield.
+                    self.prefill_admission_no_token = False
                     self.optimistic_release_and_requeue(req)
+                elif (
+                    poll == KVPoll.Bootstrapping
+                    and get_disagg().disaggregation_decode_allocation_policy
+                    != "prefill_complete"
+                    and self.prefill_admission_no_token
+                ):
+                    # Admission refused a request for lack of KV. A bootstrapped
+                    # one holds its decode reservation while parked KV keeps it
+                    # out: one parked request yields per refused pass.
+                    self.prefill_admission_no_token = False
+                    if (
+                        self.has_bootstrapped_waiting_req()
+                        or self.has_bootstrapped_parked_chunk()
+                    ):
+                        self.optimistic_release_and_requeue(req)
                 continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
@@ -2033,6 +2061,21 @@ class SchedulerDisaggregationPrefillMixin:
         # The checkpoint above already handed the prefill KV to the tree; the
         # request is not finished, so the release only frees the rest.
         release_kv_cache(req, self.tree_cache, checkpoint=False)
+        if req.output_ids:
+            # A parked request sampled its first token. The retry samples it
+            # again, so drop what the discarded token left on the request.
+            if req.grammar is not None:
+                req.grammar.rollback(len(req.output_ids))
+                req.grammar.finished = False
+            if req.return_logprob:
+                req.logprob.output_token_logprobs_val.clear()
+                req.logprob.output_token_logprobs_idx.clear()
+                req.logprob.output_top_logprobs_val.clear()
+                req.logprob.output_top_logprobs_idx.clear()
+                req.logprob.output_token_ids_logprobs_val.clear()
+                req.logprob.output_token_ids_logprobs_idx.clear()
+            if req.return_sampling_mask:
+                req.sampling_mask_rows.take()
         req.reset_for_retract()
         req.output_ids = array("q")
         req.customized_info = None
