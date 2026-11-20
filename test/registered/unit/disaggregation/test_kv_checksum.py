@@ -11,7 +11,9 @@ import torch
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
+    _state_indices,
     is_health_check_req,
+    page_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -164,6 +166,54 @@ class TestKvChecksumComputerConfig(unittest.TestCase):
         self.assertEqual(computer._state_data_ptrs, [55, 66, 79])
 
 
+class TestKvChecksumStateIndices(unittest.TestCase):
+    def test_checksum_translates_only_the_transferred_kv_suffix(self):
+        for pages in ([0, 7, 3, 2], [0, 2, 9, 4]):
+            with self.subTest(pages=pages):
+
+                def translate(ids):
+                    return torch.tensor(pages)[ids // 4] * 4 + ids % 4
+
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        page_size=4,
+                        translate_kv_indices_for_transfer=translate,
+                    ),
+                    req_to_token_pool=SimpleNamespace(
+                        req_to_token=torch.arange(16).reshape(1, -1)
+                    ),
+                )
+                req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+                result = page_indices_for_request(
+                    scheduler, req, end_idx=11, start_idx=4
+                )
+                self.assertEqual(result.tolist(), pages[1:3])
+
+    def test_mamba_checksum_uses_physical_state_slots(self):
+        # Unified memory moves state independently of its stable request ID.
+        # The checksum must read the same physical slot as the PD payload.
+        for slots in ([0, 7, 3], [0, 2, 9]):
+            with self.subTest(slots=slots):
+                ids = SimpleNamespace(ids=lambda idx: torch.tensor(slots)[idx])
+                allocator = SimpleNamespace(
+                    get_kvcache=lambda: SimpleNamespace(
+                        layer_router=SimpleNamespace(wrapped_view=lambda: object())
+                    ),
+                    state_ids=Mock(return_value=ids),
+                )
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    req_to_token_pool=SimpleNamespace(
+                        state_sub_pool="mamba",
+                        req_index_to_mamba_index_mapping=torch.tensor([0, 1, 2]),
+                    ),
+                )
+                req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+                result = _state_indices(scheduler, req, seq_len=32, start_idx=0)
+                self.assertEqual(result.tolist(), [slots[1]])
+                allocator.state_ids.assert_called_once_with("mamba")
+
+
 class TestKvChecksumHealthCheck(unittest.TestCase):
     def test_detects_health_check_request(self):
         self.assertTrue(is_health_check_req(SimpleNamespace(rid="HEALTH_CHECK_1")))
@@ -284,7 +334,10 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.running_reqs = KeyedReqList(ListKind.DECODING)
         # A static pool: no unified storage.
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=_plain_kv_pool, storage=None
+            page_size=1,
+            get_kvcache=_plain_kv_pool,
+            storage=None,
+            translate_kv_indices_for_transfer=lambda ids: ids,
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
