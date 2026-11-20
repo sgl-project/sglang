@@ -295,6 +295,34 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
 
+def _resolve_single_step_drafting(
+    server_args: ServerArgs,
+    source: str,
+    *,
+    algorithm: str,
+    block_size_flag: str,
+) -> None:
+    """Default ``speculative_num_steps`` to 1 for DFLASH/DSpark, or reject more.
+
+    Both algorithms propose a whole verify block per step and have no EAGLE-style
+    multi-step chain, while ``speculative_num_steps`` still steers generic
+    scheduler and KV-cache accounting. Overriding an explicit value would
+    silently contradict the requested configuration, so only the unset case
+    gets a default.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.speculative_num_steps is None:
+        declare_resolution(server_args, source, speculative_num_steps=1)
+        return
+    if int(cfg.speculative_num_steps) != 1:
+        raise ValueError(
+            f"{algorithm} only supports --speculative-num-steps 1, got "
+            f"{cfg.speculative_num_steps}. Remove --speculative-num-steps to use "
+            f"the default of 1, or set the verify window with {block_size_flag} "
+            "instead. Multi-step drafting requires EAGLE / EAGLE3 / NEXTN."
+        )
+
+
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -340,25 +368,15 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-    # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+    # RoPE reservation).
     #
     # For DFlash, the natural unit is `block_size` (verify window length).
-    if cfg.speculative_num_steps is None:
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_steps=1,
-        )
-    elif int(cfg.speculative_num_steps) != 1:
-        logger.warning(
-            "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            cfg.speculative_num_steps,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_steps=1,
-        )
+    _resolve_single_step_drafting(
+        server_args,
+        "_handle_dflash",
+        algorithm="DFLASH",
+        block_size_flag="--speculative-dflash-block-size",
+    )
 
     if cfg.speculative_eagle_topk is None:
         declare_resolution(
@@ -777,22 +795,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-draft-model-path."
             )
 
-    if cfg.speculative_num_steps is None:
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            speculative_num_steps=1,
-        )
-    elif int(cfg.speculative_num_steps) != 1:
-        logger.warning(
-            "DSpark only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-            cfg.speculative_num_steps,
-        )
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            speculative_num_steps=1,
-        )
+    _resolve_single_step_drafting(
+        server_args,
+        "_handle_dspark",
+        algorithm="DSpark",
+        block_size_flag="--speculative-dspark-block-size",
+    )
 
     if cfg.speculative_eagle_topk is None:
         declare_resolution(
