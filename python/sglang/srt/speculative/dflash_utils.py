@@ -24,7 +24,7 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -255,8 +255,6 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_additive_penalties = sampling_info.acc_additive_penalties
-    acc_scaling_penalties = sampling_info.acc_scaling_penalties
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -270,10 +268,7 @@ def apply_dflash_verify_logits_adjustments(
 
     # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
     # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
-    if acc_additive_penalties is not None:
-        get_logits_3d().add_(acc_additive_penalties[:, None, :])
-    if acc_scaling_penalties is not None:
-        apply_scaling_penalties(get_logits_3d(), acc_scaling_penalties[:, None, :])
+    apply_acc_penalties(next_token_logits, sampling_info, draft_token_num)
 
     if grammar_mask is not None:
         vocab_mask_bias = torch.zeros(
