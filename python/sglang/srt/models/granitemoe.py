@@ -28,7 +28,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models import mixtral
-from sglang.srt.models.granite import build_attention_sinks, granite_layer_attn_params
+from sglang.srt.models.granite import (
+    build_attention_sinks,
+    get_attention_sliding_window_size,
+    granite_layer_attn_params,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 
@@ -534,7 +538,9 @@ class GraniteMoeSharedForCausalLM(GraniteMoeForCausalLM):
 
 
 class GraniteMoeSWAForCausalLM(GraniteMoeForCausalLM):
-    pass
+    def get_attention_sliding_window_size(self) -> int:
+        # Must match the layers' window; the runner bounds SWA KV reads by it.
+        return get_attention_sliding_window_size(self.config)
 
 
 EntryClass = [
