@@ -5,7 +5,7 @@ import io
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -211,6 +211,26 @@ def test_request_steps(override, steps):
 def test_invalid_image_requests_fail_at_constructor(override, match):
     with pytest.raises(ValueError, match=match):
         params(**override)
+
+
+def test_rollout_steps_off_the_grid_are_rejected_when_the_server_fills_the_step_count(
+    api_server,
+):
+    """Without num_inference_steps the constructor has no grid to check against; the release's count arrives in _adjust."""
+    # the constructor alone accepts it
+    params(rollout=True, rollout_sde_step_indices=[6])
+
+    with pytest.raises(HTTPException) as rejection:
+        api_utils.build_sampling_params(
+            "req-test",
+            prompt="p",
+            request_data_type=DataType.IMAGE,
+            size="1056x800",
+            rollout=True,
+            rollout_sde_step_indices=[6],
+        )
+    assert rejection.value.status_code == 400
+    assert "rollout_sde_step_indices must lie in 0..5" in rejection.value.detail
 
 
 @pytest.fixture
