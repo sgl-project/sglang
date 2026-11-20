@@ -4,7 +4,7 @@ import unittest
 from array import array
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
@@ -53,15 +54,25 @@ _SCHEMA = [str(PoolName.KV)]
 def _hit_query_controller(*, entry_map=(PoolName.KV,), **fields):
     """A controller stand-in that reduces a hit query over the schema of one
     rank whose host pools are ``entry_map``."""
-    controller = SimpleNamespace(
-        prefetch_hits_sync_groups=[],
-        mem_pool_host=SimpleNamespace(entry_map=dict.fromkeys(entry_map)),
-        _host_pool_schemas=[],
-        **fields,
-    )
-    controller._host_pool_schema = MethodType(
-        HybridCacheController._host_pool_schema, controller
-    )
+    controller = object.__new__(HybridCacheController)
+    controller.prefetch_hits_sync_groups = []
+    controller.mem_pool_host = SimpleNamespace(entry_map=dict.fromkeys(entry_map))
+    controller._host_pool_schemas = []
+    controller.storage_backend = None
+    for name, value in fields.items():
+        setattr(controller, name, value)
+    return controller
+
+
+def _controller_for_sync(storage_backend, reduce):
+    """Keep production confirmation methods while replacing only the collective."""
+    controller = object.__new__(HybridCacheController)
+    controller.storage_backend = storage_backend
+    controller.page_size = 2
+    controller.prefetch_hits_sync_groups = []
+    controller.mem_pool_host = SimpleNamespace(entry_map=dict.fromkeys((PoolName.KV,)))
+    controller._host_pool_schemas = []
+    controller._all_reduce = reduce
     return controller
 
 
@@ -74,6 +85,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                     peer = torch.full_like(values, -1)
                     peer[0] = 0
                     peer[1 + _SCHEMA.index(PoolName.KV)] = peer_kv_pages
+                    peer[-4:] = values[-4:]
                     values.copy_(torch.minimum(values, peer))
 
                 controller = _hit_query_controller(
@@ -661,6 +673,74 @@ class TestBufferModeSidecar(unittest.TestCase):
             cache.prefetch_loaded_tokens_by_reqid[req_id], len(host_indices)
         )
         self.assertEqual(cache.prefetch_loaded_storage_start_by_reqid[req_id], 0)
+
+
+class TestResumeBoundarySync(CustomTestCase):
+    def test_disjoint_checkpoint_maxima_choose_common_boundary(self):
+        """min(4, 3)=3 is invalid on rank zero; the common checkpoint is 1."""
+        for local_boundaries, peer_boundaries in (([1, 4], [1, 3]), ([1, 3], [1, 4])):
+            with self.subTest(local=local_boundaries):
+                operation = PrefetchOperation(
+                    CacheRequestHandle("holes", 0),
+                    list(range(8)),
+                    pool_transfers=[
+                        PoolTransfer(
+                            PoolName.MAMBA, hit_policy=PoolHitPolicy.TRAILING_PAGES
+                        )
+                    ],
+                )
+                operation.all_hash_values = [f"page-{i}" for i in range(4)]
+                operation.query_pool_hit_pages = {PoolName.KV: 4}
+                operation.pool_storage_result.restorable_prefix_pages = local_boundaries
+                calls = []
+
+                def reduce_with_peer(values, reduce_op, groups):
+                    calls.append(values.numel())
+                    peer = values.clone()
+                    peer[:5] = torch.tensor(
+                        [1] + [int(i in peer_boundaries) for i in range(1, 5)]
+                    )
+                    values.copy_(torch.minimum(values, peer))
+
+                controller = _controller_for_sync(
+                    SimpleNamespace(requires_lookup_confirmation=False),
+                    reduce_with_peer,
+                )
+                hit = HybridCacheController._sync_prefetch_hit_query(
+                    controller, operation, max(local_boundaries) * 2
+                )
+                self.assertEqual(hit, 2)
+                self.assertEqual(
+                    operation.pool_storage_result.restorable_prefix_pages, [1]
+                )
+                self.assertEqual(calls, [5 + len(_SCHEMA) + 4])
+
+    def test_mixed_legacy_reply_never_enters_a_rank_only_collective(self):
+        """An explicit/absent-set mix must reject the hit, not hang one rank."""
+        operation = PrefetchOperation(
+            CacheRequestHandle("mixed", 0),
+            list(range(8)),
+            pool_transfers=[
+                PoolTransfer(PoolName.MAMBA, hit_policy=PoolHitPolicy.TRAILING_PAGES)
+            ],
+        )
+        operation.all_hash_values = [f"page-{i}" for i in range(4)]
+        operation.query_pool_hit_pages = {PoolName.KV: 4}
+        operation.pool_storage_result.restorable_prefix_pages = [1, 4]
+        calls = []
+
+        def reduce_with_legacy(values, *_):
+            calls.append(values.numel())
+            values[-4:-2] = 0  # explicit/absent MIN of (1,0) and (0,1)
+
+        controller = _controller_for_sync(
+            SimpleNamespace(requires_lookup_confirmation=False), reduce_with_legacy
+        )
+        self.assertEqual(
+            HybridCacheController._sync_prefetch_hit_query(controller, operation, 8), 0
+        )
+        self.assertEqual(operation.pool_storage_result.restorable_prefix_pages, [])
+        self.assertEqual(calls, [5 + len(_SCHEMA) + 4])
 
 
 if __name__ == "__main__":

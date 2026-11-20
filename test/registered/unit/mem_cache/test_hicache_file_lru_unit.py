@@ -756,17 +756,20 @@ class TestDcpStorage(unittest.TestCase):
             controllers.append(cc)
             operations.append(op)
 
+        peer_checkpoints = [
+            list(op.pool_storage_result.restorable_prefix_pages) for op in operations
+        ]
         for rank, cc in enumerate(controllers):
-            other = operations[1 - rank]
             peer = torch.zeros(9, dtype=torch.int)
             peer[0] = 1
-            peer[other.pool_storage_result.restorable_prefix_pages] = 1
+            peer[peer_checkpoints[1 - rank]] = 1
 
             schema = cc._host_pool_schema(cc.prefetch_hits_sync_groups)
 
             def reduce(tensor, op, groups, peer=peer, schema=schema):
-                # Restorable flags lead; per-pool verdicts trail them.
-                self.assertEqual(tensor.numel(), peer.numel() + len(schema))
+                # Restorable flags lead, followed by pool verdicts and
+                # backend-consensus flags; both ranks use the same backend.
+                self.assertEqual(tensor.numel(), peer.numel() + len(schema) + 4)
                 self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                 tensor[: peer.numel()] = torch.minimum(tensor[: peer.numel()], peer)
 

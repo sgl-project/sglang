@@ -186,13 +186,16 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             request_id="r-1",
             trace_ctx=object(),
         )
-        ctrl._page_transfer_kv_batch(
-            op,
-            batch_hashes=["h0", "h1", "h2"],
-            batch_host_indices=list(range(6)),
-            extra_info=HiCacheStorageExtraInfo(prefix_keys=["p0"]),
-            kv_derived_transfers=transfers,
-        )
+        with mock.patch.object(
+            hybrid_cc_module, "get_thread_caller_info", return_value=None
+        ):
+            ctrl._page_transfer_kv_batch(
+                op,
+                batch_hashes=["h0", "h1", "h2"],
+                batch_host_indices=list(range(6)),
+                extra_info=HiCacheStorageExtraInfo(prefix_keys=["p0"]),
+                kv_derived_transfers=transfers,
+            )
 
         page_get_extra = ctrl.page_get_func.call_args[0][3]
         self.assertEqual(page_get_extra.prefix_keys, ["p0"])

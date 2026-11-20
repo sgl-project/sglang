@@ -28,8 +28,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import (
+    KVCacheEventRecorder,
     KvEventLoraNames,
-    enable_mm_routing_labels,
     mm_routing_spans,
 )
 from sglang.srt.mem_cache.evict_policy import StateCostStrategy
@@ -363,21 +363,25 @@ def _tracker_to_binding(
     return {ids.core(component): freed for component, freed in tracker.items()}
 
 
-class _RustKVCacheEventRecorder:
+class _RustKVCacheEventRecorder(KVCacheEventRecorder):
     """Expose the Rust event queue through the Python recorder interface."""
 
     def __init__(
         self,
         binding,
         enabled: bool,
+        page_size: int,
         lora_names: KvEventLoraNames,
         dynamo_format: bool = False,
     ):
         self._binding = binding
-        self.enabled = enabled
-        if enabled and dynamo_format:
-            enable_mm_routing_labels()
-        self._lora_names = lora_names
+        super().__init__(
+            enabled=enabled,
+            page_size=page_size,
+            lora_names=lora_names,
+            dynamo_format=dynamo_format,
+        )
+        self._lora_names = self.lora_names
         self._dynamo_format = dynamo_format
 
     def record_all_cleared(self) -> None:
@@ -388,7 +392,7 @@ class _RustKVCacheEventRecorder:
             _kv_event_from_tagged(event, self._lora_names, self._dynamo_format)
             for event in self._binding.take_events()
         ]
-        return events
+        return events + super().take()
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -633,6 +637,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding,
             enabled=params.enable_kv_cache_events,
+            page_size=params.page_size,
             lora_names=params.kv_event_lora_names,
             dynamo_format=params.dynamo_kv_event_format,
         )
@@ -911,6 +916,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def take_events(self) -> list:
         return self.kv_events.take()
+
+    def storage_event_metadata(self, node_id: NodeId) -> dict:
+        keys, tagged = self._binding.storage_event_metadata(node_id)
+        events = [
+            _kv_event_from_tagged(
+                event, self.kv_events._lora_names, self.kv_events._dynamo_format
+            )
+            for event in tagged
+        ]
+        return self.kv_events.metadata_for_events(keys, events)
 
     def all_mamba_values_flatten(self) -> torch.Tensor:
         return self._binding.all_mamba_values_flatten()

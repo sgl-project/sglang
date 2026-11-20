@@ -128,6 +128,7 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     lock_params: DecLockRefParams
     occupied_units: int
     keys_by_pool: dict[PoolName, list[str]]
+    kv_event_metadata: Optional[dict] = None
 
 
 class _StagedPrefetch(msgspec.Struct):
@@ -1136,6 +1137,14 @@ class BufferModePipeline:
             lock_params=lock_params,
             occupied_units=occupied_units,
             keys_by_pool=keys_by_pool,
+            kv_event_metadata=(
+                cache.storage_kv_event_metadata(snapshot.node_id)
+                if getattr(
+                    getattr(cc, "storage_backend", None), "publishes_kv_events", False
+                )
+                is True
+                else None
+            ),
         )
         self.write_staged_tokens_ += occupied_units
         self._release_queued_span(intent)
@@ -1195,6 +1204,7 @@ class BufferModePipeline:
             hash_value,
             prefix_keys,
             extra_pools=storage_xfers or None,
+            kv_event_metadata=entry.kv_event_metadata,
         )
         self.ongoing_backup[operation_id] = entry
 
@@ -1400,7 +1410,7 @@ class BufferModePipeline:
             host_indices, operation.pool_transfers
         )
         cc.prefetch_tokens_occupied += operation.buffer_host_occupied_units
-        cc.prefetch_buffer.put(operation)
+        cc.enqueue_prefetch_transfer(operation)
 
     def try_lock_anchor(
         self, request: CacheRequestHandle, remaining_full_tokens: int
