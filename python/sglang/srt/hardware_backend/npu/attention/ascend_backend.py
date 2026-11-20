@@ -472,6 +472,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.use_flash_mla = (
             self.use_mla
+            and not self.use_dsa
             and not self.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
             and get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
@@ -523,8 +524,13 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (
-                self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
+            if self.dsa_dcp_target or (
+                self.use_fia
+                and not (
+                    self.use_quant_flash_attn
+                    or self.use_flash_mla
+                    or self.use_paged_mtp
+                )
             ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
@@ -1179,7 +1185,14 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.uniform_query_len = 1
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
+        if (
+            self.dsa_dcp_target
+            or self.use_flash_mla
+            or self.use_paged_mtp
+            or self.use_quant_flash_attn
+        ):
+            # DSA reads verify lengths including the candidates. Keep them
+            # separate from the runner's prefix lengths used by KDA and commit.
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens
@@ -2181,6 +2194,29 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
+                # npu_sparse_flash_attention requires the GQA group size
+                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
+                # has 96 q heads / 32 kv heads (group size 3), so pad the query
+                # heads to the next power of two by duplicating the last head
+                # and slice the padding off the output.
+                num_q_heads = q_nope.shape[1]
+                pad_heads = next_power_of_2(num_q_heads)
+                if pad_heads != num_q_heads:
+                    extra = pad_heads - num_q_heads
+                    q_nope = torch.cat(
+                        (
+                            q_nope,
+                            q_nope[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
+                    q_pe = torch.cat(
+                        (
+                            q_pe,
+                            q_pe[:, -1:, :].expand(-1, extra, -1),
+                        ),
+                        dim=1,
+                    ).contiguous()
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                     query=q_nope,
                     key=k_nope,
@@ -2203,6 +2239,8 @@ class AscendAttnBackend(AttentionBackend):
                     attention_mode=2,
                     return_softmax_lse=False,
                 )
+                if pad_heads != num_q_heads:
+                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
