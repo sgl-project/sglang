@@ -33,7 +33,7 @@ pub mod test_support {
 }
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, Http2Config, MetricsConfig, MmFamily, MmResample,
-    MmSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
+    MmSpec, MmVideoSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::{
@@ -513,6 +513,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MmFamily>()?;
     m.add_class::<MmResample>()?;
     m.add_class::<MmSpec>()?;
+    m.add_class::<MmVideoSpec>()?;
     m.add_class::<IngressRequest>()?;
     m.add_class::<ShmBuffer>()?;
     Ok(())

@@ -11,8 +11,8 @@ use serde_json::Value;
 use sglang_processor::dynamo_renderer::RenderedPrompt;
 use sglang_processor::dynamo_tokenizers::Tokenizer;
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_tokenizer_file,
-    select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, TemplateArgs, extract_images, extract_videos,
+    load_tokenizer, resolve_tokenizer_file, select_chat_formatter,
 };
 use sha2::{Digest, Sha256};
 
@@ -81,17 +81,41 @@ fn check_case(
     let defaults: HashMap<String, Value> = (case["default_chat_template_kwargs"].as_object())
         .map(|defaults| defaults.clone().into_iter().collect())
         .unwrap_or_default();
-    let rendered = formatter.render_request(case["request"].clone(), &defaults);
+    let request = &case["request"];
+    // A plain Jinja template has no SGLang request path; the server's `render_chat`
+    // renders it through the template.
+    let rendered = if matches!(formatter, ChatFormatter::HuggingFace { .. }) {
+        serde_json::from_value(request.clone())
+            .map_err(|error| error.to_string())
+            .and_then(|typed| {
+                (formatter.render_template(&typed, &TemplateArgs::new(request, &defaults)))
+                    .map_err(|error| error.to_string())
+            })
+    } else {
+        (formatter.render_request(request.clone(), &defaults)).map_err(|error| error.to_string())
+    };
     if !case["error"].is_null() {
         return match rendered {
             Ok(_) => Err("SGLang rejects this request".into()),
             Err(_) => Ok(()),
         };
     }
-    let (prompt, prefix) = rendered.map_err(|error| error.to_string())?;
+    let (prompt, prefix) = rendered?;
     let text = prompt.as_str().to_owned() + &prefix;
     if text != case["prompt"] {
         return Err(format!("prompt differs: {text}"));
+    }
+    // Multimodal fixtures also record each modality's URLs in the order the processor gets them.
+    let messages = &request["messages"];
+    for (key, urls) in [
+        ("image_data", extract_images(messages)),
+        ("video_data", extract_videos(messages)),
+    ] {
+        if let Some(expected) = case.get(key)
+            && Value::from(urls?) != *expected
+        {
+            return Err(format!("{key} differs"));
+        }
     }
     let Some(tokenizers) = tokenizers else {
         return Ok(());

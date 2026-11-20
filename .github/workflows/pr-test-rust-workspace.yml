@@ -81,6 +81,11 @@ jobs:
       - name: Cache DeepSeek checkpoint files
         run: sglang-processor/tests/scripts/cache_deepseek_files.sh
 
+      # dynamo-multimodal loads libvpx at runtime to decode the VP8 and VP9 fixtures;
+      # -dev provides the unversioned libvpx.so on every Ubuntu release.
+      - name: Install libvpx
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev
+
       - name: cargo test (workspace)
         run: cargo test --workspace
 

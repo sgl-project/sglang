@@ -36,7 +36,10 @@ pub use deepseek_output::{
 };
 pub use error::ProcessorError;
 #[cfg(feature = "mm")]
-pub use mm::{MmOutput, MmOutputItem, MmProcessor};
+pub use mm::{
+    MmDecoded, MmOutput, MmOutputItem, MmProcessor, MmVideo, VideoConfig, VideoHints,
+    VideoSampling, frame_indices,
+};
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
@@ -47,8 +50,8 @@ pub use parser::{
 #[cfg(feature = "render")]
 pub use render::{
     ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, EncodedPrompt, OneOrMany, TemplateArgs,
-    TemplateError, ThinkingTemplates, continues_final_message, extract_images, load_chat_formatter,
-    requested_effort, requested_thinking, select_chat_formatter,
+    TemplateError, ThinkingTemplates, continues_final_message, extract_images, extract_videos,
+    load_chat_formatter, requested_effort, requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
