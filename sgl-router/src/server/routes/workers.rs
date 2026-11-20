@@ -267,6 +267,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_retry_restores_discovery_suppressed_during_replace() {
+        let existing_url = spawn_fake_worker().await;
+        let (worker_url, introspection_started) = spawn_slow_fake_worker().await;
+        let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
+        let registry = Arc::clone(&context.registry);
+        let (control, control_rx) =
+            WorkerControlService::new(Arc::clone(&registry), ExternalWorkerSource::Kubernetes);
+        context.worker_control = Some(Arc::clone(&control));
+        let (discovery_tx, discovery_rx) = tokio::sync::mpsc::channel(4);
+        let manager = tokio::spawn(crate::workers::manager::run_with_config_and_control(
+            discovery_rx,
+            control_rx,
+            Arc::clone(&control),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let app = build_router(Arc::new(context));
+
+        let existing_id = WorkerId("existing-prefill-for-retry".into());
+        discovery_tx
+            .send(DiscoveryEvent::Added(WorkerSpec {
+                id: existing_id.clone(),
+                url: existing_url,
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("m".into())],
+                bootstrap_port: Some(8998),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.get(&existing_id).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("existing prefill registration");
+
+        let input = json!({"url":worker_url,"mode":"plain"});
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, "/workers", input.clone()))
+            .await
+            .unwrap();
+        let accepted = body_json(response).await;
+        let worker_id = accepted["worker_id"].as_str().unwrap().to_owned();
+        let worker_id_t = WorkerId(worker_id.clone());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            introspection_started.notified(),
+        )
+        .await
+        .expect("initial create introspection start");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if control.get(&worker_id_t).is_some_and(|worker| {
+                    worker
+                        .operation
+                        .is_some_and(|operation| operation.state == OperationState::Failed)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial create failure");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/workers/{worker_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let failed = body_json(response).await;
+        assert_eq!(failed["revision"], 1);
+        assert_eq!(failed["operation"]["state"], "failed");
+
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::POST, "/workers", input.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()["x-router-error-code"],
+            "worker_url_conflict"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/workers/{worker_id}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-management-key")
+                    .header("if-match", "1")
+                    .body(Body::from(input.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let retried = body_json(response).await;
+        assert_eq!(retried["worker_id"], worker_id);
+        assert_eq!(retried["revision"], 2);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            introspection_started.notified(),
+        )
+        .await
+        .expect("retry introspection start");
+        let discovered_id = WorkerId("suppressed-during-retry".into());
+        discovery_tx
+            .send(DiscoveryEvent::Added(WorkerSpec {
+                id: discovered_id.clone(),
+                url: worker_url,
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("m".into())],
+                bootstrap_port: Some(8998),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let failed = control.get(&worker_id_t).is_some_and(|worker| {
+                    worker.operation.is_some_and(|operation| {
+                        operation.state == OperationState::Failed && worker.revision == Some(2)
+                    })
+                });
+                if failed && registry.get(&discovered_id).is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery restoration after retry failure");
+        manager.abort();
+    }
+
+    #[tokio::test]
     async fn get_worker_accepts_discovery_id_with_slash() {
         let (context, _control, _control_rx) = context_with_control();
         context

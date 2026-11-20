@@ -443,6 +443,7 @@ async fn handle_control_command(
             let operation_id = command.operation_id;
             let pending_url = spec.url.clone();
             let failed_url = pending_url.clone();
+            let failed_registry = Arc::clone(&registry);
             let restore_tx = restore_tx.clone();
             let task = tokio::spawn(async move {
                 match register_one(spec, registry, cfg, kv_index, introspector).await {
@@ -453,7 +454,11 @@ async fn handle_control_command(
                     Err(error) => {
                         control.mark_failed(&operation_id, error.to_string());
                         record_control_metric(&metrics, kind, false, submitted_at);
-                        if kind == crate::workers::control::WorkerControlKind::Create {
+                        if !failed_registry
+                            .all()
+                            .iter()
+                            .any(|worker| worker_urls_equal(&worker.url, &failed_url))
+                        {
                             let _ = restore_tx.send(failed_url).await;
                         }
                     }
