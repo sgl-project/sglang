@@ -70,10 +70,14 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             seq_lens_cpu=torch.tensor([3]),
             req_pool_indices=torch.tensor([0]),
         )
-        for allowed in (False, True):
+        # A bound runtime that returns None hands the round to the stock one.
+        declining = Mock()
+        declining.decode_round.return_value = None
+        for allowed, runtime in ((False, None), (True, None), (True, declining)):
             batch.can_run_decode_cuda_graph = allowed
+            worker._runtime = runtime
             with (
-                self.subTest(allowed=allowed),
+                self.subTest(allowed=allowed, runtime=runtime),
                 patch.object(
                     dflash_worker_v2, "draft_tp_context", return_value=nullcontext()
                 ),
@@ -95,6 +99,22 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
             self.assertIs(forward_batch.can_run_decode_cuda_graph, allowed)
             self.assertEqual(forward_batch.forward_mode, ForwardMode.TARGET_VERIFY)
             torch.testing.assert_close(forward_batch.input_ids, torch.tensor([1, 2]))
+        declining.decode_round.assert_called_once_with(
+            batch, on_publish=None, grammar_barrier=None
+        )
+        # Otherwise it runs the whole round: nothing of the stock round launches.
+        taking = Mock()
+        taking.decode_round.return_value = "the runtime's round"
+        worker._runtime = taking
+        worker.draft_model_runner.forward.reset_mock()
+        self.assertEqual(
+            worker.forward_batch_generation(batch, grammar_barrier=print),
+            "the runtime's round",
+        )
+        taking.decode_round.assert_called_once_with(
+            batch, on_publish=None, grammar_barrier=print
+        )
+        worker.draft_model_runner.forward.assert_not_called()
 
 
 if __name__ == "__main__":

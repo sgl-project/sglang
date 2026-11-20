@@ -42,6 +42,7 @@ def _make_owner(with_stream: bool):
 
     owner = SimpleNamespace(
         use_full_rank_gate=True,
+        _qkvg_gate_float_shard=False,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
         _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,

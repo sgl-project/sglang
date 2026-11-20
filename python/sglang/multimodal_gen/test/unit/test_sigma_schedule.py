@@ -52,3 +52,11 @@ def test_sigma_schedule_conversion_and_steps(cls, schedule, bounds):
         assert torch.isfinite(sample).all()
         outputs.append(sample)
     torch.testing.assert_close(*outputs, rtol=0, atol=0)
+
+
+def test_flow_match_euler_scheduler_is_truthy():
+    """A scheduler instance is never falsy: `batch.scheduler or default` would
+    otherwise drop the request's own scheduler."""
+    scheduler = FlowMatchEulerDiscreteScheduler()
+    assert scheduler
+    assert len(scheduler) == scheduler.config.num_train_timesteps

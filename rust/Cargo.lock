@@ -4049,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "sglang-api-types"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "prost",
@@ -4162,6 +4162,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "blake3",
  "bytemuck",
  "bytes",
  "chrono",

@@ -64,6 +64,9 @@ class FluxVAEConfig(VAEConfig):
 
         self.arch_config.spatial_compression_ratio = self.arch_config.vae_scale_factor
 
+    def get_vae_scale_factor(self) -> int:
+        return self.arch_config.vae_scale_factor
+
 
 @dataclass
 class Flux2VAEConfig(FluxVAEConfig):

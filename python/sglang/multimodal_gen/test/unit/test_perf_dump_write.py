@@ -5,10 +5,15 @@ from unittest.mock import Mock
 
 import pytest
 
+from sglang.multimodal_gen.runtime.entrypoints.cli.generate import (
+    maybe_dump_performance,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.utils import perf_logger as perf_logger_module
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
@@ -44,6 +49,36 @@ def test_reader_during_a_dump_sees_the_previous_complete_report(tmp_path, monkey
     assert [json.loads(text)["request_id"] for text in seen_mid_write] == ["first"]
     assert json.loads(path.read_text())["request_id"] == "second"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["perf.json"]
+
+
+def test_cli_perf_dump_keeps_the_host_memory_peak(tmp_path, monkeypatch):
+    """`sglang generate --perf-dump-path` rebuilds the metrics from the worker's
+    dict; the host anonymous-memory peak must survive that round trip."""
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    metrics = RequestMetrics(request_id="request")
+    metrics.record_memory_snapshot(
+        "after_DenoisingStage",
+        MemorySnapshot(
+            allocated_mb=1.0,
+            reserved_mb=2.0,
+            peak_allocated_mb=3.0,
+            peak_reserved_mb=4.0,
+            peak_host_anon_mb=512.5,
+        ),
+    )
+    path = tmp_path / "perf.json"
+
+    maybe_dump_performance(
+        SimpleNamespace(perf_dump_path=str(path)),
+        SimpleNamespace(model_path="model"),
+        "prompt",
+        GenerationResult(metrics=metrics.to_dict()),
+    )
+
+    checkpoint = json.loads(path.read_text())["memory_checkpoints"][
+        "after_DenoisingStage"
+    ]
+    assert checkpoint["peak_host_anon_mb"] == 512.5
 
 
 @pytest.mark.parametrize("is_output_rank", [True, False])

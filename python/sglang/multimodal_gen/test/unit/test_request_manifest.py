@@ -1,17 +1,28 @@
+import argparse
+import asyncio
 import hashlib
+import io
 import json
 from types import SimpleNamespace
 
 import pytest
 
+from sglang.multimodal_gen.benchmarks import bench_offline_throughput
 from sglang.multimodal_gen.benchmarks.bench_offline_throughput import (
     BatchOutput,
     BenchArgs,
     RequestOutput,
     calculate_metrics,
     generate_batch,
+    throughput_test,
 )
+from sglang.multimodal_gen.benchmarks.bench_serving import (
+    async_request_image_sglang,
+    async_request_video_sglang,
+)
+from sglang.multimodal_gen.benchmarks.datasets import RequestFuncInput
 from sglang.multimodal_gen.benchmarks.request_manifest import load_request_manifest
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 def _write_jsonl(path, records):
@@ -174,7 +185,6 @@ def test_generate_batch_records_request_id_output_path_and_digest(
 
     output = generate_batch(
         FakeEngine(),
-        BenchArgs(),
         prompts=["A moving test pattern"],
         user_sampling_params=[{"num_frames": 17, "seed": 42}],
         request_ids=["video-1"],
@@ -188,3 +198,101 @@ def test_generate_batch_records_request_id_output_path_and_digest(
     assert output.requests[0].output_sha256 == [
         hashlib.sha256(output_path.read_bytes()).hexdigest()
     ]
+
+
+def test_offline_benchmark_runs_with_disable_safety_checker(monkeypatch):
+    """--disable-safety-checker must not add a request field SamplingParams
+    rejects: every request then fails and the run reports zero successes."""
+
+    class FakeDeviceModule:
+        @staticmethod
+        def reset_peak_memory_stats():
+            return None
+
+        @staticmethod
+        def max_memory_allocated():
+            return 0
+
+    class FakeEngine:
+        server_args = SimpleNamespace(pipeline_config=SimpleNamespace(task_type="t2i"))
+
+        @staticmethod
+        def generate(sampling_params_kwargs):
+            SamplingParams(**sampling_params_kwargs)
+            return SimpleNamespace(output_file_path=None)
+
+    monkeypatch.setattr(
+        bench_offline_throughput.torch, "get_device_module", lambda: FakeDeviceModule
+    )
+    monkeypatch.setattr(
+        bench_offline_throughput, "initialize_engine", lambda server_args: FakeEngine()
+    )
+    monkeypatch.setattr(
+        bench_offline_throughput, "configure_logger", lambda server_args: None
+    )
+    parser = argparse.ArgumentParser()
+    BenchArgs.add_cli_args(parser)
+    args = parser.parse_args(
+        ["--disable-safety-checker", "--num-prompts", "1", "--disable-tqdm"]
+    )
+
+    metrics = throughput_test(
+        SimpleNamespace(model_path="m"), BenchArgs.from_cli_args(args)
+    )
+
+    assert metrics["failed_requests"] == 0
+    assert metrics["successful_requests"] == 1
+
+
+class _RejectedSubmit:
+    status = 503
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def text(self):
+        return "rejected"
+
+
+class _SubmitRecorder:
+    """Stands in for the HTTP session: keeps the submitted form and rejects it."""
+
+    def __init__(self):
+        self.form = None
+
+    def post(self, url, data=None, json=None):
+        self.form = data
+        return _RejectedSubmit()
+
+
+@pytest.mark.parametrize(
+    "request_func", [async_request_image_sglang, async_request_video_sglang]
+)
+def test_bench_serving_upload_requests_send_num_inference_steps(tmp_path, request_func):
+    """Requests that upload an image go out as multipart forms; a form without the
+    step count runs the model default while the SLO model assumes the requested one."""
+    image_path = tmp_path / "condition.png"
+    image_path.write_bytes(b"condition-image")
+    session = _SubmitRecorder()
+
+    asyncio.run(
+        request_func(
+            RequestFuncInput(
+                prompt="Make the water move",
+                api_url="http://127.0.0.1:1/v1/unused",
+                model="m",
+                image_paths=[str(image_path)],
+                num_inference_steps=3,
+            ),
+            session,
+        )
+    )
+
+    fields = {options["name"]: value for options, _, value in session.form._fields}
+    for value in fields.values():
+        if isinstance(value, io.IOBase):
+            value.close()
+    assert fields["num_inference_steps"] == "3"

@@ -53,10 +53,6 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
         default_factory=lambda: [is_layer, is_embed_tokens, is_final_norm]
     )
 
-    def __post_init__(self):
-        # Let the parent populate tokenizer_kwargs["max_length"] = self.text_len
-        super().__post_init__()
-
 
 @dataclass
 class Mistral3EncoderConfig(TextEncoderConfig):

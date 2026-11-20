@@ -45,10 +45,6 @@ class CubeSparseAttentionBackend(AttentionBackend):
         return CubeSparseAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["CubeSparseAttentionMetadata"]:
-        return CubeSparseAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["CubeSparseAttentionMetadataBuilder"]:
         return CubeSparseAttentionMetadataBuilder
 

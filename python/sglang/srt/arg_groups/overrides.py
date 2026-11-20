@@ -444,6 +444,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
     }
 )
 
@@ -839,6 +840,18 @@ _KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
 
 
+def _kimi_k31_default_dsa_backend(view: Any) -> str:
+    # HiSparse admits only flashmla_kv among the K3.1 backends.
+    platform = get_platform()
+    if (
+        not view.enable_hisparse
+        and platform.is_sm100
+        and platform.device_sm in (100, 103, 107)
+    ):
+        return "prims_ts"
+    return _KIMI_K31_DSA_BACKEND
+
+
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
     if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
         raise ValueError(
@@ -884,7 +897,7 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
             f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
-    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+    backend = chosen.pop() if chosen else _kimi_k31_default_dsa_backend(view)
     if backend in ("trtllm", "prims_ts"):
         logger.warning(
             f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
@@ -917,6 +930,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",

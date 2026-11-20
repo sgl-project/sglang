@@ -32,6 +32,9 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Transformer2DModel,
     build_layout,
 )
+from sglang.multimodal_gen.runtime.models.encoders.text_encoder_graphs import (
+    TextEncoderGraphs,
+)
 from sglang.multimodal_gen.runtime.pipelines.qwen_image21 import QwenImage21Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -42,7 +45,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
-    TextEncoderGraphs,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (

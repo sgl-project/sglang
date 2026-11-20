@@ -134,6 +134,9 @@ from sglang.srt.entrypoints.server_utils import (
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
+from sglang.srt.entrypoints.uvicorn_worker_spawn import (
+    skip_main_reimport_in_spawned_workers,
+)
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -203,7 +206,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     delete_directory,
@@ -219,6 +222,7 @@ from sglang.srt.utils.json_response import (
     model_json_response,
     orjson_response,
 )
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -256,6 +260,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     Initialization function for multi-process tokenizer mode.
     It read args information from shm and inits tokenizer manager for current process.
     """
+    # Workers do not re-run the launcher module, which applies these filters.
+    suppress_noisy_warnings()
 
     # Read configuration from shared memory
     main_pid = get_main_process_id()
@@ -975,6 +981,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    # The streaming response holds `request` until the request finishes.
+    request.__dict__.pop("_json", None)
     return await serve_generate_request(obj, request)
 
 
@@ -3197,20 +3205,21 @@ def _setup_and_run_http_server(
                     "ssl_ca_certs": get_serving().ssl_ca_certs,
                     "ssl_keyfile_password": get_serving().ssl_keyfile_password,
                 }
-                if get_serving().enable_http_worker_reuseport:
-                    if reserved_socket is not None:
-                        reserved_socket.close()
-                    config = uvicorn.Config(app_path, **uvicorn_options)
-                    supervisor = _ReusePortMultiprocess(config)
-                    logger.info(
-                        f"Uvicorn running on {config.host}:{config.port} "
-                        f"with {config.workers} SO_REUSEPORT workers"
-                    )
-                    supervisor.run()
-                else:
-                    _run_uvicorn_workers(
-                        app_path, reserved_socket=reserved_socket, **uvicorn_options
-                    )
+                with skip_main_reimport_in_spawned_workers():
+                    if get_serving().enable_http_worker_reuseport:
+                        if reserved_socket is not None:
+                            reserved_socket.close()
+                        config = uvicorn.Config(app_path, **uvicorn_options)
+                        supervisor = _ReusePortMultiprocess(config)
+                        logger.info(
+                            f"Uvicorn running on {config.host}:{config.port} "
+                            f"with {config.workers} SO_REUSEPORT workers"
+                        )
+                        supervisor.run()
+                    else:
+                        _run_uvicorn_workers(
+                            app_path, reserved_socket=reserved_socket, **uvicorn_options
+                        )
             _shutdown_schedulers_after_http_workers(
                 router=tokenizer_manager, subprocess_watchdog=subprocess_watchdog
             )

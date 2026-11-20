@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
@@ -183,8 +184,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        *,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ) -> None:
-        del last_hash, prefix_keys, storage_hit_end
+        del last_hash, prefix_keys, storage_hit_end, kv_hints
         req_id = request.rid
         if req_id in self._external_flows:
             return

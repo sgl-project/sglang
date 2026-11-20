@@ -854,18 +854,6 @@ RUN cd sglang \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install $CONS -e "python[${all_extras}]"; \
        fi
 
-# gfx950: bundle TreeCore, which Kimi-K3.1's env defaults load on every rank so they cannot mix
-# Rust/Python implementations and diverge on HiCache reclaim. Build against the installed ROCm
-# torch; isolation would pull CUDA torch.
-RUN if [ "${GPU_ARCH%%-*}" = "gfx950" ]; then \
-      cd sglang/python \
-      && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
-      && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \
-      && SGLANG_BUILD_RUST_EXTS=rust_tree_core python setup.py build_rust --inplace \
-      && rm -rf ../rust/sglang-radix-tree/target \
-      && SGLANG_RUST_BUILD_MODE=never python -c "from sglang.srt.mem_cache.rust_tree_core import extension"; \
-    fi
-
 RUN python -m pip cache purge
 
 RUN case "${GPU_ARCH##*-}" in \

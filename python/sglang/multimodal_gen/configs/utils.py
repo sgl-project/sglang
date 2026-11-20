@@ -56,7 +56,7 @@ def update_config_from_args(
         config: The configuration object to update
         args_dict: Dictionary containing arguments
         prefix: Prefix for the configuration parameters in the args_dict.
-               If None, assumes direct attribute mapping without prefix.
+               If empty, assumes direct attribute mapping without prefix.
     """
     # Handle top-level attributes (no prefix)
     args_not_to_remove = [

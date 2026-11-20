@@ -171,7 +171,7 @@ class Sampler(nn.Module):
             token_ids_logprobs: Per-sequence list of specific token IDs to retrieve
                 logprobs for. Each element is a list of token IDs (or None) for one
                 sequence in the batch. This is used in speculative decoding.
-            positions: The positions of the tokens in the sequence. Used for deterministic sampling
+            positions: The positions of the tokens in the sequence. Used for seeded sampling
                 to get the unique seed for each position.
             logprob_logits: Optional pre-watermark logits for returned log probabilities.
         """
@@ -402,10 +402,11 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
+            if sampling_info.sampling_seed is not None:
+                # Seeded draws must not depend on the row's batch slot; FlashInfer's seeds do,
+                # the torch sampler's hash of (seed, position) does not.
+                backend = "pytorch"
             if backend in ("flashinfer", "intel_xpu"):
-                assert sampling_info.sampling_seed is None, (
-                    f"Sampling seed is not supported for {backend} backend"
-                )
                 if sampling_info.need_min_p_sampling:
                     # Apply top-p before top-k renormalization to preserve the original
                     # nucleus and match the other samplers' joint support.
@@ -820,6 +821,27 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def top_k_top_p_min_p_filter_sorted_probs_torch(
+    probs_sort: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> None:
+    """Zero, in place, the entries of descending-sorted ``probs_sort`` that
+    top-k, top-p, and min-p remove."""
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(0, probs_sort.shape[-1], device=probs_sort.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
+    if need_min_p_sampling:
+        min_p_thresholds = probs_sort[:, 0] * min_ps
+        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -834,8 +856,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
-    When sampling_seed is not None, deterministic inference will be enabled, it will sample
-    with the sampling_seed of each request.
+    When sampling_seed is not None, it samples each row with its seed.
 
     By default, returns only sampled token IDs. With return_filtered_probs=True,
     also returns the actual filtered weights, their token-ID permutation, and
@@ -846,8 +867,8 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     # The top-k mask below zeroes every column at rank >= top_k, so the max_top_k
     # leading columns carry all the mass that survives and sorting only those is
     # exact. The seeded path keeps the full sort because the order of tied
-    # probabilities may depend on k, which is a batch-wide value, and
-    # deterministic inference must not depend on the batch composition.
+    # probabilities may depend on k, which is a batch-wide value, and a seeded draw
+    # must not depend on the batch composition.
     if (
         max_top_k is not None
         and max_top_k < probs.shape[-1]
@@ -857,20 +878,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
     else:
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
-    if need_min_p_sampling:
-        # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert sampling_seed is None, (
-            "With sampling seed, multinomial_with_seed will provide wrong results"
-        )
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    top_k_top_p_min_p_filter_sorted_probs_torch(
+        probs_sort, top_ks, top_ps, min_ps, need_min_p_sampling
+    )
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)

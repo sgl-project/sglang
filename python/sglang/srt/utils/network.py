@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import ipaddress
 import logging
 import os
@@ -215,13 +216,29 @@ def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64):
     if high - low + 1 < attempts:
         return get_free_port()
     for port in random.sample(range(low, high + 1), attempts):
-        try:
-            # IPv4 explicitly: the TCPStore binds the IPv4 side of this port.
-            try_bind_socket("0.0.0.0", port, reuse_addr=False).close()
+        if _is_port_free_on_both_families(port):
             return port
-        except OSError:
-            continue
     return get_free_port()
+
+
+def _is_port_free_on_both_families(port):
+    # The libuv TCPStore binds [::] and, if only that fails, silently listens on
+    # 0.0.0.0, which clients connecting to "::" never reach. Probe each side.
+    for family, host in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        try:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+        except OSError as e:
+            if e.errno == errno.EAFNOSUPPORT:
+                continue
+            raise
+        with sock:
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                sock.bind((host, port))
+            except OSError:
+                return False
+    return True
 
 
 def bind_port(port):

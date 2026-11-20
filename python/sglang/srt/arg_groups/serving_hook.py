@@ -39,7 +39,9 @@ def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is None:
         return
-    config = load_watermark_config(cfg.watermark_config)
+    config = load_watermark_config(
+        cfg.watermark_config, algorithm=cfg.watermark_algorithm
+    )
     resolved = {
         f"watermark_{field}": getattr(config, field)
         for field in config.__struct_fields__
@@ -325,7 +327,9 @@ def handle_grpc_args(server_args: Any):
                 "--grpc-port is not supported with --encoder-only: "
                 "encoder disaggregation uses its own server."
             )
-        if cfg.tokenizer_worker_num > 1:
+        # The Rust server serves gRPC itself and sizes its tokenizer thread
+        # pool from --tokenizer-worker-num; only the Python bridge is limited.
+        if cfg.tokenizer_worker_num > 1 and not envs.SGLANG_RUST_SERVER.get():
             raise ValueError(
                 "Native gRPC does not yet support --tokenizer-worker-num > 1. "
                 "Unset --grpc-port or set --tokenizer-worker-num 1."

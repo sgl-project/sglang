@@ -30,9 +30,11 @@ class TestMXFP8AttentionSelection(unittest.TestCase):
         self.is_npu = self.enterContext(
             patch.object(ascend_fa.current_platform, "is_npu", return_value=True)
         )
+        # Ascend 950 (Atlas A5) by default; individual tests override this.
         self.enterContext(
-            patch.object(
-                torch, "npu", SimpleNamespace(get_soc_version=lambda: 260), create=True
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_ascend_950",
+                return_value=True,
             )
         )
         self.ops = SimpleNamespace(
@@ -91,7 +93,9 @@ class TestMXFP8AttentionSelection(unittest.TestCase):
         self.assertIs(self._resolve(), AttentionBackendEnum.TORCH_SDPA)
 
     def test_unsupported_device_keeps_platform_default(self):
-        with patch.object(torch.npu, "get_soc_version", return_value=250):
+        with patch(
+            "sglang.srt.hardware_backend.npu.utils.is_ascend_950", return_value=False
+        ):
             self.assertIs(self._resolve(), AttentionBackendEnum.TORCH_SDPA)
 
     def test_cross_attention_keeps_platform_default(self):

@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
 )
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, pack
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
     Flux3ImageDenoiseStage,
+    Flux3ImageTextEncodeStage,
     build_timesteps,
     crop_output,
     denoise_flow_map,
@@ -306,6 +308,43 @@ class TestFlux3PackedSampler(unittest.TestCase):
                         stage._cache_dit_requested_for_batch(batch), expected
                     )
                     self.assertEqual(stage._cache_dit_requested(), sp_size == 1)
+
+
+class _CountingTextEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.batches = []
+
+    def encode_batch(self, texts):
+        self.batches.append(list(texts))
+        return [
+            (torch.full((2, 3), float(len(text))), torch.zeros(2, 4)) for text in texts
+        ]
+
+
+class TestFlux3TextConditioningCache(unittest.TestCase):
+    @torch.no_grad()
+    def test_negative_prompt_is_encoded_once_across_requests(self):
+        stage = Flux3ImageTextEncodeStage.__new__(Flux3ImageTextEncodeStage)
+        stage.text_encoder = encoder = _CountingTextEncoder().eval()
+        with ConditioningCache(1 << 20).scope():
+            first = stage._encode(["", "a cat"], {""})
+            second = stage._encode(["", "a dog"], {""})
+        # cold: one bucketed call for both prompts; warm: only the new prompt
+        self.assertEqual(encoder.batches, [["", "a cat"], ["a dog"]])
+        torch.testing.assert_close(second[0][0], first[0][0], rtol=0, atol=0)
+        self.assertEqual(second[1][0][0, 0].item(), 5.0)
+
+    @torch.no_grad()
+    def test_without_a_cache_grouped_prompts_stay_one_call(self):
+        stage = Flux3ImageTextEncodeStage.__new__(Flux3ImageTextEncodeStage)
+        stage.text_encoder = encoder = _CountingTextEncoder().eval()
+        encoded = stage._encode(["", "p", "", "qq"], {""})
+        self.assertEqual(encoder.batches, [["", "p", "qq"]])
+        self.assertEqual(
+            [item[0][0, 0].item() for item in encoded], [0.0, 1.0, 0.0, 2.0]
+        )
 
 
 class TestFlux3ExactVaeConvolutions(unittest.TestCase):

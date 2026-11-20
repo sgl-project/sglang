@@ -83,7 +83,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.req_types import MultimodalInputs
+    from sglang.srt.managers.req_types import MultimodalInputs, TokenIdRows
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -541,7 +541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -584,8 +584,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # A one-request batch's committed KV length, which can lag one verify: a host-side
     # lower bound attention graph variants select on; None for several requests
     attention_kv_len_lower_bound: Optional[int] = None
-    watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
-    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
+    # Host-side state the watermark engine seeds its next sample from.
+    watermark_seed: Optional[Any] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -1010,10 +1010,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
-        watermark_state = (
-            model_runner.watermark_state
-            if isinstance(model_runner, ModelRunner)
-            else None
+        watermark = (
+            model_runner.watermark if isinstance(model_runner, ModelRunner) else None
         )
         ret = cls(
             # Required core inputs
@@ -1087,17 +1085,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             attention_kv_len_lower_bound=(
                 batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
             ),
-            watermark_prompt_tail_ids=(
-                watermark_state.prompt_tails(batch)
-                if watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-                else None
-            ),
-            watermark_context_hash_history=(
-                watermark_state.retracted_context_hashes(batch)
-                if watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-                else None
+            watermark_seed=(
+                watermark.seed_payload(batch) if watermark is not None else None
             ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,

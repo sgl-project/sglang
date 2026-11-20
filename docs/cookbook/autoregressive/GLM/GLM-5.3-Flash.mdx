@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and 950PR/DT series NPU recipes."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI300X, MI325X, MI355X, and TPU7x, with MTP and multimodal serving, plus Ascend A3 and 950PR/DT series NPU recipes."
 tag: NEW
 ---
 
@@ -19,6 +19,8 @@ docker pull lmsysorg/sglang:latest
 For the listed NVIDIA hardware, the deployment panel can render a complete `docker run` command. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
 
 For MI355X, follow the [AMD GPU installation guide](/docs/hardware-platforms/amd_gpu) and run the generated **Python** command on four GPUs. Select FP8 or [MXFP4](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4); SGLang downloads the model and tokenizer automatically.
+
+For MI300X and MI325X, use the `lmsysorg/sglang:v0.5.22-rocm10-mi30x` image and the launch commands in [MI300X and MI325X deployment measured with SemiAnalysis InferenceX](#mi300x-and-mi325x-deployment-measured-with-semianalysis-inferencex). The deployment panel does not list these GPUs.
 
 For TPU7x, install [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu) from source (its `main` branch; the `v0.1.0-tpu` image predates the GLM-5.3-Flash MTP fixes) and run the generated **Python** command on one TPU7x host with 4 chips:
 
@@ -111,6 +113,124 @@ Use the Playground for lower-level tuning such as attention parallelism, MoE com
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it.
+
+### MI300X and MI325X deployment measured with SemiAnalysis InferenceX
+
+FP8 checkpoint with EAGLE MTP on four MI300X or MI325X GPUs (TP4·EP4), benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #5117](https://github.com/SemiAnalysisAI/InferenceX/pull/5117), [run 44072959411](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/44072959411)): GPU-resident KV at concurrency 1–16 on MI300X and 1–12 on MI325X, and HiCache at concurrency 24–40 on MI300X and 16–32 on MI325X. GSM8K strict-match accuracy is 0.9735 on MI300X and 0.9742 on MI325X (1,319 questions, HiCache at concurrency 40 and 32).
+
+- **Container image.** `lmsysorg/sglang:v0.5.22-rocm10-mi30x` (`sha256:5658cd0d8de0c68de10d2e349296f55ceff98053182fa87b2a7e942e5e7f3c2a`, the image tested in InferenceX).
+- **Block-FP8 GEMM.** `SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK=1` runs the block-FP8 linear layers on the AITER CK GEMM instead of the AITER Triton GEMM. In this image, four of the model's six linear shapes at TP4 have no gfx942 Triton config and run the default tile. Compared with the same commands without the variable ([InferenceX #4721](https://github.com/SemiAnalysisAI/InferenceX/pull/4721) and [#4722](https://github.com/SemiAnalysisAI/InferenceX/pull/4722)), it raised throughput per GPU by 5–17% and lowered median TPOT by 11–23% at every measured point. Images built from `main` after [#43815](https://github.com/sgl-project/sglang/pull/43815) use the CK GEMM on gfx942 by default.
+- **gfx942 kernels.** `SGLANG_OPT_FUSE_MHC_POST_PRE=0` keeps the unfused mHC path, because gfx942 HIP cannot compile the fused TileLang lane-index operation. `SGLANG_DSA_FUSE_TOPK=0` and `SGLANG_OPT_USE_TOPK_V2=0` select the portable top-k path instead of the CUDA-header JIT kernels; `--dsa-topk-backend torch` requires `SGLANG_DSA_FUSE_TOPK=0`.
+- **All-reduce.** `ROCM_QUICK_REDUCE_QUANTIZATION=NONE` overrides the image's `ROCM_QUICK_REDUCE_QUANTIZATION=INT8` default.
+- **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency. The commands below use concurrency 8.
+- **HiCache.** At the higher concurrencies, add `--enable-hierarchical-cache`. On MI300X, the host tier keeps its default size of twice the device KV pool, about 118–131 GiB per rank. On MI325X, also add `--hicache-host-memory-fraction 0.60 --hicache-io-backend direct --hicache-mem-layout page_first_direct`, and leave `--hicache-size` and `--hicache-ratio` unset so that the host pools of all ranks stay within 60% of the available host memory.
+- **Differences between the GPUs.** The MI300X command uses an FP8 E4M3 KV cache, `--prefill-decode-interval 0`, `--min-free-slots-delay 1`, and `SGLANG_OPT_FUSED_KDA_VERIFY=1`. The MI325X command uses a BF16 KV cache and the default scheduling settings.
+
+<Tabs>
+<Tab title="MI300X">
+
+```bash MI300X TP4·EP4 (concurrency 8)
+SGLANG_USE_AITER=1 \
+SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK=1 \
+AITER_ONLINE_TUNE=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+SGLANG_OPT_FUSE_MHC_POST_PRE=0 \
+SGLANG_OPT_FUSED_KDA_VERIFY=1 \
+SGLANG_DSA_FUSE_TOPK=0 \
+SGLANG_OPT_USE_TOPK_V2=0 \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --tp-size 4 \
+  --ep-size 4 \
+  --quantization fp8 \
+  --context-length 1048576 \
+  --page-size 256 \
+  --mem-fraction-static 0.82 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --prefill-decode-interval 0 \
+  --min-free-slots-delay 1 \
+  --attention-backend dsa \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --dsa-topk-backend torch \
+  --linear-attn-backend triton \
+  --linear-attn-verify-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-runner-backend aiter \
+  --cuda-graph-backend-prefill disabled \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-attention-mode prefill \
+  --speculative-moe-a2a-backend none \
+  --max-running-requests 16 \
+  --cuda-graph-max-bs-decode 16 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47 \
+  --watchdog-timeout 1800 \
+  --dist-timeout 600 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Tab>
+<Tab title="MI325X">
+
+```bash MI325X TP4·EP4 (concurrency 8)
+SGLANG_USE_AITER=1 \
+SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK=1 \
+AITER_ONLINE_TUNE=0 \
+ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
+SGLANG_OPT_FUSE_MHC_POST_PRE=0 \
+SGLANG_DSA_FUSE_TOPK=0 \
+SGLANG_OPT_USE_TOPK_V2=0 \
+SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+python -m sglang.launch_server \
+  --model-path zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --tp-size 4 \
+  --ep-size 4 \
+  --quantization fp8 \
+  --context-length 1048576 \
+  --page-size 256 \
+  --mem-fraction-static 0.82 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --attention-backend dsa \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --dsa-topk-backend torch \
+  --linear-attn-backend triton \
+  --linear-attn-verify-backend triton \
+  --kv-cache-dtype bfloat16 \
+  --moe-runner-backend aiter \
+  --cuda-graph-backend-prefill disabled \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-attention-mode prefill \
+  --speculative-moe-a2a-backend none \
+  --max-running-requests 16 \
+  --cuda-graph-max-bs-decode 16 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47 \
+  --watchdog-timeout 1800 \
+  --dist-timeout 600 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Tab>
+</Tabs>
 
 ## 1. Model introduction
 

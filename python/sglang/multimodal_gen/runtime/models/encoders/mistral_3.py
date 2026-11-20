@@ -13,7 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import inspect
 from contextlib import nullcontext
 from typing import Iterable, Optional, Union
 
@@ -75,11 +74,6 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-_CREATE_CAUSAL_MASK_ARG = (
-    "inputs_embeds"
-    if "inputs_embeds" in inspect.signature(create_causal_mask).parameters
-    else "input_embeds"
-)
 
 
 def _tp_world_size() -> int:
@@ -464,7 +458,7 @@ class MistralModel(MistralPreTrainedModel):
             )
             mask_kwargs = {
                 "config": self.config,
-                _CREATE_CAUSAL_MASK_ARG: inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,

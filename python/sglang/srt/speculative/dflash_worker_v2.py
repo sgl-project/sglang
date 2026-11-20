@@ -22,22 +22,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import (
-    built_megakernel,
-    megakernel_draft_accept,
-    megakernel_draft_aux,
-    megakernel_draft_embed,
-    megakernel_draft_selector_head,
-    megakernel_enabled,
-    megakernel_kda_commit,
-    megakernel_rank0_broadcast,
-    megakernel_sampled_accept,
+from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
+    bind_dflash_runtime,
 )
-from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    HybridLinearAttnBackend,
-)
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
@@ -55,7 +42,6 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
-    MLATokenToKVPool,
     layer_window_locs,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -78,7 +64,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
-    get_serving,
     get_spec,
     mamba_track_grid,
 )
@@ -97,7 +82,6 @@ from sglang.srt.speculative.dflash_draft_ring import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_sim_acc import SimAccLenRing
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -166,7 +150,6 @@ from sglang.srt.speculative.spec_utils import (
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
-    sample_simulated_acc_len,
     simulated_acc_len_generator,
 )
 from sglang.srt.utils import (
@@ -464,68 +447,6 @@ class _SelectorDraftSampler:
             )
 
 
-class _MegakernelSelectorDraftSampler:
-    """The NVIDIA megakernel head proposes inside the draft forward."""
-
-    def __init__(self, *, head, out, candidate_out, q_out, sampling_enabled):
-        self.out, self.candidate_out, self.q_out = out, candidate_out, q_out
-        self.sampling_enabled = sampling_enabled
-        # Staging goes to the megakernel head's own buffers, not ones sized here.
-        self.max_bs = None
-        self._head = head
-        self._staged_greedy = False
-
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        if not self.sampling_enabled:
-            return
-        if _is_all_greedy(sampling_info):
-            if not self._staged_greedy:
-                self._head.stage_draft_head_sampling(
-                    temperatures=None, greedy_mask=None
-                )
-                self._staged_greedy = True
-            return
-        self._head.stage_draft_head_sampling(
-            temperatures=sampling_info.temperatures.view(-1)[:bs],
-            greedy_mask=resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.q_out.device
-            )[:bs],
-        )
-        self._staged_greedy = False
-
-    def __call__(self, hidden_states, input_ids):
-        pass
-
-
-_TAIL_VARIANTS_PER_BS = 4
-
-
-class _MegakernelTail:
-    def __init__(self, *, bs: int, block_size: int, device: torch.device):
-        rows = bs * block_size
-        self.prefix = torch.empty(bs, dtype=torch.int64, device=device)
-        self.positions = torch.empty(rows, dtype=torch.int64, device=device)
-        self.slots = torch.empty(rows, dtype=torch.int64, device=device)
-        self.kda_slots = torch.empty(bs, dtype=torch.int32, device=device)
-        self.kda_track = torch.empty(bs, dtype=torch.int32, device=device)
-        # target, accept_len, commit_lens, bonus, out_tokens, new_seq_lens per accept
-        # slot; consecutive tail rounds take different slots.
-        self.outs = tuple(
-            (
-                torch.empty((bs, block_size), dtype=torch.int64, device=device),
-                torch.empty(bs, dtype=torch.int32, device=device),
-                torch.empty(bs, dtype=torch.int32, device=device),
-                torch.empty(bs, dtype=torch.int64, device=device),
-                torch.empty((bs, block_size), dtype=torch.int64, device=device),
-                torch.empty(bs, dtype=torch.int64, device=device),
-            )
-            for _ in range(2)
-        )
-        self.graphs: dict = {}
-        self.pool = None
-        self.kda_state_ptrs: Tuple[int, ...] = ()
-
-
 class _DominoDraftSampler:
     """Capture-safe Domino rollout over a fixed-size draft block."""
 
@@ -596,7 +517,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     """
 
     _hosts_draft: bool = True
-    _megakernel_embed = None
+    _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
 
@@ -627,7 +548,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
-        self._warned_megakernel_head_eager = False
         self._draft_probs_buf = None
         self._full_embed_gpu: Optional[torch.Tensor] = None
         # Under dp attention, peer DP ranks run different (idle) paths, so
@@ -861,7 +781,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._target_logits_processor = self._defer_target_verify_gather()
         self._aux_graphs = {}
-        self._megakernel_aux_graphs = {}
         self._mamba_commit_buffers = None
         self._use_commit_metadata = (
             is_cuda() and envs.SGLANG_OPT_DFLASH_COMMIT_METADATA.get()
@@ -872,43 +791,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             and self.lilicorr is None
             and envs.SGLANG_OPT_DFLASH_AUX_GRAPH.get()
         )
-        self._megakernel_aux = self._maybe_megakernel_aux()
-        self._megakernel_aux_caches: Optional[List[torch.Tensor]] = None
-        self._megakernel_kda = megakernel_kda_commit(
-            self.target_worker.model_runner.model
-        )
-        self._megakernel_accept = self._maybe_attach_megakernel_accept()
-        self._sim_ring: Optional[SimAccLenRing] = None
-        if self._megakernel_accept is not None:
-            self._sim_ring = SimAccLenRing(self.device)
-        self._accept_target_buf: Optional[torch.Tensor] = None
-        self._tail_graph = self._tail_graph_enabled()
-        self._warn_megakernel_draft_chain_under_ring()
-        self._megakernel_tails: dict = {}
-        self._tail_variants_warned = False
-        # Megakernel mailbox slots: each alternates on every call, eager or replayed,
-        # in the same order on every rank.
-        self._accept_parity = 0
-        self._aux_parity = 0
-        # The KDA commit's switch is only known from its first call (an eager round).
-        self._kda_confirmed = False
-        self._megakernel_bcast = megakernel_rank0_broadcast(
-            self.target_worker.model_runner.model
-        )
-        self._megakernel_sampled = self._prepare_megakernel_sampled_accept()
-        self._kda_commit_buffers: Optional[Tuple[torch.Tensor, ...]] = None
-        if self._megakernel_aux is not None and self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH aux append runs on the NVIDIA megakernel for rows %s, "
-                "on the main stream",
-                list(self._megakernel_aux.draft_aux_rows),
-            )
         self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
+        # A megakernel's decode round (kimi_k31_dflash_binding.py), or None for the stock
+        # one; built before the KV pools are sized, so its allocations come out of the KV
+        # budget.
+        self._runtime = bind_dflash_runtime(self, target_model)
         # Side stream only where KV frees wait on it (overlap scheduler, no unified
-        # memory or HiCache); the megakernel aux's collective keeps it on main.
+        # memory or HiCache) and the stock round owns the draft KV writes.
         self._aux_overlap = (
             self._use_aux_graph
-            and self._megakernel_aux is None
+            and self._runtime is None
             and envs.SGLANG_OPT_DFLASH_AUX_OVERLAP.get()
             and not get_schedule().disable_overlap_schedule
             and not get_memory().enable_unified_memory
@@ -1013,48 +905,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
-
-    def _prepare_megakernel_sampled_accept(self):
-        target_lp = self._target_logits_processor
-        built = megakernel_sampled_accept(self.target_worker.model_runner.model)
-        # Declined before the build: it is collective.
-        if (
-            built is None
-            or target_lp is None
-            or self._plain_deferral_refused("sampled accept")
-        ):
-            return None
-        lm_head = unwrap_lora_layer(self.target_worker.model_runner.model.lm_head)
-        if not built.prepare_sampled_accept(
-            vocab_size=int(target_lp.vocab_size),
-            softcap=target_lp.final_logit_softcapping or None,
-            shard_width=int(lm_head.num_embeddings_per_partition),
-            seed=int(torch.initial_seed()),
-            topk=int(self.selector.top_k),
-        ):
-            return None
-        self._arm_plain_deferral("sampled accept")
-        return built
-
-    def _can_megakernel_sample(
-        self, batch: ScheduleBatch, sampling_info, bs: int, shard: torch.Tensor
-    ) -> bool:
-        """Whether the sampled accept can run on the shard alone (rank-uniform)."""
-        if (
-            self._megakernel_sampled is None
-            or self._selector_sample is None
-            or sampling_info is None
-            or batch.has_grammar
-            or batch.return_logprob
-            or self._block_verification
-        ):
-            return False
-        return (
-            not sampling_info.need_top_k_sampling
-            and not sampling_info.need_top_p_sampling
-            and _verify_logits_unadjusted(sampling_info)
-            and self._megakernel_sampled.sampled_accept_fits(bs, shard)
-        )
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
@@ -1237,8 +1087,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         available_mem,
                     )
             if capture_decode_cuda_graph:
-                # Both must run before capture so the draft graph folds them in.
-                self._megakernel_embed = self._maybe_attach_megakernel_embed()
+                # Must run before capture so the draft graph folds it in.
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
@@ -1402,91 +1251,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampler.max_bs is None or bs <= sampler.max_bs:
             sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
-    def _maybe_attach_megakernel_head(self, lm_head):
-        head = megakernel_draft_selector_head(self.draft_model)
-        graph_bs = set(get_exec().graph.cuda_graph_config.decode.bs)
-        if head is None or not graph_bs <= set(head.draft_head_requests):
-            return None
-        sampling = self._selector_sampling_enabled and head.draft_head_sampling
-        if not sampling and not self._default_sampling_is_greedy():
-            if self._target_tp_rank == 0:
-                logger.warning(
-                    "DFLASH megakernel head refused: the server's default sampling is "
-                    "not greedy, so requests without sampling params would run the "
-                    "eager selector. Serve greedy-only with "
-                    "--preferred-sampling-params '{\"temperature\": 0}'."
-                )
-            return None
-        tokens, candidates, q = head.attach_draft_head(
-            lm_head=lm_head,
-            selector=self.draft_model.candidate_selector,
-            draft_config=self.draft_model.draft_config,
-        )
-        if self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH selector decode on the NVIDIA megakernel head (%s).",
-                "greedy and sampling requests"
-                if sampling
-                else "greedy; batches with sampling requests take the eager selector",
-            )
-        return _MegakernelSelectorDraftSampler(
-            head=head,
-            out=tokens,
-            candidate_out=candidates,
-            q_out=q,
-            sampling_enabled=sampling,
-        )
-
-    def _maybe_attach_megakernel_embed(self):
-        embed = megakernel_draft_embed(self.draft_model)
-        graph_bs = set(get_exec().graph.cuda_graph_config.decode.bs)
-        if embed is None or not graph_bs <= set(embed.draft_embed_requests):
-            return None
-        if self._full_embed_gpu is not None or self._noise_embed_scale != 1.0:
-            # The megakernel embeds the shared target rows unscaled, collective-free.
-            if self._target_tp_rank == 0:
-                logger.warning(
-                    "DFLASH megakernel embed refused: replicated embed=%s, noise scale %s",
-                    self._full_embed_gpu is not None,
-                    self._noise_embed_scale,
-                )
-            return None
-        embedding = unwrap_lora_layer(
-            _resolve_dflash_embedding_module(
-                self.draft_model, self.target_worker.model_runner.model
-            )
-        )
-        embed.attach_draft_embed(
-            embedding=embedding, mask_token_id=int(self._mask_token_id)
-        )
-        if self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH draft block embedding on the NVIDIA megakernel for requests %s",
-                list(embed.draft_embed_requests),
-            )
-        return embed
-
-    def _default_sampling_is_greedy(self) -> bool:
-        preferred = get_serving().preferred_sampling_params or {}
-        params = {
-            **preferred,
-            **self.model_runner.model_config.get_default_sampling_params(),
-        }
-        return params.get("temperature", 1.0) == 0 or params.get("top_k", -1) == 1
-
-    def _graph_proposal_unusable(self, sampling_info) -> bool:
-        if not isinstance(self._draft_sampler, _MegakernelSelectorDraftSampler):
-            return False
-        if self._draft_sampler.sampling_enabled or _is_all_greedy(sampling_info):
-            return False
-        if not self._warned_megakernel_head_eager and self._target_tp_rank == 0:
-            logger.warning(
-                "DFLASH megakernel head: a batch with sampling requests ran the eager "
-                "selector; expect a throughput regression on sampling workloads."
-            )
-            self._warned_megakernel_head_eager = True
-        return True
-
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
             if self._target_tp_rank == 0:
@@ -1515,13 +1279,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if not head_supported:
                 return _eager("unsupported quantized lm_head")
             self.draft_model.lm_head = lm_head
-            megakernel = (
-                self._maybe_attach_megakernel_head(lm_head)
-                if megakernel_enabled()
-                else None
-            )
-            if megakernel is not None:
-                return megakernel
+            if self._runtime is not None:
+                sampler = self._runtime.draft_sampler(lm_head)
+                if sampler is not None:
+                    return sampler
             if self._target_tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode folded into the draft cuda graph "
@@ -2750,19 +2511,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 swa_cache_loc=swa_cache_loc,
             )
             return
-        if (
-            self._megakernel_aux is not None
-            and int(target_hidden.shape[0]) in self._megakernel_aux.draft_aux_rows
-        ):
-            self._append_target_hidden_megakernel(
-                target_hidden=target_hidden,
-                positions=positions,
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-            )
-            return
-
         # A TP-split fc all-reduces, so project on the main stream in program order;
         # the aux graph may replay on a side stream beside other collectives.
         projected = self.draft_model.fc_tp_columns is not None
@@ -2816,96 +2564,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._replay_aux_overlapped(entry[1])
         else:
             entry[1].replay()
-
-    def _append_target_hidden_megakernel(
-        self,
-        *,
-        target_hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cache_loc: torch.Tensor,
-        cache_loc_2d: torch.Tensor,
-        commit_lens: torch.Tensor,
-    ) -> None:
-        key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
-        entry = self._megakernel_aux_graphs.get(key)
-        inputs = (cache_loc, positions, commit_lens)
-        parity = self._take_aux_parity()
-        if entry is not None:
-            for dst, src in zip(entry[0], inputs):
-                dst.copy_(src)
-            if target_hidden.data_ptr() != entry[2]:
-                raise RuntimeError(
-                    "DFLASH megakernel aux: the target's capture buffer moved after capture"
-                )
-            entry[1][parity].replay()
-            return
-        static = (
-            torch.empty_like(cache_loc, dtype=torch.int64),
-            torch.empty_like(positions, dtype=torch.int64),
-            torch.empty_like(commit_lens, dtype=torch.int32),
-        )
-        for dst, src in zip(static, inputs):
-            dst.copy_(src)
-        loc_buf, pos_buf, commit_buf = static
-        caches = self._draft_mla_caches()
-
-        def append(slot: int):
-            self._megakernel_aux.draft_aux(
-                target_hidden=target_hidden,
-                positions=pos_buf,
-                slots_2d=loc_buf.view(cache_loc_2d.shape),
-                commit_lens=commit_buf,
-                kv_caches=caches,
-                parity=slot,
-            )
-
-        stream = torch.cuda.Stream(device=target_hidden.device)
-        current = torch.cuda.current_stream(target_hidden.device)
-        stream.wait_stream(current)
-        with torch.cuda.stream(stream):
-            append(parity)
-        current.wait_stream(stream)
-        graphs, pool = {}, None
-        for slot in (0, 1):
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=stream):
-                append(slot)
-            pool, graphs[slot] = graph.pool(), graph
-        current.wait_stream(stream)
-        self._megakernel_aux_graphs[key] = (static, graphs, target_hidden.data_ptr())
-        logger.info(
-            "DFLASH aux CUDA graph captured on the NVIDIA megakernel rows=%d",
-            target_hidden.shape[0],
-        )
-
-    def _draft_mla_caches(self) -> List[torch.Tensor]:
-        if self._megakernel_aux_caches is not None:
-            return self._megakernel_aux_caches
-        pool = self.draft_model_runner.token_to_kv_pool
-        # The megakernel writes whole FP8 rows at slot * 576 bytes: the plain layout.
-        plain = (
-            type(pool) is MLATokenToKVPool
-            and pool.dtype == torch.float8_e4m3fn
-            and not pool.dsa_kv_cache_store_fp8
-            and (
-                pool.dcp_replicated
-                or pool.write_loc_is_dcp_resolved
-                or get_parallel().attn_dcp_size == 1
-            )
-        )
-        if not plain:
-            raise RuntimeError(
-                "DFLASH megakernel aux needs a plain FP8 MLA draft KV pool, "
-                f"got {type(pool).__name__}"
-            )
-        caches = []
-        for layer in self.draft_model.layers:
-            if not isinstance(layer.self_attn, DFlashMLAAttention):
-                raise RuntimeError("DFLASH megakernel aux needs MLA draft layers")
-            layer_id = layer.self_attn.attn_mqa.layer_id
-            caches.append(pool.kv_buffer[layer_id - pool.start_layer])
-        self._megakernel_aux_caches = caches
-        return caches
 
     def _replay_aux_overlapped(self, graph: torch.cuda.CUDAGraph) -> None:
         current = torch.cuda.current_stream(self.device)
@@ -3052,12 +2710,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         if not self._need_mamba_verify_commit:
             return
-        if self._megakernel_kda_commit(
-            batch=batch,
-            seq_lens_pre_verify=seq_lens_pre_verify,
-            commit_lens=commit_lens,
-        ):
-            return
         attn_backend = self.target_worker.model_runner.attn_backend
 
         mamba_steps_to_track = None
@@ -3115,358 +2767,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
-
-    def _maybe_attach_megakernel_accept(self):
-        accept = megakernel_draft_accept(self.draft_model)
-        if accept is None or self._plain_deferral_refused("megakernel accept"):
-            return None
-        accept.attach_draft_accept(
-            sim_real_token=SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
-        )
-        self._arm_plain_deferral("megakernel accept")
-        if self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH greedy verify accept runs on the NVIDIA megakernel for "
-                "requests %s",
-                list(accept.draft_accept_requests),
-            )
-        return accept
-
-    def _ring_declines(self, feature: str) -> bool:
-        if not get_spec().speculative_dflash_draft_kv_ring:
-            return False
-        if self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH megakernel %s off: the draft KV ring keeps no per-slot draft "
-                "table (pass --speculative-draft-window-size)",
-                feature,
-            )
-        return True
-
-    def _maybe_megakernel_aux(self):
-        if not self._use_aux_graph:
-            return None
-        aux = megakernel_draft_aux(self.draft_model)
-        if aux is not None and self._ring_declines("draft aux"):
-            return None
-        return aux
-
-    def _tail_graph_enabled(self) -> bool:
-        if not envs.SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH.get():
-            return False
-        ring = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
-        if get_spec().speculative_dflash_draft_kv_ring and ring.is_set():
-            raise ValueError(
-                "SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH=1 with SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1: "
-                "the megakernel tail writes the per-slot draft table the ring replaces; "
-                "pass --speculative-draft-window-size or unset one of them."
-            )
-        return not self._ring_declines("post-verify tail")
-
-    def _warn_megakernel_draft_chain_under_ring(self) -> None:
-        if (
-            get_spec().speculative_dflash_draft_kv_ring
-            and built_megakernel(self.draft_model) is not None
-            and self._target_tp_rank == 0
-        ):
-            logger.warning(
-                "DFLASH megakernel draft chain with the draft KV ring has not "
-                "been validated; it writes at the ring's out_cache_loc rows"
-            )
-
-    def _plain_deferral_refused(self, consumer: str) -> bool:
-        target_lp = self._target_logits_processor
-        plain = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER
-        refused = (
-            target_lp is not None
-            and not target_lp.final_logit_softcapping
-            and plain.is_set()
-            and not plain.get()
-        )
-        if refused and self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH %s off: SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER=0 keeps the full "
-                "verify gather",
-                consumer,
-            )
-        return refused
-
-    def _arm_plain_deferral(self, consumer: str) -> None:
-        """Must run before the graphs capture."""
-        target_lp = self._target_logits_processor
-        if (
-            target_lp is None
-            or target_lp.final_logit_softcapping
-            or target_lp.defer_plain_gather
-        ):
-            return
-        target_lp.defer_plain_gather = True
-        if self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH plain verify deferral on (the %s reads the shard)", consumer
-            )
-
-    def _tail_covered(self, bs: int) -> bool:
-        accept = self._megakernel_accept
-        return (
-            self._tail_graph
-            and accept is not None
-            and bs in accept.draft_accept_requests
-            and self._megakernel_kda is not None
-            and self._kda_confirmed
-            and self._need_mamba_verify_commit
-        )
-
-    def _tail_appends_aux(self, bs: int) -> bool:
-        aux = self._megakernel_aux
-        return aux is not None and bs * int(self.block_size) in aux.draft_aux_rows
-
-    def _take_accept_parity(self) -> int:
-        slot, self._accept_parity = self._accept_parity, self._accept_parity ^ 1
-        return slot
-
-    def _take_aux_parity(self) -> int:
-        slot, self._aux_parity = self._aux_parity, self._aux_parity ^ 1
-        return slot
-
-    def _stage_sim_commit(self, block_size: int) -> torch.Tensor:
-        """This round's simulated commit length on device (zero when simulation is off)."""
-        if SIMULATE_ACC_LEN > 0:
-            return self._sim_ring.stage(
-                sample_simulated_acc_len(
-                    SIMULATE_ACC_LEN,
-                    SIMULATE_ACC_METHOD,
-                    block_size,
-                    generator=self._simulated_acc_len_rng,
-                )
-            )
-        return self._sim_ring.device_len
-
-    def _tail_on_megakernel(
-        self,
-        *,
-        target_lp,
-        logits: torch.Tensor,
-        hidden: torch.Tensor,
-        candidates: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        positions: torch.Tensor,
-        cache_loc: torch.Tensor,
-        batch: ScheduleBatch,
-        bs: int,
-    ):
-        """Run or replay the megakernel post-verify tail; None keeps SGLang's steps."""
-        with_aux = self._tail_appends_aux(bs)
-        caches = self._draft_mla_caches() if with_aux else []
-        sim_buf = self._sim_ring.device_len
-        # Keyed by input addresses: each target graph variant has its own buffers.
-        key = (
-            bs,
-            tuple(t.data_ptr() for t in (logits, hidden, candidates, sim_buf, *caches)),
-        )
-        tail = self._megakernel_tails.get(key)
-        first = tail is None
-        if first:
-            if sum(k[0] == bs for k in self._megakernel_tails) >= _TAIL_VARIANTS_PER_BS:
-                if not self._tail_variants_warned and self._target_tp_rank == 0:
-                    logger.warning(
-                        "DFLASH megakernel tail: bs=%d inputs keep moving; this round "
-                        "keeps the steps",
-                        bs,
-                    )
-                self._tail_variants_warned = True
-                return None
-            tail = _MegakernelTail(
-                bs=bs, block_size=int(self.block_size), device=self.device
-            )
-        kda = self._kda_commit_kwargs(
-            batch=batch, bs=bs, slots=tail.kda_slots, track=tail.kda_track
-        )
-        if kda is None:
-            return None
-        state = tuple(t.data_ptr() for t in kda.values() if isinstance(t, torch.Tensor))
-        if not first and state != tail.kda_state_ptrs:
-            raise RuntimeError("DFLASH megakernel tail: the captured KDA state moved")
-        tail.prefix.copy_(prefix_lens)
-        tail.positions.copy_(positions)
-        tail.slots.copy_(cache_loc)
-        block_size = int(self.block_size)
-        sim_commit = self._stage_sim_commit(block_size)
-
-        def body(accept_slot: int, aux_slot: Optional[int]) -> bool:
-            out = tail.outs[accept_slot]
-            self._megakernel_accept.draft_accept(
-                local=target_lp.deferred_local_argmax(logits),
-                candidates=candidates,
-                prefix_lens=tail.prefix,
-                sim_commit=sim_commit,
-                out=out,
-                parity=accept_slot,
-            )
-            used = self._megakernel_kda.kda_commit(
-                **kda, commit_lens=out[2], prefix_lens=tail.prefix
-            )
-            if aux_slot is not None:
-                self._megakernel_aux.draft_aux(
-                    target_hidden=hidden,
-                    positions=tail.positions,
-                    slots_2d=tail.slots.view(bs, block_size),
-                    commit_lens=out[2],
-                    kv_caches=caches,
-                    parity=aux_slot,
-                )
-            return used
-
-        slots = (
-            self._take_accept_parity(),
-            self._take_aux_parity() if with_aux else None,
-        )
-        if first:
-            # First round eager, doubling as warm-up: the KDA commit must not run twice.
-            if not body(*slots):
-                raise RuntimeError("DFLASH megakernel tail: the KDA commit turned off")
-            tail.kda_state_ptrs = state
-            self._megakernel_tails[key] = tail
-        else:
-            graph = tail.graphs.get(slots)
-            if graph is None:
-                graph = self._capture_tail(tail, body, slots)
-            graph.replay()
-        out = tail.outs[slots[0]]
-        self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, out[0])
-        return out
-
-    def _capture_tail(self, tail: _MegakernelTail, body, slots) -> torch.cuda.CUDAGraph:
-        stream = torch.cuda.Stream(device=self.device)
-        current = torch.cuda.current_stream(self.device)
-        stream.wait_stream(current)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=tail.pool, stream=stream):
-            body(*slots)
-        current.wait_stream(stream)
-        tail.pool, tail.graphs[slots] = graph.pool(), graph
-        if self._target_tp_rank == 0:
-            logger.info(
-                "DFLASH post-verify tail captured on the NVIDIA megakernel "
-                "(accept + KDA commit%s; bs=%d, accept slot %d, aux slot %s)",
-                " + aux" if slots[1] is not None else "",
-                tail.prefix.shape[0],
-                *slots,
-            )
-        return graph
-
-    def _accept_on_megakernel(
-        self,
-        *,
-        local: torch.Tensor,
-        candidates: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        bs: int,
-    ):
-        accept_len, commit_lens, bonus, out_tokens, new_seq_lens = (
-            self._next_accept_bonus_buffers(bs)
-        )
-        block_size = int(self.block_size)
-        if self._accept_target_buf is None or self._accept_target_buf.shape[0] < bs:
-            self._accept_target_buf = torch.empty(
-                (bs, block_size), dtype=torch.int64, device=self.device
-            )
-        target_predict = self._accept_target_buf[:bs]
-        sim_commit = self._stage_sim_commit(block_size)
-        self._megakernel_accept.draft_accept(
-            local=local,
-            candidates=candidates,
-            prefix_lens=prefix_lens,
-            sim_commit=sim_commit,
-            out=(
-                target_predict,
-                accept_len,
-                commit_lens,
-                bonus,
-                out_tokens,
-                new_seq_lens,
-            ),
-            parity=self._take_accept_parity(),
-        )
-        self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
-        return target_predict, accept_len, commit_lens, bonus, out_tokens, new_seq_lens
-
-    def _megakernel_kda_commit(
-        self,
-        *,
-        batch: ScheduleBatch,
-        seq_lens_pre_verify: torch.Tensor,
-        commit_lens: torch.Tensor,
-    ) -> bool:
-        if self._megakernel_kda is None:
-            return False
-        bs = int(commit_lens.shape[0])
-        slots, track, commit = self._kda_commit_inputs(bs)
-        kwargs = self._kda_commit_kwargs(batch=batch, bs=bs, slots=slots, track=track)
-        if kwargs is None:
-            return False
-        commit.copy_(commit_lens)
-        used = self._megakernel_kda.kda_commit(
-            **kwargs,
-            commit_lens=commit,
-            prefix_lens=seq_lens_pre_verify.to(torch.int64),
-        )
-        if not used:
-            # The switch is fixed at build: skip these copies from now on.
-            self._megakernel_kda = None
-        self._kda_confirmed = used
-        return used
-
-    def _kda_commit_kwargs(
-        self,
-        *,
-        batch: ScheduleBatch,
-        bs: int,
-        slots: torch.Tensor,
-        track: torch.Tensor,
-    ) -> Optional[dict]:
-        backend = self.target_worker.model_runner.attn_backend
-        if isinstance(backend, HybridAttnBackend):
-            backend = backend.target_verify_backend()
-        if (
-            not isinstance(backend, HybridLinearAttnBackend)
-            or pp_spec_stable_rows_enabled()
-        ):
-            return None
-        linear = backend.linear_attn_backend
-        state_pool = linear.state_pool
-        # Host-only checkpoints index the KDA ring by req_pool_idx; this commit
-        # writes it through the mamba slot, so SGLang's commit takes over.
-        if not state_pool.replayssm_is_kda or state_pool.replayssm_request_ring:
-            return None
-        spec_state = state_pool.get_speculative_mamba2_params_all_layers()
-        if len(spec_state.conv) != 1:
-            return None
-        state_slots = linear.forward_state_slots(bs, batch.mamba_track_indices)
-        slots.copy_(state_slots.working)
-        if state_slots.track is None:
-            track.fill_(-1)
-        else:
-            track.copy_(state_slots.track)
-        return dict(
-            temporal=spec_state.temporal,
-            rawk=spec_state.replayssm_rawk,
-            rawv=spec_state.replayssm_rawv,
-            gk=spec_state.replayssm_g,
-            beta=spec_state.replayssm_beta,
-            conv=spec_state.conv[0],
-            window=spec_state.intermediate_conv_window[0],
-            slots=slots,
-            track_slots=track,
-            track_interval=mamba_track_grid(batch.tree_cache.page_size),
-        )
-
-    def _kda_commit_inputs(self, bs: int) -> Tuple[torch.Tensor, ...]:
-        if self._kda_commit_buffers is None or self._kda_commit_buffers[0].numel() < bs:
-            self._kda_commit_buffers = tuple(
-                torch.empty(bs, dtype=torch.int32, device=self.device) for _ in range(3)
-            )
-        return tuple(buf[:bs] for buf in self._kda_commit_buffers)
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -3531,27 +2831,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        verify_shard: Optional[torch.Tensor] = None,
     ):
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
         it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
         new_seq_lens = None
         cap_trim_lens = None
-        if verify_shard is not None:
-            assert cutoff_verify_lens is None
-            # Samples on the vocab shards; every rank gets rank 0's decision.
-            selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus, target_predict = self._megakernel_sampled.sampled_accept(
-                logits=verify_shard,
-                temperatures=sampling_info.temperatures,
-                candidates=candidates,
-                candidate_ids=selector_candidate_ids,
-                q_rows=selector_q_rows,
-            )
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         # A resolved argmax (vocab-sharded verify) means the accept is greedy.
-        elif target_predict is None and self._selector_sample is not None:
+        if target_predict is None and self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus, cap_trim_lens = self._selector_sampling_accept(
                 candidates=candidates,
@@ -3562,15 +2849,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
                 cutoff_verify_lens=cutoff_verify_lens,
             )
-            bcast = self._megakernel_bcast
-            if (
-                bcast is None
-                or cutoff_verify_lens is not None
-                or not bcast.rank0_broadcast(accept_len, bonus)
-            ):
-                self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
-                self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
-                self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
@@ -3900,6 +3181,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
 
+        if self._runtime is not None:
+            # The bound runtime runs the whole round, or returns None for the stock one.
+            result = self._runtime.decode_round(
+                batch, on_publish=on_publish, grammar_barrier=grammar_barrier
+            )
+            if result is not None:
+                return result
+
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
         batch.seq_lens.record_stream(
@@ -3994,22 +3283,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        megakernel_embed = self._megakernel_embed
-        if megakernel_embed is not None and bs in megakernel_embed.draft_embed_requests:
-            # The megakernel embeds the block inside the draft forward.
-            input_embeds = None
+        if self._full_embed_gpu is not None:
+            # A borrowed embedding may use target-wide collectives, while
+            # other DP replicas are idle or looking up different token IDs.
+            noise_embedding = torch.nn.functional.embedding(
+                block_ids, self._full_embed_gpu
+            )
         else:
-            if self._full_embed_gpu is not None:
-                # A borrowed embedding may use target-wide collectives, while
-                # other DP replicas are idle or looking up different token IDs.
-                noise_embedding = torch.nn.functional.embedding(
-                    block_ids, self._full_embed_gpu
-                )
-            else:
-                noise_embedding = embed_module(block_ids)
-            if self._noise_embed_scale != 1.0:
-                noise_embedding = noise_embedding * self._noise_embed_scale
-            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            noise_embedding = embed_module(block_ids)
+        if self._noise_embed_scale != 1.0:
+            noise_embedding = noise_embedding * self._noise_embed_scale
+        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -4165,11 +3449,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 in_cuda_graph=False,
             )
-        elif (
-            self._draft_sampler is not None
-            and draft_out.can_run_graph
-            and not self._graph_proposal_unusable(batch.sampling_info)
-        ):
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -4358,52 +3638,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
-        accepted = None
-        tail_done = False
-        verify_shard = None
         target_lp = self._target_logits_processor
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):
             if self._can_skip_verify_logits(batch, sampling_info):
-                if layout is None and self._tail_covered(bs):
-                    accepted = self._tail_on_megakernel(
-                        target_lp=target_lp,
-                        logits=logits_output.next_token_logits,
-                        hidden=logits_output.hidden_states,
-                        candidates=draft_tokens,
-                        prefix_lens=prefix_lens,
-                        positions=positions,
-                        cache_loc=self._draft_write_ids(iteration_ids),
-                        batch=batch,
-                        bs=bs,
-                    )
-                    tail_done = accepted is not None
-                if tail_done:
-                    target_predict = accepted[0]
-                elif (
-                    layout is None
-                    and self._megakernel_accept is not None
-                    and bs in self._megakernel_accept.draft_accept_requests
-                ):
-                    accepted = self._accept_on_megakernel(
-                        local=target_lp.deferred_local_argmax(
-                            logits_output.next_token_logits
-                        ),
-                        candidates=draft_tokens,
-                        prefix_lens=prefix_lens,
-                        bs=bs,
-                    )
-                    target_predict = accepted[0]
-                else:
-                    target_predict = target_lp.deferred_argmax(
-                        logits_output.next_token_logits
-                    )
-                logits_output.next_token_logits = None
-            elif layout is None and self._can_megakernel_sample(
-                batch, sampling_info, bs, logits_output.next_token_logits
-            ):
-                verify_shard = logits_output.next_token_logits
+                target_predict = target_lp.deferred_argmax(
+                    logits_output.next_token_logits
+                )
                 logits_output.next_token_logits = None
             else:
                 logits_output.next_token_logits = target_lp.finish_deferred_gather(
@@ -4420,11 +3662,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if (
-            sampling_info is not None
-            and target_predict is None
-            and verify_shard is None
-        ):
+        if sampling_info is not None and target_predict is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -4436,28 +3674,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar_mask.apply(logits_output.next_token_logits)
 
         candidates = draft_tokens
-        cap_trim_lens = None
-        if accepted is not None:
-            accept_len, commit_lens, bonus, out_tokens, new_seq_lens = accepted[1:]
-        else:
-            (
-                accept_len,
-                commit_lens,
-                bonus,
-                out_tokens,
-                new_seq_lens,
-                cap_trim_lens,
-            ) = self._accept_block(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                draft_input=draft_input,
-                prefix_lens=prefix_lens,
-                bs=bs,
-                target_predict=target_predict,
-                cutoff_verify_lens=None if layout is None else layout.verify_lens,
-                verify_shard=verify_shard,
-            )
+        (
+            accept_len,
+            commit_lens,
+            bonus,
+            out_tokens,
+            new_seq_lens,
+            cap_trim_lens,
+        ) = self._accept_block(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            prefix_lens=prefix_lens,
+            bs=bs,
+            target_predict=target_predict,
+            cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(
                 correct_len=accept_len,
@@ -4493,7 +3726,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_stride=block_size,
             )
 
-        if self._need_mamba_verify_commit and not tail_done:
+        if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             if new_seq_lens is None:
                 new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
@@ -4535,26 +3768,23 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        if not (tail_done and self._tail_appends_aux(bs)):
-            cache_loc = (
-                ring_block_locs
+        cache_loc = (
+            ring_block_locs
+            if ring_block_locs is not None
+            else self._draft_write_ids(iteration_ids)
+        )
+        self._append_target_hidden_decode(
+            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+            positions=positions,
+            commit_lens=commit_lens,
+            swa_cache_loc=(
+                None
                 if ring_block_locs is not None
-                else self._draft_write_ids(iteration_ids)
-            )
-            self._append_target_hidden_decode(
-                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-                positions=positions,
-                commit_lens=commit_lens,
-                swa_cache_loc=(
-                    None
-                    if ring_block_locs is not None
-                    else self._draft_write_ids(
-                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
-                    )
-                ),
-            )
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
+            ),
+        )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

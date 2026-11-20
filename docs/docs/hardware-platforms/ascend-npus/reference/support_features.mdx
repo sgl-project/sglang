@@ -1,7 +1,7 @@
 ---
 title: "Supported Features"
 metatags:
-  description: "Documentation for Support Features on Ascend NPU"
+  description: "Documentation for Supported Features on Ascend NPU"
 ---
 This section describes the basic functions and features supported by the Ascend NPU. If you encounter issues or have any
 questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
@@ -2862,7 +2862,7 @@ To verify an L2 hit, start the server with `--enable-cache-report`. After a pref
 ## Other params
 
 The following parameters are not supported because the required third-party components
-(e.g., Ktransformer, checkpoint-engine) are not compatible with the NPU.
+(e.g., Ktransformers, checkpoint-engine) are not compatible with the NPU.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

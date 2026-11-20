@@ -345,8 +345,10 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
 ```
 
 <Note>
-`size` is the literal output resolution for most pipelines. Wan-Animate-2
-treats it as a pixel-area budget instead: the output keeps the reference image's
+`size` requests a width and height. Some pipelines align these dimensions to
+their patch grid; see [Wan2.2 TI2V 5B](/cookbook/diffusion/Wan/Wan2.2#4-1-basic-usage)
+for an example. Wan-Animate-2 treats `size` as a pixel-area budget instead:
+the output keeps the reference image's
 aspect ratio and uses the largest frame with at most `width × height` pixels whose
 sides are multiples of 16, so `size=640x800` with a 9:16 reference image yields a
 528×944 video. Request a budget with the reference image's aspect ratio to get a

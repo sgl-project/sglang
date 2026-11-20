@@ -327,7 +327,7 @@ async fn chat_completions(
         let native = GenerateRequest {
             rid: rid.clone(),
             chat_prompt: Some(choice_prompt),
-            sampling_params: sampling.clone(),
+            sampling_params: sampling.for_sample(index),
             stream,
             return_logprob: want_logprobs,
             logprob_start_len: -1,

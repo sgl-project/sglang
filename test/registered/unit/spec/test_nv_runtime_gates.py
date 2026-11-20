@@ -41,7 +41,6 @@ class TestNativeEagerVerify(CustomTestCase):
                         forward_mode=SimpleNamespace(is_idle=lambda: False),
                     )
                     runner = SimpleNamespace(
-                        watermark_state=object(),
                         attn_backend=SimpleNamespace(verify_mask=None),
                     )
                     target = SimpleNamespace(model_runner=runner)
@@ -65,6 +64,8 @@ class TestNativeEagerVerify(CustomTestCase):
                         verify_input=object(),
                         logits_output=object(),
                         grammar_mask=object(),
+                        watermark=object(),
+                        watermark_full_mask=True,
                         target_worker=target,
                         self=SimpleNamespace(
                             model_runner=runner, _speculative_runtime_hooks=hooks
@@ -99,11 +100,10 @@ class TestNativeEagerVerify(CustomTestCase):
                     else:
                         make_io.assert_not_called()
                         hooks.post_verify.assert_not_called()
-                        kwargs = dict(watermark_state=runner.watermark_state)
+                        kwargs = dict(watermark=scope["watermark"])
                         if module == "eagle_worker_common":
                             kwargs.update(
                                 uno_target_max_top_k=17,
-                                watermark_full_mask=True,
                                 simulated_acc_len_rng=scope["simulated_acc_len_rng"],
                                 sparse_bonus_argmax=True,
                             )

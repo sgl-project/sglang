@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 use sglang_mm::pipeline::{Tensor, TensorData};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,9 +51,11 @@ pub struct MmEncodedItem {
     pub hash: u64,
     /// The item's [`hash_identity`](Self::hash_identity), when its processor
     /// already computed it over this exact feature, e.g. for a feature served
-    /// from its own cache. `None` leaves it to the worker, which fills it in
-    /// after all processor hooks, so a request hashes each feature at most
-    /// once. Caller `mm_hashes` never touch it.
+    /// from its own cache, or from a [`feature_digest`] it computed anyway
+    /// (see [`identity_from_digest`](Self::identity_from_digest)). `None`
+    /// leaves it to the worker, which fills it in after all processor hooks,
+    /// so a request hashes each feature at most once. Caller `mm_hashes`
+    /// never touch it.
     pub identity: Option<[u8; 32]>,
     /// Inclusive token spans in the expanded prompt.
     pub offsets: Vec<(u32, u32)>,
@@ -117,7 +118,7 @@ impl MmEncodedEntry {
             if cfg!(debug_assertions) && item.identity.is_some() {
                 assert_eq!(
                     Ok(identity),
-                    item.hash_identity(),
+                    item.identity_from_digest(&feature_digest(&item.feature.data)),
                     "a processor-supplied identity must match the item's feature"
                 );
             }
@@ -173,6 +174,22 @@ impl<'a> MmMeta<'a> {
     }
 }
 
+/// The BLAKE3 digest of a feature's bytes: the one pass over them that an
+/// item's identity needs. A processor that hashes its feature anyway can
+/// compute this however it likes (e.g. `blake3::Hasher::update_rayon`) and
+/// derive the identity with [`MmEncodedItem::identity_from_digest`].
+pub fn feature_digest(data: &TensorData) -> [u8; 32] {
+    blake3::hash(feature_bytes(data)).into()
+}
+
+fn feature_bytes(data: &TensorData) -> &[u8] {
+    match data {
+        TensorData::F32(values) => bytemuck::cast_slice(values),
+        TensorData::I64(values) => bytemuck::cast_slice(values),
+        TensorData::Bf16(values) => bytemuck::cast_slice(values),
+    }
+}
+
 impl MmEncodedItem {
     /// The item's full output identity: the precomputed one when set, else
     /// [`hash_identity`](Self::hash_identity).
@@ -184,10 +201,16 @@ impl MmEncodedItem {
     /// worker does this after all processor hooks and before publication,
     /// unless the processor supplied [`identity`](Self::identity).
     pub fn hash_identity(&self) -> Result<[u8; 32], String> {
-        let (dtype, data): (&str, &[u8]) = match &self.feature.data {
-            TensorData::F32(values) => ("f32", bytemuck::cast_slice(values)),
-            TensorData::I64(values) => ("i64", bytemuck::cast_slice(values)),
-            TensorData::Bf16(values) => ("bf16", bytemuck::cast_slice(values)),
+        self.identity_from_digest(&feature_digest(&self.feature.data))
+    }
+
+    /// [`hash_identity`](Self::hash_identity) from the feature's
+    /// [`feature_digest`], without reading the feature bytes again.
+    pub fn identity_from_digest(&self, digest: &[u8; 32]) -> Result<[u8; 32], String> {
+        let dtype = match &self.feature.data {
+            TensorData::F32(_) => "f32",
+            TensorData::I64(_) => "i64",
+            TensorData::Bf16(_) => "bf16",
         };
         // A path-specific domain keeps different preprocessing implementations
         // separate; the raw bytes are never copied into the metadata buffer.
@@ -199,12 +222,13 @@ impl MmEncodedItem {
             &self.model_specific_data,
         ))
         .map_err(|e| format!("mm identity encode: {e}"))?;
-        let mut hash = Sha256::new();
-        hash.update(b"sglang-rust-mm-output-v1");
-        hash.update((metadata.len() as u64).to_be_bytes());
-        hash.update(metadata);
-        hash.update((data.len() as u64).to_be_bytes());
-        hash.update(data);
+        let data_len = feature_bytes(&self.feature.data).len();
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"sglang-rust-mm-output-v2");
+        hash.update(&(metadata.len() as u64).to_be_bytes());
+        hash.update(&metadata);
+        hash.update(&(data_len as u64).to_be_bytes());
+        hash.update(digest);
         Ok(hash.finalize().into())
     }
 }
@@ -257,6 +281,12 @@ mod tests {
         let first = changed.hash_identity().unwrap();
         changed.feature.data = TensorData::F32(vec![0.0; 8]);
         assert_ne!(first, changed.hash_identity().unwrap());
+
+        // A processor holding the feature's digest derives the same identity
+        // without reading the feature again, and the digest is load-bearing.
+        let digest = feature_digest(&item().feature.data);
+        assert_eq!(item().identity_from_digest(&digest), Ok(original));
+        assert_ne!(item().identity_from_digest(&[0; 32]), Ok(original));
     }
 
     #[test]

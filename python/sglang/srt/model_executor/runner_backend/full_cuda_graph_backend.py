@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -147,6 +148,21 @@ class FullCudaGraphBackend(BaseGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        foundry = get_foundry_adapter()
+        if foundry.enabled:
+            # CUDA graph persistence: SAVE captures and archives this shape;
+            # LOAD restores it. None: Foundry fell back, capture natively.
+            persisted = foundry.capture_one(
+                shape_key=shape_key,
+                forward_fn=forward_fn,
+                pool=self._pool,
+                stream=self._capture_stream,
+            )
+            if persisted is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = persisted
+                # Restored kernels read the same dummy-batch tensors as captured ones.
+                self._capture_inputs[shape_key] = capture_inputs
+                return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()

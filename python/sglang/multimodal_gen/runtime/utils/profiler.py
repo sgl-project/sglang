@@ -47,7 +47,10 @@ def _resolve_profiler_log_dir(log_dir: str | None) -> str:
     if diffusion_profiler_dir:
         return diffusion_profiler_dir
 
-    return os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+    # Unlike the LLM server (/tmp), diffusion traces default to ./logs.
+    if srt_envs.SGLANG_TORCH_PROFILER_DIR.is_set():
+        return srt_envs.SGLANG_TORCH_PROFILER_DIR.get()
+    return "./logs"
 
 
 class SGLDiffusionProfiler:

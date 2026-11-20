@@ -367,7 +367,6 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
 
         gammas_st = gammas_ts.transpose(0, 1)
 
-        # Match TorchTitan's accumulation precision.
         _bmm = torch.bmm
 
         x_std = x_td.unsqueeze(0).expand(self.n_shared_experts, -1, -1).contiguous()
@@ -376,7 +375,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
         y_stf = self._swiglu(y_st2f, gammas_st)
         z_std = _bmm(y_stf, self.w2_weight.mT)
 
-        # Match TorchTitan by accumulating in FP32 before casting back.
+        # Accumulate shared expert outputs in FP32 before casting back.
         out_td = _sum_dim0(z_std)
         if not use_reduce_scatter and self.tp_group is not None:
             out_td = symm_mem_all_reduce(out_td, self.tp_group)

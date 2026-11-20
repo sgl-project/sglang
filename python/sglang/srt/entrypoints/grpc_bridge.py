@@ -19,7 +19,7 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.entrypoints.server_utils import build_server_info
 from sglang.srt.runtime_context import get_lora, get_serving
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)

@@ -111,6 +111,26 @@ def test_frames_are_final_and_match_legacy_decode(batch_size, slicing, temporal)
     assert len(chunks) > 1 if temporal and batch_size == 1 else len(chunks) == 1
 
 
+@pytest.mark.parametrize(
+    "framewise_encoding,framewise_decoding", [(True, False), (False, True)]
+)
+@torch.no_grad()
+def test_temporal_tiled_encode_follows_the_encoding_flag(
+    framewise_encoding, framewise_decoding
+):
+    """use_framewise_encoding alone selects temporal-tiled encoding; the
+    decoding flag must not switch the encode path."""
+    vae = tiny_vae()
+    vae.use_framewise_encoding = framewise_encoding
+    vae.use_framewise_decoding = framewise_decoding
+    video = torch.randn(1, 3, 13, 8, 8)
+    with patch.object(
+        vae, "_temporal_tiled_encode", wraps=vae._temporal_tiled_encode
+    ) as tiled_encode:
+        vae.encode(video)
+    assert tiled_encode.called is framewise_encoding
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA encoder")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("audio", [False, True])

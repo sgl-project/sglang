@@ -80,16 +80,6 @@ def gated_residual(
     return x + y * gate
 
 
-def layernorm_forward(
-    layernorm: nn.Module,
-    x: torch.Tensor,
-    cond: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if cond is not None:
-        return layernorm(x, cond=cond)
-    return layernorm(x)
-
-
 def linear_compute_dtype(module: nn.Module) -> torch.dtype:
     return (
         torch.bfloat16
@@ -535,7 +525,6 @@ class PiGemmaModel(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
         )
         self.rotary_emb = PiGemmaRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -880,85 +869,6 @@ def prepare_optional_full_attention_mask(
     return torch.where(masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
 
-def compute_layer_complete(
-    inputs_embeds,
-    attention_mask,
-    position_ids,
-    adarms_cond,
-    *,
-    layers,
-    rotary_emb,
-):
-    query_states = []
-    key_states = []
-    value_states = []
-    gates = []
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = layers[i]
-        hidden_states, gate = layernorm_forward(
-            layer.input_layernorm, hidden_states, adarms_cond[i]
-        )
-        gates.append(gate)
-        query_state, key_state, value_state = layer.self_attn.project_qkv(hidden_states)
-        query_states.append(query_state)
-        key_states.append(key_state)
-        value_states.append(value_state)
-
-    query_states = torch.cat(query_states, dim=2)
-    key_states = torch.cat(key_states, dim=2)
-    value_states = torch.cat(value_states, dim=2)
-    dummy_tensor = torch.zeros(
-        query_states.shape[0],
-        query_states.shape[2],
-        query_states.shape[-1],
-        device=query_states.device,
-        dtype=query_states.dtype,
-    )
-    cos, sin = rotary_emb(dummy_tensor, position_ids)
-    query_states, key_states = native_apply_rotary_pos_emb(
-        query_states,
-        key_states,
-        cos,
-        sin,
-        unsqueeze_dim=1,
-    )
-    paligemma_layer = layers[0]
-    att_output = paligemma_layer.self_attn.attn(
-        query_states.transpose(1, 2),
-        key_states.transpose(1, 2),
-        value_states.transpose(1, 2),
-        attn_mask=attention_mask,
-    )
-    batch_size = query_states.shape[0]
-    head_dim = paligemma_layer.self_attn.head_dim
-    hidden_size = paligemma_layer.self_attn.num_heads * head_dim
-    att_output = att_output.reshape(batch_size, -1, hidden_size)
-
-    outputs_embeds = []
-    start_pos = 0
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = layers[i]
-        end_pos = start_pos + hidden_states.shape[1]
-        if att_output.dtype != layer.self_attn.projection_dtype:
-            att_output = att_output.to(layer.self_attn.projection_dtype)
-        out_emb = linear_forward(
-            layer.self_attn.o_proj,
-            att_output[:, start_pos:end_pos],
-        )
-        out_emb = gated_residual(hidden_states, out_emb, gates[i])
-        after_first_residual = out_emb.clone()
-        out_emb, gate = layernorm_forward(
-            layer.post_attention_layernorm, out_emb, adarms_cond[i]
-        )
-        if layer.mlp.projection_dtype == torch.bfloat16:
-            out_emb = out_emb.to(dtype=torch.bfloat16)
-        out_emb = layer.mlp(out_emb)
-        out_emb = gated_residual(after_first_residual, out_emb, gate)
-        outputs_embeds.append(out_emb)
-        start_pos = end_pos
-    return outputs_embeds
-
-
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -1152,30 +1062,9 @@ class PaliGemmaWithExpertModel(nn.Module):
             )
             return [None, suffix_output.last_hidden_state], None
 
-        paligemma_layers = self.paligemma.model.language_model.layers
-        expert_layers = self.gemma_expert.model.layers
-        rotary_emb = self.paligemma.model.language_model.rotary_emb
-        for layers in zip(paligemma_layers, expert_layers, strict=True):
-            inputs_embeds = compute_layer_complete(
-                inputs_embeds,
-                attention_mask,
-                position_ids,
-                adarms_cond,
-                layers=layers,
-                rotary_emb=rotary_emb,
-            )
-
-        final_norms = (
-            self.paligemma.model.language_model.norm,
-            self.gemma_expert.model.norm,
+        raise ValueError(
+            "inputs_embeds must carry either the prefix or the suffix embeddings, not both"
         )
-        outputs = []
-        for i, hidden_states in enumerate(inputs_embeds):
-            out_emb, _ = layernorm_forward(
-                final_norms[i], hidden_states, adarms_cond[i]
-            )
-            outputs.append(out_emb)
-        return outputs, None
 
 
 class Pi05CoreModel(nn.Module):

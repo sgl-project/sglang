@@ -286,7 +286,7 @@ def main():
     prompts = [
         "Write a short, neutral self-introduction for a fictional character. Hello, my name is",
         "Provide a concise factual statement about France’s capital city. The capital of France is",
-        "Explain possible future trends in artificial intelligence. The future of AI is",
+        "Explain possible future trends in artificial intelligence. The future of AI is"
     ]
 
     asyncio.run(run_llm(llm, sampling_params, prompts))
@@ -340,8 +340,8 @@ Using the same Llama wrapper from the previous section, here is how to package a
 sglang_custom_project/
 |----setup.py
 |----custom_llm/
-     |----__init__.py
-     |----llama_wrapper.py
+    |----__init__.py
+    |----llama_wrapper.py
 ```
 
 Write the `setup.py`:

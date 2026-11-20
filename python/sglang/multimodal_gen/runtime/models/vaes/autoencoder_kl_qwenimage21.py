@@ -250,7 +250,6 @@ class QwenImage21MidBlock(nn.Module):
             resnets.append(QwenImage21ResidualBlock(dim, dim, dropout, non_linearity))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=None):
         x = self.resnets[0](x, feat_cache=feat_cache, feat_idx=feat_idx)
@@ -355,7 +354,6 @@ class QwenImage21Encoder3d(nn.Module):
         )
         self.norm_out = QwenImage21RMS_norm(out_dim, images=False)
         self.conv_out = QwenImage21CausalConv3d(out_dim, z_dim, 3, padding=1)
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=None):
         x = self.conv_in(x)
@@ -403,7 +401,6 @@ class QwenImage21ResidualUpBlock(nn.Module):
             )
         else:
             self.upsampler = None
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
         x_copy = x
@@ -459,7 +456,6 @@ class QwenImage21UpBlock(nn.Module):
             self.upsamplers = nn.ModuleList(
                 [QwenImage21Resample(out_dim, mode=upsample_mode)]
             )
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=None):
         for resnet in self.resnets:
@@ -528,7 +524,6 @@ class QwenImage21Decoder3d(nn.Module):
             self.up_blocks.append(up_block)
         self.norm_out = QwenImage21RMS_norm(out_dim, images=False)
         self.conv_out = QwenImage21CausalConv3d(out_dim, out_channels, 3, padding=1)
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
         x = self.conv_in(x)
