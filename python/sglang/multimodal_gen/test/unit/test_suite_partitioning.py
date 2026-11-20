@@ -115,6 +115,34 @@ def test_file_suite_runs_each_file_once(monkeypatch, tmp_path, total_partitions)
     assert sorted(executed) == sorted(str(tmp_path / filename) for filename in files)
 
 
+@pytest.mark.parametrize("num_gpus", [1, 2])
+def test_sharded_component_accuracy_launches_all_ranks(monkeypatch, num_gpus):
+    suite = f"{num_gpus}-gpu"
+    (rel,) = run_suite.FILE_SUITES[f"component-accuracy-{suite}"]
+    target_dir = Path(run_suite.__file__).resolve().parents[1] / "server"
+    calls = []
+
+    def fail_component(cmd):
+        calls.append(cmd)
+        return 1
+
+    monkeypatch.setattr(run_suite.subprocess, "call", fail_component)
+    code, executed, results, _ = run_suite._run_standalone_file(suite, rel, target_dir)
+    key = f"standalone:{rel}"
+    assert (code, executed, results) == (1, [key], {key: "fail"})
+    (cmd,) = calls
+    launcher = ["torch.distributed.run", "--standalone", "--nproc_per_node=2", "-m"]
+    assert cmd == [
+        sys.executable,
+        "-m",
+        *(launcher if num_gpus == 2 else []),
+        "pytest",
+        "-s",
+        "-v",
+        str(target_dir / rel),
+    ]
+
+
 def test_failing_cases_do_not_skip_the_shards_standalone_files(monkeypatch, tmp_path):
     """Standalone files used to own a shard, so cases could not block them."""
     standalone_rel = "../single_test_file/test_disagg_server.py"
