@@ -163,7 +163,7 @@ MmProcessor::process_decoded(input_ids, items: Vec<MmDecoded>, text: &dyn TextEn
 ```
 
 `process_media` adds videos (`mm/video.rs`, the frame rules of Python's
-`qwen_vl.py`) and returns images, then videos, as Python's `mm_items`.
+`qwen_vl_media_processing.py`) and returns images, then videos, as Python's `mm_items`.
 
 `process_decoded` is the same request path after decode, for media a caller
 already holds decoded (`DecodedMedia` plus a source hash). `process_media`
