@@ -138,14 +138,17 @@ class BaseDiT(nn.Module, ABC):
         """
         return None
 
-    def load_non_parameter_weight(self, *, name: str, weight: torch.Tensor) -> bool:
-        """Load a weight-update entry this model serves outside ``named_parameters()``.
+    def load_non_parameter_weights(
+        self, named_weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Load the entries of a tensor weight update this model serves outside ``named_parameters()``.
 
-        Returns False, loading nothing, when ``name`` is not such a weight;
-        ``weight`` is the full tensor, before any TP sharding. Default: a
-        model has none.
+        Returns the entries left for its parameters. A weight is the full
+        tensor, before any TP sharding. An override checks all of its entries
+        before it loads any, and raises on one it cannot load. Default: a
+        model has no such weight.
         """
-        return False
+        return named_weights
 
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:

@@ -8,8 +8,8 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
-# A weight update names a PDD head stack by this prefix plus its key in the
-# fused heads file, e.g. "final_layer.pdd_fused_heads.video_out.weight".
+# A tensor weight update names a PDD head stack by this prefix plus its fused heads file key,
+# e.g. "final_layer.pdd_fused_heads.video_out.weight".
 MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX = "final_layer.pdd_fused_heads."
 
 

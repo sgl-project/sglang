@@ -271,8 +271,7 @@ class TestMiniMaxH3PDDHeadWeightUpdate(CustomTestCase):
         _project_on_each_rank(layers, step=0)
 
         for layer in layers:
-            for key, full_stack in self.updated_heads.items():
-                layer.load_pdd_fused_head_stack(key=key, full_stack=full_stack)
+            layer.load_pdd_fused_head_stacks(self.updated_heads)
 
         layers_loaded_updated = _make_final_layers(self.updated_path, tp_size=2)
         for step in (0, 7):
@@ -287,9 +286,11 @@ class TestMiniMaxH3PDDHeadWeightUpdate(CustomTestCase):
     def test_head_stack_update_keeps_its_own_copy(self):
         """The update tensor is the sender's buffer, which the sender reuses."""
         layers = _make_final_layers(self.loaded_path, tp_size=1)
-        for key, full_stack in self.updated_heads.items():
-            sender_buffer = full_stack.clone()
-            layers[0].load_pdd_fused_head_stack(key=key, full_stack=sender_buffer)
+        sender_buffers = {
+            key: full_stack.clone() for key, full_stack in self.updated_heads.items()
+        }
+        layers[0].load_pdd_fused_head_stacks(sender_buffers)
+        for sender_buffer in sender_buffers.values():
             sender_buffer.zero_()
 
         torch.testing.assert_close(
@@ -328,21 +329,58 @@ class TestMiniMaxH3PDDHeadWeightUpdate(CustomTestCase):
         prefix = MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX
         full_stack = self.updated_heads["video_out.weight"]
         cases = (
-            (None, "video_out.weight", full_stack, "serves no PDD heads"),
-            (self.loaded_path, "video_out.weight", full_stack[:6], "must have shape"),
-            (self.loaded_path, "video_out.scale", full_stack, "must be one of"),
+            (None, f"{prefix}video_out.weight", full_stack, "serves no PDD heads"),
+            (
+                self.loaded_path,
+                f"{prefix}video_out.weight",
+                full_stack[:6],
+                "must have shape",
+            ),
+            (self.loaded_path, f"{prefix}video_out.scale", full_stack, "must be among"),
+            # a prefix the parameters' name mapping strips does not make it a parameter
+            (
+                self.loaded_path,
+                f"model.diffusion_model.{prefix}video_out.weight",
+                full_stack,
+                "exactly",
+            ),
         )
-        for heads_path, key, update_tensor, expected_message in cases:
+        for heads_path, name, update_tensor, expected_message in cases:
             with self.subTest(expected_message=expected_message):
                 layers = _make_final_layers(heads_path, tp_size=1)
                 updater, _ = _make_transformer_updater(layers[0])
 
                 ok, message = updater.update_weights_from_tensor(
-                    [(f"{prefix}{key}", update_tensor)]
+                    [(name, update_tensor)]
                 )
 
                 self.assertFalse(ok)
                 self.assertIn(expected_message, message)
+
+    def test_a_rejected_tensor_update_replaces_no_head_stack(self):
+        """A weight stack loaded before its bias stack is refused would leave the new weights on the old biases."""
+        prefix = MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX
+        layers = _make_final_layers(self.loaded_path, tp_size=1)
+        updater, model = _make_transformer_updater(layers[0])
+
+        ok, _ = updater.update_weights_from_tensor(
+            [
+                ("probe", torch.ones(2)),
+                (f"{prefix}video_out.weight", self.updated_heads["video_out.weight"]),
+                (f"{prefix}video_out.bias", self.updated_heads["video_out.bias"][:6]),
+            ]
+        )
+
+        self.assertFalse(ok)
+        torch.testing.assert_close(
+            _project_on_each_rank(layers, step=3),
+            _project_on_each_rank(
+                _make_final_layers(self.loaded_path, tp_size=1), step=3
+            ),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(model.probe, torch.zeros(2))
 
 
 if __name__ == "__main__":
