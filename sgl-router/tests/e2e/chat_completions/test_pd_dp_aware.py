@@ -217,6 +217,21 @@ def _prefill_tree_blocks(router_url: str, worker_url: str) -> float:
     return total
 
 
+def _cold_cache(topo: Topology) -> None:
+    """Flush both engines and wait for the router's tree to drop their blocks.
+
+    A prompt sharing any cached block with a rank (the chat template is one)
+    is pinned to that rank ahead of load, so a spread test must start cold
+    whatever ran before it.
+    """
+    resp = httpx.post(f"{topo.router.base_url}/flush_cache", timeout=30.0)
+    assert resp.status_code == 200, resp.text
+    deadline = time.time() + 30.0
+    while _prefill_tree_blocks(topo.router.base_url, topo.prefill.url) > 0:
+        assert time.time() < deadline, "router kept prefill blocks after flush"
+        time.sleep(0.2)
+
+
 def _chat(
     topo: Topology, prompt: str, *, max_tokens: int, stream: bool = False
 ) -> httpx.Response:
@@ -257,6 +272,7 @@ def _long_prompt(tag: str) -> str:
 def test_concurrent_requests_use_every_prefill_and_decode_rank(topology):
     """Eight in flight at once land on both prefill and both decode ranks."""
     topo = topology
+    _cold_cache(topo)
     max_tokens = 48
     p0, d0 = _prefilled(topo.prefill.url), _decoded(topo.decode.url)
     results: list[httpx.Response | Exception] = [None] * 8  # type: ignore[list-item]
