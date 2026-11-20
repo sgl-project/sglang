@@ -222,6 +222,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "seaweedfs":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "gcs":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "tensorcast":
             return backend_class(storage_config)
         else:
@@ -307,4 +309,10 @@ StorageBackendFactory.register_backend(
     "seaweedfs",
     "sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store",
     "SeaweedFSStore",
+)
+
+StorageBackendFactory.register_backend(
+    "gcs",
+    "sglang.srt.mem_cache.storage.gcs.gcs_store",
+    "GcsStore",
 )

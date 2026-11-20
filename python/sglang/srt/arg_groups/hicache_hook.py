@@ -11,7 +11,7 @@ from sglang.srt.arg_groups.overrides import declare_resolution
 
 logger = logging.getLogger(__name__)
 
-UNIFIED_KEY_SCHEME_STORAGE_BACKENDS = ("file", "mooncake")
+UNIFIED_KEY_SCHEME_STORAGE_BACKENDS = ("file", "mooncake", "gcs")
 
 
 def handle_hicache(server_args: Any):

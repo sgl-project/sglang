@@ -9,7 +9,16 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Set
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import torch
 
@@ -812,89 +821,123 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
         self._backend.close()
 
 
+@dataclass(frozen=True)
+class StorageKeyScheme:
+    """Object-key suffixes shared by L3 storage backends.
+
+    ``suffix`` names a whole page (or a rank-replicated page) and ``tp_suffix``
+    names TP-sharded side-pool state. Under the unified key scheme both are the
+    rank-free chunk coordinate family, and ``unified_suffixes`` /
+    ``unified_chunk_spans`` describe the page's objects in order.
+    """
+
+    suffix: str
+    tp_suffix: str
+    unified_suffixes: Optional[Tuple[str, ...]] = None
+    unified_chunk_spans: Optional[Tuple[Tuple[int, int], ...]] = None
+
+
+def resolve_storage_key_scheme(
+    storage_config: HiCacheStorageConfig,
+) -> StorageKeyScheme:
+    """Resolve object-key suffixes from the storage config.
+
+    Backends must key objects by this result instead of building rank
+    coordinates themselves: under the unified key scheme the chunk coordinate
+    replaces the whole rank/pp/cp suffix family, and model identity lives
+    inside the namespace digest.
+    """
+    if storage_config.unified_suffixes is not None:
+        suffixes = storage_config.unified_suffixes
+        if not suffixes or len(set(suffixes)) != len(suffixes):
+            raise ValueError("Unified storage suffixes must be nonempty and unique.")
+        if storage_config.dcp_size != 1:
+            raise ValueError("Unified storage requires full pages without DCP.")
+        chunk_spans = storage_config.unified_chunk_spans
+        if chunk_spans is None:
+            if len(suffixes) != 1:
+                raise ValueError("Unified multichunk storage requires chunk spans.")
+        else:
+            if len(chunk_spans) != len(suffixes):
+                raise ValueError("Each unified suffix requires one chunk span.")
+            end = 0
+            for offset, length in sorted(chunk_spans):
+                if (
+                    type(offset) is not int
+                    or type(length) is not int
+                    or offset != end
+                    or length <= 0
+                ):
+                    raise ValueError(
+                        "Unified chunk spans must cover the page without gaps or overlap."
+                    )
+                end = offset + length
+            chunk_spans = tuple(chunk_spans)
+        resolved = tuple(f"_{suffix}" for suffix in suffixes)
+        return StorageKeyScheme(
+            suffix=resolved[0],
+            # Unified keys currently support only a single KV pool, without
+            # TP-sharded sidecars. Keep all key lookups in its chunk namespace.
+            tp_suffix=resolved[0],
+            unified_suffixes=resolved,
+            unified_chunk_spans=chunk_spans,
+        )
+    if storage_config.unified_chunk_spans is not None:
+        raise ValueError("Unified chunk spans require unified storage suffixes.")
+    model_name = storage_config.model_name
+    model_name = "-".join(model_name.split("/")) if model_name else ""
+    shard_suffix = ""
+    if storage_config.pp_size > 1:
+        shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+    # Under NSA context parallel each CP rank holds a disjoint slice of
+    # every page, so give each rank its own file key to avoid a cross-rank
+    # write race.
+    if storage_config.attn_cp_size > 1:
+        shard_suffix += (
+            f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
+        )
+    # MLA KV is replicated across TP ranks and shares one file per page;
+    # TP-sharded state is keyed by tp_suffix instead.
+    tp_suffix = (
+        f"_{model_name}_{storage_config.tp_rank}_{storage_config.tp_size}{shard_suffix}"
+    )
+    suffix = (
+        f"_{model_name}{shard_suffix}"
+        if storage_config.is_rank_replicated
+        else tp_suffix
+    )
+    # The controller includes the logical KV dtype and any storage_format_tag
+    # in model_name. Other layout differences still need extra_backend_tag.
+    if storage_config.dcp_size > 1:
+        # Equivalent MLA shards in different DCP groups share a file.
+        dcp_suffix = (
+            f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+            f"_page{storage_config.logical_page_size}"
+        )
+        suffix += dcp_suffix
+        tp_suffix += dcp_suffix
+    return StorageKeyScheme(suffix=suffix, tp_suffix=tp_suffix)
+
+
 class HiCacheFile(HiCacheStorage):
     def _init_config_suffix(self, storage_config: HiCacheStorageConfig) -> None:
         """Derive the per-deployment key suffix from the storage config."""
-        self._unified_suffixes = None
+        scheme = resolve_storage_key_scheme(storage_config)
+        self._unified_suffixes = scheme.unified_suffixes
+        self._unified_chunk_spans = scheme.unified_chunk_spans
         self._unified_chunk_sizes = {}
-        self._unified_chunk_spans = storage_config.unified_chunk_spans
-        if storage_config.unified_suffixes is not None:
-            # The chunk coordinate replaces the whole rank/pp/cp suffix family;
-            # model identity lives inside the namespace digest.
-            suffixes = storage_config.unified_suffixes
-            if not suffixes or len(set(suffixes)) != len(suffixes):
-                raise ValueError(
-                    "Unified storage suffixes must be nonempty and unique."
+        if (
+            scheme.unified_suffixes is not None
+            and scheme.unified_chunk_spans is not None
+        ):
+            self._unified_chunk_sizes = dict(
+                zip(
+                    scheme.unified_suffixes,
+                    (length for _, length in scheme.unified_chunk_spans),
                 )
-            if storage_config.dcp_size != 1:
-                raise ValueError("Unified storage requires full pages without DCP.")
-            if self._unified_chunk_spans is None:
-                if len(suffixes) != 1:
-                    raise ValueError("Unified multichunk storage requires chunk spans.")
-            else:
-                if len(self._unified_chunk_spans) != len(suffixes):
-                    raise ValueError("Each unified suffix requires one chunk span.")
-                end = 0
-                for offset, length in sorted(self._unified_chunk_spans):
-                    if (
-                        type(offset) is not int
-                        or type(length) is not int
-                        or offset != end
-                        or length <= 0
-                    ):
-                        raise ValueError(
-                            "Unified chunk spans must cover the page without gaps or overlap."
-                        )
-                    end = offset + length
-                self._unified_chunk_spans = tuple(self._unified_chunk_spans)
-            self._unified_suffixes = tuple(f"_{suffix}" for suffix in suffixes)
-            if self._unified_chunk_spans is not None:
-                self._unified_chunk_sizes = dict(
-                    zip(
-                        self._unified_suffixes,
-                        (length for _, length in self._unified_chunk_spans),
-                    )
-                )
-            self.config_suffix = self._unified_suffixes[0]
-            # Unified keys currently support only a single KV pool, without
-            # TP-sharded sidecars. Keep all key lookups in its chunk namespace.
-            self.tp_config_suffix = self.config_suffix
-            return
-        if self._unified_chunk_spans is not None:
-            raise ValueError("Unified chunk spans require unified storage suffixes.")
-        model_name = storage_config.model_name
-        model_name = "-".join(model_name.split("/")) if model_name else ""
-        shard_suffix = ""
-        if storage_config.pp_size > 1:
-            shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of
-        # every page, so give each rank its own file key to avoid a cross-rank
-        # write race.
-        if storage_config.attn_cp_size > 1:
-            shard_suffix += (
-                f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
             )
-        # MLA KV is replicated across TP ranks and shares one file per page;
-        # TP-sharded state is keyed by tp_config_suffix instead.
-        self.tp_config_suffix = (
-            f"_{model_name}_{storage_config.tp_rank}_{storage_config.tp_size}"
-            f"{shard_suffix}"
-        )
-        self.config_suffix = (
-            f"_{model_name}{shard_suffix}"
-            if storage_config.is_rank_replicated
-            else self.tp_config_suffix
-        )
-        # The controller includes the logical KV dtype and any storage_format_tag
-        # in model_name. Other layout differences still need extra_backend_tag.
-        if storage_config.dcp_size > 1:
-            # Equivalent MLA shards in different DCP groups share a file.
-            dcp_suffix = (
-                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
-                f"_page{storage_config.logical_page_size}"
-            )
-            self.config_suffix += dcp_suffix
-            self.tp_config_suffix += dcp_suffix
+        self.config_suffix = scheme.suffix
+        self.tp_config_suffix = scheme.tp_suffix
 
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
