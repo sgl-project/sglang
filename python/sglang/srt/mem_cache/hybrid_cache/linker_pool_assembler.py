@@ -672,6 +672,67 @@ def _build_mamba_swa_device_pool_group(
     )
 
 
+def _build_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+    from sglang.srt.mem_cache.memory_pool import (
+        MHATokenToKVPool,
+        MHATokenToKVPoolMXFP8,
+    )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    pools = (kvcache.full_kv_pool, kvcache.swa_kv_pool)
+    # Sidecar drafts ride the target pages, as in the full + SWA + Mamba group.
+    split = _split_sidecar_draft_pools(params.sidecar_draft_device_pools)
+    kv_drafts, swa_drafts = split or ((), ())
+    if (
+        type(kvcache) is not SWAKVPool
+        or any(
+            type(pool) not in (MHATokenToKVPool, MHATokenToKVPoolMXFP8)
+            for pool in pools
+        )
+        # The entries address one row per token slot.
+        or any(
+            pool.kv_cache_layout != "nhd" for pool in (*pools, *kv_drafts, *swa_drafts)
+        )
+        or params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports FULL + SWA models only with "
+            "slot-major (NHD) MHA pools, without packed draft KV."
+        )
+    if any(pool.page_size != page_size for pool in pools):
+        raise ValueError(
+            "FULL + SWA KV page size must match the tree page size: "
+            f"{[pool.page_size for pool in pools]} != {page_size}."
+        )
+
+    full_mapping, swa_mapping = _swa_layer_mappings(kvcache)
+    entries = [
+        _mha_device_pool_entry(
+            PoolName.KV,
+            kvcache.full_kv_pool,
+            full_mapping,
+            page_size,
+            draft_pools=kv_drafts,
+        ),
+        _mha_device_pool_entry(
+            PoolName.SWA,
+            kvcache.swa_kv_pool,
+            swa_mapping,
+            page_size,
+            draft_pools=swa_drafts,
+        ),
+    ]
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    return DevicePoolGroup(
+        entries, num_layers + 1, page_size, restores_sidecar_drafts=split is not None
+    )
+
+
 def _build_mamba_device_pool_group(
     kvcache: Any, params: Any, page_size: int
 ) -> DevicePoolGroup:
