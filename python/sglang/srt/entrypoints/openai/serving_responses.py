@@ -1403,6 +1403,43 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _response_tools_to_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
+        chat_tools = self._static_chat_tools(request)
+        # Tools discovered by client-side tool_search become callable for this
+        # turn even though they were never listed in ``request.tools``.
+        for tool in self._tool_search_output_tools(request):
+            chat_tools.append(
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=tool["name"],
+                        description=tool.get("description"),
+                        parameters=tool.get("parameters"),
+                        strict=tool.get("strict", False),
+                    ),
+                )
+            )
+        return chat_tools
+
+    def _tool_search_output_tools(self, request: ResponsesRequest) -> list[dict]:
+        """Function tools from ``tool_search_output`` input items, deduped by
+        name; earlier items win over later ones."""
+        found: dict[str, dict] = {}
+        for item in self._response_input_history(request):
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(exclude_none=True)
+            if not isinstance(item, dict) or item.get("type") != "tool_search_output":
+                continue
+            for tool in item.get("tools") or []:
+                if (
+                    isinstance(tool, dict)
+                    and tool.get("type", "function") == "function"
+                    and tool.get("name")
+                    and tool["name"] not in found
+                ):
+                    found[tool["name"]] = tool
+        return list(found.values())
+
+    def _static_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
         chat_tools = []
         is_muse = self.tool_call_parser == "muse"
         for tool in request.tools:
@@ -1540,6 +1577,36 @@ class OpenAIServingResponses(OpenAIServingChat):
         return output
 
     @staticmethod
+    def _computer_call_output_content(output: Any) -> Any:
+        """``computer_call_output.output`` may be a string, a dict with an
+        ``image_url`` (computer_screenshot), or an array of content parts; keep
+        screenshots as ``image_url`` content so the model sees the image."""
+        if isinstance(output, str):
+            return output
+        if isinstance(output, dict):
+            if output.get("image_url"):
+                return [
+                    OpenAIServingResponses._normalize_response_content_part_for_chat(
+                        {"type": "input_image", "image_url": output["image_url"]}
+                    )
+                ]
+            return orjson.dumps(output).decode("utf-8")
+        if isinstance(output, list):
+            content = [
+                OpenAIServingResponses._normalize_response_content_part_for_chat(part)
+                for part in output
+            ]
+            texts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            if len(content) == len(texts):
+                return "".join(texts)
+            return content
+        return output
+
+    @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
         return {
             "role": "assistant",
@@ -1551,6 +1618,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             ],
         }
+
+    @staticmethod
+    def _web_search_call_to_context_note(message: dict) -> dict:
+        """Render a replayed hosted web_search_call item as the context note the
+        provider injects: the queries act as the question already answered."""
+        action = message.get("action") or {}
+        queries = action.get("queries")
+        if not queries and action.get("query"):
+            queries = [action["query"]]
+        queries_text = ", ".join(q for q in queries or [] if isinstance(q, str))
+        note = (
+            "Previous web_search_call in this conversation searched for: "
+            f"{queries_text}. Status: completed. Treat those results as already "
+            "available evidence. Do not call web_search again for the same "
+            "question, substantive evidence. Do not call web_search. Before "
+            "calling web_search, first answer from those results and prior "
+            "context, or state uncertainty."
+        )
+        return {"role": "user", "content": note}
 
     @classmethod
     def _normalize_response_message_for_chat(
@@ -1600,6 +1686,36 @@ class OpenAIServingResponses(OpenAIServingChat):
                 message.get("name"),
                 encode_custom_tool_input(message.get("input") or ""),
             )
+        if msg_type == "tool_search_call":
+            # Client-executed tool search; replay as an assistant tool_call to
+            # the built-in "tool_search" pseudo-tool, matched later by call_id.
+            raw = message.get("arguments")
+            raw = orjson.dumps(raw).decode("utf-8") if isinstance(raw, dict) else "{}"
+            return cls._chat_tool_call_message(message, "tool_search", raw)
+        if msg_type == "tool_search_output":
+            return {
+                "role": "tool",
+                "tool_call_id": message.get("call_id"),
+                "content": orjson.dumps(message.get("tools") or []).decode("utf-8"),
+            }
+        if msg_type == "computer_call":
+            # The action dict is the tool arguments; "computer" is the built-in
+            # tool name OpenAI assigns to computer_use_preview calls.
+            action = message.get("action")
+            raw = (
+                orjson.dumps(action).decode("utf-8")
+                if isinstance(action, dict)
+                else "{}"
+            )
+            return cls._chat_tool_call_message(
+                message, message.get("name") or "computer", raw
+            )
+        if msg_type == "computer_call_output":
+            return {
+                "role": "tool",
+                "tool_call_id": message.get("call_id"),
+                "content": cls._computer_call_output_content(message.get("output")),
+            }
         if msg_type in ("function_call_output", "custom_tool_call_output"):
             return {
                 "role": "tool",
@@ -1634,6 +1750,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "role": "assistant",
                 "reasoning_content": "\n".join(text_parts),
             }
+        if msg_type == "web_search_call":
+            return cls._web_search_call_to_context_note(message)
         if msg_type not in (None, "message"):
             raise ValueError(f"Unsupported Responses API input item type: {msg_type!r}")
 

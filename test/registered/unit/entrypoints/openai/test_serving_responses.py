@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import functools
+import json
 import sys
 import unittest
 from contextlib import asynccontextmanager
@@ -1269,11 +1270,204 @@ class InputItemNormalizationTestCase(CustomTestCase):
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
 
+    def test_tool_search_call_becomes_assistant_tool_call(self):
+        # Regression: tool_search_call input items used to raise "Unsupported
+        # Responses API input item type", breaking tool-search replay loops.
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "tool_search_call",
+                "call_id": "call_ts_1",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {"query": "calendar", "limit": 5},
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_ts_1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": '{"query":"calendar","limit":5}',
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_tool_search_output_becomes_tool_message(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "tool_search_output",
+                "call_id": "call_ts_1",
+                "status": "completed",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "create_event",
+                        "description": "Create a calendar event",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}},
+                            "required": ["title"],
+                        },
+                    }
+                ],
+            }
+        )
+        self.assertEqual(normalized["role"], "tool")
+        self.assertEqual(normalized["tool_call_id"], "call_ts_1")
+        tools = json.loads(normalized["content"])
+        self.assertEqual(tools[0]["name"], "create_event")
+
+    def test_harmony_tool_search_input_replays(self):
+        from sglang.srt.entrypoints.harmony_utils import parse_response_input
+
+        call_msg = parse_response_input(
+            {
+                "type": "tool_search_call",
+                "call_id": "call_ts_1",
+                "arguments": {"query": "calendar"},
+            },
+            [],
+        )
+        self.assertEqual(call_msg.recipient, "functions.tool_search")
+        self.assertEqual(call_msg.channel, "commentary")
+
+        output_msg = parse_response_input(
+            {
+                "type": "tool_search_output",
+                "call_id": "call_ts_1",
+                "tools": [{"type": "function", "name": "create_event"}],
+            },
+            [],
+        )
+        self.assertEqual(output_msg.author.name, "functions.tool_search")
+        self.assertEqual(output_msg.author.role, "tool")
+        self.assertEqual(
+            json.loads(output_msg.content[0].text)[0]["name"], "create_event"
+        )
+
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
             OpenAIServingResponses._normalize_response_message_for_chat(
-                {"type": "web_search_call", "id": "ws_1"}
+                {"type": "definitely_not_a_type", "id": "x_1"}
             )
+
+    def test_web_search_call_becomes_user_context_note(self):
+        # The user's replay shape: a completed hosted web_search_call item whose
+        # queries act as the question already answered.
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "web_search_call",
+                "id": "ws-call-1",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "queries": ["Qwen API reference"],
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://help.aliyun.com/zh/model-studio/qwen-api-reference",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(normalized["role"], "user")
+        self.assertIn("Qwen API reference", normalized["content"])
+        self.assertIn("Do not call web_search", normalized["content"])
+
+    def test_web_search_call_single_query_shape(self):
+        # Older OpenAI shape: action.query as a single string instead of queries[].
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "web_search_call",
+                "id": "ws_2",
+                "status": "completed",
+                "action": {"type": "search", "query": "Qwen API reference"},
+            }
+        )
+        self.assertEqual(normalized["role"], "user")
+        self.assertIn("Qwen API reference", normalized["content"])
+
+    def test_computer_call_becomes_assistant_tool_call(self):
+        # Regression: computer_call input items used to raise "Unsupported
+        # Responses API input item type", breaking computer-use replay loops.
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "computer_call",
+                "id": "cc-1",
+                "call_id": "call-computer-1",
+                "pending_safety_checks": [],
+                "status": "completed",
+                "action": {"type": "screenshot"},
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-computer-1",
+                        "type": "function",
+                        "function": {
+                            "name": "computer",
+                            "arguments": '{"type":"screenshot"}',
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_computer_call_output_keeps_screenshot_image(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "computer_call_output",
+                "call_id": "call-computer-1",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "data:image/png;base64,iVBOR",
+                },
+                "acknowledged_safety_checks": [],
+            }
+        )
+        self.assertEqual(normalized["role"], "tool")
+        self.assertEqual(normalized["tool_call_id"], "call-computer-1")
+        self.assertEqual(
+            normalized["content"],
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBOR",
+                        "detail": "auto",
+                    },
+                }
+            ],
+        )
+
+    def test_computer_call_output_string_output_stays_text(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "computer_call_output",
+                "call_id": "call-computer-1",
+                "output": "screenshot taken",
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {
+                "role": "tool",
+                "tool_call_id": "call-computer-1",
+                "content": "screenshot taken",
+            },
+        )
 
 
 class FullResponseUsageTestCase(CustomTestCase):
