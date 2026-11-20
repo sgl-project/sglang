@@ -56,7 +56,6 @@ def test_repeated_context_and_greedy_bypass():
         max_num_reqs=2,
         context_window=2,
         max_contexts_per_req=8,
-        key="0123456789abcdef",
         device=device,
     )
     req_pool_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
@@ -95,7 +94,6 @@ def test_low_entropy_bypass_does_not_consume_context():
         max_num_reqs=1,
         context_window=2,
         max_contexts_per_req=8,
-        key="0123456789abcdef",
         device="cuda",
         max_probability=0.5,
     )
@@ -131,7 +129,6 @@ def test_inactive_batch_skips_watermark_state():
         max_num_reqs=1,
         context_window=2,
         max_contexts_per_req=8,
-        key="0123456789abcdef",
         device="cuda",
     )
     engine = GumbelEngine(state, _FEATURES)
@@ -148,7 +145,6 @@ def test_retracted_request_restores_context_history():
         max_num_reqs=2,
         context_window=2,
         max_contexts_per_req=8,
-        key="0123456789abcdef",
         device=device,
     )
     req_pool_indices = torch.tensor([1], device=device, dtype=torch.int32)
@@ -203,7 +199,6 @@ def test_speculative_record_stops_at_context_capacity():
         max_num_reqs=1,
         context_window=2,
         max_contexts_per_req=2,
-        key="0123456789abcdef",
         device="cuda",
     )
     state.num_watermarked_contexts[0] = 1
@@ -230,7 +225,6 @@ def test_speculative_tree_fast_path_matches_tensor_reference():
             max_num_reqs=4,
             context_window=4,
             max_contexts_per_req=16,
-            key="0123456789abcdef",
             key_b="fedcba9876543210",
             mixing_probability=0.5,
             device="cuda",
@@ -343,7 +337,6 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
             max_num_reqs=1,
             context_window=2,
             max_contexts_per_req=8,
-            key="0123456789abcdef",
             device="cuda",
         )
         for _ in range(2)

@@ -29,11 +29,7 @@ def _fmix32(value: torch.Tensor) -> torch.Tensor:
     return value ^ (value >> 16)
 
 
-def _as_signed_int32(value: int) -> int:
-    return value if value < (1 << 31) else value - (1 << 32)
-
-
-def _hash_contexts(
+def hash_contexts(
     context_token_ids: torch.Tensor, context_lengths: torch.Tensor
 ) -> torch.Tensor:
     state = torch.zeros(

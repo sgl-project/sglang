@@ -14,7 +14,6 @@ from ..config import (
     parse_watermark_key,
 )
 from ..interface import SampleStep
-from .algorithm import _as_signed_int32
 from .detector import hash_context
 from .state import WatermarkState
 
@@ -22,6 +21,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_params import SamplingParams
+
+
+def _as_signed_int32(value: int) -> int:
+    return value if value < (1 << 31) else value - (1 << 32)
 
 
 class GumbelRows(msgspec.Struct, frozen=True):
@@ -189,7 +192,6 @@ def make_engine(
         context_window=features.watermark_context_window,
         max_contexts_per_req=max_contexts_per_req,
         vocab_size=vocab_size,
-        key=features.watermark_key,
         key_b=features.watermark_key_b,
         mixing_probability=features.watermark_mixing_probability,
         max_probability=features.watermark_max_probability,

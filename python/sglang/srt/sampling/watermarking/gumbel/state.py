@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from ..config import MAX_WATERMARKED_CONTEXTS_PER_REQUEST, parse_watermark_key
-from .algorithm import _hash_contexts, force_watermark_tokens
+from .algorithm import force_watermark_tokens, hash_contexts
 
 if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -18,17 +18,13 @@ class WatermarkState:
         max_num_reqs: int,
         context_window: int,
         max_contexts_per_req: int,
-        key: Optional[str],
         device: str,
         vocab_size: int = 0,
         key_b: Optional[str] = None,
         mixing_probability: float = 0.5,
         max_probability: float = 1.0,
     ) -> None:
-        default_key = parse_watermark_key(key) if key is not None else None
         self.default_key_b = parse_watermark_key(key_b) if key_b is not None else None
-        if self.default_key_b is not None and default_key is None:
-            raise ValueError("watermark key B requires key A")
         if not 0 < mixing_probability < 1:
             raise ValueError(
                 "watermark mixing probability must be strictly between 0 and 1"
@@ -364,7 +360,7 @@ class WatermarkState:
         keys: torch.Tensor,
         watermark_enabled: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        context_hashes = _hash_contexts(contexts, context_lengths)
+        context_hashes = hash_contexts(contexts, context_lengths)
         expanded_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
         keys = keys.repeat_interleave(draft_token_num)
         keys_b, mixing_thresholds = self._dual_key_rows(expanded_req_pool_indices)
@@ -641,7 +637,7 @@ class WatermarkState:
             contexts, context_lengths = self.contexts_tail(
                 req_pool_indices, context_windows
             )
-            context_hashes = _hash_contexts(contexts, context_lengths)
+            context_hashes = hash_contexts(contexts, context_lengths)
             eligible = self._new_context_mask(
                 req_pool_indices,
                 context_hashes,
