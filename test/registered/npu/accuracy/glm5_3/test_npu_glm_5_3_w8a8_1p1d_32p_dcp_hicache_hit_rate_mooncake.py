@@ -150,7 +150,7 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--hicache-io-backend",
     "kernel_ascend",
     "--hicache-ratio",
-    0.5,
+    1.2,
     # MLA on NPU maps this to page_first_kv_split, which the Mooncake L3
     # backend's get_page_buffer_meta supports (layer_first_kv_split does not).
     "--hicache-mem-layout",
