@@ -1,7 +1,7 @@
 ---
 title: "DeepSeek-V4.1-Flash"
 metatags:
-  description: "Deploy DeepSeek-V4.1-Flash on Huawei Ascend A3 and 950PR/DT Series NPUs with SGLang using a unified, non-PD service."
+  description: "Deploy DeepSeek-V4.1-Flash on Ascend A3 Series and 950PR/DT Series NPUs with SGLang using a unified, non-PD service."
 ---
 
 ## Introduction
@@ -101,8 +101,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then
   source /usr/local/memfabric_hybrid/set_env.sh
 fi
-
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+# DeepEP settings
 export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
@@ -137,6 +136,8 @@ MASTER_ADDR="${NODE_IPS[0]}"
 DIST_INIT_ADDR="${MASTER_ADDR}:${DIST_PORT}"
 export HCCL_SOCKET_IFNAME="$HCCL_IF"
 DSPARK_ARGS=()
+# Speculative decoding (DSPARK)
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
 if [[ "$ENABLE_DSPARK" == "1" ]]; then
   export SGLANG_ENABLE_SPEC_V2=1
