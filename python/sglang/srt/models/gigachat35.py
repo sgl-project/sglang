@@ -26,7 +26,6 @@ from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -115,23 +114,8 @@ def build_norm(
     config: GigaChat35Config, hidden_size: int, scale: float = 1.0
 ) -> nn.Module:
     """Construct the configured norm for a GigaChat 3.5 module."""
-    norm_type = getattr(config, "norm_type", "LlamaRMSNorm")
+    norm_type = config.norm_type
     eps = config.rms_norm_eps
-    if norm_type in ("LlamaRMSNorm", "ZeroCenteredRMSNorm"):
-        norm = (
-            RMSNorm(hidden_size, eps=eps)
-            if norm_type == "LlamaRMSNorm"
-            else GemmaRMSNorm(hidden_size, eps=eps)
-        )
-        if scale != 1.0:
-
-            def _scale_output(module, args, output):
-                if isinstance(output, tuple):
-                    return output[0] * scale, output[1]
-                return output * scale
-
-            norm.register_forward_hook(_scale_output)
-        return norm
     if norm_type in ("ZeroCenteredGatedNorm", "GatedNorm"):
         return GigaChat35GatedRMSNorm(
             hidden_size,
@@ -280,7 +264,6 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
             alt_stream=alt_stream,
         )
 
-        self._norm_type = getattr(config, "norm_type", "LlamaRMSNorm")
         use_scaling = bool(getattr(config, "use_mla_scaling_factor", False))
         q_hidden = hidden_size if q_lora_rank is None else q_lora_rank
         kv_hidden = kv_lora_rank
@@ -325,6 +308,19 @@ class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
         ]
         if method in [m for m in fused if m is not None]:
             return AF.MLA
+        if method in (
+            AF.MLA_ROCM,
+            AF.MHA_ROCM,
+            AF.MHA_ONE_SHOT_ROCM,
+            AF.MHA_CHUNKED_KV_ROCM,
+            AF.MHA_NPU,
+            AF.MLA_NPU,
+            AF.DSA_NPU,
+        ):
+            raise NotImplementedError(
+                f"GigaChat gated q/kv norms are not supported by {method.name}; "
+                "its fused kernels read norm weights directly."
+            )
         return method
 
     def forward(

@@ -89,6 +89,11 @@ class GigaChat35Config(PretrainedConfig):
         nextn_is_sparse: bool = False,
         **kwargs,
     ):
+        if norm_type not in ("GatedNorm", "ZeroCenteredGatedNorm"):
+            raise ValueError(
+                "GigaChat only supports GatedNorm and ZeroCenteredGatedNorm, "
+                f"got norm_type={norm_type!r}."
+            )
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
