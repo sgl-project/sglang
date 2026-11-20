@@ -74,11 +74,6 @@ def watermark_request_enabled(sampling_params: SamplingParams) -> bool:
 
 def check_watermark_algorithm_args(cfg: Any) -> None:
     """The configured algorithm's own server-argument checks."""
-    if cfg.watermark_algorithm not in _ADAPTERS:
-        raise ValueError(
-            f"unknown --watermark-algorithm {cfg.watermark_algorithm!r}; "
-            f"choose from {sorted(_ADAPTERS)}"
-        )
     _ADAPTERS[cfg.watermark_algorithm].check_server_args(cfg)
 
 

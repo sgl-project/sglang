@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.arg_groups.choices import (
     BUILT_IN_SAMPLING_BACKENDS,
     REMOVED_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
     removed_choice_message,
 )
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
@@ -36,7 +37,6 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
-from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,13 @@ def check_watermark_server_args(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is not None and not cfg.enable_watermark:
         raise ValueError("--watermark-config requires --enable-watermark")
+    # Checked even with watermarking off: every request resolves its watermark
+    # policy through the configured algorithm.
+    if cfg.watermark_algorithm not in WATERMARK_ALGORITHM_CHOICES:
+        raise ValueError(
+            f"unknown --watermark-algorithm {cfg.watermark_algorithm!r}; "
+            f"choose from {WATERMARK_ALGORITHM_CHOICES}"
+        )
 
     if not cfg.enable_watermark:
         return
@@ -82,6 +89,9 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    # lazy: the algorithm's adapter imports torch and its kernels.
+    from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
+
     check_watermark_algorithm_args(cfg)
 
 
