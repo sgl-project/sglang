@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.configs.dspine import normalize_dspine_config, validate_dspine_runtime
+from sglang.srt.configs.dspine import (
+    is_dspine_config,
+    normalize_dspine_config,
+    validate_dspine_runtime,
+)
 from sglang.srt.speculative.dspine_components import (
     DSpineCodeBridge,
     resolve_dspine_head_topk,
@@ -59,6 +63,23 @@ def make_bridge(dtype=torch.float32, **overrides):
 
 
 class TestDSpineConfig(unittest.TestCase):
+    def test_legacy_tencent_architecture_is_recognized(self):
+        source = vars(bridge_config()) | {"architectures": ["DFlashDraftModel"]}
+        self.assertTrue(is_dspine_config(source))
+        self.assertEqual(
+            normalize_dspine_config(source)["architectures"], ["DSpineDraftModel"]
+        )
+        del source["dflash_config"]["selected_prefix_last_write_refine"]
+        self.assertFalse(is_dspine_config(source))
+        source["code_bridge_second_pass"] = {
+            "mode": "serial_table",
+            "first_exact": 2,
+            "head_topk": 4,
+        }
+        self.assertTrue(is_dspine_config(source))
+        del source["dflash_config"]["selected_prefix_code_bridge"]
+        self.assertFalse(is_dspine_config(source))
+
     def test_native_config_is_not_mutated(self):
         source = vars(bridge_config()) | {"model_type": "qwen3"}
         before = copy.deepcopy(source)
@@ -304,6 +325,7 @@ class TestDSpineNumerics(unittest.TestCase):
             query,
             anchors,
             sender_weight=torch.cat((kwargs["pred_gate"], kwargs["prev"])),
+            normed_write=kwargs["norm"][:, None] * kwargs["write"],
             **kwargs,
         )
         torch.testing.assert_close(packed, actual, atol=1e-5, rtol=1e-5)
@@ -334,6 +356,13 @@ class TestDSpineNumerics(unittest.TestCase):
         torch.testing.assert_close(
             actual[:, 0], actual[:, 0, :1].expand(-1, 4, -1), atol=0, rtol=0
         )
+
+    def test_bridge_rejects_weight_that_overflows_bfloat16(self):
+        bridge = DSpineCodeBridge(bridge_config(), params_dtype=torch.bfloat16)
+        weight = torch.full(bridge.prev.weight.shape, torch.finfo(torch.float32).max)
+        self.assertTrue(torch.isfinite(weight).all())
+        with self.assertRaisesRegex(ValueError, "Non-finite.*prev.weight"):
+            bridge.load_weight("prev.weight", weight)
 
     def test_checkpoint_validation_and_reload(self):
         bridge = DSpineCodeBridge(bridge_config(), params_dtype=torch.float32)

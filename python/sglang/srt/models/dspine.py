@@ -84,11 +84,13 @@ class DSpineSelector(CandidateSelector):
             norm_eps=model.norm.variance_epsilon,
             write_gram=model.write_gram_f32,
             sender_weight=model.sender_weight_f32,
+            normed_write=model.normed_write_f32,
         )
 
 
 class DSpineDraftModel(DFlashDraftModel):
     decoder_layer_cls = DSpineDecoderLayer
+    requires_draft_sampler_for_graph = True
 
     def __init__(self, config, quant_config=None, prefix=""):
         if quant_config is not None:
@@ -131,8 +133,19 @@ class DSpineDraftModel(DFlashDraftModel):
     @torch.no_grad()
     def prepare_refinement(self, lm_head):
         weight = getattr(lm_head, "weight", None)
-        shape = (int(self.config.vocab_size), int(self.config.hidden_size))
-        if weight is None or tuple(weight.shape) != shape or weight.stride(1) != 1:
+        vocab_size = int(self.config.vocab_size)
+        hidden_size = int(self.config.hidden_size)
+        logical_vocab_size = getattr(lm_head, "org_vocab_size", None)
+        if logical_vocab_size is None and weight is not None and weight.ndim == 2:
+            logical_vocab_size = weight.shape[0]
+        if (
+            weight is None
+            or weight.ndim != 2
+            or weight.shape[1] != hidden_size
+            or weight.shape[0] < vocab_size
+            or logical_vocab_size != vocab_size
+            or weight.stride(1) != 1
+        ):
             raise ValueError(
                 "DSPINE requires a complete row-contiguous target output head"
             )
@@ -160,6 +173,8 @@ class DSpineDraftModel(DFlashDraftModel):
             return
         self.lm_head = lm_head
         bridge = self.selected_prefix_bridge
+        write = bridge.feature_write_weights[-1].float()
+        norm = self.norm.weight.float()
         for name, tensor in (
             ("pred_gate_f32", bridge.predecessor_gate.weight),
             ("prev_f32", bridge.prev.weight),
@@ -168,13 +183,10 @@ class DSpineDraftModel(DFlashDraftModel):
                 torch.cat((bridge.predecessor_gate.weight, bridge.prev.weight)).float(),
             ),
             ("gate_bias_f32", bridge.gate.bias),
-            ("write_f32", bridge.feature_write_weights[-1]),
-            ("norm_f32", self.norm.weight),
-            (
-                "write_gram_f32",
-                bridge.feature_write_weights[-1].float().T
-                @ bridge.feature_write_weights[-1].float(),
-            ),
+            ("write_f32", write),
+            ("norm_f32", norm),
+            ("normed_write_f32", norm[:, None] * write),
+            ("write_gram_f32", write.T @ write),
         ):
             value = tensor.detach().float().contiguous()
             existing = getattr(self, name, None)
@@ -242,6 +254,39 @@ class DSpineDraftModel(DFlashDraftModel):
                     self.last_write_stash = (raw, rms, packed[:, : bridge.rank])
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
 
+    def _load_speculators_bridge(self, weights):
+        bridge = self.selected_prefix_bridge
+        aliases = {
+            "injection.receiver_gate.weight": "gate.weight",
+            "injection.predecessor_gate.weight": "predecessor_gate.weight",
+            "injection.message.weight": "prev.weight",
+            "injection.gate_bias": "gate.bias",
+        }
+        for source, dest in aliases.items():
+            if source in weights:
+                bridge.load_weight(dest, weights.pop(source))
+        for prefix, dest in (
+            ("injection.readouts", "early_read_weights"),
+            ("injection.writes", "feature_write_weights"),
+        ):
+            names = [f"{prefix}.{index}.weight" for index in range(bridge.num_layers)]
+            if missing := [name for name in names if name not in weights]:
+                raise ValueError(f"Missing DSPINE Speculators weights: {missing}")
+            layers = [weights.pop(name) for name in names]
+            if dest == "early_read_weights":
+                bridge.load_weight("read_weight", layers.pop())
+            bridge.load_weight(
+                dest, torch.stack(layers) if layers else bridge.early_read_weights
+            )
+        if weights:
+            raise ValueError(
+                f"Unexpected DSPINE Speculators weights: {sorted(weights)}"
+            )
+        # The per-layer export has no terminal projection or version tensors.
+        bridge.load_weight("out.weight", torch.zeros_like(bridge.out.weight))
+        for name in ("independent_write_version", "terminal_disabled_version"):
+            bridge.load_weight(name, torch.ones_like(getattr(bridge, name)))
+
     def load_weights(self, weights):
         self._refinement_ready = False
         bridge = self.selected_prefix_bridge
@@ -250,6 +295,9 @@ class DSpineDraftModel(DFlashDraftModel):
         self._invalidate_backbone()
 
         def backbone_weights():
+            speculators_weights = {}
+            native_bridge = False
+            transfer_codebook = None
             for name, tensor in weights:
                 short = name.removeprefix("model.")
                 if short.startswith("lm_head."):
@@ -257,9 +305,18 @@ class DSpineDraftModel(DFlashDraftModel):
                         "DSPINE checkpoints must not contain a target lm_head"
                     )
                 if short.startswith("selected_prefix_bridge."):
+                    native_bridge = True
                     bridge.load_weight(
                         short.removeprefix("selected_prefix_bridge."), tensor
                     )
+                elif short.startswith("injection."):
+                    if short in speculators_weights:
+                        raise ValueError(f"Duplicate DSPINE weight: {short}")
+                    speculators_weights[short] = tensor
+                elif short in ("transfer_embeddings", "transfer_codebook"):
+                    if transfer_codebook is not None:
+                        raise ValueError("Duplicate DSPINE codebook")
+                    transfer_codebook = tensor
                 elif short in (
                     "draft_block_causal_version",
                     "last_write_refine_version",
@@ -270,6 +327,14 @@ class DSpineDraftModel(DFlashDraftModel):
                         )
                 else:
                     yield name, tensor
+            if native_bridge and (transfer_codebook is not None or speculators_weights):
+                raise ValueError(
+                    "DSPINE cannot mix native and Speculators bridge weights"
+                )
+            if transfer_codebook is not None:
+                bridge.load_weight("codebook", transfer_codebook)
+            if speculators_weights:
+                self._load_speculators_bridge(speculators_weights)
 
         super().load_weights(backbone_weights())
 

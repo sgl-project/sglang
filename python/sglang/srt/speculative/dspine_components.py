@@ -200,14 +200,21 @@ class DSpineCodeBridge(nn.Module):
         dest = destinations[name]
         if name.endswith("_version") and (tensor.numel() != 1 or tensor.item() != 1):
             raise ValueError(f"Unsupported DSPINE {name}")
-        if tensor.is_floating_point() and not torch.isfinite(tensor).all().item():
-            raise ValueError(f"Non-finite DSPINE code-bridge weight: {name}")
         if tuple(dest.shape) != tuple(tensor.shape):
             raise ValueError(
                 f"DSPINE code-bridge shape mismatch: {name}: "
                 f"{tuple(tensor.shape)} vs {tuple(dest.shape)}"
             )
-        dest.data.copy_(tensor)
+        if dest.is_floating_point():
+            if not tensor.is_floating_point():
+                raise ValueError(
+                    f"DSPINE code-bridge weight must be floating point: {name}"
+                )
+            # Check the values that will actually be used by the bridge.
+            tensor = tensor.to(dtype=dest.dtype)
+            if not torch.isfinite(tensor).all().item():
+                raise ValueError(f"Non-finite DSPINE code-bridge weight: {name}")
+        dest.copy_(tensor)
         self._loaded.add(name)
 
     @torch.no_grad()
@@ -451,6 +458,7 @@ def score_dspine_transitions(
     norm_eps: float,
     write_gram: torch.Tensor | None = None,
     sender_weight: torch.Tensor | None = None,
+    normed_write: torch.Tensor | None = None,
     normalize: bool = True,
 ) -> torch.Tensor:
     """fp32 [B, T-1, K, K] transition logits of the redone last write.
@@ -486,9 +494,12 @@ def score_dspine_transitions(
     scale = rms.float()
     # R-space algebra: keep the [B, S, K, H] refined states implicit.
     lm_c = lm_head_weight[candidate_ids].float()  # [B, S, K, H]
-    nw = norm
-    base = torch.einsum("bsh,bsch->bsc", x * nw, lm_c)
-    tg_c = torch.matmul(lm_c * nw, write)  # [B, S, K, R]
+    base = torch.einsum("bsh,bsch->bsc", x * norm, lm_c)
+    if normed_write is None:
+        normed_write = norm[:, None] * write
+    # Fold the norm into the small write matrix rather than scaling each
+    # gathered candidate head row on every decode step.
+    tg_c = torch.matmul(lm_c, normed_write)  # [B, S, K, R]
     trans = torch.einsum("bsjr,bscr->bsjc", msg, tg_c)
     logits = base[:, :, None, :] + scale[:, :, None, None] * trans
     if normalize:

@@ -25,6 +25,7 @@ from sglang.srt.configs.deepseek_v41 import (
     DeepseekV41Config,
     normalize_deepseek_v41_config,
 )
+from sglang.srt.configs.dspine import is_dspine_config, normalize_dspine_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -227,12 +228,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         config_dict, _ = PretrainedConfig.get_config_dict(
             model, revision=revision, **kwargs
         )
-        if config_dict.get(
-            "speculators_model_type"
-        ) == "dspine" or "DSpineDraftModel" in (config_dict.get("architectures") or []):
+        if is_dspine_config(config_dict):
             from transformers import Qwen3Config
-
-            from sglang.srt.configs.dspine import normalize_dspine_config
 
             config = Qwen3Config(**normalize_dspine_config(config_dict))
             config._name_or_path = str(model)

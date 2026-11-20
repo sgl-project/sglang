@@ -1253,7 +1253,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
-                if is_cuda() and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get():
+                elif getattr(
+                    self.draft_model, "requires_draft_sampler_for_graph", False
+                ):
+                    # DSpine publishes refinement tensors during forward. A replay
+                    # cannot refresh that Python state for an out-of-graph sampler.
+                    capture_decode_cuda_graph = False
+                    logger.info(
+                        "DFLASH draft runs eager because its sampler must be captured."
+                    )
+                if (
+                    capture_decode_cuda_graph
+                    and is_cuda()
+                    and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get()
+                ):
                     self._install_draft_l2_prefetch()
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph

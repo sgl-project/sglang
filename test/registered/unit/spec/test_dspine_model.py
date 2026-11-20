@@ -117,14 +117,17 @@ class TestDSpineModel(unittest.TestCase):
             "prev_f32",
             "write_f32",
             "norm_f32",
+            "normed_write_f32",
             "write_gram_f32",
             "sender_weight_f32",
         )
         pointers = {name: getattr(model, name).data_ptr() for name in names}
         previous = model.write_gram_f32.clone()
+        previous_normed = model.normed_write_f32.clone()
         model.selected_prefix_bridge.feature_write_weights.data.add_(0.1)
         model.post_load_weights()
         self.assertFalse(torch.equal(previous, model.write_gram_f32))
+        self.assertFalse(torch.equal(previous_normed, model.normed_write_f32))
         self.assertEqual(
             pointers, {name: getattr(model, name).data_ptr() for name in names}
         )
@@ -211,6 +214,61 @@ class TestDSpineModel(unittest.TestCase):
             model.sender_weight_f32,
             torch.cat((bridge.predecessor_gate.weight, bridge.prev.weight)),
         )
+
+    def test_speculators_per_layer_weights_load_into_native_bridge(self):
+        model = draft()
+        model.projector_type = None
+        bridge = model.selected_prefix_bridge
+        native = {name: tensor.clone() for name, tensor in bridge.state_dict().items()}
+        weights = {
+            name: tensor.clone()
+            for name, tensor in model.state_dict().items()
+            if not name.startswith(("lm_head.", "selected_prefix_bridge."))
+        }
+        weights.update(
+            {
+                "transfer_embeddings": native["codebook"],
+                "injection.receiver_gate.weight": native["gate.weight"],
+                "injection.predecessor_gate.weight": native["predecessor_gate.weight"],
+                "injection.message.weight": native["prev.weight"],
+                "injection.gate_bias": native["gate.bias"],
+                **{
+                    f"injection.readouts.{i}.weight": bridge.layer_read_weight(
+                        i
+                    ).clone()
+                    for i in range(bridge.num_layers)
+                },
+                **{
+                    f"injection.writes.{i}.weight": weight
+                    for i, weight in enumerate(native["feature_write_weights"])
+                },
+            }
+        )
+        model.load_weights(
+            (f"model.{name}", tensor) for name, tensor in weights.items()
+        )
+        for name, tensor in bridge.state_dict().items():
+            torch.testing.assert_close(tensor, native[name], atol=0, rtol=0)
+        del weights["injection.readouts.1.weight"]
+        with self.assertRaisesRegex(ValueError, "Missing DSPINE Speculators weights"):
+            model.load_weights(weights.items())
+
+    def test_padded_head_must_cover_exact_logical_vocabulary(self):
+        model = draft()
+        padded_head = nn.Linear(8, 16, bias=False)
+        padded_head.org_vocab_size = 13
+        model.prepare_refinement(padded_head)
+        self.assertIs(model.lm_head, padded_head)
+
+        for logical_vocab in (12, 16):
+            padded_head.org_vocab_size = logical_vocab
+            with (
+                self.subTest(logical_vocab=logical_vocab),
+                self.assertRaisesRegex(
+                    ValueError, "complete row-contiguous target output head"
+                ),
+            ):
+                model.prepare_refinement(padded_head)
 
     def test_partial_blocks_are_rejected(self):
         model = draft()

@@ -81,6 +81,8 @@ class TestDSpineFusedBridge(unittest.TestCase):
             lm_head_weight=head,
             norm_eps=norm.variance_epsilon,
             sender_weight=sender_weight,
+            normed_write=norm.weight.float()[:, None]
+            * bridge.feature_write_weights[-1].float(),
         )
 
         def scores():

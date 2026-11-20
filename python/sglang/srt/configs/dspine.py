@@ -5,6 +5,30 @@
 from copy import deepcopy
 
 
+def is_dspine_config(source: dict) -> bool:
+    architectures = source.get("architectures") or ()
+    if source.get("speculators_model_type") == "dspine" or "DSpineDraftModel" in (
+        architectures
+    ):
+        return True
+    # Early Tencent exports used the DFlash architecture name.
+    cfg = source.get("dflash_config")
+    if "DFlashDraftModel" not in architectures or not isinstance(cfg, dict):
+        return False
+    refine = cfg.get("selected_prefix_last_write_refine")
+    second_pass = source.get("code_bridge_second_pass")
+    return (
+        cfg.get("draft_block_causal") is True
+        and bool(cfg.get("selected_prefix_code_bridge"))
+        and (
+            isinstance(refine, dict)
+            and refine.get("kind") == "exact_sender"
+            or isinstance(second_pass, dict)
+            and second_pass.get("mode") == "serial_table"
+        )
+    )
+
+
 def normalize_dspine_config(source: dict) -> dict:
     if source.get("quantization_config"):
         raise ValueError("DSPINE quantized draft exports are not supported")

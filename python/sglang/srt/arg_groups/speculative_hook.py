@@ -160,6 +160,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         )
 
     kwargs = {}
+    if cfg.speculative_algorithm == "DSPINE":
+        kwargs["revision"] = cfg.speculative_draft_model_revision
 
     override_config_file = cfg.decrypted_draft_config_file
     if override_config_file and override_config_file.strip():
