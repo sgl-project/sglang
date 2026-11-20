@@ -582,6 +582,13 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class TokenIdRows:
+    """A batch ``token_ids_logprobs`` entry with its own ids for each scored row."""
+
+    rows: List[List[int]]
+
+
 @dataclasses.dataclass
 class MultimodalInputs:
     """The multimodal data related inputs."""

@@ -5,7 +5,7 @@ import dataclasses
 import logging
 from contextlib import nullcontext
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -13,6 +13,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.runner_utils.pool import (
     borrow_graph_pool,
     graph_pool_borrow_largest_run,
@@ -298,9 +299,44 @@ def get_top_logprobs_chunk(
     return next_split_pruned_len
 
 
+@dataclasses.dataclass(slots=True)
+class _RaggedRows:
+    """Rows of differing length, stored as their concatenation and each row's size."""
+
+    values: torch.Tensor
+    lengths: List[int]
+
+    def tolist(self) -> List[List[float]]:
+        return [row.tolist() for row in self.values.split(self.lengths)]
+
+
+def _gather_token_id_rows(
+    logprobs: torch.Tensor,
+    first_row: int,
+    token_id_rows: List[List[int]],
+    log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    copy_to_pinned_cpu: bool,
+) -> _RaggedRows:
+    """Gather each row's own token ids from ``logprobs`` with one host copy."""
+    device = logprobs.device
+    index = torch.tensor(
+        [(first_row + r, t) for r, row in enumerate(token_id_rows) for t in row],
+        dtype=torch.long,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
+    rows, columns = index.reshape(-1, 2).unbind(1)
+    values = logprobs[rows, columns]
+    if log_normalizer is not None:
+        row_max, row_log_sum = log_normalizer
+        values = (values.float() - row_max[rows]) - row_log_sum[rows]
+    if copy_to_pinned_cpu:
+        values = async_d2h(values)
+    return _RaggedRows(values, [len(row) for row in token_id_rows])
+
+
 def get_token_ids_logprobs_chunk(
     logprobs: torch.Tensor,
-    token_ids_logprobs: List[int],
+    token_ids_logprobs: List[Optional[Union[List[int], TokenIdRows]]],
     pruned_lens: List[int],
     token_ids_logprobs_val: List,
     token_ids_logprobs_idx: List,
@@ -314,7 +350,8 @@ def get_token_ids_logprobs_chunk(
         logprobs: Log probabilities tensor of shape [seq_len, vocab_size].
             With ``log_normalizer`` set, raw logits instead; gathered rows are
             normalized by subtraction.
-        token_ids_logprobs: List of token IDs for each sequence
+        token_ids_logprobs: For each sequence, the token IDs to report at every
+            row, or a TokenIdRows giving each of its rows its own
         pruned_lens: List of pruned lengths for each sequence
         token_ids_logprobs_val: List to store token logprob values
         token_ids_logprobs_idx: List to store token indices
@@ -358,7 +395,18 @@ def get_token_ids_logprobs_chunk(
         # Get the token ids logprobs
         val = []
         idx = []
-        if token_ids is not None and available_len > 0:
+        if isinstance(token_ids, TokenIdRows):
+            wanted = token_ids.rows[split_pruned_len : split_pruned_len + available_len]
+            if wanted:
+                span = _gather_token_id_rows(
+                    logprobs, pt, wanted, log_normalizer, copy_to_pinned_cpu
+                )
+                if copy_to_pinned_cpu:
+                    val.append(span)
+                else:
+                    val.extend(span.tolist())
+                idx.extend(wanted)
+        elif token_ids is not None and available_len > 0:
             rows = logprobs[pt : pt + available_len, token_ids]
             if log_normalizer is not None:
                 rows = (
@@ -818,6 +866,13 @@ class InputLogprobProcessor:
         )
 
 
+def _next_token_ids(token_ids_logprobs: List) -> List[Optional[List[int]]]:
+    return [
+        None if isinstance(token_ids, TokenIdRows) else token_ids
+        for token_ids in token_ids_logprobs
+    ]
+
+
 class OutputLogprobProcessor:
     """Output (decode) logprob processing: logprobs -> topk / token-ids /
     sampled-token gather, returned as a LogprobResult for the caller to
@@ -849,7 +904,7 @@ class OutputLogprobProcessor:
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+                logprobs, _next_token_ids(token_ids_logprobs), no_copy_to_cpu=True
             )
 
         result.token_logprobs = logprobs[
@@ -876,6 +931,7 @@ class OutputLogprobProcessor:
             logger.warning("No logits available for logprob computation")
             return None
 
+        token_ids_logprobs = _next_token_ids(token_ids_logprobs)
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0
