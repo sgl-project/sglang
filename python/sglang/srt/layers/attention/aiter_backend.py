@@ -219,10 +219,8 @@ _MLA_ASM_PS_MAX_QLEN = 4
 # SGLANG_AITER_MLA_DECODE_BACKEND value that runs decode and target verify on
 # aiter's persistent fp8-query ASM MLA kernel where _fp8_q_asm_mla_skip_reason allows.
 _MLA_FP8_Q_ASM_DECODE_BACKEND = "asm_fp8q"
-# Windows the fp8-query ASM kernel runs correctly at 16 padded heads. 2-4 return
-# wrong output (ROCm/aiter#7007). 5-8 fold onto aiter's 128-row qlen-4 kernel,
-# which on MI355X beats Gluon only from about 128K tokens of context; that
-# crossover is why the route is an explicit backend choice, not a default.
+# Windows the fp8-query ASM kernel runs correctly at 16 padded heads; 2-4 return
+# wrong output (ROCm/aiter#7007), 5-8 fold onto aiter's 128-row qlen-4 kernel.
 _MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
 
 
