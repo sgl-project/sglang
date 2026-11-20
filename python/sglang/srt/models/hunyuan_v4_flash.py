@@ -75,6 +75,10 @@ from sglang.srt.utils import BumpAllocator
 logger = logging.getLogger(__name__)
 
 INDEX_DIM = 128
+_DIRECT_WEIGHT_UPDATE_ERROR = (
+    "load_format='direct' does not refresh the Hy4-Flash fused IndexPool and "
+    "Engram weights; update weights with the default load format."
+)
 
 
 def _maybe_all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -254,6 +258,7 @@ class FlashIndexPool(nn.Module):
         self._raw_keys: Optional[torch.Tensor] = None
         self._weights_t = None
         self._key_head_weight = None
+        self._direct_weight_update_error = _DIRECT_WEIGHT_UPDATE_ERROR
 
     @staticmethod
     def _copy_loader(param, loaded_weight):
@@ -715,6 +720,7 @@ class FlashEngram(nn.Module):
             projection.weight.weight_loader = self._load_projection
             projection.bias.weight_loader = self._load_bias
         self._fused_kv = None
+        self._direct_weight_update_error = _DIRECT_WEIGHT_UPDATE_ERROR
 
     def refresh_derived_weights(self):
         if self._fused_kv is not None:

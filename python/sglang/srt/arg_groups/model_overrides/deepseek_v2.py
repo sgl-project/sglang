@@ -47,8 +47,11 @@ def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
     unsupported = {
         "speculative decoding": cfg.speculative_algorithm is not None,
         "DP attention": attn_dp_enabled_of(cfg),
-        "--moe-a2a-backend": cfg.moe_a2a_backend != "none",
+        "--moe-a2a-backend": cfg.moe_a2a_backend != "none" or cfg.enable_waterfill,
         "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--enable-hisparse": cfg.enable_hisparse,
+        "two-batch overlap": cfg.enable_two_batch_overlap,
+        "single-batch overlap": cfg.enable_single_batch_overlap,
         "PD disaggregation": cfg.disaggregation_mode != "null",
     }
     names = [name for name, enabled in unsupported.items() if enabled]
