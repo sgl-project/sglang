@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import kpool_decode_row_shard
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     build_kpool_topk_v2_plan,
@@ -712,9 +713,11 @@ def init_pooled_paged_mqa_metadata(
         )
 
     pool_seqlens = torch.div(seqlens_32, kpool, rounding_mode="floor").to(torch.int32)
+    shard = kpool_decode_row_shard(pool_seqlens.shape[0])
+    plan_lens = pool_seqlens if shard is None else pool_seqlens[shard[1]]
     schedule = (
         _compute_pool_schedule_metadata(
-            pool_seqlens,
+            plan_lens,
             index_page_size=index_page_size,
         )
         if build_schedule_metadata
@@ -726,7 +729,7 @@ def init_pooled_paged_mqa_metadata(
         pooled_cache_seqlens_int32=pool_seqlens,
         pooled_real_page_table=pooled_page_table,
         pooled_paged_mqa_schedule_metadata=schedule,
-        pooled_topk_v2_plan=build_kpool_topk_v2_plan(pool_seqlens),
+        pooled_topk_v2_plan=build_kpool_topk_v2_plan(plan_lens),
     )
 
 
@@ -771,12 +774,16 @@ def update_pooled_paged_mqa_metadata(
         : pooled_page_table.shape[0], : pooled_page_table.shape[1]
     ].copy_(pooled_page_table)
 
+    plan_lens = metadata.pooled_cache_seqlens_int32
+    shard = kpool_decode_row_shard(plan_lens.shape[0])
+    if shard is not None:
+        plan_lens = plan_lens[shard[1]]
     if (
         build_schedule_metadata
         and metadata.pooled_paged_mqa_schedule_metadata is not None
     ):
         new_schedule = _compute_pool_schedule_metadata(
-            metadata.pooled_cache_seqlens_int32,
+            plan_lens,
             index_page_size=index_page_size,
         )
         if new_schedule is not None:
@@ -785,7 +792,7 @@ def update_pooled_paged_mqa_metadata(
     if metadata.pooled_topk_v2_plan is not None:
         refresh_kpool_topk_v2_plan(
             plan=metadata.pooled_topk_v2_plan,
-            pool_lens=metadata.pooled_cache_seqlens_int32,
+            pool_lens=plan_lens,
         )
 
 

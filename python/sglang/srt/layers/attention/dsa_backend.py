@@ -2897,7 +2897,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if _is_hip and self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
+            if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
                 assert topk_transform_method == TopkTransformMethod.PAGED
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
@@ -3278,9 +3278,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            # CUDA keeps upstream's dispatch: #43735 wires DCP to the trtllm
-            # backends, and this localized path has only been run on ROCm.
-            if _is_hip and self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
+            if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
                     q_rope=q_rope,
