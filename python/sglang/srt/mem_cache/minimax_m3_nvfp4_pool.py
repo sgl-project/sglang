@@ -757,6 +757,8 @@ class MiniMaxM3Nvfp4KVPool(MiniMaxSparseKVPool):
         return list(range(self.main_pool.start_layer, self.main_pool.end_layer))
 
     def get_index_k_state_buf_infos(self):
+        if self.index_k_pool is None:  # a PP stage without sparse layers
+            return [], [], []
         return self.index_k_pool.get_contiguous_buf_infos()
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
