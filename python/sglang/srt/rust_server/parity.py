@@ -42,6 +42,9 @@ PYTHON_FRONTEND_SOURCES: Tuple[Path, ...] = (
     *sorted((_SRT / "entrypoints/openai").glob("serving_*.py")),
     _SRT / "observability/request_logger.py",
     _SRT / "multimodal/processors/base_processor.py",
+    _SRT / "multimodal/multimodal_processor_mixin.py",
+    _SRT / "multimodal/serving_preprocessing.py",
+    _SRT / "multimodal/transport/feature_transport.py",
     _SRT / "function_call/function_call_parser.py",
 )
 
