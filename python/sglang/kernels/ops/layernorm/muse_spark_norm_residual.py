@@ -330,6 +330,11 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
                         alpha = torch.tensor(alpha, device=device)
             cc_alpha = alpha.reshape(-1).float().contiguous()
             cc_beta = beta.reshape(-1).float().contiguous()
+            if cc_alpha.numel() == 1 and cc_beta.numel() > 1:
+                # use_stream_gate=False returns a scalar alpha and a channel-wise
+                # beta. The kernel reads alpha in beta's mode, and the JIT
+                # launcher requires matching shapes, so expand the scalar.
+                cc_alpha = cc_alpha.expand_as(cc_beta).contiguous()
         else:
             cc_alpha = torch.empty(0, dtype=torch.float32, device=device)
             cc_beta = torch.empty(0, dtype=torch.float32, device=device)
