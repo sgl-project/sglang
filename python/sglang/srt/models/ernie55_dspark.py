@@ -30,7 +30,6 @@ from torch import nn
 
 from sglang.kernels.ops.activation.multimax import multimax
 from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
@@ -85,14 +84,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
             prefix=prefix,
             alt_streams=alt_streams,
         )
-        # compress_ratio 0 selected the main rope, but the stages were trained on
-        # the compressed YaRN rope of the HCA layers.
-        self.rope_base = config.compress_rope_theta
-        self.rope_kwargs.update(
-            base=self.rope_base,
-            original_seq_len=self.rope_scaling["original_max_position_embeddings"],
-        )
-        self.freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
+        # The stages keep the base's plain rope (rope_theta, no YaRN), as they are
+        # trained; not the HCA layers' compressed YaRN rope.
         self._init_gated_wq_b(quant_config, prefix)
         self.postmix = VhaPostMix(self.n_local_heads, self.n_heads)
 
