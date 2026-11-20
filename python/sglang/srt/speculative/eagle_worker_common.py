@@ -271,6 +271,17 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 
 
+def check_draft_branch_tail_copy(token_to_kv_pool, topk: int, page_size: int) -> None:
+    # duplicate_prefix_tail_to_draft_branches addresses slots raw, but DCP-collapsed
+    # rows live at loc // dcp_size: the tail page would land in rows the draft never reads.
+    if topk > 1 and page_size > 1 and token_to_kv_pool.rows_are_dcp_collapsed:
+        raise ValueError(
+            "--speculative-eagle-topk > 1 with --page-size > 1 does not support "
+            "a draft KV pool with DCP-collapsed rows; run with "
+            "--speculative-eagle-topk 1."
+        )
+
+
 def duplicate_prefix_tail_to_draft_branches(
     token_to_kv_pool,
     rows: torch.Tensor,
@@ -439,7 +450,7 @@ def prepare_for_draft_extend(
         # (the `_batch_size == batch_size` assertion, see #27091); the
         # marked pre-pad metadata is used as-is, matching the proven
         # skip_attn_backend_init=True behavior.
-        # On NPU with --disable-cuda-graph, block_table shape won't match
+        # On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
         if not is_npu() or can_run_decode_cuda_graph:
@@ -853,7 +864,7 @@ def run_eagle_verify(
         # skipped here unconditionally, although eagle_prepare_for_verify
         # only plans when cuda-graph load_batch ran. Single-layer eagle
         # re-inits the non-graph path instead (post-pad); multi-layer has
-        # not adopted that fix. On NPU with --disable-cuda-graph, non-graph
+        # not adopted that fix. On NPU with --disable-decode-cuda-graph --disable-prefill-cuda-graph, non-graph
         # verify needs metadata init in forward_extend (post-pad); only
         # mark ready for the cuda-graph path.
         if not _is_npu or can_run_cuda_graph:

@@ -172,6 +172,7 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
+            self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -230,6 +231,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("distributed"):
+            self.scheduler.wait_for_launched_forward()
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -281,6 +283,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("tensor"):
+            self.scheduler.wait_for_launched_forward()
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
@@ -308,6 +311,7 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
+            self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -371,6 +375,7 @@ class SchedulerWeightUpdaterManager:
             )
             if error is not None:
                 return BeginWeightUpdateReqOutput(success=False, message=error)
+        self.scheduler.wait_for_launched_forward()
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
@@ -385,6 +390,7 @@ class SchedulerWeightUpdaterManager:
                 message="no weight-update session is open; call begin_weight_update() first",
             )
         run_post_load = not self._session.loaded_weights
+        self.scheduler.wait_for_launched_forward()
         for _, runner in self._select_runners(self._session.selector):
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session = None
@@ -419,6 +425,7 @@ class SchedulerWeightUpdaterManager:
             state=self._plugin_state,
         )
         with self._observe_weight_load("plugin"):
+            self.scheduler.wait_for_launched_forward()
             try:
                 weights = handler(context=context, payload=recv_req.payload)
                 error = None
@@ -600,6 +607,8 @@ class SchedulerWeightUpdaterManager:
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self, params):
+        if _is_later_dp_replica():
+            return
         url = params["url"]
 
         self.tp_worker.model_runner.weight_exporter.save_remote_model(url)
@@ -612,11 +621,25 @@ class SchedulerWeightUpdaterManager:
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
+        if _is_later_dp_replica():
+            return
         self.tp_worker.model_runner.weight_exporter.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+
+def _is_later_dp_replica() -> bool:
+    """A plain-DP replica after the first. Every replica holds the same weights
+    under the same TP ranks, so only the first saves them; the others would
+    write the same files."""
+    parallel = get_parallel()
+    return (
+        parallel.num_dp_ranks > 1
+        and not parallel.attn_dp_enabled
+        and bool(parallel.dp_rank)
+    )
 
 
 def _export_static_state(model):

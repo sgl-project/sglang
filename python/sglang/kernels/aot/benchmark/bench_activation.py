@@ -2,16 +2,13 @@
 # (kernel, dtype, batch_size, seq_len, dim) and prints speed-up.
 import argparse
 import itertools
-import os
 import re
 from typing import List, Tuple
 
 import sgl_kernel
 import torch
-import torch.nn.functional as F
 import triton
 import triton.testing
-from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from sglang.srt.environ import envs
 

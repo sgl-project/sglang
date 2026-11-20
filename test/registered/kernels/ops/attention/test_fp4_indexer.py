@@ -12,8 +12,13 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    select_candidate_block_ids,
+    select_candidate_block_ids_triton,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    finish_prefill_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -30,6 +35,44 @@ from sglang.test.kernels.deepseek_v4.common import (
 )
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper prefill selection",
+)
+@pytest.mark.parametrize("width,topk", [(21, 32), (1021, 16), (32781, 2048)])
+def test_fused_prefill_candidate_selection(width, topk):
+    # Distinct maxima make the selected set unambiguous.
+    logits = torch.randperm(width, device="cuda").float().repeat(3, 1)
+    lens = torch.tensor([0, width // 2, width], device="cuda")[:, None]
+    logits.masked_fill_(torch.arange(width, device="cuda")[None, :] >= lens, -torch.inf)
+    expected = select_candidate_block_ids(logits, lens, topk, 8)
+    actual = select_candidate_block_ids_triton(logits, lens, topk, 8)
+    torch.testing.assert_close(actual.sort().values, expected.sort().values)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper prefill selection",
+)
+def test_fused_prefill_writeback():
+    idx = torch.tensor([[6, -1, 2], [4, 1, 0]], device="cuda")
+    slots = torch.arange(50, 57, device="cuda")
+    tokens = torch.tensor([3, 1], device="cuda")
+    lens = torch.tensor([5, 3], device="cuda")
+    raw = torch.full((4, 3), -1, device="cuda", dtype=torch.int32)
+    pages = raw.clone()
+    finish_prefill_indexer_topk(idx, slots, tokens, lens, raw, pages, 7)
+    torch.testing.assert_close(
+        raw, raw.new_tensor([[-1, -1, -1], [0, 1, -1], [-1, -1, -1], [2, -1, -1]])
+    )
+    torch.testing.assert_close(
+        pages,
+        pages.new_tensor([[-1, -1, -1], [50, 51, -1], [-1, -1, -1], [52, -1, -1]]),
+    )
+
+
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _is_xpu = is_xpu()
@@ -484,6 +527,31 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="requires Hopper CUDA",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_verify_reuses_key_tiles_under_replay(ratio):
+    batch, group, width = 12, 6, 261
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.zeros((2, width * ratio), device=q.device, dtype=torch.int32)
+    req_table[:, ::ratio] = (slots[::group] * ratio).to(torch.int32)
+    args = (q, weights, req, req_table, lens, table, PAGE_SIZE, width, ratio)
+    fp4_index_logits_paged(*args, rows_per_request=group)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_paged(*args, rows_per_request=group)
+    for offset in (0, 65, width):
+        lens.copy_((offset - torch.arange(batch, device=q.device) % group).clamp_min(0))
+        graph.replay()
+        expected = fp4_index_logits_paged(*args)
+        visible = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(actual[visible], expected[visible], atol=0, rtol=0)
+
+
 @pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("ratio,masked", [(1, False), (2, True)])
@@ -586,12 +654,16 @@ def test_hopper_indexer_backends_replay(ratio):
         paged_metadata=metadata,
         is_verify=True,
     )
-    kwargs = dict(
-        token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
+    kwargs = dict(token_to_kv_pool=pool, req_to_token=req_table)
+    full = FullTopKIndexer(
+        **kwargs, use_deep_gemm_prefill=False, use_deep_gemm_decode=False
     )
-    full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
     candidates = DenseBlocksBackend(
-        **kwargs, candidate_topk_blocks=4, candidate_block_size=8
+        **kwargs,
+        candidate_topk_blocks=4,
+        candidate_block_size=8,
+        use_deep_gemm_publish=False,
+        use_deep_gemm_consume=False,
     )
     # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
     # runtime; the candidate paths also clear padded rows and columns.

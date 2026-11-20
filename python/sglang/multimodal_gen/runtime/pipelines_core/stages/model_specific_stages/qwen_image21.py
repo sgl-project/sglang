@@ -5,7 +5,10 @@ from collections import OrderedDict
 import torch
 from PIL import Image
 
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    use_gpu_conditioning_hash,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_group,
@@ -46,6 +49,14 @@ def collapse_image_slots(hidden, input_ids, image_token_id):
     return hidden[keep], image_mask[keep]
 
 
+def reference_size(width, height, area=1024 * 1024):
+    """Diffusers' `calculate_dimensions` at the pipeline's default 1024x1024 area."""
+    ratio = width / height
+    out_width = math.sqrt(area * ratio)
+    out_height = out_width / ratio
+    return max(32, round(out_width / 32) * 32), max(32, round(out_height / 32) * 32)
+
+
 class QwenImage21InputValidationStage(InputValidationStage):
     def load_condition_image(self, image):
         return load_image(image, convert_method=lambda image: image.convert("RGBA"))
@@ -53,8 +64,23 @@ class QwenImage21InputValidationStage(InputValidationStage):
     def preprocess_condition_image(
         self, batch, server_args, condition_image_width, condition_image_height
     ):
-        # one model-owned resize is shared by the VLM and VAE in the encoding stage
-        return None
+        # One model-owned resize is shared by the VLM and VAE in the encoding
+        # stage. Here an unset output size follows the last reference, as in
+        # Diffusers; warmup and prewarm requests keep the size they chose.
+        images = batch.condition_image
+        image = images[-1] if isinstance(images, list) else images
+        if (
+            image is None
+            or batch.is_warmup
+            or batch.extra.get("server_internal_prewarm")
+        ):
+            return
+        explicit_fields = set(batch.extra.get("explicit_fields", []))
+        width, height = reference_size(image.width, image.height)
+        if "width" not in explicit_fields:
+            batch.width = width
+        if "height" not in explicit_fields:
+            batch.height = height
 
     def forward(self, batch, server_args):
         if batch.prompt is None:
@@ -225,9 +251,12 @@ class QwenImage21EncodingStage(PipelineStage):
                 vision_images.append(image)
             kwargs["images"] = vision_images
         inputs = upload_without_sync(self.processor(**kwargs), device)
-        with self.use_declared_component(
-            component_name="text_encoder", module=self.text_encoder
-        ) as encoder:
+        with (
+            self.use_declared_component(
+                component_name="text_encoder", module=self.text_encoder
+            ) as encoder,
+            use_gpu_conditioning_hash(enabled=len(images) > 1),
+        ):
 
             def run(encoder_inputs):
                 outputs = encoder(
@@ -254,19 +283,14 @@ class QwenImage21EncodingStage(PipelineStage):
             [] if images is None else images if isinstance(images, list) else [images]
         )
         resized, shapes, conditions = [], [], []
-        area = batch.height * batch.width
         image_mode = "RGBA" if ac.in_channels == 4 else "RGB"
         for image in images:
             if not isinstance(image, Image.Image):
                 image = load_image(
                     image, convert_method=lambda image: image.convert(image_mode)
                 )
-            width = max(
-                32, round(math.sqrt(area * image.width / image.height) / 32) * 32
-            )
-            height = max(
-                32, round(math.sqrt(area * image.height / image.width) / 32) * 32
-            )
+            # the reference sizes do not depend on the output size, as in Diffusers
+            width, height = reference_size(image.width, image.height)
             resized.append(
                 image.convert(image_mode).resize(
                     (width, height), Image.Resampling.LANCZOS
@@ -287,7 +311,8 @@ class QwenImage21EncodingStage(PipelineStage):
                         pixels[None].permute(0, 3, 1, 2).unsqueeze(2).float() / 255.0
                     )
                     pixels = (2 * pixels - 1).to(device=device, dtype=torch.bfloat16)
-                    latent = vae.encode(pixels).mode()
+                    with use_gpu_conditioning_hash(enabled=len(resized) > 1):
+                        latent = vae.encode(pixels).mode()
                     stats_key = (latent.dtype, latent.device)
                     if stats_key not in self.latent_stats:
                         self.latent_stats[stats_key] = tuple(

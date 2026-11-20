@@ -27,19 +27,20 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
-import requests
+import huggingface_hub.constants
 import yaml
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.server_fixtures.disaggregation_fixture import find_sgl_router_binary
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     find_available_port,
     popen_launch_server,
 )
+from sglang.utils import wait_for_http_ready
 
 INFERENCEX_REPO = "https://github.com/SemiAnalysisAI/InferenceX.git"
 INFERENCEX_COMMIT = "4538f1bc9784426ae92da31b7e8daae4ba637b84"
@@ -49,6 +50,10 @@ THINKING_MODE = "thinking_on"
 POINT = os.environ.get("AGENTX_POINT", "")
 SERVER_LAUNCH_TIMEOUT = 5400
 ROUTER_READY_TIMEOUT = 600
+# sgl-router's cache_aware learns prefixes only from the worker's KV events. It
+# finds them through the worker's /server_info: DP rank r publishes on 5557 + r,
+# and --load-publish-endpoint auto puts the load reports on the ports after.
+KV_EVENTS_CONFIG = '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'
 
 SUMMARY_HEADER = (
     "| point | requests | total tok/s/GPU | output tok/s/GPU | p50 interactivity "
@@ -123,7 +128,8 @@ def _bind_point(e2e: Path, config_key: str, commit: str, point: str) -> tuple:
         "FRAMEWORK": master["framework"],
         "PRECISION": master["precision"],
         "TP": str(tp),
-        "EP_SIZE": str(entry["ep"]),
+        # A row without ep, or with ep: null, runs EP 1 as InferenceX's matrix does.
+        "EP_SIZE": str(entry.get("ep") or 1),
         "PP_SIZE": "1",
         "DCP_SIZE": str(dcp),
         "PCP_SIZE": "1",
@@ -188,20 +194,56 @@ def _engine_cli_args(config: dict) -> list:
     return args
 
 
+# Mirrors toSglRouter in docs/src/snippets/_agentx.jsx: the dropped set and the
+# policy, request-timeout-secs and retry-max-retries branches must match. Unlike
+# the page, an arg in neither set raises here.
+# Args whose behavior is sgl-router's default, or that it has no counterpart for.
+_ROUTER_ARGS_DROPPED = {
+    "pd-disaggregation",
+    "request-id-headers",
+    "connect-timeout-secs",
+    "disable-health-check",
+    "disable-retries",
+    "balance-abs-threshold",
+    "retry-backoff-multiplier",
+}
+_ROUTER_ARGS_PASSED = {
+    "dp-aware",
+    "disable-circuit-breaker",
+    "retry-initial-backoff-ms",
+    "retry-max-backoff-ms",
+}
+
+
+def _router_policy(frontend_args: dict) -> str | None:
+    policy = frontend_args.get("policy")
+    return "cache_aware" if policy == "consistent_hashing" else policy
+
+
 def _router_cli_args(config: dict) -> list:
-    # srt-slurm's rendering of router args: recipe order, a list repeats its flag.
     args = []
     for key, value in config.items():
-        flag = f"--{key.replace('_', '-')}"
-        if value is True:
-            args.append(flag)
-        elif value is False or value is None:
-            continue
-        elif isinstance(value, list):
-            for item in value:
-                args += [flag, str(item)]
-        else:
-            args += [flag, str(value)]
+        key = key.replace("_", "-")
+        if key == "policy":
+            args += ["--policy", _router_policy(config)]
+        elif key == "retry-max-retries":
+            args += ["--retry-max-attempts", str(int(value) + 1)]
+        elif key in _ROUTER_ARGS_PASSED:
+            if value is True:
+                args.append(f"--{key}")
+            elif value is not False:
+                args += [f"--{key}", str(value)]
+        elif key == "request-timeout-secs":
+            # The recipe bounds the whole request; sgl-router bounds the time to response
+            # headers, the silence between chunks and the request lifetime separately.
+            for flag in (
+                "--request-timeout-secs",
+                "--stream-idle-timeout-secs",
+                "--stale-request-timeout-secs",
+            ):
+                args += [flag, str(value)]
+        elif key not in _ROUTER_ARGS_DROPPED:
+            raise ValueError(f"No sgl-router flag for the frontend arg {key!r}")
     return args
 
 
@@ -215,48 +257,62 @@ def _server_launch(recipe: dict) -> tuple:
     if "enable-metrics" not in args:
         other_args.append("--enable-metrics")
     other_args += _engine_cli_args(args)
-    env = os.environ.copy()
+    frontend_args = (recipe.get("frontend") or {}).get("args") or {}
+    if (
+        _router_policy(frontend_args) == "cache_aware"
+        and "kv-events-config" not in args
+    ):
+        other_args += [
+            "--kv-events-config",
+            KV_EVENTS_CONFIG,
+            "--load-publish-endpoint",
+            "auto",
+        ]
+    # Models stay in the CI's hub cache when a recipe moves HF_HOME, as they stay
+    # in srt-slurm's shared HF_HUB_CACHE.
+    env = {"HF_HUB_CACHE": huggingface_hub.constants.HF_HUB_CACHE, **os.environ}
     for scope in (recipe.get("environment") or {}, role.get("env") or {}):
         env.update((key, str(value)) for key, value in scope.items())
     return model, served_model_name, other_args, env
 
 
-def _launch_router(worker_url: str, frontend_args: dict) -> tuple:
-    """Start sglang-router in front of ``worker_url`` as srt-slurm does; ``(process, url)``."""
+def _launch_router(
+    model: str, served_model_name: str, worker_url: str, frontend_args: dict, env: dict
+) -> tuple:
+    """Start sgl-router in front of ``worker_url``; ``(process, url)``."""
     port = find_available_port(int(worker_url.rsplit(":", 1)[1]))
+    # cache_aware matches prefixes on the worker's tokenizer; other policies
+    # need no request tokens and leave tokenizing to the worker.
+    if _router_policy(frontend_args) == "cache_aware":
+        tokenizer = ["--tokenizer-path", model]
+    else:
+        tokenizer = ["--no-tokenizer"]
     command = [
-        sys.executable,
-        "-m",
-        "sglang_router.launch_router",
+        find_sgl_router_binary(),
+        "--model-id",
+        served_model_name,
+        *tokenizer,
         "--worker-urls",
         worker_url,
         "--host",
         "127.0.0.1",
         "--port",
         str(port),
-        "--prometheus-port",
-        str(find_available_port(port)),
-        "--prometheus-host",
-        "127.0.0.1",
         *_router_cli_args(frontend_args),
     ]
     print(f"router command={' '.join(command)}", flush=True)
-    process = subprocess.Popen(command)
+    # The worker's env: a router that renders chats reads the same render defaults
+    # (SGLANG_DEFAULT_THINKING, SGLANG_DSV4_REASONING_EFFORT, SGLANG_DSV41_REASONING_EFFORT).
+    process = subprocess.Popen(command, env=env)
     url = f"http://127.0.0.1:{port}"
-    # Ready once its worker registry lists healthy workers, as srt-slurm waits.
-    deadline = time.monotonic() + ROUTER_READY_TIMEOUT
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"sglang-router exited with code {process.returncode}")
-        try:
-            workers = requests.get(url + "/workers", timeout=5).json()["workers"]
-            if workers and all(worker.get("is_healthy") for worker in workers):
-                return process, url
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            pass
-        time.sleep(5)
-    kill_process_tree(process.pid)
-    raise TimeoutError(f"sglang-router not ready after {ROUTER_READY_TIMEOUT}s")
+    try:
+        wait_for_http_ready(
+            url=f"{url}/readiness", timeout=ROUTER_READY_TIMEOUT, process=process
+        )
+    except BaseException:
+        kill_process_tree(process.pid)
+        raise
+    return process, url
 
 
 def _runtime_settings(e2e: Path) -> dict:
@@ -405,7 +461,11 @@ def _serve_and_run_client(
         server_url = worker_url
         if frontend["type"] == "sglang-router":
             router, server_url = _launch_router(
-                worker_url=worker_url, frontend_args=frontend.get("args") or {}
+                model=model,
+                served_model_name=served_model_name,
+                worker_url=worker_url,
+                frontend_args=frontend.get("args") or {},
+                env=server_env,
             )
         client_env = _client_env(
             e2e=e2e,

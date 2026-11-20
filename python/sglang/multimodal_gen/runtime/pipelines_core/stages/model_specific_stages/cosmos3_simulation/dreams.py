@@ -33,6 +33,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsUnifiedActionContract,
     load_unified_normalizer,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -47,6 +48,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -872,8 +874,11 @@ class CausalDecodeQueue:
     then ``finish`` concatenates the completed frames.
     """
 
-    def __init__(self, vae: Any, *, device: torch.device) -> None:
+    def __init__(
+        self, vae: Any, *, device: torch.device, quality: str = "exact"
+    ) -> None:
         self.vae = vae
+        self.fast_path = quality_allows(quality, "lossless")
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
@@ -908,7 +913,11 @@ class CausalDecodeQueue:
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
         latents = latents.detach()
         latents.record_stream(self.stream)
-        with torch.cuda.stream(self.stream), torch.no_grad():
+        with (
+            torch.cuda.stream(self.stream),
+            torch.no_grad(),
+            use_vae_fast_path(self.vae, self.fast_path),
+        ):
             video = self.vae.causal_decode(self._denormalize(latents))
             host = torch.empty(
                 video.shape, dtype=video.dtype, device="cpu", pin_memory=True
@@ -1244,14 +1253,37 @@ def run_fixed_step_sde(
     seed: int,
     frame_start: int,
     dtype: torch.dtype,
+    forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> torch.Tensor:
     """Fixed-step SDE denoising of one chunk; history K/V is read but never written."""
+    sigmas = list(t_list)
     scheduler.set_shift(1.0)
-    scheduler.set_timesteps(sigmas=list(t_list), device=noise.device)
+    scheduler.set_timesteps(sigmas=sigmas, device=noise.device)
+    config = scheduler.config
+    if (
+        sigmas
+        and type(scheduler) is FlowMatchEulerDiscreteScheduler
+        and not (
+            config.shift_terminal
+            or config.use_karras_sigmas
+            or config.use_exponential_sigmas
+            or config.use_beta_sigmas
+            or config.invert_sigmas
+        )
+    ):
+        # With unit shift, we can check the first timestep on the host. Match
+        # the scheduler's FP32 rounding and keep its lookup for duplicate steps.
+        timesteps = np.asarray(sigmas, dtype=np.float32) * np.float32(
+            config.num_train_timesteps
+        )
+        if np.count_nonzero(timesteps == timesteps[0]) == 1:
+            scheduler.set_begin_index(0)
     latents = noise.float()
     for step_index, timestep in enumerate(scheduler.timesteps):
-        with set_forward_context(current_timestep=step_index, attn_metadata=None):
+        with set_forward_context(
+            current_timestep=step_index, attn_metadata=None, forward_batch=forward_batch
+        ):
             output = transformer(
                 latents.to(dtype),
                 timestep.reshape(1),
@@ -1300,6 +1332,7 @@ def commit_clean_kv(
     sink_frames: int,
     window_frames: int | None,
     read_history: HistoryKV | None = None,
+    forward_batch: Req | None = None,
     **forward_kwargs: Any,
 ) -> list[KVPair]:
     """Clean-refresh ``latent`` (timestep 0, no time embedding) and commit its K/V.
@@ -1307,7 +1340,9 @@ def commit_clean_kv(
     The pass attends to ``history`` unless ``read_history`` narrows it (frustum
     retrieval); the new K/V is always appended to ``history``.
     """
-    with set_forward_context(current_timestep=0, attn_metadata=None):
+    with set_forward_context(
+        current_timestep=0, attn_metadata=None, forward_batch=forward_batch
+    ):
         output = transformer(
             latent.to(dtype),
             torch.zeros(1, device=latent.device, dtype=torch.float32),
@@ -1337,6 +1372,7 @@ class _RolloutContext(msgspec.Struct):
     geometry: CosmosDreamsGeometry
     device: torch.device
     dtype: torch.dtype
+    forward_batch: Req | None = None
     row_domain_ids: torch.Tensor | None = None
     # Latent frames in the whole request; bounds the K/V buffer's initial capacity.
     target_frame: int | None = None
@@ -1425,14 +1461,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 batch.latents = self._rollout(batch)
         return batch
 
-    def _decode_queue(self, device: torch.device) -> "CausalDecodeQueue | None":
+    def _decode_queue(
+        self, device: torch.device, *, quality: str = "exact"
+    ) -> "CausalDecodeQueue | None":
         if (
             not self.overlap_vae_decode
             or device.type != "cuda"
             or self.server_args.should_start_component_on_cpu("vae")
         ):
             return None
-        return CausalDecodeQueue(self.vae, device=device)
+        return CausalDecodeQueue(self.vae, device=device, quality=quality)
 
     def _rollout(self, batch: Req) -> torch.Tensor:
         manifest = self.manifest
@@ -1457,6 +1495,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             geometry=geometry,
             device=device,
             dtype=torch.bfloat16,
+            forward_batch=batch,
             row_domain_ids=None if row_domain_ids is None else row_domain_ids.to("cpu"),
             target_frame=target_frame,
         )
@@ -1475,7 +1514,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         selector: FrustumHistorySelector | None = batch.extra[EXTRA_FRUSTUM_SELECTOR]
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
-        decode_queue = self._decode_queue(device)
+        decode_queue = self._decode_queue(device, quality=batch.sampling_params.quality)
         with decode_queue or nullcontext():
             next_frame = 0
             if batch.image_latent is not None:
@@ -1486,13 +1525,13 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     rows, frame_start=0, frame_end=1, context=context
                 )
                 if target_frame > 1:
-                    history = self._commit_clean_frame(
+                    history = self._commit_clean_chunk(
                         context,
                         history,
                         initial_latent,
                         frame_idx=0,
                         action=action,
-                        null_action=bool(null_indexes),
+                        null_indexes=null_indexes,
                         domain_ids=context.chunk_domain_ids(
                             0, 1, manifest.action_tokens_per_frame
                         ),
@@ -1534,43 +1573,68 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     if selector is None
                     else selector.select(chunk_start, chunk_end)
                 )
+                read_history = _history_view(
+                    history, selected, context.tokens_per_frame
+                )
                 clean_chunk = self._denoise_chunk(
                     context,
                     noise,
                     seed=seed,
-                    history=_history_view(history, selected, context.tokens_per_frame),
+                    history=read_history,
                     frame_start=chunk_start,
                     action=action,
                     null_indexes=null_indexes,
                     domain_ids=chunk_domains,
                 )
-                for local_idx, frame_idx in iter_clean_commit_frames(
-                    chunk_start, chunk_end, target_frame=target_frame
-                ):
-                    # The framewise refresh also sees the chunk's already-committed frames.
-                    read_history = (
-                        None
-                        if selected is None
-                        else _history_view(
-                            history,
-                            selected + list(range(chunk_start, frame_idx)),
-                            context.tokens_per_frame,
-                        )
-                    )
-                    history = self._commit_clean_frame(
+                clean_count = max(0, min(chunk_end, target_frame - 1) - chunk_start)
+                if clean_count and not null_indexes:
+                    history = self._commit_clean_chunk(
                         context,
                         history,
-                        clean_chunk[:, :, local_idx : local_idx + 1],
-                        frame_idx=frame_idx,
-                        action=action[
-                            :, local_idx * action_count : (local_idx + 1) * action_count
-                        ],
-                        null_action=local_idx in null_indexes,
-                        domain_ids=frame_domain_ids(
-                            chunk_domains, local_idx, action_count
+                        clean_chunk[:, :, :clean_count],
+                        frame_idx=chunk_start,
+                        action=action[:, : clean_count * action_count],
+                        null_indexes=(),
+                        domain_ids=(
+                            chunk_domains
+                            if chunk_domains.ndim == 1
+                            else chunk_domains[:, : clean_count * action_count]
                         ),
-                        read_history=read_history,
+                        read_history=read_history if selected is not None else None,
                     )
+                else:
+                    # Null actions use the single-frame RoPE convention during
+                    # clean refresh, so these chunks still refresh framewise.
+                    for local_idx, frame_idx in iter_clean_commit_frames(
+                        chunk_start, chunk_end, target_frame=target_frame
+                    ):
+                        # The framewise refresh also sees the chunk's already-committed frames.
+                        read_history = (
+                            None
+                            if selected is None
+                            else _history_view(
+                                history,
+                                selected + list(range(chunk_start, frame_idx)),
+                                context.tokens_per_frame,
+                            )
+                        )
+                        history = self._commit_clean_chunk(
+                            context,
+                            history,
+                            clean_chunk[:, :, local_idx : local_idx + 1],
+                            frame_idx=frame_idx,
+                            action=action[
+                                :,
+                                local_idx * action_count : (local_idx + 1)
+                                * action_count,
+                            ],
+                            null_indexes=(0,) if local_idx in null_indexes else (),
+                            domain_ids=frame_domain_ids(
+                                chunk_domains, local_idx, action_count
+                            ),
+                            read_history=read_history,
+                        )
+                del read_history
                 latents.append(clean_chunk)
                 if decode_queue is not None:
                     decode_queue.submit(clean_chunk)
@@ -1629,6 +1693,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             seed=seed,
             frame_start=frame_start,
             dtype=context.dtype,
+            forward_batch=context.forward_batch,
             text_kv=context.text_kv,
             fps=context.fps,
             action_latents=action,
@@ -1637,7 +1702,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             null_action_frame_indexes=null_indexes,
         )
 
-    def _commit_clean_frame(
+    def _commit_clean_chunk(
         self,
         context: _RolloutContext,
         history: list[KVPair] | None,
@@ -1645,11 +1710,11 @@ class CosmosDreamsRolloutStage(PipelineStage):
         *,
         frame_idx: int,
         action: torch.Tensor,
-        null_action: bool,
+        null_indexes: tuple[int, ...],
         domain_ids: torch.Tensor | None = None,
-        read_history: HistoryKV | None = None,
+        read_history: SelectedHistory | None = None,
     ) -> list[KVPair]:
-        """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
+        """Batch clean projections while preserving per-frame attention and eviction."""
         if history is None:
             # One rollout-owned [text | history | chunk] buffer replaces the
             # per-step concats and the per-commit history re-allocation.
@@ -1662,6 +1727,37 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     frames = min(frames, context.target_frame)
                 capacity = frames * context.tokens_per_frame
             history = PrefixKVHistory(context.text_kv, capacity_tokens=capacity)
+        clean_frame_ranges = None
+        if latent.shape[2] > 1:
+            tokens = context.tokens_per_frame
+            text_tokens = context.text_kv[0][0].shape[1]
+            if read_history is None:
+                history_frames = (
+                    0 if history is None else history[0][0].shape[1] // tokens
+                )
+                sink, window = self.profile.sink_frames, self.profile.window_frames
+            else:
+                # Frustum selection is fixed for this chunk. Use its compact
+                # length without gathering K/V or evicting any selected frames.
+                history_frames = len(read_history.frame_ids)
+                sink, window = 0, None
+            ranges = []
+            for frame in range(latent.shape[2]):
+                past = history_frames + frame
+                sink_end = min(sink, past)
+                window_start = (
+                    max(sink_end, past - window) if window is not None else sink_end
+                )
+                # Token offsets in [text | history | current chunk]. The window
+                # advances per frame, exactly as in sequential clean commits.
+                ranges.append(
+                    (
+                        text_tokens + sink_end * tokens,
+                        text_tokens + window_start * tokens,
+                        text_tokens + (past + 1) * tokens,
+                    )
+                )
+            clean_frame_ranges = tuple(ranges)
         return commit_clean_kv(
             self.transformer,
             latent,
@@ -1671,10 +1767,12 @@ class CosmosDreamsRolloutStage(PipelineStage):
             sink_frames=self.profile.sink_frames,
             window_frames=self.profile.window_frames,
             read_history=read_history,
+            forward_batch=context.forward_batch,
             text_kv=context.text_kv,
             frame_start=frame_idx,
             fps=context.fps,
             action_latents=action,
             action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
-            null_action_frame_indexes=(0,) if null_action else (),
+            null_action_frame_indexes=null_indexes,
+            clean_frame_ranges=clean_frame_ranges,
         )
