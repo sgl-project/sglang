@@ -753,6 +753,30 @@ class CommonKVManager(BaseKVManager):
     ) -> List[bytes]:
         raise NotImplementedError
 
+    def _required_aux_buffers(self) -> int:
+        """The metadata buffers a decode must register. The KV checksum buffer is
+        the last one and optional on either side."""
+        return len(self.kv_args.aux_data_ptrs) - int(
+            get_disagg().disaggregation_enable_kv_checksum
+        )
+
+    def validate_aux_buffer_count(self, num_remote: int) -> None:
+        """validate_aux_buffers for a backend that exchanges no item lengths: where
+        the layout differs across peers, refuse a decode whose buffers cannot pair
+        up with this prefill's by position."""
+        required_buffers = self._required_aux_buffers()
+        if self.exchange_aux_item_lens and num_remote not in (
+            required_buffers,
+            required_buffers + 1,
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer layout mismatch: prefill has "
+                f"{len(self.kv_args.aux_data_ptrs)} buffers, decode has "
+                f"{num_remote}. Both servers must run the same build with the same "
+                "SGLANG_ENABLE_DISAGG_SAMPLING_MASK and "
+                "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES."
+            )
+
     def validate_aux_buffers(
         self, dst_aux_ptrs: List[int], dst_aux_item_lens: Optional[List[int]]
     ) -> None:
@@ -761,9 +785,7 @@ class CommonKVManager(BaseKVManager):
 
         src_ptrs = self.kv_args.aux_data_ptrs
         src_item_lens = self.kv_args.aux_item_lens
-        required_buffers = len(src_ptrs) - int(
-            get_disagg().disaggregation_enable_kv_checksum
-        )
+        required_buffers = self._required_aux_buffers()
         slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
         if not (
             dst_aux_item_lens is not None

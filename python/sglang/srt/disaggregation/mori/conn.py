@@ -2029,9 +2029,13 @@ class MoriKVManager(CommonKVManager):
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
 
-        AuxDataCodec.deserialize_data_to_buffer(
-            self.kv_args, buffer_index, aux_index, data
-        )
+        try:
+            AuxDataCodec.deserialize_data_to_buffer(
+                self.kv_args, buffer_index, aux_index, data
+            )
+        except ValueError as exc:
+            logger.error(f"Dropped AUX_DATA for bootstrap_room {room}: {exc}")
+            return
 
     def _submit_kv_transfer(
         self,
@@ -2070,6 +2074,7 @@ class MoriKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"Peer info missing for engine {info.engine_key}"
                     )
+                self.validate_aux_buffer_count(len(peer_info.dst_aux_mem_descs))
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
 
         result_statuses: List[TransferStatus] = []
