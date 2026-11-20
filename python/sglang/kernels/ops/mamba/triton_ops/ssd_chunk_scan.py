@@ -13,9 +13,61 @@ import triton
 import triton.language as tl
 from packaging import version
 
-from .autotune import autotune_cache_kwargs, prune_oversized_tiles
+from .autotune import (
+    autotune_cache_kwargs,
+    chain_config_prunes,
+    prune_oversized_tiles,
+    prune_wrong_configs,
+)
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+
+# Configs measured to compute a wrong chunk scan, so never autotuned into.
+# Measured on an H20 with the Triton build in the project image, on Mamba2
+# shapes with chunk_size 256, head dim 128 and state 256 (Falcon-H1-7B): each
+# returns non-finite values from bounded inputs, except the last, whose result
+# changes between two identical runs and depends on what the output buffer held.
+# Every one of them shares its block sizes with a config that is correct at a
+# lower num_stages, which points at the pipelining of this kernel's loops; until
+# that is fixed, excluding them is what keeps the output independent of which
+# config won a benchmark. `test_ssd_chunk_scan_configs.py` re-measures the list.
+_WRONG_CONFIGS = (
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "num_warps": 4,
+        "num_stages": 4,
+    },
+    {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "num_warps": 4,
+        "num_stages": 2,
+    },
+)
 
 
 @triton.autotune(
@@ -148,12 +200,15 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
     ],
     key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
     prune_configs_by={
-        "early_config_prune": prune_oversized_tiles(
-            {
-                "BLOCK_SIZE_M": ("chunk_size",),
-                "BLOCK_SIZE_N": ("hdim",),
-                "BLOCK_SIZE_K": ("chunk_size",),
-            }
+        "early_config_prune": chain_config_prunes(
+            prune_oversized_tiles(
+                {
+                    "BLOCK_SIZE_M": ("chunk_size",),
+                    "BLOCK_SIZE_N": ("hdim",),
+                    "BLOCK_SIZE_K": ("chunk_size",),
+                }
+            ),
+            prune_wrong_configs(_WRONG_CONFIGS),
         )
     },
     **autotune_cache_kwargs,

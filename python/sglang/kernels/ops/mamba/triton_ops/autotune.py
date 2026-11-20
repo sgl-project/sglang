@@ -6,7 +6,13 @@ import triton
 
 from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
-__all__ = ["autotune_cache_kwargs", "prune_oversized_tiles"]
+__all__ = [
+    "autotune_cache_kwargs",
+    "chain_config_prunes",
+    "config_spec",
+    "prune_oversized_tiles",
+    "prune_wrong_configs",
+]
 
 
 def _tile_footprint(config: triton.Config) -> tuple[int, int, int]:
@@ -40,5 +46,57 @@ def prune_oversized_tiles(
             if all(config.kwargs[block] <= cap for block, cap in caps.items())
         ]
         return keep or [min(configs, key=_tile_footprint)]
+
+    return early_config_prune
+
+
+def config_spec(config: triton.Config) -> tuple[tuple[tuple[str, int], ...], int, int]:
+    """A config's identity for comparison: its blocks, warps and stages."""
+    return (
+        tuple(sorted(config.kwargs.items())),
+        config.num_warps,
+        config.num_stages,
+    )
+
+
+def prune_wrong_configs(
+    wrong: Sequence[Mapping[str, object]],
+) -> Callable[..., list[triton.Config]]:
+    """Build an `early_config_prune` that drops configs known to be incorrect.
+
+    These configs are not slow, they compute the wrong result: on bounded
+    inputs the kernel returns non-finite values, or a result that changes
+    between two identical runs. The autotuner chooses by measured time, so one
+    left in the list makes the model's output depend on which config happened
+    to win a benchmark.
+
+    Each entry gives the block sizes plus `num_warps` and `num_stages`. A list
+    holding only one config is kept as it is: a caller that pins a single
+    config is measuring it, and dropping it would leave nothing to launch.
+    """
+    specs = {
+        (
+            tuple(sorted((k, v) for k, v in entry.items() if k.startswith("BLOCK_"))),
+            entry["num_warps"],
+            entry["num_stages"],
+        )
+        for entry in wrong
+    }
+
+    def early_config_prune(configs, named_args, **kwargs):
+        if len(configs) <= 1:
+            return list(configs)
+        return [c for c in configs if config_spec(c) not in specs]
+
+    return early_config_prune
+
+
+def chain_config_prunes(*prunes: Callable[..., list[triton.Config]]):
+    """Apply several `early_config_prune` callables in order."""
+
+    def early_config_prune(configs, named_args, **kwargs):
+        for prune in prunes:
+            configs = prune(configs, named_args, **kwargs)
+        return configs
 
     return early_config_prune
