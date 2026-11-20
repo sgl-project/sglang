@@ -104,3 +104,47 @@ def unpool_gemm_norm_residual(
         num_stages=1,
     )
     return output, new_stream
+
+
+def unpool_gemm_norm_residual_tlx_supported(
+    x: torch.Tensor, weight: torch.Tensor
+) -> bool:
+    """Whether ``unpool_gemm_norm_residual_tlx`` handles these operands; host-only, never reads device data."""
+    from sglang.kernels.ops.gemm.tlx import mm_supported
+
+    return mm_supported(x, weight)
+
+
+def unpool_gemm_norm_residual_tlx(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    stream: torch.Tensor,
+    post_weight: torch.Tensor,
+    pre_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    post_eps: float,
+    pre_eps: float,
+    *,
+    pre_bf16: bool = False,
+):
+    """``unpool_gemm_norm_residual`` on gfx950 TLX kernels: the vendored ``tlx.ops.mm`` for the unpooler GEMM, then
+    ``tlx.ops.norm_residual_norm`` for the boundary, with the same BF16 rounding points (the FP32 sums run in
+    another order). Faster than the split-K form on MI355X at every width the fused path serves (1-16 rows)
+    except single rows, which the TLX GEMM rejects (see ``unpool_gemm_norm_residual_tlx_supported``).
+    """
+    from sglang.kernels.ops.gemm.tlx import linear
+    from sglang.kernels.ops.layernorm.tlx import norm_residual_norm
+
+    return norm_residual_norm(
+        stream,
+        linear(x, weight),
+        post_weight=post_weight,
+        post_norm_input_scale=True,
+        pre_weight=pre_weight,
+        alpha=alpha,
+        beta=beta,
+        post_eps=post_eps,
+        pre_eps=pre_eps,
+        pre_norm_bf16=pre_bf16,
+    )
