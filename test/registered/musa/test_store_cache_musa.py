@@ -7,7 +7,7 @@ from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_impl
 from sglang.srt.utils import is_musa
 from sglang.test.ci.ci_register import register_musa_ci
 
-register_musa_ci(est_time=30, suite="nightly-musa-1-gpu", nightly=True)
+register_musa_ci(est_time=30, suite="nightly-test-1-gpu-musa", nightly=True)
 
 
 def store(
