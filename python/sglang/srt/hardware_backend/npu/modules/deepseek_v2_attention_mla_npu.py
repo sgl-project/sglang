@@ -3,7 +3,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
+from sgl_kernel_npu.operators.matmul import batch_matmul_transpose
+from sgl_kernel_npu.operators.norm import fused_split_qk_norm
 
 import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
@@ -24,7 +25,6 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_cp_stream_o_proj,
@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_is_npu_arch35 = is_npu_arch35()
 
 
 def _dsa_dcp_extend_gathers_kv(forward_batch: "ForwardBatch") -> bool:
@@ -382,28 +381,7 @@ def forward_mla_core_npu(
         **attn_kwargs,
     )
 
-    attn_output = attn_output.contiguous()
-    if (
-        attn_output.shape[0] >= 65536
-        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
-        or m.w_vc.shape[-1] >= 65536
-    ):
-        # npu_transpose_batchmatmul does not support dimensions >= 65536.
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
-    else:
-        # Use the numerically validated torch_npu implementation when supported.
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+    attn_bmm_output = batch_matmul_transpose(attn_output.contiguous(), m.w_vc)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
@@ -482,6 +460,8 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        # NoPE layers (skip_rope=True, rotary_emb=None; Kimi K2/K3, GLM-5.3
+        # Flash) take the unfused split path, like the MLA prepare does.
         if m.rotary_emb is None or m.rotary_emb.is_neox_style:
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
@@ -545,14 +525,10 @@ def forward_dsa_prepare_npu(
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
         w_kc = m.w_kc_qrep if token_sharded else m.w_kc
-        q_nope_out = torch_npu.npu_transpose_batchmatmul(
-            q_nope,
-            w_kc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        q_nope_out = batch_matmul_transpose(q_nope, w_kc, impl="torch_npu")
 
+        # NoPE layers (skip_rope=True, rotary_emb=None) skip rope entirely,
+        # mirroring the None guard in forward_mla_prepare_npu.
         if (
             is_mla_preprocess_enabled()
             and m.rotary_emb is not None
@@ -919,18 +895,7 @@ def forward_dsa_core_npu(
     num_heads = m.num_heads if token_sharded else m.num_local_heads
     attn_output = attn_output.view(-1, num_heads, m.kv_lora_rank)
     w_vc = m.w_vc_qrep if token_sharded else m.w_vc
-    perm_x1 = (1, 0, 2)
-    if not _is_npu_arch35 and num_heads * m.kv_lora_rank >= 65536:
-        # A2/A3's fused input transpose requires heads * kv_lora_rank < 65536.
-        attn_output = attn_output.transpose(0, 1).contiguous()
-        perm_x1 = (0, 1, 2)
-    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-        attn_output,
-        w_vc,
-        perm_x1=perm_x1,
-        perm_x2=(0, 1, 2),
-        perm_y=(1, 0, 2),
-    )
+    attn_bmm_output = batch_matmul_transpose(attn_output, w_vc, impl="torch_npu")
 
     attn_bmm_output = attn_bmm_output.reshape(-1, num_heads * m.v_head_dim)
 

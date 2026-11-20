@@ -1828,14 +1828,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if remainder or dst_width <= 0:
                         raise ValueError("Invalid PD DCP draft destination token width")
                 if src_width == dst_width:
-                    layers_params.append(
-                        (
-                            src_kv_ptrs[entry],
-                            dst_kv_ptrs[entry],
-                            src_width,
-                            draft_groups,
+                    if draft_rows_collapsed and pack_buffer is not None:
+                        # A collapsed draft takes the target's strided rows.
+                        draft_to_pack.append(
+                            (
+                                src_kv_ptrs[entry],
+                                dst_kv_ptrs[entry],
+                                src_width,
+                                dst_width,
+                                src_width,
+                            )
                         )
-                    )
+                    else:
+                        layers_params.append(
+                            (
+                                src_kv_ptrs[entry],
+                                dst_kv_ptrs[entry],
+                                src_width,
+                                draft_groups,
+                            )
+                        )
                     continue
                 if self.is_mla_backend:
                     raise ValueError(
