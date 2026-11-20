@@ -24,7 +24,7 @@ from sglang.srt.utils.device import async_h2d, is_npu
 _is_npu = is_npu()
 
 if _is_npu:
-    import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu OE operators.
+    from sgl_kernel_npu.operators.embedding import update_oe_token_table
 else:
     from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 
@@ -39,7 +39,7 @@ def _update_token_table(tokens, ne_token_table, row_indices, column_starts, req_
     if _is_npu:
         if row_indices.numel() == 0 or tokens.numel() == 0:
             return
-        torch.ops.npu.update_oe_token_table(
+        update_oe_token_table(
             tokens.contiguous(),
             req_lens.contiguous(),
             row_indices.contiguous(),
