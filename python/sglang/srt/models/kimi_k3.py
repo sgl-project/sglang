@@ -30,7 +30,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers import layernorm_sp, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
@@ -151,9 +151,10 @@ from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
+    get_model,
     get_parallel,
     get_platform,
-    get_server_args,
     get_spec,
     linear_attn_parallel_group,
     linear_attn_tp_rank,
@@ -1790,6 +1791,41 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
 
+    def _forward_sp_rows(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        valid_token_count: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """This rank's rows of the output on a sequence-parallel pass. An EP
+        all-to-all backend dispatches the rows it is given; TP-sharded experts
+        take every row, and their sums are reduce-scattered back."""
+        with get_forward().scoped(sp_active=False):
+            if _uses_ep_a2a():
+                return self.forward(
+                    hidden_states,
+                    prefix_sum=prefix_sum,
+                    valid_token_count=valid_token_count,
+                )
+            full = layernorm_sp.all_gather_token_rows(
+                hidden_states, total_rows=layernorm_sp.sp_num_tokens()
+            )
+            if self.routed_expert_up_proj is None:
+                # Not a latent MoE: the output is a TP-partial sum.
+                return layernorm_sp.reduce_scatter_token_rows(self.forward(full))
+            if not self._eligible_for_fused_front:
+                out = layernorm_sp.shard_token_rows(self.forward(full))
+                return out if prefix_sum is None else out + prefix_sum
+            gate_up, router_logits, routed_input = self._fused_front(full)
+            latent = full.new_empty((full.shape[0], self.moe_hidden_size))
+            shared_output = full.new_empty(full.shape)
+            self._forward_routed(full, router_logits, routed_input, latent)
+            self._forward_shared(gate_up, shared_output)
+        latent_rows = layernorm_sp.reduce_scatter_token_rows(latent)
+        shared_rows = layernorm_sp.reduce_scatter_token_rows(shared_output)
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent_rows))
+        return _add3(out, shared_rows, prefix_sum)
+
     def _forward_cp_shard_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's CP rows of the complete output, for rows gathered
         rank-major over the attention-CP group (the TP group under CP-TP group
@@ -1840,6 +1876,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
+        if get_forward().sp_active:
+            return self._forward_sp_rows(hidden_states, prefix_sum, valid_token_count)
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
@@ -3218,6 +3256,23 @@ class KimiK3DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        if not get_forward().sp_active:
+            return self._attend(hidden_states, positions, forward_batch, zero_allocator)
+        # Attention takes every row, and its output is a TP-partial sum.
+        return layernorm_sp.run_replicated_token_rows(
+            hidden_states,
+            lambda rows: self._attend(rows, positions, forward_batch, zero_allocator),
+            output_is_tp_partial=True,
+            total_rows=layernorm_sp.sp_num_tokens(),
+        )
+
+    def _attend(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
         # (matching the idle skip in other DP-attention models).
@@ -3402,7 +3457,7 @@ class KimiK3LinearModel(nn.Module):
                     if shard_shared
                     else ()
                 ),
-                dummy_load=get_server_args().load_format == "dummy",
+                dummy_load=get_model().load_format == "dummy",
             )
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
@@ -3467,7 +3522,14 @@ class KimiK3LinearModel(nn.Module):
                 if self.pp_group.is_first_rank
                 else pp_proxy_tensors["attn_res_bank"]
             )
-            self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            self.attn_bank.open(
+                hidden_states,
+                attn_res_block_num,
+                inherited,
+                num_rows=layernorm_sp.stack_rows(
+                    forward_batch.forward_mode, hidden_states.shape[0]
+                ),
+            )
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
@@ -3513,9 +3575,12 @@ class KimiK3LinearModel(nn.Module):
                 and i in captures
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
-                aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, forward_batch)
-                )
+                capture = self._dspark_capture_stream(i, hidden_states, forward_batch)
+                if get_forward().sp_active:
+                    capture = layernorm_sp.sp_exit_gather(
+                        capture, num_tokens=layernorm_sp.sp_num_tokens()
+                    )
+                aux_hidden_states.append(capture)
 
         if not self.pp_group.is_last_rank:
             if self.attn_bank is not None:
@@ -3721,6 +3786,15 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
+            if input_ids is None and layernorm_sp.runs_sp(
+                forward_batch.forward_mode, embeds.shape[0]
+            ):
+                # The multimodal routine passes embeddings only, and the logits
+                # processor gathers by the ids' count.
+                hidden_states = layernorm_sp.sp_exit_gather(
+                    hidden_states, num_tokens=embeds.shape[0]
+                )
+                get_forward().set("sp_active", False)
             return self.logits_processor(
                 input_ids,
                 hidden_states,

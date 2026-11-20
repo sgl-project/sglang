@@ -181,6 +181,7 @@ class TestNixlAbortNotification(
             agent_name = f"decode-{i}"
             manager.prep_handles[agent_name] = f"dst-prep-{i}"
             manager.decode_kv_args_table[agent_name] = SimpleNamespace(
+                unified_layout_error=None,
                 decode_tp_size=1,
                 requires_dcp_relayout=False,
                 kv_xfer_segments=None,

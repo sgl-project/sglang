@@ -633,6 +633,8 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # gamma-Ada step clock when a sort pass first saw it (tp or pp > 1); kept on retraction.
+        self.uniboost_first_seen_step: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
@@ -2189,7 +2191,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
-                model_config.vocab_size,
+                model_config.token_id_vocab_size,
             ),
             dllm_config=dllm_config,
         )

@@ -263,7 +263,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_npu = is_npu()
@@ -1396,6 +1396,7 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
             weight_cache_mode=get_model().weight_cache_mode,
             weight_cache_socket=get_model().weight_cache_socket,
+            weight_cache_transport=get_model().weight_cache_transport,
             load_group=self.load_group,
         )
 
@@ -1932,7 +1933,7 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(
+        step_span_ctx = forward_nvtx_range(
             build_step_span_name(
                 forward_batch,
                 is_draft_worker=self.is_draft_worker,
