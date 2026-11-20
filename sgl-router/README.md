@@ -110,6 +110,7 @@ every flag.
 | --- | --- |
 | `POST /v1/chat/completions`, `POST /v1/completions` | OpenAI API, served [over `/generate`](#openai-over-generate) |
 | `POST`/`PUT /generate` | SGLang [native generate](#native-generate), buffered or SSE |
+| `POST /v1/responses` | [OpenAI Responses](#openai-responses), stateless |
 | `POST /v1/messages`, `/v1/messages/count_tokens` | [Anthropic Messages](#anthropic-messages) |
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
@@ -120,9 +121,9 @@ every flag.
 | `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
-Endpoints for features the router does not provide yet (the Responses and
-Conversations APIs, `/v1/loads`) answer `501` with error code
-`unsupported_endpoint`.
+Endpoints for features the router does not provide yet (the stored-response
+routes under `/v1/responses/`, the Conversations API, `/v1/loads`) answer
+`501` with error code `unsupported_endpoint`.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -298,6 +299,12 @@ per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3),
 [StepFun](REFERENCE.md#stepfun)) for which chats forward `input_ids`.
 
+### OpenAI Responses
+
+`/v1/responses` is converted to a chat completion and back, so the openai
+SDK's `responses.*` and Codex work against the router. It is stateless: send
+the full conversation in `input`. See [OpenAI Responses](REFERENCE.md#openai-responses).
+
 ### Anthropic Messages
 
 `/v1/messages` is converted to a chat completion and back.
@@ -354,9 +361,13 @@ unset fields inherit the CLI flags. See
   consecutive failures; `--disable-circuit-breaker` turns this off; see
   [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
-  engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
-  or cached prefix decides; in PD mode, `--decode-dispatch-limit N` picks the
-  decode rank shortly before the KV arrives; see
+  engines; for ranks that no routing key or cached prefix decides,
+  `--dp-rank-policy round_robin` cycles them and `least_tokens` picks the
+  one expected to hold the fewest KV tokens by the engine's load feed; in PD
+  mode,
+  `--decode-dp-rank-policy` sets the decode rank's policy on its own, and
+  `--decode-dispatch-limit N` picks the decode rank shortly before the KV
+  arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see

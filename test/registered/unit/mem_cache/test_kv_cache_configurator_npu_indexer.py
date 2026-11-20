@@ -49,6 +49,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(attn_dcp_size=2),
             ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_parallel",
+                return_value=SimpleNamespace(enable_dsa_cache_layer_split=False),
+            ),
             patch.object(
                 kcc,
                 "get_schedule",
@@ -128,7 +132,9 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
                         pc,
                         "get_exec",
                         return_value=SimpleNamespace(
-                            kernel=SimpleNamespace(enable_fp4_indexer=False)
+                            kernel=SimpleNamespace(
+                                enable_fp4_indexer=False, enable_dsa_fp4_indexer=False
+                            )
                         ),
                     ),
                     patch.object(

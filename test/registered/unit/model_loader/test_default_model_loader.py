@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -9,7 +10,7 @@ import safetensors.torch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -64,6 +65,33 @@ class TestDefaultCheckpointSelection(CustomTestCase):
         with patch.object(loader_mod, "_prefetch_all_checkpoints") as prefetch:
             self.loader.start_checkpoint_prefetch(resolved, num_threads=1)
         prefetch.assert_called_once_with([self.files[1]], num_threads=1)
+
+    def test_model_index_options_preserve_draft_shard_selection(self):
+        for filename, weight, shard in (
+            ("model.safetensors.index.json", "main.weight", self.files[0]),
+            ("draft.safetensors.index.json", "draft.weight", self.files[1]),
+        ):
+            with open(os.path.join(self.folder, filename), "w") as f:
+                json.dump({"weight_map": {weight: os.path.basename(shard)}}, f)
+
+        for index_file in (None, "draft.safetensors.index.json"):
+            with self.subTest(index_file=index_file):
+                self.model.safetensors_index_file = index_file
+                resolved = self.loader.resolve_model_weights(self.config, self.model)
+                self.assertEqual(resolved[0].weight_files, (self.files[1],))
+                with patch.object(
+                    loader_mod,
+                    "get_model",
+                    return_value=SimpleNamespace(
+                        weight_loader_disable_mmap=False,
+                        weight_loader_prefetch_checkpoints=False,
+                        weight_loader_prefetch_num_threads=1,
+                        weight_loader_drop_cache_after_load=False,
+                    ),
+                ):
+                    loaded = dict(self.loader._get_all_weights(self.config, self.model))
+                self.assertEqual(set(loaded), {"draft.weight"})
+                torch.testing.assert_close(loaded["draft.weight"], torch.tensor([2.0]))
 
     def test_unadapted_model_keeps_all_files(self):
         resolved = self.loader.resolve_model_weights(self.config, SimpleNamespace())
@@ -169,6 +197,34 @@ class TestDefaultModelLoader(CustomTestCase):
             )
 
         self.assertEqual(events, ["load", "postprocess"])
+
+    def test_mistral_honors_index_opt_out(self):
+        """safetensors_index_file=None must skip the consolidated index too."""
+        with tempfile.TemporaryDirectory() as model_path:
+            files = [
+                os.path.join(model_path, f"consolidated-0000{i}.safetensors")
+                for i in (1, 2)
+            ]
+            for path in files:
+                open(path, "w").close()
+            with open(
+                os.path.join(model_path, "consolidated.safetensors.index.json"), "w"
+            ) as f:
+                json.dump({"weight_map": {"w": os.path.basename(files[0])}}, f)
+            loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.MISTRAL))
+            with patch.object(loader_mod, "get_server_args", return_value=None):
+                for index_file, expected in (
+                    ("model.safetensors.index.json", files[:1]),
+                    (None, files),
+                ):
+                    with self.subTest(index_file=index_file):
+                        _, weight_files, _ = loader._prepare_weights(
+                            model_path,
+                            None,
+                            fall_back_to_pt=False,
+                            safetensors_index_file=index_file,
+                        )
+                        self.assertEqual(sorted(weight_files), expected)
 
     def test_reload_requires_explicit_initial_load_marker(self):
         self.assertFalse(loader_mod.QuantizedRLModelLoader.is_reload_scenario(Mock()))
