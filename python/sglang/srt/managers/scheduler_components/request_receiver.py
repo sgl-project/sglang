@@ -19,6 +19,7 @@ from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchTokenizedEmbeddingReqInput,
@@ -50,6 +51,9 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -63,14 +67,13 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
     recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
-    recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
-    stream_output: Callable[..., None]
+    request_retirer: RequestRetirer
     get_last_batch: Callable[[], Any]
     # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
     # listener's ring rather than received over zmq.
@@ -150,15 +153,6 @@ class SchedulerRequestReceiver:
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
-                            break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
         else:
@@ -222,7 +216,11 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                exchange = get_shm_exchange(
+                    group=tp_group.cpu_group,
+                    kind="recv",
+                    multihost=envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST.get(),
+                )
                 if exchange is not None:
                     recv_reqs = _broadcast_via_exchange(
                         recv_reqs, exchange=exchange, tp_group=tp_group
@@ -266,7 +264,7 @@ class SchedulerRequestReceiver:
                 else:
                     status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                self.request_retirer.retire_unadmitted(req)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
@@ -333,6 +331,8 @@ class SchedulerRequestReceiver:
                 req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
+        # An AbortReq arrives behind its request on this DP group's own socket;
+        # the work channel keeps that order, the broadcast from global rank 0 does not.
         work_reqs = [
             req
             for req in recv_reqs
@@ -343,6 +343,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    AbortReq,
                 ),
             )
         ]
@@ -356,6 +357,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    AbortReq,
                 ),
             )
         ]

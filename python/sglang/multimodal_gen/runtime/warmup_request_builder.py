@@ -580,11 +580,20 @@ def supports_synthetic_warmup(server_args: ServerArgs) -> bool:
     return task_type.is_visual_gen() or task_type.is_mesh_gen()
 
 
+def should_include_warmup_audio(server_args: ServerArgs) -> bool:
+    """Whether server warmup needs a synthetic audio input: only audio-conditioned
+    models (Wan2.2-S2V) do, and get a silent WAV."""
+    if not supports_synthetic_warmup(server_args):
+        return False
+    return server_args.pipeline_config.task_type.requires_audio_input()
+
+
 def build_warmup_reqs(
     server_args: ServerArgs,
     *,
     warmup_resolutions: list[str] | None,
     warmup_input_path: str | None = None,
+    warmup_audio_path: str | None = None,
     return_warmup_result: bool = False,
     server_based_warmup: bool = False,
 ) -> list[Req]:
@@ -592,6 +601,9 @@ def build_warmup_reqs(
     if not supports_synthetic_warmup(server_args):
         return []
     sampling_defaults = get_model_sampling_defaults(server_args)
+    warmup_prompt = sampling_defaults.prompt
+    if warmup_prompt is None:
+        warmup_prompt = DEFAULT_PLACEHOLDER_PROMPT
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
@@ -656,9 +668,14 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
+            prompt=warmup_prompt,
         )
         req_kwargs["sampling_params"] = copy(sampling_defaults)
+        # Synthetic requests skip SamplingParams._adjust, which resolves this for real ones;
+        # unset, SP shards latents along time instead of tokens, a path no real request takes.
+        req_kwargs["sampling_params"].enable_sequence_shard = resolve_sequence_shard(
+            server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+        )
         req_kwargs.update(
             negative_prompt=negative_prompt,
             guidance_scale=sampling_defaults.guidance_scale,
@@ -679,7 +696,6 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             default_image_path = sampling_defaults.image_path
             image_count = (
                 len(default_image_path)
@@ -687,6 +703,12 @@ def build_warmup_reqs(
                 else 1
             )
             req_kwargs["image_path"] = [warmup_input_path] * max(1, image_count)
+        if task_type.requires_audio_input():
+            if warmup_audio_path is None:
+                raise RuntimeError(
+                    "Warmup audio path is required for audio-input model"
+                )
+            req_kwargs["audio_path"] = warmup_audio_path
         if server_args.enable_cfg_parallel:
             if not req_kwargs.get("negative_prompt"):
                 req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
@@ -696,9 +718,9 @@ def build_warmup_reqs(
 
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
-            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+            (warmup_prompt,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
+            else (warmup_prompt,)
         )
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()

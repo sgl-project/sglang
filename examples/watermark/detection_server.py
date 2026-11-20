@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main(args: argparse.Namespace) -> None:
-    config = load_watermark_config(args.watermark_config)
+    config = load_watermark_config(args.watermark_config, algorithm="gumbel")
     if config.key is None:
         raise ValueError("watermark config must set key")
     detector = WatermarkDetector(

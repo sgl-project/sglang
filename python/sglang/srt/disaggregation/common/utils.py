@@ -35,6 +35,9 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # The room's send record this chunk was counted in when queued (a
+    # `SendRecord`); the worker reports the chunk finished to it only.
+    send_record: Optional[object] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -125,7 +128,10 @@ class AuxDataCodec:
         item_len = kv_args.aux_item_lens[buffer_index]
         dst_addr = dst_aux_ptr + item_len * aux_index
         buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
-        buffer[:] = data
+        # One memcpy through the buffer protocol. Assigning a ctypes slice converts every
+        # byte to a Python int while holding the GIL (~14 ms per MiB), which stalls the
+        # scheduler thread of the receiving decode rank.
+        memoryview(buffer).cast("B")[:] = data
         return
 
 
@@ -180,6 +186,7 @@ def build_dcp_token_transfer_plan(
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
+    draft_rows_collapsed: bool = False,
 ) -> DCPTokenTransferPlan:
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
@@ -214,5 +221,9 @@ def build_dcp_token_transfer_plan(
     )
     target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
+    if draft_rows_collapsed:
+        return DCPTokenTransferPlan(
+            target_src, target_dst, target_src.copy(), target_dst.copy()
+        )
     draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)

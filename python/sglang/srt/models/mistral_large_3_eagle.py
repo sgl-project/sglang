@@ -8,10 +8,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_v2 import DeepseekV2Model
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
-from sglang.srt.utils import add_prefix
 
 
 class MistralLarge3EagleModel(DeepseekV2Model):

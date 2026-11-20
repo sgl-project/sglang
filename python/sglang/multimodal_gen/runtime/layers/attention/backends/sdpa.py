@@ -12,6 +12,10 @@ try:
 except ImportError:
     torch_varlen_attn = None
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
     AttentionBackend,
     AttentionImpl,
@@ -52,8 +56,6 @@ def torch_default_sdpa_backends():
 
 
 class SDPABackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
@@ -218,13 +220,14 @@ class SDPAImpl(AttentionImpl):
             if start == stop:
                 continue
             if query.device.type != "mps":
-                segment = self.forward(
-                    query[start:stop].unsqueeze(0),
-                    key[start:stop].unsqueeze(0),
-                    value[start:stop].unsqueeze(0),
-                    None,
+                q_seg, k_seg, v_seg = (
+                    t[start:stop].unsqueeze(0) for t in (query, key, value)
                 )
-                output[start:stop].copy_(segment[0])
+                # same call as forward, written in place instead of copied
+                if not self.forward_into(
+                    q_seg, k_seg, v_seg, output[start:stop].unsqueeze(0), None
+                ):
+                    output[start:stop].copy_(self.forward(q_seg, k_seg, v_seg, None)[0])
                 continue
 
             # mps SDPA materializes a quadratic temporary for a varlen segment
@@ -353,13 +356,14 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
             # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
-            # FA4's faster sub-tile kernel pays off in captured segments, but
-            # its host dispatch loses to cuDNN in eager (including BCG breaks).
+            # FA4's faster sub-tile kernel pays off inside a graph: captured
+            # segments and the eager breaks of a replay. In plain eager its host
+            # dispatch loses to cuDNN.
             # Keep exact requests on the reference route: cuDNN and FA4 differ
             # in rounding. The BCG scope includes warmup, priming FA4 for capture.
-            if not is_in_breakable_cuda_graph():
+            if not is_in_breakable_cuda_graph() and get_current_replay_token() is None:
                 context = get_forward_context_or_none()
-                if context is not None and context.quality in ("lossless", "high"):
+                if context is not None and quality_allows(context.quality, "lossless"):
                     return True
             short_side, long_side = sorted((query.shape[1], key.shape[1]))
             return short_side >= 128 or long_side < 128

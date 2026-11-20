@@ -7,6 +7,8 @@
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
 
+#include "common.h"
+
 namespace {
 
 using namespace at::vec;
@@ -14,6 +16,17 @@ using namespace at::vec;
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
 inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, const Vectorized<float>& b) {
   return at::vec::convert_from_float<scalar_t>(a, b);
+}
+
+// Inverse of load_float_vec2: stores 2 * Vectorized<float>::size() elements.
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
+inline void store_float_vec2(scalar_t* __restrict__ out, const Vectorized<float>& a, const Vectorized<float>& b) {
+  convert_from_float_ext<scalar_t>(a, b).store(out);
+}
+
+inline void store_float_vec2(float* __restrict__ out, const Vectorized<float>& a, const Vectorized<float>& b) {
+  a.store(out);
+  b.store(out + Vectorized<float>::size());
 }
 
 template <typename scalar_t>
@@ -79,6 +92,24 @@ inline void store_from_float_ext<at::Half>(at::Half* out, const Vectorized<float
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
 #define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
+
+template <CpuIsa isa>
+inline __m128i cvtfp32_fp8e4m3(__m512 values) {
+  static_assert(isa == CpuIsa::AMX);
+  return at::vec::cvtfp32_fp8e4m3(values);
+}
+
+#if defined(CPU_CAPABILITY_AVX10_2)
+template <>
+__attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3<CpuIsa::AVX10_2>(__m512 values) {
+  __m256i rounded_to_zero = _mm512_cvtps_ph(values, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+  __mmask16 inexact = _mm512_cmp_ps_mask(values, _mm512_cvtph_ps(rounded_to_zero), _CMP_NEQ_OQ);
+  __m256i rounded_to_odd = _mm256_or_si256(rounded_to_zero, _mm256_maskz_set1_epi16(inexact, 1));
+  return _mm256_cvtph_hf8(_mm256_castsi256_ph(rounded_to_odd));
+}
+#endif
+
+#define CVT_FP32_TO_FP8(values) cvtfp32_fp8e4m3<isa>((values))
 
 // this doesn't handle NaN.
 inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {

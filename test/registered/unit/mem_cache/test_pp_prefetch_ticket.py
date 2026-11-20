@@ -5,7 +5,7 @@ import tempfile
 import threading
 import unittest
 from array import array
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -37,11 +39,86 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
+# The pool schema a hit query over stages holding only the KV host pool
+# reduces: the host pools some stage registers.
+_SCHEMA = [str(PoolName.KV)]
 
-class TestPPPrefetchTicket(unittest.TestCase):
+
+@contextmanager
+def _stop_after_transfers(c, operations):
+    """Drive the IO worker through ``operations`` transfers: the stop event
+    reads clear while they run (a transfer consults it per batch and skips
+    the backend once it is set) and set at the loop check after the last."""
+    done = []
+    real = c._page_transfer
+
+    def page_transfer(operation):
+        try:
+            return real(operation)
+        finally:
+            done.append(operation)
+
+    with (
+        patch.object(c, "_page_transfer", page_transfer),
+        patch.object(
+            c.storage_stop_event,
+            "is_set",
+            side_effect=lambda: len(done) >= operations,
+        ),
+    ):
+        yield
+
+
+class _TwoStageGroup:
+    """An all-gather between two simulated pipeline stages, one per thread."""
+
+    def __init__(self):
+        self.barrier = threading.Barrier(2, timeout=10)
+        self.slots = [None, None]
+
+    def all_gather(self, stage, obj):
+        self.slots[stage] = obj
+        self.barrier.wait()
+        gathered = list(self.slots)
+        self.barrier.wait()
+        return gathered
+
+
+class TestPrefetchAckSchema(unittest.TestCase):
+    def test_stages_with_different_pools_reduce_one_shape(self):
+        """BUG REGRESSION. Stages holding different host pools must reduce a
+        failed prefetch's ACK with tensors of one shape."""
+        group = _TwoStageGroup()
+        local_pools = ({"kv": None, "window_4096": None}, {"kv": None})
+        reduced = [None, None]
+
+        def stage(index):
+            c = HybridCacheController.__new__(HybridCacheController)
+            c.mem_pool_host = Mock(entry_map=local_pools[index])
+            c.prefetch_completion_sync_groups = [group]
+            c._host_pool_schemas = []
+            c._all_gather_object = lambda obj, g: g.all_gather(index, obj)
+            c._all_reduce = lambda tensor, op, groups: reduced.__setitem__(
+                index, tensor.shape
+            )
+            ack = PrefetchAck(rid="r", operation=None, pool_hits={})
+            c._reduce_prefetch_ack(ack)
+            return ack
+
+        threads = [threading.Thread(target=stage, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertIsNotNone(reduced[0])
+        self.assertEqual(reduced[0], reduced[1])
+
+
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
@@ -69,15 +146,19 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.host_mem_release_queue = Queue()
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
+        c.prefetch_io_aux_thread = None
         c.prefetch_tokens_occupied = 0
-        c.mem_pool_host = Mock(page_size=4)
+        c.mem_pool_host = Mock(page_size=4, entry_map={PoolName.KV: Mock()})
         c.mem_pool_host.available_size.return_value = 1 << 20
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c.storage_backend_type = "mooncake"
         c.storage_backend = Mock()
+        c.page_get_func = c._page_get_zero_copy
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
+        c._host_pool_schemas = []
+        c._all_gather_object = Mock(side_effect=lambda obj, group: [obj])
         ranks = {"pp": [0, 2, 4, 6], "tp": [0, 1], "command": [0, 2, 4, 6]}
         patcher = patch.object(
             torch.distributed, "get_process_group_ranks", side_effect=ranks.__getitem__
@@ -151,17 +232,101 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def run_io(self, operations):
         with (
             patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
-            patch.object(
-                self.c.storage_stop_event,
-                "is_set",
-                side_effect=[False] * operations + [True],
-            ),
+            _stop_after_transfers(self.c, operations),
         ):
             self.c.prefetch_io_aux_func()
         acks = []
         while not self.c.prefetch_sync_queue.empty():
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
+
+    def follow_hinted_ticket(self, follower_consumes_kv_hints):
+        """Run a hinted PP0 ticket on a follower; return its acks and extra_info."""
+        c = self.c
+        hint = KvHintsEnvelope(protocol_version="0.1", message_id="pp-hint")
+        key = RadixKey(array("q", range(8)), cache_salt="tenant")
+        keys = get_storage_hash_str(key, page_size=c.page_size)
+        bindings = dict(zip(keys, (42, 43), strict=True))
+        seen = []
+
+        def is_bound(key, info):
+            fields = info.extra_info or {}
+            seen.append(fields)
+            if not follower_consumes_kv_hints:
+                return True
+            return fields.get("kv_hints") == hint and (
+                fields.get("storage_key_to_event_hash", {}).get(key) == bindings[key]
+            )
+
+        def get_pages(keys, indices, info):
+            return [is_bound(key, info) for key in keys]
+
+        c._storage_hit_query = HybridCacheController._storage_hit_query.__get__(c)
+        c.page_get_func = c._page_get_zero_copy
+        c.storage_backend.batch_exists_v2.side_effect = lambda keys, pools, info: (
+            PoolTransferResult(sum(is_bound(key, info) for key in keys), {})
+        )
+        c.storage_backend.batch_get_v1.side_effect = get_pages
+        c.storage_backend.batch_get_v2.side_effect = lambda transfers, extra_info: {
+            transfer.name: get_pages(transfer.keys, transfer.host_indices, extra_info)
+            for transfer in transfers
+        }
+        c.submit_prefetch(
+            CacheRequestHandle("pp-hint", 0),
+            key,
+            None,
+            None,
+            [],
+            [PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)],
+            storage_read_metadata={
+                "kv_hints": hint,
+                "storage_key_to_event_hash": bindings,
+            },
+        )
+        ticket = pickle.loads(pickle.dumps(c.pp_prefetch_command_queue.get_nowait()))
+        c.pp_prefetch_states.clear()
+        c.storage_config.pp_rank = 1
+        c.storage_backend.consumes_kv_hints.return_value = follower_consumes_kv_hints
+
+        self.run_commands(ticket)
+        acks = self.run_io(1)
+        completed = [
+            ack.completed_tokens for ack in acks if ack.completed_tokens is not None
+        ]
+        return completed, seen
+
+    def test_pp_follower_can_lookup_and_read_hinted_pages(self):
+        completed, seen = self.follow_hinted_ticket(True)
+        self.assertEqual(completed, [self.c.page_size, 2 * self.c.page_size])
+        self.assertTrue(seen)
+
+    def test_pp_follower_that_opts_out_gets_no_hints(self):
+        """PP0 opted in, but a follower's own backend still decides."""
+        completed, seen = self.follow_hinted_ticket(False)
+        self.assertEqual(completed, [self.c.page_size, 2 * self.c.page_size])
+        self.assertTrue(seen)
+        for fields in seen:
+            self.assertNotIn("kv_hints", fields)
+            self.assertNotIn("storage_key_to_event_hash", fields)
+
+    def test_stop_event_answers_tickets_as_misses_but_still_reduces(self):
+        """A ticket delivered after the stop event is answered without a
+        backend query or a host allocation, but its hits reduce still runs,
+        so the stages stay paired; the operation reaches prefetch_buffer
+        terminated at zero hits."""
+        self.assertTrue(self.submit("hit").decision)
+        self.c.storage_stop_event.set()
+        queries = self.c._storage_hit_query.call_count
+        reduces = self.c._all_reduce.call_count
+        with patch.object(self.c, "_allocate_pp_prefetch_buffers") as allocate:
+            self.run_commands()
+        self.assertEqual(self.c._storage_hit_query.call_count, queries)
+        allocate.assert_not_called()
+        self.assertEqual(self.c._all_reduce.call_count, reduces + 1)
+        operation = self.c.prefetch_buffer.get_nowait()
+        self.assertTrue(operation.is_terminated())
+        self.assertEqual(operation.storage_hit_count, 0)
+        self.assertTrue(self.c.prefetch_buffer.empty())
 
     def test_hit_and_miss_are_reused_across_enqueue_retract_and_retry(self):
         c, cache = self.c, self.cache
@@ -225,7 +390,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, c.prefetch_hits_sync_groups)
-                    self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                     self.assertEqual(tensor[0].item(), 8)
                     self.assertEqual(c.mem_pool_host.alloc.call_count, len(votes) + 1)
                     votes.append(tensor[0].item())
@@ -241,6 +406,31 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 self.assertEqual(c._all_reduce.call_count, 2)
                 self.assertIs(c.prefetch_buffer.get_nowait(), first.operation)
                 self.assertIs(c.prefetch_buffer.get_nowait(), second.operation)
+
+    def test_hint_consumer_on_legacy_reads_is_warned_at_attach(self):
+        """Legacy batch_get() cannot carry hints, so opting in there is flagged."""
+        c = self.c
+        c.host_memory_mode = "cache"
+        for consumes, zero_copy, warns in (
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ):
+            with self.subTest(consumes=consumes, zero_copy=zero_copy):
+                c.storage_backend = Mock()
+                c.storage_backend.consumes_kv_hints.return_value = consumes
+                c.page_get_func = (
+                    c._page_get_zero_copy if zero_copy else c._generic_page_get
+                )
+                logger = f"{HybridCacheController.__module__}"
+                with patch.object(HiCacheController, "attach_storage_backend"):
+                    if warns:
+                        with self.assertLogs(logger, "WARNING") as logs:
+                            c.attach_storage_backend("dynamic")
+                        self.assertIn("interface_v1=1", logs.output[0])
+                    else:
+                        with self.assertNoLogs(logger, "WARNING"):
+                            c.attach_storage_backend("dynamic")
 
     def test_file_attachment_enables_pp_tickets(self):
         c = self.c
@@ -316,13 +506,13 @@ class TestPPPrefetchTicket(unittest.TestCase):
                     def reduce_hits(tensor, op, groups):
                         self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                         self.assertEqual(groups, ["pp", "tp"])
-                        self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                        self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                         local_votes.append(tensor[0].item())
                         c.mem_pool_host.alloc.assert_called_once_with(
                             local_hit, pool=PoolName.KV
                         )
                         tensor[0] = min(tensor[0].item(), peer_hit)
-                        kv_index = 1 + list(PoolName).index(PoolName.KV)
+                        kv_index = 1 + _SCHEMA.index(PoolName.KV)
                         tensor[kv_index] = min(tensor[kv_index].item(), peer_hit // 4)
 
                     c._all_reduce.side_effect = reduce_hits
@@ -416,9 +606,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
                         def reduce_hits(tensor, op, groups):
                             self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                             self.assertEqual(groups, c.prefetch_hits_sync_groups)
-                            self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                            self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                             local_votes.append(tensor[0].item())
-                            kv_index = 1 + list(PoolName).index(PoolName.KV)
+                            kv_index = 1 + _SCHEMA.index(PoolName.KV)
                             self.assertEqual(
                                 tensor[kv_index].item(), 32 if rank == 0 else 8
                             )
@@ -542,7 +732,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, ["pp", "tp"])
-                    self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                     local_votes.append(tensor[0].item())
                     if tensor[0].item():
                         self.assertEqual(c.mem_pool_host.alloc.call_args.args, (8,))
@@ -664,6 +854,47 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertTrue(key.is_bigram)
         self.assertFalse(c.is_pp_prefetch_ready("hit"))
 
+    def test_poll_exchanges_readiness_once_for_all_tickets(self):
+        c, cache = self.c, self.cache
+        tickets = [CacheRequestHandle(f"t{i}", 0) for i in range(6)]
+        local = CacheRequestHandle("local", 0)
+        for handle in tickets:
+            c.pp_prefetch_decisions[handle.rid] = PPPrefetchDecision.TICKETED
+        # Finishing a ticket clears its decision, as take_ready_pp_prefetch does.
+        cache._finish_pp_prefetch = Mock(
+            side_effect=lambda handle: c.pp_prefetch_decisions.pop(handle.rid)
+        )
+        cache.check_prefetch_progress = Mock()
+        queue = [tickets[0], local, *tickets[1:]]
+
+        cache.pp_rank = 0
+        with patch.object(
+            c, "is_pp_prefetch_ready", side_effect={"t2", "t4"}.__contains__
+        ):
+            cache.poll_prefetch_progress(queue)
+        cache._all_reduce.assert_called_once()
+        ready, op = cache._all_reduce.call_args.args
+        self.assertEqual(
+            (ready.tolist(), op), ([0, 0, 1, 0, 1, 0], torch.distributed.ReduceOp.MAX)
+        )
+        self.assertEqual(
+            [call.args[0] for call in cache._finish_pp_prefetch.call_args_list],
+            [tickets[2], tickets[4]],
+        )
+        # Only the unticketed request takes the local path; finished tickets do not.
+        cache.check_prefetch_progress.assert_called_once_with(local)
+
+        # A downstream stage follows PP0's verdict from the same single exchange.
+        cache.pp_rank = 1
+        cache._all_reduce.reset_mock()
+        cache._finish_pp_prefetch.reset_mock()
+        cache._all_reduce.side_effect = lambda tensor, _: tensor.__setitem__(3, 1)
+        for handle in (tickets[2], tickets[4]):
+            c.pp_prefetch_decisions[handle.rid] = PPPrefetchDecision.TICKETED
+        cache.poll_prefetch_progress(queue)
+        cache._all_reduce.assert_called_once()
+        cache._finish_pp_prefetch.assert_called_once_with(tickets[3])
+
     def test_allocation_error_preserves_ack_sequence_and_next_ticket(self):
         c = self.c
         self.submit(
@@ -707,9 +938,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
         with (
             patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
-            patch.object(
-                c.storage_stop_event, "is_set", side_effect=[False, False, True]
-            ),
+            _stop_after_transfers(c, 2),
         ):
             c.prefetch_io_aux_func()
         acks = [c.prefetch_sync_queue.get_nowait() for _ in range(6)]
@@ -804,7 +1033,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c._all_reduce.assert_called_once()
         packed, op, groups = c._all_reduce.call_args.args
         self.assertEqual(packed[0].item(), 0)
-        self.assertEqual(packed.numel(), 1 + len(PoolName))
+        self.assertEqual(packed.numel(), 1 + len(_SCHEMA))
         self.assertEqual(op, torch.distributed.ReduceOp.MIN)
         self.assertEqual(groups, c.prefetch_hits_sync_groups)
         c.mem_pool_host.free.assert_not_called()
@@ -836,7 +1065,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(tensor[0].item(), 8)
-                    self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, c.prefetch_hits_sync_groups)
                     c.mem_pool_host.alloc.assert_called_once_with(8, pool=PoolName.KV)

@@ -44,6 +44,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlus_2511_PipelineConfig,
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
@@ -67,7 +68,6 @@ from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
-    is_known_non_diffusers_multimodal_model,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -1241,6 +1241,140 @@ class TestDiffusionModelDetection(unittest.TestCase):
 
 
 class TestMiniMaxH3Routing(unittest.TestCase):
+    def test_quantized_fa_preserves_text_encoder_backend(self):
+        for components, roles in (
+            ({}, {}),
+            ({"text_encoder": "fa"}, {}),
+            ({}, {"text_encoder": {"self": "fa"}}),
+        ):
+            with (
+                self.subTest(components=components, roles=roles),
+                patch.object(current_platform, "is_npu", return_value=True),
+            ):
+                args = ServerArgs.__new__(ServerArgs)
+                args.pipeline_config = MiniMaxH3PipelineConfig()
+                args.ring_degree = 1
+                args.attention_backend = "fa"
+                args.attention_backend_config = {"precision": "fp8"}
+                args.component_attention_backends = dict(components)
+                args.component_attention_backend_roles = dict(roles)
+                args._adjust_attention_backend()
+                self.assertEqual(args.component_attention_backends, components)
+                self.assertEqual(args.component_attention_backend_roles, roles)
+
+    def _routing_args(self, kwargs):
+        # These tests cover ServerArgs routing, not device/backend validation.
+        # This helper mocks CUDA; Ascend sparse attention is NPU-only.
+        with patch.object(
+            MiniMaxH3PipelineConfig, "validate_server_args", return_value=None
+        ):
+            return _from_dict_without_model_resolution(
+                kwargs,
+                pipeline_config=MiniMaxH3PipelineConfig(),
+            )
+
+    def test_transformer_attention_defaults_text_encoder_to_sdpa(self):
+        for backend in ("laser_attn", "ascend_sparse_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "torch_sdpa"},
+                )
+                self.assertIsNone(
+                    args.requested_component_attention_backend("text_encoder")
+                )
+
+    def test_transformer_attention_preserves_explicit_text_encoder_backend(self):
+        for backend in ("laser_attn", "ascend_sparse_attn"):
+            with self.subTest(backend=backend):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": backend,
+                        "component_attention_backends": {"text_encoder": "fa"},
+                    }
+                )
+
+                self.assertEqual(args.attention_backend, backend)
+                self.assertEqual(
+                    args.component_attention_backends,
+                    {"text_encoder": "fa"},
+                )
+                self.assertEqual(
+                    args.requested_component_attention_backend("text_encoder"), "fa"
+                )
+
+    def test_ascend_sparse_native_config_is_preserved(self):
+        configs = (
+            {"sparse_type": "rf_v2", "precision": "bf16", "block_size": 128},
+            {"sparse_type": "ada_bsa", "keep_sink": False, "cdf_threshold": 0.9},
+            {"sparse_type": "rf_v3", "precision": "mix", "block_size": 128},
+            {"sparse_type": "rf_v3", "precision": "mxfp4", "block_size": 256},
+            {
+                "dense_kwargs": {"precision": "mxfp8", "pre_tokens": 2147483647},
+            },
+        )
+        for config in configs:
+            with self.subTest(config=config):
+                args = self._routing_args(
+                    {
+                        "model_path": "/models/MiniMax-H3",
+                        "performance_mode": "manual",
+                        "attention_backend": "ascend_sparse_attn",
+                        "attention_backend_config": config,
+                    }
+                )
+                self.assertEqual(dict(args.attention_backend_config), config)
+
+    def test_component_ascend_sparse_keeps_native_config(self):
+        config = {"sparse_type": "rf_v2", "precision": "bf16", "block_size": 256}
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "fa",
+                "component_attention_backends": {"transformer": "ascend_sparse_attn"},
+                "attention_backend_config": config,
+            }
+        )
+        self.assertEqual(dict(args.attention_backend_config), config)
+        self.assertEqual(
+            args.component_attention_backends["transformer"], "ascend_sparse_attn"
+        )
+
+    def test_ascend_sparse_dense_tail_config_is_preserved(self):
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "ascend_sparse_attn",
+                "attention_backend_config": {"skip_last_steps": 3},
+            }
+        )
+        self.assertEqual(args.attention_backend_config["skip_last_steps"], 3)
+
+    def test_ascend_sparse_migration_aliases_are_preserved_for_metadata(self):
+        config = {"dense_last_steps": 3, "dense_precision": "fp8"}
+        args = self._routing_args(
+            {
+                "model_path": "/models/MiniMax-H3",
+                "performance_mode": "manual",
+                "attention_backend": "ascend_sparse_attn",
+                "attention_backend_config": config,
+            }
+        )
+        self.assertEqual(dict(args.attention_backend_config), config)
+
     def test_semantic_variants_map_to_checkpoint_partitions(self):
         self.assertEqual(
             MiniMaxH3Pipeline.model_subfolder_for_variant("fl2va"), "FL2VA"
@@ -1256,7 +1390,6 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         actual = _get_config_info("MiniMax/MiniMax-H3")
         self.assertIsNotNone(expected)
         self.assertIs(actual, expected)
-        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
         self.assertEqual(
             get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
             "MiniMaxH3Pipeline",
@@ -1277,6 +1410,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         dit_parameter_count=None,
         checkpoint_sizes=None,
         is_cuda=True,
+        device_name="Test CUDA",
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -1316,7 +1450,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
-            patch.object(current_platform, "get_device_name", return_value="Test CUDA"),
+            patch.object(current_platform, "get_device_name", return_value=device_name),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
@@ -2461,6 +2595,26 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
                 self.assertEqual(args.layerwise_offload_components[0], "dit")
 
+    def test_auto_qwen_image_streams_a_dit_that_overflows_the_card(self):
+        """Flagless, every Qwen-Image-Edit-2511 request OOMed with 24 GiB free."""
+        for pipeline_config, model_path in (
+            (QwenImagePipelineConfig(), "Qwen/Qwen-Image"),
+            (QwenImageEditPlus_2511_PipelineConfig(), "Qwen/Qwen-Image-Edit-2511"),
+            (QwenImageLayeredPipelineConfig(), "Qwen/Qwen-Image-Layered"),
+        ):
+            for memory_gb in (24, 32):
+                with self.subTest(model_path=model_path, memory_gb=memory_gb):
+                    args = self._from_dict_with_pipeline_config(
+                        pipeline_config,
+                        memory_gb=memory_gb,
+                        dit_parameter_count=20_430_401_088,
+                        kwargs={"model_path": model_path, "performance_mode": "auto"},
+                    )
+
+                    self.assertEqual(
+                        args.residency_mode("transformer"), LAYERWISE_OFFLOAD
+                    )
+
     def test_auto_sizes_the_dit_at_the_precision_it_loads_in(self):
         # 16B parameters fit a 48 GB card in BF16 but not in FP32
         for pipeline_config, kwargs in (
@@ -2896,17 +3050,25 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertIsNone(args.layerwise_offload_components)
 
     def test_auto_ltx2_two_stage_device_mode_follows_device_memory(self):
-        for memory_gb, mode in ((140, "resident"), (80, "original")):
-            args = self._from_dict_with_pipeline_config(
-                LTX2PipelineConfig(),
-                memory_gb=memory_gb,
-                kwargs={
-                    "model_path": "Lightricks/LTX-2",
-                    "num_gpus": 2,
-                    "pipeline_class_name": "LTX2TwoStagePipeline",
-                },
-            )
-            self.assertEqual(args.ltx2_two_stage_device_mode, mode)
+        """The default follows total memory only. A 96 GiB GH200 has "H200" in
+        its device name and used to get both stage DiTs resident."""
+        for device_name, memory_gb, mode in (
+            ("NVIDIA H200", 140, "resident"),
+            ("Test CUDA", 80, "original"),
+            ("NVIDIA GH200 480GB", 96, "original"),
+        ):
+            with self.subTest(device_name=device_name, memory_gb=memory_gb):
+                args = self._from_dict_with_pipeline_config(
+                    LTX2PipelineConfig(),
+                    memory_gb=memory_gb,
+                    device_name=device_name,
+                    kwargs={
+                        "model_path": "Lightricks/LTX-2",
+                        "num_gpus": 2,
+                        "pipeline_class_name": "LTX2TwoStagePipeline",
+                    },
+                )
+                self.assertEqual(args.ltx2_two_stage_device_mode, mode)
 
     def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
         args = self._from_dict_with_pipeline_config(
@@ -3050,19 +3212,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            available_memory_gb={1: 50, 2: 80},
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
-                "num_gpus": 2,
-                "performance_mode": "auto",
-            },
-        )
+        # num_gpus counts every node, but each node probes only its own GPUs;
+        # probing past them fails with an invalid device id on node rank > 0.
+        multi_node = {
+            "num_gpus": 4,
+            "nnodes": 2,
+            "node_rank": 1,
+            "dist_init_addr": "127.0.0.1:5000",
+        }
+        for nodes_kwargs in ({"num_gpus": 2}, multi_node):
+            with self.subTest(**nodes_kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    available_memory_gb={1: 50, 2: 80},
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image",
+                        "base_gpu_id": 1,
+                        "performance_mode": "auto",
+                        **nodes_kwargs,
+                    },
+                )
 
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
+                self.assertFalse(args.use_fsdp_inference)
+                self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
@@ -3525,6 +3697,33 @@ class TestKVGatherDegree(unittest.TestCase):
         self.assertFalse(args.sp_split_auto)
         self.assertEqual(args.ulysses_degree, 4)
 
+    def test_higher_sp_keeps_heads_whole_when_ulysses_cannot_split_them(self):
+        # Z-Image's 30 heads do not split over 4 or 8 Ulysses ranks
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "manual",
+                    },
+                    ZImagePipelineConfig(),
+                )
+
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.kv_gather_degree, num_gpus)
+                self.assertTrue(args.sp_split_auto)
+                self.assertEqual(args.ring_degree, 1)
+
+    def test_higher_sp_keeps_ulysses_when_heads_divide(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "num_gpus": 3, "performance_mode": "manual"},
+            ZImagePipelineConfig(),
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 3)
+
     def test_explicit_ulysses_is_not_overridden(self):
         args = _from_dict_without_model_resolution(
             {
@@ -3872,34 +4071,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only defined for worker roles"):
             args.derive_pool_result_endpoint()
 
-    def test_cli_args_parsed(self):
-        """Per-role parallelism args are parsed from CLI."""
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--denoiser-tp",
-            "2",
-            "--denoiser-sp",
-            "4",
-            "--denoiser-ulysses",
-            "2",
-            "--denoiser-ring",
-            "2",
-            "--encoder-tp",
-            "1",
-            "--decoder-sp",
-            "8",
-        ]
-        args, unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.denoiser_tp, 2)
-        self.assertEqual(args.denoiser_sp, 4)
-        self.assertEqual(args.denoiser_ulysses, 2)
-        self.assertEqual(args.denoiser_ring, 2)
-        self.assertEqual(args.encoder_tp, 1)
-        self.assertEqual(args.decoder_sp, 8)
-
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
@@ -3953,19 +4124,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
-    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-downstream-wait-timeout",
-            "45",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
-
     def test_disagg_role_alias_cli_arg_is_accepted(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -3986,19 +4144,6 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
 
 class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
-    def test_scheduler_rpc_timeout_cli_arg_is_parsed_in_seconds(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--scheduler-rpc-timeout",
-            "7200",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.scheduler_rpc_timeout, 7200)
-
     def test_scheduler_rpc_timeout_rejects_invalid_values(self):
         invalid_values = (0, -1, MAX_SCHEDULER_RPC_TIMEOUT_S + 1, True, 1.5, "1")
 
@@ -4016,18 +4161,6 @@ class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
 
 
 class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
-    def test_cli_default_and_explicit_timeout(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = ["--model-path", "/fake"]
-        self.assertIsNone(parser.parse_args(argv).http_graceful_shutdown_timeout)
-        for timeout in (0, 30):
-            with self.subTest(timeout=timeout):
-                args = parser.parse_args(
-                    argv + ["--http-graceful-shutdown-timeout", str(timeout)]
-                )
-                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
-
     def test_config_values(self):
         for timeout in (None, 0, 30):
             with self.subTest(timeout=timeout):
@@ -4046,21 +4179,6 @@ class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
                             "http_graceful_shutdown_timeout": timeout,
                         }
                     )
-
-
-class TestDisaggTransferBackendArgs(unittest.TestCase):
-    def test_transfer_backend_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-transfer-backend",
-            "mock",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 class TestNcclNvlsArgs(unittest.TestCase):

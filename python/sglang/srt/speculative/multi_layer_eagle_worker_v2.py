@@ -24,6 +24,7 @@ import torch
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.dp_attention import require_gathered_buffer
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
@@ -32,7 +33,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -40,6 +41,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.observability.profile_utils import build_step_span_name
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -60,7 +62,10 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
+    check_draft_branch_tail_copy,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -84,21 +89,16 @@ from sglang.srt.speculative.spec_utils import (
     get_plan_stream,
     sample_draft_proposal,
     select_top_k_tokens,
+    use_fused_draft_sample,
 )
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    is_cpu,
-    is_npu,
-    require_gathered_buffer,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_cpu, is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import fast_topk
-from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.profile_utils import build_step_span_name
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -142,6 +142,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Single-CG runner samples in-graph (_sample_draft_proposal); per-step
         # runner samples worker-side between replays.
         self.use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        self.use_fused_draft_sample = self.use_rejection_sampling and (
+            use_fused_draft_sample(self.target_worker.model_config.vocab_size)
+        )
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
             "multi-layer EAGLE requires speculative_num_draft_tokens == "
             "speculative_num_steps + 1, "
@@ -152,11 +155,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         self._rebuild_topk1_chain_buffers()
-
-        # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
-        )
 
         # Retain the target's attention topology when swapping TP groups.
         self.parallel_layout = resolve_draft_parallel_layout(
@@ -214,6 +212,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
         )
         self.init_lm_head()
         self._init_boundary_kv_fix_state()
@@ -707,9 +708,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
+                    # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                    forward_batch.sampling_info.top_ks
+                    if self.use_fused_draft_sample
+                    else None,
                     sampling_seed=forward_batch.sampling_info.sampling_seed,
                     positions=forward_batch.seq_lens,
                     draft_step=step,
+                    fused=self.use_fused_draft_sample,
                 )
                 draft_probs_list.append(probs)
             else:
@@ -893,7 +899,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if can_run_decode_cuda_graph:
             # Graph replay bypasses ModelRunner.forward, which emits the
             # step[...] trace span for every other phase; emit it here.
-            with profile_range(build_step_span_name(forward_batch)):
+            with forward_nvtx_range(build_step_span_name(forward_batch)):
                 cgr = self.cuda_graph_runner_for_draft_extend
                 # Populate the single shared buffer set once; each step replays
                 # against it and the chain is advanced in place between steps.
@@ -917,9 +923,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
                             forward_batch.sampling_info.temperatures,
+                            # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                            forward_batch.sampling_info.top_ks
+                            if self.use_fused_draft_sample
+                            else None,
                             sampling_seed=forward_batch.sampling_info.sampling_seed,
                             positions=forward_batch.seq_lens,
                             draft_step=step,
+                            fused=self.use_fused_draft_sample,
                         )
                         ret_draft_probs_list.append(probs)
                     if rotates_in_graph:
@@ -995,9 +1006,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                         logits_sel,
                         forward_batch.sampling_info.temperatures,
+                        # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                        forward_batch.sampling_info.top_ks
+                        if self.use_fused_draft_sample
+                        else None,
                         sampling_seed=forward_batch.sampling_info.sampling_seed,
                         positions=forward_batch.seq_lens,
                         draft_step=step,
+                        fused=self.use_fused_draft_sample,
                     )
                     ret_draft_probs_list.append(probs)
                 else:
@@ -1048,6 +1064,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+
     def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         return [
             (f"draft_step_{i}", r)
@@ -1093,6 +1111,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=self.topk == 1
+        )
+
     @property
     def last_shared_read_runner(self):
         if self.draft_worker.last_draft_extend_staged:
@@ -1114,21 +1138,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     @property
-    def draft_swa_window(self) -> int:
-        # The widened extend starts front rows below the committed length, and
-        # each depth reads its own window back from there.
+    def draft_window_reaches(self) -> dict[str, int]:
+        # Widened extend reads front rows before the committed length. The
+        # attention role "swa" may route to a different storage band per runner.
         draft = self._draft_worker
-        windows = [
-            runner.sliding_window_size
-            for runner in draft.draft_runner_list
-            if runner.runner_ids.is_fused_draft
-            and runner.token_to_kv_pool.layer_router.routes_to(
-                IdSpaceKind.SLIDING_WINDOW
-            )
-        ]
-        if not windows:
-            return 0
-        return max(windows) + draft.draft_extend_num_front_tokens
+        reaches = {}
+        for runner in draft.draft_runner_list:
+            if not runner.runner_ids.is_fused_draft:
+                continue
+            router = runner.token_to_kv_pool.layer_router
+            if router.routes_to(IdSpaceKind.SLIDING_WINDOW):
+                name = router.storage_name(IdSpaceKind.SLIDING_WINDOW)
+                reach = runner.sliding_window_size + draft.draft_extend_num_front_tokens
+                reaches[name] = max(reaches.get(name, 0), reach)
+        return reaches
 
     def forward_batch_generation(
         self,
@@ -1205,6 +1228,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             target_worker=self.target_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

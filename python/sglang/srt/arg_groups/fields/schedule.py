@@ -32,6 +32,12 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of running requests.",
     ] = None
+    # Recorded by the cache hook from the raw input: a value resolved for the model
+    # (DeepSeek-V4's default) leaves it False.
+    _max_running_requests_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -97,9 +103,22 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "uniboost",
             ],
         ),
     ] = "fcfs"
+    shortest_prefill_aging_factor: A[
+        float,
+        "With --schedule-policy shortest-prefill-first, each prefill token processed while a request waits lowers its rank by this many tokens, bounding its wait to about its uncached length divided by the factor, in processed tokens. 0 disables aging.",
+    ] = 0.0
+    uniboost_gamma: A[
+        float,
+        "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Must be > 0.",
+    ] = 10.0
+    enable_uniboost_gamma_ada: A[
+        bool,
+        "Adapt --uniboost-gamma online to the observed latency tail (gamma-Ada): a heavy tail lowers gamma, a flat tail raises it.",
+    ] = False
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

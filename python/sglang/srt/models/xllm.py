@@ -72,6 +72,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -84,7 +86,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY = "xllm_source_router_gemm_partitions"
 _XLLM_SOURCE_ROUTER_PARTITIONS_MISSING = object()
@@ -960,6 +961,7 @@ class XllmSparseMoeBlock(nn.Module):
                 parallel_group="replicated"
                 if (
                     get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_flashinfer()
                 )
@@ -1040,7 +1042,11 @@ class XllmSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
+            or get_moe_a2a_backend().is_mori()
+        ):
             return self._forward_deepep(hidden_states, forward_batch)
 
         if hidden_states.shape[0] == 0:
