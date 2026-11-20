@@ -55,7 +55,7 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
         toolchain, "tvm_ffi_paths", lambda: (("/tvm/include",), "/tvm/lib", "tvm")
     )
 
-    assert toolchain.device_compiler_path() == "/opt/musa/bin/mcc"
+    assert toolchain.device_compiler_path.__wrapped__() == "/opt/musa/bin/mcc"
     assert toolchain.gpu_arch_name() == "mp_31"
     assert toolchain.target_flags() == ["--offload-arch=mp_31"]
     assert toolchain.base_cuda_flags() == ["-fPIC", "-x", "musa"]
