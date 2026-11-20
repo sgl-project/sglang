@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.attention.graph_variants import KPOOL_SHORT_DECODE
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
     mqa_logits_budget_bytes,
@@ -1518,13 +1519,26 @@ class IndexerKPool(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        act_quant,
         metadata: BaseIndexerMetadata,
-        return_indices: bool = True,
+        return_indices: bool,
+        enable_dual_stream: bool,
     ) -> Optional[torch.Tensor]:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
-
+        is_decode = forward_batch.forward_mode.is_decode()
+        # A later scored step (or prefix-cache hit) must see this key and gate.
+        gate_score = None
+        if (
+            is_decode
+            and self.index_kpool_compress
+            and enable_dual_stream
+            and self.compress_gate_stream is not None
+        ):
+            current = torch.cuda.current_stream()
+            self.compress_gate_stream.wait_stream(current)
+            with torch.cuda.stream(self.compress_gate_stream):
+                gate_score = F.linear(x, self.index_kpool_compress_gate)
         key = self._get_k_bf16(x, positions)
+        if gate_score is not None:
+            current.wait_stream(self.compress_gate_stream)
         self._compress_write(
             x=x,
             key=key,
@@ -1532,11 +1546,21 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             layer_id=layer_id,
             metadata=metadata,
+            gate_score=gate_score,
         )
-
         if not return_indices:
             return None
+        if is_decode:
+            from sglang.kernels.ops.attention.dsa.kpool_short_decode import (
+                kpool_short_decode_indices,
+            )
 
+            return kpool_short_decode_indices(
+                metadata.get_page_table_1(),
+                metadata.get_seqlens_int32(),
+                x.shape[0],
+                self.topk_output_width,
+            )
         return self._full_topk_for_short_sequence(metadata, x.device)
 
     def _forward_cuda_target_verify(
@@ -1733,11 +1757,20 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices=return_indices,
             )
 
-        skip_logits_computation = False
-        if forward_batch.forward_mode.is_extend_without_speculative():
-            if forward_batch.seq_lens_cpu is not None:
-                max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                skip_logits_computation = max_kv_len <= self.index_topk
+        skip_logits_computation = (
+            mode.is_decode()
+            and capture_mode.get_capture_attention_variant() == KPOOL_SHORT_DECODE
+            and self.skip_rope
+            and _should_fuse_kpool_topk(metadata)
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+        )
+        if (
+            mode.is_extend_without_speculative()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            skip_logits_computation = (
+                forward_batch.seq_lens_cpu.max().item() <= self.index_topk
+            )
 
         if skip_logits_computation:
             return self._forward_cuda_skip_logits(
@@ -1745,9 +1778,9 @@ class IndexerKPool(MultiPlatformOp):
                 positions,
                 forward_batch,
                 layer_id,
-                act_quant,
                 metadata,
                 return_indices,
+                enable_dual_stream,
             )
 
         precompute_compress_gate = (

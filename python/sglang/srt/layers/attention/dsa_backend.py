@@ -108,6 +108,11 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.graph_variants import (
+    KPOOL_SCORED_DECODE,
+    KPOOL_SHORT_DECODE,
+    SeqLenBucketGraphVariants,
+)
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
@@ -1537,6 +1542,35 @@ class DeepseekSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[SeqLenBucketGraphVariants]:
+        # For plain decode each row owns one sequence. A single long request
+        # sends the entire batch through the original scored graph.
+        if not (
+            envs.SGLANG_ENABLE_DSA_KPOOL_SHORT_DECODE.get()
+            and capture_forward_mode.is_decode()
+            and captured_req_width == 1
+            and is_cuda()
+            and self.device_sm_major == 9
+            and self.qk_rope_head_dim == 0
+            and self.dsa_index_kpool == 4
+            and self.dsa_index_topk == 2048
+            and self.physical_page_size == 64
+            and self.attn_dcp_size == 1
+            and self.hisparse_coordinator is None
+            and self.dsa_decode_impl == "tilelang"
+            and self.kv_cache_dtype == torch.bfloat16
+            and get_spec().speculative_algorithm is None
+            and self.use_fused_topk
+            and get_parallel().attn_dp_size == 1
+        ):
+            return None
+
+        return SeqLenBucketGraphVariants(
+            ((KPOOL_SHORT_DECODE, self.dsa_index_topk),), KPOOL_SCORED_DECODE
+        )
 
     def init_forward_metadata_out_graph(
         self,
