@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from sglang.srt.runtime_context import get_context
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.redaction import (
     redact_watermark_command_line,
     redact_watermark_secrets,
 )
