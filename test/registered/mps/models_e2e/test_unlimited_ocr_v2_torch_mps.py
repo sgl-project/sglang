@@ -1,7 +1,8 @@
 """End-to-end Unlimited-OCR v2 (BF16) on the standard Torch ModelRunner on Apple MPS.
 
 Covers the multimodal path (processor, SAM/CLIP encoder, DASH decoder with the
-Metal kernels) and document splitting, against drawn pages with known text.
+Metal kernels), document splitting, the opt-in warmup and the MPS KV pool
+default, against drawn pages with known text.
 """
 
 import base64
@@ -13,6 +14,8 @@ import unittest
 import requests
 import torch
 
+from sglang.srt.arg_groups.model_overrides.unlimited_ocr_v2 import mps_window_tokens
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.test.ci.ci_register import register_mps_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -75,8 +78,12 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
                 "unlimited-ocr",
                 "--enable-custom-logit-processor",
                 "--uocr-doc-split",
-                "--max-total-tokens",
-                "16384",
+                # With no --max-total-tokens, the MPS default sizes the KV pool.
+                "--uocr-max-page-tokens",
+                "8000",
+                # Opt-in; a broken warmup stops the server from starting.
+                "--warmups",
+                "unlimited_ocr_v2",
             ],
         )
 
@@ -84,6 +91,21 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             terminate_and_kill_process_tree(cls.process)
+
+    def test_mps_default_sizes_the_kv_pool_in_windows(self):
+        info = requests.get(f"{self.base_url}/server_info", timeout=30).json()
+        doc_cfg = UocrDocumentConfig(
+            uocr_doc_split=info["uocr_doc_split"],
+            uocr_doc_page_window=info["uocr_doc_page_window"],
+            uocr_max_page_tokens=info["uocr_max_page_tokens"],
+        )
+        window = mps_window_tokens(
+            doc_cfg,
+            chunked_prefill_size=info["chunked_prefill_size"],
+            page_size=info["page_size"],
+        )
+        self.assertGreater(info["max_total_tokens"], 0)
+        self.assertEqual(info["max_total_tokens"] % window, 0)
 
     def _ocr(self, titles: list[str]) -> str:
         content = [

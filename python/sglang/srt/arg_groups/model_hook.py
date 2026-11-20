@@ -259,6 +259,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
             env_defaults.apply_kimi_k31_rocm_env_defaults()
 
+    if model_arch == "UnlimitedOCRV2ForCausalLM":
+        from sglang.srt.arg_groups.model_overrides.unlimited_ocr_v2 import (
+            apply_unlimited_ocr_v2_mps_kv_pool_default,
+        )
+
+        apply_unlimited_ocr_v2_mps_kv_pool_default(server_args)
+
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (
             apply_glm5_next_spec_backend_defaults,

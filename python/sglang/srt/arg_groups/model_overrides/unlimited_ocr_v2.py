@@ -4,10 +4,14 @@ DASH maps each sparse block to one KV page, whose counters radix reuse loses.
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sglang.srt.arg_groups.model_override_base import _register_for, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -92,3 +96,53 @@ def _unlimited_ocr_v2_overrides(server_args: Any, hf_config: Any) -> dict:
 
     # CUDA graph defaults run earlier because they are not model-overridable.
     return overrides
+
+
+# Two windows from 10 GiB, covering 16 GB Macs below the measured M5 (an M1 reports
+# 10,922 MiB); each 2 GiB above the M5, about twice a window's KV, adds one.
+_MPS_TWO_WINDOW_MIN_MIB = 10 * 1024
+_MPS_MEASURED_LIMIT_MIB = 12124
+_MPS_MIB_PER_EXTRA_WINDOW = 2 * 1024
+_MPS_MAX_DEFAULT_WINDOWS = 8
+
+
+def _mps_window_budget(gpu_mem_mib: Optional[float]) -> int:
+    if gpu_mem_mib is None or gpu_mem_mib < _MPS_TWO_WINDOW_MIN_MIB:
+        return 1
+    extra = max(0, int(gpu_mem_mib) - _MPS_MEASURED_LIMIT_MIB)
+    return min(2 + extra // _MPS_MIB_PER_EXTRA_WINDOW, _MPS_MAX_DEFAULT_WINDOWS)
+
+
+def mps_window_tokens(
+    doc_cfg: UocrDocumentConfig, *, chunked_prefill_size: Optional[int], page_size: int
+) -> int:
+    """KV tokens of one document window: its context plus one prefill chunk."""
+    # The chunk holds the retained tail a follow-up copies; 2048 if chunking is off.
+    tokens = doc_cfg.default_context_length() + max(chunked_prefill_size or 0, 2048)
+    return (tokens + page_size - 1) // page_size * page_size
+
+
+def apply_unlimited_ocr_v2_mps_kv_pool_default(server_args: Any) -> None:
+    """Default the KV pool of a split Unlimited-OCR v2 server on MPS to whole
+    document windows, scaled by the Metal working-set limit."""
+    cfg = resolving_view(server_args)
+    if cfg.device != "mps" or use_mlx() or cfg.max_total_tokens is not None:
+        return
+    doc_cfg = UocrDocumentConfig.from_args(cfg)
+    if not doc_cfg.uocr_doc_split or doc_cfg.uocr_max_page_tokens == 0:
+        return
+    try:
+        gpu_mem_mib = get_device_memory_capacity("mps")
+    except (RuntimeError, ValueError):
+        gpu_mem_mib = None
+    # handle_gpu_memory_settings has resolved the chunk size by now.
+    window = mps_window_tokens(
+        doc_cfg,
+        chunked_prefill_size=cfg.chunked_prefill_size,
+        page_size=int(cfg.page_size or 32),
+    )
+    declare_resolution(
+        server_args,
+        "apply_unlimited_ocr_v2_mps_kv_pool_default",
+        max_total_tokens=_mps_window_budget(gpu_mem_mib) * window,
+    )
