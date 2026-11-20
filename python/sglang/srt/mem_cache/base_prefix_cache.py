@@ -539,6 +539,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def probes_external_store(self) -> bool:
+        """Whether a match with a req looks up an external KV store."""
+        return False
+
     def touch_prefix(self, key: RadixKey) -> None:
         """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
         never allocates, loads, or queries external tiers."""

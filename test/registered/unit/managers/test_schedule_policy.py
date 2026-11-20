@@ -185,13 +185,41 @@ class TestShortestPrefillFirst(CustomTestCase):
         self.assertIn("new", matched)
         self.assertEqual(len(matched), WAITING_QUEUE_PREFIX_MATCH_MAX + 1)
 
-    def test_ranking_match_skips_the_external_store(self):
-        queue = [self.make_req("a", 8)]
-        with patch("sglang.srt.managers.schedule_policy.match_kv_cache") as match:
-            self.policy._compute_prefix_matches(
-                queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            )
-        self.assertFalse(match.call_args.kwargs["probe_external"])
+    def _rank_three_times(self, req, matched_tokens, probes_external_store):
+        probes = []
+
+        def match(r, tree_cache, token_ids=None, *, probe_external=True, **kwargs):
+            probes.append(probe_external)
+            r.num_matched_prefix_tokens = matched_tokens[len(probes) - 1]
+
+        with (
+            patch(
+                "sglang.srt.managers.schedule_policy.match_kv_cache", side_effect=match
+            ),
+            patch.object(
+                self.policy.tree_cache,
+                "probes_external_store",
+                return_value=probes_external_store,
+            ),
+        ):
+            for _ in matched_tokens:
+                self.policy._compute_prefix_matches(
+                    [req], CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                )
+        return probes
+
+    def test_ranking_looks_up_the_external_store_once(self):
+        req = self.make_req("a", 64)
+        probes = self._rank_three_times(req, [48, 16, 16], True)
+        self.assertEqual(probes, [True, False, False])
+        self.assertEqual(req.num_matched_prefix_tokens, 48)
+        req.reset_for_retract()
+        self.assertIsNone(req.external_hit_end)
+
+    def test_ranking_without_an_external_store_uses_the_latest_match(self):
+        req = self.make_req("a", 64)
+        self._rank_three_times(req, [48, 16, 16], False)
+        self.assertEqual(req.num_matched_prefix_tokens, 16)
 
     def test_equal_work_uses_arrival_time(self):
         older = self.make_req("z", 32, arrived=1)
