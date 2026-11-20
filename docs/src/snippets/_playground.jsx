@@ -784,6 +784,20 @@ export const Playground = ({ config }) => {
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        // A pick made before another axis changed (e.g. TP) can be disabled
+        // under the live facts; drop it back to inherit, as the attention axis does.
+        const facts = {
+          ...(sel || {}),
+          dpAttnOn: h.dpAttnOnIn(flags),
+          cpOn: cpEnabledIn(flags),
+          effTp: h.parseIntFlagAny(flags, h.TP_HEADS),
+        };
+        const pickBlocked = (entries, picked) => {
+          const e = picked === null ? null : h.findEntry(entries || [], picked);
+          return !!(e !== null && e !== undefined && h.evaluateChip(e, facts).disabled);
+        };
+        if (pickBlocked(fc.backend?.options, value.backend)) value = { ...value, backend: null };
+        if (pickBlocked(fc.ep?.values, value.ep)) value = { ...value, ep: null };
         if (value.backend !== null) {
           flags = h.stripFlagsByFirstToken(flags, [
             "--moe-a2a-backend", "--moe-runner-backend",
@@ -1048,6 +1062,7 @@ export const Playground = ({ config }) => {
         if (picked && h.evaluateChip(picked, {
           ...sel,
           dpAttnOn: h.dpAttnOnIn(flags),
+          cpOn: cpEnabledIn(flags),
         }).disabled) {
           return { flags, env };
         }
@@ -1887,14 +1902,22 @@ export const Playground = ({ config }) => {
     const pdRoleSel = resolvedCell && resolvedCell.pd ? resolvedCell.pdMode
       : (pdFc && (pdFc.modes || []).length && pdDelta)
         ? pdDelta.mode : ((sel && sel.pdMode) || "off");
+    // Same for the picked speculative algorithm: the attention axis composes
+    // first, and its CP gate must see the algorithm the command ends with.
+    const specPick = ((pgFeatures.speculative && pgFeatures.speculative.options) || [])
+      .find((o) => o.id === allDeltas.speculative && o.id !== "current");
+    let pendingSpecAlgorithm = specPick
+      ? ((findFlagArg(specPick.flags || [], "--speculative-algorithm") || "").toUpperCase() || null)
+      : undefined;
     for (const [axisId, handler] of Object.entries(AXIS_HANDLERS)) {
       const fc = pgFeatures[axisId];
       if (!fc) continue;
       const value = allDeltas[axisId];
       if (value === undefined) continue;
       const derived = derivedMap ? derivedMap[axisId] : null;
-      const specAlgorithm = (findFlagArg(
-        flags, "--speculative-algorithm") || "").toUpperCase() || null;
+      const specAlgorithm = pendingSpecAlgorithm !== undefined ? pendingSpecAlgorithm
+        : (findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase() || null;
+      if (axisId === "speculative") pendingSpecAlgorithm = undefined;
       const liveSel = { ...sel, specAlgorithm, pdMode: pdRoleSel,
         workerNnodes: resolvedCell?.nnodes ?? parseNnodes(sel.nodes) };
       const out = handler.apply({ flags, env, value, fc, sel: liveSel, h: helpers, derived });

@@ -3,15 +3,24 @@
 import batch_invariant_ops  # noqa: F401
 import torch
 import torch_npu
+from sgl_kernel_npu.operators.batch_invariant import (
+    fused_infer_attention_score_batch_invariant,
+    fused_infer_attention_score_batch_invariant_get_max_workspace,
+    fused_infer_attention_score_batch_invariant_infer_output,
+    log_softmax_batch_invariant,
+    matmul_batch_invariant,
+    mm_batch_invariant,
+    reduce_mean_batch_invariant,
+)
 from torch_npu.npu import NpuGraphOpHandler, register_npu_graph_handler
 
 
 def npu_mm_batch_invariant(a, b):
-    return torch.ops.batch_invariant_ops.npu_mm_batch_invariant(a, b)
+    return mm_batch_invariant(a, b)
 
 
 def npu_matmul_batch_invariant(a, b):
-    return torch.ops.batch_invariant_ops.npu_matmul_batch_invariant(a, b)
+    return matmul_batch_invariant(a, b)
 
 
 def npu_mean_batch_invariant(
@@ -19,9 +28,7 @@ def npu_mean_batch_invariant(
 ):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
-        return torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
-            input, dim[0], keepdim=keepdim
-        )
+        return reduce_mean_batch_invariant(input, dim[0], keepdim=keepdim)
     else:
         assert input.dtype in {
             torch.float16,
@@ -36,14 +43,17 @@ def npu_mean_batch_invariant(
 
 def npu_log_softmax_batch_invariant(input, dim, _half_to_float):
     assert not _half_to_float, "not implemented"
-    return torch.ops.batch_invariant_ops.npu_log_softmax_batch_invariant(input, dim=dim)
+    return log_softmax_batch_invariant(input, dim)
 
 
 # Preserve the OpOverloadPacket, including its graph-compatible .out overload.
+# The operator API returns the external packet instead of forwarding the call.
 npu_fused_infer_attention_score_batch_invariant = (
-    torch.ops.batch_invariant_ops.npu_fused_infer_attention_score_batch_invariant
+    fused_infer_attention_score_batch_invariant()
 )
-npu_fia_batch_invariant_get_max_workspace = torch.ops.batch_invariant_ops._npu_fused_infer_attention_score_batch_invariant_get_max_workspace
+npu_fia_batch_invariant_get_max_workspace = (
+    fused_infer_attention_score_batch_invariant_get_max_workspace
+)
 
 
 def npu_add_rms_norm_batch_invariant(
@@ -73,7 +83,6 @@ class NativeFIAGraphHandler(NpuGraphOpHandler):
 
     @classmethod
     def prepare_capture(cls, func, args, kwargs):
-        ops = torch.ops.batch_invariant_ops
         out_op = npu_fused_infer_attention_score_batch_invariant.out
         # graph.update replaces matching kwargs; include optional lengths too.
         kwargs = dict(kwargs)
@@ -98,7 +107,7 @@ class NativeFIAGraphHandler(NpuGraphOpHandler):
         # This helper derives output shapes/dtypes from Q, V and the options
         # above, then allocates (attention_output, softmax_lse) for .out.
         # It does not compute attention; .out fills these buffers.
-        output = ops._npu_fused_infer_attention_score_batch_invariant_infer_output(
+        output = fused_infer_attention_score_batch_invariant_infer_output(
             args[0], args[2], **{k: kwargs[k] for k in keys if k in kwargs}
         )
         kwargs.update(workspace=workspace, out=list(output))

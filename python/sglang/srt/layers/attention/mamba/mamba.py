@@ -48,12 +48,7 @@ if is_cuda() or is_hip():
         causal_conv1d_update,
     )
 elif is_npu():
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu as causal_conv1d_fn,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_update_npu as causal_conv1d_update,
-    )
+    from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
 elif is_xpu():
     # XPU has no native causal_conv1d kernel yet; use the portable Triton
     # implementation for both the "native" and the "_triton" entry points so
