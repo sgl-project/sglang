@@ -314,7 +314,7 @@ class StateView:
             self.replayssm_is_flush = payloads.get("replayssm_is_flush")
             # Parts a request owns (the GDN and KDA speculative rings) are indexed
             # by the request row's unit, the rest by state slot.
-            self.replayssm_request_ring = "replayssm_d" in request_parts
+            self.replayssm_request_ring = "replayssm_g" in request_parts
         if intermediate_conv_window is None:
             self.mamba_cache = self.State(
                 conv=list(conv_views), temporal=temporal_view, **ring_fields
