@@ -218,6 +218,7 @@ class KVArgsRegisterInfo:
     dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dst_aux_item_lens: Optional[List[int]] = None
 
     @property
     def engine_key(self) -> str:
@@ -261,6 +262,12 @@ class KVArgsRegisterInfo:
             if len(payload) > 16 and payload[16]
             else []
         )
+        # Absent from a decode built before the frame existed.
+        dst_aux_item_lens = (
+            list(struct.unpack(f"<{len(payload[17]) // 8}Q", payload[17]))
+            if len(payload) > 17 and payload[17]
+            else None
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -278,6 +285,7 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=dst_dcp_rank,
             dst_state_layer_ids=dst_state_layer_ids,
             dst_kv_layer_ids=dst_kv_layer_ids,
+            dst_aux_item_lens=dst_aux_item_lens,
         )
 
 
@@ -1587,12 +1595,14 @@ class MoriKVManager(CommonKVManager):
         remote_offsets: List[List[int]] = []
         sizes: List[List[int]] = []
         uids = []
+        # validate_aux_buffers admits a decode whose rows are longer than ours.
+        dst_item_lens = peer_info.dst_aux_item_lens or self.kv_args.aux_item_lens
         for i in range(len(self.aux_mem_descs)):
             item_len = self.kv_args.aux_item_lens[i]
             src_descs.append(self.aux_mem_descs[i])
             dst_descs.append(peer_info.dst_aux_mem_descs[i])
             local_offsets.append([prefill_aux_index * item_len])
-            remote_offsets.append([dst_aux_index * item_len])
+            remote_offsets.append([dst_aux_index * dst_item_lens[i]])
             sizes.append([item_len])
             uids.append(self.engine.allocate_transfer_uid())
         statuses = list(
@@ -2029,9 +2039,13 @@ class MoriKVManager(CommonKVManager):
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
 
-        AuxDataCodec.deserialize_data_to_buffer(
-            self.kv_args, buffer_index, aux_index, data
-        )
+        try:
+            AuxDataCodec.deserialize_data_to_buffer(
+                self.kv_args, buffer_index, aux_index, data
+            )
+        except ValueError as exc:
+            logger.error(f"Dropped AUX_DATA for bootstrap_room {room}: {exc}")
+            return
 
     def _submit_kv_transfer(
         self,
@@ -2070,6 +2084,9 @@ class MoriKVManager(CommonKVManager):
                     raise RuntimeError(
                         f"Peer info missing for engine {info.engine_key}"
                     )
+                self.validate_aux_buffers(
+                    peer_info.dst_aux_mem_descs, peer_info.dst_aux_item_lens
+                )
                 targets.append(TransferTarget(info=info, peer_info=peer_info))
 
         result_statuses: List[TransferStatus] = []
@@ -2162,6 +2179,14 @@ class MoriKVManager(CommonKVManager):
             dcp_rank,
             packed_state_layer_ids,
             packed_kv_layer_ids,
+            # Always sent, empty unless exchange_aux_item_lens.
+            (
+                struct.pack(
+                    f"<{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+                if self.exchange_aux_item_lens
+                else b""
+            ),
         ]
 
     def build_receiver_metadata_message(

@@ -126,6 +126,14 @@ class AuxDataCodec:
         """Deserialize bytes into target memory buffer."""
         dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
         item_len = kv_args.aux_item_lens[buffer_index]
+        # A peer with another buffer layout sends another buffer's item here; a
+        # longer one would run past this row.
+        if len(data) > item_len:
+            raise ValueError(
+                f"Metadata item of {len(data)} bytes does not fit buffer "
+                f"{buffer_index}, whose items are {item_len} bytes: the peer has "
+                "a different metadata buffer layout."
+            )
         dst_addr = dst_aux_ptr + item_len * aux_index
         buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
         buffer[:] = data

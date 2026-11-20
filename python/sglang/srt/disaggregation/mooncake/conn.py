@@ -2187,9 +2187,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
             return
 
-        AuxDataCodec.deserialize_data_to_buffer(
-            self.kv_args, buffer_index, aux_index, data
-        )
+        try:
+            AuxDataCodec.deserialize_data_to_buffer(
+                self.kv_args, buffer_index, aux_index, data
+            )
+        except ValueError as exc:
+            logger.error(f"Dropped AUX_DATA for bootstrap_room {room}: {exc}")
+            return
 
         logger.debug(
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
