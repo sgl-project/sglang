@@ -222,6 +222,7 @@ impl AppContext {
                     decode_policy: Default::default(),
                     dp_aware: false,
                     dp_rank_policy: Default::default(),
+                    decode_dp_rank_policy: None,
                     bucket_config: None,
                     reorg_buckets: None,
                     reorg_admission: Default::default(),
