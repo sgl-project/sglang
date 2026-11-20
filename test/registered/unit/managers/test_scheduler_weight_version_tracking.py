@@ -308,6 +308,7 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
+        self.enterContext(get_parallel().override(tp_rank=0, tp_size=1))
         patcher = patch("torch.distributed.barrier")
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -436,6 +437,160 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
+
+
+class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
+    _routes = ("disk", "distributed", "tensor", "ipc")
+
+    def _case(
+        self,
+        route,
+        *,
+        local_error=False,
+        peer_receive_error=False,
+        peer_flush_error=False,
+        peer_draft_error=False,
+        events=None,
+    ):
+        events = [] if events is None else events
+        target, draft = _runner(), _runner()
+
+        def load(*args, **kwargs):
+            events.append("load")
+            if local_error:
+                raise ValueError("local loader failed")
+            return True, "ok"
+
+        def draft_load(*args, **kwargs):
+            events.append("draft_load")
+            return True, "ok"
+
+        for method in (
+            "update_weights_from_disk",
+            "load_weights_from_distributed",
+            "update_weights_from_tensor",
+            "update_weights_from_ipc",
+        ):
+            getattr(target.weight_updater, method).side_effect = load
+            getattr(draft.weight_updater, method).side_effect = draft_load
+
+        manager = self._manager(target, draft)
+
+        def flush(**kwargs):
+            events.append("flush")
+            return True
+
+        manager.flush_cache = flush
+        failed = False
+
+        def gather(outputs, value, group):
+            nonlocal failed
+            events.append("agree")
+            error = None
+            if not failed:
+                if peer_receive_error or (peer_flush_error and "flush" in events):
+                    error = "TP rank 1: peer phase failed"
+                elif peer_draft_error:
+                    if "draft_load" in events:
+                        error = "TP rank 1: peer draft failed"
+                elif not peer_flush_error and "load" in events:
+                    error = "TP rank 1: peer loader failed"
+                failed = error is not None
+            outputs[:] = [value, (0, error)]
+
+        with (
+            get_parallel().override(tp_rank=0, tp_size=2),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            output = getattr(manager, f"update_weights_from_{route}")(_request())
+        return output, manager, draft, events
+
+    def test_peer_load_failure_stops_all_runners_and_preserves_the_version(self):
+        """Rank 0 reported success and loaded the draft after a peer target failed."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, draft, events = self._case(route)
+                self.assertFalse(output.success)
+                self.assertIn("TP rank 1", output.message)
+                self.assertEqual(self.recorded, [])
+                self.assertFalse(manager._session.loaded_weights)
+                self.assertEqual(events.count("flush"), 1)
+                self.assertLess(events.index("agree"), events.index("flush"))
+                for method in (
+                    "update_weights_from_disk",
+                    "load_weights_from_distributed",
+                    "update_weights_from_tensor",
+                    "update_weights_from_ipc",
+                ):
+                    self.assertEqual(
+                        getattr(draft.weight_updater, method).call_count, 0
+                    )
+
+    def test_peer_draft_failure_fails_every_rank_and_preserves_the_version(self):
+        """A draft that loaded here still fails the update when a peer's draft did not,
+        so a mixed engine never records the new version."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, _, events = self._case(route, peer_draft_error=True)
+                self.assertFalse(output.success)
+                self.assertIn("TP rank 1", output.message)
+                self.assertEqual(self.recorded, [])
+                self.assertFalse(manager._session.loaded_weights)
+                self.assertEqual(events.count("draft_load"), 1)
+                self.assertEqual(events.count("flush"), 1)
+
+    def test_local_exception_terminates_without_entering_the_agreement(self):
+        """A rank whose loader raised must not wait in the agreement gather: a healthy
+        peer can sit in graph capture's TP barrier, so the gather would hold the
+        scheduler's termination until a collective timeout."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                events = []
+                with self.assertRaisesRegex(ValueError, "local loader failed"):
+                    self._case(route, local_error=True, events=events)
+                self.assertNotIn("agree", events[events.index("load") :])
+                self.assertEqual(self.recorded, [])
+
+    def test_deserialization_exception_terminates_without_entering_the_agreement(self):
+        """A rank whose tensor intake raised must exit at once rather than wait in the
+        agreement gather, and must not start loading or record a version."""
+        for tp_size in (1, 2):
+            with self.subTest(tp_size=tp_size):
+                target = _runner()
+                manager = self._manager(target)
+                manager.tp_worker.deserialize_own_rank = Mock(
+                    side_effect=ValueError("invalid tensor payload")
+                )
+                with (
+                    get_parallel().override(tp_rank=0, tp_size=tp_size),
+                    patch("torch.distributed.all_gather_object") as gather,
+                    self.assertRaisesRegex(ValueError, "invalid tensor payload"),
+                ):
+                    manager.update_weights_from_tensor(_request())
+                gather.assert_not_called()
+                target.weight_updater.update_weights_from_tensor.assert_not_called()
+                self.assertEqual(self.recorded, [])
+
+    def test_distributed_receive_failure_on_a_peer_prevents_loading_any_runner(self):
+        """A healthy receiver must not start writing while a peer failed intake."""
+        output, _, _, events = self._case("distributed", peer_receive_error=True)
+        self.assertFalse(output.success)
+        self.assertNotIn("load", events)
+        self.assertNotIn("flush", events)
+        self.assertEqual(self.recorded, [])
+
+    def test_peer_flush_failure_is_reported_after_a_successful_load(self):
+        """New weights are recorded, but one rank refusing invalidation fails the RPC."""
+        for route in self._routes:
+            with self.subTest(route=route):
+                self.recorded.clear()
+                output, manager, _, _ = self._case(route, peer_flush_error=True)
+                self.assertFalse(output.success)
+                self.assertIn("peer phase failed", output.message)
+                self.assertEqual(self.recorded, ["v2"])
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
