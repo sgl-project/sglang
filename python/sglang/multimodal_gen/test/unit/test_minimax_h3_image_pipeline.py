@@ -201,9 +201,7 @@ def _rollout_through_the_stages(server, **rollout_fields):
             seed=17,
             num_inference_steps=6,
             rollout=True,
-            rollout_sde_type="cps",
-            rollout_noise_level=0.8,
-            **rollout_fields,
+            **{"rollout_sde_type": "cps", "rollout_noise_level": 0.8, **rollout_fields},
         ),
     )
     req.extra[TEXT] = make_req(server).extra[TEXT]
@@ -229,6 +227,19 @@ def test_rollout_request_returns_its_trajectory_and_conditioning(server):
         "h3_token_tags",
     }
     assert conditioning["encoder_hidden_states"].shape == (3, 5120)
+
+
+@pytest.mark.parametrize(
+    "rollout_fields",
+    [{"rollout_noise_level": 0.0}, {"rollout_sde_type": "ode"}],
+    ids=["noise-level-0", "ode"],
+)
+def test_a_noise_free_rollout_takes_no_noisy_step(server, rollout_fields):
+    """Every step is in the window by default; a window alone would run cps with a zero std, or ode as a noisy type."""
+    trajectory = _rollout_through_the_stages(server, **rollout_fields)
+
+    assert trajectory.rollout_log_probs.shape == (1, 6)
+    assert not trajectory.rollout_log_probs.any()
 
 
 def test_returned_latents_are_a_subset_while_steps_stay_indexed_by_step(server):
