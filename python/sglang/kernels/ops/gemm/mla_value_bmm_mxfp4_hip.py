@@ -72,7 +72,6 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant_kernel(
     EVEN_K: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
-    """Batched A16W4 GEMM with a flattened MXFP4 output epilogue."""
     pid_batch = tl.program_id(axis=0)
     pid = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -226,7 +225,7 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant(
 ) -> None:
     batch, m, _ = x.shape
     _, n, packed_k = w.shape
-    config = _get_fused_config(x, w)
+    config = _get_fused_config(x=x, w=w)
     if config is None:
         bf16_output = torch.empty((m, batch, n), dtype=torch.bfloat16, device=x.device)
         batched_gemm_afp4wfp4_pre_quant(
@@ -293,7 +292,7 @@ def batched_gemm_a16wfp4_flatten_mxfp4_quant(
     x: torch.Tensor, w: torch.Tensor, w_scales: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute batched A16W4 GEMM and emit flattened per-1x32 MXFP4."""
-    if not can_fuse_mla_value_bmm_mxfp4_quant(x, w, w_scales):
+    if not can_fuse_mla_value_bmm_mxfp4_quant(x=x, w=w, w_scales=w_scales):
         raise ValueError(
             "Fused MLA value BMM requires BF16 x, uint8 W/scales, compatible "
             "batched dimensions, and the Kimi N=128, K=512 value shape"
@@ -313,7 +312,9 @@ def batched_gemm_a16wfp4_flatten_mxfp4_quant(
         dtype=torch.uint8,
         device=x.device,
     ).T
-    _batched_gemm_a16wfp4_flatten_mxfp4_quant(x, w, w_scales, out, out_scales)
+    _batched_gemm_a16wfp4_flatten_mxfp4_quant(
+        x=x, w=w, w_scales=w_scales, out=out, out_scales=out_scales
+    )
     return out, out_scales
 
 
