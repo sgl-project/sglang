@@ -54,6 +54,18 @@ USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
+
+# gfx1151 lands on a rocBLAS kernel that degrades sharply with K: the
+# [4096, 12288] x [12288, 4096] projection runs at 16.3 TFLOP/s, while the same
+# FLOPs at K=4096 (and a 3072-wide K) reach 23.6 and 29.7. Accumulating K/N
+# chunks keeps every GEMM on the fast kernel and reaches 22.6 TFLOP/s (1.39x on
+# that shape), at the cost of one extra copy of the weight and a bf16
+# accumulation (not bit-exact with the single GEMM).
+_SPLITK_PARTS = envs.SGLANG_USE_ROCM_SPLITK_GEMM if current_platform.is_gfx1151() else 0
+# Both were measured on gfx1151: at smaller M or K the chunked GEMMs stop
+# filling the CUs and lose to the single call.
+_SPLITK_MIN_M = 2048
+_SPLITK_MIN_K = 8192
 # gfx1250 has no tuned hipBLASLt bf16 kernels. For FLUX.2 shapes FlyDSL's a16w16
 # runs 930-960 TFLOPS vs 650-700 for Inductor's templates and ~880 for tgemm.
 if USE_AITER_GFX1250:
@@ -277,6 +289,70 @@ def apply_unquantized_linear(
     )
 
 
+def splitk_linear_eligible(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> bool:
+    """Whether the gfx1151 K-split GEMM may run this projection."""
+    k = x.shape[-1]
+    return (
+        _SPLITK_PARTS > 1
+        and bias is None
+        and x.dtype is torch.bfloat16
+        and weight.dtype is torch.bfloat16
+        and weight.dim() == 2
+        and weight.shape[1] == k
+        and weight.device == x.device
+        and k >= _SPLITK_MIN_K
+        and k % _SPLITK_PARTS == 0
+        and x.is_contiguous()
+        and x.numel() // k >= _SPLITK_MIN_M
+        and not torch.compiler.is_compiling()
+    )
+
+
+def splitk_linear_chunks(
+    layer: torch.nn.Module, weight: torch.Tensor, parts: int
+) -> tuple[torch.Tensor, ...]:
+    """One transposed, chunk-wide copy of ``weight`` per K chunk, cached on
+    ``layer`` until the weight storage changes (load, ``.to()``, offload).
+
+    The cache is keyed on ``weight.data_ptr()``, so an in-place weight update
+    that keeps the storage (``param.data.copy_``, as in the post-training weight
+    sync) has to clear ``layer._splitk_chunks`` to get fresh copies."""
+    cached = getattr(layer, "_splitk_chunks", None)
+    if cached is not None and cached[0] == weight.data_ptr():
+        return cached[1]
+    n, k = parts, weight.shape[1]
+    kc = k // n
+    # A packed (chunk, N, kc) buffer leaves each GEMM a row stride of kc; reading
+    # the chunks in place would keep the full-K stride and lose ~1.8 s per image.
+    buf = weight.new_empty((n, weight.shape[0], kc))
+    for i in range(n):
+        buf[i].copy_(weight[:, i * kc : (i + 1) * kc])
+    chunks = tuple(buf[i].t() for i in range(n))
+    layer._splitk_chunks = (weight.data_ptr(), chunks)
+    logger.info(
+        "Split-K linear enabled for %s: n=%d k=%d parts=%d",
+        getattr(layer, "prefix", "?"),
+        weight.shape[0],
+        weight.shape[1],
+        n,
+    )
+    return chunks
+
+
+def splitk_linear(x: torch.Tensor, chunks: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """``x @ weight.T`` accumulated over the K chunks held in ``chunks``."""
+    k = x.shape[-1]
+    kc = k // len(chunks)
+    x2d = x.reshape(-1, k)
+    xs = x2d.split(kc, dim=1)
+    out = torch.mm(xs[0], chunks[0])
+    for i in range(1, len(chunks)):
+        torch.addmm(out, xs[i], chunks[i], beta=1.0, alpha=1.0, out=out)
+    return out.view(*x.shape[:-1], chunks[0].shape[1])
+
+
 def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
     """Move the tensors into consecutive rows of one new buffer and leave each a
     view of its rows, so one GEMM can read them all (``rows_of_one_buffer``).
@@ -358,6 +434,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if use_intel_amx_backend(layer):
             return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
+        if splitk_linear_eligible(x, layer.weight, bias):
+            return splitk_linear(
+                x, splitk_linear_chunks(layer, layer.weight, _SPLITK_PARTS)
+            )
         return apply_unquantized_linear(x, layer.weight, bias)
 
 
