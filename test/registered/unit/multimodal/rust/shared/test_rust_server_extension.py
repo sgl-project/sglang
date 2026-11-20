@@ -393,7 +393,9 @@ def build_rust_frame_metadata_fixture() -> dict:
                 send_to_detokenizer=send_to_detokenizer,
                 tree_cache=None,
                 server_args=SimpleNamespace(
-                    enable_hierarchical_cache=False, enable_lmcache=False
+                    enable_hierarchical_cache=False,
+                    enable_lmcache=False,
+                    enable_unified_cache_external_linker=False,
                 ),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.EAGLE,
