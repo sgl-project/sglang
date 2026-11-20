@@ -14,6 +14,7 @@ from http import HTTPStatus
 from queue import Queue
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Iterator,
     NamedTuple,
@@ -86,6 +87,7 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -139,6 +141,7 @@ from sglang.srt.utils.device import get_device_module
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -752,6 +755,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
+
+    def forwards_kv_hints(self) -> bool:
+        controller = self.cache_controller
+        return (
+            self.enable_storage
+            and controller is not None
+            and controller.storage_backend is not None
+            and controller.storage_backend.consumes_kv_hints()
+        )
 
     @rank_consensus(
         same_params=["len(params.key)"],
@@ -2621,6 +2633,29 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    def _storage_read_metadata(
+        self,
+        kv_hints: Optional[KvHintsEnvelope],
+        key: RadixKey,
+        matched_prefix_tokens: Optional[list[int]],
+        last_hash: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        # Binding rehashes the whole prefix, so skip it unless a backend reads it.
+        if not self.forwards_kv_hint_actions(kv_hints):
+            return None
+        metadata: dict[str, Any] = {"kv_hints": kv_hints}
+        if key.extra_key is not None or key.cache_salt is not None:
+            metadata["storage_key_to_event_hash"] = storage_key_to_event_hashes(
+                key,
+                self.page_size,
+                matched_prefix_tokens,
+                last_hash,
+                namespace_seed=self.tree_core.kv_events.namespace_seed(
+                    key.extra_key, key.cache_salt
+                ),
+            )
+        return metadata
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -2629,6 +2664,9 @@ class UnifiedRadixCache(BasePrefixCache):
         prefix_keys: Optional[list[str]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        *,
+        kv_hints: Optional[KvHintsEnvelope] = None,
+        matched_prefix_tokens: Optional[list[int]] = None,
     ) -> int:
         """Probe L3 with the request namespace."""
         if (
@@ -2652,6 +2690,9 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            storage_read_metadata=self._storage_read_metadata(
+                kv_hints, prefetch_key, matched_prefix_tokens, last_hash
+            ),
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
@@ -2674,6 +2715,8 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        *,
+        kv_hints: Optional[KvHintsEnvelope] = None,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2802,6 +2845,9 @@ class UnifiedRadixCache(BasePrefixCache):
             matched_prefix_tokens,
             aux_xfers or None,
             assume_stored=assume_stored,
+            storage_read_metadata=self._storage_read_metadata(
+                kv_hints, prefetch_key, matched_prefix_tokens, last_hash
+            ),
         )
         operation = submission.operation
         if operation is None:

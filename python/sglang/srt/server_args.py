@@ -61,6 +61,11 @@ from sglang.srt.runtime_context import (
     num_dp_ranks_of,
     publish,
 )
+from sglang.srt.sampling.watermarking.redaction import (
+    WATERMARK_SECRET_FIELD_NAMES,
+    redact_watermark_command_line,
+    redact_watermark_secrets,
+)
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -326,12 +331,7 @@ class ServerArgs:
         return getattr(self, "_launch_command", None)
 
     def __repr__(self) -> str:
-        hidden = {
-            "watermark_key",
-            "watermark_key_b",
-            "watermark_config",
-            *SERVER_ARGS_SECRET_FIELD_NAMES,
-        }
+        hidden = {*WATERMARK_SECRET_FIELD_NAMES, *SERVER_ARGS_SECRET_FIELD_NAMES}
         values = ", ".join(
             f"{field.name}={getattr(self, field.name)!r}"
             for field in record_fields(type(self))
@@ -695,9 +695,6 @@ def redact_server_args_secrets(values: dict[str, Any]) -> dict[str, Any]:
     """A copy of a server-args mapping with the credentials and the watermark
     secrets replaced. An unset credential stays None, so readers can still
     tell whether one is configured."""
-    # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-
     return redact_watermark_secrets(
         {
             name: (
@@ -809,9 +806,6 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
-
     server_args._launch_command = redact_watermark_command_line(
         redact_secret_cli_args(argv, parser), raw_args.watermark_config
     )
