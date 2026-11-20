@@ -14,6 +14,13 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -25,6 +32,8 @@ from sglang.srt.managers.schedule_policy import (
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -32,6 +41,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -45,6 +55,9 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    prompt_len: int | None = None,
+    branching: int | None = None,
+    checkpoint_pos: int | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -57,14 +70,18 @@ def _prepare_extend(
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array(
+            "q", [1] * (prefix_len + extend_len if prompt_len is None else prompt_len)
+        ),
         sampling_params=sampling_params,
         vocab_size=128,
+        mamba_checkpoint_pos=checkpoint_pos,
     )
+    req.refresh_fill_ids()
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching
 
     batch = ScheduleBatch(reqs=[req])
     batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
@@ -135,6 +152,273 @@ class TestMambaCheckpointDepth(unittest.TestCase):
         self.assertEqual(
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
+        )
+
+
+class TestMambaTailCheckpointDepth(CustomTestCase):
+    """Tail checkpoints round down to the grid and read intermediate state h."""
+
+    def _track(self, tail_tokens: int, **kwargs):
+        """Return checkpoint depth, tail depth, and kernel tracking position."""
+        with envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.override(tail_tokens):
+            entry, req = _prepare_extend(**kwargs)
+        depth = req.kv.mamba_last_track_seqlen if entry.track_mask else None
+        return depth, req.mamba_tail_seqlen, entry.track_seqlen
+
+    def test_tail_depth_rounds_down_onto_the_grid_and_reads_h(self):
+        for tree_page, tail_tokens, expected in (
+            (CHUNK, 192, 20224),
+            (CHUNK, 227, 20160),
+            (256, 300, 19968),
+        ):
+            with self.subTest(tree_page=tree_page, tail_tokens=tail_tokens):
+                depth, tail, track_seqlen = self._track(
+                    tail_tokens,
+                    tree_page=tree_page,
+                    prefix_len=16384,
+                    extend_len=4066,
+                )
+                self.assertEqual(depth, expected)
+                self.assertEqual(tail, expected)
+                # Intermediate h states use the following tracking position.
+                self.assertEqual(track_seqlen, expected + 1)
+
+    def test_tail_replaces_the_branching_point_of_the_final_forward(self):
+        kwargs = dict(
+            tree_page=CHUNK, prefix_len=16384, extend_len=4066, branching=17408
+        )
+        self.assertEqual(self._track(0, **kwargs)[0], 17408)
+        self.assertEqual(self._track(192, **kwargs)[0], 20224)
+
+    def test_extend_with_no_grid_step_before_the_tail_keeps_the_native_depth(self):
+        # 200 - 192 leaves no whole 64-token step before the tail.
+        self.assertEqual(
+            self._track(192, tree_page=CHUNK, prefix_len=16384, extend_len=200),
+            (16576, None, 16584),
+        )
+
+    def test_forward_that_stops_short_of_the_prompt_end_keeps_the_native_depth(self):
+        depth, tail, _ = self._track(
+            192, tree_page=CHUNK, prefix_len=0, extend_len=16384, prompt_len=20000
+        )
+        self.assertEqual((depth, tail), (16384, None))
+
+    def test_dcp_keeps_the_native_depth(self):
+        kwargs = dict(
+            tree_page=256, prefix_len=16384, extend_len=4066, dcp_enabled=True
+        )
+        self.assertEqual(self._track(192, **kwargs), self._track(0, **kwargs))
+        self.assertEqual(self._track(0, **kwargs)[:2], (20224, None))
+
+    def test_zero_keeps_the_native_depth_and_end_read(self):
+        depth, tail, track_seqlen = self._track(
+            0, tree_page=CHUNK, prefix_len=16384, extend_len=4066
+        )
+        self.assertEqual((depth, tail, track_seqlen), (20416, None, 16384 + 4066))
+
+
+class TestMambaCheckpointPosDepth(CustomTestCase):
+    """Per-request positions override the environment tail depth."""
+
+    PREFIX, EXTEND = 16384, 4066  # prompt end 20450
+
+    def _track(self, pos, tail_tokens=0, **kwargs):
+        """Return checkpoint depth, tail depth, and kernel tracking position."""
+        kwargs = {
+            "tree_page": CHUNK,
+            "prefix_len": self.PREFIX,
+            "extend_len": self.EXTEND,
+            **kwargs,
+        }
+        with envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.override(tail_tokens):
+            entry, req = _prepare_extend(checkpoint_pos=pos, **kwargs)
+        depth = req.kv.mamba_last_track_seqlen if entry.track_mask else None
+        return depth, req.mamba_tail_seqlen, entry.track_seqlen
+
+    def test_position_rounds_down_onto_the_grid_past_the_prefix_and_reads_h(self):
+        for tree_page, pos, expected in (
+            (CHUNK, 18500, 18496),
+            (CHUNK, 18496, 18496),  # already on the grid
+            (CHUNK, 16384 + CHUNK, 16384 + CHUNK),
+            (256, 18500, 18432),
+            (256, 20449, 20224),  # the last token before the end
+        ):
+            with self.subTest(tree_page=tree_page, pos=pos):
+                depth, tail, track_seqlen = self._track(pos, tree_page=tree_page)
+                self.assertEqual((depth, tail), (expected, expected))
+                # Intermediate h states use the following tracking position.
+                self.assertEqual(track_seqlen, expected + 1)
+
+    def test_position_works_with_the_env_var_off(self):
+        self.assertEqual(self._track(18500, tail_tokens=0)[:2], (18496, 18496))
+
+    def test_position_overrides_the_env_depth(self):
+        self.assertEqual(self._track(None, tail_tokens=192)[:2], (20224, 20224))
+        self.assertEqual(self._track(18500, tail_tokens=192)[:2], (18496, 18496))
+        self.assertEqual(self._track(20400, tail_tokens=2048)[:2], (20352, 20352))
+
+    def test_position_replaces_the_branching_point_of_the_final_forward(self):
+        self.assertEqual(self._track(None, branching=17408)[0], 17408)
+        self.assertEqual(self._track(18500, branching=17408)[0], 18496)
+
+    def test_unset_keeps_the_env_behaviour(self):
+        for tail_tokens, expected in ((0, (20416, None)), (192, (20224, 20224))):
+            with self.subTest(tail_tokens=tail_tokens):
+                self.assertEqual(self._track(None, tail_tokens)[:2], expected)
+
+    def test_invalid_position_falls_back_to_the_env_depth_or_main(self):
+        for label, pos, kwargs in (
+            ("at the cached prefix", 16384, {}),
+            ("below the cached prefix", 100, {}),
+            ("negative", -1, {}),
+            ("a grid step short of the prefix", 16384 + CHUNK - 1, {}),
+            ("past the prompt end", 30000, {}),
+            ("past a longer prompt end", 30000, {"prompt_len": 20450}),
+        ):
+            for tail_tokens, expected in (
+                (0, (20416, None)),  # main
+                (192, (20224, 20224)),  # the env var's depth
+            ):
+                with self.subTest(case=label, tail_tokens=tail_tokens):
+                    self.assertEqual(
+                        self._track(pos, tail_tokens, **kwargs)[:2], expected
+                    )
+
+    def test_position_at_the_prompt_end_keeps_the_forward_end_checkpoint(self):
+        # Level 2 publishes the end checkpoint as a tail without changing its read.
+        for extend_len in (self.EXTEND, 4096):
+            end = self.PREFIX + extend_len
+            main = self._track(None, extend_len=extend_len)
+            for tail_tokens in (0, 192):
+                with self.subTest(extend_len=extend_len, tail_tokens=tail_tokens):
+                    depth, tail, track_seqlen = self._track(
+                        end, tail_tokens, extend_len=extend_len
+                    )
+                    self.assertEqual((depth, tail), (main[0], main[0]))
+                    self.assertEqual(track_seqlen, main[2])
+
+    def test_forward_that_stops_short_of_the_prompt_end_ignores_the_position(self):
+        # The requested position is in this chunk, but the prompt ends in a later one.
+        for tail_tokens in (0, 192):
+            with self.subTest(tail_tokens=tail_tokens):
+                depth, tail, _ = self._track(
+                    8000,
+                    tail_tokens,
+                    prefix_len=0,
+                    extend_len=16384,
+                    prompt_len=20000,
+                )
+                self.assertEqual((depth, tail), (16384, None))
+
+    def test_position_in_an_earlier_chunk_is_ignored_by_the_last_forward(self):
+        self.assertEqual(
+            self._track(8000, 0, prefix_len=16384, extend_len=3616, prompt_len=20000)[
+                :2
+            ],
+            (20000 // CHUNK * CHUNK, None),
+        )
+
+    def test_dcp_keeps_the_native_depth(self):
+        kwargs = dict(tree_page=256, dcp_enabled=True)
+        self.assertEqual(self._track(18500, **kwargs)[:2], (20224, None))
+        self.assertEqual(self._track(18500, 192, **kwargs)[:2], (20224, None))
+
+
+class TestMambaCheckpointPosReachesReq(CustomTestCase):
+    """Checkpoint positions survive normalization, tokenization, and scheduler IPC."""
+
+    def setUp(self):
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _tokenized(self, **fields):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.fake_bootstrap_room_counter = 0
+        manager.model_config = SimpleNamespace(vocab_size=128, token_id_vocab_size=128)
+        fields.setdefault("sampling_params", {"max_new_tokens": 1})
+        obj = GenerateReqInput(**fields)
+        obj.normalize_batch_and_arguments()
+        manager.rid_to_state = {
+            rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+            for rid in ([obj.rid] if obj.is_single else obj.rid)
+        }
+        items = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+        out = []
+        for item in items:
+            tokenized = manager._create_tokenized_object(item, "", list(item.input_ids))
+            tokenized.time_stats = None  # Time stats use a separate pickle hop.
+            tokenized.wrap_pickle_fields()
+            tokenized = msgpack_decode(msgpack_encode(tokenized))
+            tokenized.unwrap_pickle_fields()
+            out.append(tokenized)
+        return out
+
+    def _handle(self, recv_req) -> Req:
+        """Build a Req through Scheduler.handle_generate_request."""
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
+        )
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        built = []
+
+        def build(*args, **kwargs):
+            built.append(Req(*args, **kwargs))
+            return built[-1]
+
+        # Stop before queueing; only Req construction is under test.
+        class _Stop(Exception):
+            pass
+
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock(side_effect=_Stop)
+        with (
+            patch("sglang.srt.managers.scheduler.Req", side_effect=build),
+            patch(
+                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                return_value=1,
+            ),
+            self.assertRaises(_Stop),
+        ):
+            scheduler.handle_generate_request(recv_req)
+        (req,) = built
+        return req
+
+    def test_single_request_reaches_req(self):
+        (tokenized,) = self._tokenized(input_ids=[1, 2, 3, 4], mamba_checkpoint_pos=2)
+        self.assertEqual(tokenized.mamba_checkpoint_pos, 2)
+        self.assertEqual(self._handle(tokenized).mamba_checkpoint_pos, 2)
+
+    def test_unset_reaches_req_as_none(self):
+        (tokenized,) = self._tokenized(input_ids=[1, 2, 3, 4])
+        self.assertIsNone(tokenized.mamba_checkpoint_pos)
+        self.assertIsNone(self._handle(tokenized).mamba_checkpoint_pos)
+
+    def test_each_batch_item_keeps_its_own_position(self):
+        tokenized = self._tokenized(
+            input_ids=[[1, 2, 3], [4, 5, 6, 7], [8, 9]],
+            mamba_checkpoint_pos=[2, None, 1],
+        )
+        self.assertEqual(
+            [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, None, 1]
+        )
+
+    def test_parallel_samples_each_carry_the_position(self):
+        tokenized = self._tokenized(
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            mamba_checkpoint_pos=[2, 3],
+            sampling_params={"n": 2, "max_new_tokens": 1},
+        )
+        self.assertEqual(len(tokenized), 4)
+        self.assertEqual(
+            [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, 3, 2, 3]
         )
 
 

@@ -9,8 +9,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH, FINISH_MATCHED_TOKEN
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    prefill_checkpoint_boundary,
+    tail_checkpoint_boundary,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -201,6 +207,110 @@ class TestRequestEndCheckpoints(CustomTestCase):
         cache.checkpoint(req, up_to=8)
         self.assertEqual(_cached_len(cache, PROMPT), 8)
         cache.unlock(req.lock)
+        cache.sanity_check()
+
+
+TAIL = 8
+GRID = 4
+
+
+def _tail_prefilled_req(cache, allocator, pool, tail_tokens, pos=None):
+    """Build a request with the checkpoint depth from its final prefill forward."""
+    tail = tail_checkpoint_boundary(0, len(PROMPT), GRID, tail_tokens, pos)
+    depth = prefill_checkpoint_boundary(0, len(PROMPT), GRID) if tail is None else tail
+    req = _running_req(cache, allocator, pool, up_to=depth)
+    req.extend_end = len(PROMPT)
+    req.mamba_checkpoint_pos = pos
+    req.mamba_tail_seqlen = tail
+    return req
+
+
+class TestTailCheckpointPublish(CustomTestCase):
+    """Tail checkpoints stay reusable through request completion."""
+
+    def _tail_hits(self, level, tail_tokens, pos=None):
+        """Return hits for prompts diverging one and two grid steps before the end."""
+        with envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.override(tail_tokens):
+            cache, allocator, pool = _build(level)
+        req = _tail_prefilled_req(cache, allocator, pool, tail_tokens, pos)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        hits = tuple(
+            _cached_len(cache, PROMPT[:end] + [99])
+            for end in (len(PROMPT) - GRID, len(PROMPT) - 2 * GRID)
+        )
+        cache.unlock(req.lock)
+        cache.sanity_check()
+        return hits
+
+    def test_published_while_running_at_levels_2_and_3(self):
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.assertEqual(self._tail_hits(level, TAIL), (8, 8))
+
+    def test_off_hits_nothing_before_the_prompt_end(self):
+        # Level 2 waits for finish; level 3 publishes the end state during prefill.
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.assertEqual(self._tail_hits(level, 0), (0, 0))
+
+    def test_request_position_publishes_and_hits_at_the_boundary(self):
+        # Position 13 rounds to 12, leaving no state for a prompt diverging at 8.
+        for level in (2, 3):
+            for tail_tokens in (0, TAIL):
+                with self.subTest(level=level, tail_tokens=tail_tokens):
+                    self.assertEqual(
+                        self._tail_hits(level, tail_tokens, pos=13), (12, 0)
+                    )
+
+    def test_request_position_on_the_grid_hits_exactly_there(self):
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.assertEqual(self._tail_hits(level, 0, pos=8), (8, 8))
+
+    def test_invalid_request_position_falls_back_to_the_env_tail_or_main(self):
+        for level in (2, 3):
+            for pos in (0, -5, 3, 99):
+                with self.subTest(level=level, pos=pos):
+                    self.assertEqual(self._tail_hits(level, TAIL, pos=pos), (8, 8))
+                    self.assertEqual(self._tail_hits(level, 0, pos=pos), (0, 0))
+
+    def test_request_position_at_the_prompt_end_publishes_it_while_running(self):
+        # An explicit prompt-end position lets level 2 publish before finish.
+        for level, pos, hit in (
+            (2, len(PROMPT), 16),
+            (2, None, 0),
+            (3, len(PROMPT), 16),
+        ):
+            with self.subTest(level=level, pos=pos):
+                cache, allocator, pool = _build(level)
+                req = _tail_prefilled_req(cache, allocator, pool, 0, pos)
+                cache.checkpoint(req, up_to=len(PROMPT))
+                self.assertEqual(_cached_len(cache, PROMPT + [99]), hit)
+                cache.unlock(req.lock)
+                cache.sanity_check()
+
+    def test_level2_keeps_the_tail_when_the_request_end_state_lands(self):
+        for tail_tokens, pos, hit in ((TAIL, None, 8), (0, 13, 12)):
+            with self.subTest(tail_tokens=tail_tokens, pos=pos):
+                self._check_level2_keeps_the_tail(tail_tokens, pos, hit)
+
+    def _check_level2_keeps_the_tail(self, tail_tokens, pos, hit):
+        cache, allocator, pool = _build(2)
+        mamba = cache.components[ComponentType.MAMBA]
+        self.assertEqual(mamba.mamba_max_states_per_path, 1)
+        with envs.SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.override(tail_tokens):
+            req = _tail_prefilled_req(cache, allocator, pool, tail_tokens, pos)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT[:12] + [99]), hit)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+
+        # The tail stays locked while the finish insert applies the path cap.
+        req.kv.mamba_last_track_seqlen = len(PROMPT)
+        req.finished_reason = FINISH_LENGTH(length=0)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        cache.unlock(req.lock)
+        self.assertEqual(_cached_len(cache, PROMPT), len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT[:12] + [99]), hit)
         cache.sanity_check()
 
 

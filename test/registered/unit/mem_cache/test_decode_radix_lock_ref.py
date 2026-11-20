@@ -104,6 +104,7 @@ class MockReq:
         self.output_ids = array("q", [fill_ids[-1]] if len(fill_ids) > 1 else [])
         self.last_node = last_node
         self.lock = lock
+        self.mamba_hit_lock = None
         self.extra_key = None
         self.cache_salt = None
         self.prefix_len = 0

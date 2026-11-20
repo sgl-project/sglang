@@ -135,6 +135,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
+            mamba_checkpoint_pos=request.mamba_checkpoint_pos,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,

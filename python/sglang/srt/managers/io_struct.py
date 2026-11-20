@@ -216,6 +216,19 @@ def _check_mm_routing_labels(labels, field_name: str, input_count: int) -> None:
             )
 
 
+def _check_mamba_checkpoint_pos(value, *, single: bool) -> None:
+    """Check types here; the scheduler checks whether the position is usable."""
+    if single and isinstance(value, list):
+        raise ValueError("mamba_checkpoint_pos should be an integer for one request.")
+    for entry in value if isinstance(value, list) else [value]:
+        if isinstance(entry, bool) or not (
+            isinstance(entry, int) or (entry is None and not single)
+        ):
+            raise ValueError(
+                "mamba_checkpoint_pos should be an integer token position."
+            )
+
+
 @dataclass
 class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
@@ -434,6 +447,12 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Absolute prompt position for the hybrid model's tail state checkpoint.
+    # Rounded down to the checkpoint grid in the final prefill forward; ignored
+    # outside that forward. Overrides SGLANG_OPT_MAMBA_TAIL_CHECKPOINT_TOKENS.
+    # Batched requests carry one int or None per prompt.
+    mamba_checkpoint_pos: Optional[Union[List[Optional[int]], int]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -629,6 +648,8 @@ class GenerateReqInput:
                 self.input_embeds = [self.input_embeds]
             if self.mm_routing_labels is not None:
                 self.mm_routing_labels = [self.mm_routing_labels]
+            if isinstance(self.mamba_checkpoint_pos, int):
+                self.mamba_checkpoint_pos = [self.mamba_checkpoint_pos]
             # keep each request's media and hashes together, including empty lists
             self.image_data = batch_single_media_input(self.image_data)
             self.video_data = batch_single_media_input(self.video_data)
@@ -675,6 +696,8 @@ class GenerateReqInput:
         self.kv_hints = (
             decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
         )
+        if self.mamba_checkpoint_pos is not None:
+            _check_mamba_checkpoint_pos(self.mamba_checkpoint_pos, single=True)
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -706,6 +729,7 @@ class GenerateReqInput:
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_kv_hints(num)
+        self._normalize_mamba_checkpoint_pos()
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -1020,6 +1044,22 @@ class GenerateReqInput:
         else:
             raise ValueError("cache_salt should be a list or a string.")
 
+    def _normalize_mamba_checkpoint_pos(self):
+        """Normalize mamba_checkpoint_pos for batch processing."""
+        if self.mamba_checkpoint_pos is None:
+            return
+        if not isinstance(self.mamba_checkpoint_pos, list):
+            raise ValueError(
+                "mamba_checkpoint_pos should be a list with one entry per prompt "
+                "for batch processing."
+            )
+        if len(self.mamba_checkpoint_pos) != self.batch_size:
+            raise ValueError(
+                "The length of mamba_checkpoint_pos should be equal to the batch size."
+            )
+        _check_mamba_checkpoint_pos(self.mamba_checkpoint_pos, single=False)
+        self.mamba_checkpoint_pos = self.mamba_checkpoint_pos * self.parallel_sample_num
+
     def _normalize_kv_hints(self, num):
         """Normalize kv_hints for batch processing."""
         if self.kv_hints is None:
@@ -1182,6 +1222,11 @@ class GenerateReqInput:
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
+            mamba_checkpoint_pos=(
+                self.mamba_checkpoint_pos[i]
+                if self.mamba_checkpoint_pos is not None
+                else None
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1328,6 +1373,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
+    # See GenerateReqInput.mamba_checkpoint_pos. Defaults to None for older senders.
+    mamba_checkpoint_pos: Optional[int] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

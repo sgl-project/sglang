@@ -981,7 +981,8 @@ class MambaComponent(TreeComponent):
         self, req: Req, token_ids_len: int, checkpoint_len: int
     ) -> bool:
         """Below checkpoint level 3 a running request publishes a state only at
-        its branching point or, on a PD prefill worker, once its prompt is complete.
+        its branching point or tail checkpoint, or on a PD prefill worker once
+        its prompt is complete.
         A sliding-window tree keeps every chunk: prefill frees window rows only
         behind a checkpoint the tree takes."""
         if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
@@ -991,6 +992,8 @@ class MambaComponent(TreeComponent):
         # so deferred prompts currently remain private to their session.
         branching_seqlen = req.mamba_branching_seqlen
         if branching_seqlen is not None and checkpoint_len == branching_seqlen:
+            return False
+        if checkpoint_len == req.mamba_tail_seqlen:
             return False
         return not (
             get_disagg().disaggregation_mode == "prefill"

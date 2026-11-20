@@ -456,6 +456,8 @@ class CompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # See GenerateReqInput.mamba_checkpoint_pos (one entry per prompt for a batch).
+    mamba_checkpoint_pos: Optional[Union[List[Optional[int]], int]] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1143,6 +1145,8 @@ class ChatCompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # See GenerateReqInput.mamba_checkpoint_pos.
+    mamba_checkpoint_pos: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -2620,6 +2624,8 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    # Mamba tail checkpoint position inferred from the chat template.
+    mamba_checkpoint_pos: Optional[int] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
