@@ -573,6 +573,23 @@ class TestFilterBatch(CustomTestCase):
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
+    def test_seeds_follow_rows_through_merge_and_filter(self):
+        """A merged-in unseeded side gets filler seeds; once the last seeded row
+        leaves, the batch returns to the unseeded samplers."""
+        info = _make_info(batch_size=1)
+        seeded = _make_info(
+            batch_size=1,
+            sampling_seed=torch.tensor([123], dtype=torch.int64),
+            rows_with_seed=[True],
+        )
+        info.merge_batch(seeded)
+        self.assertEqual(info.sampling_seed[1].item(), 123)
+        self.assertEqual(info.rows_with_seed, [False, True])
+
+        info.filter_batch([0], torch.tensor([0]))
+        self.assertIsNone(info.sampling_seed)
+        self.assertIsNone(info.rows_with_seed)
+
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
         info = _make_info(batch_size=3)
@@ -713,6 +730,13 @@ class TestFromScheduleBatch(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
+        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
+        spec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_spec",
+            return_value=self._spec_ns,
+        )
+        spec_patch.start()
+        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -794,6 +818,28 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+
+    def test_seed_without_deterministic_inference(self):
+        """A non-greedy request's seed applies and the other rows get seeds too; a
+        greedy seed, or speculative decoding, leaves the batch unseeded."""
+        batch = MagicMock()
+        batch.device = DEVICE
+        batch.reqs = [self._make_req(seed=123, top_k=50), self._make_req(seed=None)]
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.sampling_seed.shape[0], 2)
+        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.rows_with_seed, [True, False])
+
+        batch.reqs = [self._make_req(seed=123, top_k=1)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
+
+        self._spec_ns.speculative_algorithm = "EAGLE"
+        batch.reqs = [self._make_req(seed=123, top_k=50)]
+        self.assertIsNone(
+            SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE).sampling_seed
+        )
 
     def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""
