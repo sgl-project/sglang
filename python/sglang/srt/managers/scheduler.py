@@ -349,6 +349,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard
 from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.hicache_storage import log_hicache_prefetch_forward_entries
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
@@ -4934,6 +4935,7 @@ class Scheduler(
         )
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        log_hicache_prefetch_forward_entries(can_run_list)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
