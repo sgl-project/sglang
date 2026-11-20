@@ -2383,7 +2383,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_len = self.encoder_lens_cpu[i]
             if encoder_len == 0:
                 continue
-            req.logprob_start_len = max(req.logprob_start_len, encoder_len)
+            # Clamp explicit start positions past the encoder tokens, but preserve
+            # -1 (output logprobs only) so later prefill chunks skip input scoring.
+            if req.logprob_start_len >= 0:
+                req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
