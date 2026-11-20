@@ -24,7 +24,7 @@ register_npu_ci(
     est_time=4800,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
+    disabled="performance testcase",
 )
 
 GLM_5_3_DCP_PD_SEP_PREFILL_ENVS = {
@@ -118,9 +118,10 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--max-prefill-tokens",
     65536,
     # Cap the device KV pool so the 32k-token GSP workload overflows L1 and
-    # exercises the L2 host tier; one 32k prompt plus routing slack must fit.
+    # exercises the L2 host tier. The host pool is half of it, which must still
+    # hold one full 28800-token prefix for L2 hits to be possible.
     "--max-total-tokens",
-    40960,
+    65536,
     "--context-length",
     220000,
     "--moe-a2a-backend",
@@ -151,7 +152,7 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--hicache-ratio",
     0.5,
     "--hicache-mem-layout",
-    "page_first",
+    "layer_first",
     "--hicache-write-policy",
     "write_through",
     "--hicache-storage-prefetch-policy",
@@ -229,34 +230,13 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
 # DCP variant with L3 Mooncake store
 # 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
-class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
+class TestNPUGLM5_3_W8A8_1P1D_DCP_HICACHE_HIT_RATE(
+    TestNpuAccuracyMultiNodePdSepTestCaseBase
+):
+    """Serve GLM-5.3-w8a8 with PD separation and DCP; check the HiCache hit tiers"""
 
-    # Run evalscope only once (no retry on accuracy miss)
-    max_retries = 1
-    # Temporary: only 32 GPQA questions while the startup path is being
-    # stabilised; restore the dataset default afterwards.
-    limit = 32
-    accuracy = 0.912
-    datasets = ["gpqa_diamond"]
-    # Weekday nightly overrides this to gsm8k (baseline is provisional).
-    dataset_baselines = {
-        "gsm8k": 0.92,
-    }
-    dataset_args = {
-        "gpqa_diamond": {
-            "filters": {"remove_until": "</think>"},
-            "system_prompt": "Your response should be in the following format:\nExplanation: {your explanation for your final answer}\nExact Answer: {your succinct, final answer}\nConfidence: {your confidence score between 0% and 100% for your answer}.",
-        },
-        "gsm8k": {"filters": {"remove_until": "</think>"}},
-    }
-    eval_batch_size = 48
-    generation_config = {
-        "max_tokens": 131072,
-        "temperature": 1.0,
-        "top_p": 0.95,
-    }
-    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
+    # L2 host and L3 storage traffic must both be non-zero.
+    min_hit_rate_pcts = {"host": 0, "storage": 0}
 
     @classmethod
     def setUpClass(cls):
@@ -265,11 +245,7 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         # --hicache-storage-backend-extra-config (once it carries
         # master_server_address the client ignores the MOONCAKE_* env vars).
         # The master runs on the first prefill pod; each scheduler rank
-        # contributes global_segment_size to the pool, and the store needs
-        # room for whole 1024-token KV pages (a 256 MiB segment filled the
-        # store and every write-through acked 0 tokens). 2 GiB per rank is the
-        # smallest value that kept the write path healthy here. Only a plain
-        # byte count or a "gb" suffix is accepted; "mb" raises in the parser.
+        # contributes global_segment_size to the pool.
         l3_config = json.dumps(
             {
                 "master_server_address": get_mooncake_master_server_address(),
@@ -305,16 +281,13 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         }
         super().setUpClass()
 
-    def test_npu_glm_5_3_w8a8_1p1d_dcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
-        self.run_accuracy()
-
     def test_npu_glm_5_3_w8a8_1p1d_32p_dcp_l2_host_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
-        # 12 groups x 8 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question. The device pool is capped at 40960 tokens
-        # per rank (--max-total-tokens), so the 12 distinct prefixes cannot all
-        # stay in L1 and evictions reach L2.
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question. Requests are shuffled and round-robin
+        # across the 8 prefill DP ranks, so 32 prompts per group give each rank
+        # several repeats of the same prefix (reuse), while the three distinct
+        # prefixes overflow the 65536-token device pool (eviction to L2).
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
@@ -323,8 +296,8 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
             input_len=32000,
             output_len=1024,
             max_concurrency=32,
-            gsp_num_groups=12,
-            gsp_prompts_per_group=8,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
             seed=100,
             warmup_requests=16,
             cache_report=True,

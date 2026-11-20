@@ -407,6 +407,7 @@ def run_bench_serving(
       - cache_hit_rate_pct: overall KV hit rate across all tiers
       - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
       - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+      - storage_hit_rate_pct: L3 tier hit rate (HiCache storage backend)
     Thresholds for these tiers are declared on the test case as the
     min_hit_rate_pcts class attribute and enforced by assert_metrics,
     which requires cache_report=True to have any values to check.
@@ -633,6 +634,13 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 2:
                         metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
+                elif stripped_line.startswith("Storage:") and stripped_line.endswith(
+                    "%"
+                ):
+                    # L3 (storage backend) hit rate, e.g. "Storage: 19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["storage_hit_rate_pct"] = parts[1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -1114,6 +1122,7 @@ def assert_metrics(self, metrics):
             "cache": "cache_hit_rate_pct",
             "device": "device_hit_rate_pct",
             "host": "host_hit_rate_pct",
+            "storage": "storage_hit_rate_pct",
         }
         unknown_tiers = sorted(set(min_hit_rate_pcts) - set(hit_rate_keys))
         if unknown_tiers:
