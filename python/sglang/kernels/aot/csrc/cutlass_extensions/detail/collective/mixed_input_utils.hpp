@@ -21,9 +21,66 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_conversion.h"
 
+// MXFP4A8: adds NumericArrayConverter<float_e4m3_t, float_e2m1_t, N> so that the
+// DirectConvert path can losslessly upcast MXFP4 weights to e4m3 for fp8xfp8 GMMA.
+// This only ADDS a specialization; the int4b_t->e4m3 path is untouched.
+#include "cutlass_extensions/detail/collective/mxfp4_numeric_conversion.hpp"
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective::detail {
+
+template <class ElementWeight>
+struct DefaultWeightScaleGroupSize;
+
+template <>
+struct DefaultWeightScaleGroupSize<cutlass::float_e2m1_t> {
+  static constexpr int value = 32;
+};
+
+template <>
+struct DefaultWeightScaleGroupSize<cutlass::int4b_t> {
+  static constexpr int value = 128;
+};
+
+using __nv_fp4x8_storage_t = uint32_t;
+using __nv_fp8x8_storage_t = uint64_t;
+
+inline __device__ unsigned prmt(unsigned hi, unsigned lo, unsigned select_code) {
+  unsigned res = 0;
+  asm volatile(
+      "{\n"
+      "prmt.b32 %0, %1, %2, %3;\n"
+      "}\n"
+      : "=r"(res)
+      : "r"(lo), "r"(hi), "r"(select_code));
+  return res;
+}
+
+template <class...>
+using MixedInputVoid = void;
+
+template <class Collective, class = void>
+struct MixedInputFusedE8M0PreMmaScale {
+  static constexpr bool value = false;
+};
+
+template <class Collective>
+struct MixedInputFusedE8M0PreMmaScale<Collective, MixedInputVoid<decltype(Collective::FusedE8M0PreMmaScale)>> {
+  static constexpr bool value = Collective::FusedE8M0PreMmaScale;
+};
+
+template <class Collective, class = void>
+struct MixedInputFoldedWeightScaleStorage {
+  static constexpr bool value = false;
+};
+
+template <class Collective>
+struct MixedInputFoldedWeightScaleStorage<
+    Collective,
+    MixedInputVoid<decltype(Collective::WeightScaleBulkCopyBytes), decltype(Collective::WeightScaleTransactionBytes)>> {
+  static constexpr bool value = true;
+};
 
 template <class Collective>
 struct MixedGroupedGemmInputUtils {
@@ -43,6 +100,8 @@ struct MixedGroupedGemmInputUtils {
   static constexpr auto KernelConversionMode = Collective::KernelConversionMode;
   static constexpr auto ModeHasScales = Collective::ModeHasScales;
   static constexpr auto UseScaleLookupTable = Collective::UseScaleLookupTable;
+  static constexpr bool FusedE8M0PreMmaScale = MixedInputFusedE8M0PreMmaScale<Collective>::value;
+  static constexpr bool HasFoldedWeightScaleStorage = MixedInputFoldedWeightScaleStorage<Collective>::value;
 
  public:
   static constexpr auto elements_per_smem_scale() {
@@ -79,17 +138,28 @@ struct MixedGroupedGemmInputUtils {
   }
 
   static constexpr uint32_t compute_tma_transaction_bytes_extra() {
+    constexpr uint32_t bulk_copy_alignment_bytes = 16;
     if constexpr (KernelConversionMode == ConversionMode::DirectConvert) {
       return 0;
     } else if constexpr (ModeHasScales) {
       constexpr uint32_t scale_tx_bytes = cutlass::bits_to_bytes(
           size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
           static_cast<uint32_t>(cute::sizeof_bits_v<ElementScale>));
-      static_assert(scale_tx_bytes % 128 == 0, "Each scale stage must be 128B aligned.");  // required by TMA
       if constexpr (KernelConversionMode == ConversionMode::ConvertAndScale) {
-        return scale_tx_bytes;
+        if constexpr (FusedE8M0PreMmaScale || HasFoldedWeightScaleStorage) {
+          static_assert(
+              Collective::WeightScaleBulkCopyBytes % bulk_copy_alignment_bytes == 0,
+              "Each folded weight-scale bulk copy must be 16B aligned.");
+          return Collective::WeightScaleTransactionBytes;
+        } else {
+          static_assert(scale_tx_bytes % 128 == 0,
+                        "Each scale stage must be 128B aligned.");  // required by TMA
+          return scale_tx_bytes;
+        }
       } else if constexpr (KernelConversionMode == ConversionMode::ConvertAndScaleWithZero) {
         // Scale and zero share smem layout
+        static_assert(scale_tx_bytes % 128 == 0,
+                      "Each scale stage must be 128B aligned.");  // required by TMA
         constexpr uint32_t zero_tx_bytes = cutlass::bits_to_bytes(
             size<0>(SmemLayoutScale{}) * size<1>(SmemLayoutScale{}) *
             static_cast<uint32_t>(cute::sizeof_bits_v<ElementZero>));
@@ -102,6 +172,19 @@ struct MixedGroupedGemmInputUtils {
     } else {
       static_assert(
           cutlass::detail::dependent_false<KernelSchedule>, "Type not handled in tma transaction bytes computation.");
+    }
+  }
+
+  /// Utilities to copy A from smem to RF
+  template <class SmemTiledCopyA, class TensorASmemView, class TensorACopyView>
+  CUTLASS_DEVICE static void copy_tensors_A(
+      SmemTiledCopyA const& smem_tiled_copy_A,
+      TensorASmemView const& tCsA,
+      TensorACopyView& tCrA_copy_view,
+      int k_block,
+      int read_stage) {
+    if (k_block < size<2>(tCsA.shape())) {
+      copy(smem_tiled_copy_A, tCsA(_, _, k_block, read_stage), tCrA_copy_view(_, _, k_block));
     }
   }
 
@@ -203,6 +286,77 @@ struct MixedGroupedGemmInputUtils {
           : "=r"(r[i])
           : "r"(lut_idx), "r"(sign), "r"(scale_neg_[0]), "r"(scale_neg_[1]), "r"(scale_pos_[0]), "r"(scale_pos_[1]));
     }
+  }
+
+  __device__ __inline__ static void fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+      __nv_fp4x8_storage_t fp4x8_0,
+      __nv_fp4x8_storage_t fp4x8_1,
+      __nv_fp8x8_storage_t& fp8x8_raw_0,
+      __nv_fp8x8_storage_t& fp8x8_raw_1,
+      uint32_t lo_exp_offset,
+      uint32_t hi_exp_offset) {
+    // One WGMMA A operand lane contributes two fp4x8 registers whose low
+    // fp8x4 chunks share one row scale, and high chunks share the other.
+    __nv_fp8x4_storage_t* fp8x4_raw_0 = reinterpret_cast<__nv_fp8x4_storage_t*>(&fp8x8_raw_0);
+    __nv_fp8x4_storage_t* fp8x4_raw_1 = reinterpret_cast<__nv_fp8x4_storage_t*>(&fp8x8_raw_1);
+
+    uint32_t const fp4_raw_0 = reinterpret_cast<uint32_t const&>(fp4x8_0);
+    uint32_t const fp4_raw_1 = reinterpret_cast<uint32_t const&>(fp4x8_1);
+    uint32_t const em_selector_0 = fp4_raw_0 & 0x77777777U;
+    uint32_t const em_selector_1 = fp4_raw_1 & 0x77777777U;
+    constexpr uint32_t fp4_codes_0_to_3_em_bias = 0x0c080000U;
+    constexpr uint32_t fp4_codes_4_to_7_em_bias = 0x1c181410U;
+    uint32_t const lo_l4b_exp_offseted_lut = (lo_exp_offset * 0x08080800U) + fp4_codes_0_to_3_em_bias;
+    uint32_t const lo_h4b_exp_offseted_lut = (lo_exp_offset * 0x08080808U) + fp4_codes_4_to_7_em_bias;
+    uint32_t const hi_l4b_exp_offseted_lut = (hi_exp_offset * 0x08080800U) + fp4_codes_0_to_3_em_bias;
+    uint32_t const hi_h4b_exp_offseted_lut = (hi_exp_offset * 0x08080808U) + fp4_codes_4_to_7_em_bias;
+
+    uint32_t const lo_em_fp8x4_0 = prmt(lo_h4b_exp_offseted_lut, lo_l4b_exp_offseted_lut, em_selector_0);
+    uint32_t const lo_em_fp8x4_1 = prmt(lo_h4b_exp_offseted_lut, lo_l4b_exp_offseted_lut, em_selector_1);
+
+#if defined(CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS)
+    fp8x4_raw_0[0] = (fp4_raw_0 & 0x80808080U) | lo_em_fp8x4_0;
+    fp8x4_raw_1[0] = (fp4_raw_1 & 0x80808080U) | lo_em_fp8x4_1;
+#else
+    uint32_t const hb_sign_fp8x4_0 = fp4_raw_0 & 0x80808080U;
+    uint32_t const hb_sign_fp8x4_1 = fp4_raw_1 & 0x80808080U;
+    uint32_t const lb_sign_fp8x4_0 = (fp4_raw_0 & 0x08080808U) << 4U;
+    uint32_t const lb_sign_fp8x4_1 = (fp4_raw_1 & 0x08080808U) << 4U;
+    uint32_t const l4b_sign_fp8x4_0 = prmt(hb_sign_fp8x4_0, lb_sign_fp8x4_0, 0x5140U);
+    uint32_t const l4b_sign_fp8x4_1 = prmt(hb_sign_fp8x4_1, lb_sign_fp8x4_1, 0x5140U);
+    uint32_t const h4b_sign_fp8x4_0 = prmt(hb_sign_fp8x4_0, lb_sign_fp8x4_0, 0x7362U);
+    uint32_t const h4b_sign_fp8x4_1 = prmt(hb_sign_fp8x4_1, lb_sign_fp8x4_1, 0x7362U);
+
+    fp8x4_raw_0[0] = l4b_sign_fp8x4_0 | lo_em_fp8x4_0;
+    fp8x4_raw_1[0] = l4b_sign_fp8x4_1 | lo_em_fp8x4_1;
+#endif
+
+    uint32_t const hi_em_fp8x4_0 = prmt(hi_h4b_exp_offseted_lut, hi_l4b_exp_offseted_lut, em_selector_0 >> 16U);
+    uint32_t const hi_em_fp8x4_1 = prmt(hi_h4b_exp_offseted_lut, hi_l4b_exp_offseted_lut, em_selector_1 >> 16U);
+
+#if defined(CUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS)
+    fp8x4_raw_0[1] = ((fp4_raw_0 << 4U) & 0x80808080U) | hi_em_fp8x4_0;
+    fp8x4_raw_1[1] = ((fp4_raw_1 << 4U) & 0x80808080U) | hi_em_fp8x4_1;
+#else
+    fp8x4_raw_0[1] = h4b_sign_fp8x4_0 | hi_em_fp8x4_0;
+    fp8x4_raw_1[1] = h4b_sign_fp8x4_1 | hi_em_fp8x4_1;
+#endif
+  }
+
+  template <class EngineIn, class LayoutIn, class EngineOut, class LayoutOut>
+  CUTLASS_DEVICE static void fp4tofp8_fused_e8m0_pre_mma_convert_pair(
+      Tensor<EngineIn, LayoutIn> const& src0,
+      Tensor<EngineIn, LayoutIn> const& src1,
+      Tensor<EngineOut, LayoutOut>& dst0,
+      Tensor<EngineOut, LayoutOut>& dst1,
+      uint32_t lo_exp_offset,
+      uint32_t hi_exp_offset) {
+    auto&& src0_ = cute::recast<__nv_fp4x8_storage_t>(src0)(0);
+    auto&& src1_ = cute::recast<__nv_fp4x8_storage_t>(src1)(0);
+    auto&& dst0_ = cute::recast<__nv_fp8x8_storage_t>(dst0)(0);
+    auto&& dst1_ = cute::recast<__nv_fp8x8_storage_t>(dst1)(0);
+
+    fp4tofp8_fused_e8m0_pre_mma_convert_pair(src0_, src1_, dst0_, dst1_, lo_exp_offset, hi_exp_offset);
   }
 
   /// Utilities to dequantize A.
@@ -373,6 +527,160 @@ struct MixedGroupedGemmInputUtils {
     for (int i = 0; i < size<1>(dst_vm); ++i) {
       LayoutAwareConvert(src_vm(_, i), dst_vm(_, i));
     }
+  }
+
+  template <
+      int KBlock,
+      class EngineIn,
+      class EngineOut,
+      class LayoutIn,
+      class LayoutOut,
+      class EngineScale,
+      class LayoutScale>
+  CUTLASS_DEVICE static void convert_A_kblock_fused_e8m0_pre_mma_raw_scale_to_slot(
+      Tensor<EngineIn, LayoutIn> const& tCrA_load,
+      Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+      Tensor<EngineScale, LayoutScale>& scale_values,
+      cute::Int<KBlock>) {
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineScale>::value, "Scale tensor for A conversion must come from registers");
+    using SrcType = typename EngineIn::value_type;
+    using ScaleScalar = ElementScale;
+    static_assert(
+        cute::is_same_v<typename EngineScale::value_type, ScaleScalar>,
+        "Raw fused e8m0 scale tensor must use scalar e8m0 elements.");
+
+    Tensor src = tCrA_load(_, _, cute::Int<KBlock>{});
+    Tensor dst = tCrA_mma_slot;
+    Tensor scales = scale_values(_, _, cute::Int<KBlock>{});
+
+    CUTE_STATIC_ASSERT_V(
+        size(src(_, 0)) == cosize(src(_, 0).layout()), "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
+    CUTE_STATIC_ASSERT_V(size(src) == size(scales));
+
+    int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value, ceil_div(32, sizeof_bits_v<SrcType>));
+    Tensor src_vm = cute::group_modes<1, -1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+    Tensor dst_vm = cute::group_modes<1, -1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+    Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, Int<NumValPerSrcReg>{}));
+
+    auto scale_values_0 = cute::filter(scales_vm(_, Int<0>{}));
+    constexpr int ScaleValueCount = decltype(size(scale_values_0))::value;
+    constexpr int DstVecCount = decltype(size<1>(dst_vm))::value;
+    static_assert(
+        ScaleValueCount == 2 || ScaleValueCount == NumValPerSrcReg,
+        "Fused e8m0 pre-MMA raw scale expects either two compact row scales or one scale per fp4 lane.");
+    static_assert(
+        (DstVecCount % 2) == 0, "Fused e8m0 pre-MMA pair conversion expects an even number of fp4x8 operands.");
+
+    constexpr int HiScaleIndex = (ScaleValueCount == NumValPerSrcReg) ? (NumValPerSrcReg / 2) : 1;
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < DstVecCount; i += 2) {
+      auto row_scales = cute::filter(scales_vm(_, i));
+      ScaleScalar const lo_scale = row_scales(0);
+      ScaleScalar const hi_scale = row_scales(HiScaleIndex);
+      uint32_t const lo_exp_offset = static_cast<uint32_t>(lo_scale.storage);
+      uint32_t const hi_exp_offset = static_cast<uint32_t>(hi_scale.storage);
+      auto src_vec0 = src_vm(_, i);
+      auto src_vec1 = src_vm(_, i + 1);
+      auto dst_vec0 = dst_vm(_, i);
+      auto dst_vec1 = dst_vm(_, i + 1);
+      fp4tofp8_fused_e8m0_pre_mma_convert_pair(src_vec0, src_vec1, dst_vec0, dst_vec1, lo_exp_offset, hi_exp_offset);
+    }
+  }
+
+  template <
+      int KBlock,
+      int ScalePairCount,
+      class EngineScale,
+      class LayoutScale,
+      class LoOffsetArray,
+      class HiOffsetArray>
+  CUTLASS_DEVICE static void cache_A_kblock_fused_e8m0_pre_mma_exp_offsets(
+      Tensor<EngineScale, LayoutScale> const& scales,
+      cute::Int<KBlock>,
+      cute::Int<ScalePairCount>,
+      LoOffsetArray& lo_exp_offsets,
+      HiOffsetArray& hi_exp_offsets) {
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    using ScaleScalar = typename EngineScale::value_type;
+    constexpr int NumValPerSrcReg = 8;
+    Tensor scales_vm = cute::group_modes<1, -1>(cute::zipped_divide(scales, Int<NumValPerSrcReg>{}));
+    static_assert(
+        decltype(size<1>(scales_vm))::value == ScalePairCount * 2,
+        "Fused e8m0 pre-MMA scale tensor must match A operand pair layout.");
+
+    cute::for_each(cute::make_seq<ScalePairCount>{}, [&](auto pair_c) {
+      constexpr int pair = decltype(pair_c)::value;
+      constexpr int scale_vec = pair * 2;
+      Tensor row_scales = scales_vm(_, Int<scale_vec>{});
+      constexpr int ScaleValueCount = decltype(size(row_scales))::value;
+      static_assert(
+          ScaleValueCount == 2 || ScaleValueCount == NumValPerSrcReg,
+          "Fused e8m0 pre-MMA raw scale expects either two compact row scales or one scale per fp4 lane.");
+      constexpr int HiScaleIndex = (ScaleValueCount == NumValPerSrcReg) ? (NumValPerSrcReg / 2) : 1;
+      ScaleScalar const lo_scale = row_scales(0);
+      ScaleScalar const hi_scale = row_scales(HiScaleIndex);
+      constexpr int cache_index = KBlock * ScalePairCount + pair;
+      lo_exp_offsets[cache_index] = static_cast<uint32_t>(lo_scale.storage);
+      hi_exp_offsets[cache_index] = static_cast<uint32_t>(hi_scale.storage);
+    });
+  }
+
+  template <
+      int KBlock,
+      int ScalePairCount,
+      class EngineIn,
+      class EngineOut,
+      class LayoutIn,
+      class LayoutOut,
+      class LoOffsetArray,
+      class HiOffsetArray>
+  CUTLASS_DEVICE static void convert_A_kblock_fused_e8m0_pre_mma_exp_offsets_to_slot(
+      Tensor<EngineIn, LayoutIn> const& tCrA_load,
+      Tensor<EngineOut, LayoutOut>& tCrA_mma_slot,
+      cute::Int<KBlock>,
+      cute::Int<ScalePairCount>,
+      LoOffsetArray const& lo_exp_offsets,
+      HiOffsetArray const& hi_exp_offsets) {
+    static_assert(FusedE8M0PreMmaScale, "This helper is only for fused e8m0 pre-MMA scale.");
+    static_assert(is_rmem<EngineIn>::value, "Input tensor for A conversion must come from registers");
+    static_assert(is_rmem<EngineOut>::value, "Output tensor for A conversion must come from registers");
+    using SrcType = typename EngineIn::value_type;
+
+    Tensor src = tCrA_load(_, _, cute::Int<KBlock>{});
+    Tensor dst = tCrA_mma_slot;
+
+    CUTE_STATIC_ASSERT_V(
+        size(src(_, 0)) == cosize(src(_, 0).layout()), "The first mode of tensor src must be contiguous in memory");
+    CUTE_STATIC_ASSERT_V(size(src) == size(dst));
+
+    int constexpr NumValPerSrcReg = cute::min(decltype(size(src(_, 0)))::value, ceil_div(32, sizeof_bits_v<SrcType>));
+    Tensor src_vm = cute::group_modes<1, -1>(cute::zipped_divide(src, Int<NumValPerSrcReg>{}));
+    Tensor dst_vm = cute::group_modes<1, -1>(cute::zipped_divide(dst, Int<NumValPerSrcReg>{}));
+
+    constexpr int DstVecCount = decltype(size<1>(dst_vm))::value;
+    static_assert(
+        (DstVecCount % 2) == 0, "Fused e8m0 pre-MMA pair conversion expects an even number of fp4x8 operands.");
+    static_assert(
+        ScalePairCount * 2 == DstVecCount,
+        "Fused e8m0 pre-MMA scale cache must provide one scale pair per fp4x8 operand pair.");
+
+    cute::for_each(cute::make_seq<ScalePairCount>{}, [&](auto pair_c) {
+      constexpr int pair = decltype(pair_c)::value;
+      constexpr int i = pair * 2;
+      auto src_vec0 = src_vm(_, i);
+      auto src_vec1 = src_vm(_, i + 1);
+      auto dst_vec0 = dst_vm(_, i);
+      auto dst_vec1 = dst_vm(_, i + 1);
+      constexpr int cache_index = KBlock * ScalePairCount + pair;
+      uint32_t const lo_exp_offset = lo_exp_offsets[cache_index];
+      uint32_t const hi_exp_offset = hi_exp_offsets[cache_index];
+      fp4tofp8_fused_e8m0_pre_mma_convert_pair(src_vec0, src_vec1, dst_vec0, dst_vec1, lo_exp_offset, hi_exp_offset);
+    });
   }
 
   /// Utilities for any additional inputs inside of the TMA load
