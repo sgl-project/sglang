@@ -99,6 +99,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
+)
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -184,6 +187,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1835,7 +1839,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
-        with self.model_context():
+        # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
+        with (
+            self.model_context(),
+            get_foundry_adapter().capture_scope(
+                phase="prefill",
+                model=self.model_runner.model,
+                # Read only when active: a test may drive capture() on a stand-in.
+                req_slots=self._capture_req_slots
+                if get_foundry_adapter().enabled
+                else None,
+                flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
+                    self.model_runner
+                ),
+            ),
+        ):
             self._capture()
 
     def _capture(self) -> None:
@@ -2168,6 +2186,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            input_candidate_selectors=forward_batch.input_candidate_selectors,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,

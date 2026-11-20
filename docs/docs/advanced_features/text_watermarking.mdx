@@ -8,6 +8,8 @@ SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The waterm
 
 This feature can support transparency controls such as the machine-readable marking and detectability described in [Article 50 of the EU AI Act](https://eur-lex.europa.eu/eli/reg/2024/1689/oj). It is one technical signal, not a complete compliance program or proof of authorship.
 
+This page describes Aaronson-Gumbel (`--watermark-algorithm gumbel`, the default); for SynthID Text see [SynthID Text Watermarking](/docs/advanced_features/synthid_text_watermarking).
+
 ## How it works
 
 ### Generation
@@ -89,7 +91,7 @@ A low p-value is evidence that the text carries the keyed watermark. It is not a
 
 ## Server configuration
 
-`--enable-watermark` turns the feature on; every other watermark setting lives in one JSON object passed with `--watermark-config`, either as a file path or inline. Restrict the file to the server account and launch a CUDA server:
+`--enable-watermark` turns the feature on and `--watermark-algorithm` selects the algorithm; `gumbel` is the default. Every other watermark setting lives in one JSON object passed with `--watermark-config`, either as a file path or inline. Restrict the file to the server account and launch a CUDA server:
 
 ```json
 {
@@ -271,7 +273,7 @@ print(result.combined.p_value, result.key_a_partition.p_value, result.key_b_part
 
 ### Standalone, without SGLang or PyTorch
 
-`detector.py` and `config.py` import only the Python standard library and `msgspec`, and the package's `__init__.py` imports only the detector. NumPy arrays are accepted as token-ID iterables, but NumPy is not required. To run detection in a separate application, copy the package directory and install `msgspec`:
+`gumbel/detector.py` and `config.py` import only the Python standard library and `msgspec`, and the package's `__init__.py` imports only the detector. NumPy arrays are accepted as token-ID iterables, but NumPy is not required. To run detection in a separate application, copy the package directory and install `msgspec`:
 
 ```bash
 mkdir -p detector_app
@@ -279,10 +281,10 @@ cp -R python/sglang/srt/sampling/watermarking detector_app/watermarking
 python -m pip install msgspec
 ```
 
-The copy also contains `core.py`, the server runtime, which imports PyTorch; nothing on the detector import path loads it. Run the application with `detector_app` on the import path and import the detector from the copied package:
+The copy also contains the server runtime, which imports PyTorch; nothing on the detector import path loads it. Run the application with `detector_app` on the import path and import the detector from the copied package:
 
 ```python
-from watermarking.detector import WatermarkDetector
+from watermarking.gumbel.detector import WatermarkDetector
 
 single = WatermarkDetector("0123456789abcdef", context_window=4)
 result = single.detect_tokens(completion_ids, prompt_token_ids=prompt_ids)
@@ -296,7 +298,7 @@ Text detection needs only an object with `encode(text, *, add_special_tokens)` t
 ```python
 from tokenizers import Tokenizer
 
-from watermarking.detector import WatermarkDetector
+from watermarking.gumbel.detector import WatermarkDetector
 
 
 class TokenizerAdapter:
