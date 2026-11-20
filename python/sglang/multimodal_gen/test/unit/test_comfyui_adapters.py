@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pack / unpack contract for ComfyUI model adapters."""
 
+import copy
 import importlib
 import sys
 import types
@@ -472,3 +473,16 @@ def test_control_is_rejected_for_adapters_that_do_not_apply_it() -> None:
         )
     assert FluxAdapter.applied_conditioning == ("control",)
     assert ZImageAdapter.applied_conditioning == ()
+
+
+def test_executor_transformer_blocks_access_raises_clear_error() -> None:
+    ex = _RowRecordingExecutor(ZImageAdapter())
+    # Fun ControlNet's register() reads it this way.
+    with pytest.raises(
+        ValueError, match=r"model patches \(diffusion_model\.transformer_blocks\)"
+    ):
+        len(ex.transformer_blocks)
+    # Attribute probes still see a missing attribute.
+    assert not hasattr(ex, "transformer_blocks")
+    assert getattr(ex, "transformer_blocks", None) is None
+    assert not hasattr(copy.deepcopy(ex), "transformer_blocks")
