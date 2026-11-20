@@ -66,7 +66,10 @@ class _State(NamedTuple):
 
 @cache_once
 def _get_state() -> Optional[_State]:
-    explicit = envs.SGLANG_K3_AR_FUSION.is_set()
+    explicit = (
+        envs.SGLANG_K3_AR_FUSION.is_set()
+        or envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get()
+    )
     if explicit:
         if not envs.SGLANG_K3_AR_FUSION.get():
             return None
@@ -182,8 +185,8 @@ def _create_buffer(
     )
     _BUFS.append(buf)
     logger.info(
-        "K3 symm buffer %r: %d rows x %d, %.1f MB (rendezvoused once on first "
-        "use; no per-forward symmetric allocation)",
+        "K3 symm buffer %r: %d rows x %d, %.1f MB (rendezvoused once; no "
+        "per-forward symmetric allocation)",
         name,
         max_rows,
         width,
@@ -236,6 +239,32 @@ def get_mc_ptr(x: torch.Tensor) -> int:
     mc = find_mc_ptr(x)
     assert mc is not None, "K3 fused pull input is not a symm_buffer slice"
     return mc
+
+
+@cache_once
+def register_sp_collective_comm() -> bool:
+    """Register the TP workspace's communicator with ``sp_collective``, whose
+    direct ops barrier on it; False when another communicator owns this TP size."""
+    from sglang.kernels.ops.communication import sp_collective
+
+    state = _get_state()
+    assert state is not None
+    try:
+        sp_collective.register_comm(
+            state.lease.get_communicator, world_size=state.world_size
+        )
+    except AssertionError:
+        return False
+    return True
+
+
+def try_symm_buffer(
+    name: str, rows: int, width: int, dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    """TP-group :func:`symm_buffer`, or None when ``rows`` exceeds its reserved rows."""
+    if rows > _max_buffer_rows():
+        return None
+    return symm_buffer(name, rows, width, dtype)
 
 
 def all_reduce(
