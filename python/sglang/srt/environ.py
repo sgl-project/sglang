@@ -487,6 +487,7 @@ class Envs:
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_FORWARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -1070,6 +1071,16 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # gfx950: BF16/FP16 unquantized linears without bias run the vendored tlx.ops.mm
+    # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_GEMM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: residual-stream boundaries that need no FP8 or router copy of their output run the
+    # vendored tlx.ops.norm_residual_norm (sglang.kernels.ops.layernorm.tlx) instead of the fused Triton kernel,
+    # and the fused unpooler + FFN boundary (2-16 rows) runs the TLX mm before it. Needs TLX (uTLX or fbtriton).
+    SGLANG_USE_TLX_BOUNDARY_NORM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: FP32 MoE router logits outside the shared router + pooler front run the vendored
+    # tlx.ops.router_gemm (plain Triton) on an [E, K] copy of each router weight, 8 MiB per MoE layer.
+    SGLANG_USE_TLX_ROUTER_GEMM = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
@@ -1855,8 +1866,6 @@ class Envs:
     # Defer the TP gather of an unsoftcapped target-verify vocab shard. The DFLASH
     # sampled and megakernel accept paths defer it unless this is set to 0.
     SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
-    # Capture the megakernel post-verify tail as CUDA graphs.
-    SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH = EnvBool(False)
     # Split the DFLASH draft's context fc across TP by output columns.
     SGLANG_OPT_DFLASH_TP_AUX_FC = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
@@ -2056,6 +2065,7 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_DISABLE_THP = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
@@ -2321,6 +2331,9 @@ class Envs:
     # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
     # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
     SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
+    # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
+    # for the tokens this rank dispatches.
+    SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
