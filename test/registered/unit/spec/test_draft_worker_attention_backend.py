@@ -11,7 +11,7 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import attention_registry
 from sglang.srt.layers.attention.attention_registry import NonCausalDraftAttention
-from sglang.srt.runtime_context import override_platform
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import draft_worker_common
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -34,22 +34,13 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
         unified_memory=False,
         deterministic=False,
     ):
-        spec = SimpleNamespace(
-            speculative_algorithm=algorithm,
-            speculative_draft_attention_backend=named_backend,
-        )
-        memory = SimpleNamespace(enable_unified_memory=unified_memory)
-        exec_bag = SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
-        )
         with (
-            patch.object(draft_worker_common, "get_spec", return_value=spec),
-            patch.object(draft_worker_common, "get_memory", return_value=memory),
-            patch.object(draft_worker_common, "get_exec", return_value=exec_bag),
-            patch.object(
-                draft_worker_common,
-                "attention_backends",
-                return_value=("aiter", "aiter"),
+            get_context().override_server_args(
+                speculative_algorithm=algorithm,
+                speculative_draft_attention_backend=named_backend,
+                attention_backend="aiter",
+                enable_unified_memory=unified_memory,
+                enable_deterministic_inference=deterministic,
             ),
             patch(
                 "sglang.srt.utils.aiter.aiter_unified_attention_supports_non_causal",
