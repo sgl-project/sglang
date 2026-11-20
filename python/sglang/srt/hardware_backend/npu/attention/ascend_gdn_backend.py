@@ -11,6 +11,7 @@ from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -23,6 +24,18 @@ fused_gdn_gating = fused_gdn_gating_npu
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        if fm in (
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            # State indices are snapshotted by metadata preparation; draft extend
+            # skips this backend entirely.
+            return SharedReadEnds.PRE_REPLAY
+        return super().shared_read_ends(fm)
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = torch.Size(

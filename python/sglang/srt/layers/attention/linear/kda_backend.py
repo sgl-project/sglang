@@ -9,6 +9,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillGraphMetadata,
@@ -44,6 +45,7 @@ elif is_cpu():
 
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -485,6 +487,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        if is_npu() and fm in (
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+        ):
+            # NPU consumes the state-index snapshot prepared outside the graph.
+            return SharedReadEnds.PRE_REPLAY
+        return super().shared_read_ends(fm)
 
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)

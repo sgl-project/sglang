@@ -10,11 +10,7 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import (
-    AttentionArch,
-    is_deepseek_dsa,
-    is_glm_moe_dsa,
-)
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -569,31 +565,17 @@ class AscendAttnBackend(AttentionBackend):
         self._shared_read_runner = model_runner
 
     def _supports_shared_read(self, model_runner: ModelRunner) -> bool:
-        if (
-            self.use_dsa
-            and is_glm_moe_dsa(model_runner.model_config.hf_config)
-            and get_parallel().pp_size == 1
-            # Host-only Mamba backups rely on the whole-forward fence.
-            and not envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get()
-            and not self.enable_sparsity_driven_kv_offload
-            and (
-                model_runner.spec_algorithm.is_none()
-                or (
-                    model_runner.spec_algorithm is SpeculativeAlgorithm.EAGLE
-                    and not get_spec().enable_multi_layer_eagle
-                )
-            )
+        if not (
+            model_runner.spec_algorithm.is_none()
+            or model_runner.spec_algorithm is SpeculativeAlgorithm.EAGLE
         ):
-            disagg = get_disagg()
-            if (
-                # Decode offload copies KV on a stream without a forward fence.
-                disagg.disaggregation_mode == "decode"
-                and disagg.disaggregation_decode_enable_offload_kvcache
-            ):
-                return False
-
-            return True
-        return False
+            return False
+        disagg = get_disagg()
+        # Decode offload copies KV on a stream without a forward fence.
+        return not (
+            disagg.disaggregation_mode == "decode"
+            and disagg.disaggregation_decode_enable_offload_kvcache
+        )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         if not self.shared_read_enabled:
@@ -604,11 +586,19 @@ class AscendAttnBackend(AttentionBackend):
             return SharedReadEnds.PRE_REPLAY
         return SharedReadEnds.UNKNOWN
 
-    def _publish_eager_shared_read_done(self, forward_batch: ForwardBatch) -> None:
+    def _publish_eager_shared_read_done(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        read_end: SharedReadEnds = SharedReadEnds.PRE_REPLAY,
+    ) -> None:
         # The final eager preparation replaces any earlier phase's event.
         runner = self._shared_read_runner
         runner.shared_read_done_event = None
-        if envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
+        if (
+            read_end is not SharedReadEnds.PRE_REPLAY
+            or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+        ):
             return
         mode = forward_batch.forward_mode
         if mode.is_draft_extend_v2() and not has_forward_context():
@@ -728,7 +718,9 @@ class AscendAttnBackend(AttentionBackend):
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, publish_read_done: bool = True
+    ):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
@@ -1032,7 +1024,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
-        if self.shared_read_enabled:
+        if self.shared_read_enabled and publish_read_done:
             self._publish_eager_shared_read_done(forward_batch)
 
     def _prepare_quant_flash_attn_metadata(

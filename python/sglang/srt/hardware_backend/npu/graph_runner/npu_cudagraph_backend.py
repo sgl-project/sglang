@@ -90,10 +90,7 @@ class NPUCudaGraphBackend(BaseGraphBackend):
     @cached_property
     def supports_shared_read_events(self) -> bool:
         runner = self._decode_runner
-        attn = getattr(runner, "attn_backend", None)
-        full = getattr(attn, "full_attn_backend", attn)
-        if not getattr(full, "shared_read_enabled", False):
-            return False
+        attn = runner.attn_backend
         # A hybrid runner can only publish once every child has finished its reads.
         return (
             attn.shared_read_ends(runner.capture_forward_mode)
