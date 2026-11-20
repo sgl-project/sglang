@@ -176,8 +176,7 @@ def _load_fused_indexer_wk(
     if fused_param is None or fused_param.dtype != torch.bfloat16:
         return False
 
-    # wk fills the top rows and weights_proj the bottom rows. A bf16 checkpoint
-    # copies straight in; block-fp8 needs weight + scale.
+    # A bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         rows = _clone_if_runai_streamed_tensor(loaded_weight)
@@ -256,7 +255,7 @@ class _PendingWeightHalves:
     them across load_weights calls: a chunked online update can split a pair."""
 
     # q_a_proj / kv_a_proj_with_mqa tensors by name, fused into fused_qkv_a_proj_with_mqa
-    a_proj: Dict[str, torch.Tensor] = field(default_factory=dict)
+    qkv_a_proj: Dict[str, torch.Tensor] = field(default_factory=dict)
     # fp8 indexer wk / weights_proj weights and block scales, fused into
     # wk_weights_proj: {checkpoint module name: {name suffix: tensor}}
     indexer_wk_weights_proj: Dict[str, Dict[str, torch.Tensor]] = field(
@@ -326,7 +325,7 @@ class DeepseekV2WeightLoaderMixin:
             self.config.q_lora_rank is not None
         )
         pending_halves = self._get_pending_weight_halves()
-        cached_a_proj = pending_halves.a_proj
+        pending_qkv_a_proj = pending_halves.qkv_a_proj
         pending_indexer_wk = pending_halves.indexer_wk_weights_proj
 
         if self.num_fused_shared_experts > 0:
@@ -509,7 +508,7 @@ class DeepseekV2WeightLoaderMixin:
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
                             # The caller may reuse its buffer while the half waits.
-                            cached_a_proj[name] = loaded_weight.clone()
+                            pending_qkv_a_proj[name] = loaded_weight.clone()
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
@@ -523,11 +522,11 @@ class DeepseekV2WeightLoaderMixin:
 
                             # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
                             if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
+                                q_a_proj_name in pending_qkv_a_proj
+                                and kv_a_proj_name in pending_qkv_a_proj
                             ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                                q_a_proj_weight = pending_qkv_a_proj[q_a_proj_name]
+                                kv_a_proj_weight = pending_qkv_a_proj[kv_a_proj_name]
 
                                 fused_weight = fuse_qkv_a_proj_tensors(
                                     name,
@@ -553,8 +552,8 @@ class DeepseekV2WeightLoaderMixin:
                                     logger.warning(
                                         f"{param_name} not found in params_dict."
                                     )
-                                    cached_a_proj.pop(q_a_proj_name, None)
-                                    cached_a_proj.pop(kv_a_proj_name, None)
+                                    pending_qkv_a_proj.pop(q_a_proj_name, None)
+                                    pending_qkv_a_proj.pop(kv_a_proj_name, None)
                                     continue
                                 param = params_dict[param_name]
 
@@ -568,8 +567,8 @@ class DeepseekV2WeightLoaderMixin:
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
+                                pending_qkv_a_proj.pop(q_a_proj_name)
+                                pending_qkv_a_proj.pop(kv_a_proj_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name
@@ -628,7 +627,7 @@ class DeepseekV2WeightLoaderMixin:
         self._pending_weight_halves = _PendingWeightHalves()
         return sorted(
             [
-                *halves.a_proj,
+                *halves.qkv_a_proj,
                 *(
                     f"{module_name}.{suffix}"
                     for module_name, entry in halves.indexer_wk_weights_proj.items()

@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -70,7 +71,7 @@ def _weight_updater(model):
         get_model=lambda: model,
         update_model_fields=MagicMock(),
         recapture_cuda_graph=None,
-        get_model_runner=None,
+        get_model_runner=lambda: None,
     )
 
 
@@ -239,6 +240,44 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
 
         self.assertFalse(success)
         self.assertIsNone(target.loaded)
+
+    def test_ipc_update_drops_held_halves_before_and_after_it(self):
+        """An IPC update loads in several calls with no session around it."""
+        target = _FakeParam()
+        loader = _FakeDeepseekLoader({_FUSED_QKV_A_SCALE: target})
+        loader.do_load_weights([(_Q_A_SCALE, torch.ones((2, 3)))])
+
+        class _Worker:
+            def __init__(self, model_runner):
+                pass
+
+            def update_weights_from_ipc(self, zmq_handles):
+                loader.do_load_weights([(_KV_A_SCALE, torch.ones((1, 3)))])
+
+        updater = _weight_updater(loader)
+        worker_module = SimpleNamespace(
+            SGLangCheckpointEngineWorkerExtensionImpl=_Worker
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.checkpoint_engine.checkpoint_engine_worker": worker_module
+                },
+            ),
+            patch.object(
+                weight_updater,
+                "get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+        ):
+            success, message = updater.update_weights_from_ipc(
+                SimpleNamespace(zmq_handles={})
+            )
+
+        self.assertTrue(success, message)
+        self.assertIsNone(target.loaded)
+        self.assertEqual(loader.discard_pending_weight_halves(), [])
 
     def test_fp8_indexer_wk_scale_and_weight_pair_across_load_weights_calls(self):
         """The indexer wk pair is held apart from the a_proj pair, and is cloned too."""

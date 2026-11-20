@@ -358,14 +358,7 @@ class WeightUpdater:
         if run_post_load:
             post_load_weights(model)
         DefaultModelLoader.postprocess_weights(model, torch.device(self.device))
-        pending = _discard_pending_weight_halves(model)
-        if pending:
-            shown = ", ".join(pending[:8]) + (", ..." if len(pending) > 8 else "")
-            return (
-                f"The update sent only one half of {len(pending)} fused weights, "
-                f"so their params keep the old values: {shown}"
-            )
-        return None
+        return _unpaired_weight_halves_error(model)
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
@@ -472,9 +465,16 @@ class WeightUpdater:
                 SGLangCheckpointEngineWorkerExtensionImpl,
             )
 
+            # An IPC update loads its buckets in several load_weights calls with
+            # no session around them: drop halves held from before, and log any
+            # left after.
+            _discard_pending_weight_halves(self.get_model())
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            error = _unpaired_weight_halves_error(self.get_model())
+            if error is not None:
+                logger.error(error)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
@@ -493,6 +493,18 @@ def _discard_pending_weight_halves(model: torch.nn.Module) -> List[str]:
         if hasattr(module, "discard_pending_weight_halves")
         for name in module.discard_pending_weight_halves()
     ]
+
+
+def _unpaired_weight_halves_error(model: torch.nn.Module) -> Optional[str]:
+    """Drop the halves still waiting for their pair; say which, if any."""
+    pending = _discard_pending_weight_halves(model)
+    if not pending:
+        return None
+    shown = ", ".join(pending[:8]) + (", ..." if len(pending) > 8 else "")
+    return (
+        f"The update sent only one half of {len(pending)} fused weights, "
+        f"so their params keep the old values: {shown}"
+    )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
