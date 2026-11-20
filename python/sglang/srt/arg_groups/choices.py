@@ -3,6 +3,8 @@
 import argparse
 from typing import Any, Callable, Optional
 
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
+
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
@@ -194,7 +196,7 @@ BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "inte
 SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
 
 # Each name has an adapter in sampling/watermarking/runtime.py.
-WATERMARK_ALGORITHM_CHOICES = ["gumbel"]
+WATERMARK_ALGORITHM_CHOICES = list(ALGORITHM_CONFIG_FIELDS)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
