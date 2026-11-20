@@ -639,6 +639,14 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        # Initialize HCCL and custom AiCPU before the L3 backend maps Host memory.
+        prewarm_before_cache = self.server_args.hicache_storage_backend in (
+            "npu_memcache",
+            "mooncake",
+        )
+        if prewarm_before_cache:
+            self.maybe_init_hccl_dp_prewarm()
+
         # Init cache and memory pool
         self.init_kv_event_lora_names()
         result = kv_cache_builder.build_kv_cache(
@@ -695,7 +703,8 @@ class Scheduler(
                     self.tp_worker.model_runner.forward_stream
                 )
         self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
+        if not prewarm_before_cache:
+            self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -861,6 +870,16 @@ class Scheduler(
             device_module=tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
+        if self.server_args.hicache_storage_backend in ("npu_memcache", "mooncake"):
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                prewarm_dsv4_aicpu,
+            )
+
+            logger.info("DSV4 AiCPU prewarm start: rank=%s", rank)
+            prewarm_dsv4_aicpu(
+                self.tp_worker.model_runner.attn_backend, tp_group.device
+            )
+            logger.info("DSV4 AiCPU prewarm done: rank=%s", rank)
 
     def init_zbal_on_npu(self):
         if _is_npu:

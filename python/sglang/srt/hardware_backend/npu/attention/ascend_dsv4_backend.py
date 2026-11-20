@@ -78,6 +78,37 @@ def _sparse_attn_kv_quant_kwargs() -> dict:
     return {}
 
 
+@torch.no_grad()
+def prewarm_dsv4_aicpu(attn_backend, device) -> None:
+    """Initialize custom AiCPU after HCCL and before L3 Host memory registration."""
+    # A single-token metadata request does not read or write KV cache pages.
+    cu_q_cpu = torch.arange(2, dtype=torch.int32, device="cpu")
+    kv_len_cpu = torch.ones(1, dtype=torch.int32, device="cpu")
+    metadata = ForwardMetadata(
+        actual_seq_lengths_q_pa=cu_q_cpu.to(device),
+        actual_seq_lengths_q_pa_cpu=cu_q_cpu,
+        actual_seq_lengths_kv=kv_len_cpu.to(device),
+        seq_lens_cpu_int=kv_len_cpu,
+    )
+    metadata.ori_sparse_indices = None
+    metadata.ori_topk_length = None
+    metadata.ori_mask_mode = 4
+    metadata.ori_win_left = attn_backend._dsv4_sliding_window_size - 1
+    metadata.ori_win_right = 0
+    previous_metadata = attn_backend.forward_metadata
+    try:
+        attn_backend.forward_metadata = metadata
+        # Retain outputs until all C1/C4/C128 and indexer tasks have completed.
+        metadata.kernel_metadata = attn_backend._kernel_metadata_from_parts(
+            bs=1,
+            actual_seq_lengths_q_pa=metadata.actual_seq_lengths_q_pa,
+            actual_seq_lengths_kv=metadata.actual_seq_lengths_kv,
+        )
+        torch.npu.synchronize(device)
+    finally:
+        attn_backend.forward_metadata = previous_metadata
+
+
 def _dspark_sparse_width(swa_window: int, block_size: int) -> int:
     """128-aligned width of the DSpark sparse-index rows."""
     return -(-(swa_window + block_size) // 128) * 128
