@@ -2042,8 +2042,10 @@ class DeepseekV4AscendAttnBackend(
 
         self.forward_metadata = ctx.fm
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
-        super().init_forward_metadata(forward_batch)
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, publish_read_done: bool = True
+    ) -> None:
+        super().init_forward_metadata(forward_batch, publish_read_done=False)
         fm = self.forward_metadata
 
         # Idle DP-attention ranks have zero seq_lens, which the metadata kernel
@@ -2052,6 +2054,8 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
             fm.kernel_metadata = {}
+            if self.shared_read_enabled and publish_read_done:
+                self._publish_eager_shared_read_done(forward_batch)
             return
 
         device = forward_batch.seq_lens.device
@@ -2153,6 +2157,31 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
+
+        if self.shared_read_enabled:
+            # Snapshot addresses before read-done; compressor and KV stores must
+            # not resolve shared mappings later in the layer loop.
+            fm.swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            ).to(torch.int64)
+            for ratio in self._dsv4_unique_compress_ratios:
+                if ratio in (4, 128):
+                    fm.dsv4_explicit_state_block_tables[ratio] = (
+                        _build_explicit_state_block_table(
+                            compress_ratio=ratio,
+                            coff=2 if ratio == 4 else 1,
+                            state_pool=self._dsv4_state_pools_by_ratio[ratio],
+                            token_to_kv_pool=self.token_to_kv_pool,
+                            req_to_token=self.req_to_token,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            start_pos=fm.start_pos,
+                            cu_seqlens=fm.actual_seq_lengths_q_pa,
+                            seqused=fm.seqused,
+                            max_input_capacity=fm.dsv4_max_input_capacity,
+                        )
+                    )
+            if publish_read_done:
+                self._publish_eager_shared_read_done(forward_batch)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
