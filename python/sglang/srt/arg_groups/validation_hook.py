@@ -420,6 +420,14 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
+    # A PP stage whose transfer poll lags releases requests later, so its gamma diverges.
+    assert not (
+        cfg.enable_uniboost_gamma_ada
+        and cfg.pp_size > 1
+        and cfg.disaggregation_mode == "prefill"
+    ), (
+        "--enable-uniboost-gamma-ada is not supported with --pp-size > 1 on a PD prefill server"
+    )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",

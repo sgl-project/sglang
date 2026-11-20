@@ -400,16 +400,17 @@ export const config = {
 
     flagSelects: [
       {
-        // DSA sparse-MLA kernel. FlashMLA (flashmla_kv) is the K3.1 default and matches the reference
-        // fp8_ds_mla KV; TRT-LLM and Prims-TS read a raw FP8 KV with FP8 q, so PD peers must both
-        // use one of them. Both phases share one KV pool, so prefill and decode get the same value.
+        // DSA sparse-MLA kernel. Prims-TS is the K3.1 default on SM100/103/107 (all hw this select
+        // shows on); FlashMLA (flashmla_kv) matches the reference fp8_ds_mla KV. TRT-LLM and Prims-TS
+        // read a raw FP8 KV with FP8 q, so PD peers must both use one of them. Both phases share one
+        // KV pool, so prefill and decode get the same value.
         id: "attention", title: "Attention Backend",
         showWhen: (b) => ["b300", "gb300", "b200", "gb200"].includes(b.hw),
         stripPrefixes: ["--dsa-prefill-backend", "--dsa-decode-backend"],
         options: [
-          { id: "flashmla", label: "FlashMLA" },
+          { id: "prims_ts", label: "Prims-TS" },
+          { id: "flashmla", label: "FlashMLA", flags: ["--dsa-prefill-backend flashmla_kv", "--dsa-decode-backend flashmla_kv"] },
           { id: "trtllm",   label: "TRT-LLM",  flags: ["--dsa-prefill-backend trtllm", "--dsa-decode-backend trtllm"] },
-          { id: "prims_ts", label: "Prims-TS", flags: ["--dsa-prefill-backend prims_ts", "--dsa-decode-backend prims_ts"] },
         ],
       },
       {
