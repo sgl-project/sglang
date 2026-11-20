@@ -588,9 +588,15 @@ impl CoreHandle {
         }
         let effect = RelayedEffect::for_tag(&forwarded.tag);
         // A weight update holds this listener too while its scheduler runs
-        // it (the origin holds its own), released once the reply is in.
+        // it (the origin holds its own). Generations already running here
+        // finish first, the same wait the origin does for its own. Released
+        // once the reply is in.
         let hold = match effect {
-            RelayedEffect::WeightUpdate => Some(self.inner.frontend.hold_for_update().await),
+            RelayedEffect::WeightUpdate => {
+                let hold = self.inner.frontend.hold_for_update().await;
+                self.inner.drain.idle().await;
+                Some(hold)
+            }
             _ => None,
         };
         let reply = self
@@ -1639,6 +1645,75 @@ mod tests {
         let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(matches!(released.kind, RequestKind::Generate(_)));
         drop(parked);
+    }
+
+    /// A generation already running on this listener blocks a relayed weight
+    /// update. The peer scheduler sees it only after that generation ends.
+    #[tokio::test]
+    async fn a_relayed_weight_update_waits_for_a_live_generation() {
+        use crate::message::io_struct::EndWeightUpdateReqInput;
+        let harness = Harness::unbounded(8);
+        let handle = harness.handle.clone();
+        let started = tokio::spawn(async move {
+            handle
+                .generate(
+                    GenerateRequest {
+                        input_ids: Some(vec![1]),
+                        ..Default::default()
+                    },
+                    ReceivedAs::without_headers(),
+                )
+                .await
+                .unwrap()
+        });
+        let _request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let call = tokio::time::timeout(std::time::Duration::from_secs(1), started)
+            .await
+            .unwrap()
+            .unwrap();
+        let header = ControlRequest::EndWeightUpdateReqInput(EndWeightUpdateReqInput::new(
+            "peer-rid".into(),
+        ))
+        .encode()
+        .unwrap();
+        let handle = harness.handle.clone();
+        let relayed = tokio::spawn(async move { handle.forward_control_req(header).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "relayed update reached the scheduler while a generation was running"
+        );
+        drop(call);
+        let request = accept_intake(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                harness.intake_rx.recv_async(),
+            )
+            .await
+            .expect("relayed update arrives once the generation ends")
+            .unwrap(),
+        );
+        assert_eq!(wire_items_tag(&request), "EndWeightUpdateReqInput");
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"success": true, "message": "ok"}))
+                    .unwrap(),
+            )))
+            .unwrap();
+        relayed.await.unwrap().unwrap();
+    }
+
+    fn wire_items_tag(request: &Request) -> String {
+        let RequestKind::Control(control) = &request.kind else {
+            panic!("expected a control request");
+        };
+        let rmpv::Value::Array(items) =
+            rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+        else {
+            panic!("positional wire");
+        };
+        items[0].as_str().unwrap().to_owned()
     }
 
     /// `configure_logging` relays only a log level, refuses an unknown one

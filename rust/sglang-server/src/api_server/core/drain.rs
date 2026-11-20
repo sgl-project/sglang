@@ -133,6 +133,14 @@ impl DrainState {
     pub(crate) async fn forced(&self) {
         self.wait_until(Self::force_reason).await;
     }
+
+    /// Resolve once no client request is in flight. A weight update waits
+    /// here after it has paused admission, which is Python's writer lock
+    /// waiting out the reader locks held for each generation.
+    pub(crate) async fn idle(&self) {
+        self.wait_until(|state| (state.in_flight.load(Ordering::SeqCst) == 0).then_some(()))
+            .await;
+    }
 }
 
 /// One client request alive, counted for the drain. Health probes are not
@@ -141,7 +149,8 @@ pub(crate) struct InFlight(Arc<DrainState>);
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 && self.0.is_draining() {
+        // Wake an idle wait as well as a drain. The count is what both read.
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.0.changed.notify_waiters();
         }
     }
@@ -189,5 +198,23 @@ mod tests {
         assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
         let _late = state.track();
         assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
+    }
+
+    /// A weight update's wait stays parked while one request is alive and
+    /// resolves when that request ends.
+    #[tokio::test]
+    async fn idle_waits_until_the_last_request_ends() {
+        let state = Arc::new(DrainState::default());
+        let request = state.track();
+        let state2 = state.clone();
+        let waiting = tokio::spawn(async move { state2.idle().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "still one request in flight");
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("idle resolves when the request ends")
+            .unwrap();
+        state.idle().await;
     }
 }
