@@ -105,21 +105,41 @@ class RequestRetirer:
             self.beam_coordinator.retire_group(req)
         discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
-        if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.release_request(req)
+        if self.hisparse_coordinator is not None:
+            if getattr(req, "hisparse_retraction_pending", False):
+                # Retraction kept a host row and its request-row identity,
+                # but has already released all logical/device KV slots.
+                self.hisparse_coordinator.discard_retracted_request(req)
+            elif req.kv.holds_kv:
+                self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.release_request(req)
+            if (
+                get_disagg().disaggregation_mode == "decode"
+                and offload_kv
+                # Retained recovery is validated for non-speculative DSV4.
+                # Other HiSparse models must keep their existing backup path.
+                and self.hisparse_coordinator.is_dsv4_hisparse
+                and not self.hisparse_coordinator.spec_swap.enabled
+                and not getattr(req, "hisparse_retraction_pending", False)
+            ):
+                # HiSparse state-preserving retraction: the host pool already
+                # holds every committed token, so keep the req_to_host_pool row,
+                # free only the device side, and recover locally instead of
+                # asking prefill to recompute the prefix.
+                self.hisparse_coordinator.retract_req_state_preserving(req)
+            else:
+                self.hisparse_coordinator.release_request(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.
         if get_disagg().disaggregation_mode != "decode":
             resumable = req.resumable_by_reprefill
-        elif offload_kv:
+        elif offload_kv and not getattr(req, "hisparse_retraction_pending", False):
             resumable = backup_kv_cache(
                 req,
                 self.tree_cache,
@@ -127,11 +147,20 @@ class RequestRetirer:
                 self.tree_cache.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+        elif offload_kv:
+            # HiSparse state-preserving retraction: the retained host-pool row
+            # IS the backup, so there is nothing to copy out.
+            resumable = True
         else:
             resumable = req.resumable_by_rebootstrap
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                checkpoint=False,
+                keep_req_pool_row=getattr(req, "hisparse_retraction_pending", False),
+            )
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:

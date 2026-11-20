@@ -34,7 +34,10 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     restore_kv_cache,
 )
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hisparse_retraction import DSV4RetractionSnapshot
 from sglang.srt.mem_cache.kv_cache_builder import maybe_register_hicache_draft
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -45,7 +48,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_o
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.speculative.base_spec_worker import (
@@ -65,6 +68,82 @@ class TestDecodeRetractionBackup(CustomTestCase):
     num_tokens = 8
     dtype = torch.bfloat16
     device = "cuda"
+
+    def test_dsv4_native_regions_survive_retraction_page_reuse(self):
+        """C128 KV and SWA-owned compressor rings must reach newly allocated pages."""
+        with get_context().override_server_args(page_size=256):
+            pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=2,
+                swa_size=2048,
+                c4_size=512,
+                c128_size=16,
+                c4_state_pool_size=64,
+                c128_state_pool_size=2,
+                page_size=256,
+                swa_page_size=256,
+                dtype=torch.float8_e4m3fn,
+                c4_state_dtype=torch.float32,
+                c128_state_dtype=torch.float32,
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                indexer_head_dim=128,
+                layer_num=2,
+                device=self.device,
+                enable_memory_saver=False,
+                compression_ratios=[4, 128],
+                full_size=2048,
+                enable_hisparse=True,
+            )
+        allocator = SimpleNamespace(
+            page_size=256,
+            get_kvcache=lambda: pool,
+            translate_loc_from_full_to_swa=lambda ids: ids + 256,
+        )
+        old_locs = torch.cat(
+            (torch.arange(256, 512), torch.arange(768, 1024), torch.tensor([1280]))
+        ).to(self.device)
+        expected, buffers = [], []
+        for region in pool.get_device_pool_infos():
+            info = region.buffer_info
+            native = (
+                info.buffers
+                if isinstance(info, DSV4PagedBufferInfo)
+                else tuple(s.pages for s in info.states)
+            )
+            for buffer in native:
+                buffer.fill_(len(buffers) + 1)
+                buffers.append(buffer)
+                if region.pool_name == PoolName.DEEPSEEK_V4_C4:
+                    continue
+                old_pages = torch.tensor(
+                    [4, 6] if region.indices_from_pool == PoolName.SWA else [1, 3, 5],
+                    device=self.device,
+                )
+                expected.append(
+                    (region.pool_name, buffer, old_pages + 1, buffer[old_pages].clone())
+                )
+        snapshot = DSV4RetractionSnapshot.capture(allocator, old_locs, 128)
+        self.assertTrue(
+            all(
+                copy.is_pinned()
+                for _, copies in snapshot.regions.values()
+                for copy in copies
+            )
+        )
+        for buffer in buffers:
+            buffer.zero_()
+        # Restoration is enqueued on the scheduling stream before the next
+        # forward. An explicit event retains pinned copies until DMA completes.
+        stream = allocate_distinct_stream(torch.cuda, (torch.cuda.current_stream(),))
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            snapshot.restore(allocator, old_locs + 256)
+            done = torch.cuda.Event()
+            done.record()
+        done.synchronize()
+        for name, buffer, rows, saved in expected:
+            with self.subTest(region=name):
+                torch.testing.assert_close(buffer[rows], saved)
 
     def test_host_receive_dense_subclass_checks_actual_buffer_geometry(self):
         class DensePool(MHATokenToKVPool):

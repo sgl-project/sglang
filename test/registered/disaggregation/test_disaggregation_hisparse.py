@@ -1,9 +1,12 @@
 import unittest
 
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    assert_process_healthy,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,6 +14,8 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
+# ci-cost-override: DSV4 PD needs two TP4 groups; reuse the accuracy launch
+# for retraction coverage rather than starting another model pair.
 register_cuda_ci(est_time=199, stage="extra-b", runner_config="8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
@@ -29,6 +34,18 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
     gsm8k_accuracy_thres = 0.93
     gsm8k_num_questions = 200
     gsm8k_num_shots = 20
+
+    def test_gsm8k(self):
+        GSM8KMixin.test_gsm8k(self)
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+        response = requests.get(self.decode_url + "/metrics", timeout=30)
+        response.raise_for_status()
+        retracted = sum(
+            float(line.rsplit(" ", 1)[1])
+            for line in response.text.splitlines()
+            if line.startswith("sglang:num_retracted_requests_total{")
+        )
+        self.assertGreater(retracted, 0, "HiSparse decode never retracted a request")
 
     @classmethod
     def setUpClass(cls):
@@ -111,6 +128,7 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             DSV4_HISPARSE_CONFIG,
             "--watchdog-timeout",
             "900",
+            "--enable-metrics",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
@@ -118,7 +136,11 @@ class TestDisaggregationDSV4HiSparseBase(PDDisaggregationServerBase, GSM8KMixin)
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env=DSV4_FLASH_ENV,
+            env={
+                **DSV4_FLASH_ENV,
+                "SGLANG_TEST_RETRACT": "1",
+                "SGLANG_TEST_RETRACT_INTERVAL": "20",
+            },
         )
 
 

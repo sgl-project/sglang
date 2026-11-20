@@ -30,6 +30,8 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,6 +56,139 @@ class TestDecodeQueueCleanup(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_hisparse_resume_reuses_held_row_when_pool_is_full(self):
+        """Recovery must not need a second request row or overwrite retained host slots."""
+        req = FakeReq(
+            rid="held-row",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            kv=ReqKvInfo(),
+            is_retracted=True,
+            hisparse_retraction_pending=True,
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            time_stats=MagicMock(),
+        )
+        rows = ReqToTokenPool(
+            size=1, max_context_len=16, device="cpu", enable_memory_saver=False
+        )
+        rows.alloc([req])
+        row = req.kv.req_pool_idx
+        self.assertEqual(rows.available_size(), 0)
+        coordinator = SimpleNamespace(
+            req_to_host_pool=torch.full((2, 16), -1, dtype=torch.int64),
+            req_to_host_pool_allocated_len=torch.tensor([0, 3]),
+            host_token_len=lambda n: n,
+            padded_buffer_size=8,
+            spec_swap=SimpleNamespace(scratch_capacity=2),
+        )
+        coordinator.req_to_host_pool[row, :3] = torch.tensor([20, 21, 22])
+        fenced = []
+
+        def resume(request):
+            self.assertEqual(fenced, ["forward"])
+            request.hisparse_retraction_pending = False
+
+        coordinator.resume_after_retraction = resume
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        needs_row = FakeReq(rid="needs-new-row", is_retracted=True)
+        move([needs_row], queue.retracted_queue)
+        queue.draft_kv_ring = None
+        queue.req_to_token_pool = rows
+        # One in-flight transfer already reserves a padded cache plus scratch.
+        queue.transfer_queue = SimpleNamespace(queue=[object()])
+        device_tokens = [19]
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            device="cpu",
+            state=None,
+            pools_share_memory=False,
+            alloc_logical_only=lambda **kw: torch.tensor([5, 6, 7]),
+            hisparse_attn_allocator=SimpleNamespace(
+                available_size=lambda: device_tokens[0]
+            ),
+            # Use the actual rebootstrap predicate's DSV4 type contract.
+            get_kvcache=lambda: DeepSeekV4TokenToKVPool.__new__(
+                DeepSeekV4TokenToKVPool
+            ),
+        )
+        queue.tree_cache = SimpleNamespace(maybe_hand_to_session=lambda req: None)
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            enable_overlap=True,
+            schedule_stream=SimpleNamespace(wait_stream=fenced.append),
+            forward_stream="forward",
+            hisparse_coordinator=coordinator,
+        )
+        queue._uses_swa_reservation = lambda: False
+        queue._uses_swa_tail_prealloc = lambda: False
+        queue._window_tails = lambda n: {}
+        queue._allocatable_token_budgets = lambda **kw: 16
+        queue._prealloc_required = lambda req: (3, {})
+        queue._pending_state_slots = lambda req: 0
+        queue._prealloc_demand = lambda *args, **kw: None
+        queue._admit_preallocation = lambda *args, **kw: True
+        queue._check_if_req_exceed_kv_capacity = lambda request: False
+        queue._create_receiver_and_enqueue = MagicMock(
+            return_value=SimpleNamespace(
+                kv_receiver=SimpleNamespace(init=lambda rank: None)
+            )
+        )
+        # Newly allocated host slots contain no saved KV. An incomplete
+        # retained row must fail before the resume claims committed tokens.
+        coordinator.mem_pool_host = SimpleNamespace(
+            alloc_paged_token_slots=lambda *args: torch.tensor([23])
+        )
+        coordinator.req_to_host_pool_allocated_len[row] = 2
+        coordinator.req_to_host_pool[row, 2] = -1
+        with self.assertRaisesRegex(ValueError, "Retained HiSparse host row"):
+            queue._pre_alloc(req, skip_host_alloc=True)
+        self.assertEqual(req.kv.kv_allocated_len, 0)
+        self.assertEqual(req.kv.kv_committed_len, 0)
+        self.assertEqual(coordinator.req_to_host_pool_allocated_len[row], 2)
+        self.assertEqual(coordinator.req_to_host_pool[row, 2], -1)
+        coordinator.req_to_host_pool_allocated_len[row] = 3
+        coordinator.req_to_host_pool[row, 2] = 22
+        queue.add(req, is_retracted=True)
+        self.assertEqual(list(queue.retracted_queue), [needs_row, req])
+        ready = IndexedReqList(ListKind.WAITING)
+        # Logical room alone cannot serve recovery: only nine physical slots
+        # remain after the transfer's reservation, while recovery needs ten.
+        self.assertEqual(queue.move_resumed(ready), [])
+        self.assertEqual(list(queue.retracted_queue), [needs_row, req])
+        self.assertTrue(req.hisparse_retraction_pending)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        device_tokens[0] = 20
+        self.assertEqual(queue.move_resumed(ready), [req])
+        self.assertEqual(list(ready), [req])
+        self.assertEqual(list(queue.retracted_queue), [needs_row])
+        self.assertEqual(rows.available_size(), 0)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        torch.testing.assert_close(
+            rows.req_to_token[row, :3],
+            torch.tensor([5, 6, 7], dtype=rows.req_to_token.dtype),
+        )
+        torch.testing.assert_close(
+            coordinator.req_to_host_pool[row, :3], torch.tensor([20, 21, 22])
+        )
+        self.assertEqual(req.kv.kv_committed_len, 3)
+        self.assertFalse(req.hisparse_retraction_pending)
+        # Ordinary DSV4 retractions still need the prefill recompute path.
+        ordinary = FakeReq(
+            rid="ordinary",
+            kv=ReqKvInfo(),
+            is_retracted=True,
+            hisparse_retraction_pending=False,
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            time_stats=MagicMock(),
+        )
+        queue.add(ordinary, is_retracted=True)
+        self.assertEqual(list(queue.retracted_queue), [needs_row])
+        queue._create_receiver_and_enqueue.assert_called_once_with(
+            ordinary, is_rebootstrap=True
+        )
 
     def test_a_request_stops_waiting_when_prefill_info_never_arrives(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -579,7 +714,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue._pending_state_slots = MagicMock(return_value=0)
         queue._prealloc_demand = MagicMock(return_value=1)
         queue._admit_preallocation = MagicMock(return_value=True)
-        queue._pre_alloc = MagicMock()
+        # Ordinary recovery also supports callbacks accepting only the request.
+        queue._pre_alloc = MagicMock(side_effect=lambda resumed: None)
         queue.draft_kv_ring = MagicMock()
         with (
             patch(

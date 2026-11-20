@@ -1134,8 +1134,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and retraction_needs_rebootstrap(
-            self.token_to_kv_pool_allocator
+        # Retained HiSparse state already provides recovery. Rebootstrapping
+        # would try to acquire its still-held request row as a fresh admission.
+        if (
+            is_retracted
+            and not getattr(req, "hisparse_retraction_pending", False)
+            and retraction_needs_rebootstrap(self.token_to_kv_pool_allocator)
         ):
             req.time_stats.set_retract_time()
             is_retracted = False
@@ -1363,7 +1367,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
+            hisparse_resume = getattr(req, "hisparse_retraction_pending", False)
+            if not hisparse_resume and self.req_to_token_pool.available_size() <= 0:
+                # A later HiSparse request may already own its row.
+                continue
+            if hisparse_resume and self._hisparse_request_budget() <= 0:
                 break
 
             if not ensure_mamba_capacity(
@@ -1389,7 +1397,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             resumed_reqs.append(req)
             req.is_retracted = False
-            self._pre_alloc(req)
+            if hisparse_resume:
+                self._pre_alloc(req, skip_host_alloc=True)
+            else:
+                self._pre_alloc(req)
             if self.draft_kv_ring is not None:
                 # Its ring rows were not backed up.
                 self.draft_kv_ring.reset_floor(
@@ -1406,22 +1417,47 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             if self.scheduler.enable_overlap:
-                # A request that finished last step can still have its forward in
-                # flight, writing slots this request was just given.
+                # Restores of retained HiSparse sidecars also write newly
+                # allocated slots that an earlier forward may still use.
                 self.scheduler.schedule_stream.wait_stream(
                     self.scheduler.forward_stream
                 )
-            restore_kv_cache(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
+            if hisparse_resume:
+                # HiSparse state-preserving retraction: the retained
+                # req_to_host_pool row already covers every committed token;
+                # re-admit with a fresh device buffer (all-miss -> swap-in
+                # from host on demand) instead of retransferring from prefill.
+                coordinator = self.scheduler.hisparse_coordinator
+                assert coordinator is not None
+                coordinator.resume_after_retraction(req)
+            else:
+                restore_kv_cache(
+                    req,
+                    self.tree_cache,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    get_disagg().disaggregation_decode_retraction_backup,
+                )
 
         move(resumed_reqs, dst)
 
         return resumed_reqs
+
+    def _hisparse_request_budget(self) -> int:
+        """Physical cache slots left after pending transfers' reservations.
+
+        Logical preallocation does not charge the HiSparse cache. Both fresh
+        admissions and retained resumes need a padded buffer plus spec scratch.
+        Waiting requests already own theirs; transfer requests do not yet.
+        """
+        coordinator = self.scheduler.hisparse_coordinator
+        per_req = (
+            coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
+        )
+        available = (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+        return max(0, available // per_req - len(self.transfer_queue.queue))
 
     def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
         decode_req.awaiting_prefill_dp_rank = False
@@ -1723,24 +1759,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
-        # HiSparse physical constraint: max requests by device buffer capacity.
-        # Each admitted req needs a padded buffer plus its speculative scratch.
-        # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
-        # only transfer_queue reqs are pending device buffer allocation.
-        hisparse_req_budget = float("inf")
-        if self.scheduler.enable_hisparse:
-            coordinator = self.scheduler.hisparse_coordinator
-            per_req_device_tokens = (
-                coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
-            )
-            hisparse_avail = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            )
-            hisparse_req_budget = max(
-                0,
-                hisparse_avail // per_req_device_tokens
-                - len(self.transfer_queue.queue),
-            )
+        hisparse_req_budget = (
+            self._hisparse_request_budget()
+            if self.scheduler.enable_hisparse
+            else float("inf")
+        )
 
         if self.scheduler.enable_lora:
             running_batches = (
@@ -2957,6 +2980,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        skip_host_alloc: bool = False,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -2965,21 +2989,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix committed to prefill as ``decode_prefix_len`` (L1 + L2 + L3);
         the ``[prefix_len, total_prefix_len)`` gap is filled later by HiCache
         loadback.
+
+        ``skip_host_alloc`` serves HiSparse state-preserving retraction: the
+        request keeps its req_to_token row and its host-pool row across the
+        retraction, so neither is re-allocated here.
         """
         if prefix_len is None:
             prefix_len = 0
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = kv_storage_of(
-            self.req_to_token_pool, self.token_to_kv_pool_allocator
-        ).acquire([req])
+        if skip_host_alloc:
+            # Retained row: req_pool_idx is already valid and its host-pool
+            # row is still keyed by it.
+            req_pool_indices = [req.kv.req_pool_idx]
+        else:
+            req_pool_indices = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).acquire([req])
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
         )
 
         fill_len = pre_alloc_fill_len(req)
+        if skip_host_alloc:
+            coordinator = self.scheduler.hisparse_coordinator
+            assert coordinator is not None
+            retained_len = int(
+                coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx]
+            )
+            required_host_len = coordinator.host_token_len(fill_len)
+            if retained_len < required_host_len:
+                # Allocating more host slots cannot recreate missing KV data.
+                # Reject before claiming committed tokens or allocating slots.
+                raise ValueError(
+                    "Retained HiSparse host row does not cover committed KV: "
+                    f"{retained_len} retained vs {required_host_len} required"
+                )
         req.kv.commit_prealloc(fill_len)
 
         if prefix_len > 0:
@@ -3051,6 +3098,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
+            assert coordinator is not None
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
                 req=req,
@@ -3059,14 +3107,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pools keep one window.
                 swa_tail_len=next(iter(window_tails.values()), fill_len),
             )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.kv.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            if skip_host_alloc:
+                # Recovery reuses saved data; it never creates a transfer target.
+                host_indices = coordinator.req_to_host_pool[
+                    req.kv.req_pool_idx, :required_host_len
+                ]
+            else:
+                # Fresh requests need host indices for the RDMA transfer target.
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.kv.req_pool_idx,
+                    0,
+                    coordinator.host_token_len(fill_len),
+                )
         else:
             kv_loc = self._alloc_for_decode_prealloc(
                 allocator,
@@ -4228,8 +4282,12 @@ class SchedulerDisaggregationDecodeMixin:
         if running_batch.is_empty():
             ret = None
         else:
-            running_batch = self.update_running_batch(running_batch)
-            ret = running_batch if not running_batch.is_empty() else None
+            decode_batch = self.update_running_batch(running_batch)
+            ret = (
+                decode_batch
+                if decode_batch is not None and not decode_batch.is_empty()
+                else None
+            )
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
