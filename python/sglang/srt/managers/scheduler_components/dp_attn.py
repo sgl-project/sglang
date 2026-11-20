@@ -76,7 +76,9 @@ def exchange_sync_rows(
     serial hops; gather + broadcast is one hop plus a log-depth tree. At two
     ranks the ring is the single hop, so it stays."""
     world_size = torch.distributed.get_world_size(group)
-    if local_row.device.type != "cpu" or world_size <= 2:
+    # An elastic group can count fewer ranks than the buffer has slots after a fault.
+    narrowed = global_flat.numel() != world_size * local_row.numel()
+    if local_row.device.type != "cpu" or world_size <= 2 or narrowed:
         all_gather_single(global_flat, local_row, group=group)
         return
     root = torch.distributed.get_global_rank(group, 0)
@@ -175,6 +177,7 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    live_scale_target: Optional[int] = None
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -189,6 +192,8 @@ class MLPSyncBatchInfo:
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        from sglang.srt.elastic_ep.elastic_ep import departure_pending
+
         return torch.tensor(
             [
                 self.num_tokens,
@@ -204,7 +209,10 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
-            ],
+            ]
+            + ([] if self.live_scale_target is None else [self.live_scale_target])
+            # Departure is always the last column.
+            + [int(departure_pending())],
             device=device,
             dtype=dtype,
         )
@@ -225,13 +233,19 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
-            ],
+            ]
+            + ([] if self.live_scale_target is None else [0])
+            + [0],
             device=device,
             dtype=dtype,
         )
 
     def finalize_local(self):
         """Populate gather-derived metadata from the sole attention-DP rank."""
+        from sglang.srt.elastic_ep.elastic_ep import departure_observe
+
+        # Sole rank, so there is no cohort to fall out of step with.
+        departure_observe(True)
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
@@ -249,6 +263,8 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        from sglang.srt.elastic_ep.elastic_ep import departure_observe
+
         sync_start = time.perf_counter()
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
@@ -274,6 +290,8 @@ class MLPSyncBatchInfo:
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
+            # No scalar sync: tick N+1's collective must wait for Mooncake to settle N,
+            # and the D2H copy below already blocks on this stream.
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
@@ -305,8 +323,16 @@ class MLPSyncBatchInfo:
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
+        # Post-normalisation, so a stale retired row cannot hold the cohort in DRAIN.
+        departure_observe(int(tp0_info_cpu[:, -1].sum()) == 0)
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        if use_all_reduce:
+            # Retiree slots can carry all-reduce garbage across a mask flip.
+            self.global_num_tokens, self.global_num_tokens_for_logprob = (
+                [t if 0 <= t <= 1 << 30 else 0 for t in col]
+                for col in (self.global_num_tokens, self.global_num_tokens_for_logprob)
+            )
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -583,6 +609,19 @@ class DPShutdownVoteSent:
         self.value = False
 
 
+def _fence_world_gather(model_runner: ModelRunner) -> None:
+    """Queue the WORLD gather behind the previous forward. It runs on the device
+    backend from the scheduler's stream, and must not share the GPU with that
+    forward's a2a kernels, whose blocks wait on each other and on peers. A rank
+    with no result to read back (an idle one) reaches this gather first."""
+    forward_stream = getattr(model_runner, "forward_stream", None)
+    if forward_stream is None:
+        return
+    current = torch.get_device_module(model_runner.device).current_stream()
+    if current != forward_stream:
+        current.wait_stream(forward_stream)
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -694,6 +733,7 @@ def prepare_mlp_sync_batch_raw(
         )
     skip_all_gather = should_skip_scheduler_all_gather(num_dp_ranks)
 
+    live_scale = getattr(model_runner, "live_scale", None)
     mlp_sync_info = MLPSyncBatchInfo(
         num_dp_ranks=num_dp_ranks,
         tp_size=attn_tp_size,
@@ -713,11 +753,14 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        live_scale_target=(live_scale.local_control_target() if live_scale else None),
     )
 
     if num_dp_ranks == 1:
         mlp_sync_info.finalize_local()
     elif not skip_all_gather:
+        if use_world_group:
+            _fence_world_gather(model_runner)
         mlp_sync_info.all_gather(
             device=device,
             group=group,
@@ -729,6 +772,10 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if live_scale is not None:
+        if not metadata_ready:
+            raise RuntimeError("Live scale requires synchronized DP batch metadata")
+        live_scale.observe_control_targets(mlp_sync_info.tp0_info_cpu[:, -2].tolist())
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(

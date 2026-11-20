@@ -59,6 +59,7 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     require_attn_tp_gather,
     require_mlp_tp_gather,
     set_dp_buffer_len,
@@ -315,6 +316,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
         record_nolora_graph: bool = False,
+        defer_capture: bool = False,
     ):
         super().__init__(model_runner)
         # The env only opts in to the automatic LoRA variant pair; explicit
@@ -682,6 +684,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # --- capture --------------------------------------------------
+        if defer_capture:
+            return
         try:
             with model_capture_mode():
                 self.capture()
@@ -1210,6 +1214,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
+        # Captured at the buffer ceiling; replay fills only the live num_dp_ranks.
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * dp_capacity_for(self.num_dp_ranks)
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
@@ -1306,6 +1313,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
         return forward_batch, attn_backend, pp_proxy_tensors
+
+    def capture_step(self, size: int) -> None:
+        """Capture one shape; the coordinator publishes the runner after all shapes.
+
+        Each capture resets shared index inputs modified by intervening serving.
+        """
+        if size not in self.capture_bs:
+            raise ValueError(f"Unknown capture shape {size}")
+        sizes = self.capture_bs
+        try:
+            self.capture_bs = [size]
+            with model_capture_mode():
+                self.capture()
+        finally:
+            self.capture_bs = sizes
 
     def capture(self) -> None:
         with self.model_context():
