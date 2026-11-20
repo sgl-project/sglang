@@ -792,7 +792,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 )
                 return batch_output
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            ctx_repr = self.get_adaptive_context(batch.reqs)
+            self.activate_step_by_batch(batch.seq_lens.shape[0], ctx_repr)
 
             if batch.spec_info is None:
                 batch.spec_info = self.draft_worker._idle_seed()

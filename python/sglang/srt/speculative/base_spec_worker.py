@@ -21,6 +21,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.adaptive_runtime_state import (
+    get_batch_context_length_for_controller,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -406,7 +409,10 @@ class BaseSpecWorker(ABC):
             self.draft_worker.init_cuda_graphs()
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        ctx_repr: int = 0,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
@@ -414,6 +420,12 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    def get_adaptive_context(self, reqs) -> int:
+        """Return the context signal only when the adaptive policy opts in."""
+        return get_batch_context_length_for_controller(
+            getattr(self, "adaptive_controller", None), reqs
+        )
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.
@@ -423,8 +435,8 @@ class BaseSpecWorker(ABC):
         """
         pass
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
-        """Activate the optimal adaptive step for the current batch size.
+    def activate_step_by_batch(self, batch_size: int, ctx_repr: int = 0) -> None:
+        """Activate the adaptive step for the current batch and context.
 
         Default no-op. Adaptive-aware workers override this to switch
         the runtime state before each draft round.
