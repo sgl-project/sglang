@@ -91,3 +91,11 @@ Temporarily skipped members (prefetch, staging, LoRA availability, or pooling co
 The gate currently supports ordinary RadixCache and FULL-only UnifiedRadixCache configurations. Hierarchical, session, sliding-window, Mamba, and other unsupported cache modes retain the existing fallback.
 
 Non-members retain the existing periodic, capped prefix refresh. dLLM retains the original LPM large-queue FCFS fallback because its separate transfer path does not use this admission loop. Disabling prefix caching still uses FCFS. No new policy name or server argument is required.
+
+### Reduce tail latency with `--schedule-policy uniboost`
+
+For mixed prompt lengths, such as agentic RL rollouts, `uniboost` admits requests with little uncached prefill work ahead of long ones. Each request gets a bounded boost, so long requests keep their place in line and are not starved.
+
+- `--uniboost-gamma` (default `10.0`) sets the boost decay rate. Lower values behave more like shortest-job-first; higher values behave more like `fcfs`.
+- `--enable-uniboost-gamma-ada` tunes gamma online from the observed p95/p99 latency, so you do not have to pick it per workload.
+- With `--tp-size` or `--pp-size` above 1, a request's arrival is measured in prefill tokens processed before it was queued, not wall time, so every rank admits the same batch.
