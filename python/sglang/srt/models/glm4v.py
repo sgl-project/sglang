@@ -57,7 +57,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
@@ -808,6 +811,12 @@ class Glm4vForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
+
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

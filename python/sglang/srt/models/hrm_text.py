@@ -34,6 +34,8 @@ On-disk ``attn.gqkv_proj.weight`` is fused ``[gate | q | k | v]`` rows and
 """
 
 import logging
+import re
+from collections import defaultdict
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -464,9 +466,27 @@ class HrmTextForCausalLM(nn.Module):
         # RadixAttention modules hold no params, and disk tensors are already
         # fused so no stacked_params_mapping is needed.
         params_dict = dict(self.named_parameters())
+        # A layer's checkpoint KV-cache scale applies to the RadixAttention of
+        # every recurrence step of that layer.
+        step_scales = defaultdict(list)
+        for param_name in params_dict:
+            m = re.fullmatch(r"(.*)\.attn\.\d+\.([kv]_scale)", param_name)
+            if m is not None:
+                step_scales[f"{m.group(1)}.{m.group(2)}"].append(param_name)
         for name, loaded_weight in weights:
             if ".attn." in name:
                 name = name.replace(".attn.", ".self_attn.", 1)
+            if name.endswith((".k_scale", ".v_scale")) and name not in params_dict:
+                # compressed-tensors: <attn>.k_scale; ModelOpt: <attn>.k_proj.k_scale
+                stem, scale = name.rsplit(".", 1)
+                stem = stem.removesuffix(f".{scale[0]}_proj")
+                for param_name in step_scales.get(f"{stem}.{scale}", ()):
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                continue
             if name not in params_dict:
                 continue
             param = params_dict[name]
