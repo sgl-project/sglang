@@ -47,6 +47,8 @@ pip install -e "python[diffusion]"
 
 For general environment setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
 
+Both Pi0.5 checkpoints use the tokenizer from [google/paligemma-3b-pt-224](https://huggingface.co/google/paligemma-3b-pt-224). Before the first download, accept the access terms on that page and run `hf auth login` on the serving host with an account that has access. The Pi0.5 weights are public, but an unauthenticated tokenizer download returns HTTP 401 and the server cannot start.
+
 ## 3. Model Deployment
 
 Serve the base Pi0.5 policy:
