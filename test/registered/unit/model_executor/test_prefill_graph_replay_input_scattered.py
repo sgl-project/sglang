@@ -1,22 +1,9 @@
-"""A prefill cuda graph replay must not run input-scattered.
+"""Prefill cuda graph replays must not run input-scattered.
 
-With --enable-attn-tp-input-scattered a model's forward opens
-``AttnTpContext.maybe_input_scattered`` and every extend batch is scattered
-(the vocab embedding then skips its all-reduce). A breakable (or full) prefill
-graph is captured through ``layer_model.forward`` outside that scope, so its
-body was recorded in the ordinary, all-reduced layout. At replay,
-``ModelRunner._forward_raw`` calls ``PrefillCudaGraphRunner.execute``, whose
-eager outer forward opens the scope: without the replay flag the embedding
-would feed unreduced vocab-shard partial sums into a body that expects full
-rows. That happens for models whose replay embeds eagerly, i.e. the archs with
-a registered ``input_embeds`` graph slot (``is_multimodal`` such as
-GLM-5.3-Flash); a text-only model embeds inside the captured body instead.
-
-The test drives the real ``ModelRunner._forward_raw`` graph/eager branch, the
-real ``PrefillCudaGraphRunner.execute`` and the real ``AttnTpContext`` with
-fakes for the ModelRunner instance, the runner's collaborators, the batch and
-the published config. The model config is a subset of
-the public zai-org/GLM-5.3-Flash config.json (no weights).
+Capture runs outside ``AttnTpContext.maybe_input_scattered``, but the replay's
+eager outer forward opens it, so with ``--enable-attn-tp-input-scattered`` the
+eager embedding would skip its all-reduce and feed partial sums into the graph.
+Uses a subset of the public zai-org/GLM-5.3-Flash config; no weights, no CUDA.
 """
 
 import unittest
@@ -47,9 +34,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 TP_SIZE = 8
 
-# Subset of zai-org/GLM-5.3-Flash config.json (public; revision
-# 46a050bec13002ad29ee795c16e61cf4fa3c4a9c). Only the fields the eligibility
-# check reads; no weights are involved.
+# The fields of the public zai-org/GLM-5.3-Flash config.json (revision
+# 46a050bec13002ad29ee795c16e61cf4fa3c4a9c) that the eligibility check reads.
 GLM53_FLASH_CONFIG = {
     "architectures": ["Glm5NextForConditionalGeneration"],
     "text_config": {
@@ -83,15 +69,10 @@ def _extend_batch(num_tokens=64):
 
 
 class FakePrefillGraphRunner(PrefillCudaGraphRunner):
-    """The real ``PrefillCudaGraphRunner.execute`` on the breakable backend,
-    with its collaborators faked (no ``__init__``, no CUDA).
+    """The real ``execute`` on the breakable backend, with fake collaborators.
 
-    capture(): the body is traced by ``layer_model.forward`` directly, outside
-    the model's ``maybe_input_scattered`` scope (``_run_forward``).
-    _execute_body_capture(): the replay runs the eager outer
-    ``*ForCausalLM.forward`` (``model_runner.model.forward``), which opens the
-    scope; the embedding reads ``input_scattered`` to decide whether to
-    all-reduce (vocab_parallel_embedding.py), then the captured body replays.
+    ``capture`` records outside the model's scope; ``_execute_body_capture``
+    runs the eager outer forward inside it, as the real runner does.
     """
 
     def __init__(self, ctx):  # noqa: super().__init__ needs a model runner
@@ -168,7 +149,7 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        # Model construction (glm5_next.py): init_context(q_lora_rank, use_dsa, mhc).
+        # As in the Glm5Next constructor.
         text = cfg["text_config"]
         self.ctx = AttnTpContext()
         self.ctx.init_context(text["q_lora_rank"], is_deepseek_dsa(text), text["mhc"])
@@ -187,7 +168,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         return fake
 
     def _eager(self, forward_batch):
-        # Eager extend: the whole forward is scattered when the flag allows.
         with self.ctx.maybe_input_scattered(forward_batch):
             self.eager_scattered = self.ctx.input_scattered
         return "eager-logits"
@@ -216,8 +196,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
                 self._model_runner_self(graph_runner), forward_batch, None
             )
 
-    # --- controls: pass with and without the fix -----------------------------
-
     def test_public_config_is_eligible(self):
         cfg = GLM53_FLASH_CONFIG
         # The replay embeds eagerly only for archs with an input_embeds slot.
@@ -226,7 +204,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         self.assertTrue(self.ctx.allow_input_scattered)  # mHC admits DSA
 
     def test_eager_extend_is_scattered(self):
-        """Without a graph the SP path stays on: the fix must not touch it."""
         runner = FakePrefillGraphRunner(self.ctx)
         runner.can_run_graph = lambda fb: False
         self.eager_scattered = None
@@ -251,12 +228,7 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         self.assertTrue(self.ctx.use_input_scattered(_extend_batch()))
         self.assertFalse(get_forward().attn_input_scattered)
 
-    # --- the bug --------------------------------------------------------------
-
     def test_breakable_replay_runs_in_the_captured_layout(self):
-        """Without the replay flag the replay's outer forward is input-scattered although
-        the graph body was captured unscattered, so the embedding skips its
-        all-reduce and the body consumes partial sums."""
         runner = FakePrefillGraphRunner(self.ctx)
         batch = _extend_batch()
         runner.capture(batch)
@@ -277,7 +249,6 @@ class TestPrefillGraphReplayInputScattered(CustomTestCase):
         )
 
     def test_predicate_under_replay_scope(self):
-        """The predicate itself, asked from inside the graph/eager branch."""
         seen = {}
         runner = FakePrefillGraphRunner(self.ctx)
 

@@ -2514,8 +2514,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with (
             self.model_context(),
             self.backend.replay_session(),
-            # The captured body was recorded outside maybe_input_scattered, so
-            # the eager embedding and tail of this replay must not scatter.
+            # The body was captured outside maybe_input_scattered; keep the
+            # replay's eager embedding unscattered to match it.
             get_forward().scoped(prefill_graph_replay=True),
         ):
             static_forward_batch, shared_read_ends = self.load_batch(
