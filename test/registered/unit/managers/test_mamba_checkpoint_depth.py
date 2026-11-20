@@ -20,7 +20,6 @@ from sglang.srt.managers.schedule_batch import (
     _MambaRadixCacheV2TrackEntry,
 )
 from sglang.srt.managers.schedule_policy import (
-    CacheAwarePolicy,
     PrefillAdder,
     mamba_prefill_chunk_grid,
 )
@@ -276,16 +275,20 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         runtime limits (here a shortest-prefill reservation) must not cut a
         continuing request below the checkpoint grid, nor starve it there."""
         from sglang.srt.managers.schedule_batch import prefill_checkpoint_boundary
-        from sglang.srt.managers.schedule_policy import SchedulePolicy
+        from sglang.srt.managers.schedule_policies.shortest_prefill import (
+            ShortestPrefillFirstRanker,
+        )
+        from sglang.srt.managers.scheduler_components.schedule_planner import (
+            SchedulePlanner,
+        )
 
         # The chunk reservation reads the encoder replay flag.
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        policy = object.__new__(SchedulePolicy)
-        policy.policy = CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        policy = object.__new__(SchedulePlanner)
         policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
-        policy.shortest_prefill_aging_factor = 0.0
+        policy.ranker = ShortestPrefillFirstRanker(policy.tree_cache, 0.0)
         adder = self._adder(strict=True)
         prompt, prefix, chunks = 4096, 0, []
         while prefix < prompt:

@@ -1,26 +1,24 @@
 """Unit tests for the UniBoost schedule policy and its gamma-Ada controller.
 
-Runs the real SchedulePolicy and GammaAdaController on fake requests; no GPU.
+Runs the real SchedulePlanner and GammaAdaController on fake requests; no GPU.
 """
 
 import itertools
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.managers import schedule_policy, uniboost_gamma_ada
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
-from sglang.srt.managers.schedule_policy import (
-    UNIBOOST_MATCH_WINDOW_SIZE,
-    CacheAgnosticPolicy,
-    CacheAwarePolicy,
-    PrefillAdder,
-    SchedulePolicy,
-)
-from sglang.srt.managers.uniboost_gamma_ada import (
+from sglang.srt.managers.schedule_policies import uniboost_gamma_ada
+from sglang.srt.managers.schedule_policies.policy import SchedulePolicy
+from sglang.srt.managers.schedule_policies.uniboost import UNIBOOST_MATCH_WINDOW_SIZE
+from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import (
     GAMMA_ADA_MAX,
     GAMMA_ADA_REFIT_EVERY,
     GammaAdaController,
 )
+from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.scheduler_components import schedule_planner
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -80,7 +78,7 @@ class FakeTreeCache:
 
 
 def make_policy(policy_name="uniboost", tree_cache=None, **kwargs):
-    return SchedulePolicy(
+    return SchedulePlanner(
         policy_name,
         tree_cache if tree_cache is not None else FakeTreeCache(),
         enable_hierarchical_cache=False,
@@ -193,8 +191,8 @@ class TestUniboostOrdering(UniboostTestBase):
 
 class TestUniboostConfig(UniboostTestBase):
     def test_disabled_tree_cache_keeps_uniboost(self):
-        self.assertEqual(make_policy().policy, CacheAwarePolicy.UNIBOOST)
-        self.assertEqual(make_policy("lpm").policy, CacheAgnosticPolicy.FCFS)
+        self.assertEqual(make_policy().policy, SchedulePolicy.UNIBOOST)
+        self.assertEqual(make_policy("lpm").policy, SchedulePolicy.FCFS)
 
     def test_invalid_config_is_rejected(self):
         for gamma in (0.0, float("inf"), 1e-320, 1e-310):
@@ -226,7 +224,7 @@ class TestUniboostMatching(UniboostTestBase):
             matched.append(req.rid)
             req.last_node = object()
 
-        with patch.object(schedule_policy, "match_kv_cache", side_effect=fake_match):
+        with patch.object(schedule_planner, "match_kv_cache", side_effect=fake_match):
             queue[:] = policy.calc_priority(queue)
         return matched
 

@@ -26,7 +26,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -38,6 +37,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -625,7 +625,9 @@ class TestPrefillResultPolling(CustomTestCase):
             def get_new_batch_prefill(self, running_batch):
                 if self.iteration > 0 and not self.result_processes[1]:
                     self.admission_attempts.append(self.iteration)
-                    self.policy.calc_priority(self.waiting_queue, running_batch)
+                    self.schedule_planner.calc_priority(
+                        self.waiting_queue, running_batch.reqs
+                    )
                     return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
                 return super().get_new_batch_prefill(running_batch)
 
@@ -654,7 +656,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     window_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
-                scheduler.policy = SchedulePolicy(
+                scheduler.schedule_planner = SchedulePlanner(
                     "fcfs", scheduler.tree_cache, False, False, False
                 )
                 scheduler.ngram_embedding_manager.prepare_for_forward = Mock(

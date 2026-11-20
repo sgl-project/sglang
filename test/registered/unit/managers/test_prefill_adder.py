@@ -17,9 +17,9 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
-    SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -270,7 +270,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -305,7 +305,7 @@ class TestPrefillAdder(CustomTestCase):
         # without them leaves the hit unable to fit whole, so it waits and the
         # room reserved for it goes unused.
         adder = self.create_shortest_prefill_adder(encoder_replay=True)
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,

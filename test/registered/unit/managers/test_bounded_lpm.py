@@ -2,12 +2,13 @@ import argparse
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.managers.schedule_policy import CacheAgnosticPolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     move,
 )
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -21,8 +22,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def policy(name="lpm", disabled=False, enabled=True):
     cache = RadixCache.create_simulated()
     cache.disable = disabled
-    p = SchedulePolicy(name, cache, False, False, False, bounded_lpm_enabled=enabled)
-    p._should_start_bounded_batch = lambda waiting: True
+    p = SchedulePlanner(name, cache, False, False, False, bounded_lpm_enabled=enabled)
+    if p._lpm is not None:
+        p._lpm._should_start_bounded_batch = lambda waiting: True
     return p
 
 
@@ -35,7 +37,9 @@ class TestBoundedLPM(CustomTestCase):
         reset_context()
         publish(ServerArgs(model_path="dummy"), role="test")
         self.addCleanup(reset_context)
-        patcher = patch("sglang.srt.managers.schedule_policy.touch_waiting_prefix")
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.schedule_planner.touch_waiting_prefix"
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -52,7 +56,7 @@ class TestBoundedLPM(CustomTestCase):
                     result,
                     sorted(q[:k], key=lambda r: -r.num_matched_prefix_tokens) + q[k:],
                 )
-                self.assertEqual(p._bounded_active, n > 128)
+                self.assertEqual(p.bounded_lpm_active, n > 128)
                 self.assertEqual(p.waiting_queue_prefix_matched(result), n <= 128)
                 self.assertTrue(all(p.allows_admission(r) for r in result[:k]))
                 self.assertTrue(all(not p.allows_admission(r) for r in result[k:]))
@@ -70,7 +74,7 @@ class TestBoundedLPM(CustomTestCase):
             self.assertFalse(p.allows_admission(q[64]))
             p.retire_waiting_members(q[30:64])
             p.calc_priority(q[64:])
-            self.assertFalse(p._bounded_active)
+            self.assertFalse(p.bounded_lpm_active)
             self.assertEqual(len(match.call_args.args[0]), 86)
             self.assertTrue(p.waiting_queue_prefix_matched(q[64:]))
 
@@ -78,14 +82,14 @@ class TestBoundedLPM(CustomTestCase):
         p, q = policy(), requests(200)
         with patch.object(p, "_compute_prefix_matches", return_value=set()):
             p.calc_priority(q[:128])
-            self.assertFalse(p._bounded_active)
+            self.assertFalse(p.bounded_lpm_active)
             p.calc_priority(q[:129])
-            self.assertTrue(p._bounded_active)
+            self.assertTrue(p.bounded_lpm_active)
             p.calc_priority([])
-            self.assertFalse(p._bounded_active)
+            self.assertFalse(p.bounded_lpm_active)
             p.calc_priority(q)
-            self.assertTrue(p._bounded_active)
-            self.assertEqual(len(p._bounded_members), 64)
+            self.assertTrue(p.bounded_lpm_active)
+            self.assertEqual(len(p._lpm._bounded_members), 64)
 
     def test_member_rematches_and_newcomer_does_not_replace_it(self):
         p, q = policy(), requests(150)
@@ -94,7 +98,7 @@ class TestBoundedLPM(CustomTestCase):
             q[0].num_matched_prefix_tokens = 100
             result = p.calc_priority(q[:2] + q[64:])
             self.assertIs(result[0], q[0])
-            self.assertEqual(len(p._bounded_members), 2)
+            self.assertEqual(len(p._lpm._bounded_members), 2)
             self.assertFalse(p.allows_admission(q[64]))
 
     def test_departure_before_retraction_without_priority_call(self):
@@ -123,8 +127,8 @@ class TestBoundedLPM(CustomTestCase):
 
         s = Scheduler.__new__(Scheduler)
         s.schedule_policy = "lpm"
-        s.policy = policy()
-        s.tree_cache = s.policy.tree_cache
+        s.schedule_planner = policy()
+        s.tree_cache = s.schedule_planner.tree_cache
         with patch(
             "sglang.srt.managers.scheduler.get_parallel",
             return_value=SimpleNamespace(tp_size=1),
@@ -135,18 +139,20 @@ class TestBoundedLPM(CustomTestCase):
         s.schedule_low_priority_values_first = False
         s.dllm_config = None
         s.init_schedule_policy()
-        s.policy._should_start_bounded_batch = lambda waiting: True
+        s.schedule_planner._lpm._should_start_bounded_batch = lambda waiting: True
         self.assertIsNone(s.waiting_queue._on_leave)
         q = requests(150)
         move(q, s.waiting_queue)
-        with patch.object(s.policy, "_compute_prefix_matches", return_value=set()):
-            s.policy.calc_priority(s.waiting_queue)
+        with patch.object(
+            s.schedule_planner, "_compute_prefix_matches", return_value=set()
+        ):
+            s.schedule_planner.calc_priority(s.waiting_queue)
         running = IndexedReqList(ListKind.DECODING)
         move([q[0]], running)
         move([q[0]], s.waiting_queue)
-        self.assertFalse(s.policy.allows_admission(q[0]))
+        self.assertFalse(s.schedule_planner.allows_admission(q[0]))
         move(list(s.waiting_queue), running)
-        s.policy.calc_priority(s.waiting_queue)
+        s.schedule_planner.calc_priority(s.waiting_queue)
         self.assertIsNone(s.waiting_queue._on_leave)
 
     def test_dllm_legacy_fallback_and_other_policies(self):
@@ -160,10 +166,10 @@ class TestBoundedLPM(CustomTestCase):
             with patch.object(p, "_compute_prefix_matches") as match:
                 self.assertEqual(p.calc_priority(q), q)
                 match.assert_not_called()
-            self.assertFalse(p._bounded_active)
+            self.assertFalse(p.bounded_lpm_active)
             self.assertEqual(list(p.admission_candidates(q)), q)
             self.assertTrue(all(p.allows_admission(r) for r in q))
-            self.assertEqual(p._determine_active_policy(q), CacheAgnosticPolicy.FCFS)
+            self.assertIsInstance(p._active_ranker(q), FcfsRanker)
 
     def test_cli_removes_separate_policy_and_flag(self):
         parser = argparse.ArgumentParser()

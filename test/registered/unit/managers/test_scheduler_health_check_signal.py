@@ -194,7 +194,7 @@ class TestWaitingHealthCheckAck(CustomTestCase):
             ranked.append(list(waiting))
             raise _PriorityPassReached
 
-        s.policy = SimpleNamespace(
+        s.schedule_planner = SimpleNamespace(
             poll_storage_prefetches=lambda waiting: None, calc_priority=calc_priority
         )
         return s, ranked

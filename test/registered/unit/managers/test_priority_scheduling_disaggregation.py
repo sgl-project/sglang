@@ -1039,7 +1039,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.spec_algorithm = MagicMock()
         scheduler.max_running_requests = 1
         scheduler.future_map = MagicMock()
-        scheduler.policy = MagicMock()
+        scheduler.schedule_planner = MagicMock()
         scheduler.schedule_stream = MagicMock()
         scheduler.forward_stream = MagicMock()
         scheduler.ngram_embedding_manager = MagicMock()
@@ -1057,8 +1057,8 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
-        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: sorted(
-            waiting_queue, key=lambda req: -req.priority
+        scheduler.schedule_planner.calc_priority.side_effect = lambda waiting_queue, _: (
+            sorted(waiting_queue, key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()
@@ -1079,8 +1079,8 @@ class TestDecodePrebuilt(unittest.TestCase):
             )
 
         self.assertIs(ret, new_batch)
-        scheduler.policy.calc_priority.assert_called_once_with(
-            ANY, scheduler.running_batch
+        scheduler.schedule_planner.calc_priority.assert_called_once_with(
+            ANY, scheduler.running_batch.reqs
         )
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])

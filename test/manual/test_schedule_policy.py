@@ -2,11 +2,8 @@ import unittest
 from array import array
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import (
-    CacheAgnosticPolicy,
-    CacheAwarePolicy,
-    SchedulePolicy,
-)
+from sglang.srt.managers.schedule_policies.policy import SchedulePolicy
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -34,28 +31,28 @@ class TestSchedulePolicy(CustomTestCase):
         self.tree_cache = RadixCache.create_simulated()
 
     def test_init_with_cache_aware_policy(self):
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="lpm",
             tree_cache=self.tree_cache,
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        self.assertEqual(policy.policy, CacheAwarePolicy.LPM)
+        self.assertEqual(policy.policy, SchedulePolicy.LPM)
 
     def test_init_with_cache_agnostic_policy(self):
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="fcfs",
             tree_cache=self.tree_cache,
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
+        self.assertEqual(policy.policy, SchedulePolicy.FCFS)
 
     def test_init_with_unknown_policy(self):
         with self.assertRaises(ValueError):
-            SchedulePolicy(
+            SchedulePlanner(
                 policy="invalid",
                 tree_cache=self.tree_cache,
                 enable_hierarchical_cache=True,
@@ -65,14 +62,14 @@ class TestSchedulePolicy(CustomTestCase):
 
     def test_init_with_disabled_cache(self):
         tree_cache = RadixCache.create_simulated(disable=True)
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="lpm",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
+        self.assertEqual(policy.policy, SchedulePolicy.FCFS)
 
     def test_calc_priority_fcfs(self):
         tree_cache = RadixCache.create_simulated()
@@ -82,7 +79,7 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req(2, "a", [1]),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="fcfs",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -106,7 +103,7 @@ class TestSchedulePolicy(CustomTestCase):
 
         waiting_queue = [r1, r2, r3]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="fcfs",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -133,7 +130,7 @@ class TestSchedulePolicy(CustomTestCase):
 
         waiting_queue = [r1, r2, r3]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="fcfs",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -155,7 +152,7 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req(2, "a", [1], SamplingParams(max_new_tokens=100)),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="lof",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -179,7 +176,7 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=0),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="lof",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -205,7 +202,7 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req(2, "a", [1], SamplingParams(max_new_tokens=100), priority=1),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="lof",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -235,14 +232,14 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req("w3", "f", [6], routing_key="key_c"),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="routing-key",
             tree_cache=tree_cache,
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch.reqs)
 
         self.assertEqual(waiting_queue[0].rid, "w2")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -263,14 +260,14 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req("w2", "e", [5], routing_key="key_a"),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="routing-key",
             tree_cache=tree_cache,
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch.reqs)
 
         self.assertEqual(waiting_queue[0].rid, "w2")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -292,14 +289,14 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req("w3", "f", [6], routing_key="key_c"),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="routing-key",
             tree_cache=tree_cache,
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch.reqs)
 
         self.assertEqual(waiting_queue[0].rid, "w3")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -317,14 +314,14 @@ class TestSchedulePolicy(CustomTestCase):
             _make_req("w3", "f", [6], routing_key="key_c"),
         ]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="routing-key",
             tree_cache=tree_cache,
             enable_hierarchical_cache=False,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch.reqs)
 
         self.assertEqual(waiting_queue[0].rid, "w1")
         self.assertEqual(waiting_queue[1].rid, "w2")

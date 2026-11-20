@@ -5,10 +5,8 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.decode import DecodeRequest
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_policy import (
-    CacheAwarePolicy,
-    SchedulePolicy,
-)
+from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker
+from sglang.srt.managers.schedule_policies.lpm import LpmRanker
 from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
@@ -16,6 +14,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,24 +24,24 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
-    def make_policy(self, policy, supports_fast_match_prefix):
-        schedule_policy = object.__new__(SchedulePolicy)
-        schedule_policy.policy = policy
-        schedule_policy._bounded_active = False
+    def make_lpm_policy(self, supports_fast_match_prefix):
+        schedule_policy = object.__new__(SchedulePlanner)
+        schedule_policy.ranker = schedule_policy._lpm = LpmRanker(None, False, True)
+        schedule_policy._fcfs_fallback = FcfsRanker()
         schedule_policy.tree_cache = SimpleNamespace(
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
         )
         return schedule_policy
 
     def test_lpm_queue_limit_respects_fast_matching_capability(self):
-        policy = self.make_policy(CacheAwarePolicy.LPM, False)
+        policy = self.make_lpm_policy(False)
         self.assertTrue(policy.waiting_queue_prefix_matched([None] * 128))
         self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
 
         policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
         self.assertTrue(policy.waiting_queue_prefix_matched([None] * 129))
 
-        policy._bounded_active = True
+        policy._lpm._bounded_active = True
         self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
 
 
@@ -257,7 +256,9 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             token_to_kv_pool_allocator=None,
             spec_algorithm=None,
             tree_cache=SimpleNamespace(waiting_storage_span=get_storage_span),
-            policy=SimpleNamespace(waiting_queue_prefix_matched=lambda queue: True),
+            schedule_planner=SimpleNamespace(
+                waiting_queue_prefix_matched=lambda queue: True
+            ),
             metrics_reporter=SimpleNamespace(recent_cache_hit_rate=0.75),
             waiting_queue=[req],
             chunked_req=None,

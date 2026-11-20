@@ -3,11 +3,9 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import (
-    CacheAgnosticPolicy,
-    CacheAwarePolicy,
-    SchedulePolicy,
-)
+from sglang.srt.managers.schedule_policies.fcfs import FcfsRanker
+from sglang.srt.managers.schedule_policies.hrrn import HrrnRanker
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -54,7 +52,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
         waiting_queue = [r_long, r_aged, r_short]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="hrrn",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -85,7 +83,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
 
         waiting_queue = [r_short_new, r_long_old]
 
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="hrrn",
             tree_cache=tree_cache,
             enable_hierarchical_cache=True,
@@ -105,7 +103,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         length can sort differently by HRRN. Also verifies rid tie-break for
         equal-ratio reqs.
 
-        Uses _sort_by_hrrn directly to bypass the prefix-match pass inside
+        Uses HrrnRanker.sort directly to bypass the prefix-match pass inside
         calc_priority, which would overwrite num_matched_prefix_tokens.
         """
         r_more_cached = _make_req("a", "x" * 100, list(range(100)))
@@ -123,7 +121,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         r_tie.arrival_processed_tokens = 0
 
         waiting_queue = [r_tie, r_less_cached, r_more_cached]
-        SchedulePolicy._sort_by_hrrn(waiting_queue, set(), processed_tokens=1000)
+        HrrnRanker().sort(waiting_queue, set(), processed_tokens=1000)
 
         self.assertEqual(waiting_queue[0].rid, "a")
         self.assertEqual(waiting_queue[1].rid, "b")
@@ -136,7 +134,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        self.policy = SchedulePolicy(
+        self.policy = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -165,7 +163,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         older = self.make_req("z", 32, arrived=1)
         newer = self.make_req("a", 32, arrived=2)
         queue = [newer, older]
-        self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
+        self.policy.ranker.sort(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [older, newer])
 
     def test_duplicate_prefix_is_deprioritized(self):
@@ -195,7 +193,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         replay.output_ids.extend([0] * 64)
         short = self.make_req("short", 32)
         queue = [replay, short]
-        self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
+        self.policy.ranker.sort(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [short, replay])
 
     def test_chunk_limit_reserves_complete_short_prefills(self):
@@ -247,7 +245,7 @@ class TestShortestPrefillFirst(CustomTestCase):
                 )
 
     def test_other_policy_keeps_normal_chunk_limit(self):
-        self.policy.policy = CacheAwarePolicy.HRRN
+        self.policy.ranker = HrrnRanker()
         self.assertIsNone(
             self.policy.shortest_prefill_chunk_limit(
                 self.make_req("continuation", 8192),
@@ -277,7 +275,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         ):
             queue = [short, staged]
             self.policy.poll_storage_prefetches(queue)
-            self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
+            self.policy.ranker.sort(queue, set(), processed_tokens=0)
             self.assertEqual(queue, [staged, short])
             self.assertEqual(
                 self.policy.shortest_prefill_chunk_limit(
@@ -294,14 +292,14 @@ class TestShortestPrefillFirst(CustomTestCase):
             can_poll.return_value = False
             self.policy.poll_storage_prefetches(queue)
             can_poll.return_value = True
-            self.policy.policy = CacheAgnosticPolicy.FCFS
+            self.policy.ranker = FcfsRanker()
             self.policy.poll_storage_prefetches(queue)
         poll.assert_called_once_with(
             [short.cache_request_handle, staged.cache_request_handle]
         )
 
     def test_aging_promotes_waiting_long_requests(self):
-        policy = SchedulePolicy(
+        policy = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -314,9 +312,9 @@ class TestShortestPrefillFirst(CustomTestCase):
         new_short.arrival_processed_tokens = 3000
         queue = [new_short, old_long]
         # Rank = uncached work - 0.5 * prefill tokens processed while waiting.
-        policy._sort_by_shortest_prefill(queue, set(), processed_tokens=1000)
+        policy.ranker.sort(queue, set(), processed_tokens=1000)
         self.assertEqual(queue, [new_short, old_long])
-        policy._sort_by_shortest_prefill(queue, set(), processed_tokens=3000)
+        policy.ranker.sort(queue, set(), processed_tokens=3000)
         self.assertEqual(queue, [old_long, new_short])
 
         continuation = self.make_req("continuation", 16384)
@@ -343,7 +341,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         ]:
             with self.subTest(policy=schedule_policy, factor=factor):
                 with self.assertRaises(ValueError):
-                    SchedulePolicy(
+                    SchedulePlanner(
                         policy=schedule_policy,
                         tree_cache=RadixCache.create_simulated(),
                         enable_hierarchical_cache=True,

@@ -85,12 +85,12 @@ class TestHeldRowAdmission(CustomTestCase):
         move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
-        s.policy = Mock(
-            _bounded_active=False,
+        s.schedule_planner = Mock(
+            bounded_lpm_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
-        s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.schedule_planner.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -191,7 +191,9 @@ class TestHeldRowAdmission(CustomTestCase):
 
 class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
     def test_each_temporary_skip_can_use_fixed_next_batch(self):
-        from sglang.srt.managers.schedule_policy import SchedulePolicy
+        from sglang.srt.managers.scheduler_components.schedule_planner import (
+            SchedulePlanner,
+        )
         from sglang.srt.mem_cache.radix_cache import RadixCache
 
         for reason in ("lora", "pooling", "prefetch", "device_hit_loss", "staging"):
@@ -210,13 +212,17 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                 s = self._scheduler(
                     DisaggregationMode.NULL, running, final_chunk, waiting
                 )
-                s.policy = SchedulePolicy(
+                s.schedule_planner = SchedulePlanner(
                     "lpm", RadixCache.create_simulated(), False, False, False
                 )
-                s.policy._should_start_bounded_batch = Mock(return_value=True)
-                s.policy._compute_prefix_matches = Mock(return_value=set())
-                s.policy._touch_waiting_prefixes = Mock()
-                s.policy.shortest_prefill_chunk_limit = Mock(return_value=None)
+                s.schedule_planner._lpm._should_start_bounded_batch = Mock(
+                    return_value=True
+                )
+                s.schedule_planner._compute_prefix_matches = Mock(return_value=set())
+                s.schedule_planner._touch_waiting_prefixes = Mock()
+                s.schedule_planner.shortest_prefill_chunk_limit = Mock(
+                    return_value=None
+                )
                 if reason == "lora":
                     s.enable_lora = True
                     s.lora_drainer = None
@@ -251,7 +257,7 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                     with self.assertRaises(_BatchBuilt) as built:
                         s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=running))
                 self.assertEqual(built.exception.args[0], [final_chunk, waiting[64]])
-                self.assertTrue(s.policy._bounded_next_selected)
+                self.assertTrue(s.schedule_planner._lpm._bounded_next_selected)
                 self.assertTrue(
                     all(req not in blocked for req in built.exception.args[0])
                 )

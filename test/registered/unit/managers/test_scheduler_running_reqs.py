@@ -397,8 +397,8 @@ class TestRunningReqsHooks(CustomTestCase):
         move([waiting], s.waiting_queue)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock(
-            _bounded_active=False,
+        s.schedule_planner = Mock(
+            bounded_lpm_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
