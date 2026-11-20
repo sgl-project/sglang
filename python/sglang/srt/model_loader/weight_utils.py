@@ -34,6 +34,7 @@ from typing import (
 
 import filelock
 import huggingface_hub.constants
+import msgspec
 import numpy as np
 import safetensors.torch
 import torch
@@ -1134,6 +1135,9 @@ class CheckpointFilePrefetchHandle:
         self._succeeded_event = succeeded_event
         self._errors = errors
 
+    def begin_file(self, index: int) -> None:
+        """Called by the weights iterator before it reads ``files[index]``."""
+
     def wait(self, timeout: Optional[float] = None) -> None:
         self._thread.join(timeout)
         if self._thread.is_alive():
@@ -1295,6 +1299,195 @@ def _prefetch_all_checkpoints(
     return handle
 
 
+class SelectedPrefetch(msgspec.Struct, frozen=True):
+    """What this node's ranks read of a checkpoint, and this rank's share of it.
+
+    ``keep(name, nbytes)`` selects the tensors any rank on this node reads; the
+    node's ranks split the files between them, rank ``node_rank`` of
+    ``node_size`` taking every ``node_size``-th file.
+    """
+
+    keep: Callable[[str, int], bool]
+    node_rank: int
+    node_size: int
+
+
+# Kept tensors this close together are read as one range; arbitrary.
+_SELECTED_PREFETCH_MERGE_GAP = 1 << 20
+
+
+def _selected_read_ranges(
+    path: str, keep: Callable[[str, int], bool]
+) -> List[Tuple[int, int]]:
+    """Sorted byte ranges ``[start, end)`` covering the tensors ``keep`` selects.
+
+    Ranges closer than ``_SELECTED_PREFETCH_MERGE_GAP`` are merged.
+    """
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    data_start = 8 + header_len
+    ranges = sorted(
+        (data_start + begin, data_start + end)
+        for name, info in header.items()
+        if name != "__metadata__"
+        for begin, end in (info["data_offsets"],)
+        if keep(name, end - begin)
+    )
+    merged: List[List[int]] = []
+    for start, end in ranges:
+        if merged and start - merged[-1][1] <= _SELECTED_PREFETCH_MERGE_GAP:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _read_ranges(
+    path: str, ranges: List[Tuple[int, int]], cancel_event: threading.Event
+) -> int:
+    """Read ``ranges`` of ``path`` front to back on one file handle.
+
+    A sequential reader keeps the kernel's readahead going, which independent
+    reads at scattered offsets do not.
+    """
+    buf = memoryview(bytearray(_get_prefetch_block_size()))
+    done = 0
+    with open(path, "rb", buffering=0) as f:
+        posix_fadvise = getattr(os, "posix_fadvise", None)
+        if posix_fadvise is not None:
+            posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        for start, end in ranges:
+            f.seek(start)
+            pos = start
+            while pos < end:
+                if cancel_event.is_set():
+                    return done + pos - start
+                n = f.readinto(buf[: end - pos])
+                if not n:
+                    break
+                pos += n
+            done += pos - start
+    return done
+
+
+class SelectedTensorPrefetchHandle(CheckpointFilePrefetchHandle):
+    """Selected-tensor prefetch kept at most ``lookahead`` files ahead of the loader.
+
+    The bound matters when the selection does not fit in the page cache, where
+    reading too far ahead evicts pages before the loader gets to them.
+    """
+
+    def __init__(self, *, lookahead: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._lookahead = lookahead
+        self._loader_file = -1
+        self._loader_moved = threading.Condition()
+
+    def begin_file(self, index: int) -> None:
+        with self._loader_moved:
+            self._loader_file = index
+            self._loader_moved.notify_all()
+
+    def wait_for_window(self, index: int) -> bool:
+        """Block until file ``index`` is within the lookahead; False once cancelled."""
+        with self._loader_moved:
+            while (
+                index > self._loader_file + self._lookahead
+                and not self._cancel_event.is_set()
+            ):
+                self._loader_moved.wait(timeout=1.0)
+        return not self._cancel_event.is_set()
+
+
+def _prefetch_selected_tensors(
+    files: List[str],
+    *,
+    selection: SelectedPrefetch,
+    num_threads: int,
+) -> SelectedTensorPrefetchHandle:
+    """Read this rank's share of the node's selected tensors into the page cache.
+
+    Like :func:`_prefetch_all_checkpoints`, but reads only the byte ranges
+    ``selection.keep`` selects, one thread per file, in ``files`` order, and
+    stays within a lookahead of the loader's position in ``files``.
+    """
+    import time
+
+    if num_threads < 1:
+        raise ValueError("weight loader prefetch num_threads must be >= 1")
+    mine = list(range(selection.node_rank, len(files), selection.node_size))
+    cancel_event = threading.Event()
+    succeeded_event = threading.Event()
+    errors: List[Tuple[str, Exception]] = []
+
+    def _read_file(path: str) -> int:
+        return _read_ranges(
+            path, _selected_read_ranges(path, selection.keep), cancel_event
+        )
+
+    def _run() -> None:
+        started = time.perf_counter()
+        read_bytes = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+            pending: Dict[concurrent.futures.Future, str] = {}
+
+            def _collect(return_when) -> None:
+                nonlocal read_bytes
+                done, _ = concurrent.futures.wait(pending, return_when=return_when)
+                for future in done:
+                    path = pending.pop(future)
+                    exc = future.exception()
+                    if exc is None:
+                        read_bytes += future.result()
+                    else:
+                        errors.append((path, exc))
+                        logger.warning("Failed to prefetch %r: %s", path, exc)
+
+            for index in mine:
+                while len(pending) >= num_threads:
+                    _collect(concurrent.futures.FIRST_COMPLETED)
+                if not handle.wait_for_window(index):
+                    break
+                pending[pool.submit(_read_file, files[index])] = files[index]
+            if pending:
+                _collect(concurrent.futures.ALL_COMPLETED)
+        succeeded_event.set()
+        logger.info(
+            "Rank %d: prefetched %.1f GiB of selected tensors from %d of %d files "
+            "in %.1f s",
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            read_bytes / (1 << 30),
+            len(mine),
+            len(files),
+            time.perf_counter() - started,
+        )
+
+    handle = SelectedTensorPrefetchHandle(
+        # Room for every rank on the node to keep all its threads busy.
+        lookahead=2 * num_threads * selection.node_size,
+        thread=threading.Thread(target=_run, daemon=True),
+        cancel_event=cancel_event,
+        succeeded_event=succeeded_event,
+        errors=errors,
+    )
+    handle._thread.start()
+    return handle
+
+
+def _start_weights_prefetch(
+    files: List[str],
+    *,
+    selection: Optional[SelectedPrefetch],
+    num_threads: int,
+) -> CheckpointFilePrefetchHandle:
+    if selection is None:
+        return _prefetch_all_checkpoints(sorted(files), num_threads=num_threads)
+    return _prefetch_selected_tensors(
+        list(files), selection=selection, num_threads=num_threads
+    )
+
+
 def _drop_file_cache_after_load(path: str) -> None:
     """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
     posix_fadvise = getattr(os, "posix_fadvise", None)
@@ -1319,25 +1512,36 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    prefetch_selection: Optional[SelectedPrefetch] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Iterate over the weights in the model safetensor files."""
+    """Iterate over the weights in the model safetensor files.
+
+    ``prefetch_selection``, when given, limits prefetching to the tensors this
+    node reads.
+    """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
     prefetch_handle = None
     if prefetch and not disable_mmap:
-        prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        prefetch_handle = _start_weights_prefetch(
+            hf_weights_files,
+            selection=prefetch_selection,
+            num_threads=prefetch_num_threads,
         )
 
-    for st_file in tqdm(
-        hf_weights_files,
-        desc="Loading safetensors checkpoint shards",
-        disable=not enable_tqdm,
-        bar_format=BAR_FORMAT,
-        position=tqdm._get_free_pos(),
+    for index, st_file in enumerate(
+        tqdm(
+            hf_weights_files,
+            desc="Loading safetensors checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        )
     ):
+        if prefetch_handle is not None:
+            prefetch_handle.begin_file(index)
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
@@ -1549,17 +1753,21 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    prefetch_selection: Optional[SelectedPrefetch] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    ``prefetch_selection`` is as in :func:`safetensors_weights_iterator`.
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
-        prefetch_handle = _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
+        prefetch_handle = _start_weights_prefetch(
+            hf_weights_files,
+            selection=prefetch_selection,
+            num_threads=prefetch_num_threads,
         )
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1592,8 +1800,12 @@ def buffered_multi_thread_safetensors_weights_iterator(
             bar_format=BAR_FORMAT,
             position=tqdm._get_free_pos(),
         ) as pbar:
+            index = 0
             while pending:
                 st_file, future = pending.popleft()
+                if prefetch_handle is not None:
+                    prefetch_handle.begin_file(index)
+                index += 1
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
