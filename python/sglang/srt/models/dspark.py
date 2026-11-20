@@ -25,12 +25,9 @@ from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
-)
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
 )
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
@@ -185,6 +182,10 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         """The w2 weight when the bias is exactly the GEMV of the previous
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
+
+    # Step logits = softcap(base + bias), masked from step_vocab_limit on.
+    step_softcap: Optional[float] = None
+    step_vocab_limit: Optional[int] = None
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
@@ -489,13 +490,8 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     hidden_size = int(config.hidden_size)
     markov_rank = int(getattr(config, "markov_rank", 0))
     with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
@@ -521,6 +517,9 @@ def _has_mla_layers(layers) -> bool:
 
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
+    # project_target_hidden may run before the target's SP gather on rank-local
+    # rows, where the split fc's TP all-reduce does not apply.
+    supports_fc_tp_split = False
     # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
     # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
     supports_vocab_parallel_draft_logits = False
@@ -701,7 +700,7 @@ class DSparkDraftMixin:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _fused_kv_write_bundle(self, pool):

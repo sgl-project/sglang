@@ -128,13 +128,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    discard_kv_cache_backup,
-    dsv4_needs_rebootstrap,
     finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     restore_kv_cache,
+    retraction_needs_rebootstrap,
     start_restore_kv_cache,
     suffix_page_indices,
 )
@@ -169,6 +168,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -184,15 +184,16 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 @dataclass
 class _HostStagedAdmissionStats:
-    # One transfer pass: running/retracted/waiting queues do not change, and
-    # transfer entries are removed only at the end. Only admission changes
-    # the active count. Allocator and radix-cache counters stay live.
+    # One transfer pass: running/retracted/waiting queues do not change; the
+    # device transfer count is read at the first admission and changes only by
+    # admission after it. Allocator and radix-cache counters stay live.
     retractable_tokens: Optional[int] = None
     retractable_window_tokens: Optional[Dict[str, int]] = None
     max_req_tokens: Optional[int] = None
@@ -424,6 +425,8 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
+    # Its receiver waits for the prefill DP rank to resolve before init.
+    awaiting_prefill_dp_rank: bool = False
     host_staged: bool = False
     # Queued for transfer but its destination not yet sent to any prefill rank.
     awaiting_publish: bool = False
@@ -487,13 +490,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_total_num_tokens: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        draft_kv_ring: Optional[DFlashDraftKVRing],
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
+        # Whether the last move_preallocated stopped on a full host staging pool.
+        self.host_pool_blocked = False
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -541,7 +548,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=self._abort_retracted
         )
-        self.pending_reqs: List[DecodeRequest] = []
         # In-flight authoritative room -> DP-rank lookups, consumed below.
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
@@ -590,12 +596,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.kv_checksum_signature = kv_layout_signature(kv_args)
-            self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{get_device().gpu_id}"),
-                kv_data_ptrs=kv_args.kv_data_ptrs,
-                kv_item_lens=kv_args.kv_item_lens,
-                state_data_ptrs=kv_args.state_data_ptrs,
-                state_item_lens=kv_args.state_item_lens,
+            self.scheduler.kv_checksum_computer = KvChecksumComputer.for_kv_args(
+                kv_args, torch.device(f"cuda:{get_device().gpu_id}")
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -785,7 +787,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             windows = dict.fromkeys(allocator.window_pool_names(), full_tokens)
         if window_tokens is not None:
             windows.update(window_tokens)
-        return KVDemand(full_tokens, windows, state_slots)
+        # The preallocation binds a request row unless the request holds one.
+        request_rows = int(
+            bool(allocator.request_allocators) and req.kv.req_pool_idx is None
+        )
+        return KVDemand(full_tokens, windows, state_slots, request_rows)
 
     def _window_retractable_lens(self, req: Req) -> Dict[str, int]:
         """What retracting ``req`` frees in each window sub-pool, by name."""
@@ -912,6 +918,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
+            draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1108,11 +1116,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req: Req,
         is_retracted: bool = False,
         is_rebootstrap: bool = False,
-        *,
-        src: Optional[ReqList] = None,
     ) -> None:
-        """Add a request to the pending queue, moving it out of `src` if given;
-        one refused at the door is finished and leaves `src` for no list.
+        """Add a request to the pending queue, moving it out of the list it is
+        in; one refused at the door is finished and leaves for no list.
 
         ``is_rebootstrap`` marks a PD true-retraction request whose prefix KV
         must be recomputed by the original prefill worker under the current
@@ -1126,22 +1132,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+        if is_retracted and retraction_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
 
-        if self._check_if_req_exceed_kv_capacity(req, src=src):
+        if self._check_if_req_exceed_kv_capacity(req):
             return
 
         if is_retracted:
             req.retraction_mb_id = None
-            move([req], src, self.retracted_queue)
+            move([req], self.retracted_queue)
         else:
             decode_req = self._create_receiver_and_enqueue(
-                req, is_rebootstrap=is_rebootstrap, src=src
+                req, is_rebootstrap=is_rebootstrap
             )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
@@ -1156,7 +1164,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._init_receiver(decode_req, prefill_dp_rank)
                 return
 
-            self.pending_reqs.append(decode_req)
+            decode_req.awaiting_prefill_dp_rank = True
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         max_prefix_len = None
@@ -1204,8 +1212,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         req: Req,
         is_rebootstrap: bool = False,
-        *,
-        src: Optional[ReqList],
     ) -> DecodeRequest:
         backend = (
             TransferBackend.FAKE if _is_fake_transfer(req) else self.transfer_backend
@@ -1221,10 +1227,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
-        move([decode_req], src, self.queue)
+        move([decode_req], self.queue)
         return decode_req
 
-    def hold_rebootstrap(self, req: Req, *, src: Optional[ReqList] = None) -> None:
+    def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
 
         Retraction is always paired with a weight update
@@ -1234,23 +1240,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         scheduler non-idle so ``update_weights``' post-update cache flush
         asserts and crashes the decode worker. Instead we hold the request and
         enqueue it from ``enqueue_held_rebootstrap`` on resume, so its prefix KV
-        is recomputed by the prefill worker under the updated weights. It moves
-        out of `src` if given.
+        is recomputed by the prefill worker under the updated weights.
         """
-        move([req], src, self.held_rebootstrap_reqs)
+        move([req], self.held_rebootstrap_reqs)
 
     def enqueue_held_rebootstrap(self) -> None:
         """Move all staged rebootstrap requests into the pending queue when
         generation resumes."""
-        held = self.held_rebootstrap_reqs
-        for req in list(held):
-            self.add(req, is_rebootstrap=True, src=held)
+        for req in list(self.held_rebootstrap_reqs):
+            self.add(req, is_rebootstrap=True)
 
-    def _check_if_req_exceed_kv_capacity(
-        self, req: Req, *, src: Optional[ReqList] = None
-    ) -> bool:
-        """Whether the request can never fit; one that cannot is finished and
-        leaves `src`."""
+    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+        """Whether the request can never fit; one that cannot is finished."""
         message = None
         allocator = self.token_to_kv_pool_allocator
         full_required, _ = self._prealloc_required(req)
@@ -1292,7 +1293,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -1306,14 +1307,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
-        for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
+        for req in [r for r in self.retracted_queue if recv_req.matches(r.rid)]:
             self.scheduler.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
-        for req in self.held_rebootstrap_reqs.take(
-            lambda req: recv_req.matches(req.rid)
-        ):
+        for req in [r for r in self.held_rebootstrap_reqs if recv_req.matches(r.rid)]:
             self.scheduler.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason
             )
@@ -1327,15 +1326,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
-        self.queue.clear()
         if self._pending_publish:
             storage = self._storage()
             for entry in self._pending_publish:
                 storage.end_receive_hold(entry.decode_req.req)
         self._pending_publish.clear()
-        for req in self.retracted_queue:
-            discard_kv_cache_backup(req, self.tree_cache)
-        self.retracted_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -1395,6 +1390,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             req.is_retracted = False
             self._pre_alloc(req)
+            if self.draft_kv_ring is not None:
+                # Its ring rows were not backed up.
+                self.draft_kv_ring.reset_floor(
+                    int(req.kv.req_pool_idx), pre_alloc_fill_len(req)
+                )
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
@@ -1419,11 +1419,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
 
-        move(resumed_reqs, self.retracted_queue, dst)
+        move(resumed_reqs, dst)
 
         return resumed_reqs
 
     def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
+        decode_req.awaiting_prefill_dp_rank = False
         decode_req.kv_receiver.init(prefill_dp_rank)
         if (
             get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
@@ -1503,11 +1504,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
-    ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
-        """Non-blocking ensure parallel info for each addr.
-        Returns (ready_addrs, remaining_reqs)."""
+    ) -> Dict[str, List[DecodeRequest]]:
+        """Non-blocking ensure parallel info for each addr; return the ready ones."""
         ready: Dict[str, List[DecodeRequest]] = {}
-        remaining: List[DecodeRequest] = []
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
@@ -1515,7 +1514,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if last_attempt is not None and (
                 now - last_attempt < self._ensure_retry_interval
             ):
-                remaining.extend(reqs)
                 continue
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
@@ -1535,25 +1533,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    # kv_receiver may be None from a prior self.queue cleanup
-                    if decode_req.kv_receiver is not None:
-                        decode_req.kv_receiver.abort()
+                    # Its receiver fails, and the request leaves the queue.
+                    decode_req.awaiting_prefill_dp_rank = False
+                    decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
-            else:
-                remaining.extend(reqs)
 
-        return ready, remaining
+        return ready
 
     def prefetch_prefill_dp_rank_queries(self) -> None:
         """Start DP-rank lookups before their normal consume point."""
-        if not self.pending_reqs:
+        pending = self._reqs_awaiting_prefill_dp_rank()
+        if not pending:
             return
 
         queries = self._prefill_dp_rank_queries
 
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
-        for decode_req in self.pending_reqs:
+        for decode_req in pending:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
@@ -1582,6 +1579,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             queries[bootstrap_addr] = (rooms, future)
 
+    def _reqs_awaiting_prefill_dp_rank(self) -> List[DecodeRequest]:
+        return [d for d in self.queue.items() if d.awaiting_prefill_dp_rank]
+
     def _cancel_prefill_dp_rank_queries(self) -> None:
         for _, future in self._prefill_dp_rank_queries.values():
             future.cancel()
@@ -1589,18 +1589,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
-        if not self.pending_reqs:
+        pending = self._reqs_awaiting_prefill_dp_rank()
+        if not pending:
             self._cancel_prefill_dp_rank_queries()
             return
 
         # Group pending requests by bootstrap_addr
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
-        for decode_req in self.pending_reqs:
+        for decode_req in pending:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         # Pass 1: ensure parallel info for each addr
-        ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
+        ready_addrs = self._ensure_prefill_info(addr_to_reqs)
 
         resolved: List[Tuple[DecodeRequest, int]] = []
         for bootstrap_addr, decode_reqs in ready_addrs.items():
@@ -1641,14 +1642,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     if prefill_dp_rank is not None:
                         resolved.append((decode_req, int(prefill_dp_rank)))
-                    else:
-                        remaining.append(decode_req)
             else:
                 prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
                 if prefetched is not None:
                     prefetched[1].cancel()
-
-        self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
             self._init_receiver(decode_req, prefill_dp_rank)
@@ -1710,7 +1707,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 1 if self.scheduler.schedule_low_priority_values_first else -1
             )
             queue.sort(key=lambda r: r.req.priority * priority_sign)
-            self.queue.replace(queue)
+            self.queue.reorder(queue)
 
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(queue):
@@ -1725,14 +1722,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
-
-        # DecodeRequest is shared between self.queue and self.pending_reqs;
-        # drop failed reqs from both
-        if failed_reqs:
-            failed_ids = {id(r) for r in failed_reqs}
-            self.pending_reqs = [
-                r for r in self.pending_reqs if id(r) not in failed_ids
-            ]
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs a padded buffer plus its speculative scratch.
@@ -1767,6 +1756,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
+        self.host_pool_blocked = False
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1794,6 +1784,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 >= get_disagg().disaggregation_decode_host_receive_threshold
             ):
                 if not self._pre_alloc_host(decode_req):
+                    self.host_pool_blocked = True
                     break
                 preallocated_reqs.append(decode_req)
                 indices_to_remove.add(i)
@@ -1962,6 +1953,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if self.draft_kv_ring is not None and _is_fake_transfer(decode_req.req):
+                # No prefill sends this request's floor.
+                self.draft_kv_ring.reset_floor(
+                    int(decode_req.req.kv.req_pool_idx),
+                    pre_alloc_fill_len(decode_req.req),
+                )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
@@ -2032,16 +2029,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
 
-        if failed_reqs:
-            failed_ids = {id(r) for r in failed_reqs}
-            self.pending_reqs = [
-                r for r in self.pending_reqs if id(r) not in failed_ids
-            ]
-            for decode_req in failed_reqs:
-                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        for decode_req in failed_reqs:
+            self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
-        self.queue.leave([decode_req.req for decode_req in failed_reqs])
-        move(preallocated_reqs, self.queue, dst)
+        move(preallocated_reqs, dst)
         self.note_destinations_queued(len(preallocated_reqs))
 
         return preallocated_reqs, failed_reqs
@@ -2229,6 +2220,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 int(decode_req.req.kv.req_pool_idx), seq_len
             )
 
+        def _draft_ring_payload():
+            return self.draft_kv_ring.transfer_rows(
+                int(decode_req.req.kv.req_pool_idx), seq_len
+            )
+
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
@@ -2250,6 +2246,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.MINIMAX_INDEX_K: _minimax_payload,
             StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
             StateType.SWA_RING: _swa_ring_payload,
+            StateType.DRAFT_RING: _draft_ring_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -2667,6 +2664,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Hand `count` published destinations over to the transfer queue."""
         self._num_published_destinations = max(
             0, self._num_published_destinations - count
+        )
+
+    @property
+    def num_tokens_pending_prealloc(self):
+        return sum(pre_alloc_fill_len(req) for req in self.queue) + sum(
+            pre_alloc_fill_len(req) for req in self.retracted_queue
         )
 
     @property
@@ -3316,6 +3319,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             abort=self._abort_receiving,
             req_of=lambda x: x.req,
         )
+        # Host-staged transfers whose KV landed but wait for device admission,
+        # as of the last move_transferred.
+        self.num_host_staged_landed = 0
         self.gloo_group = get_parallel().attn_tp_group.cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = get_parallel().tp_rank
@@ -3647,6 +3653,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own receiver reports."""
         if not self.queue:
+            self.num_host_staged_landed = 0
             return [], {}
 
         if self.scheduler.enable_decode_hicache:
@@ -3671,6 +3678,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
         admission_stats = None
+        num_host_staged_landed = 0
         queue = list(self.queue.items())
         for i, (decode_req, poll) in enumerate(zip(queue, polls)):
             if rids_to_check is not None:
@@ -3767,6 +3775,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         admission_stats
                     ):
                         if not prealloc_queue.allocate_host_staged(decode_req):
+                            num_host_staged_landed += 1
                             continue
                 self._commit_transfer_to_req(decode_req)
                 # The peer wrote its last byte.
@@ -3848,8 +3857,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.metadata_buffers.clear_slot(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
-        move(transferred_reqs, self.queue, dst)
-        self.queue.leave([queue[i].req for i in indices_to_remove])
+        move(transferred_reqs, dst)
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
         self.publish_pending_metadata(polls)
@@ -3861,6 +3869,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     rid,
                     rid_failed,
                 )
+        self.num_host_staged_landed = num_host_staged_landed
         return transferred_reqs, outcomes
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
@@ -3883,7 +3892,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self._required_abort_acks(decode_req),
                 )
             ],
-            self.queue,
             self._deferred_releases,
         )
 
@@ -4028,9 +4036,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         is_drained,
                     )
                 )
-        # Drop the released entries before releasing so a _do_release exception
-        # can't leave one in the list (double-free / None receiver on retry).
-        self._deferred_releases.leave([decode_req.req for decode_req, *_ in to_release])
+        # Each release takes its entry out; a failed one is abandoned, not retried,
+        # so the ranks' lists stay the same.
         for decode_req, start_time, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
@@ -4041,24 +4048,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             outcome = "drained" if drained else "timeout"
             try:
                 self._do_release(decode_req, idx)
-            except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
-                logger.exception(f"Deferred KV release failed for room {room}")
+            except Exception as error:
+                # Isolate a failed release so the rest still run.
+                self.scheduler.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),
                 outcome=outcome,
             )
-
-    def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
-
-    def resume_memory_occupation(self):
-        """Queues are already cleared on release; new transfers can be accepted."""
-        pass
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -4218,10 +4215,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
-            # A request the prebuilt result finished never runs.
-            self.running_reqs.leave(
-                [req for req in new_prebuilt_batch.reqs if req.finished()]
-            )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
                 if running_batch.is_empty():
@@ -4350,10 +4343,6 @@ class SchedulerDisaggregationDecodeMixin:
         )
         if not any(mismatched):
             return
-        # A mismatched request never runs.
-        self.running_reqs.leave(
-            [req for req, bad in zip(batch.reqs, mismatched) if bad]
-        )
         for i, req in enumerate(batch.reqs):
             if mismatched[i]:
                 msg = messages.get(
@@ -4395,13 +4384,13 @@ class SchedulerDisaggregationDecodeMixin:
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
-                self._add_request_to_queue(req, src=self.grammar_manager.grammar_queue)
+                self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
             return None
 
         if self.enable_priority_scheduling:
-            self.waiting_queue.replace(
+            self.waiting_queue.reorder(
                 self.policy.calc_priority(self.waiting_queue, running_batch)
             )
 
@@ -4450,7 +4439,7 @@ class SchedulerDisaggregationDecodeMixin:
             return None
         # They run from here on; one the checksum or the prebuilt result ends
         # leaves again before the merge.
-        move(can_run_list, self.waiting_queue, self.running_reqs)
+        move(can_run_list, self.running_reqs)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4567,9 +4556,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         self.disagg_decode_prealloc_queue.move_resumed(self.waiting_queue)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return False
+        # if there are still retracted requests, we do not allocate new requests;
+        # transfers already hold their pages and are still polled, so they can finish
+        has_retracted = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -4579,7 +4568,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         prealloc_deferred = False
         if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 1:
+            if (
+                not has_retracted
+                and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            ):
                 if defer_prealloc:
                     prealloc_deferred = True
                 else:
@@ -4592,7 +4584,10 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+            if (
+                not has_retracted
+                and get_disagg().disaggregation_decode_host_receive_threshold < 1
+            ):
                 # Give completed host transfers device space before new arrivals.
                 self._preallocate_new_requests()
         return prealloc_deferred

@@ -614,6 +614,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             scale_fmt="ue8m0",
             is_neox_style=False,
             fused_indexer_hadamard=False,
+            skip_rope=False,
             k_norm=SimpleNamespace(
                 weight=torch.randn((128,), device=device, generator=generator),
                 bias=torch.randn((128,), device=device, generator=generator),
@@ -688,7 +689,10 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
 
 def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse"):
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.layers.attention.dsa_backend import (
+        DeepseekSparseAttnBackend,
+        _small_heads_prefill_enabled,
+    )
     from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
@@ -721,10 +725,22 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.flashmla_kv_num_q_heads_prefill = 64
     backend.flashmla_kv_format = "V32"
     backend.hisparse_coordinator = None
+    backend.flashmla_prefill_token_packing = False
+    backend._trtllm_fused_q = False
     backend.device_sm_major = (
         torch.cuda.get_device_capability()[0]
         if torch.device(device).type == "cuda"
         else 0
+    )
+    # Mirrors DeepseekSparseAttnBackend.__init__ so forward_extend sees the
+    # same small-heads FlashMLA prefill choice as a real backend.
+    backend.sparse_prefill_small_heads = _small_heads_prefill_enabled(
+        backend.device_sm_major,
+        backend.kv_cache_dtype,
+        backend.num_q_heads,
+        backend.kv_lora_rank,
+        backend.qk_rope_head_dim,
+        prefill_impl,
     )
     backend._arange_buf = torch.arange(1024, dtype=torch.int32, device=device)
     if prefill_impl == "trtllm":
@@ -929,13 +945,21 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 
     indexer = SimpleNamespace(
         index_topk=2048,
+        fp4_index_k=False,
         num_init_tokens=0,
         num_local_tokens=0,
         logits_with_pp_recv=False,
+        use_prefill_lite_topk=False,
+        tp_split_min_rows=None,
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )
-    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens", "_mqa_logits"):
+    for name in (
+        "_with_real_sm_count",
+        "_mask_init_and_local_tokens",
+        "_mqa_logits",
+        "_indexer_tp_split",
+    ):
         setattr(indexer, name, MethodType(getattr(dsa_indexer.Indexer, name), indexer))
 
     class RecordingMetadata:

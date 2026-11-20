@@ -11,7 +11,7 @@ import time
 import weakref
 from collections import defaultdict
 from functools import lru_cache
-from typing import Union
+from typing import Callable, Union
 
 import torch
 
@@ -246,11 +246,12 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            err = cudart.cudaHostRegister(ptr, size, 0)
+            rc = int(err)
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
-                    f"{cudart.cudaGetErrorString(rc)}) at offset={offset} size={size} "
+                    f"{cudart.cudaGetErrorString(err)}) at offset={offset} size={size} "
                     f"(total={total}, chunk_limit={chunk_bytes}); host buffer is not "
                     f"pinned and device transfers may silently return stale data."
                 )
@@ -277,14 +278,15 @@ def _cuda_host_unregister_ranges(
 ) -> list[tuple[int, int]]:
     failed_ranges = []
     for ptr, size in reversed(registered_ranges):
-        rc = int(cudart.cudaHostUnregister(ptr))
+        err = cudart.cudaHostUnregister(ptr)
+        rc = int(err)
         if rc != 0:
             failed_ranges.append((ptr, size))
             logger.warning(
                 "cudaHostUnregister failed during %s (rc=%d, %s) for ptr=%#x size=%d",
                 operation,
                 rc,
-                cudart.cudaGetErrorString(rc),
+                cudart.cudaGetErrorString(err),
                 ptr,
                 size,
             )
@@ -479,20 +481,36 @@ def _uses_hip_owned_host_memory(
     )
 
 
-def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    # Not torch pin_memory: its host allocator rounds each block up to a power of
-    # two, so a 180 GB pool would pin 256 GiB of GTT.
+def alloc_owned_host_tensor(
+    dims: tuple,
+    dtype: torch.dtype,
+    alloc: Callable[[int], int],
+    free: Callable[[int], None],
+) -> torch.Tensor:
+    """A host tensor over ``alloc(nbytes)`` memory, released by ``free(ptr)``.
+
+    Unlike torch pin_memory, whose host allocator rounds each block up to a
+    power of two, the allocation has exactly the tensor's size.
+    """
     numel = math.prod(dims)
     nbytes = numel * dtype.itemsize
-    ptr = _hip_host_malloc(nbytes)
+    ptr = alloc(nbytes)
     try:
         array = (ctypes.c_uint8 * nbytes).from_address(ptr)
         buffer = torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
     except BaseException:
-        _hip_host_free(ptr)
+        free(ptr)
         raise
     # Freed with the tensor's last view; at interpreter exit the driver reclaims it.
-    weakref.finalize(array, _hip_host_free, ptr).atexit = False
+    weakref.finalize(array, free, ptr).atexit = False
+    return buffer
+
+
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory: a 180 GB pool would pin 256 GiB of GTT.
+    buffer = alloc_owned_host_tensor(
+        dims=dims, dtype=dtype, alloc=_hip_host_malloc, free=_hip_host_free
+    )
     # Not host-registered, so HostKVCache.destroy() must not cudaHostUnregister it.
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
@@ -534,6 +552,25 @@ def alloc_with_pin_memory(
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
+
+
+def alloc_with_pin_memory_npu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """
+    Allocate an NPU host tensor using the configured host-memory backend.
+    """
+    from sglang.srt.mem_cache.pool_host.npu_host_memory import get_host_memory_backend
+
+    backend = get_host_memory_backend()
+    if backend is not None:
+        return backend.alloc(dims, dtype, device, pin_memory, allocator)
+    return alloc_with_pin_memory(dims, dtype, device, pin_memory, allocator)
 
 
 def alloc_with_pin_memory_xpu(
@@ -624,7 +661,7 @@ def make_kernel_ptr_table(
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
-        "npu": alloc_with_pin_memory,
+        "npu": alloc_with_pin_memory_npu,
         "musa": alloc_with_pin_memory,
         "xpu": alloc_with_pin_memory_xpu,
     },

@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get
 end to end attention solution with aiter kernels
 """
 
+import functools
 import inspect
 import logging
 import os
@@ -46,7 +47,11 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    print_info_once,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -70,9 +75,9 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
-    # Muse Spark's opt-in unified-attention tiles (3rdparty/amd/muse_spark aiter patch 05).
-    _unified_attention_has_muse_tiles = (
-        "verify_block_m" in inspect.signature(unified_attention).parameters
+    # Upstream aiter's equal-length query flag (every sequence has max_seqlen_q rows, e.g. a verify).
+    _unified_attention_has_equal_seqlen_q = (
+        "equal_seqlen_q" in inspect.signature(unified_attention).parameters
     )
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
@@ -82,19 +87,11 @@ try:
         unified_attention_3d_mtp_ragged_func,
     )
 except ImportError:
-    _unified_attention_has_muse_tiles = False
+    _unified_attention_has_equal_seqlen_q = False
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-try:
-    from aiter.ops.flydsl.muse_paged_decode import (
-        muse_paged_gqa_decode_flydsl,
-        prepare_muse_paged_gqa_decode_scratch,
-    )
-except ImportError:
-    muse_paged_gqa_decode_flydsl = None
-    prepare_muse_paged_gqa_decode_scratch = None
 
 try:
     from sglang.kernels.ops.attention.muse_extend_gluon import (
@@ -103,6 +100,33 @@ try:
     )
 except ImportError:  # Triton without Gluon's CDNA4 ops
     muse_extend_attention = None
+
+try:
+    from sglang.kernels.ops.attention.muse_extend_gfx1250 import (
+        muse_extend_attention_gfx1250,
+        muse_extend_gfx1250_applies,
+        quantize_q_fp8,
+    )
+except ImportError:
+    muse_extend_attention_gfx1250 = None
+    muse_extend_gfx1250_applies = None
+    quantize_q_fp8 = None
+try:
+    from sglang.kernels.ops.attention.muse_extend_fly_gfx1250 import (
+        muse_extend_attention_fly_gfx1250,
+    )
+except ImportError:  # no FlyDSL with the gfx1250 TDM / WMMA ops
+    muse_extend_attention_fly_gfx1250 = None
+try:
+    from sglang.kernels.ops.attention.muse_extend_flydsl import (
+        muse_extend_attention_fly,
+    )
+except ImportError:
+    muse_extend_attention_fly = None
+try:
+    from sglang.kernels.ops.attention import muse_verify_fly_gfx1250
+except ImportError:
+    muse_verify_fly_gfx1250 = None
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
@@ -114,12 +138,21 @@ from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
     pick_splits_v2,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
-from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
+from sglang.kernels.ops.attention.swa_verify_splitkv import (
+    muse_decode_splitkv,
+    swa_verify_splitkv,
+)
 from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
     DEFERRAL as _VERIFY_REDUCE_DEFERRAL,
 )
 
 try:
+    from sglang.kernels.ops.attention.muse_verify_balanced import (
+        gqa_verify_flydsl_balanced,
+        swa_verify_flydsl,
+        use_balanced_full,
+        use_flydsl_sliding,
+    )
     from sglang.kernels.ops.attention.muse_verify_flydsl import gqa_verify_flydsl
 except Exception:  # no flydsl / aiter FlyDSL in this environment
     gqa_verify_flydsl = None
@@ -136,6 +169,12 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
     mla_gluon_decode,
     prefer_mla_gluon_decode,
 )
+from sglang.srt.layers.attention.aiter_triton_mla import (
+    aiter_triton_mla_decode,
+    resolve_aiter_mla_decode_backend,
+    triton_mla_block_size,
+    triton_mla_block_tables,
+)
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -149,7 +188,21 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
+
 # Use fp8 prefill only on gfx95
+def _muse_gfx95_like() -> bool:
+    """gfx950, or gfx1250 when SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95=1: the Muse attention paths were validated on gfx950
+    only; this lets their Triton kernels be tried on gfx1250 (FlyDSL/Gluon ones stay behind their own flags)."""
+    if is_gfx95_supported():
+        return True
+    if not get_bool_env_var("SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95", "True"):
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
@@ -212,17 +265,21 @@ _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 # Muse Spark extend: FP8 Q on full layers from this many query tokens.
 _MUSE_EXTEND_FP8_MIN_Q = 256
-# Muse Spark long-prefill 2D tile config (BLOCK_M, num_warps, num_stages, TILE_SIZE,
-# waves_per_eu) for 256+ query tokens: 90K cached + 5K new 5.57 -> 4.08 ms.
-_MUSE_PREFILL_2D_CONFIG = (128, 4, 2, 128, 2)
-# Muse Spark 8-token verify on the unified 3D kernel: one 64-row tile per
-# (request, KV head) and 256 split-KV segments (C1-tuned).
-_MUSE_VERIFY_BLOCK_M = 64
-_MUSE_VERIFY_NUM_SEGMENTS = 256
 # Full-layer GQA-folded verify (when the two-KV-head kernel is off): batch
 # floor, splits, BN, warps. 12 x 20K-120K contexts: 166 us vs 238 us for the 3D path.
 _MUSE_VERIFY_FULL_GQA = (8, 64, 64, 4)
 _muse_verify_v2_logged: set = set()
+
+
+@functools.lru_cache(maxsize=1)
+def _is_gfx1250_device() -> bool:
+    try:
+        return (
+            "gfx1250"
+            in torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+        )
+    except Exception:
+        return False
 
 
 def _defer_or_merged(result, v_descale) -> None:
@@ -239,6 +296,7 @@ def _muse_verify_attention(
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
+    seqused_k_i32,
     block_table,
     softmax_scale,
     window_size,
@@ -263,7 +321,7 @@ def _muse_verify_attention(
     sliding_window = 1 + window_size[0]
     if not (
         num_seqs > 0
-        and block_size == 16
+        and block_size in (16, 32, 64, 128)
         and head_size == 64
         and num_query_heads == 8 * num_kv_heads
         and int(max_seqlen_q) == 8
@@ -276,7 +334,78 @@ def _muse_verify_attention(
         return False
     # Splits were tuned at 2 KV heads per rank (TP8); more KV heads (TP4: 4) divide them to keep the CTA count.
     kv_scale = max(1, num_kv_heads // 2)
+    if num_kv_heads == 2 and _is_gfx1250_device():
+        # gfx1250 (wave32): Triton configs tuned at the TP8 verify shapes (8K context) for 4 / 16 / 64 requests.
+        # Above 16 requests (random pages) the KV-head-pair kernel with FP8 QK/PV runs the sliding layers, and full
+        # layers use 4 splits x 64 keys.
+        if sliding_window == 2047 and window_size[1] == 0 and "swa_gqa" in kernels:
+            if (
+                num_seqs >= 12
+                and muse_verify_fly_gfx1250 is not None
+                and seqused_k_i32 is not None
+                and muse_verify_fly_gfx1250.applies(
+                    q, k, v, seqused_k_i32, block_table, sliding_window
+                )
+            ):
+                # FlyDSL FP8-WMMA verify (16- / 64-request buckets): faster than the Triton kernels below
+                _defer_or_merged(
+                    muse_verify_fly_gfx1250.muse_verify_fly(
+                        q, k, v, out, seqused_k_i32, block_table, softmax_scale, sliding_window, k_descale, v_descale,
+                        splits=4 if num_seqs <= 32 else 2, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                    ),
+                    v_descale,
+                )  # fmt: skip
+                return True
+            small = num_seqs <= 16
+            if not small and "full_v2_fp8" in kernels and k.stride() == v.stride():
+                _defer_or_merged(
+                    gqa_verify_splitkv_2kv(
+                        q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                        splits=8 if num_seqs <= 32 else 2, bn=32 if num_seqs <= 32 else 64, num_warps=4,
+                        num_stages=2, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested, fp8=True,
+                        window=sliding_window,
+                    ),
+                    v_descale,
+                )  # fmt: skip
+                return True
+            _defer_or_merged(
+                gqa_verify_splitkv(
+                    q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
+                    sliding_window, k_descale, v_descale,
+                    splits=16 if small else 8, bn=32, num_warps=4 if small else 2,
+                    num_stages=2, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                ),
+                v_descale,
+            )  # fmt: skip
+            return True
+        if sliding_window == 0 and "full_v2" in kernels and k.stride() == v.stride():
+            small = num_seqs <= 16
+            _defer_or_merged(
+                gqa_verify_splitkv_2kv(
+                    q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                    splits=32 if num_seqs <= 8 else (16 if num_seqs <= 16 else (8 if num_seqs <= 32 else 4)), bn=64,
+                    num_warps=4, num_stages=2,
+                    defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested, fp8="full_v2_fp8" in kernels,
+                ),
+                v_descale,
+            )  # fmt: skip
+            return True
     if sliding_window == 2047 and window_size[1] == 0:
+        if (
+            "swa_fly" in kernels
+            and gqa_verify_flydsl is not None
+            and num_kv_heads in (2, 4)
+            and k.stride() == v.stride()
+            and use_flydsl_sliding(num_seqs, num_kv_heads)
+        ):
+            _defer_or_merged(
+                swa_verify_flydsl(
+                    q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                    window=sliding_window, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                ),
+                v_descale,
+            )  # fmt: skip
+            return True
         if "swa_splitkv" in kernels and 0 < num_seqs <= 8:
             _defer_or_merged(
                 swa_verify_splitkv(
@@ -308,13 +437,18 @@ def _muse_verify_attention(
         and num_kv_heads in (2, 4)
         and k.stride() == v.stride()
     ):
+        balanced = "full_fly_bal" in kernels and use_balanced_full(
+            num_seqs, num_kv_heads
+        )
         if ("fly", num_seqs) not in _muse_verify_v2_logged:
             _muse_verify_v2_logged.add(("fly", num_seqs))
             logger.info(
-                "Muse verify FlyDSL full layers: num_seqs=%d mode=exact", num_seqs
+                "Muse verify FlyDSL full layers: num_seqs=%d mode=exact balanced=%s",
+                num_seqs,
+                balanced,
             )
         _defer_or_merged(
-            gqa_verify_flydsl(
+            (gqa_verify_flydsl_balanced if balanced else gqa_verify_flydsl)(
                 q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
                 defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
             ),
@@ -458,6 +592,12 @@ class ForwardMetadata:
     verify_seqlen_k: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
+    # gfx1250 aiter Triton MLA decode; None: MLA decode takes the ASM /
+    # gfx950 mla_gluon dispatch.
+    triton_mla_block_tables: Optional[torch.Tensor] = None
+    triton_mla_seqused_k: Optional[torch.Tensor] = None
+    # The same lengths in int32, the FlyDSL sliding verify's operand type.
+    verify_seqlen_k_i32: Optional[torch.Tensor] = None
 
 
 def _build_paged_kv_view(
@@ -609,10 +749,18 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+    use_aiter_triton_mla_decode: bool = False
 
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
+    use_muse_attention_paths: bool = False
+    muse_extend_fp8_q: bool = False
+    muse_extend_swa_gluon: bool = False
+    muse_extend_gfx1250: bool = False
+    muse_extend_fly_gfx1250: bool = False
+    muse_reuse_extend_metadata: bool = False
+    muse_reuse_verify_lengths: bool = False
 
     def __init__(
         self,
@@ -651,12 +799,15 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
-        self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
-        if self.mla_decode_backend not in ("gluon", "asm"):
-            raise ValueError(
-                "SGLANG_AITER_MLA_DECODE_BACKEND must be 'gluon' or 'asm', "
-                f"got {self.mla_decode_backend!r}"
-            )
+        self.mla_decode_backend = resolve_aiter_mla_decode_backend(
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.get(),
+            use_mla=self.use_mla,
+            input_dtype=self.input_dtype,
+            dcp_world_size=self.dcp_world_size,
+            qk_rope_head_dim=(
+                model_runner.model_config.qk_rope_head_dim if self.use_mla else 0
+            ),
+        )
         self.use_mla_dcp_asm = (
             self.use_mla
             and self.dcp_world_size > 1
@@ -778,6 +929,7 @@ class AiterAttnBackend(AttentionBackend):
             self.swa_kv_pool is not None
             and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)
         )
+        self.use_aiter_triton_mla_decode = False
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
@@ -822,25 +974,6 @@ class AiterAttnBackend(AttentionBackend):
                 chunk if chunk is not None and chunk > 0 else self.max_context_len
             )
 
-        # Opt-in Muse SWA decode: replace unified_attention_2d with a split-K
-        # FlyDSL kernel. Keep this shape-gated so Qwen/Kimi/DSV4 dispatch is
-        # unchanged; full-attention Muse layers retain unified_attention_3d.
-        self.use_muse_flydsl_decode = (
-            envs.SGLANG_ROCM_MUSE_FLYDSL_DECODE.get()
-            and muse_paged_gqa_decode_flydsl is not None
-            and is_gfx95_supported()
-            and self.page_size == 16
-            and self.head_dim == 64
-            and self.num_head == self.num_kv_head * 8
-            and self.input_dtype == torch.bfloat16
-        )
-        if self.use_muse_flydsl_decode:
-            prepare_muse_paged_gqa_decode_scratch(
-                self.device,
-                batches=range(1, 9),
-                num_kv_heads=self.num_kv_head,
-                num_splits=128,
-            )
         # Decode metadata format. unified_attention and pa_decode_gluon (the
         # SHUFFLE 5D decode kernel) both read kv_indices as a 2-D
         # (bs, max_num_blocks_per_seq) page table; the remaining decode kernels
@@ -862,11 +995,11 @@ class AiterAttnBackend(AttentionBackend):
 
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
         # Triton attention. Extend and target verify take the Muse fast paths below
-        # (each behind its own SGLANG_MUSE_* switch); decode is unchanged.
+        # (each behind its own SGLANG_ROCM_MUSE_* switch); decode is unchanged.
         # Muse Spark's attention shapes (GQA 8, head_dim 64, sliding window); other models with the
         # same shapes (gpt-oss) keep the generic paths.
         self.use_muse_attention_paths = (
-            is_gfx95_supported()
+            _muse_gfx95_like()
             and getattr(model_runner.model_config.hf_config, "model_type", None)
             in ("muse_spark", "muse_spark_text")
             and not self.use_mla
@@ -925,10 +1058,35 @@ class AiterAttnBackend(AttentionBackend):
         self.muse_extend_gluon = (
             self.muse_extend_fp8_q
             and muse_extend_attention is not None
-            and is_gfx95_supported()
+            and _muse_gfx95_like()
             and envs.SGLANG_ROCM_MUSE_EXTEND_GLUON.get()
         )
         self._muse_extend_fp8_logged = False
+        # sliding-layer extend on the Gluon kernel's window variant (FP8 Q like the full layers)
+        self.muse_extend_swa_gluon = (
+            bool(self.muse_extend_gluon)
+            and envs.SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON.get()
+        )
+        # gfx1250: Triton port of the Gluon extend for full and sliding layers
+        # (SGLANG_ROCM_MUSE_GFX1250_EXTEND=1).
+        self.muse_extend_gfx1250 = (
+            self.muse_extend_fp8_q
+            and muse_extend_attention_gfx1250 is not None
+            and os.environ.get("SGLANG_ROCM_MUSE_GFX1250_EXTEND", "0") == "1"
+            and "gfx1250"
+            in torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+        )
+        self.muse_extend_fly_gfx1250 = (
+            self.muse_extend_gfx1250
+            and muse_extend_attention_fly_gfx1250 is not None
+            and envs.SGLANG_ROCM_MUSE_GFX1250_EXTEND_FLY.get()
+        )
+        # full layers on the FlyDSL extend kernel
+        self.muse_extend_fly = (
+            bool(self.muse_extend_gluon)
+            and muse_extend_attention_fly is not None
+            and envs.SGLANG_ROCM_MUSE_EXTEND_FLYDSL.get()
+        )
         self.muse_verify_kernels = frozenset(
             name
             for name, env in (
@@ -937,34 +1095,20 @@ class AiterAttnBackend(AttentionBackend):
                 ("full_v2", envs.SGLANG_ROCM_MUSE_VERIFY_FULL_V2),
                 ("full_v2_fp8", envs.SGLANG_ROCM_MUSE_VERIFY_FP8),
                 ("full_fly", envs.SGLANG_ROCM_MUSE_VERIFY_FLYDSL),
+                ("full_fly_bal", envs.SGLANG_ROCM_MUSE_VERIFY_BALANCED),
+                ("swa_fly", envs.SGLANG_ROCM_MUSE_VERIFY_SWA_FLYDSL),
                 ("full_gqa", envs.SGLANG_ROCM_MUSE_VERIFY_FULL_GQA),
             )
             if self.use_muse_attention_paths and self._use_unified_verify and env.get()
         )
-        # Extra unified_attention() arguments for Muse extend / verify calls.
-        self.muse_unified_attention_kwargs = {}
-        if self.use_muse_attention_paths and _unified_attention_has_muse_tiles:
-            if envs.SGLANG_ROCM_MUSE_PREFILL_2D_TILES.get():
-                self.muse_unified_attention_kwargs["prefill_2d_config"] = (
-                    _MUSE_PREFILL_2D_CONFIG
-                )
-            if envs.SGLANG_ROCM_MUSE_UNMASKED_INTERIOR.get():
-                self.muse_unified_attention_kwargs["unmasked_interior"] = True
-            if envs.SGLANG_ROCM_MUSE_VERIFY_BM64.get():
-                self.muse_unified_attention_kwargs.update(
-                    verify_block_m=_MUSE_VERIFY_BLOCK_M,
-                    verify_num_segments=_MUSE_VERIFY_NUM_SEGMENTS,
-                )
         if self.use_muse_attention_paths:
             logger.info(
                 "Muse Spark attention paths: reuse_extend_metadata=%s "
-                "reuse_verify_lengths=%s extend_fp8_q=%s verify_kernels=%s "
-                "unified_attention_tiles=%s",
+                "reuse_verify_lengths=%s extend_fp8_q=%s verify_kernels=%s",
                 self.muse_reuse_extend_metadata,
                 self.muse_reuse_verify_lengths,
                 self.muse_extend_fp8_q,
                 sorted(self.muse_verify_kernels),
-                sorted(self.muse_unified_attention_kwargs),
             )
 
         # aiter kernel related initialization
@@ -980,7 +1124,7 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not (self.use_mla or self.use_triton_unified_attention):
+        if self._uses_paged_ragged_decode():
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -1070,7 +1214,24 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+            # Batches on SGLANG_AITER_MLA_DECODE_BACKEND=triton do not read
+            # SGLANG_AITER_MLA_GLUON or SGLANG_AITER_MLA_PERSIST.
+            if is_gfx1250_supported():
+                self.use_aiter_triton_mla_decode = self.mla_decode_backend == "triton"
+                logger.info(
+                    "aiter gfx1250 Triton MLA decode is %s",
+                    (
+                        f"enabled (page size {self.page_size}, kernel block "
+                        f"size {triton_mla_block_size(self.page_size)})"
+                        if self.use_aiter_triton_mla_decode
+                        else "disabled (SGLANG_AITER_MLA_DECODE_BACKEND resolved "
+                        f"to {self.mla_decode_backend!r}; auto picks triton "
+                        "with bf16 activations, no DCP, qk_rope_head_dim > 0)"
+                    ),
+                )
+            # aiter's mla_gluon asserts gfx950, so the gfx950 PS switch and
+            # capability log below do not apply on gfx1250.
+            elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
                 if (
@@ -1199,6 +1360,31 @@ class AiterAttnBackend(AttentionBackend):
         return (
             k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
             v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+        )
+
+    def _uses_aiter_triton_mla_decode(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> bool:
+        """Per batch: single-token, non-speculative decode when
+        use_aiter_triton_mla_decode holds (gfx1250); other batches take the
+        existing MLA decode dispatch.
+
+        Draft decode is DECODE with spec_info. Its KV is one row per topk branch
+        and the length includes the draft step, which a per-request page table
+        and seq_lens cannot describe.
+        """
+        if (
+            self.use_aiter_triton_mla_decode
+            and spec_info is not None
+            and forward_mode.is_decode()
+        ):
+            print_info_once(
+                "aiter gfx1250: draft decode batches skip the aiter Triton MLA decode"
+            )
+        return (
+            self.use_aiter_triton_mla_decode
+            and spec_info is None
+            and forward_mode.is_decode()
         )
 
     def _use_mla_decode_persist_metadata(self) -> bool:
@@ -1648,6 +1834,84 @@ class AiterAttnBackend(AttentionBackend):
         )
         return page_table, swa_page_table
 
+    def _muse_extend_fly(
+        self, q, k, v, layer, forward_batch, cache_loc, k_descale, v_descale, sinks
+    ):
+        """Prefix-free FP8 extend on the gfx1250 FlyDSL kernel, which also stores this step's K/V where the
+        ``launch_reshape_and_cache_flash`` path of ``forward_extend`` would and quantizes Q as
+        ``_forward_extend_unified`` does; None when that path does not apply."""
+        window = 0
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            if layer.sliding_window_size != 2047:
+                return None
+            window = 2047
+        n = q.shape[0]
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if not (
+            self.use_triton_unified_attention
+            and self.use_sliding_window_kv_pool
+            and not self.kv_cache_is_vectorized_5d
+            and not self.use_mla
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.spec_info is None
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and not any(forward_batch.extend_prefix_lens_cpu)
+            and n >= _MUSE_EXTEND_FP8_MIN_Q
+            and layer.qk_head_dim == layer.v_head_dim == 64
+            and layer.tp_q_head_num == 8 * layer.tp_k_head_num
+            and self.page_size in (16, 32, 64, 128)
+            and not layer.is_cross_attention
+            and sinks is None
+            and layer.logit_cap == 0.0
+            and q.dtype == torch.bfloat16
+            and k_cache.dtype == v_cache.dtype == fp8_dtype == torch.float8_e4m3fn
+            and layer.k_scale is None
+            and layer.v_scale is None
+            and k_descale is self.k_scale
+            and v_descale is self.v_scale
+            and k_descale.numel() == v_descale.numel() == 1
+        ):
+            return None
+        fm = self.forward_metadata
+        if self.muse_reuse_extend_metadata and self.page_size > 1:
+            cu_seqlens_q = fm.qo_indptr
+            assert cu_seqlens_q is not None
+        else:
+            cu_seqlens_q = torch.zeros(
+                forward_batch.batch_size + 1, dtype=torch.int32, device=q.device
+            )
+            cu_seqlens_q[1:] = torch.cumsum(
+                forward_batch.extend_seq_lens.to(torch.int32), dim=0
+            )
+        hq, d = layer.tp_q_head_num, layer.v_head_dim
+        o = forward_batch._attn_output
+        if not (
+            o is not None
+            and o.dtype == self.input_dtype
+            and o.is_contiguous()
+            and o.numel() == n * hq * d
+        ):
+            o = q.new_empty((n, hq * d), dtype=self.input_dtype)
+        muse_extend_attention_fly_gfx1250(
+            q,
+            k.view(n, layer.tp_k_head_num, d),
+            v.view(n, layer.tp_v_head_num, d),
+            k_cache,
+            v_cache,
+            cache_loc,
+            self.swa_kv_pool.full_to_swa_index_mapping
+            if layer.sliding_window_size > 0
+            else None,
+            k_descale,
+            v_descale,
+            o.view(n, hq, d),
+            cu_seqlens_q,
+            max(forward_batch.extend_seq_lens_cpu),
+            layer.scaling,
+            window=window,
+        )
+        return o.view(-1, hq * d)
+
     def _forward_extend_unified(
         self,
         q: torch.Tensor,
@@ -1699,14 +1963,27 @@ class AiterAttnBackend(AttentionBackend):
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
-        o = q_u.new_empty(
-            (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-            dtype=self.input_dtype,
-        )
+        o_shape = (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+        # Under a breakable prefill graph the graph-owned output buffer is handed in here;
+        # writing it directly saves RadixAttention._eager_attention's copy of the result.
+        o = forward_batch._attn_output
+        if (
+            o is None
+            or o.dtype != self.input_dtype
+            or o.numel() != q_u.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+            or not o.is_contiguous()
+        ):
+            o = q_u.new_empty(o_shape, dtype=self.input_dtype)
+        else:
+            o = o.view(o_shape)
         q_descale = None
+        # sliding layers take the FP8 extend only on the Gluon kernel (its window variant)
+        swa_gluon = (
+            self.muse_extend_swa_gluon or self.muse_extend_gfx1250
+        ) and uni_window == (2046, 0)
         if (
             self.muse_extend_fp8_q
-            and uni_window == (-1, -1)
+            and (uni_window == (-1, -1) or swa_gluon)
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and forward_batch.spec_info is None
             and q_u.shape[0] >= _MUSE_EXTEND_FP8_MIN_Q
@@ -1727,12 +2004,18 @@ class AiterAttnBackend(AttentionBackend):
             # Muse Spark A8 extend: FP8 Q with a per-tensor scale computed on the
             # device (no host sync) against the FP8 KV cache, as B200's trtllm_mha
             # runs it when the KV cache is FP8.
-            q_descale = (q_u.abs().amax().float() / 448.0).clamp_min(1e-12).view(1)
-            q_u = (q_u.float() / q_descale).to(fp8_dtype)
+            if quantize_q_fp8 is not None and fp8_dtype == torch.float8_e4m3fn:
+                q_u, q_descale = quantize_q_fp8(
+                    q_u.view(q_u.shape[0], -1), layer.tp_q_head_num
+                )
+            else:
+                q_descale = (q_u.abs().amax().float() / 448.0).clamp_min(1e-12).view(1)
+                q_u = (q_u.float() / q_descale).to(fp8_dtype)
             if not self._muse_extend_fp8_logged:
                 self._muse_extend_fp8_logged = True
                 logger.info(
-                    "Muse extend FP8 (a8) for full layers, q=%d max_q=%d",
+                    "Muse extend FP8 (a8) for full%s layers, q=%d max_q=%d",
+                    " and sliding" if self.muse_extend_swa_gluon else "",
                     q_u.shape[0],
                     self.forward_metadata.max_q_len,
                 )
@@ -1744,10 +2027,10 @@ class AiterAttnBackend(AttentionBackend):
         )
         if (
             q_descale is not None
-            and self.muse_extend_gluon
-            and muse_extend_applies(q_u, k_paged)
+            and self.muse_extend_gfx1250
+            and muse_extend_gfx1250_applies(q_u, k_paged)
         ):
-            muse_extend_attention(
+            muse_extend_attention_gfx1250(
                 q_u,
                 k_paged,
                 v_paged,
@@ -1759,6 +2042,32 @@ class AiterAttnBackend(AttentionBackend):
                 k_descale,
                 v_descale,
                 layer.scaling,
+                window=uni_window[0] + 1 if swa_gluon else 0,
+            )
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if (
+            q_descale is not None
+            and self.muse_extend_gluon
+            and muse_extend_applies(q_u, k_paged)
+        ):
+            extend = (
+                muse_extend_attention_fly
+                if self.muse_extend_fly and not swa_gluon
+                else muse_extend_attention
+            )
+            extend(
+                q_u,
+                k_paged,
+                v_paged,
+                o,
+                cu_seqlens_q,
+                forward_batch.seq_lens,
+                pt,
+                q_descale,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                window=uni_window[0] + 1 if swa_gluon else 0,
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         unified_attention(
@@ -1779,7 +2088,6 @@ class AiterAttnBackend(AttentionBackend):
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=sinks,
-            **self.muse_unified_attention_kwargs,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -2092,15 +2400,49 @@ class AiterAttnBackend(AttentionBackend):
     ):
         k_buffer = self.kv_layers.read(layer.layer_id).key()
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        fm = self.forward_metadata
+        use_triton_mla = (
+            self.use_aiter_triton_mla_decode and fm.triton_mla_block_tables is not None
+        )
+        # aiter's Triton mla_decode_fwd has no soft-cap argument, so a capped
+        # layer would silently drop it. The ASM mla_decode_fwd asserts on one.
+        if use_triton_mla and layer.logit_cap:
+            print_info_once(
+                "aiter gfx1250: MLA layers with logit_cap="
+                f"{layer.logit_cap} skip the aiter Triton MLA decode"
+            )
+        if use_triton_mla and not layer.logit_cap:
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            aiter_triton_mla_decode(
+                q=q,
+                o=o,
+                kv_buffer=k_buffer,
+                block_tables=fm.triton_mla_block_tables,
+                seqused_k=fm.triton_mla_seqused_k,
+                cu_seqlens_q=fm.qo_indptr,
+                page_size=self.page_size,
+                kv_lora_rank=layer.v_head_dim,
+                qk_rope_head_dim=layer.qk_head_dim - layer.v_head_dim,
+                sm_scale=layer.scaling,
+                kv_descale=k_descale,
+            )
+            return o
+
         max_q_len = self.forward_metadata.max_q_len or 1
 
+        # "triton" batches that reach here (soft cap, draft decode) keep the
+        # ASM PS preference "asm" gives them.
         if prefer_mla_gluon_decode(
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
         ) and not (
             _use_mla_ps_kernel
-            and self.mla_decode_backend == "asm"
+            and self.mla_decode_backend != "gluon"
             and self._asm_ps_supports_qlen(max_q_len)
         ):
             return mla_gluon_decode(
@@ -2506,6 +2848,15 @@ class AiterAttnBackend(AttentionBackend):
             context_len=self.max_context_len,
         )
 
+    def _uses_paged_ragged_decode(self) -> bool:
+        """Whether forward_decode runs paged_attention_ragged, the only reader of
+        workspace_buffer and of the partition buckets."""
+        return not (
+            self.use_mla
+            or self.use_triton_unified_attention
+            or self.kv_cache_is_vectorized_5d
+        )
+
     def _build_decode_partition_buckets(self) -> tuple[tuple[str, int, int], ...]:
         """(label, max_seq_len, num_partitions), ascending; the last serves any length."""
         fallback = (
@@ -2513,15 +2864,10 @@ class AiterAttnBackend(AttentionBackend):
             self.max_context_len,
             self.max_num_partitions,
         )
-        paged_ragged_decode = not (
-            self.use_mla
-            or self.use_triton_unified_attention
-            or self.kv_cache_is_vectorized_5d
-        )
         # Below 128 partitions buckets save little: at batch 256 and 1.5K tokens,
         # 32 and 128 partitions cost 1% and 9% more than 16.
         if not (
-            paged_ragged_decode
+            self._uses_paged_ragged_decode()
             and self.max_num_partitions >= 128
             and envs.SGLANG_AITER_DECODE_PARTITION_BUCKETS.get()
         ):
@@ -2646,6 +2992,7 @@ class AiterAttnBackend(AttentionBackend):
         global_kv_indptr = None
         use_asm_cprr_verify = False
         cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
+        triton_mla_tables = triton_mla_seqused_k = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -2730,7 +3077,21 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata():
+                if self._uses_aiter_triton_mla_decode(
+                    forward_batch.forward_mode, spec_info
+                ):
+                    triton_mla_tables = triton_mla_block_tables(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices[:bs],
+                        max_kv_len=(
+                            self.req_to_token.shape[1]
+                            if max_kv_len is None
+                            else max_kv_len
+                        ),
+                        page_size=self.page_size,
+                    )
+                    triton_mla_seqused_k = forward_batch.seq_lens[:bs].to(torch.int32)
+                elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -2788,6 +3149,8 @@ class AiterAttnBackend(AttentionBackend):
                     if spec_info is None
                     else None
                 ),
+                triton_mla_block_tables=triton_mla_tables,
+                triton_mla_seqused_k=triton_mla_seqused_k,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -3045,6 +3408,11 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     )
                     max_kv_len = page_table.shape[1] * self.page_size
+                    verify_seqlen_k = (
+                        forward_batch.seq_lens[:bs] + draft_num
+                        if self.muse_reuse_verify_lengths
+                        else None
+                    )
                     self.forward_metadata = ForwardMetadata(
                         None,  # kv_indptr unused in unified-verify path
                         page_table,  # 2D block page_table stored in kv_indices
@@ -3056,10 +3424,9 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=swa_page_table,
                         swa_out_cache_loc=swa_out_cache_loc,
                         # Same lengths forward_extend would add per layer.
-                        verify_seqlen_k=(
-                            forward_batch.seq_lens[:bs] + draft_num
-                            if self.muse_reuse_verify_lengths
-                            else None
+                        verify_seqlen_k=verify_seqlen_k,
+                        verify_seqlen_k_i32=(
+                            None if verify_seqlen_k is None else verify_seqlen_k.int()
                         ),
                     )
                 else:
@@ -3456,6 +3823,22 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.use_aiter_triton_mla_decode:
+            self.cuda_graph_triton_mla_block_tables = torch.zeros(
+                (
+                    max_bs,
+                    triton.cdiv(
+                        self.req_to_token.shape[1],
+                        triton_mla_block_size(self.page_size),
+                    ),
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cuda_graph_triton_mla_seqused_k = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -3550,6 +3933,9 @@ class AiterAttnBackend(AttentionBackend):
             self.cuda_graph_verify_seqlen_k = torch.empty(
                 max_bs, dtype=torch.int64, device=self.device
             )
+            self.cuda_graph_verify_seqlen_k_i32 = torch.empty(
+                max_bs, dtype=torch.int32, device=self.device
+            )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -3581,6 +3967,7 @@ class AiterAttnBackend(AttentionBackend):
         use_asm_cprr_verify = False
 
         swa_page_table = None
+        triton_mla_tables = triton_mla_seqused_k = None
         # Unified verify never reads this host max (replay sizes from
         # max_context_len); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
@@ -3621,7 +4008,7 @@ class AiterAttnBackend(AttentionBackend):
                         and self.dcp_world_size > 1
                         and not forward_mode.is_idle()
                     ):
-                        kv_lens = seq_lens[:bs].to(torch.int32).clone()
+                        kv_lens = seq_lens[:bs].to(torch.int32, copy=True)
                         self._plan_dcp_decode_metadata(
                             kv_indptr,
                             kv_indices,
@@ -3642,6 +4029,26 @@ class AiterAttnBackend(AttentionBackend):
                             bs,
                             dest_buf=kv_indices,
                             swa_dest_buf=swa_page_table,
+                        )
+                    elif self.use_sliding_window_kv_pool and self.page_size > 1:
+                        # Both block tables in one launch (the gather / translate / stride / divide sequence
+                        # below is ~14 kernels between decode replays); each row fills its own seq_len's blocks.
+                        max_blocks = triton.cdiv(max_kv_len, self.page_size)
+                        scatter_req_to_token_to_page_table_kernel[
+                            (bs, triton.cdiv(max(max_blocks, 1), 1024))
+                        ](
+                            self.req_to_token,
+                            req_pool_indices,
+                            seq_lens,
+                            kv_indices,
+                            self.req_to_token.stride(0),
+                            kv_indices.stride(0),
+                            swa_page_table,
+                            self.swa_kv_pool.full_to_swa_index_mapping,
+                            DRAFT_NUM=0,
+                            PAGE_SIZE=self.page_size,
+                            BLOCK_SIZE=1024,
+                            HAS_SWA=True,
                         )
                     else:
                         page_indices = self.req_to_token[
@@ -3686,7 +4093,19 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata():
+                if self._uses_aiter_triton_mla_decode(forward_mode, spec_info):
+                    # Columns past max_kv_len keep stale ids the kernel never reads.
+                    triton_mla_tables = self.cuda_graph_triton_mla_block_tables[:bs]
+                    tables = triton_mla_block_tables(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices[:bs],
+                        max_kv_len=max_kv_len,
+                        page_size=self.page_size,
+                    )
+                    triton_mla_tables[:, : tables.shape[1]].copy_(tables)
+                    triton_mla_seqused_k = self.cuda_graph_triton_mla_seqused_k[:bs]
+                    triton_mla_seqused_k.copy_(seq_lens[:bs])
+                elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -3732,6 +4151,8 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
+                triton_mla_block_tables=triton_mla_tables,
+                triton_mla_seqused_k=triton_mla_seqused_k,
             )
 
         elif forward_mode.is_target_verify():
@@ -3798,10 +4219,14 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla and self.dcp_world_size > 1:
                 global_kv_indptr = self.cuda_graph_global_kv_indptr[: bs + 1]
                 global_kv_indptr.copy_(kv_indptr[: bs + 1])
+                # kv_lens, as in eager: the asm cp verify reads the verify window
+                # from the cache, so its shard must span the draft tokens too.
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
-                    seq_lens[:bs].to(torch.int32).clone(),
+                    # A copy even at int32: the planner localizes it in place, and on
+                    # the Gluon route kv_lens is the batch's seq_lens itself.
+                    kv_lens[:bs].to(torch.int32, copy=True),
                     None,
                     bs,
                     static_local_kv_lens_cpu=self.cuda_graph_dcp_static_local_kv_lens[
@@ -3930,12 +4355,14 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     max_kv_len_unified = max_num_blocks_per_seq * self.page_size
-                    verify_seqlen_k = None
+                    verify_seqlen_k = verify_seqlen_k_i32 = None
                     if self.muse_reuse_verify_lengths:
                         verify_seqlen_k = self.cuda_graph_verify_seqlen_k[:bs]
                         torch.add(
                             seq_lens[:bs], verify_tokens_per_req, out=verify_seqlen_k
                         )
+                        verify_seqlen_k_i32 = self.cuda_graph_verify_seqlen_k_i32[:bs]
+                        verify_seqlen_k_i32.copy_(verify_seqlen_k)
                     self.forward_metadata = ForwardMetadata(
                         None,
                         _page_table,
@@ -3946,6 +4373,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_extend_len=_max_q_len,
                         swa_page_table=_swa_page_table,
                         verify_seqlen_k=verify_seqlen_k,
+                        verify_seqlen_k_i32=verify_seqlen_k_i32,
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
@@ -4346,6 +4774,13 @@ class AiterAttnBackend(AttentionBackend):
         if self.kv_cache_dtype == fp8_dtype:
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
             v_descale = layer.v_scale if layer.v_scale is not None else self.v_scale
+
+        if save_kv_cache and k is not None and self.muse_extend_fly_gfx1250:
+            o = self._muse_extend_fly(
+                q, k, v, layer, forward_batch, cache_loc, k_descale, v_descale, sinks
+            )
+            if o is not None:
+                return o
 
         if k is not None:
             assert v is not None
@@ -4798,7 +5233,7 @@ class AiterAttnBackend(AttentionBackend):
                     # only powers of 2 work (128/256 OK, 192 is not).
                     num_queries_per_kv = layer.tp_q_head_num // layer.tp_k_head_num
                     use_unified_attention_3d_mtp = (
-                        is_gfx95_supported()
+                        _muse_gfx95_like()
                         and 1 < self.forward_metadata.max_q_len <= 4
                         and max_kv_len > 512
                         and (
@@ -4870,6 +5305,7 @@ class AiterAttnBackend(AttentionBackend):
                             self.forward_metadata.qo_indptr,
                             self.forward_metadata.max_q_len,
                             seqused_k,
+                            self.forward_metadata.verify_seqlen_k_i32,
                             page_table,
                             layer.scaling,
                             window_size,
@@ -4910,7 +5346,14 @@ class AiterAttnBackend(AttentionBackend):
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
-                        **self.muse_unified_attention_kwargs,
+                        **(
+                            {"equal_seqlen_q": True}
+                            if self.use_muse_attention_paths
+                            and _unified_attention_has_equal_seqlen_q
+                            and q_unified.shape[0]
+                            == self.forward_metadata.max_q_len * seqused_k.shape[0]
+                            else {}
+                        ),
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -4985,7 +5428,7 @@ class AiterAttnBackend(AttentionBackend):
                 # draft_extend has ragged short Q (accepted tokens, 1..4); the
                 # asm verify kernel serves it via in-kernel tail alignment.
                 if (
-                    is_gfx95_supported()
+                    _muse_gfx95_like()
                     and de_window == (-1, -1)
                     and not layer.logit_cap
                     and sinks is None
@@ -5492,7 +5935,7 @@ class AiterAttnBackend(AttentionBackend):
                 # the path is cuda-graph capture safe). Must run BEFORE the
                 # scaled_fp8_quant below: the asm kernel takes bf16 Q.
                 if (
-                    is_gfx95_supported()
+                    _muse_gfx95_like()
                     and self.forward_metadata.max_q_len == 1
                     and window_size == (-1, -1)
                     and sinks is None
@@ -5518,65 +5961,70 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 ):
                     return o
+                if (
+                    self.use_muse_attention_paths
+                    and bs <= 8
+                    and self.page_size == 16
+                    and self.kv_cache_dtype == fp8_dtype
+                    and window_size in ((2046, 0), (-1, -1))
+                    and sinks is None
+                    and q.dtype == torch.bfloat16
+                ):
+                    _defer_or_merged(
+                        muse_decode_splitkv(
+                            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                            k_cache.view(
+                                -1,
+                                self.page_size,
+                                layer.tp_k_head_num,
+                                layer.qk_head_dim,
+                            ),
+                            v_cache.view(
+                                -1,
+                                self.page_size,
+                                layer.tp_v_head_num,
+                                layer.v_head_dim,
+                            ),
+                            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            self.forward_metadata.qo_indptr,
+                            forward_batch.seq_lens,
+                            page_table,
+                            layer.scaling,
+                            window_size[0] + 1 if window_size[0] > 0 else 0,
+                            k_descale,
+                            v_descale,
+                            defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                        ),
+                        v_descale,
+                    )
+                    return o
                 q_descale = None
                 if self.kv_cache_dtype == fp8_dtype:
                     q, q_descale = self._quantize_q_fp8(q)
 
-                use_muse_flydsl = (
-                    self.use_muse_flydsl_decode
-                    and bs <= 8
-                    and window_size[0] > 0
-                    and window_size[0] + 1 == 2047
-                    and self.kv_cache_dtype != fp8_dtype
-                    and sinks is None
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.forward_metadata.qo_indptr,
+                    seqused_k=forward_batch.seq_lens,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=page_table,
+                    softcap=layer.logit_cap,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
                 )
-                if use_muse_flydsl:
-                    muse_paged_gqa_decode_flydsl(
-                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k_cache=k_cache.view(
-                            -1,
-                            self.page_size,
-                            layer.tp_k_head_num,
-                            layer.qk_head_dim,
-                        ),
-                        v_cache=v_cache.view(
-                            -1,
-                            self.page_size,
-                            layer.tp_v_head_num,
-                            layer.v_head_dim,
-                        ),
-                        seq_lens=forward_batch.seq_lens,
-                        block_table=page_table,
-                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        softmax_scale=self.scale,
-                        window_size=2047,
-                        num_splits=128,
-                        segment_size=16,
-                    )
-                else:
-                    unified_attention(
-                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k=k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                        ),
-                        v=v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                        ),
-                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens,
-                        max_seqlen_q=self.forward_metadata.max_q_len,
-                        max_seqlen_k=max_kv_len,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                        window_size=window_size,
-                        block_table=page_table,
-                        softcap=layer.logit_cap,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        sinks=sinks,
-                    )
             else:
                 self._reject_paged_decode_sliding_window(layer)
                 # Drop FP8 KV upcast: keep paged cache in native FP8 and use ``fp8_e4m3`` for
@@ -5695,8 +6143,13 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
+            # Pad past the real total kv_indptr[bs] (seq_lens_sum may be an upper bound)
+            # without reading it on the host.
+            kv_indices.masked_fill_(
+                torch.arange(kv_indices.numel(), device=kv_indices.device)
+                >= kv_indptr[bs],
+                kv_indices[0].clone(),
+            )
 
             extend_lens = seq_lens - prefix_lens
 

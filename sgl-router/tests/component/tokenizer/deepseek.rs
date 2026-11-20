@@ -135,15 +135,25 @@ fn v41_router_tokenizer_matches_processor_ids_on_the_checkpoint() {
     assert_router_ids_match_processor(&path);
 }
 
-/// dynamo-tokenizers' HF backend has no segmented encode, so router encoding
-/// over it fails instead of silently producing different ids. The registry
-/// enables it only for `fast` (see `deepseek_encodes_on_the_router_tokenizer_only_with_fast`).
+/// dynamo-tokenizers' HF backend encodes segments to the processor's ids too.
+/// The registry still enables router encoding only for `fast`: under `hf` it
+/// would swap one HF encode for another (see
+/// `deepseek_encodes_on_the_router_tokenizer_only_with_fast`).
 #[test]
-fn v41_router_segment_encoding_fails_on_the_hf_backend() {
+fn v41_router_segment_encoding_matches_on_the_hf_backend() {
+    let processor = ChatFormatter::load("deepseek-ai/DeepSeek-V4.1-Flash", MINI)
+        .unwrap()
+        .unwrap();
     let router = ChatFormatter::load("deepseek-ai/DeepSeek-V4.1-Flash", MINI)
         .unwrap()
         .unwrap()
         .with_router_segment_encoding(true);
     let hf = tokenizer(MINI, TokenizerBackend::Hf);
-    assert!(router.encode(&hf, &requests()[0]).is_err());
+    for (i, request) in requests().iter().enumerate() {
+        assert_eq!(
+            router.encode(&hf, request).unwrap(),
+            processor.encode(&hf, request).unwrap(),
+            "case {i}"
+        );
+    }
 }
