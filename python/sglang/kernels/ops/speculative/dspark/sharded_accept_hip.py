@@ -16,9 +16,9 @@ from typing import Callable, Optional
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
 
 from sglang.kernels.ops.speculative.dspark.markov_sample import (
+    _exponential_from_philox,
     _markov_sample_finish_kernel,
 )
 
@@ -181,8 +181,7 @@ def _accept_kernel(
     quad = (part * BLOCK + START) // 4 + tl.arange(0, BLOCK // 4)
     w0, w1, w2, w3 = _philox(KEY, quad, b, _BONUS_STEP, OFFSET)
     bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
-    # Uniform in (0, 1]: a zero word would give zero noise and win outright.
-    noise = -libdevice.log1p(-(bits.to(tl.float32) + 0.5) * 2.3283064365386963e-10)
+    noise = _exponential_from_philox(bits)
     key = tl.where(valid & (mass > 0.0), tl.log(mass) - tl.log(noise), -float("inf"))
     top = tl.max(key, 0)
     # 0x7FFFFFFF is the finish kernel's "no candidate", for an all-padding block.
