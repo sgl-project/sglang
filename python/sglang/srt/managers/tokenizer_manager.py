@@ -519,8 +519,7 @@ def _add_sampling_output_to_meta_info(
     finished: bool,
 ):
     """Add the sampling logprobs and mask rows a request asked for."""
-    # Unfiltered sampling draws from softmax(logits / temperature), which the
-    # output token logprobs already describe.
+    # An unfiltered request is not captured (Req.captures_sampling): nothing to add.
     if not state.filters_sampling:
         return
     obj = state.obj
