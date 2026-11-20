@@ -370,10 +370,8 @@ impl CoreHandle {
     /// rank 0 of a single-rank deployment is ignored, a rank outside the
     /// deployment's `[0, dp_size)` is refused. Then this listener's own: it
     /// feeds only its own DP rank's scheduler, so it refuses a request naming
-    /// another. The HTTP generation routes hand such a request to that rank's
-    /// listener before it gets here (`http::dp_relay`); one that still
-    /// arrives (over gRPC, or with no listener known for the rank) fails
-    /// rather than run on the wrong rank.
+    /// another rather than run it on the wrong rank. Clients reach each rank
+    /// at its own listener, which DP rank 0 publishes.
     fn check_routed_dp_rank(&self, rank: Option<i64>) -> Result<(), CoreError> {
         let Some(rank) = rank else {
             return Ok(());
