@@ -607,6 +607,8 @@ class SchedulerWeightUpdaterManager:
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self, params):
+        if _is_later_dp_replica():
+            return
         url = params["url"]
 
         self.tp_worker.model_runner.weight_exporter.save_remote_model(url)
@@ -619,11 +621,25 @@ class SchedulerWeightUpdaterManager:
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
+        if _is_later_dp_replica():
+            return
         self.tp_worker.model_runner.weight_exporter.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+
+def _is_later_dp_replica() -> bool:
+    """A plain-DP replica after the first. Every replica holds the same weights
+    under the same TP ranks, so only the first saves them; the others would
+    write the same files."""
+    parallel = get_parallel()
+    return (
+        parallel.num_dp_ranks > 1
+        and not parallel.attn_dp_enabled
+        and bool(parallel.dp_rank)
+    )
 
 
 def _export_static_state(model):

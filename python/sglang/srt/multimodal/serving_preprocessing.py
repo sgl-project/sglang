@@ -71,7 +71,10 @@ def fast_image_processor_device(
     if _is_xpu:
         return "xpu"
     if _is_npu:
-        return None if processor.__class__.__name__ == "Glm4vProcessor" else "npu"
+        if processor.__class__.__name__ == "Glm4vProcessor":
+            # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
+            return "cpu"
+        return "npu"
     platform = platforms.current_platform
     if not platform.is_cuda_alike():
         return None

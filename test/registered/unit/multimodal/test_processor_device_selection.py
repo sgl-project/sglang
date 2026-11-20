@@ -115,14 +115,15 @@ class TestFastImageProcessorDevice(CustomTestCase):
         self.assertEqual(self._device(processor, _is_cpu=True), "cpu")
         self.assertEqual(self._device(processor, _is_xpu=True), "xpu")
 
-    def test_npu_glm4v_leaves_the_device_unset(self):
+    def test_npu_glm4v_preprocesses_on_cpu(self):
         class Glm4vProcessor:
             pass
 
         processor = _make(base_gpu_id=3)
         with patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True):
-            device = processor._fast_image_processor_device(Glm4vProcessor())
-        self.assertIsNone(device)
+            self.assertEqual(
+                processor._fast_image_processor_device(Glm4vProcessor()), "cpu"
+            )
 
     def test_platform_respects_cuda_compatibility(self):
         processor = _make(base_gpu_id=3)
@@ -146,6 +147,21 @@ class TestTokenSpaceDevices(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
+
+    def test_npu_wrapper_keeps_ordinary_processor_on_npu(self):
+        wrapper = _make_wrapper(base_gpu_id=3)
+        processor = _Processor()
+        processor.image_processor = object.__new__(BaseImageProcessor)
+        wrapper._core = SimpleNamespace(_processor=processor)
+        wrapper._disable_fast_image_processor = False
+        wrapper._rl_on_policy_target = None
+        with (
+            patch.multiple(PLACEMENT, _is_cpu=False, _is_xpu=False, _is_npu=True),
+            patch(
+                "sglang.srt.multimodal.token_space_mm_process.serving_processor.apply_npu_image_preprocess_patches"
+            ),
+        ):
+            self.assertEqual(wrapper._serving_image_processor_device(), "npu")
 
     def test_wrapper_fills_the_image_device_unless_pil_decodes(self):
         for use_pil, expected in ((False, "cuda:3"), (True, None)):

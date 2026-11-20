@@ -265,7 +265,8 @@ class Parallel(msgspec.Struct):
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "Prefill only; supports Qwen3 dense, Kimi-K3 without attention DP or CP, "
+        "and Muse Spark ModelOpt NVFP4 with "
         "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
         "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
         "NVLink/NVSwitch.",
@@ -299,14 +300,17 @@ class Parallel(msgspec.Struct):
     ] = None
     disable_attn_tp_gather: A[
         bool,
-        "Disable scheduler-side attn_tp_gather (the upstream SP path "
-        "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
-        "buffer). Use for models that manage SP scatter/gather at the "
-        "model level (e.g., perform their own all_gather/reduce_scatter "
-        "inside attention) and do not consume the upstream gathered_buffer. "
-        "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
-        "which can cause kernel autotuners to select wrong-sized variants "
-        "at small batches.",
+        Arg(
+            help="Disable scheduler-side attn_tp_gather (the upstream SP path "
+            "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+            "buffer). Use for models that manage SP scatter/gather at the "
+            "model level (e.g., perform their own all_gather/reduce_scatter "
+            "inside attention) and do not consume the upstream gathered_buffer. "
+            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "which can cause kernel autotuners to select wrong-sized variants "
+            "at small batches.",
+            resolvable=True,
+        ),
     ] = False
     enable_p2p_check: A[
         bool,
