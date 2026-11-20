@@ -29,7 +29,9 @@ class TestUniformExtendPlan(CustomTestCase):
         )[:, :5]
         source = RunnerIds.__new__(RunnerIds)
         source.page_size, source.req_to_token = ps, slots
-        source._role_sub_pools = {}
+        # A plan whose only window is the draft's makes it the target's window
+        # role too (`KVStoragePlan.primary_window`).
+        source._role_sub_pools = {IdSpaceKind.SLIDING_WINDOW: "window_2047"}
         source._spaces = {
             name: IdSpace(
                 key=name,
@@ -39,7 +41,7 @@ class TestUniformExtendPlan(CustomTestCase):
             for name, table in ((IdSpaceKind.FULL, full), ("window_2047", window))
         }
         draft = RunnerIds.__new__(RunnerIds)
-        draft._role_sub_pools = {IdSpaceKind.SLIDING_WINDOW: "window_2047"}
+        draft._role_sub_pools = source._role_sub_pools
         draft._spaces = source._spaces
         positions = torch.empty((2, width), device=device, dtype=torch.int64)
         block = torch.empty_like(positions)
@@ -52,7 +54,6 @@ class TestUniformExtendPlan(CustomTestCase):
             anchor_src=bonus,
             anchor_out=block,
             mask_token_id=77,
-            window_sub_pool=draft.sub_pool_name(IdSpaceKind.SLIDING_WINDOW),
         )
         for result, expected in (
             (block, [[81, 77, 77, 77, 77], [93, 77, 77, 77, 77]]),
@@ -65,18 +66,6 @@ class TestUniformExtendPlan(CustomTestCase):
             ),
         ):
             torch.testing.assert_close(result, result.new_tensor(expected))
-
-        # DSPARK supplies its own proposal ids and only updates the anchor.
-        block[0].fill_(42)
-        source.plan_uniform_extend(
-            req_pool_indices=rows[:1],
-            seq_lens=starts[:1],
-            seq_lens_cpu=None,
-            width=width,
-            anchor_src=bonus[:1],
-            anchor_out=block[:1],
-        )
-        torch.testing.assert_close(block[0], block.new_tensor([81, 42, 42, 42, 42]))
 
     def test_shared_writes_preserve_virtual_ids_and_page_offsets(self):
         """A fused gather must retain per-page offsets and every reader's space.

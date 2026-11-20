@@ -564,7 +564,7 @@ def assign_extend_cache_locs_uniform(
     mask_token_id: tl.constexpr = None,
     req_stride: tl.constexpr = 1,
     start_stride: tl.constexpr = 1,
-    bonus_stride: tl.constexpr = 1,
+    anchor_src_stride: tl.constexpr = 1,
     req_row_stride: tl.constexpr = None,
 ):
     """Uniform-length variant of assign_extend_cache_locs: every row extends
@@ -580,9 +580,9 @@ def assign_extend_cache_locs_uniform(
     )
     out_cache_ptr = out_cache_loc + pid * draft_token_num
     if anchor_out is not None:
-        bonus = tl.load(anchor_src + pid * bonus_stride)
+        bonus_token = tl.load(anchor_src + pid * anchor_src_stride)
         if mask_token_id is None:
-            tl.store(anchor_out + pid * anchor_stride, bonus)
+            tl.store(anchor_out + pid * anchor_stride, bonus_token)
 
     offs = tl.arange(0, BLOCK_SIZE)
     num_loop = tl.cdiv(draft_token_num, BLOCK_SIZE)
@@ -591,13 +591,13 @@ def assign_extend_cache_locs_uniform(
         mask = o < draft_token_num
         pos = kv_start.to(tl.int64) + o
         if mask_token_id is not None:
-            # A padded DFLASH block may extend past the request row.
+            # The block may run past the row; those columns read the sink.
             data = tl.load(
                 token_pool + pos, mask=mask & (pos >= 0) & (pos < pool_len), other=0
             )
             tl.store(
                 anchor_out + pid * anchor_stride + o,
-                tl.where(o == 0, bonus, mask_token_id),
+                tl.where(o == 0, bonus_token, mask_token_id),
                 mask=mask,
             )
         else:
@@ -653,7 +653,8 @@ def assign_extend_cache_locs_uniform_func(
     per gathered token. Translation is rank-local (no DCP widening).
     ``positions_out`` ([batch, draft_token_num] int64) gets start + column and
     ``anchor_out[:, 0]`` gets ``anchor_src``, in the same launch.
-    Passing a mask token also fills the remaining draft input columns.
+    ``mask_token_id`` needs ``anchor_out`` of shape [batch, draft_token_num]:
+    columns 1.. get the mask token, and the kernel reads the sink (0) past the row.
     """
     if mask_token_id is not None:
         assert anchor_src is not None and anchor_out is not None
@@ -698,7 +699,7 @@ def assign_extend_cache_locs_uniform_func(
             mask_token_id=mask_token_id,
             req_stride=req_pool_indices.stride(0),
             start_stride=start_offset.stride(0),
-            bonus_stride=1 if anchor_src is None else anchor_src.stride(0),
+            anchor_src_stride=1 if anchor_src is None else anchor_src.stride(0),
             req_row_stride=req_to_token.stride(0),
         )
         return out_cache_loc

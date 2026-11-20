@@ -3949,8 +3949,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._use_triton_prepare_block:
             try:
                 if prefix_lens.is_cuda and target_ids.reads_are_translated:
-                    # A draft-only window lives in its own named band even when
-                    # the target has no sliding-window attention layers.
                     iteration_ids = target_ids.plan_uniform_extend(
                         req_pool_indices=batch.req_pool_indices,
                         seq_lens=prefix_lens,
@@ -3960,9 +3958,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                         anchor_src=draft_input.bonus_tokens.view(-1),
                         anchor_out=block_ids,
                         mask_token_id=int(self._mask_token_id),
-                        window_sub_pool=draft_ids.sub_pool_name(
-                            IdSpaceKind.SLIDING_WINDOW
-                        ),
                     )
                     verify_out_cache_loc_2d = iteration_ids.write_virtual.view(
                         bs, block_size
