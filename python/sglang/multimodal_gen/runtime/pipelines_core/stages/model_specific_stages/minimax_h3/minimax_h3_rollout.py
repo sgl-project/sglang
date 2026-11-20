@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -29,12 +29,9 @@ def _effective_sde_type(batch, loop_step_index: int) -> str:
     return sde_type
 
 
-def _step_is_noisy(batch, loop_step_index: int) -> bool:
-    """Whether the rollout draws transition noise on this loop step."""
-    return (
-        _effective_sde_type(batch, loop_step_index) != "ode"
-        and batch.rollout_noise_level != 0.0
-    )
+def _step_is_noisy(sde_type: str, noise_level: float) -> bool:
+    """Whether a step of this effective type draws transition noise."""
+    return sde_type != "ode" and noise_level != 0.0
 
 
 def minimax_h3_rollout_update_video_target(
@@ -57,7 +54,7 @@ def minimax_h3_rollout_update_video_target(
     noise_level = float(getattr(batch, "rollout_noise_level", 0.0))
     log_prob_no_const = bool(getattr(batch, "rollout_log_prob_no_const", False))
 
-    if not _step_is_noisy(batch, loop_step_index):
+    if not _step_is_noisy(sde_type, noise_level):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             _minimax_h3_update_target_rows_,
         )
@@ -81,7 +78,7 @@ def minimax_h3_rollout_update_video_target(
         log_prob_count = out.new_tensor([elem_count])
         return out, log_prob_sum, log_prob_count, noise_buffer
 
-    prev_sample, _, _, variance_noise, log_prob_sum, log_prob_count = _noisy_transition(
+    transition = _noisy_transition(
         video_target,
         velocity,
         sde_type=sde_type,
@@ -92,6 +89,7 @@ def minimax_h3_rollout_update_video_target(
         log_prob_no_const=log_prob_no_const,
         generator=generator,
     )
+    variance_noise = transition.variance_noise
     if (
         noise_buffer is None
         or noise_buffer.shape != variance_noise.shape
@@ -100,11 +98,22 @@ def minimax_h3_rollout_update_video_target(
         noise_buffer = torch.empty_like(variance_noise)
     noise_buffer.copy_(variance_noise)
     return (
-        prev_sample.to(dtype=video_target.dtype),
-        log_prob_sum,
-        log_prob_count,
+        transition.next_target.to(dtype=video_target.dtype),
+        transition.log_prob_sum,
+        transition.log_prob_count,
         noise_buffer,
     )
+
+
+class _NoisyTransition(NamedTuple):
+    """``next_target = prev_sample_mean + variance_noise * noise_std_dev``; the log-prob sum and count are ``[B=1]``."""
+
+    next_target: torch.Tensor
+    prev_sample_mean: torch.Tensor
+    noise_std_dev: torch.Tensor
+    variance_noise: torch.Tensor
+    log_prob_sum: torch.Tensor
+    log_prob_count: torch.Tensor
 
 
 def _noisy_transition(
@@ -118,14 +127,9 @@ def _noisy_transition(
     sigma_max: float,
     log_prob_no_const: bool,
     generator: torch.Generator,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+) -> _NoisyTransition:
     """One cps or flow-sde step of target rows, in fp32.
 
-    Returns ``(next_target, prev_sample_mean, noise_std_dev, variance_noise,
-    log_prob_sum[B=1], log_prob_count[B=1])``, with
-    ``next_target = prev_sample_mean + variance_noise * noise_std_dev``.
     ``sigma_max`` stands in for sigma == 1 in flow-sde's std.
     """
     model_output = (-velocity).float()
@@ -190,14 +194,13 @@ def _noisy_transition(
             .sum()
             .unsqueeze(0)
         )
-    log_prob_count = sample.new_tensor([float(sample.numel())])
-    return (
-        prev_sample,
-        prev_mean,
-        noise_std_dev,
-        variance_noise,
-        log_prob_sum,
-        log_prob_count,
+    return _NoisyTransition(
+        next_target=prev_sample,
+        prev_sample_mean=prev_mean,
+        noise_std_dev=noise_std_dev,
+        variance_noise=variance_noise,
+        log_prob_sum=log_prob_sum,
+        log_prob_count=sample.new_tensor([float(sample.numel())]),
     )
 
 
@@ -334,7 +337,11 @@ class MiniMaxH3ImageRollout:
         return cls(
             sigmas=sigmas,
             noisy_steps=frozenset(
-                step for step in range(len(sigmas) - 1) if _step_is_noisy(batch, step)
+                step
+                for step in range(len(sigmas) - 1)
+                if _step_is_noisy(
+                    _effective_sde_type(batch, step), batch.rollout_noise_level
+                )
             ),
             sde_type=batch.rollout_sde_type,
             noise_level=batch.rollout_noise_level,
@@ -355,14 +362,7 @@ class MiniMaxH3ImageRollout:
         self, target_rows: torch.Tensor, velocity: torch.Tensor, *, step: int
     ) -> torch.Tensor:
         """Record the step's cps or flow-sde transition and return the rows after it."""
-        (
-            next_rows,
-            prev_sample_mean,
-            noise_std_dev,
-            variance_noise,
-            log_prob_sum,
-            _,
-        ) = _noisy_transition(
+        transition = _noisy_transition(
             target_rows,
             velocity,
             sde_type=self._sde_type,
@@ -374,14 +374,14 @@ class MiniMaxH3ImageRollout:
             generator=self._generator,
         )
         self._record_step(
-            next_rows,
+            transition.next_target,
             velocity,
-            log_prob_sum=log_prob_sum,
-            variance_noise=variance_noise,
-            prev_sample_mean=prev_sample_mean,
-            noise_std_dev=noise_std_dev,
+            log_prob_sum=transition.log_prob_sum,
+            variance_noise=transition.variance_noise,
+            prev_sample_mean=transition.prev_sample_mean,
+            noise_std_dev=transition.noise_std_dev,
         )
-        return next_rows
+        return transition.next_target
 
     def record_deterministic_step(
         self, next_rows: torch.Tensor, velocity: torch.Tensor
@@ -414,7 +414,7 @@ class MiniMaxH3ImageRollout:
         if self._debug_tensors_by_step is not None:
             self._debug_tensors_by_step.append(
                 (
-                    variance_noise.detach().cpu().clone(),
+                    variance_noise.detach().cpu(),
                     prev_sample_mean.detach().float().cpu().clone(),
                     noise_std_dev.detach().float().cpu().reshape(1),
                     # the trainer's convention: noise - clean
