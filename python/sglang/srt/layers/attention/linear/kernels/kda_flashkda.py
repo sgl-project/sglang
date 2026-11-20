@@ -128,10 +128,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # The fused kernel cannot expose per-chunk states (h), which the mamba
-        # radix extra_buffer track path needs; route tracked batches through
-        # the Triton chunk_kda fallback instead of silently skipping the
-        # snapshot (that would corrupt prefix-cache restores).
+        # FlashKDA cannot emit the per-chunk states (h) an interior tracked boundary needs;
+        # those batches take the Triton fallback so the snapshot is not skipped.
         if return_intermediate_states or self._should_fall_back(
             lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
         ):
