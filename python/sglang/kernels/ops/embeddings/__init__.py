@@ -1,7 +1,23 @@
 """Embedding kernels."""
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
+
+register_kernel(
+    KernelSpec(
+        op="embeddings.get_masked_input_and_mask_npu",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.embeddings.masked_input:get_masked_input_and_mask_npu"
+        ),
+        capabilities=CapabilityRequirement.NPU,
+    )
+)
 
 register_kernel(
     KernelSpec(
