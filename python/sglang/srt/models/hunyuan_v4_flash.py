@@ -729,7 +729,9 @@ class FlashEngram(nn.Module):
                 [p.weight for p in self.key_projs] + [self.value_proj.weight],
                 out=weight,
             )
-            torch.cat([p.bias for p in self.key_projs] + [self.value_proj.bias], out=bias)
+            torch.cat(
+                [p.bias for p in self.key_projs] + [self.value_proj.bias], out=bias
+            )
 
     def _load_projection(self, param, value):
         if value.shape != (self.hidden_size, self.total_width):
