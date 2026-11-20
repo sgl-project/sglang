@@ -21,33 +21,33 @@
             }
         },
         {
-            "id": "flux1_dev_t2i_1024",
-            "model": "black-forest-labs/FLUX.1-dev",
+            "id": "flux3_base_t2i_1024",
+            "model": "black-forest-labs/flux-3-image-klein-base",
             "task": "text-to-image",
             "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 2,
+            "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
+                    "serve_args": "--warmup-mode server --component-residency all=resident --attention-backend fa",
                     "extra_env": {}
                 }
             }
         },
         {
-            "id": "flux2_dev_t2i_1024",
-            "model": "black-forest-labs/FLUX.2-dev",
+            "id": "flux3_distilled_t2i_1024",
+            "model": "black-forest-labs/flux-3-image-klein",
             "task": "text-to-image",
             "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "num_gpus": 2,
+            "num_gpus": 1,
             "frameworks": {
                 "sglang": {
-                    "serve_args": "--warmup-mode server --component-residency dit=resident --tp-size 2",
+                    "serve_args": "--warmup-mode server --component-residency all=resident --attention-backend fa",
                     "extra_env": {}
                 }
             }

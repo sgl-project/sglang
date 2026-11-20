@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in full-checkpoint test: SGLANG_TEST_FLUX3_IMAGE=1 pytest <this file>."""
+"""Opt-in FLUX.3 full-checkpoint batching checks."""
 
 import base64
 import io
@@ -20,11 +20,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
-)
-
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SGLANG_TEST_FLUX3_IMAGE") != "1",
-    reason="requires access to the full FLUX.3 image checkpoint",
 )
 
 
@@ -50,6 +45,10 @@ def case():
     )
 
 
+@pytest.mark.skipif(
+    os.environ.get("SGLANG_TEST_FLUX3_IMAGE") != "1",
+    reason="requires access to the full FLUX.3 image checkpoint",
+)
 def test_grouped_requests_multi_output_and_repeat(diffusion_server):
     url = f"http://localhost:{diffusion_server.port}/v1/images"
     reference = io.BytesIO()

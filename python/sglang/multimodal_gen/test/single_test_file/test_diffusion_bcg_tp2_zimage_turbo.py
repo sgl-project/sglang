@@ -1,4 +1,4 @@
-"""Breakable CUDA graph must survive tensor parallelism.
+"""Breakable CUDA graph must register legacy custom all-reduce inputs under TP.
 
 With ``--tp-size > 1`` every ``RowParallelLinear`` issues a per-block all-reduce
 that lands *inside* a captured BCG segment (BCG's break points are the attention
