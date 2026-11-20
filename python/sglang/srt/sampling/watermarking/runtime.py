@@ -16,6 +16,7 @@ from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
 from sglang.srt.sampling.watermarking.interface import NO_WATERMARK_VIEW_FIELDS
 
 if TYPE_CHECKING:
+    from sglang.srt.arg_groups.model_override_base import ResolvingConfig
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.sampling.watermarking.interface import (
@@ -65,7 +66,7 @@ def watermark_request_enabled(sampling_params: SamplingParams) -> bool:
     )
 
 
-def check_watermark_algorithm_args(cfg: Any) -> None:
+def check_watermark_algorithm_args(cfg: ResolvingConfig) -> None:
     """The configured algorithm's own server-argument checks."""
     _ADAPTERS[cfg.watermark_algorithm].check_server_args(cfg)
 

@@ -14,6 +14,8 @@ from torch import Tensor
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.arg_groups.fields.exec_ import ExecFeatures
+    from sglang.srt.arg_groups.model_override_base import ResolvingConfig
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -56,15 +58,6 @@ def merge_watermark_rows(
     return a.concat(b, a_len, b_len)
 
 
-def num_prefill_rows(batch: ScheduleBatch) -> int:
-    """The leading rows of an extend batch that prefill; the rest decode."""
-    if batch.forward_mode.is_mixed():
-        return len(batch.reqs) - len(batch.mix_running_indices_cpu)
-    if batch.decoding_reqs is not None:
-        return 0
-    return len(batch.reqs)
-
-
 @dataclass(frozen=True)
 class SampleStep:
     # What the stock sampler must sample with.
@@ -93,14 +86,14 @@ class VerifyWatermark(Protocol):
         self,
         logits: Tensor,
         *,
-        sampling_info: Any,
+        sampling_info: SamplingBatchInfo,
         req_pool_indices: Tensor,
         draft_tokens: Tensor,
         positions: Tensor,
         draft_token_num: int,
         custom_mask: Optional[Tensor],
         keep_logits: bool,
-    ) -> tuple[Tensor, Any]:
+    ) -> tuple[Tensor, SamplingBatchInfo]:
         """The logits to verify against and the sampling info to verify with.
 
         Callers accept with the returned sampling info, not the one passed in.
@@ -163,7 +156,7 @@ class WatermarkAdapter(Protocol):
 
     def make_engine(
         self,
-        features: Any,
+        features: ExecFeatures,
         *,
         max_num_reqs: int,
         max_contexts_per_req: int,
@@ -172,19 +165,23 @@ class WatermarkAdapter(Protocol):
     ) -> WatermarkEngine: ...
 
     def build_rows(
-        self, requests: Sequence[Req], *, features: Any, device: torch.device | str
+        self,
+        requests: Sequence[Req],
+        *,
+        features: ExecFeatures,
+        device: torch.device | str,
     ) -> Optional[WatermarkRows]:
         """The batch's rows, or None when no request is a candidate."""
         ...
 
     def request_enabled(
-        self, sampling_params: SamplingParams, *, features: Any
+        self, sampling_params: SamplingParams, *, features: ExecFeatures
     ) -> bool:
         """Whether the request is watermarked; raises ValueError for an invalid
         request. Runs for every request, watermarking on or off."""
         ...
 
-    def check_server_args(self, cfg: Any) -> None:
+    def check_server_args(self, cfg: ResolvingConfig) -> None:
         """Server-argument checks; runs only with --enable-watermark."""
         ...
 

@@ -8,18 +8,22 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
+from ..batch_layout import num_prefill_rows
 from ..config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     WatermarkRequestConfig,
     parse_watermark_key,
 )
-from ..interface import SampleStep, num_prefill_rows
+from ..interface import SampleStep
 from .detector import hash_context
 from .state import WatermarkState
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.arg_groups.fields.exec_ import ExecFeatures
+    from sglang.srt.arg_groups.model_override_base import ResolvingConfig
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
 
 
@@ -134,9 +138,9 @@ def resolve_watermark_request(
 
 
 def build_rows(
-    requests: Sequence[Any],
+    requests: Sequence[Req],
     *,
-    features: Any,
+    features: ExecFeatures,
     device: torch.device | str,
 ) -> Optional[GumbelRows]:
     keys = []
@@ -167,7 +171,7 @@ def build_rows(
     )
 
 
-def request_enabled(sampling_params: SamplingParams, *, features: Any) -> bool:
+def request_enabled(sampling_params: SamplingParams, *, features: ExecFeatures) -> bool:
     _, _, enabled = resolve_watermark_request(
         sampling_params.watermark,
         server_enabled=features.enable_watermark,
@@ -180,7 +184,7 @@ def request_enabled(sampling_params: SamplingParams, *, features: Any) -> bool:
 
 
 def make_engine(
-    features: Any,
+    features: ExecFeatures,
     *,
     max_num_reqs: int,
     max_contexts_per_req: int,
@@ -201,7 +205,7 @@ def make_engine(
 
 
 class GumbelEngine:
-    def __init__(self, state: WatermarkState, features: Any) -> None:
+    def __init__(self, state: WatermarkState, features: ExecFeatures) -> None:
         self.state = state
         self._features = features
 
@@ -352,14 +356,14 @@ class GumbelVerify:
         self,
         logits: torch.Tensor,
         *,
-        sampling_info: Any,
+        sampling_info: SamplingBatchInfo,
         req_pool_indices: torch.Tensor,
         draft_tokens: torch.Tensor,
         positions: torch.Tensor,
         draft_token_num: int,
         custom_mask: Optional[torch.Tensor],
         keep_logits: bool,
-    ) -> tuple[torch.Tensor, Any]:
+    ) -> tuple[torch.Tensor, SamplingBatchInfo]:
         if keep_logits:
             logits = logits.clone()
         if custom_mask is None:
@@ -506,7 +510,7 @@ def watermark_view_fields(rows: GumbelRows) -> dict[str, Any]:
     }
 
 
-def check_server_args(cfg: Any) -> None:
+def check_server_args(cfg: ResolvingConfig) -> None:
     if cfg.watermark_key is not None:
         parse_watermark_key(cfg.watermark_key)
     if cfg.watermark_key_b is not None:
