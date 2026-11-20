@@ -221,15 +221,21 @@ class TestRebuildCompactDraftReqToToken(CustomTestCase):
             draft_b = draft_a.clone()
 
             self._legacy(draft_a, target, req_idx, start, lens, verify_2d, bs, block)
-            rebuild_compact_draft_req_to_token_func(
+            # The kernel derives the compact prefix lengths from the committed lengths.
+            kernel_lens = rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=draft_b,
                 target_req_to_token=target,
                 req_pool_indices=req_idx,
-                suffix_start=start,
-                draft_prefix_lens=lens,
+                seq_lens=seq,
                 verify_out_cache_loc_2d=verify_2d,
                 batch_size=bs,
                 block_size=block,
+                window=window,
+                page_size=page,
+            )
+            self.assertEqual(kernel_lens.dtype, torch.int32)
+            torch.testing.assert_close(
+                kernel_lens.to(torch.int64), lens.to(torch.int64), rtol=0, atol=0
             )
             torch.testing.assert_close(draft_b, draft_a, rtol=0, atol=0)
             for i in range(bs):

@@ -308,6 +308,7 @@ def _selector_walk_kernel(
     greedy_ptr,
     tokens_ptr,
     q_ptr,
+    tokens_stride,
     slots: tl.constexpr,
     top_k: tl.constexpr,
 ):
@@ -341,8 +342,145 @@ def _selector_walk_kernel(
             )
             index = tl.minimum(index, top_k - 1)
         tl.store(q_ptr + base + offsets, probabilities)
-        tl.store(tokens_ptr + row * slots + slot, tl.load(candidate_ptr + base + index))
+        tl.store(
+            tokens_ptr + row * tokens_stride + slot,
+            tl.load(candidate_ptr + base + index),
+        )
         previous = index
+
+
+@triton.jit
+def _stage_selector_params_kernel(
+    temperatures_ptr, top_ks_ptr, temperatures_out, greedy_out, n, BLOCK: tl.constexpr
+):
+    i = tl.arange(0, BLOCK)
+    live = i < n
+    t = tl.load(temperatures_ptr + i, mask=live, other=1.0).to(tl.float32)
+    tl.store(temperatures_out + i, tl.maximum(t, 1e-5), mask=live)
+    tl.store(
+        greedy_out + i, tl.load(top_ks_ptr + i, mask=live, other=1) <= 1, mask=live
+    )
+
+
+def stage_selector_params(temperatures, top_ks, temperatures_out, greedy_out):
+    """``clamp(temperatures, min=1e-5)`` and ``top_ks <= 1`` into the [:n] rows of
+    the outputs, one launch."""
+    n = temperatures_out.shape[0]
+    assert (
+        temperatures.is_contiguous()
+        and top_ks.is_contiguous()
+        and greedy_out.dtype == torch.bool
+    )
+    _stage_selector_params_kernel[(1,)](
+        temperatures,
+        top_ks,
+        temperatures_out,
+        greedy_out,
+        n,
+        triton.next_power_of_2(n),
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _selector_lattice_kernel(
+    candidate_ptr,
+    unary_ptr,
+    hidden_ptr,
+    anchor_ptr,
+    predecessor_ptr,
+    successor_ptr,
+    scores_ptr,
+    slots: tl.constexpr,
+    top_k: tl.constexpr,
+    rank: tl.constexpr,
+    round_bf16: tl.constexpr,
+):
+    """One (request, slot) of the selector lattice: scores[p, c] = unary[c] +
+    <A[pred[p]] * h, B[cand[c]]>, pred = the previous slot's candidates (the anchor
+    at slot 0), rounded where the selector's elementwise product and batched matmul
+    round (``round_bf16``)."""
+    row = tl.program_id(0)
+    slot = tl.program_id(1)
+    k = tl.arange(0, top_k)
+    r = tl.arange(0, rank)
+    base = (row * slots + slot) * top_k
+    if slot == 0:
+        predecessors = tl.load(anchor_ptr + row + k * 0)
+    else:
+        predecessors = tl.load(candidate_ptr + base - top_k + k)
+    h = tl.load(hidden_ptr + (row * slots + slot) * rank + r).to(tl.float32)
+    a = (
+        tl.load(predecessor_ptr + predecessors[:, None] * rank + r[None, :]).to(
+            tl.float32
+        )
+        * h[None, :]
+    )
+    keys = tl.load(
+        successor_ptr + tl.load(candidate_ptr + base + k)[None, :] * rank + r[:, None]
+    )
+    if round_bf16:
+        edge = (
+            tl.dot(a.to(tl.bfloat16), keys.to(tl.bfloat16))
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+    else:
+        edge = tl.dot(a, keys.to(tl.float32), input_precision="ieee")
+    scores = tl.load(unary_ptr + base + k).to(tl.float32)[None, :] + edge
+    tl.store(scores_ptr + (base + k[:, None]) * top_k + k[None, :], scores)
+
+
+def selector_score_walk_triton(
+    *,
+    candidate_ids,
+    unary_logits,
+    hidden,
+    anchor_token_ids,
+    predecessor_table,
+    successor_table,
+    uniforms,
+    temperatures,
+    greedy_mask,
+    tokens_out,
+    q_out,
+):
+    """The selector lattice (``hidden`` is the projected [batch, slots, rank] state,
+    ``unary_logits`` [batch, slots, K]), every (request, slot) block in parallel, then
+    ``selector_walk_triton`` on it into ``tokens_out`` / ``q_out``."""
+    batch, slots, top_k = candidate_ids.shape
+    rank = hidden.shape[-1]
+    product = torch.result_type(predecessor_table, hidden)
+    assert product == torch.result_type(successor_table, hidden) and product in (
+        torch.bfloat16,
+        torch.float32,
+    )
+    scores = torch.empty(
+        (batch, slots, top_k, top_k), dtype=torch.float32, device=hidden.device
+    )
+    _selector_lattice_kernel[(batch, slots)](
+        candidate_ids.contiguous(),
+        unary_logits.contiguous(),
+        hidden.contiguous(),
+        anchor_token_ids.contiguous(),
+        predecessor_table,
+        successor_table,
+        scores,
+        slots=slots,
+        top_k=top_k,
+        rank=rank,
+        round_bf16=product == torch.bfloat16,
+        num_warps=4,
+    )
+    selector_walk_triton(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        uniforms=uniforms,
+        temperatures=temperatures,
+        greedy_mask=greedy_mask,
+        tokens_out=tokens_out,
+        q_out=q_out,
+    )
 
 
 def selector_walk_triton(
@@ -352,12 +490,23 @@ def selector_walk_triton(
     uniforms,
     temperatures,
     greedy_mask,
+    tokens_out=None,
+    q_out=None,
 ):
+    """The walk's tokens [batch, slots] int64 and q rows [batch, slots, top_k] fp32,
+    into ``tokens_out`` (rows of any stride) / ``q_out`` (contiguous) when given."""
     batch, slots, top_k = candidate_ids.shape
-    tokens = torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
-    q_rows = torch.empty(
-        (batch, slots, top_k), dtype=torch.float32, device=scores.device
+    tokens = (
+        torch.empty((batch, slots), dtype=torch.int64, device=scores.device)
+        if tokens_out is None
+        else tokens_out
     )
+    q_rows = (
+        torch.empty((batch, slots, top_k), dtype=torch.float32, device=scores.device)
+        if q_out is None
+        else q_out
+    )
+    assert tokens.stride(1) == 1 and q_rows.is_contiguous()
     _selector_walk_kernel[(batch,)](
         scores.contiguous(),
         candidate_ids.contiguous(),
@@ -366,6 +515,7 @@ def selector_walk_triton(
         greedy_mask.contiguous(),
         tokens,
         q_rows,
+        tokens.stride(0),
         slots=slots,
         top_k=top_k,
         num_warps=1,

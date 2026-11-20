@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
     _prepare_dflash_mamba_commit,
     compute_dflash_correct_drafts_and_bonus,
+    stage_selector_params,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
@@ -363,6 +364,10 @@ class _SelectorDraftSampler:
     the sampling path, and a static greedy_mask selects the argmax per row.
     """
 
+    # gfx950: the selector params staged by one launch, the lattice scored by one
+    # kernel and walked straight into the output buffers (set in __init__).
+    fused = False
+
     def __init__(
         self,
         *,
@@ -379,6 +384,11 @@ class _SelectorDraftSampler:
         self.sampling_enabled = sampling_enabled
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.max_bs = max_bs
+        self.fused = (
+            is_hip()
+            and is_gfx95_supported()
+            and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_LATTICE.get()
+        )
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -407,8 +417,15 @@ class _SelectorDraftSampler:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
             return
+        temperatures = sampling_info.temperatures.view(-1)[:bs]
+        top_ks = sampling_info.top_ks.view(-1)[:bs]
+        if self.fused and temperatures.is_contiguous() and top_ks.is_contiguous():
+            stage_selector_params(
+                temperatures, top_ks, self.temperatures[:bs], self.greedy_mask[:bs]
+            )
+            return
         torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+            temperatures.to(torch.float32),
             min=1e-5,
             out=self.temperatures[:bs],
         )
@@ -422,6 +439,26 @@ class _SelectorDraftSampler:
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        if self.fused and self.acceptance_estimator is None:
+            gamma = hs.shape[1]
+            candidate_ids, unary_logits = self.draft_model.compute_candidates(
+                hs.reshape(-1, hs.shape[-1])
+            )
+            candidate_ids = candidate_ids.view(bs, gamma, -1)
+            # In-graph philox draw: each replay advances the generator and redraws.
+            self.selector.score_walk(
+                candidate_ids=candidate_ids,
+                unary_logits=unary_logits.view(bs, gamma, -1),
+                hidden_states=hs,
+                anchor_token_ids=block_ids[:, 0],
+                uniforms=self.uniforms[:bs].uniform_(),
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+                tokens_out=self.out[: bs * gamma].view(bs, gamma),
+                q_out=self.q_out[:bs],
+            )
+            self.candidate_out[:bs].copy_(candidate_ids)
+            return
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -746,6 +783,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             None  # [cap_bs, block_size]
         )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._token_counts: dict[int, torch.Tensor] = {}  # read-only device scalars
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
@@ -1671,28 +1709,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         req_pool_indices: torch.Tensor,
         prefix_lens: torch.Tensor,
-        draft_prefix_lens: torch.Tensor,
         verify_out_cache_loc_2d: torch.Tensor,
         bs: int,
         block_size: int,
-    ) -> None:
+    ) -> torch.Tensor:
         """Write the draft-local compact req->token rows: the committed suffix
-        window at [0, draft_prefix_len) plus the verify block slots after it."""
-        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        window at [0, draft_prefix_len) plus the verify block slots after it.
+        Returns the compact prefix lengths."""
         full_to_swa = self._draft_kv_full_to_swa_mapping()
         if self._use_triton_compact_rebuild:
-            rebuild_compact_draft_req_to_token_func(
+            draft_prefix_lens = rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
                 target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=req_pool_indices,
-                suffix_start=suffix_start,
-                draft_prefix_lens=draft_prefix_lens,
+                seq_lens=prefix_lens,
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 batch_size=bs,
                 block_size=block_size,
+                window=int(self.draft_window_size),
+                page_size=self._draft_compact_page_size,
                 full_to_swa=full_to_swa,
             )
         else:
+            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                torch.int64
+            )
             suffix_cache_loc = self._gather_req_to_token_segments(
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 req_pool_indices=req_pool_indices,
@@ -1722,6 +1764,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
             )
+        return draft_prefix_lens
 
     def _draft_kv_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
         """The target's full->SWA id table when the draft pool's rows are the
@@ -2692,10 +2735,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
+        write_all_layers_kv = None
+        write_layers = getattr(
+            token_to_kv_pool, "set_kv_buffer_prefix_valid_layers", None
+        )
+        if (
+            write_layers is not None
+            and ctx_cache_loc_2d is not None
+            and commit_lens is not None
+        ):
+            layers = self.draft_model.layers
+            if all(
+                layer.self_attn.attn.k_scale is None
+                and layer.self_attn.attn.v_scale is None
+                for layer in layers
+            ):
+                layer_ids = tuple(layer.self_attn.attn.layer_id for layer in layers)
+
+                def write_all_layers_kv(cache_k, cache_v) -> bool:
+                    return write_layers(
+                        layer_ids, ctx_cache_loc_2d, commit_lens, cache_k, cache_v
+                    )
+
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
+            write_all_layers_kv=write_all_layers_kv,
         )
 
     def _update_target_mamba_state_after_verify(
@@ -2771,6 +2837,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
+
+    def _token_count(self, n: int) -> torch.Tensor:
+        """A device int32 scalar holding ``n``, made once: a draft block's token count
+        is the same every step and nothing writes it."""
+        if n not in self._token_counts:
+            self._token_counts[n] = torch.full(
+                (), n, dtype=torch.int32, device=self.device
+            )
+        return self._token_counts[n]
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
         if self._accept_bonus_buffer_cap >= int(bs):
@@ -3294,7 +3369,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_ids, self._full_embed_gpu
             )
         else:
-            noise_embedding = embed_module(block_ids)
+            inner = getattr(embed_module, "_embedding", embed_module)
+            full = getattr(inner, "replicated_weight", None)
+            if full is not None:
+                # A replicated table (a monokernel bind builds one): the
+                # vocab-parallel lookup without its all-reduce, then the
+                # module's own norm.
+                noise_embedding = torch.nn.functional.embedding(block_ids, full)
+                norm = getattr(embed_module, "_norm", None)
+                if norm is not None:
+                    noise_embedding = norm(noise_embedding)
+            else:
+                noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:
             noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -3318,16 +3404,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
                 out=seq_lens_cpu,
             )
-            self._rebuild_compact_draft_cache(
+            draft_prefix_lens = self._rebuild_compact_draft_cache(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
-                draft_prefix_lens=draft_prefix_lens,
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 bs=bs,
                 block_size=block_size,
@@ -3369,7 +3453,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=(
-                torch.full((), bs * block_size, dtype=torch.int32, device=device)
+                self._token_count(bs * block_size)
                 if enable_num_token_non_padded()
                 else None
             ),

@@ -29,6 +29,8 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
+from sglang.srt.kernel_plugins.amd.binding import is_metadata_unread
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     resolve_window_id_space,
@@ -391,6 +393,10 @@ def _muse_verify_attention(
             )  # fmt: skip
             return True
     if sliding_window == 2047 and window_size[1] == 0:
+        if not (k.is_contiguous() and v.is_contiguous()):
+            # a head-major SWA pool: these kernels address NHD pages; unified_attention
+            # honours the strides
+            return False
         if (
             "swa_fly" in kernels
             and gqa_verify_flydsl is not None
@@ -430,6 +436,10 @@ def _muse_verify_attention(
             return True
         return False
     if sliding_window != 0:
+        return False
+    if not (k.is_contiguous() and v.is_contiguous()):
+        # a head-major full pool (memory_pool.full_head_major): these kernels address NHD pages;
+        # unified_attention honours the strides
         return False
     if (
         "full_fly" in kernels
@@ -773,6 +783,7 @@ class AiterAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 
+        self.model_runner = model_runner
         self.input_dtype = model_runner.model_config.dtype
 
         self.page_size = get_schedule().page_size
@@ -1734,22 +1745,25 @@ class AiterAttnBackend(AttentionBackend):
         draft_num: int,
         page_table_dest: Optional[torch.Tensor] = None,
         swa_page_table_dest: Optional[torch.Tensor] = None,
+        qo_indptr_too: bool = True,
     ):
         """Build the 2D block page_table + qo_indptr for EAGLE target_verify
         through unified_attention. Assumes the new draft K/V have already been
         written by set_kv_buffer, so req_to_token[rp, :seq_lens[i]+draft_num]
         covers both the prefix and the freshly committed draft tokens. Returns
-        (page_table, qo_indptr, max_q_len=draft_num).
+        (page_table, qo_indptr, max_q_len=draft_num); ``qo_indptr_too=False``
+        leaves the qo_indptr buffer as it is (a reader of the page tables only).
         """
         device = seq_lens.device
         qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * draft_num,
-            step=draft_num,
-            dtype=torch.int32,
-            device=device,
-        )
+        if qo_indptr_too:
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * draft_num,
+                step=draft_num,
+                dtype=torch.int32,
+                device=device,
+            )
 
         page_size = self.page_size
         max_blocks = (self.max_context_len + page_size - 1) // page_size
@@ -2927,6 +2941,14 @@ class AiterAttnBackend(AttentionBackend):
             if forward_batch.forward_mode.is_target_verify()
             else None
         )
+        # A monokernel verify reads the page tables only (it translates its own SWA
+        # write slots); the side tables would be wasted replay preparation.
+        side_tables = not (
+            forward_batch.forward_mode.is_target_verify()
+            and is_metadata_unread(
+                self.model_runner.model, forward_batch, StepMetadata.VERIFY_SIDE_TABLES
+            )
+        )
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -2936,6 +2958,7 @@ class AiterAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
             verify_tokens_per_req=verify_tokens_per_req,
+            side_tables=side_tables,
         )
         if in_capture and forward_batch.forward_mode.is_decode():
             self.forward_metadata.decode_num_partitions = (
@@ -2944,7 +2967,11 @@ class AiterAttnBackend(AttentionBackend):
 
         # Refill the SWA write-target buffer from the live out_cache_loc and
         # bind it onto the metadata before replay (_apply rebuilds it each call).
-        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+        if (
+            side_tables
+            and self.use_sliding_window_kv_pool
+            and forward_batch.out_cache_loc is not None
+        ):
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
             if in_capture:
@@ -3947,6 +3974,7 @@ class AiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         verify_tokens_per_req: Optional[int],
+        side_tables: bool = True,
     ):
         num_kv_splits = None
         # num_kv_splits_indptr = None
@@ -4164,13 +4192,14 @@ class AiterAttnBackend(AttentionBackend):
                 self.num_draft_tokens if self.use_mla else verify_tokens_per_req
             )
             qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                (1 + bs) * tokens_per_req,
-                step=tokens_per_req,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if side_tables:
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * tokens_per_req,
+                    step=tokens_per_req,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             if self.use_mla:
                 use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
                     self.num_draft_tokens
@@ -4351,12 +4380,13 @@ class AiterAttnBackend(AttentionBackend):
                             verify_tokens_per_req,
                             page_table_dest=page_table,
                             swa_page_table_dest=swa_page_table,
+                            qo_indptr_too=side_tables,
                         )
                     )
 
                     max_kv_len_unified = max_num_blocks_per_seq * self.page_size
                     verify_seqlen_k = verify_seqlen_k_i32 = None
-                    if self.muse_reuse_verify_lengths:
+                    if self.muse_reuse_verify_lengths and side_tables:
                         verify_seqlen_k = self.cuda_graph_verify_seqlen_k[:bs]
                         torch.add(
                             seq_lens[:bs], verify_tokens_per_req, out=verify_seqlen_k
