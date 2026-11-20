@@ -1,10 +1,13 @@
-"""CUDA regressions for DSA kpool speculative writes spanning multiple pools."""
+"""CUDA regressions for DSA kpool cache writes."""
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
+from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     kpool_assemble_softmax_rotate_write_cache,
@@ -15,6 +18,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     _alloc_kpool_write_plan_buffers,
 )
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -207,6 +211,85 @@ class TestDsaKpoolMultiPool(CustomTestCase):
 
     def test_effective_n_only_compresses_accepted_pools(self):
         self._run_compress_case(effective_n=2, expected_closed_pools=1)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "Test requires CUDA")
+class TestDsaKpoolDecodeWritePadding(CustomTestCase):
+    POOL_SIZE = 4
+    TAIL_EXTRA_SLOTS = 6
+    INDEX_PAGE_SIZE = 64
+    # Last slot of the second pool, so the write also compresses into the cache.
+    REAL_POS = 7
+
+    def _decode_write(self, num_key_rows: int):
+        torch.manual_seed(0)
+        tail_size = self.POOL_SIZE + self.TAIL_EXTRA_SLOTS
+        page_nbytes = self.INDEX_PAGE_SIZE * INDEX_HEAD_DIM + self.INDEX_PAGE_SIZE * 4
+        buf = torch.zeros((1, page_nbytes), dtype=torch.uint8, device="cuda")
+        tail_k = torch.randn(
+            2, tail_size, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        tail_score = torch.randn_like(tail_k)
+        pool = SimpleNamespace(
+            kpool_use_compress=True,
+            start_layer=0,
+            page_size=256,
+            index_head_dim=INDEX_HEAD_DIM,
+            index_page_size=self.INDEX_PAGE_SIZE,
+            index_kpool=self.POOL_SIZE,
+            tail_extra_slots=self.TAIL_EXTRA_SLOTS,
+            get_index_k_with_scale_buffer=lambda layer_id: buf,
+            _compress_tail_k=[tail_k],
+            _compress_tail_score=[tail_score],
+        )
+        pool.kpool_decode_update_index_cache = MethodType(
+            DSATokenToKVPool.kpool_decode_update_index_cache, pool
+        )
+        indexer = SimpleNamespace(
+            index_kpool_compress_ape=torch.randn(
+                self.POOL_SIZE, INDEX_HEAD_DIM, dtype=torch.float32, device="cuda"
+            ),
+            scale_fmt=None,
+        )
+        # Row 0 is request 1; MLP sync pads with request 0, position 0, slot 0.
+        key = torch.randn(4, INDEX_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        gate_score = torch.randn_like(key)
+        positions = torch.tensor([self.REAL_POS, 0, 0, 0], device="cuda")
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 0, 0, 0], device="cuda")[:num_key_rows],
+            out_cache_loc=torch.tensor([8, 0, 0, 0], device="cuda")[:num_key_rows],
+        )
+        metadata = SimpleNamespace(
+            get_seqlens_int32=lambda: torch.tensor(
+                [self.REAL_POS + 1], dtype=torch.int32, device="cuda"
+            ),
+            get_page_table_64=lambda: torch.zeros(
+                (1, 4), dtype=torch.int32, device="cuda"
+            ),
+        )
+        with patch.object(indexer_module, "get_token_to_kv_pool", return_value=pool):
+            IndexerKPool._compress_write_decode(
+                indexer,
+                key=key[:num_key_rows],
+                gate_score=gate_score[:num_key_rows],
+                positions=positions[:num_key_rows],
+                forward_batch=forward_batch,
+                layer_id=0,
+                metadata=metadata,
+            )
+        return (buf, tail_k, tail_score), key[0]
+
+    def test_decode_write_ignores_mlp_sync_padded_key_rows(self):
+        """Eager decode under attention DP pads key past the rows its metadata
+        covers; the write must accept the padded rows and match the unpadded write."""
+        padded, _ = self._decode_write(num_key_rows=4)
+        unpadded, real_key = self._decode_write(num_key_rows=1)
+        for actual, expected in zip(padded, unpadded):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        buf, tail_k, _ = unpadded
+        tail_slot = self.REAL_POS % (self.POOL_SIZE + self.TAIL_EXTRA_SLOTS)
+        self.assertTrue(torch.equal(tail_k[1, tail_slot], real_key))
+        self.assertTrue(bool(buf.any()))
 
 
 if __name__ == "__main__":
