@@ -14,6 +14,7 @@ import torch
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
 from sglang.srt.sampling.watermarking.interface import NO_WATERMARK_VIEW_FIELDS
+from sglang.srt.sampling.watermarking.synthid import adapter as synthid_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.arg_groups.model_override_base import ResolvingConfig
@@ -25,7 +26,10 @@ if TYPE_CHECKING:
         WatermarkRows,
     )
 
-_ADAPTERS: dict[str, WatermarkAdapter] = {"gumbel": gumbel_adapter}
+_ADAPTERS: dict[str, WatermarkAdapter] = {
+    "gumbel": gumbel_adapter,
+    "synthid": synthid_adapter,
+}
 
 
 def make_watermark_engine(

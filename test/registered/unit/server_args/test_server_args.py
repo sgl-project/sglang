@@ -1064,7 +1064,7 @@ class TestWatermarkServerArgs(CustomTestCase):
     def test_unknown_algorithm_refused_with_watermarking_off(self):
         with self.assertRaisesRegex(ValueError, "unknown --watermark-algorithm"):
             validation_hook.check_watermark_server_args(
-                ServerArgs(model_path="dummy", watermark_algorithm="synthid")
+                ServerArgs(model_path="dummy", watermark_algorithm="kirchenbauer")
             )
 
     def test_every_algorithm_choice_has_an_adapter(self):

@@ -194,7 +194,7 @@ BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "inte
 SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
 
 # Each name has an adapter in sampling/watermarking/runtime.py.
-WATERMARK_ALGORITHM_CHOICES = ["gumbel"]
+WATERMARK_ALGORITHM_CHOICES = ["gumbel", "synthid"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",

@@ -37,6 +37,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
+from sglang.srt.sampling.watermarking.config import ALGORITHM_CONFIG_FIELDS
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -89,6 +90,22 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+    # Another algorithm's fields, set directly as server arguments; the config
+    # loader refuses them in the file.
+    defaults = {
+        field.name: _field_default(field) for field in record_fields(type(server_args))
+    }
+    unread = [
+        f"watermark_{name}"
+        for name in sorted(set().union(*ALGORITHM_CONFIG_FIELDS.values()))
+        if name not in ALGORITHM_CONFIG_FIELDS[cfg.watermark_algorithm]
+        and getattr(cfg, f"watermark_{name}") != defaults[f"watermark_{name}"]
+    ]
+    if unread:
+        raise ValueError(
+            f"server arguments {unread} are not supported with "
+            f"--watermark-algorithm {cfg.watermark_algorithm}"
+        )
     # lazy: the algorithm's adapter imports torch and its kernels.
     from sglang.srt.sampling.watermarking.runtime import check_watermark_algorithm_args
 

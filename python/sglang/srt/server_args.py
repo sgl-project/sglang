@@ -329,6 +329,7 @@ class ServerArgs:
         hidden = {
             "watermark_key",
             "watermark_key_b",
+            "watermark_keys",
             "watermark_config",
             *SERVER_ARGS_SECRET_FIELD_NAMES,
         }
