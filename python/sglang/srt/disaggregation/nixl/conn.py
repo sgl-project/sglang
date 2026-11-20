@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_schedule
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.aiter import pin_aiter_hip_runtime
 from sglang.srt.utils.common import run_with_deadline
 
 try:
@@ -607,6 +608,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_threads=num_threads,
             sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
         )
+        pin_aiter_hip_runtime()
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
