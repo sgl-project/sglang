@@ -52,8 +52,8 @@ class SpectrumParams(CacheParams):
             Order of the local discrete Taylor fallback used in the blend when
             `w < 1.0`. Supported values: `1`, `2`, or `3`.
         separate_cfg_branches (not a field — determined by the DiT model):
-            Wan, Hunyuan, and SD3 maintain independent Spectrum state per CFG
-            branch. Other ``CachableDiT`` models use one counter for all
+            Wan, Hunyuan, SD3, and FLUX maintain independent Spectrum state per
+            CFG branch. Other ``CachableDiT`` models use one counter for all
             forwards; see ``get_total_forward_steps()``.
     """
 
@@ -108,26 +108,31 @@ class SpectrumParams(CacheParams):
             raise ValueError("Spectrum taylor_order must be one of 1, 2, or 3.")
 
     def get_total_forward_steps(
-        self, num_inference_steps: int, do_cfg: bool, separate_cfg_branches: bool
+        self,
+        num_inference_steps: int,
+        do_cfg: bool,
+        separate_cfg_branches: bool,
+        *,
+        cfg_parallel: bool = False,
     ) -> int:
         """How many DiT forward calls one Spectrum counter sees per generation.
 
-        Used by (1) ``ChebyshevForecaster`` to map step indices onto [-1, 1] and
-        by (2) ``begin_spectrum_step`` to wrap branch counters at end-of-run.
-        Not used for logging.
+        Used by ``begin_spectrum_step`` to wrap branch counters at end-of-run.
+        The forecaster maps denoising step indices with ``tau_num_steps``
+        instead. Not used for logging.
 
-        - **Separate counters** (Wan, Hunyuan, SD3): each CFG branch has its own
-          ``spectrum_cnt`` / forecaster. Every denoising step triggers one cond
-          forward and one uncond forward, but each counter only advances on its
-          branch → ``num_inference_steps`` calls per counter.
+        - **Separate counters** (Wan, Hunyuan, SD3, FLUX): each CFG branch has
+          its own ``spectrum_cnt`` / forecaster. Every denoising step triggers one
+          cond forward and one uncond forward, but each counter only advances on
+          its branch → ``num_inference_steps`` calls per counter. With CFG gating
+          the uncond counter stops early; the next request resets it.
 
-        - **Single counter** (FLUX, …): one counter interleaves cond and
+        - **Single counter** (other models): one counter interleaves cond and
           uncond forwards when CFG is enabled → ``2 * num_inference_steps`` calls.
-          FLUX.1-dev uses embedded guidance (no true CFG), so this path is
-          normally single-branch in practice.
 
-        When CFG is off, every model performs one forward per denoising step.
+        When CFG is off, or CFG branches execute on separate ranks, every model
+        performs one local forward per denoising step.
         """
-        if do_cfg and not separate_cfg_branches:
+        if do_cfg and not separate_cfg_branches and not cfg_parallel:
             return num_inference_steps * 2
         return num_inference_steps
