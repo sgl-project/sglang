@@ -60,9 +60,10 @@ _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
 # Measured range: decode up to c = 128 with 8 draft tokens.
 _ROUTING_METADATA_MAX_TOKENS = 1024
 # Smallest token count from which routing on the router stream was measured to beat the fused
-# routing, per (compute capability, TP size); unlisted configurations keep the fused routing. GB300
-# (10, 3) is unlisted: its router stream gates the experts at nearly every token count.
+# routing, per (compute capability, TP size); unlisted configurations keep the fused routing.
 _ROUTING_METADATA_MIN_TOKENS: dict[tuple[tuple[int, int], int], int] = {
+    ((10, 3), 4): 8,
+    ((10, 3), 8): 8,
     ((10, 7), 4): 8,
     ((10, 7), 8): 8,
 }
