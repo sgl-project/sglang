@@ -967,8 +967,7 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             sample.call_args.kwargs,
             {
                 "uno_target_max_top_k": None,
-                "watermark_state": None,
-                "watermark_full_mask": True,
+                "watermark": None,
                 "simulated_acc_len": None,
                 "simulated_acc_len_rng": None,
                 "sparse_bonus_argmax": False,
