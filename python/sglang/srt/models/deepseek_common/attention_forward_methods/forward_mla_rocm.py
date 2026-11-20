@@ -577,8 +577,7 @@ def _can_fuse_mxfp4_bmm_rope_cat_and_cache(
     is_capture_mode: bool,
     num_tokens: int,
 ) -> bool:
-    """MXFP4 terms: aiter-backend graph decode of up to 256 tokens at shapes the
-    kernel tiles."""
+    """MXFP4 terms: aiter graph decode of up to 256 tokens at kernel-tiled shapes."""
     return (
         # Graph decode is the scope validated end to end; eager decode runs split.
         is_capture_mode
