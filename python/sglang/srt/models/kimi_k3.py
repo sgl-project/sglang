@@ -4488,6 +4488,16 @@ class KimiK3ForConditionalGeneration(nn.Module):
             use_gpu_preprocessing=use_gpu_preprocessing,
         )
 
+    def get_image_dp_group(self):
+        parallel = get_parallel()
+        if (
+            self.use_data_parallel
+            and parallel.attn_cp_size > 1
+            and parallel.attn_dp_size == 1
+        ):
+            return parallel.tp_group
+        return None
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -4638,6 +4648,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.use_data_parallel:
             from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 
+            vision_dp_group = self.get_image_dp_group()
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
                 None,
@@ -4651,6 +4662,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 load_local_pixel_values=materialize_item_features,
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
+                parallel_group=vision_dp_group,
             )
             return self.mm_projector(image_embeds)
 
