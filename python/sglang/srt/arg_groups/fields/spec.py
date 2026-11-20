@@ -41,6 +41,13 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_draft_kv_layout: A[
+        Literal["shared", "independent", "hybrid"],
+        Arg(
+            help="DFLASH experimental draft cache: shared target IDs (default), independent full slots, or independent native full/SWA slots.",
+            choices=["shared", "independent", "hybrid"],
+        ),
+    ] = "shared"
     speculative_boundary_reduction: A[
         Literal["ar", "rs", "rsv", "rs+rsv"],
         Arg(no_cli=True, resolvable=True),

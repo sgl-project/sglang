@@ -1323,18 +1323,36 @@ class DeepseekSparseAttnBackend(
         )
         return torch.cat([page_table_1, padding], dim=1), padded_top_k
 
+    def _runtime_verify_width(self, forward_batch: ForwardBatch) -> int:
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # A DFlash verify batch can use fewer query rows than the configured
+        # draft block. Keep that live width local to this metadata update.
+        if isinstance(forward_batch.spec_info, DFlashVerifyInput):
+            width = int(forward_batch.spec_info.draft_token_num)
+        else:
+            width = self.speculative_num_draft_tokens
+        if width is None or width < 1:
+            raise ValueError("Target verify requires a positive runtime query width")
+        return width
+
     def _build_paged_mqa_schedule_2d_ctx_lens(
         self,
         forward_mode: ForwardMode,
         cache_seqlens_int32: torch.Tensor,
         seqlens_expanded: torch.Tensor,
         batch_size: int,
+        draft_token_num: Optional[int] = None,
     ) -> torch.Tensor:
         # target_verify with next_n>=2 uses DG-native q=[B,next_n,H,D] which
         # needs a [B, next_n] schedule; everything else stays per-token.
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
-        next_n = self.speculative_num_draft_tokens
+        next_n = (
+            self.speculative_num_draft_tokens
+            if draft_token_num is None
+            else draft_token_num
+        )
         dg_native_verify = (
             forward_mode.is_target_verify()
             and next_n
@@ -1576,7 +1594,7 @@ class DeepseekSparseAttnBackend(
         device = forward_batch.seq_lens.device
 
         if forward_batch.forward_mode.is_target_verify():
-            draft_token_num = self.speculative_num_draft_tokens
+            draft_token_num = self._runtime_verify_width(forward_batch)
         else:
             draft_token_num = 0
 
@@ -1646,22 +1664,22 @@ class DeepseekSparseAttnBackend(
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
                 0,
-                batch_size * self.speculative_num_draft_tokens + 1,
+                batch_size * draft_token_num + 1,
                 1,
                 dtype=torch.int32,
                 device=device,
             )
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+            extend_seq_lens_cpu = [draft_token_num] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
             seqlens_expanded = seqlens_expand_triton(
                 torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
                 cache_seqlens_int32,
-                self.speculative_num_draft_tokens * batch_size,
-                self.speculative_num_draft_tokens,
+                draft_token_num * batch_size,
+                draft_token_num,
             )
             page_table = torch.repeat_interleave(
-                page_table, repeats=self.speculative_num_draft_tokens, dim=0
+                page_table, repeats=draft_token_num, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
             # Avoid unused host mirrors and their rank-divergent D2H syncs.
@@ -1851,6 +1869,7 @@ class DeepseekSparseAttnBackend(
                 cache_seqlens_int32,
                 seqlens_expanded,
                 forward_batch.batch_size,
+                draft_token_num=draft_token_num,
             )
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
@@ -2866,7 +2885,7 @@ class DeepseekSparseAttnBackend(
         if self.hisparse_coordinator is not None:
             if forward_batch.forward_mode.is_target_verify():
                 num_reqs = forward_batch.req_pool_indices.shape[0]
-                num_steps = self.speculative_num_draft_tokens
+                num_steps = self._runtime_verify_width(forward_batch)
                 assert topk_indices is not None
                 grouped_topk_indices = topk_indices.view(num_reqs, num_steps, -1)
                 assert metadata.dsa_seqlens_expanded is not None
