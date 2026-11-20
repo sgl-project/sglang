@@ -99,8 +99,7 @@ class TestEPLBNoA2ADPAttention(TestEPLBNoA2A):
     the expert-weight migration."""
 
     extra_args = [
-        "--enable-dp-attention",
-        "--dp",
+        "--attn-dp-size",
         "2",
     ]
     rebalance_num_iterations = "50"

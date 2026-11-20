@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import operator
+import random
+from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -12,14 +15,25 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    CustomLogitProcessor,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.sampling.watermarking.interface import (
+    WatermarkRows,
+    merge_watermark_rows,
+)
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
+from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
@@ -33,6 +47,49 @@ def _rows_to_device_indices(
     if pin is None:
         pin = is_pin_memory_available(device)
     return torch.tensor(rows, dtype=torch.long, pin_memory=pin).to(
+        device, non_blocking=True
+    )
+
+
+def _rows_with_seed(
+    reqs: List[Req], *, enable_deterministic: bool
+) -> Optional[List[bool]]:
+    """Which rows sample with their request's own seed, outside deterministic mode.
+
+    None when no row does, in deterministic mode (which seeds every row), and under
+    speculative decoding, whose draft graphs have seed buffers only in deterministic
+    mode. A greedy row never draws, so its seed does not count.
+    """
+    if enable_deterministic:
+        return None
+    rows = [
+        r.sampling_params.sampling_seed is not None and r.sampling_params.top_k > 1
+        for r in reqs
+    ]
+    if not any(rows):
+        return None
+    if get_spec().speculative_algorithm is not None:
+        print_warning_once(
+            "sampling_seed is ignored with speculative decoding unless "
+            "--enable-deterministic-inference is set."
+        )
+        return None
+    return rows
+
+
+# TP ranks sample independently, so their filler seeds must match. Every rank builds
+# the same batches, but other code (e.g. tracing) may draw from the global `random`
+# on one rank and not another, which would put the ranks' sequences out of step.
+_FILLER_SEED_RNG = random.Random(0)  # Any constant works; it must match across ranks.
+
+
+def _filler_seed() -> int:
+    # The seeded samplers hash each seed as uint64; any int64 works.
+    return _FILLER_SEED_RNG.getrandbits(63)
+
+
+def _filler_seeds(n: int, device: str) -> torch.Tensor:
+    return torch.tensor([_filler_seed() for _ in range(n)], dtype=torch.int64).to(
         device, non_blocking=True
     )
 
@@ -89,13 +146,22 @@ class SamplingBatchInfo:
     # Custom logit processor
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
-    # Used for deterministic sampling
+    # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
+    # Outside deterministic mode, which rows sample with their own seed; None if none do.
+    rows_with_seed: Optional[List[bool]] = None
 
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
     return_sampling_masks: Optional[List[bool]] = None
+    return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
+    sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
+
+    # Per-row watermark policy; None unless some row is a watermark candidate.
+    watermark: Optional[WatermarkRows] = None
 
     # Device
     device: str = "cuda"
@@ -106,6 +172,12 @@ class SamplingBatchInfo:
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
+
+    # Host-side upper bound on every row's top_k, or None when some row samples
+    # from the whole vocabulary. Any value >= the true max stays exact, so
+    # filter_batch keeps it unchanged (ScheduleBatch tightens it with
+    # refresh_top_k_flags).
+    max_top_k: Optional[int] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -138,22 +210,21 @@ class SamplingBatchInfo:
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
-        sampling_seed = (
-            torch.tensor(
-                [
-                    (
-                        r.sampling_params.sampling_seed
-                        if r.sampling_params.sampling_seed is not None
-                        else 42
-                    )
-                    for r in reqs
-                ],
-                dtype=torch.int64,
-                pin_memory=_pin,
-            ).to(device, non_blocking=True)
-            if enable_deterministic
-            else None
+        rows_with_seed = _rows_with_seed(
+            reqs, enable_deterministic=enable_deterministic
         )
+        sampling_seed = None
+        if enable_deterministic or rows_with_seed is not None:
+            seeds = []
+            for r in reqs:
+                seed = r.sampling_params.sampling_seed
+                if seed is None:
+                    # A deterministic run defaults to 42; otherwise the row stays random.
+                    seed = 42 if enable_deterministic else _filler_seed()
+                seeds.append(seed)
+            sampling_seed = torch.tensor(seeds, dtype=torch.int64, pin_memory=_pin).to(
+                device, non_blocking=True
+            )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -180,14 +251,40 @@ class SamplingBatchInfo:
                 )
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        enable_custom_processor = get_exec().features.enable_custom_logit_processor
+        has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                enable_custom_processor
+                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
+            )
+            for r in reqs
+        )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        return_sampling_support_logprobs = [
+            r.return_sampling_mask and r.sampling_logprobs_mode == "support"
+            for r in reqs
+        ]
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        watermark = (
+            build_watermark_rows(reqs, device)
+            if isinstance(batch, ScheduleBatch)
+            else None
+        )
+        sampling_support_logprobs_capture_indices = (
+            cls._make_sampling_support_logprobs_capture_indices(
+                return_sampling_masks,
+                return_sampling_support_logprobs,
+                device,
+            )
+        )
+        sampling_mask_top_ks = [
+            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+        ]
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -237,14 +334,10 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
+            rows_with_seed=rows_with_seed,
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            npu_top_k_top_p_eligible=all(
-                1 <= r.sampling_params.top_k <= 1024 for r in reqs
-            ),
+            **_top_k_flags([r.sampling_params.top_k for r in reqs]),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -253,7 +346,13 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
+            return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            watermark=watermark,
+            sampling_support_logprobs_capture_indices=(
+                sampling_support_logprobs_capture_indices
+            ),
+            sampling_mask_top_ks=sampling_mask_top_ks,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -280,6 +379,30 @@ class SamplingBatchInfo:
         indices = [
             i for i, should_return in enumerate(return_sampling_masks) if should_return
         ]
+        if not indices:
+            return None
+        return _rows_to_device_indices(indices, device)
+
+    @staticmethod
+    def _make_sampling_support_logprobs_capture_indices(
+        return_sampling_masks: List[bool],
+        return_sampling_support_logprobs: Optional[List[bool]],
+        device: str,
+    ) -> Optional[torch.Tensor]:
+        """Map support-mode requests to rows in the compact mask capture."""
+        if return_sampling_support_logprobs is None:
+            return None
+        capture_index = -1
+        indices = []
+        for return_mask, return_support in zip(
+            return_sampling_masks,
+            return_sampling_support_logprobs,
+            strict=True,
+        ):
+            if return_mask:
+                capture_index += 1
+            if return_support:
+                indices.append(capture_index)
         if not indices:
             return None
         return _rows_to_device_indices(indices, device)
@@ -377,6 +500,13 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
+        if self.rows_with_seed is not None:
+            self.rows_with_seed = [self.rows_with_seed[i] for i in keep_indices]
+            if not any(self.rows_with_seed):
+                # The last seeded row left; go back to the unseeded samplers.
+                self.rows_with_seed = None
+                self.sampling_seed = None
+
         for item in [
             "temperatures",
             "top_ps",
@@ -388,16 +518,34 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
+        if self.watermark is not None:
+            self.watermark = self.watermark.filter(keep_indices, keep_indices_device)
+
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
         if self.return_sampling_masks is not None:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.sampling_mask_top_ks is not None:
+                self.sampling_mask_top_ks = [
+                    self.sampling_mask_top_ks[i] for i in keep_indices
+                ]
+            if self.return_sampling_support_logprobs is not None:
+                self.return_sampling_support_logprobs = [
+                    self.return_sampling_support_logprobs[i] for i in keep_indices
+                ]
             if self.sampling_mask_batch_indices is not None:
                 self.sampling_mask_batch_indices = (
                     self._make_sampling_mask_batch_indices(
                         self.return_sampling_masks, self.device
+                    )
+                )
+                self.sampling_support_logprobs_capture_indices = (
+                    self._make_sampling_support_logprobs_capture_indices(
+                        self.return_sampling_masks,
+                        self.return_sampling_support_logprobs,
+                        self.device,
                     )
                 )
 
@@ -475,6 +623,29 @@ class SamplingBatchInfo:
             self.return_sampling_masks = (
                 self.return_sampling_masks or [False] * self_len
             ) + (other.return_sampling_masks or [False] * other_len)
+            self.return_sampling_support_logprobs = (
+                self.return_sampling_support_logprobs or [False] * self_len
+            ) + (other.return_sampling_support_logprobs or [False] * other_len)
+            self.sampling_support_logprobs_capture_indices = (
+                self._make_sampling_support_logprobs_capture_indices(
+                    self.return_sampling_masks,
+                    self.return_sampling_support_logprobs,
+                    self.device,
+                )
+            )
+            self.sampling_mask_top_ks = (
+                self.sampling_mask_top_ks or [1] * self_len
+            ) + (other.sampling_mask_top_ks or [1] * other_len)
+
+        if self.rows_with_seed is not None or other.rows_with_seed is not None:
+            self.rows_with_seed = (self.rows_with_seed or [False] * self_len) + (
+                other.rows_with_seed or [False] * other_len
+            )
+            # Rows of an unseeded side sample with random seeds, as in from_schedule_batch.
+            if self.sampling_seed is None:
+                self.sampling_seed = _filler_seeds(self_len, self.device)
+            if other.sampling_seed is None:
+                other.sampling_seed = _filler_seeds(other_len, self.device)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
@@ -491,14 +662,34 @@ class SamplingBatchInfo:
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
+        self.watermark = merge_watermark_rows(
+            self.watermark, other.watermark, self_len, other_len
+        )
+
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
+        self.max_top_k = (
+            None
+            if self.max_top_k is None or other.max_top_k is None
+            else max(self.max_top_k, other.max_top_k)
+        )
 
         self.adjusted_merge_batch(other)
+
+    def refresh_top_k_flags(self, top_ks: List[int]) -> None:
+        """Set the top-k flags from the rows' top_k, as from_schedule_batch does.
+
+        filter_batch leaves them as they were, which is safe but sticky: one
+        finished greedy row (top_k=1) keeps need_top_k_sampling on and max_top_k
+        None for the rest of the running batch. ScheduleBatch.filter_batch calls
+        this with its kept requests' top_k.
+        """
+        for name, value in _top_k_flags(top_ks).items():
+            setattr(self, name, value)
 
     def _merge_processor_entries(
         self, other: SamplingBatchInfo
@@ -535,7 +726,43 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
+            new = object.__new__(SamplingBatchInfo)
+            new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
+            new.penalizer_orchestrator = None
+            return new
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+@cache
+def _fast_copy_enabled() -> bool:
+    # Preserve the original EAGLE runtime policy without the resource-pool dependency.
+    return (
+        current_platform.is_cuda()
+        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
+        and (get_spec().speculative_eagle_topk or 1) == 1
+        and not get_schedule().disable_overlap_schedule
+        and get_parallel().moe_ep_size == 1
+    )
+
+
+_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
+_FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
+
+
+def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
+    """The SamplingBatchInfo flags that follow from the rows' top_k values."""
+    return {
+        "is_all_greedy": all(k <= 1 for k in top_ks),
+        "is_any_greedy": any(k <= 1 for k in top_ks),
+        "need_top_k_sampling": any(k != TOP_K_ALL for k in top_ks),
+        "npu_top_k_top_p_eligible": all(1 <= k <= 1024 for k in top_ks),
+        # None when any row samples the whole vocabulary.
+        "max_top_k": (
+            max(top_ks) if top_ks and all(1 <= k < TOP_K_ALL for k in top_ks) else None
+        ),
+    }
 
 
 def merge_bias_tensor(

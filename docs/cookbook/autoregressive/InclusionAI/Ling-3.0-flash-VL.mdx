@@ -1,7 +1,6 @@
 ---
 title: Ling-3.0-flash-VL
 description: "Deploy Ling-3.0-flash-VL with SGLang — a ~125B hybrid KDA + MLA MoE vision-language model (5.1B active) with image and video input, thinking mode, and 128K context on Blackwell and Hopper GPUs."
-tag: NEW
 ---
 
 ## Deployment

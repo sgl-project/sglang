@@ -3,15 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+from flash_attn import flash_attn_func
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    flash_attn_func,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -20,8 +18,6 @@ logger = init_logger(__name__)
 
 
 class FlashAttention2Backend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
@@ -68,10 +64,6 @@ class FlashAttention2Impl(AttentionImpl):
             q=query,  # type: ignore[no-untyped-call]
             k=key,
             v=value,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=None,
-            max_seqlen_k=None,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
         )

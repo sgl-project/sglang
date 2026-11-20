@@ -12,16 +12,13 @@
 // slice S_r (in any buffer), so there is no write-write conflict, and each
 // per-element load completes before its store (data dependency).
 //
-// Two variants:
-//   * ..._kernel  (v1): no in-kernel sync; the caller fences with the symm-mem
-//     handle's barrier() on each side (3 launches total).
-//   * ..._fused_kernel (v2): an in-kernel per-block system barrier (entry:
-//     producers done + visible; exit: broadcasts done + visible), so the whole
-//     all-reduce is a single launch. The barrier uses a DEDICATED symmetric
-//     flags buffer (independent of torch's signal pad, so no interference with
-//     multimem) and a device-resident monotonic epoch counter per block, which
-//     keeps advancing across launches -- including CUDA-graph replays -- so
-//     flags never go stale (spin is `flag < epoch`, epoch strictly increasing).
+// ..._fused_kernel (v2) uses an in-kernel per-block system barrier (entry:
+// producers done + visible; exit: broadcasts done + visible), so the whole
+// all-reduce is a single launch. The barrier uses a DEDICATED symmetric
+// flags buffer (independent of torch's signal pad, so no interference with
+// multimem) and a device-resident monotonic epoch counter per block, which
+// keeps advancing across launches -- including CUDA-graph replays -- so
+// flags never go stale (spin is `flag < epoch`, epoch strictly increasing).
 //
 // Fusion seam: the reduced `result` Storage below is where an epilogue (RMSNorm
 // / short-conv / bias) plugs in -- applied in registers before the broadcast
@@ -162,15 +159,6 @@ __device__ __forceinline__ void two_shot_reduce_local(DType* (&input)[kNumGPU], 
   }
 }
 
-// v1: no in-kernel barrier (caller fences via hdl.barrier()).
-template <typename DType, uint32_t kNumGPU>
-__global__ __launch_bounds__(1024, 1) void inkling_two_shot_all_reduce_kernel(
-    void* const* __restrict__ peer_ptrs, const uint32_t rank, const uint32_t num_items) {
-  DType* input[kNumGPU];
-  const uint32_t local_vecs = slice_setup<DType, kNumGPU>(input, peer_ptrs, rank, num_items);
-  two_shot_reduce_local<DType, kNumGPU>(input, local_vecs);
-}
-
 // v2: single-launch, fused entry + exit system barrier. `shared` (optional):
 // this rank's LOCAL shared-expert partials, folded into its own buffer before
 // the entry barrier (which then must publish -- see fold_shared_local).
@@ -207,7 +195,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_two_shot_all_reduce_fused_ker
 // per-block EXIT waits compose into "every peer block's broadcasts done"
 // before my consumer can run. The two calls share the per-block epoch slot
 // (it just advances twice per launch).
-template <typename DType, uint32_t kNumGPU, bool kPerBlockBarrier>
+// kAccF32 accumulates the multicast reduction in FP32 (one rounding to BF16).
+template <typename DType, uint32_t kNumGPU, bool kPerBlockBarrier, bool kAccF32 = false>
 __global__ __launch_bounds__(1024, 1) void inkling_multimem_one_shot_fused_kernel(
     DType* __restrict__ mc_ptr,     // multicast base pointer (covers all peers)
     DType* __restrict__ local_ptr,  // this rank's LOCAL base of the same buffer
@@ -224,6 +213,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_one_shot_fused_kerne
   const uint2 slice = rank_vec_slice<DType, kNumGPU>(rank, num_items);
   const uint32_t local_vecs = slice.y;
   DType* mc = mc_ptr + slice.x * kElemsPerVec;
+  PDLWaitPrimary<true>();
 
   if (shared != nullptr) {
     // Fold covers the FULL range while each peer ld_reduces only its slice, so
@@ -237,14 +227,21 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_one_shot_fused_kerne
     inkling_ar::grid_system_barrier<kNumGPU>(
         state, flag_ptrs, rank, 0, /*publish_writes=*/false);  // ENTRY: producers done + visible
   }
+  PDLTriggerSecondary<true>();
   const uint32_t stride = gridDim.x * blockDim.x;
   for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < local_vecs; v += stride) {
     DType* addr = mc + v * kElemsPerVec;  // 16 B, 16-B aligned
     uint32_t r0, r1, r2, r3;
     // hardware reduce across all GPUs mapped to the multicast region.
-    asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "l"(addr));
+    if constexpr (kAccF32) {
+      asm volatile("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                   : "l"(addr));
+    } else {
+      asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
+                   : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                   : "l"(addr));
+    }
     // <-- EPILOGUE SEAM (norm / sconv / bias on {r0..r3} before broadcast)
     // broadcast the reduced slice to every GPU.
     asm volatile(
@@ -385,6 +382,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
   static_assert(std::is_same_v<DType, bf16_t>, "multimem.add path is bf16-only");
   constexpr uint32_t kElemsPerVec = Trait::kElemsPerVec;  // 8 bf16 = 16 B
   const uint32_t total_vec = num_items / kElemsPerVec;
+  PDLWaitPrimary<true>();
 
   if (shared != nullptr) {
     // Fold into this rank's (double-buffered) input region; the publishing
@@ -395,6 +393,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
   }
   inkling_ar::grid_system_barrier<kNumGPU>(
       state, flag_ptrs, rank, 0, /*publish_writes=*/shared != nullptr);  // ENTRY only (single barrier)
+  PDLTriggerSecondary<true>();
   const uint32_t stride = gridDim.x * blockDim.x;
   for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x; v < total_vec; v += stride) {
     DType* in = mc_ptr + v * kElemsPerVec;
@@ -408,7 +407,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
   // NO exit barrier: result is local & complete; input reuse is caller-managed.
 }
 
-// Blocks needed to cover this rank's two-shot slice (v1/v2/v3 partition).
+// Blocks needed to cover this rank's two-shot slice (v2/v3 partition).
 template <typename DType, uint32_t kNumGPU>
 uint32_t work_num_blocks(uint32_t n, uint32_t block_size) {
   using Trait = InklingAllReduceTrait<DType, kNumGPU>;
@@ -484,22 +483,6 @@ void validate(tvm::ffi::TensorView buf, int64_t peer_ptrs_dev, int64_t rank, int
 }
 
 template <typename DType, uint32_t kNumGPU>
-void inkling_two_shot_all_reduce(
-    tvm::ffi::TensorView local_buffer, int64_t peer_ptrs_dev, int64_t rank, int64_t num_items) {
-  using namespace host;
-  uint32_t n;
-  validate<DType, kNumGPU>(local_buffer, peer_ptrs_dev, rank, num_items, n);
-  const auto device = local_buffer.device();
-  const uint32_t num_blocks = work_num_blocks<DType, kNumGPU>(n, 1024u);  // no in-kernel barrier -> uncapped
-  const auto stream = LaunchKernel::resolve_device(device);
-  LaunchKernel(num_blocks, 1024u, stream)(
-      inkling_two_shot_all_reduce_kernel<DType, kNumGPU>,
-      reinterpret_cast<void* const*>(peer_ptrs_dev),
-      static_cast<uint32_t>(rank),
-      n);
-}
-
-template <typename DType, uint32_t kNumGPU>
 void inkling_two_shot_all_reduce_fused(
     tvm::ffi::TensorView local_buffer,
     int64_t data_ptrs_dev,
@@ -544,7 +527,8 @@ void inkling_multimem_one_shot_fused(
     int64_t nb_override,
     int64_t bs_override,
     int64_t per_block_barrier,
-    tvm::ffi::TensorView shared) {
+    tvm::ffi::TensorView shared,
+    int64_t acc_f32) {
   using namespace host;
   uint32_t n;
   // validate uses the local buffer view only for device/dtype/shape; the kernel
@@ -555,15 +539,19 @@ void inkling_multimem_one_shot_fused(
   RuntimeCheck(multicast_ptr % 16 == 0, "multicast_ptr not 16B aligned");
   const DType* shared_ptr = shared_ptr_or_null<DType>(shared, num_items);
   const auto device = local_buffer.device();
-  const auto kernel = per_block_barrier ? inkling_multimem_one_shot_fused_kernel<DType, kNumGPU, true>
-                                        : inkling_multimem_one_shot_fused_kernel<DType, kNumGPU, false>;
+  const auto kernel = acc_f32
+                          ? (per_block_barrier ? inkling_multimem_one_shot_fused_kernel<DType, kNumGPU, true, true>
+                                               : inkling_multimem_one_shot_fused_kernel<DType, kNumGPU, false, true>)
+                          : (per_block_barrier ? inkling_multimem_one_shot_fused_kernel<DType, kNumGPU, true>
+                                               : inkling_multimem_one_shot_fused_kernel<DType, kNumGPU, false>);
   const uint32_t block_size = bs_override > 0 ? static_cast<uint32_t>(bs_override) : 1024u;
   uint32_t cap = max_resident_blocks(kernel, block_size, device);
   if (per_block_barrier) cap = min(cap, inkling_ar::kMaxBarrierBlocks);
   const uint32_t num_blocks = nb_override > 0 ? min(static_cast<uint32_t>(nb_override), cap)
                                               : min(work_num_blocks<DType, kNumGPU>(n, block_size), cap);
   const auto stream = LaunchKernel::resolve_device(device);
-  LaunchKernel(num_blocks, block_size, stream)(
+  auto launch = LaunchKernel(num_blocks, block_size, stream);
+  launch.enable_pdl(true)(
       kernel,
       reinterpret_cast<DType*>(multicast_ptr),
       reinterpret_cast<DType*>(local_buffer.data_ptr()),
@@ -657,7 +645,8 @@ void inkling_multimem_full_oneshot(
   const uint32_t num_blocks = nb_override > 0 ? min(static_cast<uint32_t>(nb_override), cap)
                                               : min(full_range_num_blocks<DType>(n, block_size), cap);
   const auto stream = LaunchKernel::resolve_device(device);
-  LaunchKernel(num_blocks, block_size, stream)(
+  auto launch = LaunchKernel(num_blocks, block_size, stream);
+  launch.enable_pdl(true)(
       kernel,
       reinterpret_cast<DType*>(multicast_ptr),
       reinterpret_cast<DType*>(in_buffer.data_ptr()),

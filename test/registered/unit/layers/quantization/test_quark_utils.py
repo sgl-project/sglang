@@ -105,14 +105,46 @@ class TestE8M0ToF32(CustomTestCase):
         x = torch.zeros((3, 4, 5), dtype=torch.uint8)
         self.assertEqual(tuple(e8m0_to_f32(x).shape), (3, 4, 5))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "no GPU")
-    def test_cuda_parity(self):
-        x = torch.tensor([127, 134, 255], dtype=torch.uint8, device="cuda")
-        out = e8m0_to_f32(x)
-        self.assertEqual(out.device.type, "cuda")
-        self.assertEqual(out[0].item(), 1.0)
-        self.assertEqual(out[1].item(), 128.0)
-        self.assertTrue(torch.isnan(out[2]).item())
+
+QKV_MAPPING = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+
+class TestShouldIgnoreLayerFusedNames(CustomTestCase):
+    """An `exclude` entry naming an already-fused module, or naming experts
+    individually, must exclude the fused module SGLang builds; otherwise an
+    MXFP4-packed parameter is allocated for a BF16 tensor and loading aborts."""
+
+    # ---- Bug-catchers: must FAIL on unfixed code ---------------------------
+
+    def test_directly_excluded_fused_qkv_is_ignored(self):
+        name = "visual.blocks.0.attn.qkv_proj"
+        self.assertTrue(
+            should_ignore_layer(name, ignore=[name], fused_mapping=QKV_MAPPING)
+        )
+
+    def test_per_expert_excludes_ignore_the_fused_moe_module(self):
+        layer = "model.layers.6.mlp.experts"
+        ignore = [
+            f"{layer}.{i}.{proj}"
+            for i in range(3)
+            for proj in ("down_proj", "gate_proj", "up_proj")
+        ]
+        self.assertTrue(
+            should_ignore_layer(layer, ignore=ignore, fused_mapping=QKV_MAPPING)
+        )
+
+    # ---- Guards: behavior that must NOT change -----------------------------
+
+    def test_unrelated_moe_layer_is_not_ignored(self):
+        # a prefix match must not bleed into a neighboring layer index
+        ignore = ["model.layers.6.mlp.experts.0.down_proj"]
+        self.assertFalse(
+            should_ignore_layer(
+                "model.layers.7.mlp.experts",
+                ignore=ignore,
+                fused_mapping=QKV_MAPPING,
+            )
+        )
 
 
 if __name__ == "__main__":

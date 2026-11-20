@@ -46,7 +46,7 @@ def sequence_model_parallel_all_gather(
 
 
 def sequence_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce the input tensor across model parallel group."""
+    """All-reduce the input tensor across sequence parallel group."""
     return get_sp_group().all_reduce(input_)
 
 

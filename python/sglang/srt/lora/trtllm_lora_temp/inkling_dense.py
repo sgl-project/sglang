@@ -41,10 +41,10 @@ def apply_multi_lora(
 ) -> torch.Tensor:
     if getattr(layer.lora_backend, "name", None) != "triton" or not inputs.is_cuda:
         raise RuntimeError("Multi-slot dense LoRA requires Triton on CUDA")
-    from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import (
+    from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_a import (
         shared_sink_sgemm_lora_a_fwd,
     )
-    from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_b import (
+    from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_b import (
         shared_sink_sgemm_lora_b_fwd,
     )
 
@@ -86,7 +86,7 @@ def _apply_per_expert_lora(
     lora_a: torch.Tensor,
     lora_b: torch.Tensor,
 ) -> None:
-    from sglang.kernels.ops.moe.virtual_experts import (
+    from sglang.kernels.ops.lora.moe.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
 
@@ -156,7 +156,7 @@ def forward_with_lora(
             if single_gate_up:
                 torch.mm(x_td, a_gate_up.T, out=gate_up_shrink)
             else:
-                from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_a import (
+                from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_a import (
                     shared_sink_sgemm_lora_a_fwd,
                 )
 
@@ -190,7 +190,7 @@ def forward_with_lora(
                 y_flat.addmm_(gate_up_shrink, layer._w1_delta[0].T)
                 y = y_flat.view(t, n, -1)
             else:
-                from sglang.kernels.ops.gemm.trtllm_lora_temp.sgemm_lora_b import (
+                from sglang.kernels.ops.lora.dense.trtllm_lora_temp.sgemm_lora_b import (
                     shared_sink_sgemm_lora_b_fwd,
                 )
 

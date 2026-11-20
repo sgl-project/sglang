@@ -32,7 +32,6 @@ class EngineBase(ABC):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
-        data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
@@ -43,6 +42,16 @@ class EngineBase(ABC):
     @abstractmethod
     def flush_cache(self):
         """Flush the cache of the engine."""
+        pass
+
+    @abstractmethod
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session; update_weights_from_* must run inside one."""
+        pass
+
+    @abstractmethod
+    def end_weight_update(self):
+        """Close the weight-update session and finalize quantized weights."""
         pass
 
     @abstractmethod

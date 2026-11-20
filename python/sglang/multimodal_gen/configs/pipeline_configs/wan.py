@@ -1,25 +1,39 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import html
+import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits import (
+    WanAnimate2Config,
+    WanAnimate2DistilledConfig,
+    WanS2VConfig,
+    WanVideoConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPVisionConfig,
     T5Config,
+    WanS2VAudioEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     PipelineConfig,
+    TextConditioningOutput,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
+)
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
 )
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
@@ -28,8 +42,66 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+try:
+    import ftfy
+except ImportError:  # pragma: no cover
+    ftfy = None
 
-def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+
+def _wan_basic_clean(text: str) -> str:
+    if ftfy is not None:
+        text = ftfy.fix_text(text)
+    text = html.unescape(html.unescape(text))
+    return text.strip()
+
+
+def _wan_whitespace_clean(text: str) -> str:
+    text = _wan_basic_clean(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _make_wan_s2v_text_encoder_config() -> T5Config:
+    config = T5Config()
+    arch = config.arch_config
+    arch.vocab_size = 256384
+    arch.architectures = ["UMT5EncoderModel"]
+    arch.d_model = 4096
+    arch.hidden_size = 4096
+    arch.d_kv = 64
+    arch.d_ff = 10240
+    arch.num_layers = 24
+    arch.num_attention_heads = 64
+    arch.num_heads = 64
+    arch.relative_attention_num_buckets = 32
+    arch.feed_forward_proj = "gated-gelu"
+    arch.text_len = 512
+    # Keep the Wan reference T5 norm numerics: RMSNorm's kernel rounds differently,
+    # which changes S2V samples (~1.5 dB PSNR at the same seed).
+    arch.reference_layer_norm = True
+    arch.__post_init__()
+    return config
+
+
+def wan_text_encoder_extra_args() -> list[dict]:
+    """Tokenizer overrides for the Wan UMT5 encoder, chosen by
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING. t5_postprocess_text zero-pads the
+    embeddings back to 512, so the encoder itself can run on fewer tokens."""
+    mode = envs.SGLANG_DIFFUSION_WAN_TEXT_PADDING
+    if mode == "max":
+        return [{}]
+    if mode == "longest":
+        return [dict(padding="longest")]
+    if mode == "bucket":
+        return [dict(padding="longest", pad_to_multiple_of=64)]
+    raise ValueError(
+        f"SGLANG_DIFFUSION_WAN_TEXT_PADDING must be max, longest or bucket, got {mode!r}"
+    )
+
+
+def t5_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> TextConditioningOutput:
     mask: torch.Tensor = outputs.attention_mask
     hidden_state: torch.Tensor = outputs.last_hidden_state
     seq_lens = mask.gt(0).sum(dim=1).long()
@@ -42,7 +114,14 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
         ],
         dim=0,
     )
-    return prompt_embeds_tensor
+    prompt_embeds_mask = torch.arange(512, device=seq_lens.device) < seq_lens[:, None]
+    return TextConditioningOutput(
+        prompt_embeds_tensor, prompt_embeds_mask, seq_lens.tolist()
+    )
+
+
+def animate2_postprocess_text(outputs: BaseEncoderOutput, text_inputs) -> torch.Tensor:
+    return outputs.last_hidden_state[0, : text_inputs["num_tokens"]]
 
 
 @dataclass
@@ -85,6 +164,11 @@ class WanT2V480PConfig(PipelineConfig):
     )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (t5_postprocess_text,))
+    )
+    # Off by default ("max"): a shorter padding changes the bf16 rounding, so the
+    # video is a different valid sample. See wan_text_encoder_extra_args.
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=wan_text_encoder_extra_args
     )
 
     # Precision for each component
@@ -278,9 +362,12 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
         self.dit_config.torch_compile_mode = "default"
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
 
 
@@ -295,10 +382,248 @@ class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
         self.dit_config.boundary_ratio = self.boundary_ratio
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # both 14B experts plus T5 take ~66 GB per GPU; 120 keeps 80 GB cards streaming
         return ModelDeploymentConfig(
             dit_layerwise_offload_modes=("auto", "memory"),
             auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=120,
+            keep_resident_components=("dit", "vae"),
         )
+
+
+@dataclass
+class Wan_Animate_2_14B_Config(WanI2V720PConfig):
+    """Wan-Animate-2 14B (Wan2.2): reference image + reference video -> video.
+
+    Shares the Wan I2V component bundle (T5, CLIP vision, Wan VAE with the encoder
+    loaded) and swaps in the in-context ``WanAnimate2Config`` DiT; a single expert, so no
+    ``boundary_ratio`` switching. The bespoke stages read ``flow_shift`` from here
+    (carrying the audio track is a per-request sampling parameter); everything else below
+    restates the Wan2.2 14B defaults instead of inheriting the Wan2.1 ones from the base.
+    """
+
+    # reference image + reference video -> video is I2V-shaped.
+    task_type: ModelTaskType = ModelTaskType.I2V
+
+    # In-context animation DiT (in_channels=36 = 16 noise + 20 conditioning).
+    dit_config: DiTConfig = field(default_factory=WanAnimate2Config)
+
+    # Denoising stage. Used when building the sigma grid.
+    flow_shift: float | None = 5.0
+
+    postprocess_text_funcs: tuple[Callable, ...] = field(
+        default_factory=lambda: (animate2_postprocess_text,)
+    )
+
+    def tokenize_prompt(self, prompt, tokenizer, tok_kwargs):
+        text_inputs = super().tokenize_prompt(
+            prompt,
+            tokenizer,
+            {**tok_kwargs, "max_length": self.dit_config.arch_config.text_len},
+        )
+        # Count on the host before TextEncodingStage uploads inputs; no GPU scalar sync.
+        text_inputs["num_tokens"] = int(text_inputs["attention_mask"][0].gt(0).sum())
+        return text_inputs
+
+    # The component manager casts the VAE to this dtype at its first use (the reference
+    # encode in the before-denoising stage), so it is the precision the whole bespoke
+    # VAE path runs at; fp32 like the other Wan2.2 configs changes the output.
+    vae_decode_precision: str = "bf16"
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # The Wan2.2 A14B modes (auto mode may layerwise-offload the 14B DiT) with the
+        # resident threshold the base had: at or above 60 GB free the DiT stays resident.
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("auto", "memory"),
+            auto_dit_offload_prefetch_size=2,
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit",),
+        )
+
+    def get_decode_scale_and_shift(
+        self,
+        device: torch.device | None,
+        dtype: torch.dtype | None,
+        vae: torch.nn.Module | None,
+    ) -> tuple[float, None]:
+        """``(1.0, None)``: ``WanAnimate2VaeAdapter.decode`` applies the latent scaling itself,
+        so the DecodingStage must not de-normalize again."""
+        return 1.0, None
+
+    def supports_disaggregation(self) -> bool:
+        # The stages share one WanAnimate2RequestState object (GPU tensors, a torch.Generator,
+        # the clip schedule) through batch.extra. The disaggregation transport forwards only
+        # JSON scalars and tensor pytrees (dict/list/tuple) from batch.extra and never the
+        # generator (disaggregation/extra_tensors.py, scheduler_mixin._EXCLUDE_FIELDS), so a
+        # split-role deployment would silently drop the state and fail at the first request.
+        return False
+
+    def validate_server_args(self, server_args: Any) -> None:
+        if server_args.use_fsdp_inference:
+            raise NotImplementedError(
+                "Wan-Animate-2 does not support --use-fsdp-inference; use "
+                "--dit-layerwise-offload or --tp-size instead."
+            )
+        # Ring splits the K/V across ranks; the in-context block mask indexes the full
+        # [generation | reference-video] K/V on one rank.
+        if server_args.ring_degree > 1:
+            raise NotImplementedError(
+                "Wan-Animate-2 does not support ring sequence parallelism "
+                f"(--ring-degree {server_args.ring_degree}); use --ulysses-degree N "
+                "with --ring-degree 1."
+            )
+        num_heads = self.dit_config.num_attention_heads
+        if num_heads % server_args.tp_size != 0:
+            raise ValueError(
+                f"Wan-Animate-2 tensor parallelism needs the {num_heads} attention "
+                f"heads divisible by --tp-size {server_args.tp_size}."
+            )
+        local_num_heads = num_heads // server_args.tp_size
+        if local_num_heads % server_args.ulysses_degree != 0:
+            raise ValueError(
+                f"Wan-Animate-2 Ulysses SP needs the TP-local head count ({local_num_heads}) "
+                f"divisible by --ulysses-degree {server_args.ulysses_degree}."
+            )
+        # The in-context self-attention runs on torch flex_attention whatever backend is
+        # selected; only the cross-attention and the reference pass would follow the flag.
+        requested_dit_backend = server_args.requested_component_attention_backend(
+            "transformer"
+        )
+        if (
+            server_args.is_arg_explicitly_set("attention_backend")
+            and server_args.attention_backend is not None
+        ) or requested_dit_backend is not None:
+            raise ValueError(
+                "Wan-Animate-2 does not support selecting the DiT attention backend "
+                f"(--attention-backend {server_args.attention_backend} / "
+                f"--component-attention-backends transformer={requested_dit_backend}): "
+                "its in-context self-attention runs on torch flex_attention only. Drop "
+                "the flag; the text encoder still takes "
+                "--component-attention-backends text_encoder=<backend>."
+            )
+        # The parent block applies the offline Q/K rotation inside its own attention
+        # path; forward_ref / forward_gen never do, so a rotated checkpoint would load
+        # and produce wrong output without a message.
+        if envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION:
+            raise ValueError(
+                "Wan-Animate-2 does not support SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION "
+                "(offline Q/K rotation); unset it for this model."
+            )
+        super().validate_server_args(server_args)
+
+
+@dataclass
+class Wan_Animate_2_14B_Distilled_Config(Wan_Animate_2_14B_Config):
+    """Distilled Wan-Animate-2 14B: same components and stages, log_scale -1.3 in the DiT."""
+
+    dit_config: DiTConfig = field(default_factory=WanAnimate2DistilledConfig)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # No unconditional branch to split: a CFG group would recompute one branch per rank,
+        # so an explicit CFG group is rejected. Auto-enable needs no flag: the server only
+        # auto-enables CFG parallel for a model whose default sampling params use guidance.
+        return replace(
+            super().get_model_deployment_config(), supports_cfg_parallel=False
+        )
+
+
+@dataclass
+class Wan2_2_S2V_14B_Config(WanT2V480PConfig, WanI2VCommonConfig):
+    dit_config: DiTConfig = field(default_factory=WanS2VConfig)
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (_make_wan_s2v_text_encoder_config(),)
+    )
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
+        default_factory=lambda: (_wan_whitespace_clean,)
+    )
+    audio_encoder_config: EncoderConfig = field(
+        default_factory=WanS2VAudioEncoderConfig
+    )
+    audio_encoder_precision: str = "fp32"
+    vae_precision: str = "bf16"
+    flow_shift: float | None = 3.0
+    task_type: ModelTaskType = ModelTaskType.S2V
+    vae_stride = (4, 8, 8)
+    max_area: int = 704 * 1024
+
+    def validate_server_args(self, server_args: Any) -> None:
+        super().validate_server_args(server_args)
+        # wav2vec2 has no layerwise hooks. Reject only an explicit choice; a layerwise
+        # "all" selection skips it via the capability the audio loader records.
+        if server_args.canonical_residency_mode("audio_encoder") == LAYERWISE_OFFLOAD:
+            raise ValueError(
+                "Wan2.2-S2V does not support layerwise offload for its audio encoder "
+                "(wav2vec2); use --component-residency audio_encoder=component-offload "
+                "(or resident / snapshot-offload)"
+            )
+
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        z_dim = self.vae_config.arch_config.z_dim
+        oh = batch.height
+        ow = batch.width
+        return (
+            batch_size,
+            z_dim,
+            num_frames,
+            oh // self.vae_stride[1],
+            ow // self.vae_stride[2],
+        )
+
+    def slice_noise_pred(self, noise, latents):
+        if isinstance(noise, (list, tuple)):
+            if len(noise) != 1:
+                raise ValueError(
+                    f"Wan S2V expected a single noise tensor, got {len(noise)} outputs"
+                )
+            noise = noise[0]
+        return noise
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        del rotary_emb
+        extra = batch.extra.get("wan_s2v", {})
+        return {
+            "ref_latents": extra["ref_latents"].to(device=device, dtype=dtype),
+            "motion_latents": extra["motion_latents"].to(device=device, dtype=dtype),
+            "cond_states": extra["cond_states"].to(device=device, dtype=dtype),
+            "audio_input": extra["audio_input"].to(device=device, dtype=dtype),
+            "motion_frames": extra["motion_frames"],
+            "drop_motion_frames": extra["drop_motion_frames"],
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        pos_kwargs = self.prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
+        pos_kwargs["audio_input"] = torch.zeros_like(pos_kwargs["audio_input"])
+        return pos_kwargs
+
+    def prepare_decoding_latents(self, batch, server_args=None, vae=None):
+        del server_args, vae
+        extra = batch.extra["wan_s2v"]
+        prefix_latents = (
+            extra["ref_latents"]
+            if extra["drop_motion_frames"]
+            else extra["motion_latents"]
+        )
+        prefix_latents = prefix_latents.to(
+            device=batch.latents.device,
+            dtype=batch.latents.dtype,
+        )
+        return torch.cat([prefix_latents, batch.latents], dim=2)
+
+    def postprocess_decoded_batch(self, frames, batch, server_args):
+        del server_args
+        extra = batch.extra["wan_s2v"]
+        frames = frames[:, :, -extra["infer_frames"] :]
+        if extra["drop_motion_frames"]:
+            frames = frames[:, :, 3:]
+        return frames
+
+    def __post_init__(self) -> None:
+        self.vae_config.load_encoder = True
+        self.vae_config.load_decoder = True
+        self.vae_config.use_feature_cache = True
+        self.vae_config.use_parallel_encode = False
+        self.vae_config.use_parallel_decode = True
 
 
 # =============================================
@@ -312,3 +637,166 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+
+
+def _is_wan_animate_2_path(p: str) -> bool:
+    # Registry probes are lower-cased. Require the "-2-"/"_2" token so a v1
+    # Wan2.2-Animate-14B checkpoint (a different model / pipeline) does not route here.
+    return "wan_animate_2" in p or "wan2.2-animate-2" in p
+
+
+def _is_wan_animate_2_distilled_path(p: str) -> bool:
+    # The distill token counts in the directory's own name only, so a base checkpoint
+    # kept under a parent such as distillation-runs/ keeps the base config.
+    short_name = p.rstrip("/").split("/")[-1]
+    return _is_wan_animate_2_path(p) and "distill" in short_name
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.wan import (
+        FastWanT2V480PConfig,
+        Turbo_Wan2_2_I2V_A14B_SamplingParam,
+        Wan2_1_Fun_1_3B_InP_SamplingParams,
+        Wan2_2_I2V_A14B_SamplingParam,
+        Wan2_2_S2V_14B_SamplingParam,
+        Wan2_2_T2V_A14B_SamplingParam,
+        Wan2_2_TI2V_5B_SamplingParam,
+        Wan_Animate_2_14B_Distilled_SamplingParam,
+        Wan_Animate_2_14B_SamplingParam,
+        WanI2V_14B_480P_SamplingParam,
+        WanI2V_14B_720P_SamplingParam,
+        WanT2V_1_3B_SamplingParams,
+        WanT2V_14B_SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=WanT2V480PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        ],
+        model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_1_3B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V1_3B480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=WanT2V720PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanT2V_14B_SamplingParams,
+        pipeline_config_cls=TurboWanT2V480PConfig,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.1-T2V-14B-Diffusers",
+            "IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanI2V_14B_480P_SamplingParam,
+        pipeline_config_cls=WanI2V480PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+        ],
+        model_detectors=[lambda hf_id: "wanimagetovideo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=WanI2V_14B_720P_SamplingParam,
+        pipeline_config_cls=WanI2V720PConfig,
+        hf_model_paths=[
+            "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Turbo_Wan2_2_I2V_A14B_SamplingParam,
+        pipeline_config_cls=TurboWanI2V720Config,
+        hf_model_paths=[
+            "IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_1_Fun_1_3B_InP_SamplingParams,
+        pipeline_config_cls=WanI2V480PConfig,
+        hf_model_paths=[
+            "weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
+        pipeline_config_cls=Wan2_2_TI2V_5B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
+        pipeline_config_cls=FastWan2_2_TI2V_5B_Config,
+        hf_model_paths=[
+            "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+            "FastVideo/FastWan2.2-TI2V-5B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_T2V_A14B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_I2V_A14B_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    register_configs(
+        sampling_param_cls=Wan2_2_S2V_14B_SamplingParam,
+        pipeline_config_cls=Wan2_2_S2V_14B_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-S2V-14B"],
+    )
+    register_configs(
+        sampling_param_cls=FastWanT2V480PConfig,
+        pipeline_config_cls=FastWan2_1_T2V_480P_Config,
+        hf_model_paths=[
+            "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    # Both repos ship model_index.json with the same _class_name (WanAnimate2Pipeline);
+    # modular_model_index.json names the variant, and the registry probes the detectors
+    # with both classes and the path (a distill token counts in the directory's own name
+    # only). Detectors are checked in registration order, and a directory that ships
+    # model_index.json matches the base detector through the shared class as well, so
+    # the distilled entry is registered first.
+    register_configs(
+        sampling_param_cls=Wan_Animate_2_14B_Distilled_SamplingParam,
+        pipeline_config_cls=Wan_Animate_2_14B_Distilled_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"],
+        model_detectors=[
+            lambda p: (
+                p == "wananimate2distilledmodularpipeline"
+                or _is_wan_animate_2_distilled_path(p)
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Wan_Animate_2_14B_SamplingParam,
+        pipeline_config_cls=Wan_Animate_2_14B_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+        model_detectors=[
+            lambda p: (
+                p in ("wananimate2modularpipeline", "wananimate2pipeline")
+                or (
+                    _is_wan_animate_2_path(p)
+                    and not _is_wan_animate_2_distilled_path(p)
+                )
+            )
+        ],
+    )

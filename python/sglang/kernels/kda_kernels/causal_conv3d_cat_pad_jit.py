@@ -17,6 +17,8 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 @cache_once
 def _jit_causal_conv3d_cat_pad_module(dtype: torch.dtype) -> Module:
+    if dtype not in _SUPPORTED_DTYPES:
+        raise RuntimeError(f"unsupported dtype for causal Conv3D cat/pad: {dtype}")
     args = make_cpp_args(dtype)
     return load_jit(
         "diffusion_causal_conv3d_cat_pad",
@@ -101,19 +103,7 @@ def fused_causal_conv3d_cat_pad_cuda(
     cache_x: torch.Tensor,
     padding: list[int] | tuple[int, ...],
 ) -> torch.Tensor:
-    if x.dtype not in _SUPPORTED_DTYPES:
-        raise RuntimeError(f"unsupported dtype for causal Conv3D cat/pad: {x.dtype}")
-    if not torch.compiler.is_compiling():
-        if (
-            not x.is_cuda
-            or not cache_x.is_cuda
-            or x.dim() != 5
-            or cache_x.dim() != 5
-            or not x.is_contiguous()
-            or not cache_x.is_contiguous()
-            or not can_use_fused_causal_conv3d_cat_pad_cuda(x, cache_x, padding)
-        ):
-            raise RuntimeError("unsupported input for causal Conv3D cat/pad CUDA")
+    """Concatenate the temporal cache and pad; the C++ launcher validates inputs."""
     return _causal_conv3d_cat_pad_custom_op(x, cache_x, *padding)
 
 

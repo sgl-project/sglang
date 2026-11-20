@@ -11,7 +11,10 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup, ReduceOp
 
-from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+from sglang.multimodal_gen.runtime.distributed.utils import (
+    all_gather_single,
+    reduce_scatter_single,
+)
 
 
 def _ipc_all_to_all_4d(group, input_, scatter_dim):
@@ -131,9 +134,7 @@ class DistributedAutograd:
             grad_input = torch.empty(
                 ctx.input_shape, dtype=grad_output.dtype, device=grad_output.device
             )
-            dist.reduce_scatter_tensor(
-                grad_input, grad_chunks.contiguous(), group=ctx.group
-            )
+            reduce_scatter_single(grad_input, grad_chunks.contiguous(), group=ctx.group)
 
             return None, grad_input, None, None
 
@@ -269,7 +270,6 @@ class DeviceCommunicatorBase:
         self.world_size = dist.get_world_size(cpu_group)
         self.ranks = dist.get_process_group_ranks(cpu_group)
         self.global_rank = dist.get_rank()
-        self.global_world_size = dist.get_world_size()
         self.rank_in_group = dist.get_group_rank(self.cpu_group, self.global_rank)
 
     def all_reduce(

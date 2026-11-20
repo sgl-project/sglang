@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import (
@@ -21,8 +22,9 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 from sglang.srt.runtime_context import get_parallel
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 
@@ -46,11 +48,6 @@ hook_custom_types(KvMetrics)
 @dataclass(kw_only=True, slots=True)
 class SchedulerKvEventsPublisher:
     kv_events_config: Optional[str]
-    ps: ParallelState
-    attn_tp_rank: int
-    attn_cp_rank: int
-    attn_dp_rank: int
-    dp_rank: Optional[int]
     tree_cache: BasePrefixCache
     send_metrics_from_scheduler: Optional[zmq.Socket]
     max_running_requests: int
@@ -58,18 +55,20 @@ class SchedulerKvEventsPublisher:
     get_stats: Callable
     enable_kv_cache_events: bool = False
     kv_event_publisher: Any = None
+    metrics_drop_warned: bool = False
 
     def __post_init__(self) -> None:
         self.init_kv_events(self.kv_events_config)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
-        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config, self.ps)
+        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config)
 
         if self.enable_kv_cache_events:
+            parallel = get_parallel()
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config,
                 select_kv_publisher_dp_rank(
-                    self.ps.attn_dp_size, self.ps.attn_dp_rank, get_parallel().dp_rank
+                    parallel.attn_dp_size, parallel.attn_dp_rank, parallel.dp_rank
                 ),
             )
 
@@ -92,7 +91,24 @@ class SchedulerKvEventsPublisher:
         )
 
         if not self.send_metrics_from_scheduler.closed:
-            sock_send(self.send_metrics_from_scheduler, kv_metrics)
+            # Auxiliary telemetry must not stall the scheduler when the receiver
+            # is unavailable or cannot keep up. KV events use a separate publisher.
+            try:
+                sock_send(
+                    self.send_metrics_from_scheduler, kv_metrics, flags=zmq.NOBLOCK
+                )
+            except zmq.Again:
+                if not self.metrics_drop_warned:
+                    logger.warning(
+                        "KV metrics receiver unavailable or queue full; dropping auxiliary metrics"
+                    )
+                    self.metrics_drop_warned = True
+
+    def local_kv_event_sources(self, block_size: int) -> list[dict[str, Any]]:
+        if self.kv_event_publisher is None:
+            return []
+        source = self.kv_event_publisher.describe_local_source(block_size)
+        return [source] if source is not None else []
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

@@ -8,18 +8,18 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -89,6 +89,7 @@ from .speculative_cuda_graph_runner import (
 from .speculative_draft_runner import (
     EagleDraftRunnerSettings,
     _configure_runner_for_eagle_draft,
+    _DummyTpGroup,
     _reset_cuda_graph_test_buffers,
     _seeded_rng,
     _single_rank_graph_capture,
@@ -442,6 +443,7 @@ class _EagleDraftExtendWorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.model_runner.model = model_forward
 
     @property
@@ -469,6 +471,7 @@ class _EagleDraftExtendV2WorkerHarness:
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.eagle_use_aux_hidden_state = False
         self.hot_token_id = None
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.draft_runner.model = model_forward
         EagleDraftWorker._init_dsa_index_share_state(self)
 
@@ -531,7 +534,7 @@ def _capture_eagle_draft_extend_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftExtendCudaGraphRunner(
@@ -671,6 +674,7 @@ class _EagleDraftExtendForward(nn.Module):
         device: str,
     ):
         super().__init__()
+        self.shared_experts_config = SharedExpertsConfig()
         self.module = module
         self.token_embed = nn.Embedding(
             vocab_size, hidden_size, dtype=dtype, device=device

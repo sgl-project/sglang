@@ -103,6 +103,9 @@ DEFAULT_MIN_SEQ_LEN = 4096
 # Keep the established BF16 kernel as the default. ``sage_fp8`` is explicit
 # until its model-level quality/performance envelope has been validated.
 DEFAULT_COMPUTE_MODE = "bf16"
+# Caps the [H, Gq, Gk] routing scores and block index of one call at 2 GiB each;
+# larger calls (e.g. every head on one GPU at long sequences) are split by heads.
+_MAX_ROUTED_BLOCK_PAIRS = 2**29
 
 # ``blocks.<idx>.attn`` is a DiT layer; ``token_refiner.blocks.<idx>.attn`` and
 # anything else is not and stays dense.
@@ -394,14 +397,6 @@ class SubBlockSparseAttentionMetadata(AttentionMetadata):
 
 
 class SubBlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    # The base class declares __init__ abstract, so a builder that does not
-    # override it cannot be instantiated at all.
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore[override]
         self, current_timestep: int, **kwargs: dict[str, Any]
     ) -> SubBlockSparseAttentionMetadata:
@@ -567,6 +562,33 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         sparse_query_block_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Q ``[1, Sq, H, 128]`` against K/V ``[1, Sk, H, 128]``."""
+        block_pairs = -(-q.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE) * -(
+            -k.shape[1] // SUBBLOCK_SPARSE_BLOCK_SIZE
+        )
+        heads_per_call = max(1, _MAX_ROUTED_BLOCK_PAIRS // block_pairs)
+        if q.shape[2] <= heads_per_call:
+            return self._sparse_attention_heads(
+                q, k, v, sparse_query_block_mask=sparse_query_block_mask
+            )
+        out = torch.empty_like(q)
+        for start in range(0, q.shape[2], heads_per_call):
+            heads = slice(start, start + heads_per_call)
+            out[:, :, heads] = self._sparse_attention_heads(
+                q[:, :, heads],
+                k[:, :, heads],
+                v[:, :, heads],
+                sparse_query_block_mask=sparse_query_block_mask,
+            )
+        return out
+
+    def _sparse_attention_heads(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        sparse_query_block_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         plan = self.router.route(
             q,
             k,

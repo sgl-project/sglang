@@ -114,6 +114,9 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
   m.impl("moe_sum", torch::kMUSA, &moe_sum);
 
+  m.def("apply_gguf_moe_weights(Tensor! outputs, Tensor weights, Tensor ids) -> ()");
+  m.impl("apply_gguf_moe_weights", torch::kMUSA, &apply_gguf_moe_weights);
+
   // moe_fused_gate / kimi_k2_moe_fused_gate (AOT gate kernels) retired: gate/topk
   // is consolidated onto the unified Triton router (sglang issue #26771). sglang's
   // MUSA path uses `mate.moe_fused_gate`, so dropping the sgl_kernel MUSA op here
@@ -283,7 +286,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "musa_fused_moe_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"
       "Tensor! topk_weights, Tensor! topk_ids, bool mul_routed_weight, int topk, bool use_int4_w4a16,"
       "bool use_swigelu) -> ()");
-  m.impl("fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
+  m.impl("musa_fused_moe_gemv", torch::kMUSA, &fused_moe_gemv);
 
   m.def(
       "musa_fused_gemv(Tensor! A, Tensor! B, Tensor! C, Tensor? A_scale, Tensor? B_scale,"

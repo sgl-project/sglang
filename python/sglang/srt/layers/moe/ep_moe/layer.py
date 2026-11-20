@@ -15,7 +15,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -42,9 +41,11 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
@@ -97,12 +98,8 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        is_humming = (
-            get_moe_runner_backend().is_humming()
-            or get_moe_runner_backend().is_auto()
-            and quant_config is not None
-            and quant_config.get_name() == "humming"
-        )
+        backend = self.runner_backend
+        is_humming = backend is not None and backend.is_humming()
         if get_moe_a2a_backend().is_deepep_v2():
             self.deprecate_flag = True
         elif is_humming:
@@ -121,14 +118,16 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
-            get_moe_runner_backend().is_flashinfer_cutedsl()
+            backend is not None
+            and backend.is_flashinfer_cutedsl()
             and quant_config is not None
             and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.deprecate_flag = True
         elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and get_moe_runner_backend().is_deep_gemm()
+            and backend is not None
+            and backend.is_deep_gemm()
             and quant_config is not None
             and quant_config.get_name() == "mxfp4"
         ):
@@ -138,7 +137,8 @@ class DeepEPMoE(FusedMoE):
         elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
-            and get_moe_runner_backend().is_deep_gemm()
+            and backend is not None
+            and backend.is_deep_gemm()
             and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu
             and not _is_hip
@@ -200,21 +200,7 @@ class DeepEPMoE(FusedMoE):
         finally:
             set_is_extend_in_batch(saved_is_extend_in_batch)
 
-    def _a2a_forward_capture_stub(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_logits: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        # Capture pass only: record the buffer address, skip the
-        # rank-coupled a2a. Warmup and replay run the real body.
-        output.zero_()
-
-    a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
-    )(_a2a_forward_with_output_impl)
+    a2a_forward_with_output = eager_on_graph(True)(_a2a_forward_with_output_impl)
 
     def forward(
         self,
@@ -351,7 +337,20 @@ class DeepEPMoE(FusedMoE):
         )
 
 
-def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+def get_moe_impl_class(
+    quant_config: Optional[QuantizationConfig],
+    *,
+    context: Optional[MoeExpertExecutorContext] = None,
+) -> type[torch.nn.Module]:
+    """Select an OOT expert executor or SGLang's built-in MoE implementation."""
+    if context is not None and current_platform.is_out_of_tree():
+        executor_cls = current_platform.get_moe_expert_executor_cls(context)
+        if executor_cls is not None:
+            return executor_cls
+
+    if get_moe_a2a_backend().is_mori_epv2():
+        return FusedMoE
+
     # [TODO] kk, temporary solution
     if (
         get_moe_a2a_backend().is_mori()

@@ -133,8 +133,13 @@ class HYV4Config(PreTrainedConfig):
                 )
         if set(self.mlp_layer_types) - {"dense", "sparse"}:
             raise ValueError("mlp_layer_types only supports dense and sparse")
-        if set(self.layer_types) != {"deepseek_sparse_attention"}:
-            raise ValueError("HYV4 only supports deepseek_sparse_attention")
+        if not set(self.layer_types) <= {
+            "deepseek_sparse_attention",
+            "indexed_attention",
+        }:
+            raise ValueError(
+                "HYV4 only supports deepseek_sparse_attention (indexed_attention)"
+            )
         if set(self.indexer_types) - {"full", "shared"}:
             raise ValueError("indexer_types only supports full and shared")
         if self.indexer_types[0] != "full":

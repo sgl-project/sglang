@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -49,7 +49,7 @@ class Test00(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -67,8 +67,7 @@ class Test01(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
             ],
         )
@@ -86,7 +85,7 @@ class Test01(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -104,8 +103,7 @@ class Test02(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
             ],
         )
@@ -123,7 +121,7 @@ class Test02(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -143,7 +141,8 @@ class Test03(CustomTestCase):
                 "8",
                 "--moe-dense-tp-size",
                 "1",
-                "--enable-flashinfer-allreduce-fusion",
+                "--flashinfer-allreduce-fusion-backend",
+                "auto",
             ],
         )
 
@@ -160,7 +159,7 @@ class Test03(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -178,8 +177,7 @@ class Test04(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -199,7 +197,7 @@ class Test04(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -217,8 +215,7 @@ class Test05(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -238,7 +235,7 @@ class Test05(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -256,8 +253,7 @@ class Test06(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--enable-dp-lm-head",
             ],
@@ -276,7 +272,7 @@ class Test06(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -294,8 +290,7 @@ class Test07(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--enable-dp-lm-head",
             ],
@@ -314,7 +309,7 @@ class Test07(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -332,8 +327,7 @@ class Test08(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -354,7 +348,7 @@ class Test08(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -372,8 +366,7 @@ class Test09(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -394,7 +387,7 @@ class Test09(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -432,7 +425,7 @@ class Test10(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -450,8 +443,7 @@ class Test11(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-a2a-backend",
                 "deepep",
@@ -473,7 +465,7 @@ class Test11(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -491,8 +483,7 @@ class Test12(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-a2a-backend",
                 "deepep",
@@ -514,7 +505,7 @@ class Test12(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -554,7 +545,7 @@ class Test13(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -572,8 +563,7 @@ class Test14(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -597,7 +587,7 @@ class Test14(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -615,8 +605,7 @@ class Test15(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -640,7 +629,7 @@ class Test15(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -658,8 +647,7 @@ class Test16(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--enable-dp-lm-head",
                 "--moe-a2a-backend",
@@ -682,7 +670,7 @@ class Test16(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -700,8 +688,7 @@ class Test17(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--enable-dp-lm-head",
                 "--moe-a2a-backend",
@@ -724,7 +711,7 @@ class Test17(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -742,8 +729,7 @@ class Test18(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -768,7 +754,7 @@ class Test18(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -786,8 +772,7 @@ class Test19(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -812,7 +797,7 @@ class Test19(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -848,7 +833,7 @@ class Test20(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -866,8 +851,7 @@ class Test21(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--ep",
                 "8",
@@ -887,7 +871,7 @@ class Test21(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -905,8 +889,7 @@ class Test22(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--ep",
                 "8",
@@ -926,7 +909,7 @@ class Test22(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -964,7 +947,7 @@ class Test23(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -982,8 +965,7 @@ class Test24(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -1005,7 +987,7 @@ class Test24(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1023,8 +1005,7 @@ class Test25(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -1046,7 +1027,7 @@ class Test25(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1064,8 +1045,7 @@ class Test26(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--enable-dp-lm-head",
                 "--ep",
@@ -1086,7 +1066,7 @@ class Test26(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1104,8 +1084,7 @@ class Test27(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--enable-dp-lm-head",
                 "--ep",
@@ -1126,7 +1105,7 @@ class Test27(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1144,8 +1123,7 @@ class Test28(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -1168,7 +1146,7 @@ class Test28(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1186,8 +1164,7 @@ class Test29(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -1210,7 +1187,7 @@ class Test29(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1254,7 +1231,7 @@ class Test30(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1272,8 +1249,7 @@ class Test31(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--speculative-algo",
                 "EAGLE",
@@ -1301,7 +1277,7 @@ class Test31(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1319,8 +1295,7 @@ class Test32(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--speculative-algo",
                 "EAGLE",
@@ -1348,7 +1323,7 @@ class Test32(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1394,7 +1369,7 @@ class Test33(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1412,8 +1387,7 @@ class Test34(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -1443,7 +1417,7 @@ class Test34(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1461,8 +1435,7 @@ class Test35(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -1492,7 +1465,7 @@ class Test35(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1510,8 +1483,7 @@ class Test36(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--enable-dp-lm-head",
                 "--speculative-algo",
@@ -1540,7 +1512,7 @@ class Test36(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1558,8 +1530,7 @@ class Test37(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--enable-dp-lm-head",
                 "--speculative-algo",
@@ -1588,7 +1559,7 @@ class Test37(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1606,8 +1577,7 @@ class Test38(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -1638,7 +1608,7 @@ class Test38(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1656,8 +1626,7 @@ class Test39(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -1688,7 +1657,7 @@ class Test39(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1738,7 +1707,7 @@ class Test40(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1756,8 +1725,7 @@ class Test41(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-a2a-backend",
                 "deepep",
@@ -1791,7 +1759,7 @@ class Test41(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1809,8 +1777,7 @@ class Test42(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-a2a-backend",
                 "deepep",
@@ -1844,7 +1811,7 @@ class Test42(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1896,7 +1863,7 @@ class Test43(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1914,8 +1881,7 @@ class Test44(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -1951,7 +1917,7 @@ class Test44(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -1969,8 +1935,7 @@ class Test45(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -2006,7 +1971,7 @@ class Test45(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2024,8 +1989,7 @@ class Test46(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--enable-dp-lm-head",
                 "--moe-a2a-backend",
@@ -2060,7 +2024,7 @@ class Test46(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2078,8 +2042,7 @@ class Test47(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--enable-dp-lm-head",
                 "--moe-a2a-backend",
@@ -2114,7 +2077,7 @@ class Test47(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2132,8 +2095,7 @@ class Test48(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -2170,7 +2132,7 @@ class Test48(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2188,8 +2150,7 @@ class Test49(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -2226,7 +2187,7 @@ class Test49(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2272,7 +2233,7 @@ class Test50(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2290,8 +2251,7 @@ class Test51(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--ep",
                 "8",
@@ -2321,7 +2281,7 @@ class Test51(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2339,8 +2299,7 @@ class Test52(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--ep",
                 "8",
@@ -2370,7 +2329,7 @@ class Test52(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2418,7 +2377,7 @@ class Test53(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2436,8 +2395,7 @@ class Test54(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -2469,7 +2427,7 @@ class Test54(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2487,8 +2445,7 @@ class Test55(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -2520,7 +2477,7 @@ class Test55(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2538,8 +2495,7 @@ class Test56(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--enable-dp-lm-head",
                 "--ep",
@@ -2570,7 +2526,7 @@ class Test56(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2588,8 +2544,7 @@ class Test57(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--enable-dp-lm-head",
                 "--ep",
@@ -2620,7 +2575,7 @@ class Test57(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2638,8 +2593,7 @@ class Test58(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "4",
                 "--moe-dense-tp-size",
                 "1",
@@ -2672,7 +2626,7 @@ class Test58(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 
@@ -2690,8 +2644,7 @@ class Test59(CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--enable-dp-attention",
-                "--dp",
+                "--attn-dp-size",
                 "8",
                 "--moe-dense-tp-size",
                 "1",
@@ -2724,7 +2677,7 @@ class Test59(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.48)
 

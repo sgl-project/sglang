@@ -1,12 +1,14 @@
 name: PR Test (MLX)
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
     inputs:
-      # target_stage is the job id (e.g. stage-b-e2e-test-mlx), distinct from
-      # the run_suite.py suite name it dispatches (e.g. stage-b-e2e-mlx).
+      # target_stage is the job id, which equals the run_suite.py suite it
+      # dispatches (e.g. extra-e2e-test-mlx).
       target_stage:
         description: "Select a stage to run from dropdown (leave empty for auto-detect)"
         required: false
@@ -14,8 +16,10 @@ on:
         default: ''
         options:
           - ''
-          - stage-a-unit-test-mlx
-          - stage-b-e2e-test-mlx
+          - extra-unit-test-mlx
+          - extra-e2e-test-mlx
+          - extra-unit-test-mps
+          - extra-e2e-test-mps
 
 concurrency:
   group: pr-test-mlx-${{ github.ref }}
@@ -58,9 +62,11 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-mlx-extra
     secrets: inherit
 
-  stage-a-unit-test-mlx:
+  extra-unit-test-mlx:
     needs: [check-changes, pr-gate]
     # !cancelled() lets dispatch past a skipped pr-gate; the pull_request
     # path still requires pr-gate success, keeping the run-ci gate intact.
@@ -70,8 +76,9 @@ jobs:
           (needs.check-changes.outputs.main_package == 'true' ||
            needs.check-changes.outputs.sgl_kernel == 'true')) ||
         (github.event_name == 'workflow_dispatch' &&
-         inputs.target_stage == 'stage-a-unit-test-mlx')
+         inputs.target_stage == 'extra-unit-test-mlx')
       )
+      && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -118,13 +125,14 @@ jobs:
       - name: Run model-free MLX unit tests
         timeout-minutes: 15
         run: |
-          uv run python test/run_suite.py --hw mlx --suite stage-a-unit-test-mlx
+          uv run python test/run_suite.py --hw mlx --suite extra-unit-test-mlx
 
-  stage-b-e2e-test-mlx:
+  extra-e2e-test-mlx:
     needs: [check-changes, pr-gate]
     # Manual-only: no self hosted Apple Silicon runner is generally available; hosted runners are too small for e2e.
     if: |
-      !cancelled() && inputs.target_stage == 'stage-b-e2e-test-mlx'
+      !cancelled() && inputs.target_stage == 'extra-e2e-test-mlx'
+      && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 120
     env:
@@ -158,29 +166,123 @@ jobs:
       - name: Run MLX e2e smoke tests
         timeout-minutes: 90
         run: |
-          uv run python test/run_suite.py --hw mlx --suite stage-b-e2e-mlx
+          uv run python test/run_suite.py --hw mlx --suite extra-e2e-test-mlx
+
+  # Run the Torch MPS path without SGLANG_USE_MLX.
+  extra-unit-test-mps:
+    needs: [check-changes, pr-gate]
+    if: |
+      !cancelled() && (
+        (needs.pr-gate.result == 'success' &&
+          (needs.check-changes.outputs.main_package == 'true' ||
+           needs.check-changes.outputs.sgl_kernel == 'true')) ||
+        (github.event_name == 'workflow_dispatch' &&
+         inputs.target_stage == 'extra-unit-test-mps')
+      )
+      && needs.pr-gate.outputs.opted-in != 'false'
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SGLANG_IS_IN_CI: true
+      # Forbid HF downloads to enforce the model-free guarantee.
+      HF_HUB_OFFLINE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
+
+      - name: Verify Apple Silicon runner
+        run: |
+          echo "uname -m: $(uname -m)"
+          python3 -c "import platform; assert platform.machine()=='arm64', platform.machine(); print('machine:', platform.machine(), 'system:', platform.system())"
+
+      - name: Install dependencies (srt_mps extra)
+        timeout-minutes: 30
+        run: |
+          test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
+          rm -f python/pyproject.toml
+          mv python/pyproject_other.toml python/pyproject.toml
+          uv venv
+          uv pip install -e "python[srt_mps,test]"
+
+      - name: Report torch version and MPS availability
+        run: |
+          uv run python -c "import torch; print('torch', torch.__version__, 'mps', torch.mps.is_available())"
+
+      - name: Run model-free MPS unit tests
+        timeout-minutes: 15
+        run: |
+          uv run python test/run_suite.py --hw mps --suite extra-unit-test-mps
+
+  extra-e2e-test-mps:
+    needs: [check-changes, pr-gate]
+    # Manual-only, same rationale as the MLX e2e stage above.
+    if: |
+      !cancelled() && inputs.target_stage == 'extra-e2e-test-mps'
+      && needs.pr-gate.outputs.opted-in != 'false'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 120
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_other.toml'
+
+      - name: Verify Apple Silicon runner
+        run: |
+          echo "uname -m: $(uname -m)"
+          python3 -c "import platform; assert platform.machine()=='arm64', platform.machine(); print('machine:', platform.machine(), 'system:', platform.system())"
+
+      - name: Install dependencies (srt_mps extra)
+        timeout-minutes: 30
+        run: |
+          test -f python/pyproject_other.toml || { echo "alt pyproject_other.toml missing"; exit 1; }
+          rm -f python/pyproject.toml
+          mv python/pyproject_other.toml python/pyproject.toml
+          uv venv --python 3.11
+          uv pip install -e "python[srt_mps,test]"
+
+      # Needs a warm HF cache or network and roughly 24 GB of unified memory.
+      - name: Run MPS e2e smoke tests
+        timeout-minutes: 90
+        run: |
+          uv run python test/run_suite.py --hw mps --suite extra-e2e-test-mps
 
   pr-test-mlx-finish:
     needs:
       [
         pr-gate,
         check-changes,
-        stage-a-unit-test-mlx,
-        stage-b-e2e-test-mlx,
+        extra-unit-test-mlx,
+        extra-e2e-test-mlx,
+        extra-unit-test-mps,
+        extra-e2e-test-mps,
       ]
-    if: always()
+    if: always() && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-          for job in $job_names; do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
+            exit 1
+          fi

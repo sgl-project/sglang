@@ -7,7 +7,7 @@ MI35x ROCm 7.2.
 
 Both tests share a single launched server.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro suite
 """
 
 import json
@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=14400, suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro", nightly=True
 )
 
 DEEPSEEK_V4_PRO_FP8_MODEL_PATH = os.environ.get(
@@ -107,7 +107,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -134,7 +134,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
         cmd = [
             "python3",
             "-m",
-            "sglang.bench_one_batch_server",
+            "sglang.benchmark.one_batch_server",
             "--model",
             "None",
             "--base-url",

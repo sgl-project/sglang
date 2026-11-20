@@ -149,7 +149,7 @@ class KVCacheQuantMethodBase(ABC):
         on a private ``ServerArgs`` helper, and keep pool sizing/allocation on
         the same selection path.
         """
-        from sglang.srt.arg_groups.overrides import (
+        from sglang.srt.arg_groups.model_override_base import (
             attention_backends_of,
             resolved_view,
         )
@@ -1034,11 +1034,6 @@ def resolve_kv_cache_quant(kv_cache_dtype) -> Optional[str]:
             )
         return None
 
-    if kv_cache_dtype == "fp4_e2m1":
-        raise ValueError(
-            "--kv-cache-dtype=fp4_e2m1 is deprecated. "
-            "Use --kv-cache-dtype=fp4_mx_block16."
-        )
     if kv_cache_dtype == "mxfp4":
         raise ValueError(
             "--kv-cache-dtype=mxfp4 is reserved for true MXFP4 block-size-32 "

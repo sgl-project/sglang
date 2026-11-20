@@ -1,11 +1,12 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.kernels.ops.attention.minimax_sparse.common.index import topk_index_reduce
+from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
 from sglang.kernels.ops.attention.minimax_sparse.common.utils import get_cu_seqblocks
 from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx import (
     flash_decode_with_topk_idx,
@@ -13,15 +14,29 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx impo
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
+from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_idx import (
+    verify_topk_idx,
+)
 from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
     flash_prefill_with_topk_index,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_gfx95_supported, is_hip
+
+_use_aiter_gfx95 = envs.SGLANG_USE_AITER.get() and is_hip() and is_gfx95_supported()
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
+_gluon_fallback_warned = False
+
+
+def _num_kv_heads(k_cache) -> int:
+    if isinstance(k_cache, Nvfp4Cache):
+        return k_cache.num_heads
+    return k_cache.shape[1]
 
 
 def _warn_msa_fallback(err: Exception) -> None:
@@ -33,6 +48,18 @@ def _warn_msa_fallback(err: Exception) -> None:
         err,
     )
     _msa_fallback_warned = True
+
+
+def _warn_gluon_fallback(msg: str) -> None:
+    global _gluon_fallback_warned
+    if _gluon_fallback_warned:
+        return
+    logger.warning(
+        "MiniMax Gluon sparse prefill is unavailable (%s); falling back to Triton "
+        "sparse attention.",
+        msg,
+    )
+    _gluon_fallback_warned = True
 
 
 def minimax_sparse_prefill(
@@ -75,6 +102,11 @@ def minimax_sparse_prefill(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     return_topk_idx: bool = False,
+    loc_mapping: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
+    # The o_proj's fp8_input_quant_format: Gluon may return O as (fp8, scale) for it.
+    out_quant: str = "",
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -90,6 +122,10 @@ def minimax_sparse_prefill(
     kernels. Supplying them avoids recomputing the same block layout twice.
     ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
     ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
+
+    ``seq_lens_cpu`` (host copy of ``seq_lens``, i.e. prefix + current chunk
+    per request) is only consumed by the env-gated Gluon prefill path for
+    sync-free scratch-page sizing; ``None`` disables that path.
     """
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
@@ -128,13 +164,14 @@ def minimax_sparse_prefill(
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
             all_seqblock_q=all_seqblock_q,
+            page_size=page_size,
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
         )
         # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
         num_idx_heads = idx_q.shape[1]
-        num_kv_heads = k_cache.shape[1]
+        num_kv_heads = _num_kv_heads(k_cache)
         idx_group_size = num_idx_heads // num_kv_heads
         if idx_group_size > 1:
             topk_idx = topk_index_reduce(
@@ -143,10 +180,65 @@ def minimax_sparse_prefill(
 
     # Reduced top-k cached by the caller for subsequent skip layers.
     reduced_topk_idx = topk_idx
-    # Step 3: Sparse attention using topk index (main head). The MSA path only
-    # replaces this step; the indexer above is unchanged. MSA has no attn-sink
-    # input, so keep the Triton path when sink is present.
-    if use_msa and sink is None:
+    # Step 3: Sparse attention using topk index (main head). The Gluon and
+    # MSA paths only replace this step; the indexer above is unchanged. MSA has
+    # no attn-sink input, so keep the Triton path when sink is present.
+    o = None
+    if (
+        _use_aiter_gfx95
+        and envs.SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL.get()
+        # the scratch gather reads pool slots without the HiSparse remap
+        and loc_mapping is None
+    ):
+        from sglang.kernels.ops.attention.minimax_sparse.prefill.gluon_prefill import (
+            GluonPrefillUnavailableError,
+            can_use_gluon_prefill,
+            gluon_sparse_prefill,
+        )
+
+        if can_use_gluon_prefill(
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            block_size_k,
+            seq_lens_cpu,
+            q_scale,
+            k_scale,
+            v_scale,
+        ):
+            try:
+                o = gluon_sparse_prefill(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    topk_idx=topk_idx,
+                    req_to_token=req_to_token,
+                    req_pool_indices=slot_ids,
+                    cu_seqlens=cu_seqlens,
+                    seq_lens=seq_lens,
+                    prefix_lens=prefix_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    block_size_k=block_size_k,
+                    sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    out_quant=out_quant,
+                    q_lens_cpu=seqlens_cpu,
+                )
+            except GluonPrefillUnavailableError as err:
+                if isinstance(k_cache, Nvfp4Cache):
+                    raise
+                _warn_gluon_fallback(str(err))
+        elif not isinstance(k_cache, Nvfp4Cache):
+            _warn_gluon_fallback("unsupported batch/cache layout or dtype")
+    if o is None and isinstance(k_cache, Nvfp4Cache):
+        raise NotImplementedError(
+            "NVFP4 KV sparse prefill runs only on the gfx950 Gluon path (SGLANG_USE_AITER=1, "
+            "SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL=1, no HiSparse); otherwise serve with "
+            "SGLANG_MINIMAX_M3_AMD_KV_FORMAT=fp8"
+        )
+    if o is None and use_msa and sink is None and loc_mapping is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
         try:
@@ -188,8 +280,9 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                loc_mapping=loc_mapping,
             )
-    else:
+    elif o is None:
         o = flash_prefill_with_gqa_share_sparse(
             q=q,
             k_cache=k_cache,
@@ -210,6 +303,7 @@ def minimax_sparse_prefill(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            loc_mapping=loc_mapping,
         )
     if return_topk_idx:
         return idx_o, o, reduced_topk_idx
@@ -255,18 +349,94 @@ def minimax_sparse_decode(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     topk_out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    hisparse_swap_in_fn: Optional[Callable] = None,
+    indexer_cp=None,
+    packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
+    verify_num_draft: Optional[int] = None,  # rows = reqs x num_draft, one slot per req
+    # The o_proj's fp8_input_quant_format: O may come back as (fp8, scale) for it.
+    out_quant: str = "",
+) -> Tuple[
+    Optional[torch.Tensor], Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
     # skip layers pass that buffer back as ``cached_topk_idx`` and skip Step 1
     # (flash-index decode + top-k) and Step 2 (reduce) entirely, never reading
     # idx_k_cache. Only valid for disable_index_value layers on the
     # non-dense-main path (idx_o is None there). All-device: CUDA-graph safe.
+
+    # Without a head reduction the verify indexer's top-k is the published one.
+    topk_direct_out = (
+        topk_out
+        if dense_main_attn_fn is None and idx_q.shape[1] == _num_kv_heads(k_cache)
+        else None
+    )
     if cached_topk_idx is not None:
         idx_o = None
         real_seq_lens = None
         topk_idx = cached_topk_idx
         _skip_reduce = True
+    elif (
+        indexer_cp is not None
+        and disable_index_value
+        and idx_sink is None
+        and score_type == "max"
+        and block_size_k == 128
+        and topk == 16
+        and dense_main_attn_fn is None
+        and indexer_cp.supports(
+            idx_q,
+            idx_k_cache,
+            max_seqlen,
+            req_to_token,
+            packed_queries=packed_queries,
+            local_blocks=local_blocks,
+        )
+    ):
+        idx_o = real_seq_lens = None
+        topk_idx = indexer_cp(
+            idx_q,
+            idx_k_cache,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            max_seqlen,
+            init_blocks,
+            local_blocks,
+            idx_sm_scale,
+            idx_q_scale,
+            idx_k_scale,
+            packed_queries=packed_queries,
+        )
+        _skip_reduce = True
+    elif (
+        verify_num_draft is not None
+        and idx_q.shape[0] % verify_num_draft == 0
+        and idx_sink is None
+        and disable_index_value
+        and dense_main_attn_fn is None
+        and score_type == "max"
+    ):
+        _skip_reduce = False
+        idx_o = None
+        topk_idx = verify_topk_idx(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            slot_ids=slot_ids,
+            num_draft=verify_num_draft,
+            block_size=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            topk_idx_out=topk_direct_out,
+            page_size=page_size,
+        )
     else:
         _skip_reduce = False
         # Step 1: Flash decode with topk index (using index head). When the dense main
@@ -295,7 +465,7 @@ def minimax_sparse_decode(
             v_scale=idx_v_scale,
         )
     num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
+    num_kv_heads = _num_kv_heads(k_cache)
     idx_group_size = num_idx_heads // num_kv_heads
     assert dense_main_attn_fn is None or (
         cached_topk_idx is None and topk_out is None
@@ -318,10 +488,14 @@ def minimax_sparse_decode(
                     f"topk_out shape {tuple(topk_out.shape)} does not match "
                     f"reduced top-k shape {tuple(topk_idx.shape)}"
                 )
-            topk_out.copy_(topk_idx)
+            if topk_idx is not topk_out:
+                topk_out.copy_(topk_idx)
+        hisparse_slots = (
+            hisparse_swap_in_fn(topk_idx) if hisparse_swap_in_fn is not None else None
+        )
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
-        if use_msa and sink is None:
+        if use_msa and sink is None and hisparse_slots is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main
 
             try:
@@ -354,9 +528,12 @@ def minimax_sparse_decode(
                     block_size=block_size_k,
                     topk_idx=topk_idx,
                     sm_scale=sm_scale,
+                    page_size=page_size,
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    hisparse_slots=hisparse_slots,
+                    out_quant=out_quant,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -370,8 +547,11 @@ def minimax_sparse_decode(
                 block_size=block_size_k,
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
+                page_size=page_size,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                hisparse_slots=hisparse_slots,
+                out_quant=out_quant,
             )
     return idx_o, o

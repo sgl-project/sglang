@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=700, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=700, suite="base-c-test-large-8-gpu-amd-mi35x")
 
 KIMI_K25_MXFP4_MODEL_PATH = "amd/Kimi-K2.5-MXFP4"
 # Bumped from b071bc6f -> 419004c8 (HF main HEAD as of 2026-05-18). The pinned
@@ -85,7 +85,7 @@ class TestKimiK25MXFP4(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

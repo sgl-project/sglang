@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 from zmq import IPV6  # type: ignore
-from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
+from zmq import SUB, SUBSCRIBE, XPUB, XPUB_NODROP, XPUB_VERBOSE, Context  # type: ignore
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
@@ -206,6 +206,7 @@ class MessageQueue:
             # except that it can receive subscription messages
             # to confirm the number of subscribers
             self.local_socket = context.socket(XPUB)
+            self.local_socket.setsockopt(XPUB_NODROP, True)
             # set the verbose option so that we can receive every subscription
             # message. otherwise, we will only receive the first subscription
             # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
@@ -234,14 +235,18 @@ class MessageQueue:
             # for remote readers, we will:
             # create a publish-subscribe socket to communicate large data
             self.remote_socket = context.socket(XPUB)
+            self.remote_socket.setsockopt(XPUB_NODROP, True)
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
             remote_subscribe_port = get_open_port()
             na = NetworkAddress(connect_ip, remote_subscribe_port)
             if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-            address = na.to_tcp()
-            logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
-            self.remote_socket.bind(address)
+            # get_open_port() only probes; bind atomically in a window from that port.
+            remote_subscribe_port = self.remote_socket.bind_to_random_port(
+                na.to_tcp().rsplit(":", 1)[0],  # address without the port
+                min_port=remote_subscribe_port,
+                max_port=remote_subscribe_port + 32,
+            )
 
         else:
             remote_subscribe_port = None

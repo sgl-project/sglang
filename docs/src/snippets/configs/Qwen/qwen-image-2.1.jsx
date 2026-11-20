@@ -1,10 +1,12 @@
 export const config = (() => {
 const sm12Hardware = ["rtx5090", "rtxpro6000", "dgx-spark"];
-const platformAttention = (s) => sm12Hardware.includes(s.hw) ? "sdpa" : "fa";
+// One B200 serves the platform default, cuDNN SDPA: 2.22 s against 2.32 s with FlashAttention for
+// 1024px/40-step generation and 2.70 s against 2.89 s for an edit (2026-11-01, sglang 3a01d4cc).
+const platformAttention = (s) => sm12Hardware.includes(s.hw) ? "sdpa" : s.hw === "b200" && Number(s.gpus_per_node) === 1 ? "cudnn" : "fa";
 const effectiveAttention = (s) => s.attention === "platform" || (sm12Hardware.includes(s.hw) && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
-  modelName: "Qwen-Image 2.1",
+  modelName: "Qwen-Image 2.1 / Turbo",
   supportedHardware: ["h200", "b200", "rtxpro6000", "rtx5090", "rtx4090", "dgx-spark"],
   hardware: [
     { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "consumer" },
@@ -19,9 +21,12 @@ const config = {
       id: "weights",
       title: "Checkpoint weights",
       scope: "base",
-      description: "One checkpoint serves generation and editing. Set its Hugging Face repository or local path under Variables.",
+      description: "Both checkpoints serve generation and editing. Turbo uses its preset eight-step sigma grid. Restart the server when changing weights.",
       default: "default",
-      options: [{ id: "default", label: "Qwen-Image 2.1", flags: [] }],
+      options: [
+        { id: "default", label: "Qwen-Image 2.1", description: "Original checkpoint with a configurable step count; defaults to 40 steps." },
+        { id: "turbo", label: "Qwen-Image 2.1 Turbo", description: "Accelerated checkpoint with a fixed eight-step schedule, loaded automatically from model_index.json." },
+      ],
     },
     {
       id: "mode",
@@ -53,14 +58,14 @@ const config = {
         },
         {
           id: "offload", label: "CPU offload",
-          flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
+          flags: (s) => ["rtx4090", "rtx5090"].includes(s.hw) && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === platformAttention(s) && s.precision === "native" && s.execution === "eager"
             && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
-            ? ["--performance-mode manual", "--component-residency dit=resident text_encoder=layerwise-offload vae=resident", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
+            ? ["--performance-mode manual", "--component-residency text_encoder=layerwise-offload"]
             : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
           softReason: "This offload topology has not completed an HTTP verification run.",
-          description: "RTX 4090 native single-output FlashAttention keeps the DiT and VAE resident and streams encoder layers. Other offload recipes stream DiT layers; RTX 4090 also offloads the encoder. Requires sufficient host RAM.",
+          description: "RTX 4090 and RTX 5090 keep the DiT and VAE on the card, on their platform attention kernel, and stream encoder layers. That is faster than streaming the DiT: measured 1024px / 40 steps on one RTX 5090, 14.12s against 19.95s, on 17.0GB against 19.3GB steady. Other offload recipes stream DiT layers. Requires sufficient host RAM.",
         },
         {
           id: "all_offload", label: "All components layerwise",
@@ -80,10 +85,16 @@ const config = {
       options: [
         {
           id: "platform", label: "Automatic", recommended: true,
-          flags: (s) => s.hw === "b200" ? ["--attention-backend fa"] : [],
-          description: "Uses SDPA on RTX PRO 6000, RTX 5090, and DGX Spark, and FlashAttention on the other listed GPUs.",
+          flags: (s) => s.hw === "b200" && Number(s.gpus_per_node) !== 1 ? ["--attention-backend fa"] : [],
+          description: "Uses cuDNN SDPA on one B200, SDPA on RTX PRO 6000, RTX 5090, and DGX Spark, and FlashAttention on the other listed GPUs.",
         },
         { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000, RTX 5090, and DGX Spark." },
+        {
+          id: "cudnn", label: "cuDNN SDPA", flags: ["--attention-backend dynamic_cudnn_sdpa"],
+          soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("cudnn") && Number(s.gpus_per_node) === r.gpus_per_node),
+          softReason: "This hardware and placement combination has not completed HTTP verification with cuDNN SDPA.",
+          description: "Exact attention through cuDNN on Blackwell. Floating-point reduction order can differ from FlashAttention.",
+        },
         {
           id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"],
           soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("sdpa") && Number(s.gpus_per_node) === r.gpus_per_node),
@@ -210,8 +221,8 @@ const config = {
         { id: "eager", label: "Eager", recommended: true },
         {
           id: "bcg", label: "Breakable CUDA Graph",
-          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`, "--bcg-text-buckets 64"],
-          soft: true, softReason: "A 1024px H200 server captured its warmup graph, but tested requests fell back to eager because condition-prefix shapes differed.",
+          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`],
+          soft: true, softReason: "Unmatched condition-prefix shapes run eagerly. Keep eager execution for the recommended recipes.",
           description: "Captures the selected resolution. Condition-prefix shapes must also match warmup; text buckets alone do not ensure replay.",
         },
       ],
@@ -263,8 +274,18 @@ const config = {
       id: "steps",
       title: "Denoising steps",
       scope: "request",
+      showWhen: (s) => s.weights !== "turbo",
       description: "40 is the checkpoint default. Fewer steps trade detail for latency.",
       kind: "number", min: 1, max: 100, unit: "steps", default: 40, options: [],
+    },
+    {
+      id: "schedule",
+      title: "Denoising schedule",
+      scope: "request",
+      showWhen: (s) => s.weights === "turbo",
+      description: "Turbo loads the checkpoint's eight-step sigma grid. A step-count override does not replace this grid.",
+      default: "preset",
+      options: [{ id: "preset", label: "8 steps (checkpoint preset)", recommended: true }],
     },
     {
       id: "outputs",
@@ -284,16 +305,22 @@ const config = {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
       verifiedRecipes: [
         { id: "h200-1-resident", hw: "h200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
-        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2, 4], batchAttentions: ["fa"], default: true },
+        { id: "h200-2-tp-turbo", weights: "turbo", hw: "h200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], verifiedWhen: (s) => s.weights === "turbo" && (!s.batching || s.batching === "off") },
+        { id: "b200-1-resident", hw: "b200", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa", "cudnn"], batchSizes: [1, 2, 4], batchAttentions: ["fa", "cudnn"], default: true },
         { id: "b200-2-tp", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 2, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "b200-2-ulysses", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1, 2, 4], default: true },
         { id: "rtxpro6000-1-offload", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"] },
-        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true, unverified: true },
+        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2], batchAttentions: ["fa"], default: true },
         { id: "dgx-spark-1-resident", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
       ],
-      autoTopology: (s) => ({ tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 }),
+      // B200 x2 (b200-2-tp above), 1024x1024 40 steps: TP2 1.43 s vs Ulysses 2
+      // 1.59 s.
+      autoTopology: (s) => Number(s.gpus_per_node) === 2
+        && ((s.weights === "turbo" && s.hw === "h200") || s.hw === "b200")
+        ? { tp_size: 2, ulysses_degree: 1, ring_degree: 1 }
+        : { tp_size: 1, ulysses_degree: Number(s.gpus_per_node), ring_degree: 1 },
       validateTopology: (s, topology) => {
         const errors = [];
         const nodes = Number(s.nodes);
@@ -305,7 +332,7 @@ const config = {
         if (![tp, ulysses, ring].every((n) => [1, 2, 4].includes(n))) errors.push("TP, Ulysses and Ring must each be 1, 2, or 4.");
         if (nodes * perNode !== tp * ulysses * ring) errors.push(`World size ${nodes * perNode} must equal TP × Ulysses × Ring (${tp * ulysses * ring}).`);
         if (32 % (tp * ulysses) !== 0) errors.push("32 attention heads must be divisible by TP × Ulysses.");
-        if (ring > 1 && effectiveAttention(s) === "sdpa") errors.push("Ring requires FlashAttention or SageAttention; Torch SDPA is unsupported.");
+        if (ring > 1 && ["sdpa", "cudnn"].includes(effectiveAttention(s))) errors.push(`Ring requires FlashAttention or SageAttention; ${effectiveAttention(s) === "sdpa" ? "Torch" : "cuDNN"} SDPA is unsupported.`);
         if (s.precision?.startsWith("nvfp4_") && !["b200", "rtxpro6000", "rtx5090", "dgx-spark"].includes(s.hw)) errors.push("Native NVFP4 requires a Blackwell GPU. Select B200, RTX PRO 6000, RTX 5090, or DGX Spark.");
         if (perNode === 1 && ["rtx5090", "rtx4090"].includes(s.hw) && s.placement === "resident") errors.push("The full resident pipeline exceeds this GPU's memory. Select CPU offload.");
         return errors;
@@ -322,20 +349,27 @@ const config = {
         && entry.placement === s.placement && entry.tp_size === topology.tp_size
         && entry.ulysses_degree === topology.ulysses_degree && entry.ring_degree === topology.ring_degree);
       const serveVerified = !!recipe && !recipe.unverified && errors.length === 0 && s.encoder === "auto"
-        && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
+        && recipe.verifiedWhen(s) && recipe.attentions.includes(effectiveAttention(s)) && s.precision === "native"
         && s.execution === "eager" && s.vae === "full"
         && (!s.batching || s.batching === "off" || ((recipe.batchSizes || [1]).includes(Number(s.batching))
           && (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s))));
       // Exact HTTP workloads from the validation matrix, not blanket quality coverage.
-      const requestVerified = serveVerified
-        && ((recipe.batchSizes && (Number(s.outputs) === 1 || (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s)))
+      const turboRequestVerified = s.resolution === "1024"
+        && (Number(s.gpus_per_node) === 1
+          ? ((Number(s.outputs) === 1 && (s.mode === "text"
+              || (s.mode === "edit" && (s.background === "scene" || effectiveAttention(s) === "fa"))
+              || (s.mode === "multi" && s.background === "scene" && effectiveAttention(s) === "fa")))
+            || (Number(s.outputs) === 2 && s.mode === "text" && s.background === "scene" && effectiveAttention(s) === "fa"))
+          : Number(s.outputs) === 1 && ["text", "edit"].includes(s.mode) && s.background === "scene");
+      const requestVerified = serveVerified && (s.weights === "turbo" ? turboRequestVerified
+        : ((recipe.batchSizes && (Number(s.outputs) === 1 || (recipe.batchAttentions || recipe.attentions).includes(effectiveAttention(s)))
             && ["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && recipe.batchSizes.includes(Number(s.outputs)))
           || (["text", "edit"].includes(s.mode) && s.resolution === "1024" && Number(s.steps) === 40 && Number(s.outputs) === 1
             && (["h200", "rtxpro6000"].includes(s.hw) || s.mode === "text" || s.background === "scene"))
           || (s.hw === "h200" && s.background === "scene" && s.mode === "text" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 2)
-          || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1));
+          || (s.hw === "h200" && s.background === "scene" && s.mode === "multi" && s.resolution === "512" && Number(s.steps) === 4 && Number(s.outputs) === 1)));
       const world = Number(s.nodes) * Number(s.gpus_per_node);
-      const flags = ['--model-path "{{MODEL_PATH}}"'];
+      const flags = [s.weights === "turbo" ? '--model-path "{{TURBO_MODEL_PATH}}"' : '--model-path "{{MODEL_PATH}}"'];
       if (world > 1) flags.push(`--num-gpus ${world}`);
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
       if (world > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
@@ -359,7 +393,7 @@ const config = {
             request: errors.length ? "error" : requestVerified ? "verified" : "unverified",
           },
           resolvedSettings: {
-            attention: s.attention === "platform" ? `${platformAttention(s) === "sdpa" ? "Torch SDPA" : "FlashAttention"} (auto)`
+            attention: s.attention === "platform" ? `${{ sdpa: "Torch SDPA", cudnn: "cuDNN SDPA" }[platformAttention(s)] || "FlashAttention"} (auto)`
               : sm12Hardware.includes(s.hw) && s.attention === "fa" ? "Torch SDPA (FA fallback)" : undefined,
             encoder: s.encoder === "auto" && world === 1 ? "Single GPU (auto)" : undefined,
           },
@@ -370,7 +404,8 @@ const config = {
 
   modelNames: { default: "Qwen-Image-2.1" },
   placeholders: {
-    MODEL_PATH: { target: "command", label: "Checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1" },
+    MODEL_PATH: { target: "command", label: "Base checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1" },
+    TURBO_MODEL_PATH: { target: "command", label: "Turbo checkpoint repository or directory", default: "Qwen/Qwen-Image-2.1-Turbo" },
     FP8_DIT_PATH: { target: "command", label: "Serialized FP8 DiT directory", default: "/models/qwen-image-2.1-fp8/transformer" },
     FP8_ENCODER_PATH: { target: "command", label: "Serialized FP8 encoder directory", default: "/models/qwen-image-2.1-fp8/text_encoder" },
     GGUF_DIT_PATH: { target: "command", label: "GGUF DiT file", default: "/models/qwen-image-2.1-gguf/transformer-Q4_0.gguf" },
@@ -398,16 +433,17 @@ const config = {
         : "Combine the subjects from Picture 1 and Picture 2 into one coherent scene, preserving their appearance.",
     };
     const request = {
-      model: "{{MODEL_NAME}}", prompt: prompts[s.mode], n: Number(s.outputs),
-      size: `${s.resolution}x${s.resolution}`, num_inference_steps: Number(s.steps),
-      guidance_scale: 1, seed: 42, generator_device: "cpu",
+      prompt: prompts[s.mode], generator_device: "cpu",
       output_format: "png", response_format: "b64_json",
-      background: transparent ? "transparent" : "auto",
     };
+    if (Number(s.outputs) !== 1) request.n = Number(s.outputs);
+    if (s.resolution !== "1024") request.size = `${s.resolution}x${s.resolution}`;
+    if (s.weights !== "turbo" && Number(s.steps) !== 40) request.num_inference_steps = Number(s.steps);
+    if (transparent) request.background = "transparent";
     if (s.mode === "text") {
       return `curl -sS --fail-with-body http://{{CURL_HOST}}:{{CURL_PORT}}/v1/images/generations \\
   -H 'Content-Type: application/json' \\
-  -d '${JSON.stringify({ ...request, enable_cache_dit: false }, null, 2)}'`;
+  -d '${JSON.stringify(request, null, 2)}'`;
     }
     const fields = Object.entries(request).map(([key, value]) => `  --form-string '${key}=${value}'`);
     fields.push('  -F "image[]=@{{INPUT_IMAGE}};type=image/png"');
@@ -420,6 +456,12 @@ ${fields.join(" \\\n")}`;
   showPlaygroundLink: false,
   cells: [],
 };
+
+// Turbo verification is limited to the H200 runs; other base recipes remain unchanged.
+for (const recipe of config.commandBuilder.resource.verifiedRecipes) {
+  recipe.verifiedWhen ??= (s) => s.weights !== "turbo"
+    || (recipe.id === "h200-1-resident" && (!s.batching || s.batching === "off"));
+}
 
 return config;
 })();

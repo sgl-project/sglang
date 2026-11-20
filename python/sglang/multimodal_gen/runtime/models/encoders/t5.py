@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.loader.weight_utils import load_stacked_weight
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     TextEncoder,
     get_folding_tp_group,
@@ -69,6 +69,30 @@ class AttentionType:
 @dataclass
 class AttentionMetadata:
     attn_bias: torch.Tensor
+
+
+class T5LayerNorm(nn.Module):
+    """T5 RMS norm in plain PyTorch, as in HF / the Wan reference: fp32 statistics,
+    cast to the weight dtype, then scale. Runs on any device."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states * torch.rsqrt(
+            hidden_states.float().pow(2).mean(dim=-1, keepdim=True) + self.eps
+        )
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return self.weight * hidden_states
+
+
+def _t5_layer_norm(config: T5Config) -> nn.Module:
+    if getattr(config, "reference_layer_norm", False):
+        return T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+    return RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
 
 
 class T5DenseActDense(nn.Module):
@@ -147,7 +171,7 @@ class T5LayerFF(nn.Module):
         else:
             self.DenseReluDense = T5DenseActDense(config, quant_config=quant_config)
 
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = _t5_layer_norm(config)
 
     def forward(self, hidden_states) -> torch.Tensor:
         forwarded_states = self.layer_norm(hidden_states)
@@ -158,9 +182,6 @@ class T5LayerFF(nn.Module):
 
 # T5 has attn_bias and does not use softmax scaling
 class T5MultiHeadAttention(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-
     def forward(self, q, k, v, attn_bias=None):
         b, _, n, c = q.shape
         attn = torch.einsum("binc,bjnc->bnij", q, k)
@@ -388,7 +409,7 @@ class T5LayerSelfAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.SelfAttention",
         )
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = _t5_layer_norm(config)
 
     def forward(
         self,
@@ -421,7 +442,7 @@ class T5LayerCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.EncDecAttention",
         )
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = _t5_layer_norm(config)
 
     def forward(
         self,
@@ -509,7 +530,6 @@ class T5Stack(nn.Module):
     ):
         super().__init__()
         self.embed_tokens = embed_tokens
-        self.is_umt5 = is_umt5
         if is_umt5:
             self.block = nn.ModuleList(
                 [
@@ -537,7 +557,7 @@ class T5Stack(nn.Module):
                     for i in range(n_layers)
                 ]
             )
-        self.final_layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.final_layer_norm = _t5_layer_norm(config)
 
     def forward(
         self,
@@ -618,37 +638,13 @@ class T5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            loaded = False
             if "decoder" in name or "lm_head" in name:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded = True
-                break
-            if not loaded:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 
@@ -709,41 +705,42 @@ class UMT5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            loaded = False
+            # Wan-native UMT5 checkpoint keys, remapped to this module's names.
+            if name.startswith("token_embedding."):
+                name = name.replace("token_embedding.weight", "shared.weight")
+            elif name == "norm.weight":
+                name = "encoder.final_layer_norm.weight"
+            elif name.startswith("blocks."):
+                name = name.replace("blocks.", "encoder.block.", 1)
+                name = name.replace(".norm1.weight", ".layer.0.layer_norm.weight")
+                name = name.replace(".attn.q.weight", ".layer.0.SelfAttention.q.weight")
+                name = name.replace(".attn.k.weight", ".layer.0.SelfAttention.k.weight")
+                name = name.replace(".attn.v.weight", ".layer.0.SelfAttention.v.weight")
+                name = name.replace(".attn.o.weight", ".layer.0.SelfAttention.o.weight")
+                name = name.replace(".norm2.weight", ".layer.1.layer_norm.weight")
+                name = name.replace(
+                    ".ffn.gate.0.weight", ".layer.1.DenseReluDense.wi_0.weight"
+                )
+                name = name.replace(
+                    ".ffn.fc1.weight", ".layer.1.DenseReluDense.wi_1.weight"
+                )
+                name = name.replace(
+                    ".ffn.fc2.weight", ".layer.1.DenseReluDense.wo.weight"
+                )
+                name = name.replace(
+                    ".pos_embedding.embedding.weight",
+                    ".layer.0.SelfAttention.relative_attention_bias.weight",
+                )
             if "decoder" in name or "lm_head" in name:
                 continue
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded = True
-                break
-            if not loaded:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name,
+                loaded_weight,
+                params_dict,
+                self.config.arch_config.stacked_params_mapping,
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 

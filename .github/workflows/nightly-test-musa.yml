@@ -165,7 +165,7 @@ jobs:
           cd test
           python3 run_suite.py \
             --hw musa \
-            --suite nightly-musa-1-gpu \
+            --suite nightly-test-1-gpu-musa \
             --nightly \
             --timeout-per-file 7200
 
@@ -284,16 +284,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-
-          for job in $job_names; do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-            echo "$job: $result"
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "Nightly failed."
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully."
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
+            exit 1
+          fi
