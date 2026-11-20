@@ -31,13 +31,21 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    RequestRetirer,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -686,7 +694,9 @@ class TestAllocationIntegration(CustomTestCase):
         return req
 
     def drain_transfer_queue(self, reqs):
-        scheduler = self.inflight_scheduler(reqs)
+        return self.drain_transfer_queue_of(self.inflight_scheduler(reqs))
+
+    def drain_transfer_queue_of(self, scheduler):
         scheduler.request_retirer = release_only_retirer(scheduler.tree_cache)
         scheduler.req_to_metadata_buffer_idx_allocator = Mock()
         scheduler._release_mm_inputs = MethodType(
@@ -711,6 +721,49 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(self.drain_transfer_queue([req]), [req])
 
         req.multimodal_inputs.release_features.assert_not_called()
+
+    def test_concluded_transfers_are_sent_before_their_release(self):
+        """A concluded transfer's final output is enqueued before its KV and
+        sender state are released, all within the same poll."""
+        log = []
+        done = self.mm_req("done", sent=True)
+        failed = self.mm_req("failed", sent=False)
+        failed.disagg_kv_sender = Mock(poll=Mock(return_value=KVPoll.Failed))
+        failed.multimodal_inputs = None
+        done.disagg_kv_sender.clear = Mock(side_effect=lambda: log.append("clear"))
+        scheduler = self.inflight_scheduler([done, failed])
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.output_streamer.stream_output.side_effect = lambda reqs, *args: (
+            log.append(("send", [req.rid for req in reqs]))
+        )
+        release = RequestRetirer.release
+        enter_scope(
+            self,
+            patch.object(
+                RequestRetirer,
+                "release",
+                autospec=True,
+                side_effect=lambda retirer, req, *, checkpoint: (
+                    log.append(("release", req.rid, checkpoint)),
+                    release(retirer, req, checkpoint=checkpoint),
+                ),
+            ),
+        )
+
+        with get_parallel().override(tp_rank=0):
+            drained = self.drain_transfer_queue_of(scheduler)
+
+        self.assertEqual(drained, [done, failed])
+        self.assertEqual(
+            log,
+            [
+                ("send", ["done", "failed"]),
+                ("release", "done", True),
+                "clear",
+                ("release", "failed", False),
+            ],
+        )
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()

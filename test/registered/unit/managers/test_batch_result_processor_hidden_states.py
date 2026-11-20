@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -725,6 +726,97 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
 
         self.assertEqual(req.hidden_states, [second_step[1].tolist()])
         self.assertEqual(len(req.hidden_states), 1)
+
+
+class TestDecodeFinalOutputFirst(CustomTestCase):
+    def _finish_one(self, *, auxiliary_output=None):
+        """One decode step that finishes a request whose finished_len the send
+        fills; returns the log of sends, releases and consumes."""
+        processor = _make_processor(self)
+        log = []
+        req = _DecodeReq()
+        req.multimodal_inputs = None
+        req.finished = lambda: True
+        req.update_finish_state = Mock()
+
+        def send(reqs, return_logprob):
+            log.append("send")
+            req.finished_len = len(req.output_ids)
+
+        processor.output_streamer.stream_output.side_effect = send
+        if auxiliary_output is not None:
+            auxiliary_output.consume.side_effect = lambda *args: log.append("consume")
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            batch_size=lambda: 1,
+            mamba_track_mask_cpu=None,
+        )
+        result = GenerationBatchResult(
+            logits_output=SimpleNamespace(
+                hidden_states=None, customized_info=None, sampling_mask_output=None
+            ),
+            speculative_num_draft_tokens=4,
+            auxiliary_host_output=auxiliary_output,
+        )
+        brp = SchedulerBatchResultProcessor
+        with (
+            patch.object(brp, "_normalize_decode_outputs", return_value=([[9]], None)),
+            patch.object(brp, "_maybe_update_reasoning_tokens"),
+            patch.object(brp, "_mamba_prefix_cache_update"),
+            patch.object(brp, "_mamba_can_cache_finished_req", return_value=True),
+            patch.object(brp, "_maybe_collect_routed_experts"),
+            patch.object(brp, "_maybe_collect_indexer_topk"),
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "request_retirer.release_kv_cache",
+                side_effect=lambda req, cache, *, checkpoint: log.append(
+                    ("release", req.finished_len)
+                ),
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+        self.assertEqual(req.finished_len, 1)
+        return log
+
+    def test_final_output_is_sent_before_the_release(self):
+        """The release runs in the same call, after the send, and sees the
+        finished_len from before the send."""
+        self.assertEqual(self._finish_one(), ["send", ("release", None)])
+
+    def test_prebuilt_finish_is_sent_before_the_release(self):
+        """A PD decode request that finishes on its prefill token."""
+        log = []
+        retirer = Mock()
+        retirer.release.side_effect = lambda req, *, checkpoint: log.append(
+            ("release", checkpoint)
+        )
+        processor = replace(
+            _make_processor(self),
+            disaggregation_mode=DisaggregationMode.DECODE,
+            request_retirer=retirer,
+        )
+        processor.output_streamer.stream_output.side_effect = lambda *args: log.append(
+            "send"
+        )
+        req = FakeReq(
+            rid="r",
+            time_stats=Mock(),
+            update_finish_state=Mock(),
+            finished=lambda: True,
+        )
+        processor.process_batch_result_prebuilt(
+            SimpleNamespace(reqs=[req], return_logprob=False)
+        )
+        self.assertEqual(log, ["send", ("release", True)])
+
+    def test_auxiliary_output_consumes_after_the_release(self):
+        """A consumer may defer the finished response, which requires its release."""
+        self.assertEqual(
+            self._finish_one(auxiliary_output=Mock()),
+            [("release", None), "consume", "send"],
+        )
 
 
 if __name__ == "__main__":

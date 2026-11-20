@@ -8,6 +8,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from weakref import WeakKeyDictionary as WeakKeyDict
@@ -312,6 +313,9 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                     req.kv, "req_pool_idx", None
                 )
                 processor = SimpleNamespace(decode_offload_manager=manager)
+                processor._release_finished_req = partial(
+                    SchedulerBatchResultProcessor._release_finished_req, processor
+                )
                 if inflight:
                     manager.offload_inflight[req] = 1
                     manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0, [])

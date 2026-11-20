@@ -1,6 +1,7 @@
 import ast
 import pathlib
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -181,6 +182,60 @@ class TestTakeOutWithoutRelease(CustomTestCase):
 
         self.assertIsNone(req.owner_list)
         self.assertEqual(req.exit_via, "release")
+
+
+class TestStreamThenRelease(CustomTestCase):
+    def _run(self, reqs, log, *, send_error=None, release_errors=()):
+        """Send ``reqs``, filling a missing finished_len, then release each."""
+
+        def send():
+            log.append("send")
+            for req in reqs:
+                if req.finished_len is None:
+                    req.finished_len = 4
+            if send_error is not None:
+                raise send_error
+
+        def release(req, error):
+            log.append((req.rid, req.finished_len))
+            if error is not None:
+                raise error
+
+        errors = list(release_errors) or [None] * len(reqs)
+        ops = [partial(release, req, error) for req, error in zip(reqs, errors)]
+        try:
+            request_retirer.stream_then_release(stream=send, reqs=reqs, release_ops=ops)
+        finally:
+            self.assertEqual(ops, [])
+
+    def test_releases_see_the_finished_len_from_before_the_send(self):
+        """A release frees the KV range finished_len bounds (lookahead, abort);
+        the send's fill must not reach it, and stays for later readers."""
+        log = []
+        filled, preset = FakeReq(rid="a"), FakeReq(rid="b", finished_len=2)
+        self._run([filled, preset], log)
+        self.assertEqual(log, ["send", ("a", None), ("b", 2)])
+        self.assertEqual((filled.finished_len, preset.finished_len), (4, 2))
+
+    def test_releases_run_when_the_send_raises(self):
+        log, req = [], FakeReq(rid="a")
+        with self.assertRaisesRegex(RuntimeError, "send"):
+            self._run([req], log, send_error=RuntimeError("send"))
+        self.assertEqual(log, ["send", ("a", None)])
+        self.assertEqual(req.finished_len, 4)
+
+    def test_a_failed_release_stops_no_other_and_raises_the_first_error(self):
+        """Each queued release is attempted once, so a partial release is never
+        retried, and the first failure surfaces."""
+        log = []
+        reqs = [FakeReq(rid=rid) for rid in "abc"]
+        with self.assertRaisesRegex(ValueError, "first"):
+            self._run(
+                reqs,
+                log,
+                release_errors=[ValueError("first"), KeyError("second"), None],
+            )
+        self.assertEqual(log, ["send", ("a", None), ("b", None), ("c", None)])
 
 
 if __name__ == "__main__":

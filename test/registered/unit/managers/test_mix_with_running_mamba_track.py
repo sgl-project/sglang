@@ -8,6 +8,7 @@ whatever the slot held before.
 """
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -289,6 +290,9 @@ class TestLazyFinishBeforeBoundary(unittest.TestCase):
             request_retirer=SimpleNamespace(
                 release=lambda req, checkpoint: released.append(checkpoint)
             ),
+        )
+        processor._release_finished_req = partial(
+            brp.SchedulerBatchResultProcessor._release_finished_req, processor
         )
         with (
             patch.object(brp, "get_exec", return_value=_settings(lazy=True)),
