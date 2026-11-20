@@ -8,6 +8,9 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+# A tensor weight update names a PDD head stack by this prefix plus its fused heads file key,
+# e.g. "final_layer.pdd_fused_heads.video_out.weight".
+MINIMAX_H3_PDD_FUSED_HEADS_WEIGHT_NAME_PREFIX = "final_layer.pdd_fused_heads."
 
 
 @dataclass
@@ -111,6 +114,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     ffn_hidden_size: int = 14336
     latents_dim: int = 24
     audio_latents_dim: int = 32
+    # False for an image checkpoint without the audio input/output projections
+    # (audio_patch_proj, final_layer.audio_out); it serves no audio rows.
+    audio_enabled: bool = True
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_dim: int = 5120
     timestep_input_dim: int = 256
@@ -134,6 +140,10 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if type(self.audio_enabled) is not bool:
+            raise ValueError(
+                f"audio_enabled must be a bool, got {self.audio_enabled!r}"
+            )
         if isinstance(self.patch_size, list):
             self.patch_size = tuple(self.patch_size)
         if len(self.patch_size) != 3:

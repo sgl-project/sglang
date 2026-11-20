@@ -167,10 +167,32 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
 
         self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
 
-    def test_requested_flash_attention_uses_torch_sdpa_on_sm120(self):
+    def test_requested_flash_attention_on_sm120_initializes_fa4(self):
         FakeCudaPlatform.is_sm120_device = True
+        module_name = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        )
+        fake_flash_attn = ModuleType(module_name)
+        fake_flash_attn.set_fa_ver = Mock()
 
-        self.assertEqual(self.resolve(AttentionBackendEnum.FA), SDPA_BACKEND_CLS_STR)
+        class FakeFlashAttentionBackend:
+            @staticmethod
+            def get_supported_head_sizes():
+                return [128]
+
+        fake_flash_attn.FlashAttentionBackend = FakeFlashAttentionBackend
+        with patch.dict("sys.modules", {module_name: fake_flash_attn}):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.FA),
+                f"{module_name}.FlashAttentionBackend",
+            )
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_requested_flash_attention_on_sm120_retains_dtype_fallback(self):
+        FakeCudaPlatform.is_sm120_device = True
+        self.assertEqual(
+            self.resolve(AttentionBackendEnum.FA, torch.float32), SDPA_BACKEND_CLS_STR
+        )
 
     def test_default_backend_falls_back_for_non_flash_attention_dtype(self):
         self.assertEqual(self.resolve(None, torch.float32), SDPA_BACKEND_CLS_STR)
