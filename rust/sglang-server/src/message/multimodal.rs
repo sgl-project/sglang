@@ -25,6 +25,10 @@ pub struct MediaHints {
     pub fps: Option<f64>,
     /// Image: the requested detail level ("auto" | "low" | "high").
     pub detail: Option<String>,
+    /// Video: the most frames to sample.
+    pub max_frames: Option<i64>,
+    /// Video: the most tokens per sampled frame.
+    pub max_tokens_per_frame: Option<i64>,
 }
 
 impl MmItem {

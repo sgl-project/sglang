@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
@@ -63,7 +64,7 @@ class TestNumTokensPendingPrealloc(CustomTestCase):
             ListKind.PD_PREALLOC, [SimpleNamespace(req=_waiting_req(100, 0))]
         )
         queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
-        queue.retracted_queue.join([_waiting_req(50, 11)])
+        move([_waiting_req(50, 11)], queue.retracted_queue)
         # The last output id of a retracted req is the pending decode input.
         self.assertEqual(queue.num_tokens_pending_prealloc, 100 + 50 + 10)
 

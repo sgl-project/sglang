@@ -20,9 +20,29 @@ on:
         required: false
         type: boolean
         default: false
+  # Called by release-branch-cut.yml so a new release branch also runs the
+  # weekly suites. Named git_ref, not ref: the stages read it back out of
+  # toJson(inputs) as `.git_ref`.
+  workflow_call:
+    inputs:
+      git_ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
+      runner_filter:
+        description: 'runner_config to run alone (empty or "all" runs every one)'
+        required: false
+        type: string
+        default: 'all'
+      full_parallel:
+        description: 'Run all shards of a job at once (faster, but competes with per-commit CI for machines). Off by default: one shard at a time.'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: weekly-test-nvidia-${{ github.ref }}
+  group: weekly-test-nvidia-${{ inputs.git_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -38,6 +58,7 @@ jobs:
   check-changes:
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
+      git_ref: ${{ inputs.git_ref || '' }}
       pr_test_yml: '.github/workflows/weekly-test-nvidia.yml'
       run_all_tests: true
       force_continue_on_error: true
@@ -62,6 +83,7 @@ jobs:
           - { runner_config: 4-gpu-b200, run_timeout: '150', job_timeout: '210' }
           - { runner_config: 8-gpu-h200, run_timeout: '240', job_timeout: '300' }
           - { runner_config: 8-gpu-b200, run_timeout: '360', job_timeout: '420' }
+          - { runner_config: 8-gpu-b300, run_timeout: '360', job_timeout: '420' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: weekly-test-${{ matrix.runner_config }}

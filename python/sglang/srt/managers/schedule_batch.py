@@ -77,6 +77,7 @@ import torch
 from sglang.srt.beam_search.batch_tail import (
     BeamTail,
     append_beam_tail,
+    beam_launch_complete,
     beam_retraction_order,
     num_beam_member_rows,
     strip_beam_tail,
@@ -104,7 +105,7 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
-    get_request_return_hidden_states_mode,
+    TokenIdRows,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -180,19 +181,13 @@ def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     return mode
 
 
-def need_return_hidden_states(
-    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
-) -> bool:
-    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
-
-
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
         raise ValueError(
             f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
             f"MM pad_values may overlap with valid token IDs. "
-            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+            f"Please increase MM_PAD_SHIFT_VALUE in req_types.py."
         )
 
 
@@ -237,6 +232,7 @@ def split_cached_prefix_by_tier(
 class ReqLogprob:
     top_logprobs_num: int
     token_ids_logprob: Optional[List[int]]
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
     input_token_logprobs_val: Optional[List[float]] = None
     input_token_logprobs_idx: Optional[List[int]] = None
     input_top_logprobs_val: Optional[List[List[float]]] = None
@@ -258,6 +254,13 @@ class ReqLogprob:
         None
     )
     output_token_ids_logprobs_idx: Optional[list] = None
+
+    @property
+    def scores_input_token_ids(self) -> bool:
+        return (
+            self.token_ids_logprob is not None
+            or self.token_ids_logprob_rows is not None
+        )
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -637,6 +640,8 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # gamma-Ada step clock when a sort pass first saw it (tp or pp > 1); kept on retraction.
+        self.uniboost_first_seen_step: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
@@ -1880,6 +1885,24 @@ def retract_all(
     return reqs_to_abort
 
 
+def token_id_rows_for_extend(
+    rows: List[List[int]],
+    *,
+    logprob_start_len: int,
+    first_scored_pos: int,
+    num_scored: int,
+) -> TokenIdRows:
+    """The rows one extend scores: position q predicts token q + 1, so it reads
+    ``rows[q - logprob_start_len]``, and the last input position an empty row."""
+    first = first_scored_pos - logprob_start_len
+    last = first + num_scored
+    assert num_scored == 0 or (first >= 0 and last <= len(rows) + 1), (
+        f"extend scores rows [{first}, {last}) of {len(rows)} token id rows"
+    )
+    picked = rows[first:last]
+    return TokenIdRows(picked + [[]] * (num_scored - len(picked)))
+
+
 def compute_extend_logprob_start_len(
     *,
     logprob_start_len: int,
@@ -2127,7 +2150,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For processing logprobs
     top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
@@ -2193,7 +2216,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
-                model_config.vocab_size,
+                model_config.token_id_vocab_size,
             ),
             dllm_config=dllm_config,
         )
@@ -2600,7 +2623,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
+            self.token_ids_logprobs = [
+                (
+                    r.logprob.token_ids_logprob
+                    if r.logprob.token_ids_logprob_rows is None
+                    else token_id_rows_for_extend(
+                        r.logprob.token_ids_logprob_rows,
+                        logprob_start_len=r.logprob_start_len,
+                        first_scored_pos=prefix_lens[i] + extend_logprob_start_lens[i],
+                        num_scored=extend_lens[i] - extend_logprob_start_lens[i],
+                    )
+                )
+                for i, r in enumerate(reqs)
+            ]
 
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
@@ -3353,7 +3388,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
+                if not self.reqs[i].finished()
+                and not beam_launch_complete(self.reqs[i])
+                and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -3421,6 +3458,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        self.sampling_info.refresh_top_k_flags(
+            [req.sampling_params.top_k for req in self.reqs]
+        )
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,

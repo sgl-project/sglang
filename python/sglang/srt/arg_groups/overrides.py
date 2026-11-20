@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
+    mamba_extra_buffer_of,
     model_config_of,
     record_of,
     register_model_override_predicate,
@@ -52,7 +53,10 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
-from sglang.srt.configs.quant_utils import get_quantization_config
+from sglang.srt.configs.quant_utils import (
+    LOADER_RESOLVED_QUANT_METHODS,
+    get_quantization_config,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -263,9 +267,16 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        mamba_extra_buffer_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
+
+
+def mamba_path_state_cap_of(cfg: Any) -> int:
+    """The per-path Mamba state cap the tree enforces."""
+    if cfg.mamba_max_states_per_path is not None:
+        return cfg.mamba_max_states_per_path
+    return 1 if cfg.hybrid_cache_checkpoints_level < 3 else -1
 
 
 def collect_model_override_declarations(
@@ -382,6 +393,9 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_7ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -417,6 +431,9 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "Lfm3ForCausalLM",
+        "Lfm3VlForConditionalGeneration",
+        "Lfm3AudioForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -427,6 +444,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
+        "Inkling2ForConditionalGeneration",
     }
 )
 
@@ -436,6 +454,13 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
+    if get_platform().is_xpu:
+        return False
+    if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
+        # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
+        return False
+    if get_platform().is_xpu:
+        return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
@@ -528,11 +553,24 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
     if kv_cache_dtype == "auto":
+        # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels
+        # take fp8 KV and the gfx950-tuned sparse-MLA path requires it. The raw
+        # fp8 MLA layout is only read back on the aiter path (forward_mha.py).
+        hip_gfx95_fp8 = (
+            get_platform().is_hip
+            and is_gfx95_supported()
+            and envs.SGLANG_USE_AITER.get()
+            and view.dsa_prefill_backend in (None, "triton", "tilelang")
+            and view.dsa_decode_backend in (None, "triton", "tilelang")
+        )
         kv_cache_dtype = (
-            "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"
+            "fp8_e4m3"
+            if (major >= 10 or hip_gfx95_fp8) and not has_attention_sinks
+            else "bfloat16"
         )
         logger.warning(
-            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA "
+            f"(device capability major {major})."
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
@@ -551,10 +589,20 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     dcp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    from sglang.srt.configs.model_config import is_q8_raw_fp8_nope_layout
+
     chosen = {prefill_backend, decode_backend}
+
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+        )
 
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
@@ -575,9 +623,18 @@ def _check_dsa_backend_constraints(
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
-    if prefill_backend != "tilelang" or decode_backend != "tilelang":
+    native_raw_nope = is_q8_raw_fp8_nope_layout(
+        prefill_backend=prefill_backend,
+        decode_backend=decode_backend,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    if not native_raw_nope and (
+        prefill_backend != "tilelang" or decode_backend != "tilelang"
+    ):
         raise ValueError(
-            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
+            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang, "
+            "or Q8 prefill with TileLang decode and a 512-dim NoPE layout; "
             "raw and scaled FP8 KV layouts cannot be mixed."
         )
     if dcp_size > 1:
@@ -586,6 +643,8 @@ def _check_dsa_backend_constraints(
     import torch
 
     major, minor = torch.cuda.get_device_capability()
+    if native_raw_nope and major != 9:
+        raise ValueError("Native raw FP8 NoPE sparse prefill requires SM90.")
     if (major, minor) < (8, 9):
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
@@ -596,11 +655,19 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     dcp_size: int = 1,
 ) -> None:
-    """Backward-compatible entry point for the TileLang DSA validation."""
+    """Entry point for TileLang DSA validation with explicit KV geometry."""
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
+        kv_cache_dtype,
+        prefill_backend,
+        decode_backend,
+        hip=hip,
+        dcp_size=dcp_size,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
 
 
@@ -706,6 +773,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             decode,
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
+            kv_lora_rank=model_config_of(view).kv_lora_rank,
+            qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -740,6 +809,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        kv_lora_rank=model_config_of(view).kv_lora_rank,
+        qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
@@ -764,9 +835,21 @@ def _pin_dsa_backends(
 
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
-_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
+
+
+def _kimi_k31_default_dsa_backend(view: Any) -> str:
+    # HiSparse admits only flashmla_kv among the K3.1 backends.
+    platform = get_platform()
+    if (
+        not view.enable_hisparse
+        and platform.is_sm100
+        and platform.device_sm in (100, 103, 107)
+    ):
+        return "prims_ts"
+    return _KIMI_K31_DSA_BACKEND
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
@@ -782,9 +865,11 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
-    if view.enable_hisparse:
-        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
     if get_platform().is_hip:
+        if view.enable_hisparse:
+            raise ValueError(
+                "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
+            )
         backend = _KIMI_K31_DSA_BACKEND_HIP
         return _pin_dsa_backends(
             view,
@@ -808,16 +893,23 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     if len(chosen) > 1:
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
-            f"layouts); got {view.dsa_prefill_backend!r} and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
-    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-    if backend == "trtllm":
+    backend = chosen.pop() if chosen else _kimi_k31_default_dsa_backend(view)
+    if backend in ("trtllm", "prims_ts"):
         logger.warning(
-            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
-            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
-            "use trtllm."
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
@@ -893,7 +985,9 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
                         "keeping bf16 for DeepSeek-arch model on sm100"
                     )
             else:
-                overrides["quantization"] = quantization = quant_method
+                quantization = quant_method
+                if quant_method not in LOADER_RESOLVED_QUANT_METHODS:
+                    overrides["quantization"] = quant_method
         if (
             view.moe_a2a_backend == "none"
             and view.moe_runner_backend == "auto"
@@ -1747,10 +1841,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """Disable shared-expert fusion for incompatible MoE runners.
-
-    Runs before the deprecated cutlass environment override.
-    """
+    """Disable shared-expert fusion for incompatible MoE runners."""
     runner = view.moe_runner_backend
     if runner in ("lora_triton", "lora_cutedsl", "lora_marlin"):
         logger.warning("LoRA MoE keeps shared experts separate for adapter attachment.")
@@ -2034,6 +2125,14 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     if cfg.enable_memory_saver:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+        return False
+    # NIXL registers each unified arena as one region; post-capture VMM backing can
+    # span multiple CUDA allocations, not qualified with our UCX registration.
+    if (
+        cfg.enable_unified_memory
+        and cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend == "nixl"
+    ):
         return False
     # Mooncake over EFA cannot register the CUDA VMM allocation used by
     # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
