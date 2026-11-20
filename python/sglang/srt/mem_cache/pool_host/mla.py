@@ -737,7 +737,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
-        if io_backend not in ("kernel", "direct"):
+        if io_backend not in ("kernel", "direct", "kernel_ascend"):
             raise ValueError(
                 f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"
             )
@@ -745,7 +745,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Draft transfer IDs follow all target device layers, while host rows
         # follow only this rank's target layers.
         host_layer_id = self._host_layer_by_controller[layer_id]
-        device_buffer = self.device_kv_buffers[self._buffer_index_by_layer[layer_id]]
+        if io_backend != "kernel_ascend":
+            device_buffer = self.device_kv_buffers[
+                self._buffer_index_by_layer[layer_id]
+            ]
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -800,6 +803,47 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     "Layer-sharded direct HiCache backup only supports "
                     f"layer_first layout, got {self.layout}"
                 )
+        elif io_backend == "kernel_ascend":
+            # Layer-sharded NPU D2H: the whole owned-layer range is transferred
+            # in one call per pool, so only the first owned layer triggers the
+            # transfer and later iterations return early.  Pools (target and
+            # compatible MTP drafts) mirror the non-sharded kernel_ascend
+            # backup via the same all-layer kv-split kernel.
+            if is_draft or layer_id != 0:
+                return
+            if self.layout == "page_first_kv_split":
+                transfer = transfer_kv_all_layer_kv_split_lf_pf
+            elif self.layout == "layer_first_kv_split":
+                transfer = transfer_kv_all_layer_kv_split
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            indexer_backup = self._npu_indexer_backup
+            for native, host_k, host_v, is_target in self._npu_pool_bindings:
+                copy_indexer_with_kv = is_target and indexer_backup is None
+                transfer(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    device_k=native.k,
+                    host_k=host_k,
+                    device_v=native.v,
+                    host_v=host_v,
+                    device_index_k=native.index_k,
+                    host_index_k=self.index_k_buffer if copy_indexer_with_kv else None,
+                    device_index_k_scale=native.index_scales,
+                    host_index_k_scale=(
+                        self.index_k_scale_buffer if copy_indexer_with_kv else None
+                    ),
+                    page_size=self.page_size,
+                    impl="auto",
+                )
+                if is_target and indexer_backup is not None:
+                    ratio = self.page_size // indexer_backup["page_size"]
+                    transfer(
+                        device_indices=device_indices[::ratio] // ratio,
+                        host_indices=host_indices[::ratio] // ratio,
+                        **indexer_backup,
+                        impl="auto",
+                    )
 
     def _init_npu_transfer_bindings(self):
         self._npu_layer_bindings = {}
