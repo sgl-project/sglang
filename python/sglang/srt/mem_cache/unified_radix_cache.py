@@ -964,7 +964,13 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if not (params.num_tokens or params.window_num_tokens or params.mamba_num):
             return
-        if params.num_tokens and windows and _is_cuda and self.is_write_back:
+        if (
+            params.num_tokens
+            and windows
+            and state is None
+            and _is_cuda
+            and self.is_write_back
+        ):
             # FULL victims also free window bytes;
             # batch write-back until admission credits enough of both.
             demand = self._units_demand(demands)

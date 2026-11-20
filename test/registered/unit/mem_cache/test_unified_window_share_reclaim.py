@@ -28,10 +28,12 @@ from sglang.test.hicache_write_back_fixtures import (
     SlotOnlyHostPool,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import token_demand
 from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_swa_cache,
+    build_tri_cache,
     build_unified_bundle,
     build_window_chain,
     largest_take,
@@ -139,24 +141,32 @@ class TestWindowShareTrim(CustomTestCase):
         self.addCleanup(reset_context)
         setup_allocator_context()
 
-    def _reclaim(self, page_size, occupancy, share_rows, windows_first):
+    def _reclaim(self, page_size, occupancy, share_rows, windows_first, locked=False):
         cache, allocator = _write_back_cache(
             occupancy, window_host=True, page_size=page_size
         )
         owner = allocator.full_attn_allocator.sub_pool_name
         (window,) = allocator.window_pool_names()
         allocator.window_share_rows = share_rows
-        demand = KVDemand(largest_take(allocator, owner) + 2, {window: 0})
-        waits = []
-        with _count_waits(cache, waits):
-            result = cache.reclaim_jointly(demand, windows_first=windows_first)
-        self.assertTrue(allocator.ensure_capacity(demand))
+        # Found without a match, which would make it the most recent entry.
+        oldest = _node_id(cache, list(range(page_size)))
+        lock = cache.lock(oldest) if locked else None
+        try:
+            demand = KVDemand(largest_take(allocator, owner) + 2, {window: 0})
+            waits = []
+            with _count_waits(cache, waits):
+                result = cache.reclaim_jointly(demand, windows_first=windows_first)
+            self.assertTrue(allocator.ensure_capacity(demand))
+            outcome = (
+                result.num_tokens_evicted // page_size,
+                cache.window_evictable_size(window) // page_size,
+                len(waits),
+                _on_device(cache, oldest),
+            )
+        finally:
+            cache.unlock(lock)
         cache.sanity_check()
-        return (
-            result.num_tokens_evicted // page_size,
-            cache.window_evictable_size(window) // page_size,
-            len(waits),
-        )
+        return outcome
 
     def test_a_trim_starts_past_the_high_mark_and_ends_at_the_low_mark(self):
         for windows_first, page_size, occupancy in itertools.product(
@@ -169,11 +179,22 @@ class TestWindowShareTrim(CustomTestCase):
                     page_size, occupancy, 32 * page_size, windows_first
                 )
                 unshared = self._reclaim(page_size, occupancy, None, windows_first)
-                self.assertEqual(unshared, (1, occupancy - 1, 1))
+                self.assertEqual(unshared, (1, occupancy - 1, 1, False))
                 if occupancy <= 34:
                     self.assertEqual(trimmed, unshared)
                 else:
-                    self.assertEqual(trimmed, (5, 30, 5))
+                    self.assertEqual(trimmed, (5, 30, 5, False))
+
+    def test_a_locked_prefix_is_kept_out_of_the_trim(self):
+        for windows_first, page_size in itertools.product((False, True), (1, 16, 64)):
+            with self.subTest(windows_first=windows_first, page_size=page_size):
+                share = 32 * page_size
+                unlocked = self._reclaim(page_size, 36, share, windows_first)
+                self.assertFalse(unlocked[3])
+                self.assertEqual(
+                    self._reclaim(page_size, 36, share, windows_first, locked=True),
+                    (5, 30, 5, True),
+                )
 
     def test_joint_lru_evicts_by_recency_alone(self):
         _, allocator, _ = build_window_chain(
@@ -207,14 +228,25 @@ class TestWindowShareTrim(CustomTestCase):
         self.assertEqual(cached, [i != 1 for i in range(len(keys))])
 
 
-def _cached(cache, key):
+def _node_id(cache, key):
     stack = list(cache.tree_core.root_node.children.values())
     while stack:
         node = stack.pop()
         if list(node.key) == key:
-            return True
+            return node.id
         stack.extend(node.children.values())
-    return False
+    return None
+
+
+def _cached(cache, key):
+    return _node_id(cache, key) is not None
+
+
+def _on_device(cache, node_id):
+    return all(
+        cache.tree_core.get_component_device_value(node_id, ct) is not None
+        for ct in (ComponentType.FULL, *cache.window_slots())
+    )
 
 
 class TestSecondaryWindowShare(CustomTestCase):
@@ -432,6 +464,65 @@ class TestOwnerReclaimBesideWindows(CustomTestCase):
             ),
             ([victims], victims),
         )
+
+
+class TestStateChainKeepsPerVictimWalk(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(reset_context)
+        setup_allocator_context()
+
+    def _reclaim(self, cuda):
+        _, allocator, cache = build_tri_cache()
+        keys = []
+        for i in range(6):
+            key = RadixKey(array("q", range(i * 1000, i * 1000 + 4)))
+            state = allocator.state_slots.alloc(1).reshape(1)
+            cache.insert(
+                InsertParams(key=key, value=allocator.alloc(4), mamba_value=state)
+            )
+            keys.append(key)
+        while allocator.state_slots.alloc(1) is not None:
+            pass
+        host_pool = SlotOnlyHostPool(1024, 1)
+        host_group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=host_pool,
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        cache.host_pool_group = host_group
+        cache.cache_controller = InstantWriteBackController(host_group, allocator)
+        cache.components[ComponentType.FULL]._full_kv_pool_host = host_pool
+        cache.tree_core.set_hicache_enabled()
+        cache.is_write_back = True
+        cache.write_through_threshold = 1 << 30
+        while allocator.ensure_capacity(token_demand(allocator, 4, 4)):
+            allocator.free_swa(allocator.alloc(4))
+        demand = token_demand(
+            allocator, allocator.full_available_size() + 12, 0, state_slots=1
+        )
+        waits = []
+        with mock.patch.object(urc, "_is_cuda", cuda), _count_waits(cache, waits):
+            result = cache.evict_for_alloc(demand)
+        self.assertTrue(allocator.ensure_capacity(demand))
+        cache.sanity_check()
+        cached = [
+            cache.match_prefix(MatchPrefixParams(key)).device_prefix_len for key in keys
+        ]
+        return waits, result.num_tokens_evicted, result.mamba_num_evicted, cached
+
+    def test_cuda_walks_victims_as_other_platforms_do(self):
+        per_victim = self._reclaim(cuda=False)
+        waits, _, states, _ = per_victim
+        self.assertEqual(waits, [1] * len(waits))
+        self.assertGreaterEqual(len(waits), 2)
+        self.assertGreater(states, 0)
+        self.assertEqual(self._reclaim(cuda=True), per_victim)
 
 
 class _QueuedOwnerWalkOnTrees:
