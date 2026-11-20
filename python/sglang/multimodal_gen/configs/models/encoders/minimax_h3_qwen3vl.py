@@ -35,6 +35,14 @@ class MiniMaxH3Qwen3VLConfig(Qwen3VLConfig):
     arch_config: MiniMaxH3Qwen3VLArchConfig = field(
         default_factory=MiniMaxH3Qwen3VLArchConfig
     )
+    # both switches follow the Diffusers / Transformers pipeline, the reference
+    # of the video releases; the image release turns them off
+    # keep the whole ~0.4B vision tower on every encoder TP rank instead of
+    # TP-folding it, so image-conditioned embeddings do not depend on the TP
+    # width (which follows the Ulysses degree)
+    vision_replicated: bool = True
+    # round the vision tower as the Transformers reference does
+    vision_transformers_numerics: bool = True
 
     def post_diffusers_config_update(self) -> None:
         """Select the in-tree extractor after loading the HF architecture."""

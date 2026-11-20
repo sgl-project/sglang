@@ -226,8 +226,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             # CPU initialization computes pow differently from CUDA. Image
             # releases rebuild the small vision frequency table after offload
             # transfers so conditioning matches the GPU-resident encoder, as in
-            # the native Qwen-Image path. Video releases keep the table their
-            # consistency references were generated with.
+            # the native Qwen-Image path. Video releases use the host-initialized
+            # table of the Transformers reference instead (host_inv_freq).
             visual.rotary_pos_emb.recompute_on_device_change = True
         self.add_stage(
             MiniMaxH3TextEncodingStage(
