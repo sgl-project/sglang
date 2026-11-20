@@ -56,7 +56,7 @@ ROUNDS = 2 * eagle_post_verify_graphs._NUM_WARMUP + 4
 
 def _target_worker():
     return SimpleNamespace(
-        model_runner=SimpleNamespace(watermark_state=None),
+        model_runner=SimpleNamespace(watermark=None),
         random_seed=11,
         device="cpu",
     )
@@ -157,7 +157,7 @@ def _round(bs, generator, vocab=VOCAB):
             acc_scaling_penalties=None,
             logit_bias=None,
             sampling_seed=None,
-            has_watermark_candidates=False,
+            watermark=None,
             temperatures=None,
             top_ks=None,
             top_ps=None,
@@ -215,7 +215,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         has_grammar=False,
         device="cpu",
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
-        sampling_info=None,
+        sampling_info=SimpleNamespace(watermark=None),
         return_logprob=False,
     )
     target_worker = SimpleNamespace(
@@ -226,7 +226,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
             )
         ),
         model_runner=SimpleNamespace(
-            watermark_state=None,
+            watermark=None,
             attn_backend=SimpleNamespace(verify_mask=None),
         ),
     )
@@ -323,7 +323,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 logit_bias=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,
-                has_watermark_candidates=False,
+                watermark=None,
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
@@ -457,7 +457,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 logit_bias=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,
-                has_watermark_candidates=False,
+                watermark=None,
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=False,
@@ -552,7 +552,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         reference_rng = simulated_acc_len_generator(0)
         graphs = EaglePostVerifyGraphs(
             target_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(watermark_state=None, model_config=None)
+                model_runner=SimpleNamespace(watermark=None, model_config=None)
             ),
             simulated_acc_len_rng=worker_rng,
         )
