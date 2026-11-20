@@ -369,7 +369,7 @@ class ServerArgs:
     # construction in model_runner_kv_cache_mixin._init_pools.
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
-        return {"mooncake"}
+        return {"mooncake", "nixl"}
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -839,9 +839,6 @@ class PortArgs:
     # The port for nccl initialization (torch.dist)
     nccl_port: int
 
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
-
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
@@ -906,7 +903,6 @@ class PortArgs:
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 decoupled_spec_ipc_config=decoupled_spec_ipc_config,
@@ -941,7 +937,6 @@ class PortArgs:
                 port_base = dist_init_port + 1
 
             detokenizer_port = port_base + 1
-            rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
             if dp_rank is None:
@@ -971,7 +966,6 @@ class PortArgs:
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     if not dist_init_overridden:
                         wait_port_available(nccl_port, "nccl_port")
-                    wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
@@ -994,7 +988,6 @@ class PortArgs:
                     dist_init_host, detokenizer_port
                 ).to_tcp(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 decoupled_spec_ipc_config=decoupled_spec_ipc_config,
