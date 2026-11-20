@@ -3524,14 +3524,6 @@ class DeepseekSparseAttnBackend(
             # helpers keep them aligned); fall back to full-width compute if
             # they ever diverge.
             topk_length = None
-        if (
-            topk_length is not None
-            and self.dsa_index_topk is not None
-            and page_table_1.shape[-1] < self.dsa_index_topk
-        ):
-            # A narrower selection (e.g. a sliding window) holds at most its
-            # width of valid indices; don't scan past it.
-            topk_length = topk_length.clamp(max=page_table_1.shape[-1])
 
         if use_small_heads:
             o, _, _ = self._call_flash_mla_sparse_fwd_small_heads(
