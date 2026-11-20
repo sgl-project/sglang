@@ -212,3 +212,12 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _name in ("tournament", "sample", "project_state", "commit_state"):
+    register_kernel(
+        KernelSpec(
+            op=f"sampling.synthid_{_name}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.sampling.synthid_triton:synthid_{_name}_triton",
+            capabilities=CUDA_ONLY,
+        )
+    )

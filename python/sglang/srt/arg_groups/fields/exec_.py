@@ -104,7 +104,7 @@ class ExecFeatures(msgspec.Struct):
         "Watermark settings as a JSON file path or an inline JSON object with "
         "optional default_enabled and enforce_all fields; gumbel reads key, key_b, "
         "context_window, mixing_probability, and max_probability; synthid reads "
-        "keys, ngram_len, top_k, context_history_size, and "
+        "keys, ngram_len, num_candidates, context_history_size, and "
         "skip_first_ngram_calls.",
     ] = None
     watermark_key: A[
@@ -143,7 +143,7 @@ class ExecFeatures(msgspec.Struct):
         Optional[int],
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = None
-    watermark_top_k: A[
+    watermark_num_candidates: A[
         Optional[int],
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = None

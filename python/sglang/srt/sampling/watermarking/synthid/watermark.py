@@ -15,63 +15,36 @@
 
 The transform rewrites the logits of watermarked rows so that a stock sampler,
 which divides by the temperature and samples from the softmax, draws from the
-SynthID law: on each row the ``top_k`` candidates get ``score * T`` and every
-other token gets ``-inf``. ``score`` is the log-probability after temperature,
-the request filters, and the tournament; a row whose context is repeated (or
-among the first skipped calls) keeps the filtered base law inside the cap.
-Request filters (top-k, top-p, min-p) come from the caller as a callable and
-run on the capped candidates before the watermark.
+SynthID law: on each row the ``num_candidates`` candidates get ``score * T`` and
+every other token gets ``-inf``. ``score`` is the log-probability after
+temperature, the request filters, and the tournament; a row whose context is
+repeated (or among the first skipped calls) keeps the filtered base law inside
+the cap.
 
-Caller contract: on watermarked rows the stock sampler runs with top_p=1 and
-min_p=0; the request top-p and min-p belong in ``filter_probs``, before the
-tournament. The request top-k may stay: after ``filter_probs`` a row's support
-has at most top_k tokens, so the sampler's top-k keeps all of it. Without
-``filter_probs`` the sampler's top-k would act after the tournament instead of
-before it. The law holds up to rounding, since ``(score * T) / T`` is not
-bit-equal to ``score``.
+Caller contract: the request top-k, top-p, and min-p run as ``filter_probs``,
+before the tournament; the stock sampler then draws the watermarked rows with
+top_p=1 and min_p=0.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import torch
 
 from sglang.kernels.ops.sampling.synthid import MAX_BLOCK_CANDIDATES
 from sglang.srt.sampling.watermarking.synthid.algorithm import (
     SynthIDConfig,
-    watermark_topk_scores_torch,
+    synthid_tournament_torch,
 )
 from sglang.srt.sampling.watermarking.synthid.state import SynthIDStatePool
 
-# Maps base probabilities ``[R, top_k]`` over each row's candidates to the
-# filtered probabilities; a zero entry removes that candidate.
+# Maps base probabilities ``[R, num_candidates]`` over each row's candidates to
+# the filtered probabilities; a zero entry removes that candidate.
 FilterProbs = Callable[[torch.Tensor], torch.Tensor]
 
 
-def top_k_top_p_min_p_filter_probs(
-    probs: torch.Tensor,
-    *,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
-    min_ps: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """The request top-k, top-p, and min-p of each row over ``probs`` ``[R, C]``,
-    renormalized: a ``FilterProbs`` once the per-row values are bound. Keeps the
-    same tokens as the pytorch sampling backend's filter (``min_ps`` None skips
-    min-p)."""
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    rank = torch.arange(probs.shape[-1], device=probs.device).view(1, -1)
-    probs_sort[rank >= top_ks.view(-1, 1)] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    if min_ps is not None:
-        probs_sort[probs_sort < probs_sort[:, :1] * min_ps.view(-1, 1)] = 0.0
-    filtered = torch.zeros_like(probs).scatter_(1, probs_idx, probs_sort)
-    return filtered / filtered.sum(dim=-1, keepdim=True)
-
-
-class SynthIDSampler:
+class SynthIDWatermark:
     """SynthID keys, per-slot state, and the logits transforms."""
 
     def __init__(
@@ -83,6 +56,21 @@ class SynthIDSampler:
         self.config = config
         self.keys = torch.tensor(config.keys, dtype=torch.int64, device=device)
         self.state = SynthIDStatePool(config, num_slots, device)
+
+    def seed(
+        self, slots: torch.Tensor, replay_token_ids: Sequence[Sequence[int]]
+    ) -> None:
+        """See ``SynthIDStatePool.seed``."""
+        self.state.seed(slots, replay_token_ids)
+
+    def commit(
+        self,
+        slots: torch.Tensor,
+        token_ids: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> None:
+        """See ``SynthIDStatePool.commit``."""
+        self.state.commit(slots, token_ids, lengths)
 
     def apply(
         self,
@@ -113,13 +101,13 @@ class SynthIDSampler:
         slots: torch.Tensor,
         verify_tokens: torch.Tensor,
         *,
-        requests: Optional[torch.Tensor] = None,
+        request_rows: Optional[torch.Tensor] = None,
         filter_probs: Optional[FilterProbs] = None,
     ) -> None:
         """Watermark the target logits of a linear verify step, in place.
 
         ``logits`` is ``[B * W, V]`` float32, ``W`` rows per request.
-        ``requests`` (int64, ``[N]``) picks the watermarked requests, all ``B``
+        ``request_rows`` (int64, ``[N]``) picks the watermarked requests, all ``B``
         when None; ``temperatures`` ``[N, 1]``, ``slots`` ``[N]`` and
         ``verify_tokens`` ``[N, W]`` (see ``SynthIDStatePool.project``) belong
         to those requests, and ``filter_probs`` sees their ``N * W`` rows in
@@ -128,9 +116,9 @@ class SynthIDSampler:
         width = verify_tokens.shape[1]
         context_hashes, apply_mask = self.state.project(slots, verify_tokens)
         rows = None
-        if requests is not None:
-            offsets = torch.arange(width, device=requests.device)
-            rows = (requests[:, None] * width + offsets).view(-1)
+        if request_rows is not None:
+            offsets = torch.arange(width, device=request_rows.device)
+            rows = (request_rows[:, None] * width + offsets).view(-1)
         self._watermark_rows(
             logits,
             rows,
@@ -145,7 +133,7 @@ class SynthIDSampler:
         return (
             self.state.use_triton
             and logits.dtype == torch.float32
-            and self.config.top_k <= MAX_BLOCK_CANDIDATES
+            and self.config.num_candidates <= MAX_BLOCK_CANDIDATES
         )
 
     def sample(
@@ -159,9 +147,9 @@ class SynthIDSampler:
         For a batch whose rows are all watermarked and have no request filters,
         logprob, or sampling-mask outputs. ``logits`` ``[B, V]`` float32 is read
         only; returns int32 token ids ``[B]``, which the caller commits with
-        ``state.commit``.
+        ``commit``.
         """
-        from sglang.kernels.ops.sampling.synthid.triton import synthid_sample_triton
+        from sglang.kernels.ops.sampling.synthid_triton import synthid_sample_triton
 
         scores, token_ids = self._candidates(logits)
         exponential_noise = torch.empty_like(scores).exponential_(1.0)
@@ -219,7 +207,7 @@ class SynthIDSampler:
     def _candidates(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.topk(
             logits,
-            k=min(self.config.top_k, logits.shape[-1]),
+            k=min(self.config.num_candidates, logits.shape[-1]),
             dim=-1,
             sorted=False,
         )
@@ -231,14 +219,14 @@ class SynthIDSampler:
         context_hashes: torch.Tensor,
         apply_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if scores.is_cuda:
-            from sglang.kernels.ops.sampling.synthid.triton import (
-                watermark_topk_scores_triton,
+        if self.state.use_triton:
+            from sglang.kernels.ops.sampling.synthid_triton import (
+                synthid_tournament_triton,
             )
 
-            return watermark_topk_scores_triton(
+            return synthid_tournament_triton(
                 scores, token_ids, context_hashes, self.keys, apply_mask
             )
-        return watermark_topk_scores_torch(
+        return synthid_tournament_torch(
             scores, token_ids, context_hashes, self.keys, apply_mask
         )

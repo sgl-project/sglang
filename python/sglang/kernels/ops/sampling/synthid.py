@@ -11,14 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""SynthID Triton sampling kernels and the shapes they support.
+"""SynthID hash constants and the shapes its Triton kernels support; imports
+without Triton. The kernels are in ``synthid_triton``."""
 
-The limits import without Triton; the kernels are in ``triton``.
-"""
+HASH_MULTIPLIER = 6364136223846793005
+HASH_INCREMENT = 1
+HASH_ROUNDS = 12
+HASH_SHIFT = 5
+G_VALUE_SHIFT = 30
 
 # One program holds at most this many candidates: the one-block tournament and
 # the fused sample; the wide tournament streams candidates in tiles of it.
 MAX_BLOCK_CANDIDATES = 1024
+# The widest tournament the kernel tests cover.
+MAX_NUM_CANDIDATES = 65536
 # The wide tournament packs one g-value bit per key into an int64.
 MAX_KEYS = 64
 # The sample and projection kernels load a slot's whole history in one block.

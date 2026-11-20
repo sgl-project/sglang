@@ -18,16 +18,20 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.synthid import adapter
-from sglang.srt.sampling.watermarking.synthid.algorithm import REFERENCE_SYNTHID_KEYS
+from sglang.srt.sampling.watermarking.synthid.adapter import SynthIDRows
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.synthid_utils import (
+    REFERENCE_SYNTHID_KEYS,
+    STATE_FIELDS,
+    synthid_state,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 
 _BATCH = 4
 _VOCAB = 4096
 _STEPS = 6
-_STATE_FIELDS = ("context", "context_history", "history_cursor", "num_calls")
 _FILTERS = {
     "top_ks": [8, TOP_K_ALL, 32, 4],
     "top_ps": [0.9, 0.8, 1.0, 0.95],
@@ -36,7 +40,6 @@ _FILTERS = {
 # name -> (watermarked rows, request filters)
 _CASES = {
     "all_rows": ([True] * 4, False),
-    "request_filters": ([True] * 4, True),
     "mixed_rows": ([True, False, True, False], True),
 }
 
@@ -79,7 +82,7 @@ def _sampling_info(device, on, *, filters):
         need_top_k_sampling=bool((top_ks != TOP_K_ALL).any()),
         need_min_p_sampling=bool((min_ps > 0).any()),
         vocab_size=_VOCAB,
-        watermark=adapter._rows(on, device),
+        watermark=SynthIDRows.from_candidates(on, device),
     )
 
 
@@ -90,7 +93,7 @@ def _run_case(rank, device, on, filters):
     features = SimpleNamespace(
         watermark_keys=REFERENCE_SYNTHID_KEYS[:8],
         watermark_ngram_len=None,
-        watermark_top_k=64,
+        watermark_num_candidates=64,
         watermark_context_history_size=16,
         watermark_skip_first_ngram_calls=None,
     )
@@ -101,7 +104,6 @@ def _run_case(rank, device, on, filters):
         vocab_size=_VOCAB,
         device=device,
     )
-    synthid = engine.sampler
     stock_sampler = Sampler()
     info = _sampling_info(device, on, filters=filters)
     req_pool_indices = torch.arange(1, _BATCH + 1, device=device)
@@ -135,8 +137,7 @@ def _run_case(rank, device, on, filters):
             )
         sample.commit(token_ids)
         tokens.append(token_ids.cpu().to(torch.int64))
-    state = {name: getattr(synthid.state, name).cpu() for name in _STATE_FIELDS}
-    return {"tokens": tokens, "fused": fused, "state": state}
+    return {"tokens": tokens, "fused": fused, "state": synthid_state(engine.watermark)}
 
 
 def _worker(rank, port, results):
@@ -162,7 +163,7 @@ def _worker(rank, port, results):
                 zip(local["tokens"], other["tokens"], strict=True)
             ):
                 assert torch.equal(mine, theirs), (name, step, mine, theirs)
-            for field in _STATE_FIELDS:
+            for field in STATE_FIELDS:
                 assert torch.equal(local["state"][field], other["state"][field]), (
                     name,
                     field,

@@ -25,6 +25,11 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.sampling.synthid import (
+    G_VALUE_SHIFT,
+    HASH_INCREMENT,
+    HASH_MULTIPLIER,
+    HASH_ROUNDS,
+    HASH_SHIFT,
     MAX_BLOCK_CANDIDATES,
     MAX_CHAIN_WIDTH,
     MAX_CONTEXT_HISTORY_SIZE,
@@ -32,12 +37,46 @@ from sglang.kernels.ops.sampling.synthid import (
     MAX_KEYS,
 )
 
-_HASH_MULTIPLIER = tl.constexpr(6364136223846793005)
+_HASH_MULTIPLIER = tl.constexpr(HASH_MULTIPLIER)
+_HASH_INCREMENT = tl.constexpr(HASH_INCREMENT)
+_HASH_ROUNDS = tl.constexpr(HASH_ROUNDS)
+_HASH_SHIFT = tl.constexpr(HASH_SHIFT)
+_G_VALUE_SHIFT = tl.constexpr(G_VALUE_SHIFT)
+_FLT_MIN = tl.constexpr(1.1754943508222875e-38)
 
 
 @triton.jit
 def _accumulate_hash(value, data):
-    return (value + data) * _HASH_MULTIPLIER + 1
+    return (value + data) * _HASH_MULTIPLIER + _HASH_INCREMENT
+
+
+@triton.jit
+def _g_value(candidate_hashes, key):
+    """The int64 0/1 g-value of each candidate under one key."""
+    hashes = _accumulate_hash(candidate_hashes, key)
+    for _ in range(_HASH_ROUNDS):
+        hashes = _accumulate_hash(hashes, 1) >> _HASH_SHIFT
+    return (hashes >> _G_VALUE_SHIFT) & 1
+
+
+@triton.jit
+def _eligible(
+    call_number,
+    context_width: tl.constexpr,
+    skip_first_ngram_calls: tl.constexpr,
+):
+    """Whether the ``call_number``-th generated token (from 1) may be watermarked."""
+    if skip_first_ngram_calls:
+        return call_number > context_width
+    return call_number > 0
+
+
+@triton.jit
+def _in_history(history_values, history_mask, context_hash):
+    return (
+        tl.max(tl.where(history_mask & (history_values == context_hash), 1, 0), axis=0)
+        != 0
+    )
 
 
 @triton.jit
@@ -47,11 +86,13 @@ def _projected_context_hash(
     slot,
     request,
     step,
-    context_stride: tl.constexpr,
-    verify_stride: tl.constexpr,
+    context_stride,
+    verify_stride,
     context_width: tl.constexpr,
     hash_iv,
 ):
+    """The context hash of chain position ``step``: the slot's committed context
+    followed by the request's draft tokens ``1..step``."""
     context_hash = hash_iv.to(tl.int64)
     for context_index in range(context_width):
         base_index = context_index + step
@@ -75,7 +116,7 @@ def _projected_context_hash(
 
 
 @triton.jit
-def _synthid_topk_kernel(
+def _synthid_tournament_kernel(
     scores_ptr,
     token_ids_ptr,
     context_hashes_ptr,
@@ -111,10 +152,7 @@ def _synthid_topk_kernel(
 
     for key_index in range(depth):
         key = tl.load(keys_ptr + key_index).to(tl.int64)
-        hashes = _accumulate_hash(candidate_hashes, key)
-        for _ in range(12):
-            hashes = _accumulate_hash(hashes, 1) >> 5
-        g_values = ((hashes >> 30) & 1).to(tl.float32)
+        g_values = _g_value(candidate_hashes, key).to(tl.float32)
         g_values = tl.where(mask, g_values, 0.0)
         g_mass = tl.sum(g_values * probs, axis=0)
         probs *= 1.0 + g_values - g_mass
@@ -127,7 +165,7 @@ def _synthid_topk_kernel(
 
 
 @triton.jit
-def _synthid_wide_topk_kernel(
+def _synthid_wide_tournament_kernel(
     scores_ptr,
     token_ids_ptr,
     context_hashes_ptr,
@@ -177,18 +215,14 @@ def _synthid_wide_topk_kernel(
             other=0,
         ).to(tl.int64)
         candidate_hashes = _accumulate_hash(context_hash, token_ids)
-        g_bits = token_ids ^ token_ids
+        g_bits = tl.zeros([BLOCK_SIZE], dtype=tl.int64)
         for key_index in tl.range(0, depth):
             key = tl.load(keys_ptr + key_index).to(tl.int64)
-            hashes = _accumulate_hash(candidate_hashes, key)
-            for _ in range(12):
-                hashes = _accumulate_hash(hashes, 1) >> 5
-            g_value = ((hashes >> 30) & 1).to(tl.int64)
-            g_bits |= g_value << key_index
+            g_bits |= _g_value(candidate_hashes, key) << key_index
         g_bits = tl.where(should_apply, g_bits, 0)
         tl.store(g_bits_base + candidate_offsets, g_bits, mask=mask)
 
-    denominator = tl.maximum(denominator, 1.1754943508222875e-38)
+    denominator = tl.maximum(denominator, _FLT_MIN)
     current_mass = 0.0
     for start in tl.range(0, num_candidates, BLOCK_SIZE):
         candidate_offsets = start + offsets
@@ -271,17 +305,20 @@ def _synthid_sample_kernel(
     base_probs /= tl.sum(base_probs, axis=0)
     probs = base_probs
 
-    context_hash = hash_iv.to(tl.int64)
-    for context_index in range(context_width):
-        context_token = tl.load(context_ptr + slot * context_stride + context_index).to(
-            tl.int64
-        )
-        context_hash = _accumulate_hash(context_hash, context_token)
-
+    # Position 0 of a chain reads only the committed context.
+    context_hash = _projected_context_hash(
+        context_ptr,
+        context_ptr,
+        slot,
+        slot,
+        0,
+        context_stride=context_stride,
+        verify_stride=context_stride,
+        context_width=context_width,
+        hash_iv=hash_iv,
+    )
     call_number = tl.load(num_calls_ptr + slot).to(tl.int64) + 1
-    eligible = True
-    if skip_first_ngram_calls:
-        eligible = call_number >= context_width + 1
+    eligible = _eligible(call_number, context_width, skip_first_ngram_calls)
 
     history_offsets = tl.arange(0, HISTORY_BLOCK_SIZE)
     history_mask = history_offsets < history_size
@@ -290,17 +327,7 @@ def _synthid_sample_kernel(
         mask=history_mask,
         other=0,
     ).to(tl.int64)
-    repeated = (
-        tl.max(
-            tl.where(
-                history_mask & (history_values == context_hash),
-                1,
-                0,
-            ),
-            axis=0,
-        )
-        != 0
-    )
+    repeated = _in_history(history_values, history_mask, context_hash)
 
     token_ids = tl.load(
         token_ids_ptr + row * token_stride + candidate_offsets,
@@ -310,10 +337,7 @@ def _synthid_sample_kernel(
     candidate_hashes = _accumulate_hash(context_hash, token_ids)
     for key_index in range(depth):
         key = tl.load(keys_ptr + key_index).to(tl.int64)
-        hashes = _accumulate_hash(candidate_hashes, key)
-        for _ in range(12):
-            hashes = _accumulate_hash(hashes, 1) >> 5
-        g_values = ((hashes >> 30) & 1).to(tl.float32)
+        g_values = _g_value(candidate_hashes, key).to(tl.float32)
         g_values = tl.where(valid_mask, g_values, 0.0)
         g_mass = tl.sum(g_values * probs, axis=0)
         probs *= 1.0 + g_values - g_mass
@@ -324,7 +348,7 @@ def _synthid_sample_kernel(
         mask=valid_mask,
         other=1.0,
     ).to(tl.float32)
-    selection_scores = selection_probs / tl.maximum(noise, 1.1754943508222875e-38)
+    selection_scores = selection_probs / tl.maximum(noise, _FLT_MIN)
     selection_scores = tl.where(
         valid_mask,
         selection_scores,
@@ -339,7 +363,7 @@ def _synthid_sample_kernel(
 
 
 @triton.jit
-def _synthid_project_kernel(
+def _synthid_project_state_kernel(
     slot_indices_ptr,
     verify_tokens_ptr,
     context_ptr,
@@ -375,10 +399,9 @@ def _synthid_project_kernel(
     )
 
     base_num_calls = tl.load(num_calls_ptr + slot).to(tl.int64)
-    call_number = base_num_calls + step + 1
-    eligible = True
-    if skip_first_ngram_calls:
-        eligible = call_number >= context_width + 1
+    eligible = _eligible(
+        base_num_calls + step + 1, context_width, skip_first_ngram_calls
+    )
 
     history_offsets = tl.arange(0, HISTORY_BLOCK_SIZE)
     history_mask = history_offsets < history_size
@@ -389,11 +412,9 @@ def _synthid_project_kernel(
     ).to(tl.int64)
     projected_cursor = tl.load(history_cursor_ptr + slot).to(tl.int64)
     for previous_step in range(verify_width):
-        active_previous = previous_step < step
-        previous_call_number = base_num_calls + previous_step + 1
-        previous_eligible = active_previous
-        if skip_first_ngram_calls:
-            previous_eligible &= previous_call_number >= context_width + 1
+        previous_eligible = (previous_step < step) & _eligible(
+            base_num_calls + previous_step + 1, context_width, skip_first_ngram_calls
+        )
         previous_history_hash = _projected_context_hash(
             context_ptr,
             verify_tokens_ptr,
@@ -416,23 +437,13 @@ def _synthid_project_kernel(
             projected_cursor,
         )
 
-    repeated = (
-        tl.max(
-            tl.where(
-                history_mask & (history_values == context_hash),
-                1,
-                0,
-            ),
-            axis=0,
-        )
-        != 0
-    )
+    repeated = _in_history(history_values, history_mask, context_hash)
     tl.store(context_hashes_ptr + flat_row, context_hash)
     tl.store(apply_mask_ptr + flat_row, eligible & ~repeated)
 
 
 @triton.jit
-def _synthid_commit_kernel(
+def _synthid_commit_state_kernel(
     token_ids_ptr,
     lengths_ptr,
     slot_indices_ptr,
@@ -460,17 +471,20 @@ def _synthid_commit_kernel(
 
     for step in range(max_tokens):
         committed = step < length
-        context_hash = hash_iv.to(tl.int64)
-        for context_index in range(context_width):
-            context_token = tl.load(
-                context_ptr + slot * context_stride + context_index
-            ).to(tl.int64)
-            context_hash = _accumulate_hash(context_hash, context_token)
-
-        call_number = num_calls + 1
-        record = committed
-        if skip_first_ngram_calls:
-            record &= call_number >= context_width + 1
+        context_hash = _projected_context_hash(
+            context_ptr,
+            context_ptr,
+            slot,
+            slot,
+            0,
+            context_stride=context_stride,
+            verify_stride=context_stride,
+            context_width=context_width,
+            hash_iv=hash_iv,
+        )
+        record = committed & _eligible(
+            num_calls + 1, context_width, skip_first_ngram_calls
+        )
         tl.store(
             context_history_ptr + slot * history_stride + history_cursor,
             context_hash,
@@ -507,7 +521,7 @@ def _synthid_commit_kernel(
     tl.store(num_calls_ptr + slot, num_calls)
 
 
-def watermark_topk_scores_triton(
+def synthid_tournament_triton(
     scores: torch.Tensor,
     token_ids: torch.Tensor,
     context_hashes: torch.Tensor,
@@ -537,7 +551,7 @@ def watermark_topk_scores_triton(
                 f"The wide Triton SynthID path supports at most {MAX_KEYS} keys."
             )
         g_bits = torch.empty_like(token_ids)
-        _synthid_wide_topk_kernel[(scores.shape[0],)](
+        _synthid_wide_tournament_kernel[(scores.shape[0],)](
             scores,
             token_ids,
             context_hashes,
@@ -556,7 +570,7 @@ def watermark_topk_scores_triton(
             num_stages=1,
         )
         return output
-    _synthid_topk_kernel[(scores.shape[0],)](
+    _synthid_tournament_kernel[(scores.shape[0],)](
         scores,
         token_ids,
         context_hashes,
@@ -615,7 +629,8 @@ def synthid_sample_triton(
     history_block_size = triton.next_power_of_2(context_history.shape[1])
     if candidate_block_size > MAX_BLOCK_CANDIDATES:
         raise ValueError(
-            f"The fused SynthID sampling path supports top_k <= {MAX_BLOCK_CANDIDATES}."
+            "The fused SynthID sampling path supports "
+            f"num_candidates <= {MAX_BLOCK_CANDIDATES}."
         )
     if history_block_size > MAX_CONTEXT_HISTORY_SIZE:
         raise ValueError(
@@ -659,7 +674,7 @@ def synthid_sample_triton(
     return output_token_ids
 
 
-def project_synthid_state_triton(
+def synthid_project_state_triton(
     slot_indices: torch.Tensor,
     verify_tokens: torch.Tensor,
     context: torch.Tensor,
@@ -693,7 +708,7 @@ def project_synthid_state_triton(
         device=verify_tokens.device,
     )
     apply_mask = torch.empty_like(context_hashes, dtype=torch.bool)
-    _synthid_project_kernel[(context_hashes.shape[0],)](
+    _synthid_project_state_kernel[(context_hashes.shape[0],)](
         slot_indices,
         verify_tokens,
         context,
@@ -717,7 +732,7 @@ def project_synthid_state_triton(
     return context_hashes, apply_mask
 
 
-def commit_synthid_state_triton(
+def synthid_commit_state_triton(
     token_ids: torch.Tensor,
     lengths: torch.Tensor | None,
     slot_indices: torch.Tensor,
@@ -734,8 +749,12 @@ def commit_synthid_state_triton(
         raise ValueError("token_ids must be [rows, width] with one slot per row.")
     if lengths is not None and lengths.shape != slot_indices.shape:
         raise ValueError("lengths must have one value per row.")
+    if token_ids.shape[1] > MAX_CHAIN_WIDTH:
+        raise ValueError(
+            f"The SynthID state commit supports at most {MAX_CHAIN_WIDTH} tokens."
+        )
 
-    _synthid_commit_kernel[(token_ids.shape[0],)](
+    _synthid_commit_state_kernel[(token_ids.shape[0],)](
         token_ids,
         lengths if lengths is not None else token_ids,
         slot_indices,

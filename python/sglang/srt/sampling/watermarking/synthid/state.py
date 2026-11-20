@@ -18,8 +18,7 @@
 
 A slot holds the last ``ngram_len - 1`` committed tokens (the context), a ring
 of recent context hashes (a context seen there is not watermarked again), and
-the number of tokens committed so far. Callers pass slot indices and token
-tensors; nothing here reads scheduler or batch objects.
+the number of tokens committed so far.
 """
 
 from __future__ import annotations
@@ -28,16 +27,16 @@ from typing import Optional, Sequence
 
 import torch
 
-from sglang.kernels.ops.sampling.synthid import MAX_CHAIN_WIDTH, MAX_CONTEXT_WIDTH
 from sglang.srt.sampling.watermarking.synthid.algorithm import (
     SynthIDConfig,
-    compute_context_hash_torch,
-    hash_context_python,
+    hash_context,
+    hash_contexts,
 )
 
 
 class SynthIDStatePool:
-    """SynthID state for every request slot, on one device."""
+    """SynthID state for every request slot, on one device: Triton kernels on
+    CUDA, torch on CPU (the reference the kernels are tested against)."""
 
     def __init__(
         self,
@@ -56,9 +55,7 @@ class SynthIDStatePool:
         )
         self.history_cursor = torch.zeros(num_slots, dtype=torch.int64, device=device)
         self.num_calls = torch.zeros(num_slots, dtype=torch.int64, device=device)
-        self.use_triton = (
-            self.context.is_cuda and config.context_width <= MAX_CONTEXT_WIDTH
-        )
+        self.use_triton = self.context.is_cuda
 
     def seed(
         self,
@@ -67,11 +64,12 @@ class SynthIDStatePool:
     ) -> None:
         """Start each slot over, then commit its replayed tokens.
 
-        ``slots`` is ``[N]`` int64 on the pool's device. Row ``i`` of
+        ``slots`` is ``[N]`` on the pool's device. Row ``i`` of
         ``replay_token_ids`` lists the tokens a resumed request already
         generated (all of them, so the history ring and its cursor match the
         uninterrupted run); an empty row is a fresh request with a zero context.
         """
+        slots = slots.to(torch.int64)
         self.context.index_fill_(0, slots, 0)
         self.context_history.index_fill_(0, slots, 0)
         self.history_cursor.index_fill_(0, slots, 0)
@@ -100,7 +98,7 @@ class SynthIDStatePool:
         for token_id in token_ids:
             call_number = num_calls + 1
             if not config.skip_first_ngram_calls or call_number >= config.ngram_len:
-                history[cursor] = hash_context_python(context, config.hash_iv)
+                history[cursor] = hash_context(context, config.hash_iv)
                 cursor = (cursor + 1) % config.context_history_size
             context = context[1:] + [int(token_id)]
             num_calls = call_number
@@ -128,12 +126,12 @@ class SynthIDStatePool:
         Position ``j`` is scored as if columns ``1..j`` had been committed.
         Returns two ``[N * W]`` tensors in row-major order.
         """
-        if self.use_triton and verify_tokens.shape[1] <= MAX_CHAIN_WIDTH:
-            from sglang.kernels.ops.sampling.synthid.triton import (
-                project_synthid_state_triton,
+        if self.use_triton:
+            from sglang.kernels.ops.sampling.synthid_triton import (
+                synthid_project_state_triton,
             )
 
-            return project_synthid_state_triton(
+            return synthid_project_state_triton(
                 slots,
                 verify_tokens.contiguous(),
                 self.context,
@@ -198,12 +196,12 @@ class SynthIDStatePool:
         """
         if token_ids.ndim == 1:
             token_ids = token_ids[:, None]
-        if self.use_triton and token_ids.shape[1] <= MAX_CHAIN_WIDTH:
-            from sglang.kernels.ops.sampling.synthid.triton import (
-                commit_synthid_state_triton,
+        if self.use_triton:
+            from sglang.kernels.ops.sampling.synthid_triton import (
+                synthid_commit_state_triton,
             )
 
-            commit_synthid_state_triton(
+            synthid_commit_state_triton(
                 token_ids.contiguous(),
                 lengths,
                 slots,
@@ -230,7 +228,7 @@ class SynthIDStatePool:
 
         for step in range(token_ids.shape[1]):
             committed = step < lengths
-            context_hashes = compute_context_hash_torch(context, self.config.hash_iv)
+            context_hashes = hash_contexts(context, self.config.hash_iv)
             record = committed & self._eligible(num_calls)
 
             write_slots = slots[record]
@@ -252,6 +250,6 @@ class SynthIDStatePool:
         return torch.ones_like(num_calls, dtype=torch.bool)
 
     def _hashes_and_mask(self, context, history, num_calls):
-        context_hashes = compute_context_hash_torch(context, self.config.hash_iv)
+        context_hashes = hash_contexts(context, self.config.hash_iv)
         repeated = torch.any(history == context_hashes[:, None], dim=1)
         return context_hashes, self._eligible(num_calls) & ~repeated

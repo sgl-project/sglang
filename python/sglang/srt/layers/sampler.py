@@ -821,6 +821,27 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     )
 
 
+def top_k_top_p_min_p_filter_sorted_probs_torch(
+    probs_sort: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> None:
+    """Zero, in place, the entries of descending-sorted ``probs_sort`` that
+    top-k, top-p, and min-p remove."""
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[
+        torch.arange(0, probs_sort.shape[-1], device=probs_sort.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
+    if need_min_p_sampling:
+        min_p_thresholds = probs_sort[:, 0] * min_ps
+        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+
+
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
@@ -857,16 +878,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         probs_sort, probs_idx = torch.topk(probs, k=max_top_k, dim=-1, sorted=True)
     else:
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
-    if need_min_p_sampling:
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    top_k_top_p_min_p_filter_sorted_probs_torch(
+        probs_sort, top_ks, top_ps, min_ps, need_min_p_sampling
+    )
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)

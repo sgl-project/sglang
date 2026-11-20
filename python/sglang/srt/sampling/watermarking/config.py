@@ -31,7 +31,7 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     enforce_all: bool | None = None
     keys: list[int] | None = None
     ngram_len: int | None = None
-    top_k: int | None = None
+    num_candidates: int | None = None
     context_history_size: int | None = None
     skip_first_ngram_calls: bool | None = None
 
@@ -44,13 +44,13 @@ class WatermarkServerConfig(msgspec.Struct, frozen=True, kw_only=True):
             f"default_enabled={self.default_enabled!r}, "
             f"enforce_all={self.enforce_all!r}, "
             f"keys={'<redacted>' if self.keys is not None else None}, "
-            f"ngram_len={self.ngram_len!r}, top_k={self.top_k!r}, "
+            f"ngram_len={self.ngram_len!r}, num_candidates={self.num_candidates!r}, "
             f"context_history_size={self.context_history_size!r}, "
             f"skip_first_ngram_calls={self.skip_first_ngram_calls!r})"
         )
 
 
-# The fields only one algorithm reads; default_enabled and enforce_all are shared.
+_SHARED_CONFIG_FIELDS = ("default_enabled", "enforce_all")
 GUMBEL_CONFIG_FIELDS = (
     "key",
     "key_b",
@@ -61,13 +61,13 @@ GUMBEL_CONFIG_FIELDS = (
 SYNTHID_CONFIG_FIELDS = (
     "keys",
     "ngram_len",
-    "top_k",
+    "num_candidates",
     "context_history_size",
     "skip_first_ngram_calls",
 )
 ALGORITHM_CONFIG_FIELDS = {
-    "gumbel": frozenset(("default_enabled", "enforce_all", *GUMBEL_CONFIG_FIELDS)),
-    "synthid": frozenset(("default_enabled", "enforce_all", *SYNTHID_CONFIG_FIELDS)),
+    "gumbel": frozenset((*_SHARED_CONFIG_FIELDS, *GUMBEL_CONFIG_FIELDS)),
+    "synthid": frozenset((*_SHARED_CONFIG_FIELDS, *SYNTHID_CONFIG_FIELDS)),
 }
 
 
@@ -154,26 +154,18 @@ def load_watermark_config(source: str, *, algorithm: str) -> WatermarkServerConf
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")
     keys = raw.get("keys")
     if keys is not None and (
-        not isinstance(keys, list) or not all(_is_int64(key) for key in keys)
+        not isinstance(keys, list) or not all(_is_int(key) for key in keys)
     ):
-        raise WatermarkConfigError(
-            "watermark config keys must be a list of 64-bit integers"
-        )
-    for name in ("ngram_len", "top_k", "context_history_size"):
+        raise WatermarkConfigError("watermark config keys must be a list of integers")
+    for name in ("ngram_len", "num_candidates", "context_history_size"):
         value = raw.get(name)
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, int)
-        ):
+        if value is not None and not _is_int(value):
             raise WatermarkConfigError(f"watermark config {name} must be an integer")
     return WatermarkServerConfig(**raw)
 
 
-def _is_int64(value: Any) -> bool:
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and -(1 << 63) <= value < (1 << 63)
-    )
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):

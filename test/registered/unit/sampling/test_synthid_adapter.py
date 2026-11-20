@@ -1,7 +1,6 @@
 """SynthID adapter: config, request policy, server checks, rows, and the bound
 sample and verify steps on CPU."""
 
-import functools
 import json
 import unittest
 from types import SimpleNamespace
@@ -16,26 +15,21 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
-from sglang.srt.sampling.watermarking.config import (
-    SYNTHID_CONFIG_FIELDS,
-    load_watermark_config,
-)
+from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.sampling.watermarking.interface import merge_watermark_rows
 from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.sampling.watermarking.synthid import adapter
+from sglang.srt.sampling.watermarking.synthid.adapter import SynthIDRows
 from sglang.srt.sampling.watermarking.synthid.algorithm import SynthIDConfig
-from sglang.srt.sampling.watermarking.synthid.sampler import (
-    SynthIDSampler,
-    top_k_top_p_min_p_filter_probs,
-)
+from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.synthid_utils import STATE_FIELDS, synthid_state
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 _KEYS = [11, 22, 33]
-_STATE_FIELDS = ("context", "context_history", "history_cursor", "num_calls")
 
 
 def _resolve(watermark_config, **kwargs):
@@ -89,29 +83,33 @@ def _info(batch_size, *, top_ks=None, top_ps=None, min_ps=None, watermark=None):
     )
 
 
-def _sampler(num_slots=8):
-    config = SynthIDConfig(keys=(1, 2, 3), ngram_len=3, top_k=6, context_history_size=4)
-    sampler = SynthIDSampler(config, num_slots, "cpu")
-    sampler.state.seed(torch.arange(num_slots), [[] for _ in range(num_slots)])
-    sampler.state.commit(torch.arange(num_slots), torch.arange(num_slots) + 3)
-    return sampler
+def _watermarks(num_slots=8):
+    """Two watermarks with the same keys and the same state, held separately."""
+    config = SynthIDConfig(
+        keys=(1, 2, 3), ngram_len=3, num_candidates=6, context_history_size=4
+    )
+    watermarks = []
+    for _ in range(2):
+        watermark = SynthIDWatermark(config, num_slots, "cpu")
+        watermark.seed(torch.arange(num_slots), [[] for _ in range(num_slots)])
+        watermark.commit(torch.arange(num_slots), torch.arange(num_slots) + 3)
+        watermarks.append(watermark)
+    return watermarks
 
 
-def _twin(sampler):
-    """A sampler with the same keys and an independent copy of the state."""
-    twin = SynthIDSampler(sampler.config, sampler.state.context.shape[0], "cpu")
-    for name in _STATE_FIELDS:
-        getattr(twin.state, name).copy_(getattr(sampler.state, name))
-    return twin
+def _assert_same_state(test, actual, expected):
+    actual, expected = synthid_state(actual), synthid_state(expected)
+    for name in STATE_FIELDS:
+        test.assertTrue(torch.equal(actual[name], expected[name]), name)
 
 
 class TestSynthIDConfig(CustomTestCase):
     def test_file_fields_resolve_and_keys_are_redacted(self):
-        cfg = _resolve({"keys": _KEYS, "ngram_len": 3, "top_k": 40})
+        cfg = _resolve({"keys": _KEYS, "ngram_len": 3, "num_candidates": 40})
         self.assertEqual(cfg.watermark_keys, _KEYS)
         config = adapter._synthid_config(cfg)
         self.assertEqual(config.keys, tuple(_KEYS))
-        self.assertEqual((config.ngram_len, config.top_k), (3, 40))
+        self.assertEqual((config.ngram_len, config.num_candidates), (3, 40))
         # Unset fields keep the lib defaults.
         self.assertEqual(config.context_history_size, 1024)
         self.assertFalse(config.skip_first_ngram_calls)
@@ -132,6 +130,8 @@ class TestSynthIDConfig(CustomTestCase):
             "speculative_algorithm": "EAGLE",
             "speculative_draft_model_path": "dummy",
             "speculative_eagle_topk": 1,
+            "speculative_num_steps": 3,
+            "speculative_num_draft_tokens": 4,
             "speculative_use_rejection_sampling": True,
         }
         drafts = {
@@ -159,8 +159,8 @@ class TestSynthIDConfig(CustomTestCase):
             "requires watermark config keys": ({}, {}),
             "1 to 64": ({"keys": list(range(65))}, {}),
             "distinct": ({"keys": [7, 7]}, {}),
-            "ngram_len must be at least 2": ({"keys": _KEYS, "ngram_len": 1}, {}),
-            "top_k must be from 2": ({"keys": _KEYS, "top_k": 1}, {}),
+            "ngram_len must be from 2 to 17": ({"keys": _KEYS, "ngram_len": 18}, {}),
+            "num_candidates must be from 2": ({"keys": _KEYS, "num_candidates": 1}, {}),
             "context_history_size must be from 1 to 2048": (
                 {"keys": _KEYS, "context_history_size": 2049},
                 {},
@@ -194,6 +194,14 @@ class TestSynthIDConfig(CustomTestCase):
             "only with EAGLE or EAGLE3": (
                 {"keys": _KEYS},
                 {**eagle, "speculative_algorithm": "NGRAM"},
+            ),
+            "at most 8 --speculative-num-draft-tokens": (
+                {"keys": _KEYS},
+                {
+                    **eagle,
+                    "speculative_num_steps": 8,
+                    "speculative_num_draft_tokens": 9,
+                },
             ),
             "--rl-on-policy-target": (
                 {"keys": _KEYS},
@@ -265,30 +273,32 @@ class TestSynthIDRequestPolicy(CustomTestCase):
         requests = [_request(on), _request(off), _request(on, top_k=1), _request(on)]
         rows = adapter.build_rows(requests, features=_features(), device="cpu")
         self.assertEqual(rows.indices.tolist(), [0, 3])
-        self.assertEqual(rows.on_host, [True, False, False, True])
+        self.assertEqual(rows.candidates_host, [True, False, False, True])
         self.assertFalse(rows.all_on)
         self.assertIsNone(
             adapter.build_rows(requests[1:3], features=_features(), device="cpu")
         )
 
         kept = rows.filter([3, 1], torch.tensor([3, 1]))
-        self.assertEqual((kept.indices.tolist(), kept.on_host), ([0], [True, False]))
+        self.assertEqual(
+            (kept.indices.tolist(), kept.candidates_host), ([0], [True, False])
+        )
         self.assertIsNone(rows.filter([1, 2], torch.tensor([1, 2])))
         merged = merge_watermark_rows(None, kept, 2, 2)
         self.assertEqual(merged.indices.tolist(), [2])
         merged = merge_watermark_rows(kept, None, 2, 1)
-        self.assertEqual(merged.on_host, [True, False, False])
+        self.assertEqual(merged.candidates_host, [True, False, False])
         everything = rows.filter([0, 3], torch.tensor([0, 3]))
         self.assertTrue(everything.all_on)
-        self.assertIsNone(everything.partial_indices)
+        self.assertIsNone(everything.take_index)
         # The overlapped forward may still read the old rows.
         self.assertEqual(rows.indices.tolist(), [0, 3])
 
 
 class TestSynthIDEngine(CustomTestCase):
     def test_seed_payload_covers_prefill_rows_only(self):
-        engine = adapter.SynthIDEngine(_sampler(), allow_fused_sample=False)
-        rows = adapter._rows([True, False, True, True], "cpu")
+        engine = adapter.SynthIDEngine(_watermarks()[0], allow_fused_sample=False)
+        rows = SynthIDRows.from_candidates([True, False, True, True], "cpu")
         reqs = [SimpleNamespace(output_ids=ids) for ids in ([], [5], [7, 8], [9])]
 
         def batch(mode, *, decoding_reqs=None, num_mixed=0):
@@ -315,10 +325,9 @@ class TestSynthIDEngine(CustomTestCase):
         self.assertIsNone(engine.seed_payload(batch(ForwardMode.DECODE)))
 
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):
-        sampler = _sampler()
-        twin = _twin(sampler)
-        engine = adapter.SynthIDEngine(sampler, allow_fused_sample=False)
-        rows = adapter._rows([True, False, True, False], "cpu")
+        watermark, twin = _watermarks()
+        engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
+        rows = SynthIDRows.from_candidates([True, False, True, False], "cpu")
         info = _info(
             4,
             top_ks=torch.tensor([3, 2, TOP_K_ALL, TOP_K_ALL]),
@@ -341,17 +350,12 @@ class TestSynthIDEngine(CustomTestCase):
         torch.testing.assert_close(step.logprob_logits, original, rtol=0, atol=0)
         torch.testing.assert_close(logits[[1, 3]], original[[1, 3]], rtol=0, atol=0)
         expected = original[[0, 2]].clone()
-        twin.state.seed(torch.tensor([4]), [[3, 5]])
+        twin.seed(torch.tensor([4]), [[3, 5]])
         twin.apply(
             expected,
             info.temperatures[[0, 2]],
             torch.tensor([6, 4]),
-            filter_probs=functools.partial(
-                top_k_top_p_min_p_filter_probs,
-                top_ks=info.top_ks[[0, 2]],
-                top_ps=info.top_ps[[0, 2]],
-                min_ps=None,
-            ),
+            filter_probs=adapter._request_filter(info, rows),
         )
         torch.testing.assert_close(logits[[0, 2]], expected, rtol=0, atol=0)
         # Row 0's request top-k ran before the tournament.
@@ -365,17 +369,13 @@ class TestSynthIDEngine(CustomTestCase):
         self.assertIsNone(step.token_ids)
 
         sample.commit(torch.tensor([7, 8, 9, 10]))
-        twin.state.commit(torch.tensor([6, 4]), torch.tensor([7, 9]))
-        for name in _STATE_FIELDS:
-            torch.testing.assert_close(
-                getattr(sampler.state, name), getattr(twin.state, name)
-            )
+        twin.commit(torch.tensor([6, 4]), torch.tensor([7, 9]))
+        _assert_same_state(self, watermark, twin)
 
     def test_verify_watermarks_on_rows_and_appends_their_tokens(self):
-        sampler = _sampler()
-        twin = _twin(sampler)
-        engine = adapter.SynthIDEngine(sampler, allow_fused_sample=False)
-        rows = adapter._rows([False, True, True], "cpu")
+        watermark, twin = _watermarks()
+        engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
+        rows = SynthIDRows.from_candidates([False, True, True], "cpu")
         info = _info(3, top_ks=torch.tensor([TOP_K_ALL, 4, TOP_K_ALL]))
         req_pool_indices = torch.tensor([5, 3, 7])
         draft_tokens = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
@@ -403,12 +403,7 @@ class TestSynthIDEngine(CustomTestCase):
             info.temperatures[1:],
             torch.tensor([3, 7]),
             draft_tokens[1:],
-            filter_probs=functools.partial(
-                top_k_top_p_min_p_filter_probs,
-                top_ks=info.top_ks[1:].repeat_interleave(3),
-                top_ps=info.top_ps[1:].repeat_interleave(3),
-                min_ps=None,
-            ),
+            filter_probs=adapter._request_filter(info, rows, width=3),
         )
         torch.testing.assert_close(verified[3:], expected, rtol=0, atol=0)
         self.assertLessEqual(int(torch.isfinite(verified[3:6]).sum(dim=1).max()), 4)
@@ -417,80 +412,28 @@ class TestSynthIDEngine(CustomTestCase):
         accept_tokens = torch.tensor([[1, 0, 0], [4, 5, 0], [10, 11, 12]])
         accept_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
         engine.append_accept_tokens(rows, req_pool_indices, accept_tokens, accept_lens)
-        twin.state.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
-        for name in _STATE_FIELDS:
-            torch.testing.assert_close(
-                getattr(sampler.state, name), getattr(twin.state, name)
-            )
+        twin.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
+        _assert_same_state(self, watermark, twin)
 
 
 class TestSynthIDFusedGate(CustomTestCase):
-    def test_fused_sample_falls_back_on_each_gate_condition(self):
+    def test_fused_sample_falls_back_for_a_seed_or_logprobs(self):
         fusable = SimpleNamespace(can_fuse_sample=lambda logits: True)
-        logits = torch.zeros(2, 16)
 
-        def can_fuse(*, on=(True, True), keep_logits=False, filters=None, **fields):
-            info = _info(2, **(filters or {}))
-            for name, value in fields.items():
-                setattr(info, name, value)
+        def can_fuse(*, keep_logits=False, sampling_seed=None):
+            info = _info(2)
+            info.sampling_seed = sampling_seed
             sample = adapter.SynthIDSample(
                 fusable,
-                adapter._rows(list(on), "cpu"),
+                SynthIDRows.from_candidates([True, True], "cpu"),
                 SimpleNamespace(sampling_info=info),
                 allow_fused_sample=True,
             )
-            return sample._can_fuse(logits, keep_logits)
+            return sample._can_fuse(torch.zeros(2, 16), keep_logits)
 
         self.assertTrue(can_fuse())
-        fallbacks = {
-            "a row off": {"on": (True, False)},
-            "request top-k": {"filters": {"top_ks": torch.tensor([2, TOP_K_ALL])}},
-            "request top-p": {"filters": {"top_ps": torch.tensor([1.0, 0.9])}},
-            "request min-p": {"filters": {"min_ps": torch.tensor([0.0, 0.1])}},
-            "sampling seed": {"sampling_seed": torch.tensor([1, 2])},
-            "logprobs": {"keep_logits": True},
-            "sampling mask": {"sampling_mask_batch_indices": torch.tensor([0])},
-        }
-        for name, kwargs in fallbacks.items():
-            with self.subTest(name):
-                self.assertFalse(can_fuse(**kwargs))
-
-    def test_fused_sample_needs_one_tp_rank_a_float32_row_and_a_small_cap(self):
-        features = SimpleNamespace(
-            watermark_keys=_KEYS,
-            **{
-                f"watermark_{name}": None
-                for name in SYNTHID_CONFIG_FIELDS
-                if name != "keys"
-            },
-        )
-        for tp_size, allowed in ((1, True), (2, False)):
-            with patch.object(
-                adapter, "get_parallel", return_value=SimpleNamespace(tp_size=tp_size)
-            ):
-                engine = adapter.make_engine(
-                    features,
-                    max_num_reqs=2,
-                    max_contexts_per_req=1,
-                    vocab_size=16,
-                    device="cpu",
-                )
-            self.assertEqual(engine.allow_fused_sample, allowed)
-
-        for top_k, dtype, fusable in (
-            (1024, torch.float32, True),
-            (1025, torch.float32, False),
-            (1024, torch.bfloat16, False),
-        ):
-            with self.subTest(top_k=top_k, dtype=dtype):
-                sampler = SynthIDSampler(
-                    SynthIDConfig(keys=(1,), top_k=top_k), 1, "cpu"
-                )
-                # The CPU state has no Triton path; the cap and dtype checks remain.
-                sampler.state.use_triton = True
-                self.assertEqual(
-                    sampler.can_fuse_sample(torch.zeros(1, 2048, dtype=dtype)), fusable
-                )
+        self.assertFalse(can_fuse(sampling_seed=torch.tensor([1, 2])))
+        self.assertFalse(can_fuse(keep_logits=True))
 
 
 if __name__ == "__main__":

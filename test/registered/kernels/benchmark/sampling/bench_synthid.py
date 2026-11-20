@@ -6,12 +6,10 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.srt.sampling.watermarking.synthid.algorithm import (
-    REFERENCE_SYNTHID_KEYS,
-    SynthIDConfig,
-)
-from sglang.srt.sampling.watermarking.synthid.sampler import SynthIDSampler
+from sglang.srt.sampling.watermarking.synthid.algorithm import SynthIDConfig
+from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.synthid_utils import REFERENCE_SYNTHID_KEYS
 
 register_cuda_ci(
     est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -25,10 +23,10 @@ VOCAB_SIZE = 248_320
 @marker.parametrize("batch_size", BATCH_SIZES, CI_BATCH_SIZES)
 @marker.benchmark("provider", ["transform", "fused"])
 def benchmark_stochastic(batch_size: int, provider: str):
-    config = SynthIDConfig(keys=REFERENCE_SYNTHID_KEYS, top_k=1024)
-    sampler = SynthIDSampler(config, max(BATCH_SIZES), "cuda")
+    config = SynthIDConfig(keys=REFERENCE_SYNTHID_KEYS, num_candidates=1024)
+    watermark = SynthIDWatermark(config, max(BATCH_SIZES), "cuda")
     slots = torch.arange(batch_size, device="cuda")
-    sampler.state.seed(slots, [[] for _ in range(batch_size)])
+    watermark.seed(slots, [[] for _ in range(batch_size)])
     logits = torch.randn(batch_size, VOCAB_SIZE, dtype=torch.float32, device="cuda")
     temperatures = torch.ones((batch_size, 1), dtype=torch.float32, device="cuda")
 
@@ -36,17 +34,17 @@ def benchmark_stochastic(batch_size: int, provider: str):
 
         def fn():
             watermarked = logits.clone()
-            sampler.apply(watermarked, temperatures, slots)
+            watermark.apply(watermarked, temperatures, slots)
             probs = torch.softmax(watermarked / temperatures, dim=-1)
             noise = torch.empty_like(probs).exponential_(1.0)
             token_ids = (probs / noise).argmax(dim=-1)
-            sampler.state.commit(slots, token_ids)
+            watermark.commit(slots, token_ids)
 
     elif provider == "fused":
 
         def fn():
-            token_ids = sampler.sample(logits, temperatures, slots)
-            sampler.state.commit(slots, token_ids)
+            token_ids = watermark.sample(logits, temperatures, slots)
+            watermark.commit(slots, token_ids)
 
     else:
         raise ValueError(f"Unknown provider: {provider}")

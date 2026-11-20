@@ -579,7 +579,7 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_algorithm",
     "watermark_keys",
     "watermark_ngram_len",
-    "watermark_top_k",
+    "watermark_num_candidates",
     "watermark_context_history_size",
     "watermark_skip_first_ngram_calls",
 )
