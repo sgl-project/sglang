@@ -139,6 +139,14 @@ async def _send_realtime_chunk_stats(
     )
 
 
+def _first_error_line(error: Exception) -> str:
+    """Return a one-line failure reason, including for exceptions with no message."""
+    for line in str(error).splitlines():
+        if line.strip():
+            return line
+    return type(error).__name__
+
+
 async def _generate_loop(ws: WebSocket, session: GenerateSession):
     adapter = session.adapter
     if adapter is None:
@@ -222,7 +230,7 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             )
             break
         except Exception as e:
-            err_msg = str(e).splitlines()[0]
+            err_msg = _first_error_line(e)
             logger.error("error during generate loop: %s", err_msg)
             try:
                 # finish any frame header/payload pair before reporting a generation error
