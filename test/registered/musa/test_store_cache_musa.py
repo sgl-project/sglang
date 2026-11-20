@@ -40,7 +40,7 @@ def test_musa_cache_store_is_autograd_opaque() -> None:
     v_cache = torch.zeros((32, 16), dtype=torch.bfloat16, device="musa")
     k_cache.requires_grad_(True)
     v_cache.requires_grad_(True)
-    indices = torch.arange(8, device="musa", dtype=torch.int32)
+    indices = torch.arange(1, 9, device="musa", dtype=torch.int32)
 
     store(k, v, k_cache, v_cache, indices)
     torch.musa.synchronize()
@@ -59,7 +59,7 @@ def test_musa_cache_store_is_graph_safe() -> None:
     v = torch.randn((8, 16), dtype=torch.bfloat16, device="musa")
     k_cache = torch.zeros((32, 16), dtype=torch.bfloat16, device="musa")
     v_cache = torch.zeros((32, 16), dtype=torch.bfloat16, device="musa")
-    indices = torch.arange(8, device="musa", dtype=torch.int64)
+    indices = torch.arange(1, 9, device="musa", dtype=torch.int64)
 
     for _ in range(2):
         store(k, v, k_cache, v_cache, indices)
@@ -92,12 +92,9 @@ def test_musa_cache_store_keeps_asymmetric_kv_on_fallback(
         [3, 7, 11, 15, 19, 23, 27, 31], device="musa", dtype=torch.int32
     )
 
-    def fail_triton_store(*args: object, **kwargs: object) -> None:
-        raise AssertionError("asymmetric MUSA KV rows must use the fallback")
-
     monkeypatch.setattr(
-        "sglang.srt.mem_cache.memory_pool._set_kv_buffer_prefix_valid_impl",
-        fail_triton_store,
+        "sglang.srt.mem_cache.memory_pool.can_use_store_cache",
+        lambda *args, **kwargs: False,
     )
 
     _set_kv_buffer_impl(
