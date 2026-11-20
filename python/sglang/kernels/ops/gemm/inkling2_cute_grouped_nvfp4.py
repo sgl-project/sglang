@@ -1896,13 +1896,13 @@ def routed_swap_matmul(
     k = packed * 2
     scale_rows = (values.shape[0] + 127 * experts + 127) // 128 * 128
     # The model's distinct top-k experts bound each expert's rows by its input
-    # token count. At <=8 rows each active expert has one 128-row schedule block;
+    # token count. At <=32 rows each active expert has one 128-row schedule block;
     # a smaller compute tile consumes the same first scale block. No GPU scalar
     # reads are needed, including during CUDA graph capture. Larger/unknown
     # groups retain the original schedule and compute tile.
     token_tile = (
         TOKEN_TILE
-        if max_expert_rows is not None and 0 < max_expert_rows <= min(TOKEN_TILE, 8)
+        if max_expert_rows is not None and 0 < max_expert_rows <= min(TOKEN_TILE, 32)
         else 128
     )
     _compile(experts, n, k, token_tile)(
