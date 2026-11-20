@@ -402,6 +402,11 @@ class MoeLoraMxfp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
 class MoeLoraFp8MarlinQuantInfo(MoeLoraMarlinQuantInfo):
     """E4M3 Marlin tiles with exponent-compensated BF16 scales per K group."""
 
+    group_size: int  # 32 or 128 along K, the same for both stages
+
     @classmethod
     def from_layer(cls, base_layer: FusedMoE) -> MoeLoraFp8MarlinQuantInfo:
-        return cls(**cls._prepared_fields(base_layer))
+        # prepare_moe_fp8_layer_for_marlin: one group size for both stages, widths kept.
+        fields = cls._prepared_fields(base_layer)
+        group_size = fields["hidden_size"] // fields["w13_scales"].shape[1]
+        return cls(group_size=group_size, **fields)

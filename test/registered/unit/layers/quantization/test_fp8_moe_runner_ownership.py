@@ -148,6 +148,7 @@ class TestFp8MoEMarlinOwnership(CustomTestCase):
                     self.assertEqual(family_of_layer(layer), family)
                     if family == "mxfp8":
                         info = MoeLoraFp8MarlinQuantInfo.from_layer(layer)
+                        self.assertEqual(info.group_size, 32)
                         self.assertTrue((info.w2_scales == 2.0**120).all())
 
 

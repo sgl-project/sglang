@@ -11,9 +11,13 @@ including SM120, are unsupported.
 Tables are process-cached; use a fresh server to evaluate an override.
 
 The file contains a tuned `domain`, ordered `scenarios`, and conservative
-`fallback` rows. Scenario selection matches adapter layout, phase, pool rank,
-resident expert count and quantization. Shapes outside the tuned domain use
-fallback rows. Row names are labels, not selectors.
+`fallback` rows. Scenario selection matches adapter layout, phase, pool rank (a ceiling, a floor,
+and a multiple a kernel's tiles need: `max_rank`, `min_rank`, `rank_multiple`),
+resident expert count, quantization family, base-GEMM vendor and the
+activation-scale mode a kernel implements (`act_scale`: `static`,
+`per_token`; absent means any). Shapes
+outside the tuned domain use fallback rows. Row names are labels, not
+selectors.
 
 Each row declares:
 
