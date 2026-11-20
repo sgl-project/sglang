@@ -90,6 +90,7 @@ from sglang.srt.rocm_muse_spark import (
 from sglang.srt.rocm_muse_spark.all_reduce_boundary import (
     AllReduceAttnBoundary,
     ar_boundary_enabled,
+    decode_rows_skipped,
     gather_ffn_boundary,
 )
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
@@ -1605,8 +1606,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.self_attn_input_norm(stream) if attn_input is None else attn_input
         )
         prefill_fp8 = _prefill_fp8_rows(forward_batch, attn_input.shape[0])
+        fusion_skipped = decode_rows_skipped(forward_batch, attn_input.shape[0])
         ar_boundary = (
             sp is None
+            and not fusion_skipped
             and self._attn_ar_boundary is not None
             and self._attn_ar_boundary.applicable(stream)
         )
@@ -1669,6 +1672,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
         if (
             sp is None
+            and not fusion_skipped
             and self._gather_ffn is not None
             and pre_norm_dtype is None
             and self._gather_ffn.supports(ffn_input.shape[0])

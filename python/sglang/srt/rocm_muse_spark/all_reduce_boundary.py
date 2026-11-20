@@ -58,6 +58,14 @@ _FLYDSL_ONESHOT_MAX_ROWS = int(
 _GATHER_FFN_MAX_ROWS = int(
     os.environ.get("SGLANG_ROCM_MUSE_GATHER_FFN_BOUNDARY_MAX_ROWS", "0")
 )
+# decode batches of exactly these many rows keep the stack's attention and MoE tails (comma-separated; empty:
+# none). The default leaves 4 and 8 to the AMD monokernel's gfx1250 Muse Spark build, faster there; target verify
+# forwards are not affected
+_DECODE_SKIP_ROWS = frozenset(
+    int(r)
+    for r in os.environ.get("SGLANG_ROCM_MUSE_AR_BOUNDARY_DECODE_SKIP_ROWS", "4,8").split(",")
+    if r.strip()
+)
 
 
 def _mode_for(num_rows: int) -> int:
@@ -81,6 +89,10 @@ def ar_boundary_enabled() -> bool:
     from sglang.srt.environ import envs
 
     return envs.SGLANG_ROCM_MUSE_AR_BOUNDARY.get()
+
+
+def decode_rows_skipped(forward_batch, num_rows: int) -> bool:
+    return num_rows in _DECODE_SKIP_ROWS and forward_batch.forward_mode.is_decode()
 
 
 def _ensure_comm(hidden: int) -> None:
