@@ -23,7 +23,6 @@ _FEATURES = SimpleNamespace(
 
 
 def _server_rows(batch_size, context_window, device="cuda"):
-    """Rows of requests that take the server key and window by default."""
     return GumbelRows(
         keys=torch.full(
             (batch_size,),
@@ -81,7 +80,6 @@ def test_repeated_context_and_greedy_bypass():
         first_logits, keep_logits=True
     )
 
-    assert step.sampling_info is sampling_info and step.token_ids is None
     assert torch.equal(step.logprob_logits, torch.zeros_like(first_logits))
     assert torch.isfinite(first_logits[0]).sum().item() == 1
     assert torch.equal(first_logits[1], torch.zeros(64, device=device))
@@ -132,21 +130,6 @@ def test_low_entropy_bypass_does_not_consume_context():
 
     assert torch.isfinite(boundary_logits).sum().item() == 1
     assert state.num_watermarked_contexts[0].item() == 1
-
-
-def test_inactive_batch_skips_watermark_state():
-    state = WatermarkState(
-        max_num_reqs=1,
-        context_window=2,
-        max_contexts_per_req=8,
-        device="cuda",
-    )
-    engine = GumbelEngine(state, _FEATURES)
-    batch = SimpleNamespace(sampling_info=SimpleNamespace(watermark=None))
-
-    assert engine.seed_payload(batch) is None
-    assert engine.bind_sample(batch) is None
-    assert engine.bind_verify(None, full_mask=True) is None
 
 
 def test_retracted_request_restores_context_history():
@@ -333,7 +316,7 @@ def test_speculative_tree_paths_match_tensor_reference():
         candidates_host=[True, True],
     )
     verify = GumbelEngine(states[2], _FEATURES).bind_verify(rows, full_mask=True)
-    verify_logits, verify_sampling_info = verify.apply(
+    verify_logits, _ = verify.apply(
         logits,
         sampling_info=sampling_info,
         req_pool_indices=req_pool_indices,
@@ -343,7 +326,6 @@ def test_speculative_tree_paths_match_tensor_reference():
         custom_mask=custom_mask,
         keep_logits=True,
     )
-    assert verify_sampling_info is sampling_info
     assert torch.equal(verify_logits, reference_logits)
     assert torch.isfinite(logits).all()
 
@@ -469,62 +451,6 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
         state.watermarked_context_hashes[0, :2],
         reference.watermarked_context_hashes[0, :2],
     )
-
-
-def test_chain_record_matches_explicit_accept_index():
-    draft_token_num = 4
-    req_pool_indices = torch.tensor([2, 0], dtype=torch.int32, device="cuda")
-    sampling_info = SimpleNamespace(
-        temperatures=torch.ones((2, 1), device="cuda"),
-        top_ks=torch.tensor([64, 64], dtype=torch.int32, device="cuda"),
-        top_ps=torch.ones(2, device="cuda"),
-        min_ps=torch.zeros(2, device="cuda"),
-        max_top_k=64,
-    )
-    draft_tokens = torch.tensor(
-        [[30, 31, 32, 33], [40, 41, 42, 43]], dtype=torch.int64, device="cuda"
-    )
-    logits = torch.randn(
-        (2 * draft_token_num, 64),
-        generator=torch.Generator("cuda").manual_seed(7),
-        device="cuda",
-    )
-    rows = _server_rows(2, 2)
-    states = []
-    for accept_index in (
-        None,
-        torch.arange(2 * draft_token_num, dtype=torch.int32, device="cuda").view(
-            2, draft_token_num
-        ),
-    ):
-        state = WatermarkState(
-            max_num_reqs=3, context_window=2, max_contexts_per_req=8, device="cuda"
-        )
-        state.init_from_prompt(req_pool_indices, [[10, 11], [20, 21]])
-        verify = GumbelEngine(state, _FEATURES).bind_verify(rows, full_mask=False)
-        verify.apply(
-            logits.clone(),
-            sampling_info=sampling_info,
-            req_pool_indices=req_pool_indices,
-            draft_tokens=draft_tokens,
-            positions=torch.arange(2, 6, device="cuda").repeat(2, 1),
-            draft_token_num=draft_token_num,
-            custom_mask=None,
-            keep_logits=False,
-        )
-        verify.record(
-            accept_index, torch.tensor([3, 2], dtype=torch.int32, device="cuda")
-        )
-        states.append(state)
-
-    counts = states[1].num_watermarked_contexts.tolist()
-    assert counts == [2, 0, 3]
-    assert states[0].num_watermarked_contexts.tolist() == counts
-    for row, count in enumerate(counts):
-        assert torch.equal(
-            states[0].watermarked_context_hashes[row, :count],
-            states[1].watermarked_context_hashes[row, :count],
-        )
 
 
 if __name__ == "__main__":

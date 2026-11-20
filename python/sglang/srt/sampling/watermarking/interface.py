@@ -42,9 +42,7 @@ class WatermarkRows(Protocol):
         """These rows followed by ``other``'s, or by ``other_len`` off rows."""
         ...
 
-    def prepend_off(self, num_rows: int) -> WatermarkRows:
-        """``num_rows`` off rows followed by these rows."""
-        ...
+    def prepend_off(self, num_rows: int) -> WatermarkRows: ...
 
 
 def merge_watermark_rows(

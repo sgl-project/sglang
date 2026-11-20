@@ -1,5 +1,4 @@
-"""Aaronson-Gumbel behind the engine's watermark interface: request policy,
-per-batch rows, and the engine that binds them to WatermarkState."""
+"""The Aaronson-Gumbel watermark behind ``interface``'s contract."""
 
 from __future__ import annotations
 
@@ -214,7 +213,6 @@ class GumbelEngine:
     ) -> Optional[
         tuple[list[Optional[list[int]]], Optional[list[Optional[list[int]]]]]
     ]:
-        """Prompt tails and retracted-request histories of an extend batch."""
         if batch.sampling_info.watermark is None:
             return None
         prompt_tails = self._prompt_tails(batch)

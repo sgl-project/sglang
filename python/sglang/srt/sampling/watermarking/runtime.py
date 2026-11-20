@@ -59,7 +59,6 @@ def build_watermark_rows(
 
 
 def watermark_request_enabled(sampling_params: SamplingParams) -> bool:
-    """Whether the request is watermarked; raises ValueError for an invalid request."""
     features = get_exec().features
     return _ADAPTERS[features.watermark_algorithm].request_enabled(
         sampling_params, features=features
@@ -67,12 +66,10 @@ def watermark_request_enabled(sampling_params: SamplingParams) -> bool:
 
 
 def check_watermark_algorithm_args(cfg: ResolvingConfig) -> None:
-    """The configured algorithm's own server-argument checks."""
     _ADAPTERS[cfg.watermark_algorithm].check_server_args(cfg)
 
 
 def watermark_view_fields(rows: Optional[WatermarkRows]) -> dict[str, Any]:
-    """The provider ABI v2 watermark fields of ``VerifySamplingView`` for these rows."""
     if rows is None:
         return NO_WATERMARK_VIEW_FIELDS
     return _ADAPTERS[get_exec().features.watermark_algorithm].watermark_view_fields(

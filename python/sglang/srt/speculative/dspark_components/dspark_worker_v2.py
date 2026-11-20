@@ -1406,7 +1406,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         positions_2d: torch.Tensor,
         sampling_info,
     ) -> tuple[torch.Tensor, Any, Optional[VerifyWatermark]]:
-        """The logits and sampling info to accept with, and the bound watermark."""
         target_logits = logits_output.next_token_logits
         engine = self.target_worker.model_runner.watermark
         watermark = (

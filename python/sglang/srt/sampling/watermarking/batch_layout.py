@@ -1,5 +1,3 @@
-"""Row layout of a ScheduleBatch as the watermark algorithms read it."""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
