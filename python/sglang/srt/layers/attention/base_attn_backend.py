@@ -360,8 +360,8 @@ class AttentionBackend(ABC):
         return None
 
     def takes_fp8_dcp_verify_q(self) -> bool:
-        """Whether DCP MLA target verify takes the gathered query as unit-scale
-        fp8 [rows, heads, nope + rope] and needs no verify-window K/V."""
+        """Whether DCP MLA target verify needs no verify-window K/V,
+        and takes the gathered query as unit-scale fp8 [rows, heads, nope + rope]."""
         return False
 
     def update_verify_buffers_to_fill_after_draft(
