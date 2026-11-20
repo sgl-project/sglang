@@ -50,6 +50,7 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -1738,7 +1739,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
                 input_ids=[1],
                 mm_inputs=None,
                 time_stats=tm.rid_to_state[req.rid].time_stats,
-                sampling_params=SimpleNamespace(max_new_tokens=4),
+                sampling_params=SamplingParams(max_new_tokens=4),
             )
         )
         sent = asyncio.Queue()

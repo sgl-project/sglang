@@ -229,9 +229,9 @@ def _mix_fused(
         return prefix_sum
     cw = get_cw(score_proj, score_norm)
     if is_npu():
-        from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused
+        from sgl_kernel_npu.operators.hyper_conn import attn_res_mix_fused
 
-        return mix_fused(
+        return attn_res_mix_fused(
             prefix_sum,
             bank,
             nvb,
@@ -466,8 +466,12 @@ class AttnResidual:
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        *,
+        num_rows: Optional[int] = None,
     ) -> None:
         num_tokens, hidden_size = hidden_states.shape
+        if num_rows is not None:
+            num_tokens = num_rows
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
