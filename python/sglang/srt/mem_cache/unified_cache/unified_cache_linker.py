@@ -29,13 +29,14 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -348,6 +349,14 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        # A device hit never reaches the store, so its read leases lapse and
+        # eviction drops a live conversation's head pages first.
+        self._lease_renewer = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="linker-lease")
+            if envs.SGLANG_LINKER_RENEW_DEVICE_HIT_LEASES.get()
+            else None
+        )
+        self._lease_renewed_rids: set[str] = set()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -369,6 +378,7 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        self._maybe_renew_device_hit_leases(req, result, device_hit_len)
         if self.load_mode == "prefetch":
             # Prefetch is issued on enqueue; only completed GPU KV is matchable.
             return result
@@ -633,6 +643,34 @@ class UnifiedCacheLinkerWrapper:
     def _record_lookup(self, lookup_tokens: int, hit_tokens: int) -> None:
         if self.metrics is not None:
             self.metrics.increment_linker_lookup_tokens(lookup_tokens, hit_tokens)
+
+    def _maybe_renew_device_hit_leases(
+        self, req: Req, result: MatchResult, device_hit_len: int
+    ) -> None:
+        if self._lease_renewer is None or req.rid in self._lease_renewed_rids:
+            return
+        num_pages = device_hit_len // self.cache.page_size
+        if num_pages == 0:
+            return
+        hashes = self.cache.get_prefix_hash_values(result.last_device_node)
+        if len(hashes) < num_pages:
+            return
+        self._lease_renewed_rids.add(req.rid)
+        self._lease_renewer.submit(self._renew_leases, req.rid, hashes[:num_pages])
+
+    def _renew_leases(self, rid: str, hashes: list[str]) -> None:
+        try:
+            transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes
+                )
+                if transfer is None:
+                    return
+                transfers.append(transfer)
+            self.cache_linker.lookup(rid, transfers)
+        except Exception:
+            logger.warning("External linker lease renewal failed", exc_info=True)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -982,6 +1020,7 @@ class UnifiedCacheLinkerWrapper:
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self.hit_markers.pop(rid, None)
+        self._lease_renewed_rids.discard(rid)
         self._cancel_prefetch(request, reason="released")
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
@@ -990,5 +1029,7 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
+        if self._lease_renewer is not None:
+            self._lease_renewer.shutdown(wait=False, cancel_futures=True)
         self.cache_linker.close()
         self._clear_state()
