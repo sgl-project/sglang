@@ -831,14 +831,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         min_tokens = ceil_align(
             max(2, page_size + get_disagg().num_reserved_decode_tokens), page_size
         )
-        max_rows = requested_rows
-        if token_limit is None:
-            preferred_tokens = ceil_align(self._sparse_min_tokens, page_size)
-        else:
-            preferred_tokens = token_limit // page_size * page_size
-            max_rows = min(max_rows, preferred_tokens // 2)
-            if preferred_tokens < min_tokens:
-                max_rows = 0
 
         def plan_for(rows: int) -> BudgetPlan:
             if rows == requested_rows:
@@ -860,38 +852,34 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 + native_tokens * self._cell_size
             )
 
-        def exceeds_budget(plan: BudgetPlan, native_tokens: int) -> bool:
+        def exceeds_budget(rows: int) -> bool:
+            # Match the native request limit (token capacity // 2). The
+            # configured token limit caps capacity; it is not a reservation.
+            native_tokens = max(min_tokens, ceil_align(2 * rows, page_size))
+            if token_limit is not None and native_tokens > token_limit:
+                return True
+            plan = plan_for(rows)
             return (
                 hbm_limit != 0 and plan.managed_hbm_bytes > hbm_limit
             ) or required_bytes(plan, native_tokens) > available_bytes
 
-        def exceeds_preferred_budget(rows: int) -> bool:
-            native_tokens = max(
-                preferred_tokens, min_tokens, ceil_align(2 * rows, page_size)
-            )
-            return exceeds_budget(plan_for(rows), native_tokens)
-
         # Buffer sizes are nondecreasing in the row count, including the graph
         # and eager scratch rounded to their batch alignment.
         fitting_rows = bisect_right(
-            range(1, max_rows + 1), False, key=exceeds_preferred_budget
+            range(1, requested_rows + 1), False, key=exceeds_budget
         )
         if fitting_rows:
             return plan_for(fitting_rows)
 
-        # Preserve the largest native token pool possible with one resident
-        # row when even that row cannot coexist with the preferred token count.
         one_row = plan_for(1)
-        if max_rows < 1 or exceeds_budget(one_row, min_tokens):
-            raise RuntimeError(
-                "Not enough memory for one sparse KV resident row and a native "
-                f"token pool: need {required_bytes(one_row, min_tokens)} bytes "
-                f"for {min_tokens} native tokens, have {available_bytes} bytes "
-                f"(manager needs {one_row.managed_hbm_bytes} bytes, "
-                f"manager HBM limit={hbm_limit or 'unset'}, "
-                f"max_total_tokens={token_limit})."
-            )
-        return one_row
+        raise RuntimeError(
+            "Not enough memory for one sparse KV resident row and a native "
+            f"token pool: need {required_bytes(one_row, min_tokens)} bytes "
+            f"for {min_tokens} native tokens, have {available_bytes} bytes "
+            f"(manager needs {one_row.managed_hbm_bytes} bytes, "
+            f"manager HBM limit={hbm_limit or 'unset'}, "
+            f"max_total_tokens={token_limit})."
+        )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

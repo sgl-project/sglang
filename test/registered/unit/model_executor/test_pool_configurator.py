@@ -1393,20 +1393,22 @@ class TestEagleConfigurator(CustomTestCase):
             KVCacheConfigurator.resolve_max_num_reqs(mr, tokens)
         )
 
+        server_args = dict(
+            attention_backend="ascend",
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="ascend",
+            disaggregation_decode_extra_slots=extra_rows,
+            page_size=page_size,
+            max_running_requests=requested_rows,
+            num_reserved_decode_tokens=decode_reserve,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+        )
         with (
             get_context().override_server_args(
-                attention_backend="ascend",
-                disaggregation_mode="decode",
-                disaggregation_transfer_backend="ascend",
-                disaggregation_decode_extra_slots=extra_rows,
-                page_size=page_size,
-                max_running_requests=requested_rows,
-                max_total_tokens=token_limit,
-                num_reserved_decode_tokens=decode_reserve,
-                speculative_algorithm="EAGLE",
-                speculative_num_steps=2,
-                speculative_num_draft_tokens=3,
-                speculative_eagle_topk=1,
+                **server_args, max_total_tokens=token_limit
             ),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
             envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
@@ -1443,26 +1445,40 @@ class TestEagleConfigurator(CustomTestCase):
                     + (tokens + page_size) * native_bytes_per_token
                 )
 
-            for rows, tokens in (
-                (requested_rows, token_limit),
-                (2, token_limit),
-                (1, min_tokens),
+            for rows, tokens, cap in (
+                (requested_rows, token_limit, token_limit),
+                (2, token_limit, token_limit),
+                (1, min_tokens, token_limit),
+                (2, min_tokens, token_limit),
+                (2, min_tokens, None),
             ):
-                with self.subTest(rows=rows, tokens=tokens):
+                with self.subTest(rows=rows, tokens=tokens, cap=cap):
                     mr.sparse_kv_budget_plan = None
                     mr.sparse_kv_budget_finalized = False
                     mr._profile_available_bytes.return_value = budget_for(rows, tokens)
-                    with self.assertLogs(
-                        "sglang.srt.mem_cache.kv_cache_configurator", level="INFO"
-                    ) as logs:
+                    with (
+                        get_context().override_server_args(
+                            **server_args, max_total_tokens=cap
+                        ),
+                        self.assertLogs(
+                            "sglang.srt.mem_cache.kv_cache_configurator", level="INFO"
+                        ) as logs,
+                    ):
                         sizes = KVCacheConfigurator._resolve_memory_pool_config(
                             mr, pre_model_load_memory=0
                         )
                     self.assertEqual(sizes.max_running_requests, rows)
                     self.assertEqual(sizes.max_total_num_tokens, tokens)
-                    self.assertEqual(mr.sparse_kv_budget_plan.resident_rows, rows + 1)
+                    plan = mr.sparse_kv_budget_plan
+                    self.assertEqual(plan.resident_rows, rows + 1)
+                    self.assertEqual(plan.request_rows, rows + extra_rows + 1)
+                    for name in ("device_k_buffer", "device_v_buffer"):
+                        self.assertEqual(plan.manager_buffers[name].shape[0], rows + 1)
                     self.assertEqual(
-                        mr.sparse_kv_budget_plan.request_rows, rows + extra_rows + 1
+                        plan.manager_buffers["device_slot_map"].shape[0], rows + 2
+                    )
+                    self.assertEqual(
+                        plan.adapter_buffers["last_prefix"].shape[0], rows + 2
                     )
                     self.assertIn(
                         f"requested_bs={requested_rows} effective_bs={rows}",
