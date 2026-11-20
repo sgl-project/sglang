@@ -1663,8 +1663,13 @@ class UnifiedRadixCache(BasePrefixCache):
             # sliding window of live SWA and the match after the insert rejects it.
             # The insert stops at page_floor(len(radix_key)), and a bigram key is
             # one shorter than the tokens it spans, so measure the key.
+            frontier = len(radix_key) - 1
+            if insert_params.mamba_checkpoint_dropped:
+                # Nothing is inserted, so no leaf needs a window behind the key:
+                # retire behind the request's own frontier, as decode does.
+                frontier = len(token_ids) - 1
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+                comp.free_out_of_window_slots(req, frontier, insert_params)
 
         if effective_cache_len <= 0:
             for comp in self._components_tuple:

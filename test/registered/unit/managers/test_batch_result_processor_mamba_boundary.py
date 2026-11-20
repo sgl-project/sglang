@@ -86,7 +86,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
             think_end_ids=None, self_opened_think_start_ids=None
         ),
         token_to_kv_pool_allocator=MagicMock(),
-        tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
+        tree_cache=SimpleNamespace(
+            page_size=TRACK_INTERVAL, window_slots=lambda: (ComponentType.SWA,)
+        ),
         hisparse_coordinator=None,
         beam_coordinator=MagicMock(),
         request_retirer=release_only_retirer(
@@ -332,7 +334,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 self.assertEqual(req.kv.mamba_next_track_idx, 1 if took else 0)
                 self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
 
-    def test_spec_crossing_plans_no_write_and_keeps_the_checkpoint(self):
+    def test_spec_crossing_plans_no_write_and_drops_the_checkpoint(self):
         req, batch = self._make_lazy_batch(took=False)
         batch.mamba_lazy_spec_prepare(TRACK_INTERVAL, max_draft_tokens=2)
         self.assertEqual(batch.mamba_lazy_spec_track_positions_cpu, [-1])
@@ -343,7 +345,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         self.assertEqual(req.kv.mamba_ping_pong_track_buffer.tolist(), [10, -1])
         self.assertEqual(req.kv.mamba_next_track_idx, 0)
         self.assertEqual(req.kv.mamba_last_track_idx, 0)
-        self.assertEqual(req.kv.mamba_last_track_seqlen, TRACK_INTERVAL)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
 
     def test_eviction_frees_the_slot_before_skipping(self):
         for spec in (False, True):

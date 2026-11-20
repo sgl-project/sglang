@@ -105,6 +105,9 @@ class InsertParams:
     # Prepare held the running request's state back from the tree; the request
     # keeps its tracked checkpoint for a later insert.
     mamba_checkpoint_deferred: bool = False
+    # Prepare found no free state slot to publish the running request's
+    # checkpoint: the tree takes nothing and the request drops the checkpoint.
+    mamba_checkpoint_dropped: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None

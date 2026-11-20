@@ -544,6 +544,8 @@ class SchedulerBatchResultProcessor:
                                     req,
                                 )
                             )
+                    elif batch.forward_mode.is_mixed():
+                        self._mamba_mixed_decode_update(req, batch, i)
 
                     if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
@@ -1604,6 +1606,18 @@ class SchedulerBatchResultProcessor:
                 i,
                 known_boundary=not lazy and known_mamba_boundary is True,
             )
+        elif (
+            lazy
+            and not req.finished()
+            and self._mamba_checkpoint_holds_windows()
+            and self._mamba_check_track_boundary(req, batch, result, i)[0]
+        ):
+            # The boundary had no second slot (mamba_lazy_prealloc_at_boundary)
+            # and wrote no snapshot: drop the checkpoint it leaves more than an
+            # interval behind, so window retirement stops keeping its window.
+            kv_storage_of(
+                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+            ).advance(req, tracking=TrackingAdvance(boundary=None))
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache
@@ -1805,8 +1819,10 @@ class SchedulerBatchResultProcessor:
         Running req with a confirmed crossing: the commit scattered the
         crossing state into the planned position; promote it to keep unless
         the plan already pointed at the keep slot (promoted by an earlier
-        overlapped confirmation). A -1 plan had no slot: the keep slot and
-        mamba_last_track_seqlen stay.
+        overlapped confirmation). A -1 plan had no slot: the keep slot stays,
+        and with windows the request drops its checkpoint
+        (mamba_last_track_seqlen), which the crossing leaves more than an
+        interval behind, so window retirement stops keeping the window behind it.
         Finishing req: donate the keep slot only if this step's scatter did
         not write it.
         """
@@ -1826,12 +1842,17 @@ class SchedulerBatchResultProcessor:
                 req.mamba_lazy_checkpoint = False
             return
 
-        if not crossed or planned_pos is None or planned_pos < 0:
+        if not crossed or planned_pos is None:
+            return
+        storage = kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        )
+        if planned_pos < 0:
+            if self._mamba_checkpoint_holds_windows():
+                storage.advance(req, tracking=TrackingAdvance(boundary=None))
             return
         old_position = req.kv.mamba_next_track_idx
-        kv_storage_of(
-            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-        ).advance(
+        storage.advance(
             req,
             tracking=TrackingAdvance(
                 boundary=track_seqlen,
@@ -1856,6 +1877,33 @@ class SchedulerBatchResultProcessor:
             f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "
             "overlap lookahead wider than assumed"
         )
+
+    def _mamba_checkpoint_holds_windows(self) -> bool:
+        """Whether a request's latest state checkpoint keeps window rows behind
+        it (`swa_retain_floor`). Only then is a checkpoint no snapshot backs
+        worth dropping: without windows the drop frees nothing and loses the
+        checkpoint a finish would publish."""
+        return bool(self.tree_cache.window_slots())
+
+    def _mamba_mixed_decode_update(
+        self, req: Req, batch: ScheduleBatch, i: int
+    ) -> None:
+        """A decode row of a mixed forward is not tracked
+        (`ScheduleBatch.mix_with_running`), so a track boundary it reaches
+        writes no snapshot: drop the checkpoint that boundary leaves more than
+        an interval behind, so window retirement stops keeping its window."""
+        if (
+            req.kv.mamba_ping_pong_track_buffer is None
+            or req.kv.mamba_last_track_seqlen is None
+            or not self._mamba_checkpoint_holds_windows()
+        ):
+            return
+        seq_len = batch.prefix_lens[i] + batch.extend_lens[i]
+        if seq_len % mamba_track_grid(self.tree_cache.page_size):
+            return
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(req, tracking=TrackingAdvance(boundary=None))
 
     def _mamba_check_track_boundary(self, req, batch, result, i):
         """Check if this decode step crosses a mamba track interval boundary.
