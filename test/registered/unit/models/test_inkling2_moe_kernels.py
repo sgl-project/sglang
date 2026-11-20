@@ -14,6 +14,11 @@ from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.inkling_common import inkling2_moe as moe
+from sglang.srt.models.inkling_common.inkling2_attn_res import (
+    Inkling2AttnRes,
+    Inkling2AttnResState,
+)
+from sglang.srt.models.inkling_common.inkling2_norm import RMSNorm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 
@@ -268,6 +273,48 @@ def _quantize_reference(x):
     packed = torch.where(choose4[..., None], packed4, packed6)
     scale = torch.where(choose4, scale4, scale6).to(torch.float8_e4m3fn)
     return packed.reshape(*x.shape[:-1], x.shape[-1] // 2), scale, amax
+
+
+@blackwell
+@pytest.mark.parametrize("tokens,rank", [(1028, 0), (4099, 3), (16384, 2)])
+@pytest.mark.parametrize("layer", [6, 7])
+def test_mega_moe_local_input_matches_full_batch_rows(tokens, rank, layer):
+    """The MoE input chain (AttnRes, norm, router, top-k) on the rows a rank
+    dispatches to MegaMoE equals those rows of the chain on every token: from
+    MEGA_MOE_LOCAL_INPUT_MIN_ROWS up, no kernel in it is picked by row count.
+    Layer 6 opens an AttnRes block; layer 7 adds the attention output instead."""
+    start, count = moe.Inkling2Experts.mega_token_slice(
+        SimpleNamespace(ep_size=4, ep_rank=rank), tokens
+    )
+    assert count >= moe.MEGA_MOE_LOCAL_INPUT_MIN_ROWS
+    rows = slice(start, start + count)
+    torch.manual_seed(tokens + rank)
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        attn_res = Inkling2AttnRes(12, H, 6, [], normalize_values=True)
+        norm = RMSNorm(H, 1e-6, output_dtype=torch.bfloat16)
+        gate = moe.Inkling2Gate(
+            SimpleNamespace(
+                num_experts_per_tok=TOPK,
+                route_scale=8.0,
+                n_routed_experts=4 * E,
+                hidden_size=H,
+                use_gate_bias=True,
+            )
+        )
+        for parameter in (attn_res.mlp_queries[layer], gate.weight, gate.bias):
+            parameter.data.copy_(torch.randn(parameter.shape, dtype=torch.float32))
+        norm.weight.data.copy_(torch.rand(H, dtype=torch.float32) + 0.5)
+        blocks = [torch.randn(tokens, H) for _ in range(2)]
+        partial, attention = torch.randn(tokens, H), torch.randn(tokens, H)
+    state = Inkling2AttnResState(attn_res, partial, blocks)
+
+    full = norm(state.mlp_input(layer, attention))
+    local = norm(state.mlp_input(layer, attention, (start, count)))
+    assert torch.equal(local, full[rows])
+    full_weights, full_ids = gate(full)
+    weights, ids = gate(local)
+    assert torch.equal(ids, full_ids[rows])
+    assert torch.equal(weights, full_weights[rows])
 
 
 @pytest.mark.skipif(
