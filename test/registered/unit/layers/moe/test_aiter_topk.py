@@ -38,7 +38,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: only ROCm runs the real AITER kernel through the strided
 # shared-column buffer, including CUDA-graph replay.
-register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=15, suite="base-b-test-1-gpu-small-amd")
 
 
 def _publish(test):
