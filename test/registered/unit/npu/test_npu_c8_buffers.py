@@ -16,8 +16,8 @@ for name in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
-    "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
 ):
     sys.modules.setdefault(name, MagicMock())
 
@@ -246,7 +246,9 @@ class TestC8BufferContracts(CustomTestCase):
                 None,
                 None,
                 SimpleNamespace(layer_id=0, scaling=0.1),
-                SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE, attn_dcp_metadata=None
+                ),
                 save_kv_cache=False,
                 q_rope=torch.ones(1, 1, 64, dtype=torch.float16),
                 topk_indices=torch.tensor([[0]]),
