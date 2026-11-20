@@ -93,6 +93,7 @@ from sglang.srt.entrypoints.openai.responses_tools.beam import (
     BeamToolAdapter,
     ResponseToolChoiceError,
 )
+from sglang.srt.entrypoints.openai.responses_tools.minicpm import MiniCPMToolAdapter
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     _incomplete_tool_call_indices,
@@ -176,6 +177,12 @@ def _should_emit_normal_text_as_message(
 
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
 
+_TOOL_ADAPTERS = {
+    "beam": BeamToolAdapter,
+    "minicpm5_moe": MiniCPMToolAdapter,
+    "minicpm5_latent_moe_swa_msa": MiniCPMToolAdapter,
+}
+
 
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
@@ -205,9 +212,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             tool_server.has_tool("python") if tool_server else False
         )
         self.tool_server = tool_server
-        # Beam renders namespaced and built-in tools as flat function tools.
-        self._translates_tools = (
-            self.tokenizer_manager.model_config.hf_config.model_type == "beam"
+        self._tool_adapter_cls = _TOOL_ADAPTERS.get(
+            self.tokenizer_manager.model_config.hf_config.model_type
         )
         # Get from model config
         self.use_harmony = (
@@ -322,9 +328,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
         tool_adapter = None
-        if self._translates_tools:
+        if self._tool_adapter_cls is not None:
             try:
-                request, tool_adapter = BeamToolAdapter.from_request(
+                request, tool_adapter = self._tool_adapter_cls.from_request(
                     request, tool_call_parser=self.tool_call_parser
                 )
             except ResponseToolChoiceError as exc:
@@ -1675,6 +1681,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and (
                     merged[-1].get("phase") == msg.get("phase")
                     or set(merged[-1]) == {"role", "reasoning_content"}
+                    or (
+                        merged[-1].get("phase") == "commentary"
+                        and set(msg) == {"role", "tool_calls"}
+                    )
                 )
             ):
                 prev = merged[-1] = dict(merged[-1])
