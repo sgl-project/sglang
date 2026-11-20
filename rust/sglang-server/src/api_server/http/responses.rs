@@ -263,6 +263,7 @@ mod tests {
         // No `reasoning` sent: Python echoes a null effort.
         let (_, body) = post_json(&app, "/v1/responses", r#"{"input": "hi"}"#).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], model);
         assert_eq!(
             json["reasoning"],
             serde_json::json!({"effort": null, "summary": null})
@@ -371,6 +372,7 @@ mod tests {
     #[tokio::test]
     async fn stream_emits_the_responses_event_sequence() {
         let state = answering_app_state();
+        let model = state.server_args.served_model_name.clone();
         let app = app(state);
         let (status, body) =
             post_json(&app, "/v1/responses", r#"{"input": "hi", "stream": true}"#).await;
@@ -410,6 +412,9 @@ mod tests {
         for (i, (kind, payload)) in frames.iter().enumerate() {
             assert_eq!(payload["type"], *kind);
             assert_eq!(payload["sequence_number"], i, "{kind}");
+            if let Some(response) = payload.get("response") {
+                assert_eq!(response["model"], model, "{kind}");
+            }
         }
         assert_eq!(frames[0].1["response"]["status"], "in_progress");
         assert_eq!(frames[4].1["delta"], "ok");
