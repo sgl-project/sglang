@@ -23,6 +23,9 @@ labels and rerun runs, so they need both keys. The
 labeling commands and the no-argument `/run-ci` alias of `/tag-and-rerun-ci`
 check each key for the step it gates.
 
+NPU runs by default with `run-ci` on ready PRs, with no extra label. Its
+checks are non-required. Use `/run-ci npu` or `/run-full-ci npu` to rerun it.
+
 Each opt-in workflow passes `require-label: run-ci-<tier>` to `pr-gate.yml` and
 is registered under that tier in `scripts/ci/opt_in_ci_tiers.json`;
 `scripts/lint/check_opt_in_ci_tiers.py` checks the two agree. Without the label,

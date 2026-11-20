@@ -47,8 +47,8 @@
       ".github/workflows/pr-test-xeon.yml"
     ]
   },
-  "npu-extra": {
-    "label": "run-ci-npu-extra",
+  "npu": {
+    "label": null,
     "workflows": [
       ".github/workflows/pr-test-npu.yml"
     ]

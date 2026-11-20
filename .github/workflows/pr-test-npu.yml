@@ -106,8 +106,6 @@ jobs:
     needs: check-changes
     if: ${{ inputs.coverage_mode != true && needs.check-changes.outputs.changes_exist == 'true' }}
     uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-label: run-ci-npu-extra
     secrets: inherit
 
   set-image-config:
