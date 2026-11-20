@@ -1942,6 +1942,10 @@ class MiniMaxH3FinalLayer(nn.Module):
                 device=served_stack.device, dtype=served_stack.dtype, copy=True
             )
         self._pdd_device_heads = {}
+        logger.info(
+            "MiniMax-H3 PDD: head stacks %s replaced by a weight update",
+            sorted(tp_shard_by_key),
+        )
 
     def _narrow_pdd_head_stack(
         self, *, key: str, full_stack: torch.Tensor, steps: int
