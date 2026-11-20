@@ -723,6 +723,30 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                             torch.tensor([[0.5 * scale] * 2] * 3 + [[0.0, 0.0]]),
                         )
 
+    def test_mega_gate_row_masks_rebuilt_inside_graph_capture(self):
+        # The decoder replay tail captures after eager warm-ups in the same forward.
+        bound = torch.tensor([3], dtype=torch.int32)
+        forward_batch = SimpleNamespace()
+
+        def masks(capturing):
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=capturing
+            ):
+                return mega_gate_runtime._gate_row_masks(
+                    None, 4, bound, None, "cpu", forward_batch
+                )[0]
+
+        with (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
+            mega_gate_runtime.mega_gate_forward_scope(forward_batch),
+        ):
+            eager = masks(False)
+            self.assertIs(masks(False), eager)
+            captured = masks(True)
+            self.assertIsNot(captured, eager)
+            self.assertIs(masks(True), captured)
+        torch.testing.assert_close(captured, torch.tensor([True, True, True, False]))
+
     def test_mega_gate_maps_eplb_in_kernel_and_records_from_buffer(self):
         moe = self._mega_gate_moe()
         hidden = torch.ones((4, 256), dtype=torch.bfloat16)

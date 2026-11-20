@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Cosmos-Dreams frustum K/V retrieval: selector geometry, pose
-recovery from unified rows, the per-layer archive view and request resolution."""
+"""Unit tests for Cosmos-Dreams frustum K/V retrieval: selector geometry,
+pose recovery from unified rows and request resolution."""
 
 import math
 import unittest
@@ -91,6 +91,16 @@ class TestFrustumSelector(unittest.TestCase):
         )
         self.assertEqual(zero.select(10), [])
         self.assertEqual(selector.partition(50), (2, 46))
+
+    def test_describe_selection(self):
+        selector = _selector(
+            [_pose() for _ in range(100)], sink_size=2, retrieved_size=3, recent_size=4
+        )
+        selected = selector.select(50)
+        self.assertEqual(
+            describe_selection(selector, 50, selected),
+            "9 frames: 2 sinks, 4 recent, retrieved [43, 44, 45]",
+        )
 
     def test_multi_frame_query_averages_over_the_chunk(self):
         poses = (
@@ -292,16 +302,6 @@ class TestSelectedHistory(unittest.TestCase):
         for bad in ([3, 0], [0, 0], [8], [-1]):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 view.select(bad, tokens_per_frame=tokens)
-
-    def test_describe_selection(self):
-        selector = _selector(
-            [_pose() for _ in range(100)], sink_size=2, retrieved_size=3, recent_size=4
-        )
-        selected = selector.select(50)
-        self.assertEqual(
-            describe_selection(selector, 50, selected),
-            "9 frames: 2 sinks, 4 recent, retrieved [43, 44, 45]",
-        )
 
 
 class TestResolveFrustumSelector(unittest.TestCase):

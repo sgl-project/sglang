@@ -1041,8 +1041,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             _use_aiter
+            and x.is_cuda
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
+            # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
+            and x.is_cuda
         ):
             if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
                 return F.linear(x, layer.weight, bias)

@@ -1554,8 +1554,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
         )
 
     def _rollout(self, batch: Req) -> torch.Tensor:
-        device = get_local_torch_device()
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
+        if (
+            self.profile.history_mode == HISTORY_MODE_FULL
+            and target_frame > self.profile.window_frames
+        ):
+            raise ValueError(
+                "Cosmos-Dreams full history must retain the entire rollout. "
+                f"Raise history_max_frames to cover {batch.num_frames} pixel frames."
+            )
+        device = get_local_torch_device()
         if not isinstance(batch.seed, int):
             raise ValueError(
                 f"Cosmos-Dreams requires a single integer seed, got {batch.seed!r}."

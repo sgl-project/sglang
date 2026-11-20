@@ -61,8 +61,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     EXTRA_DECODED_OUTPUT,
     EXTRA_STREAMED_OUTPUT_PATHS,
+    EXTRA_TARGET_LATENT_FRAMES,
     CausalDecodeQueue,
     CosmosDreamsDecodingStage,
+    CosmosDreamsPrepareStage,
     CosmosDreamsRolloutStage,
     FixedStepSchedules,
     _RolloutContext,
@@ -934,6 +936,42 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
                 chunk_frames=2,
                 rollout_frames=None,
             )
+
+    def test_full_history_rejects_requests_beyond_configured_limit(self):
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.profile = SimpleNamespace(history_mode="full", window_frames=2)
+        batch = SimpleNamespace(extra={EXTRA_TARGET_LATENT_FRAMES: 3}, num_frames=9)
+        with self.assertRaisesRegex(ValueError, "history_max_frames"):
+            stage._rollout(batch)
+
+    def test_frustum_requires_an_image_and_complete_archive(self):
+        """The selected working set assumes the archive retains every past
+        frame; sliding and image-free requests must fail before entering it.
+        """
+        stage = object.__new__(CosmosDreamsPrepareStage)
+        batch = SimpleNamespace(
+            sampling_params=SimpleNamespace(frustum_geometry={}), num_frames=9
+        )
+        for profile, has_image, message in (
+            (None, True, "history_mode='full'"),
+            (SimpleNamespace(history_mode="sliding"), True, "history_mode='full'"),
+            (SimpleNamespace(history_mode="full"), False, "conditioning image"),
+            (
+                SimpleNamespace(history_mode="full", window_frames=1, sink_frames=0),
+                True,
+                "whole rollout",
+            ),
+        ):
+            with self.subTest(profile=profile, has_image=has_image):
+                stage.profile = profile
+                with self.assertRaisesRegex(ValueError, message):
+                    stage._frustum_selector(
+                        batch, rows=None, target_frame=3, has_image=has_image
+                    )
+        batch.sampling_params.frustum_geometry = None
+        self.assertIsNone(
+            stage._frustum_selector(batch, rows=None, target_frame=3, has_image=False)
+        )
 
 
 class TestCosmosDreamsBatchedClean(CustomTestCase):
