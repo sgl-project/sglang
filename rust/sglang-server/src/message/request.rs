@@ -11,13 +11,14 @@ use itertools::izip;
 
 use super::buffers::Buffer;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::multimodal::{self, MmItem};
+use super::multimodal::{self, MediaHints, MmItem};
 use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
+use crate::multi_modality::worker::MediaError;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 use sglang_api_types::api::v1 as api_v1;
@@ -1000,6 +1001,53 @@ impl GenerateRequest {
         }
         buffers.append(&mut self.mm_buffers);
         buffers
+    }
+
+    /// Move the media into the `epd.media` buffer, for Python to dispatch to
+    /// the encoders: a msgpack list with one entry per image, its source or
+    /// `{"url", "detail"}`, as Python's `image_data` holds it.
+    pub fn take_epd_media(&mut self, image_token_id: Option<i32>) -> Result<(), Error> {
+        let Some(mm) = self.mm.take() else {
+            return Ok(());
+        };
+        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err(Error::Validation(
+                "SGLANG_RUST_SERVER=1 with --language-only serves image inputs only; \
+                 video and audio are not supported"
+                    .into(),
+            ));
+        }
+        if mm.image_data.is_empty() {
+            return Ok(());
+        }
+        if let (Some(id), Some(ids)) = (image_token_id, &self.input_ids) {
+            let found = ids.iter().filter(|&&t| t == i64::from(id)).count();
+            let items = mm.image_data.len();
+            if found != items {
+                // The Rust MM pipeline's refusal (`layout_by_placeholder`), word for word.
+                return Err(Error::Encode(MediaError::Client(format!(
+                    "prompt has {found} media placeholder(s) but {items} media item(s)"
+                ))));
+            }
+        }
+        let images: Vec<serde_json::Value> = mm
+            .image_data
+            .iter()
+            .map(|item| match item {
+                MmItem::Ref {
+                    url,
+                    hints:
+                        MediaHints {
+                            detail: Some(detail),
+                            ..
+                        },
+                } => serde_json::json!({"url": url, "detail": detail}),
+                MmItem::Ref { url, .. } | MmItem::Source(url) => serde_json::json!(url),
+            })
+            .collect();
+        let media = rmp_serde::to_vec(&images).map_err(|e| Error::Internal(e.to_string()))?;
+        self.mm_buffers.push(Buffer::inline("epd.media", media));
+        Ok(())
     }
 }
 

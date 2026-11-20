@@ -233,6 +233,12 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
+    /// `--language-only`: media skips the MM pool and the prefetch; Python
+    /// sends it to the encoders.
+    pub epd_dispatch: bool,
+    /// The image placeholder a `--language-only` prompt holds once per image,
+    /// for a model whose Rust MM pipeline checks that count; `None` skips it.
+    pub epd_image_token_id: Option<i32>,
     /// The resolved `--enable-return-hidden-states`;
     /// decides the mode only when `return_hidden_states_mode` is unset.
     pub enable_return_hidden_states: bool,
@@ -330,6 +336,8 @@ impl ServerArgs {
         enable_strict_thinking,
         limit_mm_data_per_request,
         allow_auto_truncate,
+        epd_dispatch,
+        epd_image_token_id,
         enable_return_hidden_states,
         return_hidden_states_mode,
         num_reserved_tokens,
@@ -397,6 +405,8 @@ impl ServerArgs {
         enable_strict_thinking: bool,
         limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
+        epd_dispatch: bool,
+        epd_image_token_id: Option<i32>,
         enable_return_hidden_states: bool,
         return_hidden_states_mode: Option<String>,
         num_reserved_tokens: u64,
@@ -462,6 +472,8 @@ impl ServerArgs {
             enable_strict_thinking,
             limit_mm_data_per_request,
             allow_auto_truncate,
+            epd_dispatch,
+            epd_image_token_id,
             enable_return_hidden_states,
             return_hidden_states_mode,
             num_reserved_tokens,
@@ -534,6 +546,8 @@ impl Default for ServerArgs {
             enable_strict_thinking: false,
             limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
+            epd_dispatch: false,
+            epd_image_token_id: None,
             enable_return_hidden_states: false,
             return_hidden_states_mode: None,
             num_reserved_tokens: 0,
