@@ -84,7 +84,7 @@ def _candidate_block_scores_kernel(
         return
     cols = blocks[:, None] * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     vals = tl.load(
-        logits_ptr + row * logits_stride + cols,
+        logits_ptr + row.to(tl.int64) * logits_stride + cols,
         mask=(cols < length) & (cols < width),
         other=float("-inf"),
     )
@@ -118,7 +118,7 @@ def _gather_candidate_blocks_kernel(
     t = tl.arange(0, BLOCK_SIZE)[None, :]
     cols = ids[:, None] * BLOCK_SIZE + t
     vals = tl.load(
-        logits_ptr + row * logits_stride + cols,
+        logits_ptr + row.to(tl.int64) * logits_stride + cols,
         mask=(ids[:, None] >= 0) & (cols < length) & (cols < width),
         other=float("-inf"),
     )
