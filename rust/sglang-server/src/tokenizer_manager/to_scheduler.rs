@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
-use crate::message::request::{Request, RequestKind, SchedulerRequest};
+use crate::message::request::{GenerateRequest, Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
@@ -169,6 +169,16 @@ impl Intake {
             self.request_states.remove(&req.rid),
             Some(RequestState::Aborted)
         ) {
+            // Back with its ids tokenized (and expanded, from the mm pool), its
+            // abort reports them once fitted to the context, as Python's does
+            // for a request aborted once tokenized. One still bound for the mm
+            // pool, or whose ids fail the checks, reports none.
+            if let (RequestState::PreSendValidating, RequestKind::Generate(g)) =
+                (&req.state, &mut req.kind)
+                && self.check_final_ids(g).is_ok()
+            {
+                g.report_prompt_token_ids();
+            }
             tracing::debug!(rid = %req.rid, "dropping request aborted");
             return;
         }
@@ -320,8 +330,7 @@ impl Intake {
                 // a text request has no ids yet.
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = validate_input_ids(g, self.limits.vocab_size)
-                            .and_then(|()| check_total_tokens(g, &self.limits))
+                        && let Err(e) = self.check_final_ids(g)
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
@@ -359,6 +368,13 @@ impl Intake {
                 }
             }
         }
+    }
+
+    /// Check a request's final ids, as the scheduler will get them, and fit
+    /// them to the context.
+    fn check_final_ids(&self, g: &mut GenerateRequest) -> Result<(), Error> {
+        validate_input_ids(g, self.limits.vocab_size)
+            .and_then(|()| check_total_tokens(g, &self.limits))
     }
 
     /// Register the response sink with the owning detok shard (by id) so the response
@@ -547,9 +563,12 @@ impl Intake {
         // buffers out; the resulting values own their data, so no borrow
         // outlives a `fail(&mut req)`.
         let serialized = match &mut req.kind {
-            RequestKind::Generate(g) if g.already_tokenized() => g
-                .encode_header()
-                .map(|header| (header, g.take_buffers(), g.dispatch_finish_time.clone())),
+            RequestKind::Generate(g) if g.already_tokenized() => {
+                // Final here, and before the buffers take them.
+                g.report_prompt_token_ids();
+                g.encode_header()
+                    .map(|header| (header, g.take_buffers(), g.dispatch_finish_time.clone()))
+            }
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
                 "non-generate request reached push_to_channel".into(),
