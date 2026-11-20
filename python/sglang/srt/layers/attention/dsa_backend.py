@@ -2714,6 +2714,7 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -3142,6 +3143,7 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention

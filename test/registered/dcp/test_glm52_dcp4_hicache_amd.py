@@ -19,6 +19,9 @@ GLM52_MODEL_PATH = os.environ.get("GLM52_MODEL_PATH", "amd/GLM-5.2-MXFP4")
 DCP_SIZE = 4
 WIDENED_PAGE = 64 * DCP_SIZE
 DCP_ARGS = [
+    # DCP returns output + LSE through the breakable prefill wrapper.
+    "--cuda-graph-backend-prefill",
+    "breakable",
     "--kv-cache-dtype",
     "fp8_e4m3",
     "--dsa-prefill-backend",
