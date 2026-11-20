@@ -6039,6 +6039,26 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
 
+    def test_fallback_explicit_thinking_env_default_on(self):
+        # With SGLANG_DEFAULT_THINKING=1, the grammar gate must see thinking
+        # for kwargs-less requests, same as the parse-side _thinking_requested.
+        # When the gate alone saw non-thinking, a json_object grammar started
+        # from the first token, the think-end token could never be emitted,
+        # and the whole constrained JSON streamed as reasoning_content with an
+        # empty content field.
+        self._setup_fallback("deepseek-v3")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        req_disabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": False},
+        )
+        with envs.SGLANG_DEFAULT_THINKING.override(1):
+            self.assertTrue(self.chat._get_reasoning_from_request(req_default))
+            self.assertFalse(self.chat._get_reasoning_from_request(req_disabled))
+
     def test_fallback_explicit_enable_thinking_mode_default_off(self):
         self._setup_fallback("mimo")
         req_default = ChatCompletionRequest(
