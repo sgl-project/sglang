@@ -27,13 +27,8 @@ def test_musa_runtime_alias_owner_is_torchada():
     musa_block = utils.split("#if defined(__MUSACC__)", 1)[1].split(
         "#elif !defined(USE_ROCM)", 1
     )[0]
-    for header in (
-        "cuda.h",
-        "cuda_bf16.h",
-        "cuda_fp16.h",
-        "cuda_fp8.h",
-        "cuda_runtime.h",
-    ):
+    assert "#include <cuda.h>" not in musa_block
+    for header in ("cuda_bf16.h", "cuda_fp16.h", "cuda_fp8.h", "cuda_runtime.h"):
         assert f"#include <{header}>" in musa_block
     for symbol in (
         "cudaFuncAttributeMaxDynamicSharedMemorySize",
@@ -53,8 +48,8 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
     monkeypatch.setattr(toolchain, "musa_home", lambda: "/opt/musa")
     monkeypatch.setattr(
         toolchain,
-        "torchada_cxx_compat_include_dir",
-        lambda: "/torchada/stable_compat",
+        "torchada_cuda_compat_include_dir",
+        lambda: "/torchada/cuda_compat",
     )
     monkeypatch.setattr(
         toolchain, "tvm_ffi_paths", lambda: (("/tvm/include",), "/tvm/lib", "tvm")
@@ -65,7 +60,7 @@ def test_musa_toolchain_paths_and_flags(monkeypatch):
     assert toolchain.target_flags() == ["--offload-arch=mp_31"]
     assert toolchain.base_cuda_flags() == ["-fPIC", "-x", "musa"]
     assert toolchain.base_include_paths() == [
-        "/torchada/stable_compat",
+        "/torchada/cuda_compat",
         "/tvm/include",
         "/opt/musa/include",
     ]

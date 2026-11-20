@@ -27,7 +27,6 @@
 #include <optional>
 #include <type_traits>
 #if defined(__MUSACC__)
-#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -191,7 +190,7 @@ inline constexpr uint32_t kWarpSize = kWarpThreads;
  */
 template <uint32_t kNumThreads = kWarpThreads>
 SGL_DEVICE uint32_t get_lane_id() {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM)
   static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
   uint32_t lane_id;
   asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
@@ -397,7 +396,7 @@ inline const char* get_cuda_error_string(::cudaError_t error) {
   return ::cudaGetErrorString(error);
 }
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 
 inline bool is_cuda_error(::CUresult error) {
   return error != ::CUDA_SUCCESS;
@@ -479,7 +478,7 @@ struct LaunchKernel {
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_MUSA)
     (void)enabled;
     m_config.numAttrs = 0;
 #else
@@ -498,7 +497,11 @@ struct LaunchKernel {
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
+#ifdef USE_MUSA
+    attr.id = musaLaunchAttributeClusterDimension;
+#else
     attr.id = cudaLaunchAttributeClusterDimension;
+#endif
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
 #endif
@@ -517,7 +520,11 @@ struct LaunchKernel {
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
+#ifdef USE_MUSA
+      attr.id = musaLaunchAttributeCooperative;
+#else
       attr.id = cudaLaunchAttributeCooperative;
+#endif
       attr.val.cooperative = 1;
       m_config.attrs = m_attrs;
     }
@@ -551,6 +558,8 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
+#elif defined(USE_MUSA)
+    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
