@@ -1346,12 +1346,11 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::GrpcService;
-    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata, HiCacheManager};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::{ModelConfig, PreferredSamplingParams, ServerArgs};
-    use crate::message::finish_reason::FinishReason;
-    use crate::message::ids::Rid;
+
     use crate::message::request::{GenerateRequest, Request as RuntimeRequest, RequestKind};
-    use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
+    use crate::message::response::{ResponseItem, ResponseSink};
     use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 
     struct Harness {
@@ -1362,7 +1361,6 @@ mod tests {
 
     struct GenerationIntake {
         request: Box<GenerateRequest>,
-        rid: Rid,
         sink: ResponseSink,
         admission: RequestAdmission,
     }
@@ -1424,7 +1422,7 @@ mod tests {
                 panic!("expected generation intake");
             };
             let RuntimeRequest {
-                rid,
+                rid: _,
                 sink,
                 kind,
                 state: _,
@@ -1434,7 +1432,6 @@ mod tests {
             };
             GenerationIntake {
                 request,
-                rid,
                 sink,
                 admission,
             }
@@ -1450,25 +1447,6 @@ mod tests {
             },
             ..Default::default()
         }
-    }
-
-    fn chunk(rid: &Rid, text: &str, token_id: i64, finished: bool) -> ChunkEvent {
-        ChunkEvent {
-            rid: rid.clone(),
-            token_ids: vec![token_id],
-            finish_reason: finished.then(stop_reason),
-            prompt_tokens: 3,
-            cached_tokens: 2,
-            reasoning_tokens: 0,
-            text: text.into(),
-            completion_tokens: 1,
-            stop_token_trimmed: false,
-            extras: None,
-        }
-    }
-
-    fn stop_reason() -> FinishReason {
-        serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap()
     }
 
     fn one_string(value: &str) -> api::StringOrList {
@@ -1511,13 +1489,6 @@ mod tests {
         }
     }
 
-    fn frame(item: api::GenerateStreamItem) -> api::GenerateResponse {
-        match item.item {
-            Some(Item::Frame(frame)) => frame,
-            other => panic!("expected a frame, got {other:?}"),
-        }
-    }
-
     fn stream_error(item: api::GenerateStreamItem) -> api::GenerateStreamError {
         match item.item {
             Some(Item::Error(error)) => error,
@@ -1525,202 +1496,18 @@ mod tests {
         }
     }
 
-    fn meta(frame: &api::GenerateResponse) -> &api::GenerateMetaInfo {
-        frame
-            .meta_info
-            .as_ref()
-            .expect("every frame carries meta_info")
-    }
-
-    fn output_ids(frame: &api::GenerateResponse) -> &[i64] {
-        frame
-            .output_ids
-            .as_ref()
-            .map_or(&[], |ids| ids.ids.as_slice())
-    }
-
+    /// A request the tokenizer manager refuses after admission is its
+    /// in-stream error item with the client's-error type, not an RPC status;
+    /// the call is disarmed.
     #[tokio::test]
-    async fn generate_streams_cumulative_frames_for_a_text_prompt() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(text_request("prompt", "request-1")))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        assert_eq!(intake.request.text.as_deref(), Some("prompt"));
-        assert!(intake.request.input_ids.is_none());
-        assert!(intake.request.stream);
-        assert_eq!(intake.rid.client_facing(), "request-1");
-        // One chunk at a time: a queued backlog of cumulative frames collapses to
-        // its last, so sending both up front would yield only the terminal frame.
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "Hel", 1, false)))
-            .unwrap();
-        let first = frame(stream.next().await.unwrap().unwrap());
-        assert_eq!(first.text, "Hel");
-        assert_eq!(output_ids(&first), [1]);
-        assert_eq!(first.index, None);
-        let first_meta = meta(&first);
-        assert_eq!(first_meta.id, "request-1");
-        assert_eq!(first_meta.prompt_tokens, 3);
-        assert_eq!(first_meta.cached_tokens, 2);
-        assert_eq!(first_meta.completion_tokens, 1);
-        assert!(first_meta.finish_reason.is_none());
-        assert!(first_meta.e2e_latency.is_none());
-
-        intake
-            .sink
-            .try_send(ResponseItem::Done(chunk(&intake.rid, "lo", 2, true)))
-            .unwrap();
-        let finished = frame(stream.next().await.unwrap().unwrap());
-        assert_eq!(finished.text, "Hello");
-        assert_eq!(output_ids(&finished), [1, 2]);
-        let finished_meta = meta(&finished);
-        assert_eq!(finished_meta.completion_tokens, 2);
-        assert!(matches!(
-            finished_meta.finish_reason,
-            Some(api::FinishReason {
-                kind: Some(api::finish_reason::Kind::Stop(_))
-            })
-        ));
-        assert!(finished_meta.e2e_latency.is_some());
-        assert!(stream.next().await.is_none());
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    /// Incremental frames carry each delta with the cumulative completion
-    /// count and cached-token split, which a scheduler abort does not carry.
-    #[tokio::test]
-    async fn incremental_frames_carry_deltas_with_cumulative_count() {
-        use crate::message::response::{CachedTokensDetails, ChunkExtras};
-
-        let harness = Harness::new(2, true, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[4, 5], Some("tokens"))))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        assert_eq!(intake.request.input_ids.as_deref(), Some(&[4, 5][..]));
-        assert!(intake.request.text.is_none());
-        let mut first = chunk(&intake.rid, "A", 10, false);
-        first.extras = Some(Box::new(ChunkExtras {
-            cached_tokens_details: Some(CachedTokensDetails {
-                device: 1,
-                host: 1,
-                storage: None,
-                storage_backend: None,
-            }),
-            ..Default::default()
-        }));
-        intake.sink.try_send(ResponseItem::Frame(first)).unwrap();
-        let mut aborted = chunk(&intake.rid, "B", 11, true);
-        aborted.extras = Some(Box::new(ChunkExtras {
-            abort_output: true,
-            ..Default::default()
-        }));
-        intake.sink.try_send(ResponseItem::Done(aborted)).unwrap();
-
-        let first = frame(stream.next().await.unwrap().unwrap());
-        let finished = frame(stream.next().await.unwrap().unwrap());
-        assert_eq!(output_ids(&first), [10]);
-        assert_eq!(output_ids(&finished), [11]);
-        assert_eq!(finished.text, "B");
-        assert_eq!(meta(&finished).completion_tokens, 2);
-        let split = Some(api::CachedTokensDetails {
-            device: 1,
-            host: 1,
-            storage: None,
-            storage_backend: None,
-        });
-        assert_eq!(meta(&first).cached_tokens_details, split);
-        assert_eq!(meta(&finished).cached_tokens_details, split);
-        assert!(stream.next().await.is_none());
-    }
-
-    /// `stream: false` is a one-frame stream: deltas fold into the terminal
-    /// result, and the server's incremental policy does not split a unary reply.
-    #[tokio::test]
-    async fn unary_request_yields_only_the_cumulative_terminal_frame() {
-        let harness = Harness::new(2, true, Duration::from_secs(1));
-        let mut request = text_request("prompt", "unary");
-        request.stream = Some(false);
-        let mut stream = harness
-            .service
-            .generate(Request::new(request))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        assert!(!intake.request.stream);
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "Hel", 1, false)))
-            .unwrap();
-        intake
-            .sink
-            .try_send(ResponseItem::Done(chunk(&intake.rid, "lo", 2, true)))
-            .unwrap();
-
-        let only = frame(stream.next().await.unwrap().unwrap());
-        assert_eq!(only.text, "Hello");
-        assert_eq!(output_ids(&only), [1, 2]);
-        assert_eq!(meta(&only).completion_tokens, 2);
-        assert!(stream.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn stream_drop_aborts_admitted_request() {
-        let harness = Harness::new(1, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], Some("cancel-me"))))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "partial", 1, false)))
-            .unwrap();
-        assert!(stream.next().await.unwrap().is_ok());
-        drop(stream);
-        let abort = harness.abort_rx.recv_async().await.unwrap();
-        assert_eq!(abort.rid().client_facing(), "cancel-me");
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    /// A runtime failure after admission is this request's in-stream error item
-    /// (the SSE error frame's twin, `type` and `retryable` included), not an
-    /// RPC status; the call is disarmed.
-    #[tokio::test]
-    async fn runtime_failure_rides_the_stream_as_an_error_item() {
+    async fn validation_failure_rides_the_stream_as_a_client_error_item() {
         use crate::utils::error::Error;
-        for (failure, code, kind, retryable) in [
-            (
-                Error::Validation("bad sampling".into()),
-                400,
-                "invalid_request_error",
-                false,
-            ),
-            (
-                Error::Internal("bad state".into()),
-                500,
-                "internal_error",
-                true,
-            ),
-        ] {
+        for (failure, code, kind, retryable) in [(
+            Error::Validation("bad sampling".into()),
+            400,
+            "invalid_request_error",
+            false,
+        )] {
             let harness = Harness::new(1, false, Duration::from_secs(1));
             let mut stream = harness
                 .service
@@ -1743,30 +1530,6 @@ mod tests {
             drop(stream);
             assert!(harness.abort_rx.try_recv().is_err());
         }
-    }
-
-    #[tokio::test]
-    async fn per_chunk_timeout_after_progress_returns_deadline_exceeded_and_aborts() {
-        let harness = Harness::new(1, false, Duration::from_millis(10));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], Some("too-slow"))))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "partial", 1, false)))
-            .unwrap();
-        assert!(stream.next().await.unwrap().is_ok());
-
-        let error = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(error.code(), Code::DeadlineExceeded);
-        drop(stream);
-        let abort = harness.abort_rx.recv_async().await.unwrap();
-        assert_eq!(abort.rid().client_facing(), "too-slow");
     }
 
     /// `--grpc-response-timeout-secs` sets the per-event wait; 0 keeps the
@@ -1908,58 +1671,6 @@ mod tests {
         assert!(intake_rx.is_empty());
     }
 
-    /// A list-form request fans out like the HTTP batch: every item is tagged
-    /// with its position, and one item's failure neither ends the stream nor
-    /// touches its siblings.
-    #[tokio::test]
-    async fn batch_items_are_indexed_and_fail_independently() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(api::GenerateRequest {
-                text: Some(many_strings(&["a", "b"])),
-                stream: Some(true),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        let first = harness.next_generation().await;
-        let second = harness.next_generation().await;
-        assert!(first.admission.try_accept());
-        assert!(second.admission.try_accept());
-        assert_eq!(first.request.text.as_deref(), Some("a"));
-        assert_eq!(second.request.text.as_deref(), Some("b"));
-        first
-            .sink
-            .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
-                "first failed".into(),
-            )))
-            .unwrap();
-        second
-            .sink
-            .try_send(ResponseItem::Done(chunk(&second.rid, "ok", 5, true)))
-            .unwrap();
-
-        let mut items = Vec::new();
-        while let Some(item) = stream.next().await {
-            items.push(item.unwrap());
-        }
-        assert_eq!(items.len(), 2);
-        let (errors, frames): (Vec<_>, Vec<_>) = items
-            .into_iter()
-            .partition(|item| matches!(item.item, Some(Item::Error(_))));
-        let error = stream_error(errors.into_iter().next().unwrap());
-        assert_eq!(error.index, Some(0));
-        assert!(error.error.unwrap().message.contains("first failed"));
-        let ok = frame(frames.into_iter().next().unwrap());
-        assert_eq!(ok.index, Some(1));
-        assert_eq!(ok.text, "ok");
-        assert_eq!(meta(&ok).id, second.rid.client_facing());
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
     /// Launch-time preferred sampling params fill the fields a protobuf request
     /// left unset, beneath the ones it set: the HTTP precedence at the gRPC entry.
     /// A filled `max_new_tokens` is marked defaulted; a set one is the client's.
@@ -2068,435 +1779,6 @@ mod tests {
         assert_eq!(probe.request.input_ids.as_deref(), Some(&[0][..]));
     }
 
-    /// Check gRPC validation, scheduler results, and the configuration returned by GET.
-    #[tokio::test]
-    async fn hicache_controls_preserve_results_and_configuration() {
-        let h = Harness::new(8, false, Duration::from_secs(5));
-        let service = &h.service;
-        let initial = service
-            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(initial, api::HiCacheStatus::default());
-
-        // Without an admin key, attach and detach are refused before any rank
-        // sees them, as on HTTP.
-        let refusing = GrpcService {
-            core: service.core.clone(),
-            config: service.config.clone(),
-            hicache_manager: Arc::new(HiCacheManager::new(
-                service.core.clone(),
-                &ServerArgs::default(),
-            )),
-            server_args: service.server_args.clone(),
-            chat_formatter: None,
-        };
-        let attach = refusing
-            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
-                hicache_storage_backend: Some("file".into()),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        let detach = refusing
-            .detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {}))
-            .await
-            .unwrap_err();
-        for error in [attach, detach] {
-            assert_eq!(error.code(), Code::FailedPrecondition);
-            assert_eq!(error.message(), super::HICACHE_GRPC_UNAVAILABLE);
-        }
-        assert!(h.intake_rx.is_empty());
-
-        let error = service
-            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest::default()))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::InvalidArgument);
-        assert!(h.intake_rx.is_empty());
-
-        for success in [false, true] {
-            let response = hicache_reply(
-                &h,
-                "AttachHiCacheStorageReqInput",
-                success,
-                service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
-                    hicache_storage_backend: Some("file".into()),
-                    hicache_storage_backend_extra_config_json: Some(r#"{"secret_key":"s"}"#.into()),
-                    hicache_write_policy: Some("write_through".into()),
-                    ..Default::default()
-                })),
-            )
-            .await;
-            assert_eq!(response.success, success);
-            assert_eq!(response.message, "backend detail");
-        }
-        let status = service
-            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            status.hicache_storage_backend_extra_config.as_deref(),
-            Some("<redacted>")
-        );
-        for success in [false, true] {
-            let response = hicache_reply(
-                &h,
-                "ClearHiCacheReqInput",
-                success,
-                service.clear_hi_cache_storage(Request::new(api::ClearHiCacheStorageRequest {})),
-            )
-            .await;
-            assert_eq!(response.success, success);
-            assert!(response.message.is_empty());
-        }
-        for success in [false, true] {
-            let response = hicache_reply(
-                &h,
-                "DetachHiCacheStorageReqInput",
-                success,
-                service.detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {})),
-            )
-            .await;
-            assert_eq!(response.success, success);
-            assert_eq!(response.message, "backend detail");
-        }
-        let status = service
-            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            status,
-            api::HiCacheStatus {
-                hicache_write_policy: Some("write_through".into()),
-                ..Default::default()
-            }
-        );
-    }
-
-    // Drive the RPC and a simulated scheduler reply together, checking the request tag.
-    async fn hicache_reply(
-        h: &Harness,
-        tag: &str,
-        success: bool,
-        call: impl std::future::Future<
-            Output = Result<tonic::Response<api::HiCacheStorageResponse>, tonic::Status>,
-        >,
-    ) -> api::HiCacheStorageResponse {
-        let scheduler = async {
-            let TmEvent::Intake { request, admission } = h.intake_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected control intake");
-            };
-            assert!(admission.try_accept());
-            let RequestKind::Control(control) = &request.kind else {
-                panic!("expected control request");
-            };
-            let wire: serde_json::Value =
-                rmp_serde::from_slice(&control.encode().unwrap()).unwrap();
-            assert_eq!(wire[0], tag);
-            request
-                .sink
-                .try_send(ResponseItem::Control(bytes::Bytes::from(
-                    rmp_serde::to_vec_named(
-                        &serde_json::json!({"success": success, "message": "backend detail"}),
-                    )
-                    .unwrap(),
-                )))
-                .unwrap();
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let (response, ()) = tokio::join!(call, scheduler);
-            response.unwrap().into_inner()
-        })
-        .await
-        .expect("HiCache RPC did not finish")
-    }
-
-    /// Out-of-process orchestrators read these launch facts to reproduce the
-    /// server's token admission.
-    #[tokio::test]
-    async fn server_info_reports_launch_facts_for_orchestrators() {
-        let Harness {
-            service,
-            intake_rx,
-            abort_rx: _,
-        } = Harness::build(
-            1,
-            false,
-            Duration::from_secs(1),
-            true,
-            None,
-            ServerArgs {
-                allow_auto_truncate: true,
-                skip_tokenizer_init: true,
-                num_reserved_tokens: 4,
-                ..test_server_args()
-            },
-        );
-        let request = tokio::spawn(async move {
-            service
-                .get_server_info(Request::new(api::GetServerInfoRequest {}))
-                .await
-        });
-        let TmEvent::Intake {
-            request: control,
-            admission,
-        } = intake_rx.recv_async().await.unwrap()
-        else {
-            panic!("server info must submit one control request");
-        };
-        assert!(admission.try_accept());
-        let envelope = rmpv::Value::Map(vec![(
-            rmpv::Value::from("internal_state"),
-            rmpv::Value::Map(Vec::new()),
-        )]);
-        let mut payload = Vec::new();
-        rmpv::encode::write_value(&mut payload, &envelope).unwrap();
-        control
-            .sink
-            .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
-            .unwrap();
-        let info = request.await.unwrap().unwrap().into_inner();
-        assert!(info.allow_auto_truncate);
-        assert!(info.skip_tokenizer_init);
-        assert_eq!(info.num_reserved_tokens, 4);
-    }
-
-    /// gRPC `GetServerInfo` advertises the same nonempty owning-runtime id on
-    /// repeated calls against the same core-backed adapter.
-    #[tokio::test]
-    async fn server_info_instance_id_is_stable_across_grpc_reads() {
-        let Harness {
-            service,
-            intake_rx,
-            abort_rx: _,
-        } = Harness::new(1, false, Duration::from_secs(1));
-        let mut ids = Vec::new();
-        for _ in 0..2 {
-            let call = service.get_server_info(Request::new(api::GetServerInfoRequest {}));
-            let scheduler = async {
-                let TmEvent::Intake {
-                    request: control,
-                    admission,
-                } = intake_rx.recv_async().await.unwrap()
-                else {
-                    panic!("server info must submit one control request");
-                };
-                assert!(admission.try_accept());
-                let envelope = rmpv::Value::Map(vec![(
-                    rmpv::Value::from("internal_state"),
-                    rmpv::Value::Map(Vec::new()),
-                )]);
-                let mut payload = Vec::new();
-                rmpv::encode::write_value(&mut payload, &envelope).unwrap();
-                control
-                    .sink
-                    .try_send(ResponseItem::Control(bytes::Bytes::from(payload)))
-                    .unwrap();
-            };
-            let (response, ()) = tokio::join!(call, scheduler);
-            ids.push(response.unwrap().into_inner().instance_id);
-        }
-        let uuid = uuid::Uuid::parse_str(&ids[0]).unwrap();
-        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
-        assert_eq!(ids[0], ids[1]);
-    }
-
-    /// `OllamaChat` renders the messages with the served template and streams
-    /// the adapter's frames, counts on the done frame; `OllamaShow` needs no
-    /// intake.
-    #[tokio::test]
-    async fn ollama_chat_streams_frames_and_show_is_static() {
-        let mut harness = Harness::new(2, true, Duration::from_secs(1));
-        harness.service.chat_formatter =
-            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
-        let request = api::OllamaChatRequest {
-            model: "m".into(),
-            messages: vec![api::OllamaMessage {
-                role: "user".into(),
-                content: "hi".into(),
-                images: None,
-            }],
-            ..Default::default()
-        };
-        let rpc = harness.service.ollama_chat(Request::new(request));
-        let runtime = async {
-            let intake = harness.next_generation().await;
-            assert!(intake.admission.try_accept());
-            let chat = intake.request.chat_prompt.as_ref().unwrap();
-            assert!(chat.prompt.as_str().contains("hi"));
-            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(2048));
-            intake
-                .sink
-                .try_send(ResponseItem::Frame(chunk(&intake.rid, "o", 7, false)))
-                .unwrap();
-            intake
-                .sink
-                .try_send(ResponseItem::Done(chunk(&intake.rid, "k", 8, true)))
-                .unwrap();
-        };
-        let (response, ()) = tokio::join!(rpc, runtime);
-        let mut stream = response.unwrap().into_inner();
-        let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.message.as_ref().unwrap().content, "o");
-        assert!(!first.done && first.eval_count.is_none());
-        let second = stream.next().await.unwrap().unwrap();
-        assert_eq!(second.message.as_ref().unwrap().content, "k");
-        let done = stream.next().await.unwrap().unwrap();
-        assert!(done.done);
-        assert_eq!(done.done_reason.as_deref(), Some("stop"));
-        assert_eq!(done.message.as_ref().unwrap().content, "");
-        assert_eq!(done.prompt_eval_count, Some(3));
-        assert_eq!(done.eval_count, Some(2));
-        assert!(stream.next().await.is_none());
-
-        let card = harness
-            .service
-            .ollama_show(Request::new(api::OllamaShowRequest {
-                model: "org/Qwen-Chat".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(card.details.unwrap().family, "Qwen");
-        assert_eq!(card.parameters, "num_ctx 4096");
-    }
-
-    /// `AnthropicMessages` renders through the chat core and shapes the
-    /// reply; `AnthropicCountTokens` counts the rendered prompt's ids.
-    #[tokio::test]
-    async fn anthropic_messages_and_count_tokens_over_grpc() {
-        let mut harness = Harness::new(2, true, Duration::from_secs(1));
-        harness.service.chat_formatter =
-            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
-        let request: api::AnthropicMessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .unwrap();
-        let rpc = harness.service.anthropic_messages(Request::new(request));
-        let runtime = async {
-            let intake = harness.next_generation().await;
-            assert!(intake.admission.try_accept());
-            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(8));
-            intake
-                .sink
-                .try_send(ResponseItem::Done(chunk(&intake.rid, "ok", 7, true)))
-                .unwrap();
-        };
-        let (response, ()) = tokio::join!(rpc, runtime);
-        let message = response.unwrap().into_inner();
-        assert_eq!(message.r#type, "message");
-        assert_eq!(message.stop_reason.as_deref(), Some("end_turn"));
-        let content = message.content.unwrap().items;
-        assert_eq!(content.len(), 1);
-        assert!(matches!(
-            &content[0].block,
-            Some(api::anthropic_content_block::Block::Text(text)) if text.text == "ok"
-        ));
-        assert_eq!(message.usage.unwrap().input_tokens, Some(3));
-
-        let request: api::AnthropicCountTokensRequest = serde_json::from_value(serde_json::json!({
-            "model": "m", "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .unwrap();
-        let rpc = harness
-            .service
-            .anthropic_count_tokens(Request::new(request));
-        let runtime = async {
-            let TmEvent::Intake { request, admission } =
-                harness.intake_rx.recv_async().await.unwrap()
-            else {
-                panic!("expected intake");
-            };
-            assert!(admission.try_accept());
-            assert!(matches!(request.kind, RequestKind::Tokenize { .. }));
-            request
-                .sink
-                .try_send(ResponseItem::TokenIds(vec![1, 2, 3, 4]))
-                .unwrap();
-        };
-        let (response, ()) = tokio::join!(rpc, runtime);
-        assert_eq!(response.unwrap().into_inner().input_tokens, 4);
-    }
-
-    #[tokio::test]
-    async fn list_models_uses_static_metadata_without_intake() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        let models = harness
-            .service
-            .list_models(Request::new(api::ListModelsRequest {}))
-            .await
-            .unwrap()
-            .into_inner()
-            .models;
-        assert_eq!(
-            models,
-            vec![api::ModelCard {
-                id: "test-model".into(),
-                root: "test-model".into(),
-                parent: None,
-                max_model_len: 4096,
-            }]
-        );
-        assert!(harness.intake_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn detokenize_returns_text_and_maps_invalid_ids() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        for invalid in [false, true] {
-            let tokens = if invalid { vec![-1] } else { vec![1, 2] };
-            let decode = harness
-                .service
-                .detokenize(Request::new(api::DetokenizeRequest {
-                    tokens: tokens.clone(),
-                }));
-            let runtime = async {
-                let TmEvent::Intake { request, admission } =
-                    harness.intake_rx.recv_async().await.unwrap()
-                else {
-                    panic!("expected intake");
-                };
-                assert!(admission.try_accept());
-                assert!(
-                    matches!(&request.kind, RequestKind::Detokenize { token_ids, skip_special_tokens: true } if *token_ids == tokens)
-                );
-                let reply = if invalid {
-                    ResponseItem::Error(crate::utils::error::Error::Validation(
-                        "invalid token ID".into(),
-                    ))
-                } else {
-                    ResponseItem::Data(bytes::Bytes::from_static("héllo".as_bytes()))
-                };
-                request.sink.try_send(reply).unwrap();
-            };
-            let (result, ()) = tokio::join!(decode, runtime);
-            if invalid {
-                assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
-            } else {
-                assert_eq!(result.unwrap().into_inner().text, "héllo");
-            }
-            assert!(harness.abort_rx.try_recv().is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn detokenize_rejects_missing_tokenizer_without_submission() {
-        let mut harness = Harness::new(2, false, Duration::from_secs(1));
-        harness.service.config.has_tokenizer = false;
-        let error = harness
-            .service
-            .detokenize(Request::new(api::DetokenizeRequest { tokens: vec![1] }))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::Unimplemented);
-        assert!(harness.intake_rx.try_recv().is_err());
-    }
-
     #[tokio::test]
     async fn detokenize_timeout_releases_the_internal_call() {
         let harness = Harness::new(2, false, Duration::from_millis(10));
@@ -2515,86 +1797,6 @@ mod tests {
         };
         let (result, ()) = tokio::join!(decode, runtime);
         assert_eq!(result.unwrap_err().code(), Code::DeadlineExceeded);
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn abort_rpc_cancels_generation_with_an_in_stream_error() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], Some("abort-me"))))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        let reply = harness
-            .service
-            .abort(Request::new(api::AbortRequest {
-                rid: "abort-me".into(),
-                abort_all: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(reply.success);
-        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
-        let error = stream_error(stream.next().await.unwrap().unwrap());
-        assert_eq!(error.error.unwrap().code, 499);
-        assert!(stream.next().await.is_none());
-        assert!(
-            !harness
-                .service
-                .abort(Request::new(api::AbortRequest {
-                    rid: "abort-me".into(),
-                    abort_all: false,
-                }))
-                .await
-                .unwrap()
-                .into_inner()
-                .success
-        );
-        drop(stream);
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn abort_validates_selector_and_supports_all() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        for (rid, abort_all) in [("", false), ("ambiguous", true)] {
-            let error = harness
-                .service
-                .abort(Request::new(api::AbortRequest {
-                    rid: rid.into(),
-                    abort_all,
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), Code::InvalidArgument);
-        }
-        let stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], Some("all"))))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        assert!(
-            harness
-                .service
-                .abort(Request::new(api::AbortRequest {
-                    rid: String::new(),
-                    abort_all: true,
-                }))
-                .await
-                .unwrap()
-                .into_inner()
-                .success
-        );
-        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
-        drop(stream);
         assert!(harness.abort_rx.try_recv().is_err());
     }
 }

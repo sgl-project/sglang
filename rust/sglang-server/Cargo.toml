@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+# `tests/` is one binary laid out as `src/` is; without this every top-level
+# file there would be linked as a binary of its own.
+autotests = false
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module.
 [package.metadata.sglang]
@@ -19,8 +22,9 @@ name = "sglang_server"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# `pre_generate::test_support`: the app an HTTP layer's tests serve it from.
-test-support = []
+# `sglang_server::test_utils`: the internals `sglang-server-test` builds on.
+# Enabled by that crate only.
+test-utils = []
 
 [dependencies]
 async-stream = { workspace = true }
@@ -88,7 +92,14 @@ sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" 
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 
+[[test]]
+name = "integration"
+path = "tests/main.rs"
+
 [dev-dependencies]
+# The scheduler-less server `tests/` drive; it depends on this crate, a cycle
+# Cargo allows for dev-dependencies.
+sglang-server-test = { path = "../sglang-server-test" }
 # An HTTP/2 client that can reset its streams, for the h2c listener's tests.
 h2 = "0.4"
 # Paused virtual time for deadline tests.

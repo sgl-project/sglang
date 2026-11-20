@@ -804,14 +804,11 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, submitted, with_cached_tokens};
     use super::{
-        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        ChoiceExtensions, PromptSpec, completion_logprobs, completion_prompt_specs,
+        completion_response_value,
     };
     use crate::message::response::ChunkExtras;
-    use axum::http::StatusCode;
-    use futures::StreamExt;
     use sglang_processor::dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
@@ -886,97 +883,5 @@ mod tests {
             value["choices"][0]["logprobs"]["text_offset"],
             serde_json::json!([-1])
         );
-    }
-
-    #[tokio::test]
-    async fn unary_fold_orders_choices_and_counts_each_prompt_once() {
-        for cache_report in [false, true] {
-            let (choice0, tx0) = submitted(0, 0, "r0");
-            let (choice1, tx1) = submitted(1, 0, "r1");
-            tx0.send(chunk("r0", "a", false)).await.unwrap();
-            tx0.send(with_cached_tokens(chunk("r0", "b", true), 3))
-                .await
-                .unwrap();
-            tx1.send(chunk("r1", "x", false)).await.unwrap();
-            tx1.send(with_cached_tokens(chunk("r1", "y", true), 4))
-                .await
-                .unwrap();
-
-            let response = unary_completion(
-                vec![choice0, choice1],
-                "cmpl-test".into(),
-                "model".into(),
-                1,
-                false,
-                false,
-                cache_report,
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(value["choices"][0]["text"], "ab");
-            assert_eq!(value["choices"][1]["text"], "xy");
-            assert_eq!(value["choices"][0]["matched_stop"], "</s>");
-            assert_eq!(value["usage"]["prompt_tokens"], 5);
-            assert_eq!(value["usage"]["completion_tokens"], 4);
-            assert_eq!(
-                value["usage"]["completion_tokens_details"]["reasoning_tokens"],
-                0
-            );
-            // A prompt's cached tokens are its first choice's, as on Python.
-            let details = &value["usage"]["prompt_tokens_details"];
-            match cache_report {
-                true => assert_eq!(details["cached_tokens"], 3, "{value}"),
-                false => assert!(details.is_null(), "{value}"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn stream_uses_deltas_then_usage_and_done() {
-        for cache_report in [false, true] {
-            let (choice, tx) = submitted(0, 0, "r0");
-            tx.send(chunk("r0", "a", false)).await.unwrap();
-            tx.send(chunk("r0", "b", true)).await.unwrap();
-
-            let stream = completion_event_stream(
-                vec![choice],
-                "cmpl-test".into(),
-                "model".into(),
-                1,
-                false,
-                false,
-                true,
-                cache_report,
-                cache_report,
-            );
-            futures::pin_mut!(stream);
-            let frames: Vec<String> = stream.collect().await;
-            assert_eq!(frames.len(), 4);
-            let first: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
-            let terminal: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-            let usage: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
-            assert_eq!(first["choices"][0]["text"], "a");
-            assert_eq!(terminal["choices"][0]["text"], "b");
-            assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
-            assert!(usage["choices"].as_array().unwrap().is_empty());
-            assert_eq!(usage["usage"]["prompt_tokens"], 5);
-            assert_eq!(usage["usage"]["completion_tokens"], 2);
-            assert_eq!(frames[3], "[DONE]");
-            // Python reports a zero cache hit rather than omitting it, but not
-            // in per-chunk usage.
-            let details = &usage["usage"]["prompt_tokens_details"];
-            match cache_report {
-                true => {
-                    assert_eq!(details["cached_tokens"], 0, "{usage}");
-                    assert_eq!(first["usage"]["prompt_tokens"], 5);
-                    assert!(first["usage"]["prompt_tokens_details"].is_null());
-                }
-                false => assert!(details.is_null(), "{usage}"),
-            }
-        }
     }
 }

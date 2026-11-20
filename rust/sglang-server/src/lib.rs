@@ -25,12 +25,8 @@ pub use api_server::http::generate_hook::{
     GenerateTerminal,
 };
 pub use api_server::http::pre_generate::abortable_before_generate;
-/// What a model package's tests serve its extensions from.
-#[cfg(feature = "test-support")]
-pub mod test_support {
-    pub use crate::api_server::http::pre_generate::test_support::*;
-    pub use crate::utils::runtime::test_support::*;
-}
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, Http2Config, MetricsConfig, MmFamily, MmResample,
     MmSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,

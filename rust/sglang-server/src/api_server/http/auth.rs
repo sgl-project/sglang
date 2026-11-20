@@ -244,12 +244,10 @@ fn bearer_matches(authorization: Option<&str>, key: &str) -> bool {
 mod tests {
     use super::*;
     use axum::{body::Body, routing::get};
-    use std::future::IntoFuture;
+
     use tower::ServiceExt;
 
     const API: &str = "sk-api";
-    const ADMIN: &str = "sk-admin";
-
     fn keys(api_key: Option<&str>, admin_api_key: Option<&str>) -> ApiKeys {
         ApiKeys::new(api_key.map(Into::into), admin_api_key.map(Into::into))
     }
@@ -329,51 +327,6 @@ mod tests {
     #[should_panic(expected = "has no auth level")]
     fn an_undeclared_route_stops_the_server() {
         let _: Router = Router::new().declared_route("/nope", get(|| async { "ok" }));
-    }
-
-    /// A DP control relay passes a keyed peer's check: the relay presents the
-    /// admin key, which the peer requires on its relay route once one is
-    /// configured; a relay without it is refused.
-    #[tokio::test]
-    async fn the_control_relay_presents_the_admin_key_to_its_peers() {
-        use crate::api_server::core::{FORWARD_PEER_PATH, peer_endpoints};
-        use crate::message::config::{DeploymentInfo, RustServerEndpoint};
-        use crate::message::io_struct::{ControlRequest, FlushCacheReqInput};
-        use axum::routing::post;
-
-        let both = keys(Some(API), Some(ADMIN));
-        let peer = apply(
-            Router::new().route(FORWARD_PEER_PATH, post(|| async { "ok" })),
-            &both,
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(axum::serve(listener, peer).into_future());
-        let info = DeploymentInfo {
-            dp_rank: Some(0),
-            rust_server_endpoints: vec![RustServerEndpoint {
-                dp_rank: 1,
-                endpoint: url,
-            }],
-            ..Default::default()
-        };
-        let flush =
-            || ControlRequest::FlushCacheReqInput(FlushCacheReqInput::new("r".into(), None));
-        for (case, relay_keys, accepted) in [
-            ("admin key", both.clone(), true),
-            ("API key only", keys(Some(API), None), false),
-            ("no key", ApiKeys::default(), false),
-        ] {
-            let peers = peer_endpoints(&info, 0, &relay_keys).unwrap();
-            let outcome = peers[0].control(&flush).await.remove(0).outcome;
-            match outcome {
-                Ok(_) => assert!(accepted, "{case}: must be refused"),
-                Err(error) => {
-                    assert!(!accepted, "{case}: {error}");
-                    assert_eq!(error.http_status(), StatusCode::UNAUTHORIZED);
-                }
-            }
-        }
     }
 
     #[tokio::test]

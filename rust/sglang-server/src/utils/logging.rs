@@ -29,7 +29,7 @@ pub fn init_tracing() {
 /// capture, if any. A per-test scoped subscriber would race: a log site first
 /// reached on another thread while no scoped subscriber exists can cache
 /// "never log" after this thread's subscriber registered, dropping its lines.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn capture_logs() -> CapturedLogs {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
@@ -45,18 +45,18 @@ pub fn capture_logs() -> CapturedLogs {
     CapturedLogs { lines }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 thread_local! {
     static CAPTURE: std::cell::RefCell<Option<CapturedLines>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct CapturedLogs {
     lines: CapturedLines,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 impl CapturedLogs {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.lines.0.lock().unwrap()).into_owned()
@@ -72,7 +72,7 @@ impl CapturedLogs {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 impl Drop for CapturedLogs {
     fn drop(&mut self) {
         CAPTURE.with(|capture| {
@@ -87,15 +87,15 @@ impl Drop for CapturedLogs {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Clone, Default)]
 struct CapturedLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 /// Writes to the current thread's capture; drops the line if there is none.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 struct ThreadCapture;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-utils"))]
 impl std::io::Write for ThreadCapture {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         CAPTURE.with(|capture| {
