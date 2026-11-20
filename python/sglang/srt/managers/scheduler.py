@@ -1426,6 +1426,7 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             send_output=self.send_control_output,
+            pp_rank=get_parallel().pp_rank if get_parallel().pp_size > 1 else None,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -3350,6 +3351,15 @@ class Scheduler(
         mm_input_error: Optional[str] = None,
     ):
         with ExitStack() as mm_cleanup:
+            if (
+                recv_req.pp_prefetch_ticketed is True
+                and self.enable_unified_cache_external_linker
+            ):
+                # The source already issued the ticket. An early validation
+                # return on this stage still owes the worker an empty vote.
+                mm_cleanup.callback(
+                    self.tree_cache.linker.pp_tickets.skip_unbound, recv_req.rid
+                )
             if isinstance(
                 recv_req.mm_inputs, (MultimodalInputs, MultimodalProcessorOutput)
             ):
@@ -3512,7 +3522,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if recv_req.pp_prefetch_ticketed is True:
+        if (
+            recv_req.pp_prefetch_ticketed is True
+            and not self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.bind_prefetch_ticket(req.rid)
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
@@ -3749,6 +3762,17 @@ class Scheduler(
     def _bind_pp_arrival_prefetch(self, req: Req, recv_req) -> None:
         """PP0 decides the request's L3 ticket on arrival; every stage takes the
         prefix match behind that decision at the same step."""
+        linker = getattr(self.tree_cache, "linker", None)
+        if linker is not None:
+            tickets = linker.pp_tickets
+            if (
+                tickets is not None
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
+                recv_req.pp_prefetch_ticketed = tickets.bind(
+                    req, recv_req.pp_prefetch_ticketed
+                )
+            return
         controller = self.tree_cache.cache_controller
         if controller is None or controller.pp_prefetch_command_group is None:
             return
@@ -4221,7 +4245,7 @@ class Scheduler(
         Mirrors ``handle_bootstrap_failure``.
         """
         req = self._pending_chunked_abort_req
-        if req is None:
+        if req is None or self._pp_linker_chunk_batch is not None:
             return
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
@@ -4337,7 +4361,10 @@ class Scheduler(
 
             # A parked chunk (add_chunked_req found no budget) leaves extend_end
             # at prefix_len: it computed no new KV, so nothing to stash.
-            if self.chunked_req.extend_end > self.chunked_req.prefix_len:
+            if (
+                self._pp_linker_chunk_batch is None
+                and self.chunked_req.extend_end > self.chunked_req.prefix_len
+            ):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -4566,6 +4593,10 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        # A private chunk awaits the previous forward's PP load verdict.
+        # Decode and output exchange keep progressing while prefill is parked.
+        if self._pp_linker_chunk_batch is not None:
+            return None, running_batch
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -5378,7 +5409,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # A load-back submitted in this build may still be writing pages that a
             # later request matched as device prefix; don't early-send them (#44070).
-            load_pending = batch.hicache_consumer_index >= 0
+            load_pending = batch.hicache_consumer_index >= 0 or batch.pp_linker_load
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
@@ -5678,11 +5709,16 @@ class Scheduler(
                 )
 
         if self.enable_unified_cache_external_linker:
-            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
-            if self.chunked_req in failed:
-                # Result processing finishes the others; a chunked one is
-                # released like a client abort so its next chunk never runs.
-                self._pending_chunked_abort_req = self.chunked_req
+            if batch.pp_linker_load:
+                ret.pp_failed_load_rids = tuple(
+                    self.tree_cache.linker.finish_loads(batch.reqs)
+                )
+            else:
+                failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
+                if self.chunked_req in failed:
+                    # Result processing finishes the others; a chunked one is
+                    # released like a client abort so its next chunk never runs.
+                    self._pending_chunked_abort_req = self.chunked_req
 
         self._maybe_report_active_ranks()
 
@@ -6061,7 +6097,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
-                    and self.tree_cache.linker.prefetches
+                    and self.tree_cache.linker.has_pending_prefetch()
                 )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
@@ -6186,7 +6222,7 @@ class Scheduler(
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
             if self.enable_unified_cache_external_linker:
-                idle &= not self.tree_cache.linker.prefetches
+                idle &= not self.tree_cache.linker.has_pending_prefetch()
 
         return idle
 
@@ -6300,9 +6336,12 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def flush_cache(
+        self, empty_cache: bool = True, *, pp_all_idle: bool = False
+    ) -> bool:
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
+        # After the PP vote, every stage must enter reset on the same iteration.
+        if pp_all_idle or self.is_fully_idle(ignore_waiting=self.pause_state.paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             if self.uocr_runtime is not None:

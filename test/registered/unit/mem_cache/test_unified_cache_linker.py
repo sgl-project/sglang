@@ -15,8 +15,9 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -42,6 +43,7 @@ from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _storage_suffix,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -61,8 +63,9 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
-from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.runtime_context import get_context, get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
@@ -78,6 +81,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import FAMILY_OF, index_slots
+from sglang.test.unified_allocator_fixtures import build_window_chain
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
@@ -179,14 +183,6 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = True
 
 
-class _MappingRecorder:
-    def __init__(self):
-        self.mapping = []
-
-    def set_full_to_swa_mapping(self, full, swa):
-        self.mapping.append((full.clone(), swa.clone()))
-
-
 class _FakeExternalTreeCore:
     def __init__(self, nodes=None, offload_transfers=None):
         self.enable_external_cache_linker = False
@@ -222,10 +218,13 @@ def _cache_for_wrapper(**kwargs):
     defaults = {
         "_components_tuple": (),
         "components": {},
-        "tree_core": SimpleNamespace(enable_external_cache_linker=False),
+        "tree_core": SimpleNamespace(
+            enable_external_cache_linker=False, is_eagle=False
+        ),
         "tree_components": (ComponentType.FULL,),
         "write_through_threshold": 256,
         "pp_size": 1,
+        "pp_rank": 0,
         "pp_group": None,
         "metrics_collector": None,
     }
@@ -298,6 +297,27 @@ class TestMooncakePrefetch(CustomTestCase):
         ready = TransferReady([SimpleNamespace(synchronize=synchronize)])
         with patch.object(linker, "record_transfer_ready", return_value=ready):
             return linker.prefetch([transfer])
+
+    def test_pp_lookup_queries_stage_local_keys(self):
+        linker, _ = self._linker(read=None)
+        storage = linker.storage
+        storage.mem_pool_host = linker.pool_group
+        storage._has_request_context_support = False
+        storage.pp_size = 2
+        linker.stats = {"lookup": 0}
+        for rank, replicated, key in (
+            (0, True, "page_cp1_pp0_k"),
+            (1, False, "page_tp2_cp1_pp1_k"),
+        ):
+            storage.pp_rank = rank
+            storage.mla_suffix = _storage_suffix(
+                rank_replicated=replicated, tp_rank=2, attn_cp_rank=1, pp_rank=rank
+            )
+            storage.store.batch_is_exist = MagicMock(return_value=[1])
+            self.assertEqual(
+                linker.lookup("rid", [PoolTransfer(PoolName.KV, keys=["page"])]), [1]
+            )
+            storage.store.batch_is_exist.assert_called_once_with([key])
 
     def test_all_layers_and_queued_cancellation_quiesce_before_reset(self):
         """Neither publication nor reset may overtake the final device write."""
@@ -372,10 +392,29 @@ class TestMooncakePrefetch(CustomTestCase):
                 assert not torch.any(buffers[1])
 
 
+def _reserve_pp_pages(cache, req, hashes):
+    req.init_next_round_input(cache, cow_mamba=False)
+    return cache.linker.reserve_pp_prefetch(
+        req.cache_request_handle,
+        req.last_node,
+        cache.linker._prefetch_key(req),
+        req.prefix_len,
+        hashes,
+    )
+
+
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete", metrics=None):
+    def _fixture(
+        self,
+        *,
+        swa=False,
+        mamba=False,
+        policy="wait_complete",
+        metrics=None,
+        page_size=2,
+    ):
         cfg = CacheConfig(
-            page_size=1 if mamba else 2,
+            page_size=1 if mamba else page_size,
             components=(ComponentType.FULL,)
             + ((ComponentType.SWA,) if swa else ())
             + ((ComponentType.MAMBA,) if mamba else ()),
@@ -463,6 +502,191 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             tree_cache=cache,
         )
         Scheduler._prefetch_kvcache(scheduler, req)
+
+    def test_pp_reservation_retargets_window_and_checkpoint_to_common_boundary(self):
+        cache, backend, req, allocator = self._fixture(swa=True, mamba=True)
+        handle = req.cache_request_handle
+        hashes = [f"page-{i}" for i in range(6)]
+        # Only four FULL slots remain for six possible pages.
+        occupied = allocator.full_attn_allocator.alloc(28)
+        self.addCleanup(allocator.full_attn_allocator.free, occupied)
+        assert _reserve_pp_pages(cache, req, hashes) == 4
+        before = {
+            t.name: t.device_indices.clone()
+            for _, t in cache.linker.prefetches[handle].component_transfers
+        }
+        assert len(before[PoolName.KV]) == 4
+        assert len(before[PoolName.SWA]) == 2
+        future = cache.linker.submit_pp_prefetch(handle, 1)
+        fetched = {t.name: t for t in backend.prefetch.call_args.args[0]}
+        for pool in (PoolName.KV, PoolName.SWA, PoolName.MAMBA):
+            assert fetched[pool].keys == hashes[:1]
+            assert torch.equal(fetched[pool].device_indices, before[pool][:1])
+        assert allocator.full_attn_allocator.available_size() == 3
+        assert allocator.swa_attn_allocator.available_size() == 31
+        assert allocator.state_slots.available_size() == 19
+        future.set_result(True)
+        cache.linker._finish_prefetch(handle, publish=True)
+        assert self._match(cache, req).device_prefix_len == 1
+        assert torch.equal(
+            allocator.translate_loc_from_full_to_swa(
+                fetched[PoolName.KV].device_indices
+            ),
+            fetched[PoolName.SWA].device_indices,
+        )
+
+    def test_pp_prefetch_zero_end_releases_only_its_attempt(self):
+        cache, backend, req, allocator = self._fixture(swa=True, mamba=True)
+        retry = self._request(req.rid, attempt=1)
+        for attempt in (req, retry):
+            assert _reserve_pp_pages(cache, attempt, ["a", "b"]) == 2
+        cache.linker.submit_pp_prefetch(req.cache_request_handle, 0)
+        assert req.cache_request_handle not in cache.linker.prefetches
+        assert retry.cache_request_handle in cache.linker.prefetches
+        assert allocator.full_attn_allocator.available_size() == 30
+        assert allocator.swa_attn_allocator.available_size() == 30
+        assert allocator.state_slots.available_size() == 19
+        with patch.object(backend, "prefetch", return_value=None):
+            assert (
+                cache.linker.submit_pp_prefetch(retry.cache_request_handle, 2) is None
+            )
+        assert not cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_reservation_prices_full_and_window_in_one_arena(self):
+        cache, _, _, _ = self._fixture(swa=True)
+        with get_parallel().override(attn_dcp_size=1):
+            _, chain, _ = build_window_chain(
+                n_full_slots=32,
+                n_swa_slots=16,
+                full_layer_num=1,
+                swa_layer_num=1,
+                page_size=2,
+            )
+        with (
+            patch.object(cache, "token_to_kv_pool_allocator", chain),
+            patch.object(
+                cache.components[ComponentType.SWA], "sliding_window_size", 24
+            ),
+        ):
+            assert chain.units_fit({"full": 12}) and chain.units_fit({"swa": 12})
+            assert cache.linker._pp_prefetch_fits(11)
+            assert not cache.linker._pp_prefetch_fits(12)
+
+    def test_pp_reservation_leaves_other_requests_cached_and_unwinds_partial_takes(
+        self,
+    ):
+        cache, backend, req, allocator = self._fixture()
+        other = self._request("other", start=11)
+        self._enqueue(cache, other)
+        backend.prefetch_futures[-1].set_result(True)
+        cache.linker.check_prefetch_events()
+        assert _reserve_pp_pages(cache, other, []) == 3
+        assert other.prefix_len == 6
+        occupied = allocator.alloc(24)
+        # Two free slots can vote just one page, even with six evictable tokens.
+        with patch.object(
+            cache, "evict_for_alloc", wraps=cache.evict_for_alloc
+        ) as evict:
+            assert _reserve_pp_pages(cache, req, ["a", "b", "c"]) == 1
+            assert self._match(cache, other).device_prefix_len == 6
+            evict.assert_not_called()
+        cache.linker.submit_pp_prefetch(req.cache_request_handle, 0)
+        allocator.free(occupied)
+        self._assert_balanced(cache, allocator)
+
+        cache, _, req, allocator = self._fixture(swa=True, mamba=True)
+        # The state take can still fail after the joint capacity check and
+        # successful FULL/window takes. Neither slots nor locks may leak.
+        with (
+            patch.object(cache.kv_storage(), "take_state_slots", return_value=None),
+            patch.object(
+                cache, "evict_for_alloc", wraps=cache.evict_for_alloc
+            ) as evict,
+        ):
+            assert _reserve_pp_pages(cache, req, ["a", "b"]) == 0
+            evict.assert_not_called()
+        assert req.cache_request_handle not in cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_layer_load_extends_an_existing_request_row(self):
+        cache, backend, req, allocator = self._fixture(swa=True, page_size=1)
+        cache.pp_size = 2
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        backend.lookup.side_effect = AssertionError(
+            "only the PP ticket queries storage"
+        )
+
+        def extend(end):
+            req.extend_end = end
+            count = end - req.prefix_len
+            seq_lens = torch.tensor([end])
+            batch = ScheduleBatch(
+                reqs=[req],
+                tree_cache=cache,
+                req_to_token_pool=cache.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                forward_mode=ForwardMode.EXTEND,
+                device="cpu",
+                prefix_lens=[req.prefix_len],
+                extend_lens=[count],
+                extend_num_tokens=count,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens,
+            )
+            with get_context().override_server_args(attention_backend="torch_native"):
+                slots, _, _ = alloc_for_extend(batch)
+            return slots
+
+        req.init_next_round_input(cache)
+        prefix = extend(2)
+        cache.checkpoint(req, up_to=2)
+        req.external_cache_hit_length = 4
+        req.init_next_round_input(cache)
+        row = req.kv.req_pool_idx
+        assert (req.prefix_len, req.host_hit_length) == (2, 2)
+        assert cache.linker.load_back(req) == (2, req.last_node)
+        assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (2, 2)
+        tail = cache.linker.private_load_indices[req.rid]
+
+        req.prefix_len = 4
+        suffix = extend(6)
+        assert req.kv.req_pool_idx == row
+        assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (6, 6)
+        assert torch.equal(
+            cache.req_to_token_pool.req_to_token[row, :6],
+            torch.cat([prefix, tail, suffix]),
+        )
+        cache.linker.start_layer_wise_loading()
+        backend.queued_loads.clear()  # The backend has started writing this row.
+        cache.linker.release_request(req.cache_request_handle)
+        assert req.rid in cache.linker.private_load_indices
+        assert cache.linker.finish_loads() == []
+        cache.checkpoint(req, up_to=6)
+        assert self._match(cache, req).device_prefix_len == 6
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_rejected_layer_load_retires_its_reservation(self):
+        cache, backend, req, allocator = self._fixture(swa=True)
+        cache.pp_size = 2
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        req.external_cache_hit_length = 4
+        req.init_next_round_input(cache)
+        hashes = cache.linker.hit_markers[req.rid].tail_hashes
+        assert _reserve_pp_pages(cache, req, hashes) == 2
+        backend.load = MagicMock(side_effect=OSError("queue failed"))
+        with patch.object(cache.linker, "pp_tickets", True):
+            assert cache.linker.load_back(req) == (4, req.last_node)
+        loaded = cache.linker.private_load_indices[req.rid]
+        cache.req_to_token_pool.alloc([req])
+        cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 4)), loaded)
+        req.kv.set_row_len(4)
+        assert cache.linker.finish_loads([req]) == [req.rid]
+        assert (
+            not cache.linker.private_load_indices and not cache.linker.rejected_pp_loads
+        )
+        cache.free_kv_row(req.kv, [(0, 4)])
+        self._assert_balanced(cache, allocator)
 
     def test_prefetch_metrics_count_lookup_load_and_outcome(self):
         for landed in (True, False):
@@ -795,6 +1019,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
 
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size = 1
     cache.tree_core = SimpleNamespace(
         enable_external_cache_linker=False,
         write_through_threshold=256,
@@ -830,19 +1055,6 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
     with pytest.raises(ValueError, match=component_type.name):
         UnifiedCacheLinkerWrapper(cache, backend)
 
-    assert not cache.tree_core.enable_external_cache_linker
-
-
-def test_pipeline_parallelism_rejects_only_prefetch_mode():
-    cache = _cache_for_wrapper(pp_size=2)
-    UnifiedCacheLinkerWrapper(cache, _FakeLinker())
-    assert cache.tree_core.enable_external_cache_linker
-
-    cache = _cache_for_wrapper(pp_size=2)
-    backend = _FakeLinker()
-    backend.load_mode = "prefetch"
-    with pytest.raises(ValueError, match="prefetch currently requires PP=1"):
-        UnifiedCacheLinkerWrapper(cache, backend)
     assert not cache.tree_core.enable_external_cache_linker
 
 

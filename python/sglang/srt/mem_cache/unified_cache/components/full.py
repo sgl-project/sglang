@@ -514,10 +514,12 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOOKUP:
             return PoolTransfer(name=PoolName.KV, keys=list(keys))
 
-        if phase == LinkerTransferPhase.LOAD:
+        if phase in (LinkerTransferPhase.LOAD, LinkerTransferPhase.RESERVE):
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
             if not storage.units_fit(sub_pool, num_tokens):
+                if phase == LinkerTransferPhase.RESERVE:
+                    return None
                 self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:

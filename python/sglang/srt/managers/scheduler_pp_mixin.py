@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -10,12 +11,16 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    all_reduce_flags,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -70,6 +75,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
+        and not batch.pp_linker_load
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
@@ -140,6 +146,8 @@ class SchedulerPPMixin:
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
     _pp_release_reqs_awaiting_verdict: Tuple[ReleaseMemoryOccupationReqInput, ...] = ()
+    _pp_flush_probe = False
+    _pp_linker_chunk_batch: Optional[ScheduleBatch] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -252,6 +260,7 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 if cur_batch:
@@ -339,7 +348,9 @@ class SchedulerPPMixin:
 
                 self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
+                    last_batch=self.last_batch,
+                    running_batch=self.running_batch,
+                    hold_chunk=self._pp_linker_chunk_batch is not None,
                 )
                 self._process_hicache_events()
                 batch = None
@@ -411,6 +422,7 @@ class SchedulerPPMixin:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -614,6 +626,7 @@ class SchedulerPPMixin:
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
+                self._pp_finish_flush()
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -644,7 +657,61 @@ class SchedulerPPMixin:
         """Hold a pause, and the inputs after it, until no micro-batch is
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
-        return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        received = self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+        if self.pp_group.is_first_rank:
+            self._pp_flush_probe = self.flush_wrapper.prepare_pp_probe(
+                self._pp_vote_on_flush_probe
+            )
+            if self._pp_flush_probe:
+                return [*received, FlushCacheReqInput(pp_probe=True)]
+        else:
+            # The raw relay includes requests held behind a pause. Every stage
+            # must vote on the same iteration, even if its dispatcher is held.
+            self._pp_flush_probe = any(
+                isinstance(req, FlushCacheReqInput) and req.pp_probe for req in received
+            )
+        return received
+
+    def _pp_flush_idle(self: Scheduler) -> bool:
+        return self.is_fully_idle(ignore_waiting=self.pause_state.paused)
+
+    def _pp_flush_vote(self: Scheduler, values, *, across_stages=False):
+        # A DP replica receives its own probe on the work channel. Only the
+        # ranks that share its queue may enter these conditional collectives.
+        groups = (
+            [self.attn_tp_group, self.attn_cp_group]
+            if get_parallel().attn_dp_enabled
+            else [self.tp_group]
+        )
+        if across_stages:
+            groups.append(self.pp_group)
+        for group in groups:
+            if group.world_size > 1:
+                values = all_reduce_flags(
+                    values, group.cpu_group, torch.distributed.ReduceOp.MIN
+                )
+        return values
+
+    def _pp_vote_on_flush_probe(self: Scheduler, deadline: float):
+        parallel = get_parallel()
+        leader = parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        return self._pp_flush_vote(
+            [self._pp_flush_idle(), not leader or time.monotonic() < deadline]
+        )
+
+    def _pp_finish_flush(self: Scheduler) -> None:
+        if not self._pp_flush_probe:
+            return
+        self._pp_flush_probe = False
+        # All request, tensor and PD sends for this turn have been issued. A
+        # busy PP0 never waits here while later stages still need its sends.
+        (idle,) = self._pp_flush_vote([self._pp_flush_idle()], across_stages=True)
+        if idle:
+            # Fence every reset before PP0 can enqueue another storage ticket.
+            success = self.flush_cache(pp_all_idle=True)
+            (idle,) = self._pp_flush_vote([success], across_stages=True)
+        if self.pp_group.is_first_rank:
+            self.flush_wrapper.finish_pp_probe(bool(idle))
 
     def _pp_apply_war_barrier(self: Scheduler) -> None:
         """Order later schedule-stream writes after the launched forward's reads.
@@ -1006,6 +1073,9 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        if result.pp_failed_load_rids:
+            tensor_dict["pp_failed_load_rids"] = result.pp_failed_load_rids
+
         if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
             # mirror seq_lens/KV bookkeeping and the bonus token to root the
@@ -1103,8 +1173,12 @@ class SchedulerPPMixin:
         self: Scheduler, result: GenerationBatchResult
     ) -> None:
         with torch.profiler.record_function("send_proxy_dict_to_next_stage"):
+            tensors = result.pp_hidden_states_proxy_tensors.tensors
+            if result.pp_failed_load_rids:
+                # Keep request-local metadata off model-owned replay buffers.
+                tensors = {**tensors, "pp_failed_load_rids": result.pp_failed_load_rids}
             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                result.pp_hidden_states_proxy_tensors.tensors,
+                tensors,
                 async_send=True,
                 msg_type="proxy",
                 ready_event=self.launch_event,
@@ -1231,6 +1305,17 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
         routed_experts_rows = pp_outputs.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
+        # Keep the verdict on the wire for all stages. The forward snapshot owns
+        # the original rows even if the live microbatch was subsequently filtered.
+        if failed_rids := pp_outputs.tensors.get("pp_failed_load_rids"):
+            fwd_batch = mb_metadata.fwd_batch or batch
+            failed = self.tree_cache.mark_failed_linker_loads(
+                fwd_batch.reqs, failed_rids
+            )
+            if self.chunked_req in failed:
+                self._pending_chunked_abort_req = self.chunked_req
+        if self._pp_linker_chunk_batch is batch:
+            self._pp_linker_chunk_batch = None
 
         if (
             batch.return_logprob
@@ -1937,13 +2022,35 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                # A ticket is common across stages even when one stage has an L1
+                # hit. Select its first forward covering that boundary on all ranks.
+                earlier_failures = ()
+                cur_batch.pp_linker_load = False
+                if (
+                    cur_batch.forward_mode.is_extend()
+                    and self.enable_unified_cache_external_linker
+                ):
+                    for req in cur_batch.reqs:
+                        end = req.pp_linker_verdict_end
+                        if end and req.extend_end >= end:
+                            cur_batch.pp_linker_load = True
+                            req.pp_linker_verdict_end = 0
+                            if req is cur_batch.chunked_req:
+                                self._pp_linker_chunk_batch = cur_batch
                 if pp_proxy_tensors is not None:
+                    earlier_failures = pp_proxy_tensors.tensors.pop(
+                        "pp_failed_load_rids", ()
+                    )
                     # Prevent allocator reuse of received tensors while the forward
                     # stream is still consuming them.
                     for tensor in pp_proxy_tensors.tensors.values():
                         if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
                             tensor.record_stream(self.forward_stream)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if earlier_failures:
+                    result.pp_failed_load_rids = tuple(
+                        dict.fromkeys((*earlier_failures, *result.pp_failed_load_rids))
+                    )
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

@@ -1163,12 +1163,11 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            # A failed layer-wise restore also invalidates intermediate chunks.
+            if req.discard_output_reason is not None:
+                req.request_finish(req.discard_output_reason)
             if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
-
-                # Its KV never landed: abort instead of sending it to decode.
-                if req.discard_output_reason is not None:
-                    req.request_finish(req.discard_output_reason)
                 if is_aborted(req):
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1586,6 +1585,7 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         last_batch: Optional[ScheduleBatch],
         running_batch: ScheduleBatch,
+        hold_chunk: bool = False,
     ) -> None:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
@@ -1593,10 +1593,10 @@ class SchedulerDisaggregationPrefillMixin:
             # A parked chunk (add_chunked_req found no budget) leaves extend_end
             # at prefix_len: it computed no new KV to checkpoint or send.
             computed = req.extend_end > req.prefix_len
-            if computed:
+            if computed and not hold_chunk:
                 self.checkpoint_disagg_prefill(req)
 
-            if not self.check_bootstrap(req):
+            if not hold_chunk and not self.check_bootstrap(req):
                 # A failed bootstrap released the request, emptying the slot.
                 if (
                     not is_aborted(req)
@@ -1616,7 +1616,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_end,
                     len(req.origin_input_ids),
                 )
-            elif computed:
+            elif computed and not hold_chunk:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
