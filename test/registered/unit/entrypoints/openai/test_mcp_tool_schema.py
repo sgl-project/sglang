@@ -1,10 +1,21 @@
+import asyncio
 import unittest
 from enum import Enum
+from types import SimpleNamespace
 from typing import Optional, Union
+from unittest.mock import AsyncMock, patch
 
-from pydantic import BaseModel
+from openai_harmony import (
+    Conversation,
+    DeveloperContent,
+    HarmonyEncodingName,
+    Message,
+    Role,
+    load_harmony_encoding,
+)
+from pydantic import BaseModel, Field
 
-from sglang.srt.entrypoints.openai.tool_server import trim_schema
+from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, trim_schema
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,6 +49,10 @@ class StructuredUnionArgs(BaseModel):
 
 class RecursiveArgs(BaseModel):
     child: Optional["RecursiveArgs"] = None
+
+
+class Filter(BaseModel):
+    any_of: list["Filter"] = Field(default_factory=list)
 
 
 class TestMCPToolSchema(CustomTestCase):
@@ -98,9 +113,51 @@ class TestMCPToolSchema(CustomTestCase):
             schema["properties"]["value"], {"type": "string", "enum": ["x"]}
         )
 
-    def test_recursive_reference_reports_a_bounded_error(self):
-        with self.assertRaisesRegex(ValueError, "recursive.*reference"):
-            trim_schema(RecursiveArgs.model_json_schema())
+    def test_recursive_reference_stops_expanding(self):
+        schema = trim_schema(RecursiveArgs.model_json_schema())
+        self.assertEqual(
+            schema["properties"]["child"], {"$ref": "#/$defs/RecursiveArgs"}
+        )
+
+    def test_list_recursive_tool_loads_and_renders(self):
+        tool = SimpleNamespace(
+            name="search",
+            description="Find matches",
+            inputSchema=Filter.model_json_schema(),
+            annotations=None,
+        )
+        initialization = SimpleNamespace(
+            serverInfo=SimpleNamespace(name="filters"), instructions="Search filters"
+        )
+        server = MCPToolServer()
+        with patch(
+            "sglang.srt.entrypoints.openai.tool_server.list_server_and_tools",
+            new=AsyncMock(return_value=(initialization, SimpleNamespace(tools=[tool]))),
+        ):
+            asyncio.run(server.add_tool_server("localhost:8000"))
+
+        self.assertTrue(server.has_tool("filters"))
+        self.assertEqual(
+            tool.inputSchema["properties"]["any_of"]["items"],
+            {"$ref": "#/$defs/Filter"},
+        )
+        content = DeveloperContent.new().with_tools(
+            server.get_tool_description("filters")
+        )
+        encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        conversation = Conversation.from_messages(
+            [Message.from_role_and_content(Role.DEVELOPER, content)]
+        )
+        prompt = encoding.decode(
+            encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+        )
+        self.assertIn("namespace filters", prompt)
+        self.assertIn("type search", prompt)
+        self.assertIn("any_of", prompt)
+
+    def test_unresolved_reference_reports_an_error(self):
+        with self.assertRaisesRegex(ValueError, "Unresolved.*reference"):
+            trim_schema({"$ref": "#/$defs/missing"})
 
     def test_deep_reference_chain_reports_a_bounded_error(self):
         definitions = {

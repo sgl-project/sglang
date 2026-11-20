@@ -41,12 +41,12 @@ def trim_schema(schema: dict) -> dict:
         if ref is not None:
             if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
                 raise ValueError("MCP tool schemas only support local JSON references")
+            if ref in seen_refs:
+                # Harmony accepts opaque references. Stop expanding a valid
+                # recursive schema without dropping its entire tool server.
+                return node
             if len(seen_refs) >= 64:
                 raise ValueError("MCP tool schema reference depth exceeds 64")
-            if ref in seen_refs:
-                raise ValueError(
-                    f"MCP tool schema has a recursive JSON reference: {ref}"
-                )
             target = root
             try:
                 for part in ref[2:].split("/") if ref != "#" else []:
