@@ -808,7 +808,7 @@ class Req(ReqDllmMixin):
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
-        # Set when the request is aborted by caller (a 4xx instead of a 5xx http response)
+        # Aborted while its PD KV sender held it; not traced as a server fault.
         self.aborted_by_caller: bool = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
