@@ -13,7 +13,6 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import prepare_abort
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.internal_state import (
@@ -23,12 +22,7 @@ from sglang.srt.managers.scheduler_components.internal_state import (
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_registry import CustomSpecAlgo
-from sglang.srt.speculative.spec_sampling_mask import (
-    validate_spec_sampling_mask_request,
-)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -37,7 +31,7 @@ class _PastSamplingChecks(Exception):
     """Admission reached its first step after the sampling-output checks."""
 
 
-def _handle_request(mode, req):
+def _handle_request(mode, req, spec_algorithm=SpeculativeAlgorithm.NONE):
     """Run admission on `req`: the abort mock, the queue mock, and whether the
     request got past the sampling-output checks."""
     scheduler = Scheduler.__new__(Scheduler)
@@ -50,11 +44,7 @@ def _handle_request(mode, req):
     scheduler.dllm_config = None
     scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
     scheduler._record_kv_event_lora_name = MagicMock()
-    scheduler.spec_algorithm = SimpleNamespace(
-        is_dflash_family=lambda: False,
-        is_uno=lambda: False,
-        is_none=lambda: True,
-    )
+    scheduler.spec_algorithm = spec_algorithm
     scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
     scheduler.init_req_max_new_tokens = MagicMock(side_effect=_PastSamplingChecks)
     scheduler._add_request_to_queue = MagicMock()
@@ -94,10 +84,6 @@ def _handle_request(mode, req):
     return abort, scheduler._add_request_to_queue, passed
 
 
-def _spec_algorithm(name):
-    return SpeculativeAlgorithm[name.upper()]
-
-
 def _sampling_req(sampling_params, *, logprobs=False, mask=False):
     params = SamplingParams(max_new_tokens=8, **sampling_params)
     params.normalize(None)
@@ -114,7 +100,7 @@ def _sampling_req(sampling_params, *, logprobs=False, mask=False):
 
 class TestSamplingCapture(CustomTestCase):
     def test_only_filtered_sampling_is_captured(self):
-        """An unfiltered request reuses its output logprobs, so neither flag may put
+        """An unfiltered request returns no sampling fields, so neither flag may put
         it on the capture path; greedy, top-k, top-p and min-p each must."""
         for sampling_params, filtered in (
             ({}, False),
@@ -131,135 +117,45 @@ class TestSamplingCapture(CustomTestCase):
                     self.assertEqual(req.captures_sampling, captured)
                     self.assertEqual(req.sampling_mask_rows is not None, captured)
 
-    def test_speculative_decoding_admits_what_stays_exact(self):
-        """Output logprobs are exact sampling logprobs under any speculative
-        algorithm while acceptance is unrelaxed; a filtered request also needs the
-        DFlash capture."""
-        eagle = _spec_algorithm("eagle")
-        dflash = _spec_algorithm("dflash")
-        unfiltered = _sampling_req({}, logprobs=True, mask=True)
-        greedy = _sampling_req({"temperature": 0.0}, logprobs=True)
-
-        with get_context().override_server_args(speculative_accept_threshold_acc=1.0):
-            self.assertIsNone(validate_spec_sampling_mask_request(unfiltered, eagle))
-            self.assertIn(
-                "top-k/top-p/min-p", validate_spec_sampling_mask_request(greedy, eagle)
-            )
-            self.assertIsNone(validate_spec_sampling_mask_request(greedy, dflash))
-            with envs.SGLANG_SIMULATE_ACC_LEN.override(2):
-                self.assertIsNotNone(
-                    validate_spec_sampling_mask_request(unfiltered, eagle)
+    def test_speculative_decoding_validates_captured_requests_only(self):
+        """EAGLE cannot capture sampling: a request that filters sampling is
+        refused, and an unfiltered one, which returns no sampling fields, is not."""
+        for sampling_params, refused in (({"top_k": 20}, True), ({}, False)):
+            with self.subTest(params=sampling_params):
+                abort, _, passed = _handle_request(
+                    DisaggregationMode.NULL,
+                    _sampling_req(sampling_params, logprobs=True, mask=True),
+                    spec_algorithm=SpeculativeAlgorithm.EAGLE,
                 )
-        with get_context().override_server_args(speculative_accept_threshold_acc=0.9):
-            for algorithm in (eagle, dflash):
-                self.assertIsNotNone(
-                    validate_spec_sampling_mask_request(unfiltered, algorithm)
-                )
-
-    def test_speculative_decoding_refuses_platforms_whose_verify_is_greedy(self):
-        """On CPU, XPU and ROCm without rejection sampling EAGLE verify commits
-        argmax for a sampled row, so an unfiltered request would get a logprob
-        for a token that was never drawn from that distribution."""
-        eagle = _spec_algorithm("eagle")
-        unfiltered = _sampling_req({"temperature": 0.7}, logprobs=True, mask=True)
-        for platform, use_rejection_sampling, refused in (
-            ("cuda", False, False),
-            ("cpu", False, True),
-            ("cpu", True, True),
-            ("xpu", False, True),
-            ("hip", False, True),
-            ("hip", True, False),
-        ):
-            with (
-                self.subTest(platform=platform, rejection=use_rejection_sampling),
-                patch.multiple(
-                    eagle_utils,
-                    _is_cpu=platform == "cpu",
-                    _is_xpu=platform == "xpu",
-                    _is_hip=platform == "hip",
-                ),
-                get_context().override_server_args(
-                    speculative_accept_threshold_single=1.0,
-                    speculative_accept_threshold_acc=1.0,
-                    speculative_use_rejection_sampling=use_rejection_sampling,
-                ),
-            ):
-                error_msg = validate_spec_sampling_mask_request(unfiltered, eagle)
+                self.assertEqual(passed, not refused)
                 if refused:
-                    self.assertIn("argmax", error_msg)
+                    self.assertIn("speculative decoding", abort.call_args.args[1])
                 else:
-                    self.assertIsNone(error_msg)
+                    abort.assert_not_called()
 
-    def test_speculative_decoding_refuses_plugin_algorithms(self):
-        """A plugin algorithm verifies with its own worker, which may commit argmax
-        or relax acceptance. Neither flag may be admitted for it, even for an
-        unfiltered request, while every in-tree algorithm that verifies through
-        eagle_sample is."""
-        unfiltered = _sampling_req({"temperature": 0.7}, logprobs=True, mask=True)
-        with (
-            patch.multiple(eagle_utils, _is_cpu=False, _is_xpu=False, _is_hip=False),
-            patch(
-                "sglang.srt.speculative.spec_sampling_mask."
-                "is_dflash_sampling_verify_available",
-                return_value=True,
-            ),
-            get_context().override_server_args(
-                speculative_accept_threshold_single=1.0,
-                speculative_accept_threshold_acc=1.0,
-            ),
-        ):
-            self.assertIn(
-                "this speculative decoding algorithm",
-                validate_spec_sampling_mask_request(
-                    unfiltered, CustomSpecAlgo("PLUGIN", lambda server_args: object)
-                ),
-            )
-            for name in (
-                "eagle",
-                "eagle3",
-                "frozen_kv_mtp",
-                "standalone",
-                "ngram",
-                "uno",
-                "dflash",
-                "dspark",
-            ):
-                with self.subTest(algorithm=name):
-                    self.assertIsNone(
-                        validate_spec_sampling_mask_request(
-                            unfiltered, _spec_algorithm(name)
-                        )
-                    )
-
-    def test_threshold_update_is_refused_where_admission_required_one(self):
-        """A request admitted because both acceptance thresholds were 1.0 must not
-        see one lowered while it runs, under every algorithm that reads them;
-        DSpark and plain decoding do not."""
-        running = _sampling_req({}, logprobs=True)
-        for name, refused in (
-            ("eagle", True),
-            ("dflash", True),
-            ("dspark", False),
-            ("none", False),
-        ):
+    def test_threshold_update_counts_captured_requests_only(self):
+        """Under DFlash a relaxed acceptance threshold is refused while a captured
+        request runs; an unfiltered request returns no sampling fields and does not
+        block it."""
+        for sampling_params, refused in (({"top_k": 20}, True), ({}, False)):
+            running = _sampling_req(sampling_params, logprobs=True, mask=True)
             controller = SchedulerInternalStateController(
                 SimpleNamespace(
-                    spec_algorithm=_spec_algorithm(name),
+                    spec_algorithm=SpeculativeAlgorithm.DFLASH,
                     request_lists=lambda: {"running": [running]},
                 ),
                 record_step_time=False,
             )
-            for key in (
-                "speculative_accept_threshold_single",
-                "speculative_accept_threshold_acc",
-            ):
-                with self.subTest(algorithm=name, key=key):
-                    controller._validate_accept_threshold(key, 1.0)
-                    if refused:
-                        with self.assertRaises(UpdateRejected):
-                            controller._validate_accept_threshold(key, 0.9)
-                    else:
-                        controller._validate_accept_threshold(key, 0.9)
+            with self.subTest(params=sampling_params):
+                if refused:
+                    with self.assertRaises(UpdateRejected):
+                        controller._validate_accept_threshold(
+                            "speculative_accept_threshold_acc", 0.9
+                        )
+                else:
+                    controller._validate_accept_threshold(
+                        "speculative_accept_threshold_acc", 0.9
+                    )
 
 
 class TestSchedulerSamplingMaskValidation(CustomTestCase):
@@ -275,6 +171,15 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
                 )
                 add_to_queue.assert_not_called()
+
+    def test_pd_admits_unfiltered_requests_without_mask_buffers(self):
+        """An unfiltered request is not captured, so the metadata buffers carry
+        nothing for it."""
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                abort, _, passed = _handle_request(mode, _sampling_req({}, mask=True))
+                self.assertTrue(passed)
+                abort.assert_not_called()
 
     def test_pd_top_logprobs_beyond_capacity_return_bad_request_before_admission(
         self,
@@ -307,8 +212,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
 
     def test_top_k_cap_applies_to_captured_mask_requests_only(self):
         """The cap bounds the captured support. An unfiltered mask request is not
-        captured and returns empty rows, so its whole-vocabulary top_k must pass;
-        so must a filtered logprobs-only request, which captures no support."""
+        captured, so its whole-vocabulary top_k must pass; so must a filtered
+        logprobs-only request, which captures no support."""
         for sampling_params, flags, rejected in (
             ({}, {"mask": True}, False),
             ({"top_k": 20}, {"mask": True}, False),

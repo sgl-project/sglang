@@ -286,12 +286,12 @@ class GenerateReqInput:
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
     # Whether to return each output token's logprob under the distribution it was
-    # sampled from: after temperature and top-k/top-p/min-p, renormalized. Equal to
-    # the output token logprob when no filter applies. Requires return_logprob.
+    # sampled from: after temperature and top-k/top-p/min-p, renormalized. Returned
+    # only when top-k (greedy included), top-p or min-p filters sampling.
     return_sampling_logprobs: Optional[Union[List[bool], bool]] = None
     # Whether to return each output token's sampling support with its logprobs
-    # under that distribution. A row is empty when no filter applies: the support
-    # is the whole vocabulary.
+    # under that distribution. Returned only when top-k (greedy included), top-p or
+    # min-p filters sampling.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Removed: any value but None is rejected.
     sampling_logprobs_mode: Optional[Any] = None

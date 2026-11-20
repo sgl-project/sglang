@@ -753,9 +753,9 @@ class TestFromScheduleBatch(CustomTestCase):
         return req
 
     def test_unfiltered_mask_request_does_not_widen_the_capture(self):
-        """An unfiltered request that returns the mask gets empty rows without being
-        captured: it must stay out of both index tensors and keep a capture width of
-        1, like the captured request that returns sampling logprobs only."""
+        """An unfiltered request that returns the mask is not captured: it must stay
+        out of both index tensors and keep a capture width of 1, like the captured
+        request that returns sampling logprobs only."""
 
         def req(sampling_params, *, logprobs=False, mask=False):
             params = SamplingParams(max_new_tokens=8, **sampling_params)

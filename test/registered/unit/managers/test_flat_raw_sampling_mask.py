@@ -59,15 +59,11 @@ def _make_state(filters_sampling: bool = True, **obj_kwargs) -> ReqState:
     )
 
 
-def _meta_info(state: ReqState, chunks, finished: bool, num_output_tokens=0) -> dict:
+def _meta_info(state: ReqState, chunks, finished: bool) -> dict:
     meta_info = {}
     for i, chunk in enumerate(chunks):
         _add_sampling_output_to_meta_info(
-            meta_info,
-            state,
-            chunk,
-            num_output_tokens=num_output_tokens,
-            finished=finished and i == len(chunks) - 1,
+            meta_info, state, chunk, finished=finished and i == len(chunks) - 1
         )
     return meta_info
 
@@ -154,43 +150,25 @@ class TestSamplingOutputMetaInfo(CustomTestCase):
         for key in _FLAT_KEYS:
             self.assertEqual(fields[key], [])
 
-    def test_unfiltered_request_returns_output_logprobs_and_empty_rows(self):
-        """Without a sampling filter nothing is captured: the sampling logprobs are
-        the output token logprobs and every mask row is empty, one per output token."""
-        output_logprobs = [-0.5, -1.25, -0.125]
-        for flat in (False, True):
-            with self.subTest(flat=flat):
+    def test_unfiltered_request_omits_sampling_fields(self):
+        """An unfiltered request is not captured; its response must carry no sampling
+        field for either flag, nested or flat, rather than an empty one."""
+        keys = ("output_token_sampling_logprobs", "output_sampling_mask_logprobs")
+        for logprobs, mask, flat in (
+            (True, False, False),
+            (False, True, False),
+            (True, True, False),
+            (False, True, True),
+        ):
+            with self.subTest(logprobs=logprobs, mask=mask, flat=flat):
                 state = _make_state(
                     filters_sampling=False, return_flat_raw_sampling_mask=flat
                 )
-                state.output_token_logprobs_val.extend(output_logprobs[:2])
-                _meta_info(state, [None], finished=False, num_output_tokens=2)
-                state.output_token_logprobs_val.extend(output_logprobs[2:])
-                fields = _meta_info(state, [None], finished=True, num_output_tokens=3)
-
-                self.assertEqual(
-                    fields["output_token_sampling_logprobs"], output_logprobs
-                )
-                if flat:
-                    self.assertEqual(fields[_FLAT_KEYS[0]], [])
-                    self.assertEqual(fields[_FLAT_KEYS[1]], [])
-                    self.assertEqual(fields[_FLAT_KEYS[2]], [0, 0, 0])
-                else:
-                    self.assertEqual(
-                        fields["output_sampling_mask_logprobs"], [[], [], []]
-                    )
-
-    def test_unfiltered_zero_output_request_has_no_sampling_logprob(self):
-        """A max_new_tokens=0 request batched with a generating one keeps the
-        logprob of the token sampled after its prompt. It emits no token, so its
-        sampling logprobs must be as empty as its mask rows."""
-        state = _make_state(filters_sampling=False)
-        state.output_token_logprobs_val.append(-1.5)
-
-        fields = _meta_info(state, [None], finished=True, num_output_tokens=0)
-
-        self.assertEqual(fields["output_token_sampling_logprobs"], [])
-        self.assertEqual(fields["output_sampling_mask_logprobs"], [])
+                state.obj.return_sampling_logprobs = logprobs
+                state.obj.return_sampling_mask = mask
+                fields = _meta_info(state, [None, None], finished=True)
+                for key in (*keys, *_FLAT_KEYS):
+                    self.assertNotIn(key, fields)
 
 
 if __name__ == "__main__":

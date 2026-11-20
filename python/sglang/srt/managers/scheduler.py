@@ -3608,9 +3608,7 @@ class Scheduler(
                 self._reject_bad_request(req, error_msg)
                 return
 
-        if (
-            req.return_sampling_logprobs or req.return_sampling_mask
-        ) and not self.spec_algorithm.is_none():
+        if req.captures_sampling and not self.spec_algorithm.is_none():
             error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
             if error_msg is not None:
                 self._reject_bad_request(req, error_msg)
