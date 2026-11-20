@@ -774,11 +774,12 @@ def create_scheduler_watchdog(
             _, messages = scheduler.invariant_checker._check_all_pools(
                 scheduler.pool_stats_observer.get_pool_stats(),
             )
-            parts += [
-                f"{scheduler.cur_batch_for_debug.batch_size()=}",
-                f"{scheduler.cur_batch_for_debug.reqs=}",
-                *messages,
-            ]
+            if scheduler.cur_batch_for_debug is not None:
+                parts += [
+                    f"{scheduler.cur_batch_for_debug.batch_size()=}",
+                    f"{scheduler.cur_batch_for_debug.reqs=}",
+                ]
+            parts.extend(messages)
         return "\n".join(parts)
 
     return WatchdogRaw(
@@ -786,7 +787,12 @@ def create_scheduler_watchdog(
         # A step or a heartbeat while it waits (`Scheduler.feed_watchdog`).
         get_counter=lambda: (scheduler.forward_ct, scheduler.watchdog_heartbeats),
         is_active=lambda: (
-            scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
+            scheduler.is_initializing
+            or (
+                scheduler._single_iteration_active
+                if scheduler._event_loop_driver == "single_iteration"
+                else scheduler.cur_batch_for_debug is not None
+            )
         ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,
