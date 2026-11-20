@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
+from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
@@ -1791,6 +1792,7 @@ class TestHicacheMambaSize(CustomTestCase):
         for drafts, layers in (((), 2), ((draft,), 3)):
             with (
                 self.subTest(draft_layers=len(drafts)),
+                host_memory_budget_scope(2 << 30),
                 patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
             ):
                 host = MambaPoolHost(
