@@ -3,6 +3,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
 )
@@ -58,6 +61,14 @@ class TestSubtileAttentionRouting(unittest.TestCase):
                 exact = impl.forward(q, k, v, None)
                 fa.assert_called_once()
             torch.testing.assert_close(captured, exact, rtol=0, atol=0)
+            # a replay's eager break runs the kernel the capture ran
+            with (
+                replay_token_scope(),
+                patch.object(impl.fa_impl, "forward", wraps=impl.fa_impl.forward) as fa,
+            ):
+                in_break = impl.forward(q, k, v, None)
+                fa.assert_called_once()
+            torch.testing.assert_close(in_break, exact, rtol=0, atol=0)
             q.copy_(torch.randn_like(q))
             k.copy_(torch.randn_like(k))
             v.copy_(torch.randn_like(v))

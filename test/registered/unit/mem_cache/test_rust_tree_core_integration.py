@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.events import LoRANameTable
+from sglang.srt.mem_cache.events import KvEventLoraNames, LoRANameTable
 from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.rust_tree_core.adapter import (
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     ComponentAction,
@@ -2314,6 +2315,77 @@ def test_dynamo_format_events_match_python_hashes_and_name_the_adapter():
     assert core.take_events() == [
         BlockRemoved(block_hashes=namespaced, medium=StorageMedium.GPU)
     ]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("dynamo_format", [False, True])
+@pytest.mark.parametrize("is_eagle", [False, True])
+@pytest.mark.parametrize(
+    "salt, adapter",
+    [
+        (None, None),
+        ("tenant-a", None),
+        (None, "adapter-a"),
+        ("tenant-a", "adapter-a"),
+    ],
+)
+def test_storage_key_binding_matches_published_event_ids(
+    backend, dynamo_format, is_eagle, salt, adapter
+):
+    """Hinted storage keys bind to the IDs each tree core publishes.
+
+    With EAGLE, keys are bigrams: the matched prefix holds one raw token per
+    bigram and the new key's raw tokens start with the shared boundary token.
+    """
+    lora_id = "a" * 32
+    extra_key = None if adapter is None else "user-" + lora_id
+    lora_names = KvEventLoraNames()
+    if adapter is not None:
+        lora_names.register(lora_id=lora_id, lora_name=adapter)
+        lora_names.register(SimpleNamespace(extra_key=extra_key, lora_id=lora_id))
+    core = _tree_core(
+        backend,
+        enable_kv_cache_events=True,
+        page_size=2,
+        dynamo_kv_event_format=dynamo_format,
+        kv_event_lora_names=lora_names,
+        is_eagle=is_eagle,
+    )
+    tokens = array("q", range(1, 9 + is_eagle))
+    key = RadixKey(tokens, extra_key=extra_key, cache_salt=salt, is_bigram=is_eagle)
+    _pump_insert(
+        core, InsertParams(key=key, value=torch.arange(10, 18, dtype=torch.int64))
+    )
+    event_ids = [
+        block_hash & ((1 << 64) - 1)
+        for event in core.kv_events.take()
+        if isinstance(event, BlockStored)
+        for block_hash in event.block_hashes
+    ]
+    storage_keys = get_storage_hash_str(key, page_size=2)
+    assert len(event_ids) == len(storage_keys) == 4
+    if salt is None and adapter is None:
+        # Un-namespaced hints carry no map; the event ID is the storage key's.
+        assert event_ids == [int(page_key[:16], 16) for page_key in storage_keys]
+
+    seed = core.kv_events.namespace_seed(extra_key, salt)
+    for prefix_pages in range(4):
+        split = 2 * prefix_pages
+        binding = storage_key_to_event_hashes(
+            RadixKey(
+                tokens[split:],
+                extra_key=extra_key,
+                cache_salt=salt,
+                is_bigram=is_eagle,
+            ),
+            2,
+            tokens[:split].tolist(),
+            storage_keys[prefix_pages - 1] if prefix_pages else None,
+            namespace_seed=seed,
+        )
+        assert binding == dict(
+            zip(storage_keys[prefix_pages:], event_ids[prefix_pages:])
+        )
 
 
 def test_salted_eagle_events_match_the_bigram_hash_contract():

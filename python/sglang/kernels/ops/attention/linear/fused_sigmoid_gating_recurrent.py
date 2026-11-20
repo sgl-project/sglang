@@ -17,8 +17,9 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
-# The narrow-tile PTX add below has no AMDGCN form.
-_PTX_NARROW_KDA_ADD = tl.constexpr(not _is_hip)
+# The narrow-tile PTX add below has no AMDGCN form and is CUDA-only;
+# other backends (e.g. Ascend NPU) must keep the generic add.
+_PTX_NARROW_KDA_ADD = tl.constexpr(is_cuda() and not _is_hip)
 _is_sm90 = is_sm90_supported()
 _is_sm103 = is_cuda() and get_device_sm() == 103
 _is_sm107 = is_cuda() and get_device_sm() == 107
@@ -531,7 +532,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and V == 128 and BV == 4 and _PTX_NARROW_KDA_ADD:
+        elif (IS_KDA and V == 128) and (BV == 4 and _PTX_NARROW_KDA_ADD):
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",

@@ -135,6 +135,7 @@ class PPPrefetchTicket:
     prefix_keys: Optional[List[str]]
     matched_prefix_tokens: List[int]
     pool_specs: tuple[PPPrefetchPoolSpec, ...]
+    storage_read_metadata: Optional[dict[str, Any]] = None
 
 
 class PPPrefetchDecision(Enum):
@@ -206,7 +207,10 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        *,
+        storage_read_metadata: Optional[dict[str, Any]] = None,
     ):
+        self.storage_read_metadata = storage_read_metadata
         self.handle = handle
         self.request_id = handle.rid
         self._lock = threading.Lock()
@@ -308,6 +312,14 @@ def _storage_trace_extra(operation: Any, include_request_id: bool = True) -> dic
     if span_id:
         extra_info["span_id"] = span_id
     return extra_info
+
+
+def _storage_read_extra(operation: PrefetchOperation) -> Optional[dict]:
+    fields = _storage_trace_extra(operation)
+    metadata = getattr(operation, "storage_read_metadata", None)
+    if metadata is not None:
+        fields.update(metadata)
+    return fields or None
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -514,6 +526,17 @@ class HybridCacheController(BaseHiCacheController):
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
                 self.pp_prefetch_command_group = None
             raise
+
+        if (
+            self.storage_backend.consumes_kv_hints()
+            and self.page_get_func == self._generic_page_get
+        ):
+            logger.warning(
+                "Storage backend %r consumes kv_hints, but its KV reads use the "
+                "legacy batch_get(), which receives no extra_info. Lookups still "
+                "carry hints; set extra_config interface_v1=1 so reads do too.",
+                storage_backend,
+            )
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
@@ -1299,6 +1322,8 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
         assume_stored: bool = False,
+        *,
+        storage_read_metadata: Optional[dict[str, Any]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             handle,
@@ -1307,6 +1332,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
+            storage_read_metadata=storage_read_metadata,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -1334,6 +1360,8 @@ class HybridCacheController(BaseHiCacheController):
         matched_prefix_tokens: Optional[List[int]],
         pool_transfers: Optional[list[PoolTransfer]],
         assume_stored: bool = False,
+        *,
+        storage_read_metadata: Optional[dict[str, Any]] = None,
     ) -> PrefetchSubmission:
         if self.pp_prefetch_command_group is None:
             return PrefetchSubmission(
@@ -1344,6 +1372,7 @@ class HybridCacheController(BaseHiCacheController):
                     prefix_keys,
                     extra_pools=pool_transfers,
                     assume_stored=assume_stored,
+                    storage_read_metadata=storage_read_metadata,
                 )
             )
 
@@ -1366,6 +1395,7 @@ class HybridCacheController(BaseHiCacheController):
                 PPPrefetchPoolSpec.from_transfer(transfer)
                 for transfer in pool_transfers or []
             ),
+            storage_read_metadata=storage_read_metadata,
         )
         operation = PrefetchOperation(
             handle,
@@ -1373,6 +1403,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=ticket.prefix_keys,
             pool_transfers=pool_transfers,
+            storage_read_metadata=ticket.storage_read_metadata,
         )
 
         # Every rank queries and allocates in ticket order on the worker.
@@ -1548,6 +1579,12 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.prefetch_key,
                             ticket.last_hash,
                             prefix_keys=ticket.prefix_keys,
+                            # PP0 decided from its own backend; honor ours too.
+                            storage_read_metadata=(
+                                ticket.storage_read_metadata
+                                if self.storage_backend.consumes_kv_hints()
+                                else None
+                            ),
                             # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
                                 PoolTransfer(
@@ -1667,7 +1704,7 @@ class HybridCacheController(BaseHiCacheController):
         # plus request_id to the storage backend.
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info=_storage_trace_extra(operation, include_request_id=True) or None,
+            extra_info=_storage_read_extra(operation),
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1860,10 +1897,9 @@ class HybridCacheController(BaseHiCacheController):
         kv_derived_transfers: List[PoolTransfer],
     ) -> int:
         """Add hybrid request/caller metadata before the inherited KV read."""
-        trace_extra = _storage_trace_extra(operation, include_request_id=True)
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=extra_info.prefix_keys,
-            extra_info=trace_extra or None,
+            extra_info=_storage_read_extra(operation),
         )
         return super()._page_transfer_kv_batch(
             operation,
@@ -1917,8 +1953,7 @@ class HybridCacheController(BaseHiCacheController):
                     operation.prefix_keys,
                     sidecar_hashes,
                     transfers_nonkv,
-                    extra_info=_storage_trace_extra(operation, include_request_id=True)
-                    or None,
+                    extra_info=_storage_read_extra(operation),
                 ):
                     results.update(
                         self.storage_backend.batch_get_v2(

@@ -15,6 +15,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,6 +35,7 @@ class WhisperAttention(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         is_cross_attention: bool = False,
         is_encoder=False,
+        prefix: str = "",
     ):
         super().__init__()
         self.total_num_heads = num_heads
@@ -58,7 +60,10 @@ class WhisperAttention(torch.nn.Module):
 
         if is_cross_attention:
             self.q_proj = ColumnParallelLinear(
-                embed_dim, embed_dim, quant_config=quant_config
+                embed_dim,
+                embed_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("q_proj", prefix),
             )
             self.kv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
@@ -67,13 +72,22 @@ class WhisperAttention(torch.nn.Module):
                 total_num_kv_heads=num_heads,
                 bias=bias,
                 quant_config=quant_config,
+                prefix=add_prefix("kv_proj", prefix),
             )
         else:
             self.qkv_proj = QKVParallelLinear(
-                embed_dim, head_dim, num_heads, quant_config=quant_config
+                embed_dim,
+                head_dim,
+                num_heads,
+                quant_config=quant_config,
+                prefix=add_prefix("qkv_proj", prefix),
             )
         self.out_proj = RowParallelLinear(
-            embed_dim, embed_dim, bias=bias, quant_config=quant_config
+            embed_dim,
+            embed_dim,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=add_prefix("out_proj", prefix),
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -141,6 +155,7 @@ class WhisperEncoderLayer(torch.nn.Module):
         config: WhisperConfig,
         layer_id: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.embed_dim = config.d_model
@@ -151,6 +166,7 @@ class WhisperEncoderLayer(torch.nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             is_encoder=True,
+            prefix=add_prefix("self_attn", prefix),
         )
         self.self_attn_layer_norm = torch.nn.LayerNorm(self.embed_dim)
 
@@ -158,8 +174,18 @@ class WhisperEncoderLayer(torch.nn.Module):
             config.activation_function, quant_config=quant_config
         )
 
-        self.fc1 = ColumnParallelLinear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = RowParallelLinear(config.encoder_ffn_dim, self.embed_dim)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            config.encoder_ffn_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("fc1", prefix),
+        )
+        self.fc2 = RowParallelLinear(
+            config.encoder_ffn_dim,
+            self.embed_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("fc2", prefix),
+        )
         self.final_layer_norm = torch.nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -197,6 +223,7 @@ class WhisperDecoderLayer(torch.nn.Module):
         config: WhisperConfig,
         layer_id: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.embed_dim = config.d_model
@@ -212,6 +239,7 @@ class WhisperDecoderLayer(torch.nn.Module):
             num_heads=config.decoder_attention_heads,
             layer_id=decoder_self_attn_layer_id,
             quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
 
         self.activation_fn = get_act_fn(
@@ -225,10 +253,21 @@ class WhisperDecoderLayer(torch.nn.Module):
             layer_id=decoder_cross_attn_layer_id,
             quant_config=quant_config,
             is_cross_attention=True,
+            prefix=add_prefix("encoder_attn", prefix),
         )
         self.encoder_attn_layer_norm = torch.nn.LayerNorm(self.embed_dim)
-        self.fc1 = ColumnParallelLinear(self.embed_dim, config.decoder_ffn_dim)
-        self.fc2 = RowParallelLinear(config.decoder_ffn_dim, self.embed_dim)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            config.decoder_ffn_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("fc1", prefix),
+        )
+        self.fc2 = RowParallelLinear(
+            config.decoder_ffn_dim,
+            self.embed_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("fc2", prefix),
+        )
         self.final_layer_norm = torch.nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -263,7 +302,10 @@ class WhisperDecoderLayer(torch.nn.Module):
 
 class WhisperEncoder(torch.nn.Module):
     def __init__(
-        self, config: WhisperConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: WhisperConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -282,7 +324,9 @@ class WhisperEncoder(torch.nn.Module):
 
         self.layers = torch.nn.ModuleList(
             [
-                WhisperEncoderLayer(config, id, quant_config)
+                WhisperEncoderLayer(
+                    config, id, quant_config, prefix=add_prefix(f"layers.{id}", prefix)
+                )
                 for id in range(config.encoder_layers)
             ]
         )
@@ -314,7 +358,10 @@ class WhisperEncoder(torch.nn.Module):
 
 class WhisperDecoder(torch.nn.Module):
     def __init__(
-        self, config: WhisperConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: WhisperConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.max_target_positions = config.max_target_positions
@@ -330,7 +377,12 @@ class WhisperDecoder(torch.nn.Module):
 
         self.layers = torch.nn.ModuleList(
             [
-                WhisperDecoderLayer(config, layer_idx, quant_config)
+                WhisperDecoderLayer(
+                    config,
+                    layer_idx,
+                    quant_config,
+                    prefix=add_prefix(f"layers.{layer_idx}", prefix),
+                )
                 for layer_idx in range(config.decoder_layers)
             ]
         )
@@ -360,12 +412,28 @@ class WhisperDecoder(torch.nn.Module):
 
 
 class WhisperForConditionalGeneration(torch.nn.Module):
+    # Fused linears -> their checkpoint shards, so quantization `ignore` entries that
+    # name q_proj/k_proj/v_proj match the fused qkv_proj/kv_proj layers.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "kv_proj": ["k_proj", "v_proj"],
+    }
+
     def __init__(
-        self, config: WhisperConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: WhisperConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
-        self.encoder = WhisperEncoder(config, quant_config)
-        self.decoder = WhisperDecoder(config, quant_config)
+        # Quantization prefixes use the checkpoint's module names (model.encoder....),
+        # which is what compressed-tensors `targets`/`ignore` entries refer to.
+        self.encoder = WhisperEncoder(
+            config, quant_config, prefix=add_prefix("model.encoder", prefix)
+        )
+        self.decoder = WhisperDecoder(
+            config, quant_config, prefix=add_prefix("model.decoder", prefix)
+        )
         self.proj_out = ParallelLMHead(
             config.vocab_size, config.d_model, quant_config=quant_config
         )

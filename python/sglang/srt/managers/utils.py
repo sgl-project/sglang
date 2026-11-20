@@ -52,6 +52,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Async copy of the top logprobs to the host: one copy for the [rows, k] tensor
+# (every row asks the same k), or one batched copy for the per-row list.
+def _async_d2h_top_logprobs(
+    rows: Optional[Union[torch.Tensor, List]],
+) -> Optional[Union[torch.Tensor, List]]:
+    if rows is None:
+        return None
+    if torch.is_tensor(rows):
+        return _async_d2h(rows)
+    return _async_d2h_rows(rows)
+
+
 def allocate_distinct_stream(device_module, avoid_streams):
     """Draw a stream that aliases none of ``avoid_streams``.
 
@@ -236,14 +248,12 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = _async_d2h(
                     self.logits_output.input_token_logprobs
                 )
-            if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = _async_d2h_rows(
-                    self.logits_output.next_token_top_logprobs_val
-                )
-            if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = _async_d2h_rows(
-                    self.logits_output.next_token_top_logprobs_idx
-                )
+            self.logits_output.next_token_top_logprobs_val = _async_d2h_top_logprobs(
+                self.logits_output.next_token_top_logprobs_val
+            )
+            self.logits_output.next_token_top_logprobs_idx = _async_d2h_top_logprobs(
+                self.logits_output.next_token_top_logprobs_idx
+            )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
                     self.logits_output.next_token_token_ids_logprobs_val

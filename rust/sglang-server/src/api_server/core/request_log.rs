@@ -1514,12 +1514,18 @@ impl LogSink {
 /// Python's watermark redaction (`redact_watermark_secrets`), by key: the
 /// secret fields anywhere, and a watermark config's keys. Python redacts only
 /// with `--enable-watermark`; these lines always do.
-const WATERMARK_SECRET_FIELDS: [&str; 3] = ["watermark_key", "watermark_key_b", "watermark_config"];
+const WATERMARK_SECRET_FIELDS: [&str; 4] = [
+    "watermark_key",
+    "watermark_key_b",
+    "watermark_keys",
+    "watermark_config",
+];
 
 /// Whether the value under key `name` is a watermark secret; `in_watermark`
 /// is set under a `watermark` key.
 fn is_watermark_secret(name: &str, in_watermark: bool) -> bool {
-    WATERMARK_SECRET_FIELDS.contains(&name) || (in_watermark && matches!(name, "key" | "key_b"))
+    WATERMARK_SECRET_FIELDS.contains(&name)
+        || (in_watermark && matches!(name, "key" | "key_b" | "keys"))
 }
 
 /// One field or dict entry: the value, or `'<redacted>'` for a watermark

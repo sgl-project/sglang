@@ -204,9 +204,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import (
-    resolve_watermark_request,
-)
+from sglang.srt.sampling.watermarking.runtime import watermark_request_enabled
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -245,16 +243,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
-    watermark = sampling_params.watermark
-    features = get_exec().features
-    _, _, enabled = resolve_watermark_request(
-        watermark,
-        server_enabled=features.enable_watermark,
-        default_key=features.watermark_key,
-        default_context_window=features.watermark_context_window,
-        default_enabled=features.watermark_default_enabled,
-        enforce_all=features.watermark_enforce_all,
-    )
+    enabled = watermark_request_enabled(sampling_params)
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
 
@@ -576,6 +565,13 @@ def wait_for_schedulers_to_exit() -> None:
             f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
             f"ShutdownReq, killing them before they released: {stragglers}"
         )
+
+
+def _requested_token_ids(obj: GenerateReqInput) -> Optional[list]:
+    """The token ids a request asked log-probabilities at, in either form."""
+    if obj.token_ids_logprob is not None:
+        return obj.token_ids_logprob
+    return obj.token_ids_logprob_rows
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -1543,6 +1539,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._validate_token_ids_logprob(obj)
             self._validate_top_logprobs_num(obj)
             self._validate_logprob_start_len(obj)
+            self._validate_token_ids_logprob_rows(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1668,6 +1665,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
 
+    def _validate_token_ids_logprob_rows(self, obj: GenerateReqInput) -> None:
+        rows = obj.token_ids_logprob_rows
+        if rows is None:
+            return
+        if (
+            obj.input_ids is None
+            or not obj.return_logprob
+            or obj.stream
+            or obj.logprob_start_len < 0
+            or (obj.sampling_params or {}).get("max_new_tokens") != 0
+            or obj.token_ids_logprob is not None
+            or obj.multi_item_delimiter_indices is not None
+            or obj.token_indices_to_pool is not None
+            or obj.session_params is not None
+            or self.model_config.is_encoder_decoder
+            or self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            raise ValueError(
+                "token_ids_logprob_rows requires input_ids, return_logprob, "
+                "max_new_tokens=0 and logprob_start_len >= 0, and no other mode."
+            )
+        # The first reported position has no predecessor in the scored range.
+        scored = len(obj.input_ids) - obj.logprob_start_len - 1
+        vocab_size = self.model_config.token_id_vocab_size
+        if (
+            not isinstance(rows, list)
+            or len(rows) != scored
+            or not all(isinstance(row, list) for row in rows)
+            or any(
+                type(i) is not int or not 0 <= i < vocab_size
+                for row in rows
+                for i in row
+            )
+        ):
+            raise ValueError(
+                f"token_ids_logprob_rows must be {scored} lists (len(input_ids) - "
+                f"logprob_start_len - 1) of token ids in [0, {vocab_size})."
+            )
+
     def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:
         # Batch requests are split into per-request sub-objects before this
         # runs (normalize_batch_and_arguments + __getitem__), so the only
@@ -1678,7 +1714,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not isinstance(token_ids_logprob, list):
             raise ValueError("token_ids_logprob must be a flat list of integers.")
-        vocab_size = self.model_config.vocab_size
+        vocab_size = self.model_config.token_id_vocab_size
         for token_id in token_ids_logprob:
             if not isinstance(token_id, int):
                 raise ValueError("token_ids_logprob must be a flat list of integers.")
@@ -1776,7 +1812,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+        sampling_params.verify(self.model_config.token_id_vocab_size)
         _validate_watermark_request(sampling_params)
 
         # Build return object
@@ -1809,6 +1845,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # A logprob batch gathers every request's count, including disabled ones.
                 top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
+                token_ids_logprob_rows=obj.token_ids_logprob_rows,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
@@ -2479,9 +2516,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.sampling_params = (
+                        tokenized_obj.sampling_params.for_sample(sample_index)
+                    )
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
@@ -2906,7 +2946,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info,
                     state,
                     state.obj.top_logprobs_num,
-                    state.obj.token_ids_logprob,
+                    _requested_token_ids(state.obj),
                     state.obj.return_text_in_logprobs and not self.skip_tokenizer_init,
                     recv_obj,
                     i,
@@ -3467,7 +3507,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             meta_info,
             state,
             state.obj.top_logprobs_num,
-            state.obj.token_ids_logprob,
+            _requested_token_ids(state.obj),
             return_text_in_logprobs,
             finished=finished,
         )
@@ -3922,7 +3962,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info,
                 state,
                 state.obj.top_logprobs_num,
-                state.obj.token_ids_logprob,
+                _requested_token_ids(state.obj),
                 state.obj.return_text_in_logprobs
                 and not get_serving().skip_tokenizer_init,
                 finished=True,
