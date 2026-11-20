@@ -64,3 +64,8 @@ serde_json = { workspace = true }
 # Native media fetch (stage 1 of the server MM pipeline); rustls so the
 # extension never links the system OpenSSL.
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+
+# `rlib_is_single_threaded` counts the process's threads: Linux reads procfs,
+# macOS asks libproc.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
