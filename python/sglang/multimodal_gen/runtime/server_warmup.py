@@ -280,6 +280,7 @@ async def run_async_client_warmup(
         if isinstance(result, BaseException):
             raise result
 
+
 def _warm_replica_sync(
     server_args: ServerArgs,
     forward: Callable[..., OutputBatch],
