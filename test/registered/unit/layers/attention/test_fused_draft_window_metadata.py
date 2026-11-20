@@ -10,12 +10,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch import nn
 
 from sglang.srt.layers.attention import aiter_backend as ab
 from sglang.srt.layers.attention import flashinfer_backend as fb
 from sglang.srt.layers.attention import triton_backend as tb
 from sglang.srt.layers.attention import trtllm_mha_backend as tm
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -36,12 +37,28 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods import (
+    dense_attention as _kit,
+)
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    DenseAttentionCase,
+    MockModelRunner,
+    TinyModelConfig,
+)
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of, plan_stand_in
+
+# The kit enters a process-wide single-rank parallel override when imported;
+# keep it to the tests that build a backend from its runner.
+_kit._parallel_override.__exit__(None, None, None)
+
+# Draft tokens per request in a target verify.
+_VERIFY = 4
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
@@ -53,18 +70,18 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self.args = ServerArgs(model_path="dummy", page_size=1)
         publish(self.args, role="tokenizer")
 
-    def _fixture(self, window, target_window, backend_kind="triton"):
+    def _fixture(self, window, target_window, backend_kind="triton", full_layer=False):
+        geometry = DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8)
+        kinds = {
+            LAYER_WINDOW: DraftLayerSet(
+                layer_ids=(0,), geometry=geometry, window=window
+            )
+        }
+        if full_layer:
+            kinds[LAYER_FULL] = DraftLayerSet(layer_ids=(1,), geometry=geometry)
         decision = place_fused_draft(
             profile=DraftKVProfile(
-                num_layers=1,
-                num_depths=1,
-                kinds={
-                    LAYER_WINDOW: DraftLayerSet(
-                        layer_ids=(0,),
-                        geometry=DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8),
-                        window=window,
-                    )
-                },
+                num_layers=2 if full_layer else 1, num_depths=1, kinds=kinds
             ),
             num_runners=1,
             ctx=PlacementContext(
@@ -80,7 +97,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         # A draft window rides in the target window of its length; any other
         # draft window gets a band of its own, named by its length.
         host = f"window_{window}"
-        self.assertEqual(placement.hosts(), (host,))
+        self.assertEqual(placement.hosts(), ("full", host) if full_layer else (host,))
         self.assertEqual(
             host in placement.new_bands, window != target_window, placement.new_bands
         )
@@ -148,6 +165,13 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             layer_id=0,
             sliding_window_size=window,
         )
+        layers = [layer]
+        if full_layer:
+            layers.append(
+                RadixAttention(
+                    num_heads=1, head_dim=8, scaling=0.5, num_kv_heads=1, layer_id=1
+                )
+            )
         bound = bind_fused_draft(
             placement=placement,
             runner=0,
@@ -155,8 +179,13 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             plan=storage_plan,
             owner=storage_plan.owner().name,
             target_state=None,
-            model=SimpleNamespace(modules=lambda: [layer]),
-            model_config=SimpleNamespace(),
+            model=SimpleNamespace(modules=lambda: layers),
+            # Read only when the draft spans both kinds: layer 0 is its window.
+            model_config=SimpleNamespace(
+                is_hybrid_swa=True,
+                is_compressed_kv_arch=False,
+                swa_attention_layer_ids=(0,),
+            ),
             req_to_token_pool=req,
             page_size=1,
         )
@@ -521,6 +550,144 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 metadata.page_table[0, :seq_len].to(torch.int64),
                 owner_ids[:seq_len].to(torch.int64),
             )
+        )
+
+    def _trtllm_verify_backend(self, window, *, full_layer=False):
+        """A trtllm_mha backend built by its own init for the fused window
+        draft, whose layers all run ENCODER_ONLY, as a non-causal DFLASH
+        draft's do; with ``full_layer``, one of them lives on the full band."""
+        override = get_parallel().override(attn_tp_size=1, attn_dcp_rank=0)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+        self._fixture(window, 128, backend_kind="trtllm", full_layer=full_layer)
+        case = DenseAttentionCase(
+            name="fused_draft_encoder_only_verify",
+            backend="trtllm_mha",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=1,
+            num_kv_heads=1,
+            page_size=1,
+            prefix_lens=(0,),
+            extend_lens=(_VERIFY,),
+            sliding_window_size=window,
+        )
+        runner = MockModelRunner(
+            case=case,
+            model_config=TinyModelConfig(
+                num_heads=1,
+                num_kv_heads=1,
+                head_dim=8,
+                hidden_size=8,
+                context_len=512,
+                sliding_window_size=window,
+            ),
+            dtype=torch.bfloat16,
+            device="cuda",
+            max_context_len=512,
+            head_dim=8,
+        )
+        self.addCleanup(runner._server_args_override.restore)
+        runner.is_draft_worker = True
+        runner.req_to_token_pool = self.runner.req_to_token_pool
+        runner.token_to_kv_pool = self.bound_pool
+        runner.token_to_kv_pool_allocator = self.allocator
+        runner.runner_ids = self.reader
+        runner.model = nn.ModuleList(
+            RadixAttention(
+                num_heads=1,
+                head_dim=8,
+                scaling=0.5,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                sliding_window_size=window if layer_id == 0 else -1,
+                attn_type=AttentionType.ENCODER_ONLY,
+            )
+            for layer_id in ((0, 1) if full_layer else (0,))
+        )
+        return tm.TRTLLMHAAttnBackend(runner)
+
+    def _verify_batch(self, seq_len):
+        seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+        rows = torch.zeros(1, dtype=torch.int64, device="cuda")
+        plan = self.reader.plan(
+            req_pool_indices=rows,
+            seq_lens=seq_lens,
+            seq_lens_cpu=None,
+            write_virtual=None,
+            read_extent=_VERIFY,
+        )
+        return SimpleNamespace(
+            batch_size=1,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            req_pool_indices=rows,
+            seq_lens=seq_lens,
+            input_ids=torch.zeros(_VERIFY, dtype=torch.int64, device="cuda"),
+            positions=torch.arange(_VERIFY, dtype=torch.int64, device="cuda"),
+            ragged_verify_layout=None,
+            iteration_ids=plan,
+            out_cache_loc=None,
+            spec_info=None,
+        )
+
+    def _assert_encoder_rows_read(self, metadata, kind, seq_len, window):
+        """Every expanded verify row reads ``kind``'s ids over the window that
+        ends at the request's last draft token."""
+        end = seq_len + _VERIFY
+        live = slice(end - window, end)
+        expected = (
+            self.reader.space(IdSpaceKind.SLIDING_WINDOW).ids(self.virtual)
+            if kind == IdSpaceKind.SLIDING_WINDOW
+            else self.allocator.translate_kv_loc(self.virtual)
+        )
+        rows = metadata.encoder_page_table[:_VERIFY, live].to(torch.int64)
+        self.assertEqual(rows.shape[0], _VERIFY)
+        self.assertTrue(torch.equal(rows, expected[live].expand_as(rows)))
+
+    def test_trtllm_encoder_only_verify_reads_the_window_table(self):
+        """An all-sliding non-causal DFLASH draft on a window band verifies
+        through the ENCODER_ONLY rows, which take one page table for every
+        layer. Those rows must hold the window ids in eager metadata and on
+        every graph replay; the full table holds other ids for the same
+        tokens, so a draft reading it attends the wrong KV without failing."""
+        window, seq_len = 64, 300
+        backend = self._trtllm_verify_backend(window)
+        self.assertTrue(backend._encoder_only_reads_swa)
+
+        backend.init_forward_metadata(self._verify_batch(seq_len))
+        self._assert_encoder_rows_read(
+            backend.forward_metadata, IdSpaceKind.SLIDING_WINDOW, seq_len, window
+        )
+
+        backend.init_cuda_graph_state(max_bs=1, max_num_tokens=_VERIFY)
+        batch = self._verify_batch(seq_len)
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            backend.init_forward_metadata_in_graph(batch)
+        torch.cuda.current_stream().wait_stream(stream)
+        metadata = backend.forward_metadata
+        for length in (seq_len + 1, seq_len + 40):
+            replay = self._verify_batch(length)
+            batch.seq_lens.copy_(replay.seq_lens)
+            batch.iteration_ids = replay.iteration_ids
+            backend.init_forward_metadata_out_graph(batch, in_capture=False)
+            graph.replay()
+            torch.cuda.synchronize()
+            self._assert_encoder_rows_read(
+                metadata, IdSpaceKind.SLIDING_WINDOW, length, window
+            )
+
+    def test_trtllm_encoder_only_verify_with_a_full_layer_reads_the_full_table(self):
+        """The ENCODER_ONLY rows take one table for all their layers, so a
+        draft with any such layer on the full band keeps the full table."""
+        window, seq_len = 64, 300
+        backend = self._trtllm_verify_backend(window, full_layer=True)
+        self.assertFalse(backend._encoder_only_reads_swa)
+        backend.init_forward_metadata(self._verify_batch(seq_len))
+        self._assert_encoder_rows_read(
+            backend.forward_metadata, IdSpaceKind.FULL, seq_len, window
         )
 
     def test_aiter_refuses_a_routed_window_view_at_init(self):

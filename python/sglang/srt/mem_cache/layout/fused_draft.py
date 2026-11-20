@@ -602,7 +602,8 @@ def draft_kv_profile(
     ``num_depths`` overrides the checkpoint depth.
     ``window`` is the window the draft's sliding-window layers attend over, as
     its runner will resolve it, so a window equal to a target's shares its sub-pool.
-    ``window_layer_ids`` overrides the config's window layers.
+    ``window_layer_ids`` lists window layers the config cannot: an all-sliding
+    DFLASH draft is not hybrid-SWA, so ``draft_swa_layer_ids`` returns none.
     """
     from sglang.srt.configs.hybrid_arch import mambaish_config
     from sglang.srt.configs.model_config import AttentionArch
