@@ -22,12 +22,14 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
 from sglang.srt.models.kimi_k3_amd import mla as k3_mla
 from sglang.srt.models.kimi_k3_amd.mla import KimiK3RocmMlaQCacheWriter
+from sglang.srt.runtime_context import get_parallel, get_resources
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -280,13 +282,9 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
         del self.writer._write_fused
         kernel = mock.Mock(side_effect=lambda *a, **kw: (kw["q_out"], None, None, None))
         self.writer._fused_rope_cat_and_cache = kernel
-        patch = mock.patch.object(
-            k3_mla,
-            "get_buffer",
-            return_value=SimpleNamespace(get=lambda **_: rope),
-        )
-        patch.start()
-        self.addCleanup(patch.stop)
+        buffers = get_resources().buffers
+        buffers["kimi_k3_mla_identity_rope"] = SimpleNamespace(get=lambda **_: rope)
+        self.addCleanup(buffers.pop, "kimi_k3_mla_identity_rope", None)
         return kernel
 
     def test_declined_write_requests_no_fp8_query_buffer(self):
@@ -385,24 +383,15 @@ class TestMlaQCacheWriterCallSite(CustomTestCase):
             ),
             out_cache_loc=torch.arange(2) if out_cache_loc is None else out_cache_loc,
         )
+        backend = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                layer_router=SimpleNamespace(read=lambda _: kv_layer)
+            ),
+            mla_fp8_q_out=lambda **_: self.fp8_q_out,
+        )
         with (
-            mock.patch.object(
-                forward_mla_rocm,
-                "get_parallel",
-                return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
-            ),
-            mock.patch.object(
-                forward_mla_rocm,
-                "get_token_to_kv_pool",
-                return_value=SimpleNamespace(
-                    layer_router=SimpleNamespace(read=lambda _: kv_layer)
-                ),
-            ),
-            mock.patch.object(
-                forward_mla_rocm,
-                "get_attn_backend",
-                return_value=SimpleNamespace(mla_fp8_q_out=lambda **_: self.fp8_q_out),
-            ),
+            get_parallel().override(dcp_enabled=dcp_enabled),
+            forward_context(ForwardContext(attn_backend=backend)),
         ):
             result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
                 attn,
