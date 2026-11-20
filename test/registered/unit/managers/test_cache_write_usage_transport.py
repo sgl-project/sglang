@@ -352,7 +352,7 @@ class TestCacheWriteReportingWindowTransport(CacheWriteTransportTestCase):
         manager.sampling_params_class = SamplingParams
         manager.tokenized_generate_req_type = TokenizedGenerateReqInput
         manager.tokenizer = None
-        manager.model_config = SimpleNamespace(vocab_size=100)
+        manager.model_config = SimpleNamespace(vocab_size=100, token_id_vocab_size=100)
         manager.rid_to_state = {
             obj.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
         }
