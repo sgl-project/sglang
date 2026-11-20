@@ -27,6 +27,7 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -108,6 +109,7 @@ class Router:
         self.stale_request_timeout_secs = stale_request_timeout_secs
 
         self.process: subprocess.Popen | None = None
+        self.log_path: Path | None = None
         self._started: bool = False
         # Track child workers we spawned so __exit__ can tear them down.
         self._owned_workers: list[subprocess.Popen] = []
@@ -130,6 +132,7 @@ class Router:
         worker_urls: list[str],
         policy: str = "round_robin",
         kv_indexer_endpoint: str | None = None,
+        extra_args: list[str] | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in regular (non-PD) mode.
@@ -145,6 +148,7 @@ class Router:
             policy: Policy kind — ``round_robin``, ``random``, ``power_of_two``,
                     or ``cache_aware``.
             kv_indexer_endpoint: Optional external KV Indexer gRPC endpoint.
+            extra_args: Further router flags, appended verbatim.
             timeout: How long to wait for ``/readyz`` before giving up.
         """
         self._launch(
@@ -154,6 +158,7 @@ class Router:
                 urls=list(worker_urls),
                 policy=policy,
                 kv_indexer_endpoint=kv_indexer_endpoint,
+                extra_args=extra_args,
             ),
             timeout=timeout,
         )
@@ -166,6 +171,7 @@ class Router:
         prefill_urls: list[str],
         decode_urls: list[str],
         policy: str = "round_robin",
+        extra_args: list[str] | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in PD-disaggregated mode.
@@ -185,6 +191,7 @@ class Router:
                 tokenizer_path=tokenizer_path,
                 urls=list(prefill_urls) + list(decode_urls),
                 policy=policy,
+                extra_args=extra_args,
             ),
             timeout=timeout,
         )
@@ -254,6 +261,7 @@ class Router:
         urls: list[str],
         policy: str,
         kv_indexer_endpoint: str | None = None,
+        extra_args: list[str] | None = None,
     ) -> list[str]:
         resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
@@ -280,6 +288,8 @@ class Router:
             ]
         if kv_indexer_endpoint is not None:
             args += ["--kv-indexer-endpoint", kv_indexer_endpoint]
+        if extra_args:
+            args += list(extra_args)
         # `--worker-urls` is multi-valued; keep it last so clap doesn't
         # absorb a following flag as a URL.
         args += ["--worker-urls", *urls]
@@ -294,12 +304,15 @@ class Router:
             )
         logger.info("sgl-router args: %s", args)
 
-        self.process = subprocess.Popen(
-            [str(self.binary), *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        # A file, not a pipe nothing drains: a full pipe blocks the router.
+        self.log_path = Path(tempfile.gettempdir()) / f"sgl-router-{self.port}.log"
+        with open(self.log_path, "w") as log_handle:
+            self.process = subprocess.Popen(
+                [str(self.binary), *args],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
 
         try:
             self._wait_ready(timeout=timeout)
@@ -313,19 +326,9 @@ class Router:
         last_exc: Exception | None = None
         while time.time() < deadline:
             if self.process is not None and self.process.poll() is not None:
-                # Process exited early — surface stdout/stderr. This is the
-                # primary startup-failure diagnostic, so if the read itself
-                # fails, report that instead of blanking the output.
-                try:
-                    out = b""
-                    if self.process.stdout is not None:
-                        out = self.process.stdout.read() or b""
-                    output = out.decode(errors="replace")
-                except Exception as read_exc:  # noqa: BLE001
-                    output = f"<failed to read router stdout: {read_exc}>"
                 raise RuntimeError(
                     f"sgl-router exited during startup with code "
-                    f"{self.process.returncode}. output:\n{output}",
+                    f"{self.process.returncode}. output:\n{self.log_tail()}",
                 )
             try:
                 resp = httpx.get(f"{self.base_url}/readyz", timeout=2.0)
@@ -336,5 +339,16 @@ class Router:
             time.sleep(0.5)
         raise TimeoutError(
             f"sgl-router did not become ready at {self.base_url} within {timeout}s "
-            f"(last error: {last_exc})"
+            f"(last error: {last_exc}); log tail:\n{self.log_tail()}"
         )
+
+    def log_tail(self, lines: int = 200) -> str:
+        """Last `lines` of the router's log, for failure diagnostics."""
+        if self.log_path is None:
+            return "(no log file)"
+        try:
+            return "\n".join(
+                self.log_path.read_text(errors="replace").splitlines()[-lines:]
+            )
+        except OSError:
+            return f"({self.log_path} unreadable)"

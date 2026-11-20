@@ -181,8 +181,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`--attn-dp-size` / `--attention-data-parallel-size`</td>
       <td>Runs attention data-parallel inside the TP group, the axes combining as
       `tp_size = attn_tp_size × attn_dp_size × attn_cp_size`. Each DP group serves its own requests with its own KV
-      cache and attention weights, TP-sharded over the remaining `tp/attn_dp` ranks; FFN/MoE stay TP/EP-sharded. The
-      published scripts write the deprecated equivalent `--enable-dp-attention --dp-size 8`.</td>
+      cache and attention weights, TP-sharded over the remaining `tp/attn_dp` ranks; FFN/MoE stay TP/EP-sharded.</td>
       <td><strong>Discrete.</strong> Up: more independent decode instances, so higher throughput and lower TPOT under
       concurrency. Down: each group's attention TP widens and per-request attention runs faster — raise the value only
       while attention is not the bottleneck. Must divide the TP size; sweep the divisors (`2`, `4`, `8` on TP `8`).</td>
@@ -319,9 +318,8 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Delays admitting a prefill batch for a bounded number of forward passes so decode keeps making progress
       under attention DP, where prefill bursts otherwise stall decode. Sized by
       `--prefill-delayer-max-delay-passes` (`30`), `--prefill-delayer-queue-min-ratio`,
-      `--prefill-delayer-max-delay-ms`, and `--prefill-delayer-token-usage-low-watermark`; the env spellings
-      `SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE` and `SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES` are deprecated aliases of
-      the first two flags.</td>
+      `--prefill-delayer-max-delay-ms`, and `--prefill-delayer-token-usage-low-watermark`; the published scripts pass
+      `--enable-prefill-delayer` with `--prefill-delayer-max-delay-passes`.</td>
       <td><strong>Range.</strong> Up (more passes, a higher `--prefill-delayer-max-delay-ms`, a lower
       `--prefill-delayer-queue-min-ratio`): buys decode TPOT and pays TTFT. Down: shorter TTFT, at more decode stalls
       behind prefill bursts. Not for dedicated prefill or pure-decode roles.</td>
@@ -693,10 +691,10 @@ In practice, set [`--cuda-graph-max-bs-decode`](#batching-graphs-and-memory) to 
 multiple of it whenever attention DP, an all-to-all backend, or `--moe-dense-tp-size` is in play. A dense model with
 plain TP has no such constraint.
 
-Two defaults follow from this area. NPU prefill graphs are off by default, so no prefill graph flag is needed. And do
-not use the deprecated `--disable-cuda-graph` on a mixed node: it also disables decode graphs there — use
-`--cuda-graph-backend-decode=disabled` to disable only decode graphs. A dedicated prefill role that captures no graphs
-may still carry it, as the published prefill scripts do; there it is redundant and harmless.
+Two defaults follow from this area. NPU prefill graphs are off by default, so no prefill graph flag is needed. And to
+disable only decode graphs on a mixed node, use `--disable-decode-cuda-graph`. The published prefill scripts pass
+`--disable-decode-cuda-graph --disable-prefill-cuda-graph`; on a dedicated prefill role that captures no graphs this is
+redundant and harmless.
 
 ### Sizing the DeepEP dispatch buffer
 

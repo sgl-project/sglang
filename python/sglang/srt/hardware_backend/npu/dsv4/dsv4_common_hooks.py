@@ -282,7 +282,35 @@ def maybe_build_dsv4_verify_bundle(
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens_cpu
     if live_seq_lens_cpu is None:
-        live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
+        # Mirrorless (SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0): the host
+        # seq_lens mirror does not exist, and a seq_lens.cpu() fallback here
+        # would be a pageable D2H that drains the whole async task queue (the
+        # per-step StreamSynchronize bubble). Build the whole bundle on
+        # device; every op stays asynchronous.
+        ragged_layout = getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        out_full_loc = batch.out_cache_loc
+        t = out_full_loc.numel()
+        bs = len(req_indices)
+        return type(reserve_bundle)(
+            out_full_loc=out_full_loc,
+            out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                out_full_loc
+            ),
+            out_c4_loc=_compact_c4_loc(out_full_loc, min(t, t // 4 + bs)),
+            out_c128_loc=_flatten_interval_device(
+                table=pool.req_to_c128_sidecar,
+                page_size=pool.c128_page_size,
+                req_pool_indices=batch.req_pool_indices[:bs],
+                live_seq_lens=batch.seq_lens[:bs],
+                verify_lens=(
+                    None if ragged_layout is None else ragged_layout.verify_lens[:bs]
+                ),
+                n_draft=int(draft_token_num),
+                upper=min(t, t // 128 + bs),
+            ),
+        )
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
     ragged_layout = getattr(
@@ -327,6 +355,63 @@ def maybe_build_dsv4_verify_bundle(
         out_c4_loc=out_c4_loc,
         out_c128_loc=flatten_interval(pool.req_to_c128_sidecar, 128),
     )
+
+
+def _flatten_interval_device(
+    *,
+    table: torch.Tensor,
+    page_size: int,
+    req_pool_indices: torch.Tensor,
+    live_seq_lens: torch.Tensor,
+    verify_lens: torch.Tensor | None,
+    n_draft: int,
+    upper: int,
+) -> torch.Tensor:
+    """Device twin of the host ``flatten_interval`` loop (ratio=128): the c128
+    slots of the compressed positions ``[live // 128, (live + verify) // 128)``,
+    compacted req-major into a fixed ``upper``-wide buffer whose tail carries
+    the slot-map skip sentinel. Every op is an asynchronous device kernel and
+    the shape is host-known, so consumers' ``numel()`` never syncs. DP-padding
+    rows (live == 0) yield an empty interval, like the host ``end > start``
+    guard.
+    """
+    from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+        _loc_pad_value,
+    )
+
+    device = live_seq_lens.device
+    bs = live_seq_lens.shape[0]
+    if verify_lens is None:
+        verify_lens = torch.full((bs,), n_draft, dtype=torch.int64, device=device)
+    live = live_seq_lens.reshape(-1)[:bs].to(torch.int64)
+    verify = verify_lens.reshape(-1)[:bs].to(torch.int64)
+    starts, ends = live // 128, (live + verify) // 128
+
+    # Per-req interval is at most n_draft // 128 + 1 compressed positions,
+    # which sizes the shared position grid without a host ``max()`` read.
+    positions = (
+        starts[:, None] + torch.arange(n_draft // 128 + 1, device=device)[None, :]
+    )
+    valid = positions < ends[:, None]
+
+    # Single flat gather; invalid lanes clamp their page index into the row
+    # and contribute garbage that the compact below drops.
+    n_cols = table.shape[1]
+    page_idx = (positions // page_size).clamp_(max=n_cols - 1)
+    flat_idx = (
+        req_pool_indices[:bs].to(torch.int64)[:, None] * n_cols + page_idx
+    ).reshape(-1)
+    locs = table.reshape(-1)[flat_idx] * page_size + positions.reshape(-1) % page_size
+
+    # Stable compact without NonZero, mirroring _compact_c4_loc: each valid
+    # lane lands on its ordinal among valid lanes; invalid lanes share the
+    # trash slot at ``upper`` (duplicate writes are fine) which the slice
+    # below drops.
+    flat_valid = valid.reshape(-1)
+    dest = flat_valid.cumsum(0).sub_(1).masked_fill_(~flat_valid, upper)
+    buf = torch.full((upper + 1,), _loc_pad_value(), dtype=locs.dtype, device=device)
+    buf.scatter_(0, dest, locs)
+    return buf[:upper]
 
 
 def _write_per_req(

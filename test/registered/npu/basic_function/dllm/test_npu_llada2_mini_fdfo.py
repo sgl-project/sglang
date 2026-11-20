@@ -51,7 +51,12 @@ class TestLLaDA2MiniFDFO(CustomTestCase):
         ]
         for common_arg in common_args:
             other_args = common_arg + (
-                ["--attention-backend", "ascend", "--disable-cuda-graph"]
+                [
+                    "--attention-backend",
+                    "ascend",
+                    "--disable-decode-cuda-graph",
+                    "--disable-prefill-cuda-graph",
+                ]
             )
             res = run_bench_serving(
                 model=model,

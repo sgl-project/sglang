@@ -1008,7 +1008,7 @@ The decode role's `--cuda-graph-bs-decode` then has to cover `N*2 / attn_dp_size
 
 Two things then differ between the two roles regardless of strategy:
 
-- **CUDA graphs.** Prefill runs `--disable-cuda-graph`, because the FP4 indexer's prefill path is not captured. Decode captures `--cuda-graph-bs-decode`.
+- **CUDA graphs.** Prefill runs `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, because the FP4 indexer's prefill path is not captured. Decode captures `--cuda-graph-bs-decode`.
 - **Speculative decoding** is the same on both. Keep `--speculative-dspark-block-size` equal on the two roles. The original Flash and Pro checkpoints have no DSpark head and use their MTP head instead: `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
 
 **MoE parallelism differs too, on the high-throughput pair.** Each role uses what suits its batch size. Prefill runs **EP8**, with the experts split across the 8 ranks: it processes a 65536-token chunk, so the split pays for the all-to-all it costs. Decode runs **TP8**, with the experts replicated on every rank, because a few tokens per request per step would not pay for it.
@@ -1032,8 +1032,7 @@ python3 -m sglang.launch_server \
   --disaggregation-bootstrap-port 7200 \
   --disaggregation-transfer-backend mori \
   --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
-  --tp-size 8 --dp-size 8 --ep-size 8 \
-  --enable-dp-attention \
+  --tp-size 8 --attn-dp-size 8 --ep-size 8 \
   --enable-dp-attention-local-control-broadcast \
   --enable-dp-lm-head \
   --moe-a2a-backend megamoe \
@@ -1048,7 +1047,7 @@ python3 -m sglang.launch_server \
   --chunked-prefill-size 65536 \
   --max-running-requests 512 \
   --context-length 1048576 \
-  --disable-cuda-graph \
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 3 \
   --speculative-num-steps 1 \
@@ -1084,8 +1083,7 @@ python3 -m sglang.launch_server \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend mori \
   --disaggregation-ib-device rdma3,rdma0,rdma2,rdma1,rdma7,rdma4,rdma6,rdma5 \
-  --tp-size 8 --dp-size 8 \
-  --enable-dp-attention \
+  --tp-size 8 --attn-dp-size 8 \
   --enable-dp-attention-local-control-broadcast \
   --enable-dp-lm-head \
   --enforce-shared-experts-fusion \
@@ -1116,7 +1114,7 @@ Decode sets neither `--ep-size` nor `--moe-a2a-backend`. `--moe-a2a-backend` nam
 
 The shared-expert, `SGLANG_DP_USE_GATHERV`, and `SGLANG_DP_USE_REDUCE_SCATTER` settings control the `all_gatherv` / `reduce_scatterv` path. Shared-expert locality and gatherv default to off; reduce-scatter defaults to on for ROCm. The commands only set the values that differ from those defaults. That is what decode's TP MoE uses and what prefill's all-to-all replaces, so leaving them on under EP8 would run both over the same tokens.
 
-The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
+The rest of the difference is the prefill-only set already described above: `--chunked-prefill-size`, `--disable-decode-cuda-graph --disable-prefill-cuda-graph`, and the linker flags with `--optimistic-prefill-attempts` / `--enable-cache-report`. Decode replaces the first two with `--cuda-graph-bs-decode`.
 
 On the prefill env:
 

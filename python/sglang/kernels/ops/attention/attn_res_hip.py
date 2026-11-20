@@ -15,6 +15,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx95_supported
+
 # _agg_kernel keeps a next_pow2(nvb) x next_pow2(H) fp32 tile in registers, and
 # that is the whole basis of its speed. Past this budget it spills and loses to
 # the 2-kernel Triton pipeline it replaces: measured at T=4 on MI355X,
@@ -208,5 +210,6 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        # an 8-row bank tile spills at 4 warps (measured on MI350X, H=7168)
+        num_warps=8 if is_gfx95_supported() and triton.next_power_of_2(nvb) >= 8 else 4,
     )

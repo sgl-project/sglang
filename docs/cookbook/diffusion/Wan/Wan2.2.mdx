@@ -67,6 +67,11 @@ same seed. They do not shorten the DiT's input or denoising work.
 For more API usage and request examples, please refer to:
 [SGLang Diffusion OpenAI API](/docs/sglang-diffusion/api/openai_api)
 
+On the native Wan2.2 TI2V 5B pipeline, use multiples of 32 for the requested
+width and height. The pipeline rounds each positive dimension down, with a
+minimum of 32: for example, `size=1280x720` requests a `1280x704` canvas.
+The Diffusers backend handles sizing separately.
+
 #### 4.1.1 Launch a server and then send requests
 
 Use the Server and Request commands in the [command builder](#1-quick-start)

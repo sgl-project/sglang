@@ -909,13 +909,13 @@ class TestToolCallParserDetection(unittest.TestCase):
                     "{% endfor %}"
                 ),
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm45",
+                "glm",
             ),
             (
                 "xml_kv_tool_call_via_vocab",
                 "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
                 ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
-                "glm45",
+                "glm",
             ),
         ]
         for name, template, vocab, expected in cases:
@@ -962,7 +962,7 @@ class TestToolCallParserDetection(unittest.TestCase):
 
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
-        # xml_kv_tool_call fallback. Both currently map to "glm45", so the
+        # xml_kv_tool_call fallback. Both currently map to "glm", so the
         # value-based test above can't catch a swap — assert positions directly.
         rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
         self.assertLess(rule_index["glm47"], rule_index["glm45"])

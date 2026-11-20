@@ -299,6 +299,16 @@ class TestImageProcessorKwargsPatch(CustomTestCase):
 
 
 class TestPilImageProcessorTensorPatch(CustomTestCase):
+    def test_npu_tensor_is_copied_to_cpu_before_pil_processing(self):
+        tensor = MagicMock(spec=torch.Tensor)
+        tensor.device.type = "npu"
+        pixels = torch.arange(3 * 5 * 7, dtype=torch.uint8).reshape(3, 5, 7)
+        tensor.cpu.return_value = pixels
+
+        result = PilBackend().process_image(tensor, do_convert_rgb=False)
+        tensor.cpu.assert_called_once_with()
+        np.testing.assert_array_equal(result, pixels.numpy())
+
     def test_grayscale_jpeg_tensor_matches_pil_rgb(self):
         """A grayscale JPEG tensor should match the PIL RGB backend output."""
         image = Image.new("L", (56, 56), 128)

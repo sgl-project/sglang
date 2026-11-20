@@ -16,6 +16,15 @@ import triton.language as tl
 
 
 @triton.jit
+def _rope_pairs(x, cos, sin, H: tl.constexpr, D: tl.constexpr):
+    bf = tl.bfloat16
+    a, b = tl.split(tl.reshape(x.to(bf).to(tl.float32), (H, D // 2, 2)))
+    ra = (a * cos).to(bf).to(tl.float32) - (b * sin).to(bf).to(tl.float32)
+    rb = (b * cos).to(bf).to(tl.float32) + (a * sin).to(bf).to(tl.float32)
+    return tl.reshape(tl.join(ra, rb), (H, D))
+
+
+@triton.jit
 def _qk_norm_kernel(
     Q,
     K,
@@ -25,9 +34,13 @@ def _qk_norm_kernel(
     k_stride,
     eps,
     q_scale,
+    POS,
+    COS_SIN,
+    cos_sin_stride,
     HQ: tl.constexpr,
     HK: tl.constexpr,
     D: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
 ):
     t = tl.program_id(0)
     offs_q = tl.arange(0, HQ * D)
@@ -35,15 +48,21 @@ def _qk_norm_kernel(
     q2 = tl.reshape(q, (HQ, D))
     rstd_q = tl.rsqrt(tl.sum(q2 * q2, axis=1) / D + eps)
     qn = (q2 * rstd_q[:, None]).to(tl.bfloat16).to(tl.float32) * q_scale
-    tl.store(QO + t * (HQ * D) + offs_q, tl.reshape(qn, (HQ * D,)).to(tl.bfloat16))
     offs_k = tl.arange(0, HK * D)
     k = tl.load(K + t * k_stride + offs_k).to(tl.float32)
     k2 = tl.reshape(k, (HK, D))
     rstd_k = tl.rsqrt(tl.sum(k2 * k2, axis=1) / D + eps)
-    tl.store(
-        KO + t * (HK * D) + offs_k,
-        tl.reshape(k2 * rstd_k[:, None], (HK * D,)).to(tl.bfloat16),
-    )
+    kn = k2 * rstd_k[:, None]
+    if HAS_ROPE:
+        # GPT-J (interleaved) rotary as the separate rotary kernel computes it: on the stored BF16 values, with the
+        # fp32 cos | sin cache row held in BF16 and each product rounded to BF16 before the add.
+        cs = COS_SIN + tl.load(POS + t) * cos_sin_stride + tl.arange(0, D // 2)
+        cos = tl.load(cs).to(tl.bfloat16).to(tl.float32)[None, :]
+        sin = tl.load(cs + D // 2).to(tl.bfloat16).to(tl.float32)[None, :]
+        qn = _rope_pairs(qn, cos, sin, HQ, D)
+        kn = _rope_pairs(kn, cos, sin, HK, D)
+    tl.store(QO + t * (HQ * D) + offs_q, tl.reshape(qn, (HQ * D,)).to(tl.bfloat16))
+    tl.store(KO + t * (HK * D) + offs_k, tl.reshape(kn, (HK * D,)).to(tl.bfloat16))
 
 
 def qk_norm_supported(q: torch.Tensor, k: torch.Tensor, head_dim: int) -> bool:
@@ -62,10 +81,16 @@ def qk_norm_supported(q: torch.Tensor, k: torch.Tensor, head_dim: int) -> bool:
 
 
 def fused_qk_norm(
-    q: torch.Tensor, k: torch.Tensor, head_dim: int, eps: float, q_scale: float
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+    eps: float,
+    q_scale: float,
+    rope: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """q: [T, HQ*D] (any row stride, e.g. a split view of the qkv buffer), k: [T, HK*D]. Returns
-    contiguous bf16 (normed_q * q_scale, normed_k)."""
+    contiguous bf16 (normed_q * q_scale, normed_k). ``rope`` = (positions [T], fp32 cos | sin cache
+    [positions, head_dim]) also applies the GPT-J rotary to both, as the separate rotary kernel would."""
     T = q.shape[0]
     qo = torch.empty(T, q.shape[1], dtype=torch.bfloat16, device=q.device)
     ko = torch.empty(T, k.shape[1], dtype=torch.bfloat16, device=k.device)
@@ -80,9 +105,14 @@ def fused_qk_norm(
         k.stride(0),
         float(eps),
         float(q_scale),
+        rope[0] if rope is not None else None,
+        rope[1] if rope is not None else None,
+        rope[1].stride(0) if rope is not None else 0,
         HQ=q.shape[1] // head_dim,
         HK=k.shape[1] // head_dim,
         D=head_dim,
-        num_warps=4,
+        HAS_ROPE=rope is not None,
+        # gfx1250: one wave per token is faster than four at 8K-16K rows and ties at 128-512.
+        num_warps=1,
     )
     return qo, ko

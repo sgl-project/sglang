@@ -37,8 +37,24 @@ _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
 
+
 # DFlash draft blocks (Muse Spark DFlash2 at TP8) on gfx950 take the split-KV kernel.
-_use_dflash_block_splitkv = _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_SPLITKV.get()
+def _gfx1250_try_gfx95():
+    import os as _os
+
+    if _os.environ.get("SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95", "1") != "1":
+        return False
+    try:
+        import torch as _t
+
+        return "gfx1250" in _t.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+_use_dflash_block_splitkv = (
+    _is_gfx95 or _gfx1250_try_gfx95()
+) and envs.SGLANG_ROCM_MUSE_DFLASH_SPLITKV.get()
 _dflash_block_splitkv_logged: set = set()
 
 try:
@@ -444,6 +460,7 @@ def _fwd_kernel(
     IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     IDENTITY_KV_INDICES: tl.constexpr = False,
+    BF16_DOT: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
     aux0_stride_t=0,
@@ -620,9 +637,10 @@ def _fwd_kernel(
             # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
             # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
-            # On all other platforms keep the original q.to(k.dtype) downcast.
-            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-            if IS_GFX1250:
+            # On all other platforms keep the original q.to(k.dtype) downcast, unless
+            # BF16_DOT asks for the same upcast so that q and the dots stay BF16.
+            # TODO: drop IS_GFX1250 here once the gfx1250 fp8 tl.dot issue is resolved.
+            if IS_GFX1250 or BF16_DOT:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
                 qk = tl.dot(q.to(k.dtype), k)
@@ -645,7 +663,7 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                if IS_GFX1250:
+                if IS_GFX1250 or BF16_DOT:
                     qk += tl.dot(qpe, kpe.to(qpe.dtype))
                 else:
                     qk += tl.dot(qpe.to(kpe.dtype), kpe)
@@ -717,6 +735,8 @@ def _fwd_kernel(
                 # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
                 if IS_GFX1250:
                     dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                elif BF16_DOT:
+                    dot = tl.dot(p.to(q.dtype), v.to(q.dtype))
                 else:
                     dot = tl.dot(p.to(v.dtype), v)
                 acc = acc * re_scale[:, None] + dot * v_scale
@@ -953,6 +973,7 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    bf16_dot: bool = False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -964,9 +985,12 @@ def extend_attention_fwd(
     ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
     respectively so DCP can compute those two parts separately.
     ``score_mod`` / ``aux_tensors`` add a custom term to the attention logits;
-    see triton_ops/score_mod.py for the contract.
+    see score_mod.py for the contract.
     ``identity_kv_indices`` promises that the prefix buffer is densely packed,
     allowing direct addressing instead of loading an index for every token.
+    ``bf16_dot``: with an FP8 cache and BF16 q, upcast the cached K/V and run the
+    prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
+    prefix or zero-prefix kernel). No effect on a BF16 cache.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -1017,6 +1041,9 @@ def extend_attention_fwd(
                 sliding_window_size,
                 k_buffer.data_ptr(),
             )
+        # gfx1250, 1 KV head (TP8), 2048-token window, from 16 requests: one 64-row tile per request (8 tokens x
+        # 8 heads, KV read once), 64-key tiles, 8 splits; faster than the default split-KV launch at these batches.
+        wide = _is_gfx1250 and k_extend.shape[1] == 1 and batch_size >= 16
         dflash_block_splitkv(
             q_extend,
             k_extend,
@@ -1029,10 +1056,12 @@ def extend_attention_fwd(
             kscale=k_scale,
             vscale=v_scale,
             softmax_scale=sm_scale,
-            splits=8 if k_extend.shape[1] == 2 else 16,
+            splits=8 if k_extend.shape[1] == 2 or wide else 16,
             pv_bf16=True,
             out=o_extend,
             window_left=sliding_window_size,
+            block_m=64 if wide else 16,
+            block_n=64 if wide else 128,
         )
         return
 
@@ -1057,6 +1086,7 @@ def extend_attention_fwd(
     # native-FP8 zero-prefix kernel at every sequence length.
     use_fp8_zero_prefix = (
         _is_gfx95
+        and not bf16_dot
         and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
         and zero_prefix_shape
         and q_extend.dtype == torch.bfloat16
@@ -1090,6 +1120,7 @@ def extend_attention_fwd(
     HAS_SINK = sinks is not None
     USE_FP8_PREFIX = (
         _is_gfx95
+        and not bf16_dot
         and kimi_k3_shape
         and k_buffer.dtype == torch.float8_e4m3fn
         and v_buffer.dtype == torch.float8_e4m3fn
@@ -1226,6 +1257,7 @@ def extend_attention_fwd(
         FP8_MAX=FP8_MAX,
         PAGE_SIZE=page_size,
         IDENTITY_KV_INDICES=identity_kv_indices,
+        BF16_DOT=bf16_dot,
         SCORE_MOD=score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
@@ -1930,7 +1962,6 @@ def _fwd_kernel_dense_prefill(
         return
 
     offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
 
