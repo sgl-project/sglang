@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -2236,19 +2237,17 @@ class TestMambaHostShare(CustomTestCase):
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
         )
-        memory = SimpleNamespace(
-            hicache_size=1e-5,
-            hicache_ratio=2,
-            hicache_mem_layout="page_first_direct",
-            hicache_write_policy="write_through",
-            hicache_io_backend="direct",
-            hicache_host_memory_mode="cache",
-            enable_unified_memory=False,
-        )
         for tri_pool in (False, True):
             with (
                 self.subTest(tri_pool=tri_pool),
-                patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    hicache_ratio=2,
+                    hicache_mem_layout="page_first_direct",
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="direct",
+                ),
+                get_memory().override(hicache_size=1e-5),
                 patch.object(
                     hybrid_pool_assembler, "_get_allocator_type", return_value="default"
                 ),
@@ -2303,11 +2302,17 @@ class TestMambaHostShare(CustomTestCase):
                     mirrored_bytes,
                     sum(pool.get_kv_size_bytes() for pool in (mamba_pool, *drafts)),
                 )
-                kv_share = build_kv_host_pool.call_args_list[0].kwargs["host_size"]
+                kv_shares = [
+                    call.kwargs["host_size"]
+                    for call in build_kv_host_pool.call_args_list
+                ]
                 mamba_share = build_mamba_host_pool.call_args.kwargs["host_size"]
-                self.assertAlmostEqual(
-                    mamba_share / kv_share, mirrored_bytes / kv_bytes
-                )
+                self.assertEqual(len(kv_shares), 2 if tri_pool else 1)
+                self.assertAlmostEqual(sum(kv_shares) + mamba_share, 1e-5)
+                for share in kv_shares:
+                    self.assertAlmostEqual(
+                        mamba_share / share, mirrored_bytes / kv_bytes
+                    )
 
 
 class TestMambaHostShareForModelGeometries(CustomTestCase):
