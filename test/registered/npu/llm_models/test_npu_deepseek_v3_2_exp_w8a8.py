@@ -5,7 +5,7 @@ from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="full-16-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-16-npu-a3", nightly=True)
 
 
 class TestDeepSeekV32(GSM8KAscendMixin, CustomTestCase):
@@ -24,7 +24,8 @@ class TestDeepSeekV32(GSM8KAscendMixin, CustomTestCase):
         "0.9",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--tp-size",
         "16",
         "--quantization",

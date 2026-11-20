@@ -76,9 +76,6 @@
             "runtime_peak_vram": 0.02
         }
     },
-    "improvement_reporting": {
-        "threshold": 0.2
-    },
     "sampling": {
         "step_fractions": [
             0.0,

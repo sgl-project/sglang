@@ -27,9 +27,9 @@ from sglang.test.test_utils import (
 
 register_npu_ci(
     est_time=400,
-    suite="base-b-test-4-npu-a3",
+    suite="extra-b-test-4-npu-a3",
 )
-register_npu_ci(est_time=2700, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=2700, suite="nightly-test-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -59,7 +59,8 @@ class TestDPAttentionDP2TP2(
                 "2",
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         )
 
@@ -171,7 +172,8 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
                 "2",
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
             ],
         )
 

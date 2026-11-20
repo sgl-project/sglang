@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=7200,
-    suite="nightly-acc-4-npu-a5",
+    suite="nightly-acc-test-4-npu-a5",
     nightly=True,
 )
 
@@ -57,7 +57,6 @@ DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
     "ASCEND_LAUNCH_BLOCKING": "1",
     # Dspark
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_SAMPLING": "0",
 }
 
 DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
@@ -88,8 +87,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     "auto",
     "--enable-dp-lm-head",
     "--disable-radix-cache",
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     4,
     "--reasoning-parser",
     "deepseek-v4",

@@ -162,6 +162,13 @@ before choosing it. AdaLN
 precomputation and the VAE retain native precision. MXFP8 uses block scaling on
 Blackwell and the FP8 fallback on Hopper; use FP8 on older supported GPUs.
 
+**FP8 attention** separately quantizes attention inputs on SM120/SM121 GPUs.
+Select it explicitly in the picker, or pass
+`--component-attention-backends.transformer fp8_fa_sm120`. Native FlashAttention
+remains the default. The measured Spark combination uses **MXFP8 DiT + encoder**
+and **FP8 attention** together; both change numerical precision. Ring parallelism
+requires native FlashAttention.
+
 **Breakable CUDA graph** captures the picker's task, size and reference layout
 during startup. Its warmup prompt matches the generated request; editing also
 needs the reference files on the server. Matching signatures replay the graph,
@@ -255,7 +262,7 @@ The container limit does not cap all CUDA allocations; keep at least 106 GiB
 available in the shared pool before starting the verified Auto recipe.
 
 The tested ARM64 base is `lmsysorg/sglang@sha256:d4a56f6f9356539957974bb4008161b4c08d14a712805ff63eae526f36dbda71`,
-with driver 580.173.02, PyTorch 2.14.1+cu130, FlashInfer 0.7.2 and FA4 4.0.0b38.
+with driver 580.173.02, PyTorch 2.14.1+cu130 and FlashInfer 0.7.3.
 Mount this checkout and a task-owned cache directory, then install the source
 and matching diffusion dependencies inside the container:
 
@@ -278,9 +285,9 @@ python3 -m pip uninstall -y flashinfer-jit-cache-sm80 flashinfer-jit-cache-sm89 
   flashinfer-jit-cache-sm90a flashinfer-jit-cache-sm100a flashinfer-jit-cache-sm103a \
   flashinfer-jit-cache-sm110a flashinfer-jit-cache-sm120f flashinfer-jit-cache-sm121a
 python3 -m pip install --no-deps flash-attn-4==4.0.0b38
-python3 -m pip install --no-deps flashinfer-cubin==0.7.2 \
+python3 -m pip install --no-deps flashinfer-cubin==0.7.3 \
   --index-url https://flashinfer.ai/whl/
-python3 -m pip install --no-deps flashinfer-jit-cache==0.7.2+cu130 \
+python3 -m pip install --no-deps flashinfer-jit-cache==0.7.3+cu130 \
   --index-url https://flashinfer.ai/whl/cu130
 ```
 
@@ -326,7 +333,8 @@ environments.
 ### DGX Spark at 2K and 4K
 
 One GB10 with Auto resident placement and native AdaLN precomputation, at
-`539fea720b86`, using the pinned checkpoints and ARM64 environment above:
+`539fea720b86`, using the pinned checkpoints and the same ARM64 base with
+FlashInfer 0.7.2:
 
 | Workload | Pipeline median | Observed warm range |
 | --- | --- | --- |
@@ -345,10 +353,31 @@ workflows was about 91 GiB; other runtime and host allocations also share the
 same pool. The native offline API also passed 2K generation and editing at
 exact and lossless quality with matching decoded pixels.
 
-With cached checkpoints, the two server starts took 281–282 seconds to become
-healthy in the 12-core container, including startup warmup. Weight downloads and
-installation are outside that boundary. Keep the server running to reuse this
-preparation; startup time is excluded from the warm-request table.
+Startup takes several minutes in the 12-core container, even with cached
+checkpoints. Keep the server running to reuse weight loading and warmup; both
+are excluded from the warm-request table.
+
+### DGX Spark with MXFP8 and FP8 attention
+
+Select **MXFP8 DiT + encoder** and **FP8 attention** for the accelerated Spark
+recipe. Native precision remains the default; these options can change image
+composition and details even with `quality=lossless`.
+
+| Workload | Pipeline median | Observed warm range |
+| --- | --- | --- |
+| T2I, 2048 × 2048 | 10.99 s | 10.86–11.14 s |
+| T2I, 4736 × 3552 | 56.31 s | 54.85–56.55 s |
+| Editing, 4096 × 4096 | 62.78 s | 62.75–62.82 s |
+
+Measured at `7e9078906472` and `78567c4042a0` with FlashInfer 0.7.3 and the ARM64
+environment above. 4K generation has five measured requests across two fresh
+servers (three plus two); the other rows have three each. The first request per
+task in each server is excluded as warmup. All six steps
+run with resident components, eager execution and warm conditioning. T2I uses
+seed 42; editing uses seed 1234 and one 1024 × 1024 reference. Times exclude
+HTTP, PNG encoding and client saving. Peak CUDA reserved memory is 51.32 GiB
+in the shared pool. The native baseline at `1b51a11129bb` on the same environment measured
+82.45 s for 4736 × 3552 (81.73–83.18 s, two warm requests).
 
 ### B300 at 2K
 
