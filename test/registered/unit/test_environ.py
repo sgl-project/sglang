@@ -238,18 +238,6 @@ class TestRenamedEnvAliases(unittest.TestCase):
             "1",
             True,
         ),
-        (
-            "SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND",
-            "SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND",
-            "aiter",
-            "aiter",
-        ),
-        (
-            "SGLANG_OPT_HIP_K3_FLYDSL_SOURCE",
-            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE",
-            "sglang",
-            "sglang",
-        ),
         ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True),
         ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK", "1", True),
         (

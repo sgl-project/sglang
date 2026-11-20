@@ -312,12 +312,12 @@ Outside the two verified B300 1×8 `Unified` cells, no cell has a serving round 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting <strong>both</strong> gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND=aiter</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>gfx950</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Opt in to the fused ROCm KDA decode boundary: the <code>f_b</code> projection is deferred into the gfx950 FlyDSL kernel so decode fuses <code>f_b</code> + convolution + recurrent state update + gated RMSNorm. The kernel takes a BF16 <code>f_b</code>: a block-FP8 one uses the dequantized copy the model already keeps, and a Quark per-channel FP8 one is dequantized once at load. The default <code>gfx950</code> selects the SGLang <code>gfx950</code> kernel, which takes an FP32 state only; any other value keeps the unfused KDA path.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_FLYDSL_SOURCE</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_HIP_K3_FLYDSL_SOURCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Which FlyDSL implementation backs the fused decode: <code>sglang</code> / <code>aiter</code> pin one, and <code>auto</code> prefers SGLang's vendored kernel but binds AITER's when the vendored one is missing or does not take the recurrent state dtype. The vendored kernel takes an FP32 state only; AITER's (<code>aiter.ops.flydsl.linear_attention_kernels</code>, from <a href="https://github.com/ROCm/aiter/pull/6026">ROCm/aiter#6026</a>) also takes the BF16 state of <code>--mamba-ssm-dtype bfloat16</code>, so <code>auto</code> serves that state on AITER's kernel.</td>
     </tr>
