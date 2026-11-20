@@ -262,15 +262,16 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         # master_server_address the client ignores the MOONCAKE_* env vars).
         # The master runs on the first prefill pod and the segment is requested
         # per scheduler rank: 32 ranks make the registration slow and skewed,
-        # so keep it small. A large value also makes the Ascend driver reject
-        # the last rank's HalMemCreate and the prefill server dies with
-        # "Failed to setup Mooncake store".
+        # so keep it small (256 MiB). A large value also makes the Ascend
+        # driver reject the last rank's HalMemCreate and the prefill server
+        # dies with "Failed to setup Mooncake store". Only a plain byte count
+        # or a "gb" suffix is accepted; "mb" raises in the config parser.
         l3_config = json.dumps(
             {
                 "master_server_address": get_mooncake_master_server_address(),
                 "metadata_server": "P2PHANDSHAKE",
                 "protocol": "ascend",
-                "global_segment_size": "256mb",
+                "global_segment_size": "268435456",
                 "local_hostname": resolve_local_ip(),
                 "extra_backend_tag": "pd-1p1d-glm5.3-w8a8-dcp",
             }
