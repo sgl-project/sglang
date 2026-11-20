@@ -337,6 +337,8 @@ class TestConfigureGcLogging(CustomTestCase):
             callback("stop", {"generation": 2, "collected": 3, "uncollectable": 0})
         self.assertIn("LONG GARBAGE COLLECTION DETECTED", logs.output[0])
         self.assertIn("Collected: 3", logs.output[0])
+        self.assertIn("Thread: MainThread", logs.output[0])
+        self.assertNotIn("Counts:", logs.output[0])
 
 
 if __name__ == "__main__":
