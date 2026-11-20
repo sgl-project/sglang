@@ -10,7 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,19 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
         overrides["dcp_replicate_q_proj"] = True
     return overrides
+
+
+def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
+    unsupported = {
+        "speculative decoding": cfg.speculative_algorithm is not None,
+        "DP attention": attn_dp_enabled_of(cfg),
+        "--moe-a2a-backend": cfg.moe_a2a_backend != "none",
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "PD disaggregation": cfg.disaggregation_mode != "null",
+    }
+    names = [name for name, enabled in unsupported.items() if enabled]
+    if names:
+        raise ValueError(f"Hy4-Flash does not support {', '.join(names)}.")
 
 
 @_register_for(
@@ -91,6 +104,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "provide single-owner semantics for learnable attention sinks. "
                 f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
             )
+        if model_arch == "HYV4FlashForConditionalGeneration":
+            _reject_unsupported_hyv4_flash(cfg)
 
     overrides: Dict[str, Any] = {}
 

@@ -139,10 +139,8 @@ class _RowLayout:
 def _row_layout(forward_batch: ForwardBatch, metadata, num_rows: int) -> _RowLayout:
     """The row layout is the same for every layer of a forward pass; the model
     resets `forward_batch.hy4f_layouts` at the start of each pass."""
-    cache = getattr(forward_batch, "hy4f_layouts", None)
-    if cache is None:
-        return _RowLayout(forward_batch, metadata, num_rows)
-    key = (id(metadata), num_rows)
+    cache = forward_batch.hy4f_layouts
+    key = (id(metadata.attn_metadata), num_rows)
     layout = cache.get(key)
     if layout is None:
         layout = cache[key] = _RowLayout(forward_batch, metadata, num_rows)
@@ -269,6 +267,16 @@ class FlashIndexPool(nn.Module):
                 (slots, INDEX_DIM), dtype=torch.bfloat16, device=device
             )
         return self._raw_keys
+
+    def refresh_derived_weights(self):
+        if self._weights_t is not None:
+            self._weights_t[0].copy_(self.key_value_projection.weight.t())
+            self._weights_t[1].copy_(self.key_gating.weight.t())
+        if self._key_head_weight is not None:
+            torch.cat(
+                [self.token_key_projection.weight, self.head_weight_projection.weight],
+                out=self._key_head_weight,
+            )
 
     def _transposed_weights(self):
         if self._weights_t is None:
@@ -526,9 +534,9 @@ class FlashEngramHasher(EngramHasher):
         self._loaded = False
 
     def load_lookup(self, value: torch.Tensor) -> None:
-        lookup = value.detach().cpu().to(torch.int64).numpy()
         if self._loaded:
             return
+        lookup = value.detach().cpu().to(torch.int64).numpy()
         compressed_vocab = int(lookup.max()) + 1
         token_map = lookup.tolist()
         token_map.extend(range(len(token_map), self.vocab_size))
@@ -707,6 +715,15 @@ class FlashEngram(nn.Module):
             projection.weight.weight_loader = self._load_projection
             projection.bias.weight_loader = self._load_bias
         self._fused_kv = None
+
+    def refresh_derived_weights(self):
+        if self._fused_kv is not None:
+            weight, bias = self._fused_kv
+            torch.cat(
+                [p.weight for p in self.key_projs] + [self.value_proj.weight],
+                out=weight,
+            )
+            torch.cat([p.bias for p in self.key_projs] + [self.value_proj.bias], out=bias)
 
     def _load_projection(self, param, value):
         if value.shape != (self.hidden_size, self.total_width):
@@ -1260,6 +1277,9 @@ class HYV4FlashForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                 yield name, loaded_weight
 
         self.do_load_weights(mapped_weights())
+        for module in model.modules():
+            if isinstance(module, (FlashIndexPool, FlashEngram)):
+                module.refresh_derived_weights()
         if model.engram_hasher is not None and not model.engram_hasher._loaded:
             raise ValueError("Hy4-Flash checkpoint is missing the Engram lookup_table")
 
