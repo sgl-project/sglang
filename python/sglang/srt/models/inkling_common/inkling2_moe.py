@@ -397,6 +397,7 @@ class Inkling2Experts(nn.Module):
             kwargs=kwargs,
             min_tokens=envs.SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS.get(),
             max_tokens=max_tokens,
+            local_input=envs.SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT.get(),
             buffer=_mega_moe_buffer(
                 get_parallel().moe_ep_group.device_group,
                 self.num_global_experts,
@@ -408,27 +409,51 @@ class Inkling2Experts(nn.Module):
             ),
         )
 
-    def _forward_mega(self, x, weights, ids, combine):
+    def mega_token_slice(self, tokens):
+        """(start, count) of the tokens this rank dispatches to MegaMoE."""
+        per_rank = -(-tokens // self.ep_size)
+        start = min(self.ep_rank * per_rank, tokens)
+        return start, min(tokens - start, per_rank)
+
+    def mega_local_input_rows(self, tokens):
+        """mega_token_slice(tokens) if the MoE input is needed for those rows only."""
+        if (
+            self._marlin
+            or self._lacks_routed_kernels
+            or self.mega is None
+            or not self.mega.local_input
+            or not self.mega.min_tokens <= tokens <= self.mega.max_tokens * self.ep_size
+        ):
+            return None
+        start, count = self.mega_token_slice(tokens)
+        return (start, count) if count >= MEGA_MOE_LOCAL_INPUT_MIN_ROWS else None
+
+    def _forward_mega(self, x, weights, ids, combine, tokens=None):
         """Each EP rank feeds its slice of the (replicated) tokens to MegaMoE, which
         writes the combined rows of every slice to every rank. A forward larger than
-        the MegaMoE buffer runs in buffer-sized pieces."""
+        the MegaMoE buffer runs in buffer-sized pieces. With `tokens`, the inputs
+        hold only this rank's slice; such a forward always fits the buffer."""
         mega, deep_gemm = self.mega, self.mega.deep_gemm
-        tokens = x.shape[0]
+        sliced = tokens is not None
+        tokens = tokens if sliced else x.shape[0]
         cap = mega.max_tokens * self.ep_size
         if tokens > cap:
+            assert not sliced
             out = torch.empty_like(x)
             for s in range(0, tokens, cap):
                 rows = slice(s, s + cap)
                 out[rows] = self._forward_mega(x[rows], weights[rows], ids[rows], True)
             return out if combine else RoutedOutput(out, None, 0)
         per_rank = -(-tokens // self.ep_size)
-        start = min(self.ep_rank * per_rank, tokens)
-        local = min(tokens - start, per_rank)
+        start, local = self.mega_token_slice(tokens)
+        if not sliced:
+            rows = slice(start, start + local)
+            x, ids, weights = x[rows], ids[rows], weights[rows]
         buf = mega.buffer
         deep_gemm.mega_moe_pre_dispatch(
-            x[start : start + local],
-            ids[start : start + local].int(),
-            weights[start : start + local].float(),
+            x,
+            ids.int(),
+            weights.float(),
             buf.x,
             buf.x_sf,
             buf.topk_idx,
@@ -811,6 +836,8 @@ class Inkling2Experts(nn.Module):
 
 
 PREFILL_EXCHANGE_MAX_TOKENS = 32768
+# Above 256 rows the router and RMSNorm pick the same kernel at any row count.
+MEGA_MOE_LOCAL_INPUT_MIN_ROWS = 257
 PARTIAL_COMBINE_MIN_TOKENS = 16
 
 _MEGA_MOE_BUFFERS = {}
@@ -966,11 +993,22 @@ class Inkling2MoE(nn.Module):
             config, config.n_routed_experts, checkpoint_prefix, quant_config
         )
 
-    def forward(self, x, forward_batch=None, combine=True):
-        """combine=False may return a RoutedOutput instead of the combined output."""
+    def local_input_rows(self, tokens, combine):
+        """(start, count) of the MoE-input rows this rank needs, or None for all."""
+        if not combine or get_parallel().moe_tp_size > 1:
+            return None
+        return self.experts.mega_local_input_rows(tokens)
+
+    def forward(self, x, forward_batch=None, combine=True, total_tokens=None):
+        """combine=False may return a RoutedOutput instead of the combined output.
+        With total_tokens, x holds only local_input_rows(total_tokens, combine)."""
         if x.shape[0] == 0:
             return x
         weights, ids = self.gate(x)
+        if total_tokens is not None:
+            return self.experts._forward_mega(
+                x, weights, ids, combine, tokens=total_tokens
+            )
         if not combine and get_parallel().moe_tp_size == 1:
             return self.experts(x, weights, ids, combine=False)
         out = self.experts(x, weights, ids)
