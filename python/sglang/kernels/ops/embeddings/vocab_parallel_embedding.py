@@ -62,10 +62,12 @@ def vocab_parallel_embedding(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> torch.Tensor:
-    assert input_.is_cuda
+    """Look up local rows. Ascend callers supply contiguous ND tensors."""
+    is_npu = input_.device.type == "npu"
+    assert input_.is_cuda or is_npu
     assert input_.is_contiguous()
     assert input_.dtype in (torch.int32, torch.int64)
-    assert weight.is_cuda
+    assert weight.device == input_.device
     assert weight.ndim == 2
     assert weight.stride(1) == 1
 
@@ -74,11 +76,12 @@ def vocab_parallel_embedding(
         (*input_.shape, hidden_dim), dtype=weight.dtype, device=weight.device
     )
     n_tokens = input_.numel()
-    if n_tokens == 0:
+    if output.numel() == 0:
         return output
 
     block_h = min(1024, triton.next_power_of_2(hidden_dim))
     grid = (n_tokens, triton.cdiv(hidden_dim, block_h))
+    launch_options = {} if is_npu else {"num_warps": 8}
     _vocab_parallel_embedding_kernel[grid](
         input_,
         weight,
@@ -91,6 +94,6 @@ def vocab_parallel_embedding(
         added_vocab_start_index,
         added_vocab_end_index,
         BLOCK_H=block_h,
-        num_warps=8,
+        **launch_options,
     )
     return output

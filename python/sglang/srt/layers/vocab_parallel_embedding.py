@@ -462,18 +462,37 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
         """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
-        if _is_npu:
-            return False
         if self.tp_size == 1:
             return False
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             return False
-        if not input_.is_cuda or not input_.is_contiguous():
+        if not input_.is_contiguous():
             return False
         if input_.dtype not in (torch.int32, torch.int64):
             return False
+        if _is_npu:
+            if type(self.quant_method) is not UnquantizedEmbeddingMethod:
+                return False
+            import torch_npu
+
+            from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
+            weight = self.weight
+            # Triton's row offsets address plain storage. A tensor in a
+            # blocked Ascend format can also report contiguous logical strides.
+            return (
+                input_.device.type == "npu"
+                and weight.device == input_.device
+                and weight.dtype == torch.bfloat16
+                and weight.ndim == 2
+                and weight.is_contiguous()
+                and weight.stride(1) == 1
+                and torch_npu.get_npu_format(input_) == NPUACLFormat.ACL_FORMAT_ND
+                and torch_npu.get_npu_format(weight) == NPUACLFormat.ACL_FORMAT_ND
+            )
         return (
-            self.weight.is_cuda
+            input_.is_cuda
+            and self.weight.is_cuda
             and self.weight.ndim == 2
             and self.weight.stride(1) == 1
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
