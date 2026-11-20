@@ -40,7 +40,7 @@ class TestAiterWheelCache(CustomTestCase):
                     )
                 self.assertEqual(list((host / "aiter-wheels/.locks").iterdir()), [])
 
-    def make_wheel(self, directory, complete=True):
+    def _make_wheel(self, directory, complete=True):
         wheel = Path(directory) / "amd_aiter-1-py3-none-any.whl"
         with zipfile.ZipFile(wheel, "w") as archive:
             archive.writestr("aiter/__init__.py", "")
@@ -79,7 +79,7 @@ class TestAiterWheelCache(CustomTestCase):
 
     def test_atomic_publication_reuse_and_corruption_detection(self):
         with tempfile.TemporaryDirectory() as directory:
-            wheel = self.make_wheel(directory)
+            wheel = self._make_wheel(directory)
             root = Path(directory) / "cache"
             cache.publish(wheel=wheel, root=root, key="key")
             cache.publish(wheel=wheel, root=root, key="key")
@@ -95,7 +95,7 @@ class TestAiterWheelCache(CustomTestCase):
             root = Path(directory) / "cache"
             with self.assertRaises(ValueError):
                 cache.publish(
-                    wheel=self.make_wheel(directory, complete=False),
+                    wheel=self._make_wheel(directory, complete=False),
                     root=root,
                     key="key",
                 )
