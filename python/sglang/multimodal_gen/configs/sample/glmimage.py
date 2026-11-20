@@ -10,7 +10,7 @@ GLM_IMAGE_RESOLUTION_ALIGNMENT = 32
 
 @dataclass
 class GlmImageSamplingParams(SamplingParams):
-    negative_prompt = ""
+    negative_prompt: str = ""
 
     num_frames: int = 1
     guidance_scale: float = 1.5

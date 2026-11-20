@@ -2,7 +2,7 @@
 
 Tests GLM-5 with DSA attention backend using bench_one_batch on 8 GPUs.
 
-Registry: nightly-perf-8-gpu-mi35x-glm5 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-glm5 suite
 """
 
 import os
@@ -16,7 +16,7 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-perf-8-gpu-mi35x-glm5",
+    suite="nightly-perf-test-8-gpu-amd-mi35x-glm5",
     nightly=True,
     disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
