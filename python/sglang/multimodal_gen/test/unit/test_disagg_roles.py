@@ -92,7 +92,9 @@ class TestFlux3RoleLoading(CustomTestCase):
                     vae="vae.safetensors",
                 )
                 args = SimpleNamespace(
-                    pipeline_config=SimpleNamespace(flux3_package=package),
+                    pipeline_config=SimpleNamespace(
+                        flux3_package=package, vae_sp=False
+                    ),
                     quantization=None,
                     disagg_role=role,
                     should_start_component_on_cpu=lambda _: True,

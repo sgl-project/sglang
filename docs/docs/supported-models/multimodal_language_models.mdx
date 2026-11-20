@@ -438,7 +438,7 @@ python -m sglang.launch_server \
   --enable-multimodal \
   --dtype bfloat16 \
   --attention-backend triton \ # Use Triton attention backend
-  --disable-cuda-graph \ # Disable Cuda Graph
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \ # Disable Cuda Graph
   --chunked-prefill-size -1 # Disable Chunked Prefill
 ```
 

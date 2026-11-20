@@ -7,6 +7,7 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     resolving_view,
 )
+from sglang.srt.configs.quant_utils import LOADER_RESOLVED_QUANT_METHODS
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,8 @@ def _glm4_moe_overrides(server_args: Any, hf_config: Any) -> dict:
             and not server_args._quantization_explicitly_unset
             and quant_method is not None
         ):
-            overrides["quantization"] = quant_method
+            if quant_method not in LOADER_RESOLVED_QUANT_METHODS:
+                overrides["quantization"] = quant_method
             quantization = quant_method
         if (
             quantization in {"modelopt_fp4", None}

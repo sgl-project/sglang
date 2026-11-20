@@ -33,7 +33,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 def _scheduler_for_typed_config(load_snapshot_writer=None):
     return SimpleNamespace(
         server_args=SimpleNamespace(
-            enable_return_hidden_states=True, return_hidden_states_mode="last"
+            enable_return_hidden_states=True,
+            return_hidden_states_mode="last",
+            engine_info_bootstrap_url="http://127.0.0.1:6789",
         ),
         model_config=SimpleNamespace(
             context_len=2048,

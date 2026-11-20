@@ -262,6 +262,46 @@ class TestXPUGraphMetadata(CustomTestCase):
                 ):
                     PrefillCudaGraphRunner(_FakeModelRunner())
 
+    def test_full_xpu_graph_backend_retains_capture_inputs_and_cleans_up(self):
+        from contextlib import nullcontext
+
+        backend = FullXPUGraphBackend.__new__(FullXPUGraphBackend)
+        backend._graphs = {}
+        backend._outputs = {}
+        backend._capture_inputs = {}
+        backend._output_buffer = None
+        backend._pool = None
+        backend._reuse_output_buffer = False
+        backend._cuda_graph_runner = SimpleNamespace(enable_profile_cuda_graph=False)
+        backend._device_module = SimpleNamespace(
+            synchronize=lambda: None,
+            graph=lambda **kw: nullcontext(),
+        )
+        backend._tp_group = SimpleNamespace(barrier=lambda: None)
+        backend._capture_stream = None
+
+        reset_called = []
+        mock_graph = SimpleNamespace(reset=lambda: reset_called.append(True))
+
+        shape_key = 128
+        dummy_input = SimpleNamespace(global_num_tokens_gpu=torch.tensor([128]))
+
+        with patch("torch.xpu.XPUGraph", return_value=mock_graph):
+            backend.capture_one(
+                shape_key=shape_key,
+                forward_fn=lambda: torch.tensor([1.0]),
+                capture_inputs=dummy_input,
+            )
+
+        self.assertIs(backend._capture_inputs[shape_key], dummy_input)
+        self.assertIn(shape_key, backend._graphs)
+
+        backend.cleanup()
+        self.assertEqual(len(backend._capture_inputs), 0)
+        self.assertEqual(len(backend._graphs), 0)
+        self.assertEqual(len(backend._outputs), 0)
+        self.assertEqual(reset_called, [True])
+
 
 if __name__ == "__main__":
     unittest.main()

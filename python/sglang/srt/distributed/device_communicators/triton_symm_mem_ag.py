@@ -21,7 +21,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +354,8 @@ def create_state(
 
 def _launch_config(local_numel: int):
     assert local_numel % _NUMEL_PER_THREAD == 0
-    return _MIN_BLOCKS, _BLOCK_THREADS, _BLOCK_THREADS // 32, _NUMEL_PER_THREAD
+    blocks = min(_MAX_BLOCKS, max(_MIN_BLOCKS, local_numel >> 17))
+    return blocks, _BLOCK_THREADS, _BLOCK_THREADS // 32, _NUMEL_PER_THREAD
 
 
 def all_gather_inner(
@@ -467,7 +468,8 @@ class MultimemAllGatherer:
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
+        # gfx950 has no multicast; the build's symm-mem rendezvous hung MI355X start.
+        self._state = self._UNINIT if enabled and not is_gfx95_supported() else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (

@@ -308,7 +308,24 @@ impl Default for SamplingParams {
     }
 }
 
+/// 2**64 / golden ratio: a request's samples get seeds far from each other and from
+/// the small seeds clients pick by hand.
+const SAMPLE_SEED_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
+
 impl SamplingParams {
+    /// These params for sample `sample_index` of the request's `n` samples.
+    /// Sample 0 keeps the request's seed, so `n == 1` is unchanged; the others get
+    /// seeds of their own, or `n` samples sharing a seed and prompt would be `n`
+    /// copies. Python's `SamplingParams.for_sample` derives the same seeds.
+    pub fn for_sample(&self, sample_index: usize) -> Self {
+        let mut params = self.clone();
+        params.sampling_seed = self.sampling_seed.map(|seed| {
+            (seed as u64).wrapping_add((sample_index as u64).wrapping_mul(SAMPLE_SEED_STRIDE))
+                as i64
+        });
+        params
+    }
+
     /// `__post_init__` → `normalize` → `verify`, the order
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
     /// request-local 400. `skip_tokenizer_init` stands in for Python's
@@ -639,6 +656,15 @@ mod tests {
 
     fn get(v: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
         v.get(key).cloned()
+    }
+
+    /// Python's `TestForSample` checks the same seeds.
+    #[test]
+    fn seeds_for_samples_match_python() {
+        let sp = norm(r#"{"sampling_seed": 42}"#);
+        assert_eq!(sp.for_sample(0).sampling_seed, Some(42));
+        assert_eq!(sp.for_sample(1).sampling_seed, Some(-7046029254386353089));
+        assert_eq!(sp.for_sample(2).sampling_seed, Some(4354685564936845396));
     }
 
     #[test]

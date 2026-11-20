@@ -2,6 +2,11 @@
 
 import os
 
+# ModelConfig picks the Marlin method for these itself only when --quantization is
+# unset or names a Marlin method, so a model override must not write them into
+# server_args.quantization.
+LOADER_RESOLVED_QUANT_METHODS = frozenset({"awq", "gptq"})
+
 
 def has_hf_quant_config(model_path: str) -> bool:
     """Check if the model path contains hf_quant_config.json file.

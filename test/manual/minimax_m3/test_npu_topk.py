@@ -19,16 +19,16 @@ def _install_fake_modules():
         sys.modules.setdefault(name, types.ModuleType(name))
 
     root = types.ModuleType("sgl_kernel_npu")
-    norm = types.ModuleType("sgl_kernel_npu.norm")
-    l1_norm_mod = types.ModuleType("sgl_kernel_npu.norm.l1_norm")
+    operators = types.ModuleType("sgl_kernel_npu.operators")
+    norm = types.ModuleType("sgl_kernel_npu.operators.norm")
 
     def l1_norm(x):
         return x / x.sum(dim=-1, keepdim=True)
 
-    l1_norm_mod.l1_norm = l1_norm
+    norm.l1_norm = l1_norm
     sys.modules.setdefault("sgl_kernel_npu", root)
-    sys.modules.setdefault("sgl_kernel_npu.norm", norm)
-    sys.modules["sgl_kernel_npu.norm.l1_norm"] = l1_norm_mod
+    sys.modules.setdefault("sgl_kernel_npu.operators", operators)
+    sys.modules["sgl_kernel_npu.operators.norm"] = norm
 
     expert_distribution = types.ModuleType("sglang.srt.eplb.expert_distribution")
 

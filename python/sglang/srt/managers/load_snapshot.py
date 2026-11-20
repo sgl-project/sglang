@@ -184,6 +184,10 @@ class DisaggregationMetrics(msgspec.Struct, array_like=True):
     decode_retracted_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    # 1 while a full host staging pool holds back ready decode prealloc requests;
+    # host-staged transfers whose KV landed but wait for device admission.
+    decode_host_pool_blocked: int = 0
+    decode_host_staged_landed_reqs: int = 0
 
 
 class QueueMetrics(msgspec.Struct, array_like=True):

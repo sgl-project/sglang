@@ -23,7 +23,7 @@ class TestNpuViTBatching(DefaultServerBase):
     other_args = (
         "--attention-backend ascend --dtype bfloat16 --context-length 8192 "
         "--chunked-prefill-size 512 --max-running-requests 8 "
-        "--mem-fraction-static 0.7 --disable-cuda-graph"
+        "--mem-fraction-static 0.7 --disable-decode-cuda-graph --disable-prefill-cuda-graph"
     ).split()
     server_env = {"ASCEND_USE_FIA": "1", "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1"}
 

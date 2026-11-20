@@ -186,6 +186,62 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
     return out
 
 
+def rel_bias_partials(
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    seqused_k,
+    rel_bias,
+    softmax_scale,
+    out,
+    *,
+    window_size_left,
+    verify,
+):
+    """Split-KV partials of paged attention with the compact relative bias, for
+    combine_gate_sink; verify: several queries per sequence (MTP verify)."""
+    from sglang.srt.runtime_context import get_platform
+    from sglang.srt.utils import get_device_core_count
+
+    if not get_platform().is_sm90:
+        from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
+            paged_rel_bias_decode,
+        )
+
+        return paged_rel_bias_decode(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seqused_k,
+            rel_bias,
+            softmax_scale,
+            out,
+            window_size_left=window_size_left,
+            reduce=False,
+            num_sms=(
+                get_device_core_count(q.device.index)
+                if verify and window_size_left is None
+                else None
+            ),
+        )
+    from sglang.kernels.ops.attention.inkling2_decode_attention_sm90 import (
+        decode_partials,
+    )
+
+    return decode_partials(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seqused_k,
+        rel_bias,
+        softmax_scale,
+        window_size_left=window_size_left,
+    )
+
+
 @cache_once
 def _gate_sink_module(heads, head_dim, group, padded_group):
     args = f"{heads}, {head_dim}, {group}, {padded_group}"

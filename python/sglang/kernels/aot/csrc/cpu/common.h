@@ -10,6 +10,36 @@
 
 namespace {
 
+enum class CpuIsa { AMX, AVX10_2 };
+
+#if defined(CPU_CAPABILITY_AVX10_2)
+// The build guard checks toolchain support; the running CPU must also support AVX10.2.
+inline bool has_avx10_2() {
+  static const bool available = __builtin_cpu_supports("avx10.2");
+  return available;
+}
+#endif
+
+// Dispatch outside hot loops so the callback can use isa as a template argument.
+#if defined(CPU_CAPABILITY_AVX10_2)
+#define CPU_DISPATCH_ISA(...)                 \
+  [&]() -> decltype(auto) {                   \
+    if (::has_avx10_2()) {                    \
+      constexpr auto isa = ::CpuIsa::AVX10_2; \
+      return __VA_ARGS__();                   \
+    } else {                                  \
+      constexpr auto isa = ::CpuIsa::AMX;     \
+      return __VA_ARGS__();                   \
+    }                                         \
+  }()
+#else
+#define CPU_DISPATCH_ISA(...)           \
+  [&]() -> decltype(auto) {             \
+    constexpr auto isa = ::CpuIsa::AMX; \
+    return __VA_ARGS__();               \
+  }()
+#endif
+
 // dispatch bool
 #define AT_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...) \
   [&] {                                          \

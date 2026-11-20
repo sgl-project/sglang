@@ -98,7 +98,7 @@ async fn completions(
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if let Some(message) = model_error(&model, &state.server_args.served_model_name) {
+    if let Some(message) = model_error(&model, &state.core.served_model_name().await) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
 
@@ -210,7 +210,7 @@ async fn completions(
                 rid: rid.clone(),
                 text: text.clone(),
                 input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
+                sampling_params: sampling.for_sample(sample_index),
                 stream,
                 return_logprob: request.logprobs.is_some(),
                 logprob_start_len: if echo && request.logprobs.is_some() {

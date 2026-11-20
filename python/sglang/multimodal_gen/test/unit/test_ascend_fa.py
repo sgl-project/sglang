@@ -479,7 +479,7 @@ def legacy_native(monkeypatch, adapter):
     config.clear()
     monkeypatch.setattr(ascend_fa.current_platform, "is_npu", lambda: True)
     monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(get_soc_version=lambda: 260), raising=False
+        "sglang.srt.hardware_backend.npu.utils.is_ascend_950", lambda: True
     )
     monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "true")
     monkeypatch.setenv("SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", "4")

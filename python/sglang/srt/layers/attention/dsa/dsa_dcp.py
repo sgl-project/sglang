@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.runtime_context import get_parallel
 
 TRTLLM_MAX_BATCH_ROWS = 65535
@@ -47,6 +48,7 @@ def localize_dcp_page_table(
     dcp_size: int,
     dcp_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    assert not dsa_shards_index_k(), "the sharded indexer already returns local slots"
     reuse = (
         topk_indices is not None
         and cache.metadata is metadata

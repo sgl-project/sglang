@@ -126,6 +126,8 @@ const SECTIONS: &[Section] = &[
             ("decode_retracted_queue_reqs", Some(Zero::Int)),
             ("kv_transfer_speed_gb_s", Some(Zero::Float)),
             ("kv_transfer_latency_ms", Some(Zero::Float)),
+            ("decode_host_pool_blocked", Some(Zero::Int)),
+            ("decode_host_staged_landed_reqs", Some(Zero::Int)),
         ],
     },
     Section {

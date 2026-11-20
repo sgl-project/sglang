@@ -37,6 +37,7 @@ from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_exec,
     get_lora,
     get_memory,
     get_mm,
@@ -49,7 +50,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
@@ -108,6 +109,12 @@ def _build_server_args(
         "max_prefill_tokens": get_schedule().max_prefill_tokens,
         "enable_dp_attention": get_parallel().attn_dp_size > 1,
         "speculative_algorithm": get_spec().speculative_algorithm,
+        "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
+        "gc_threshold": get_device().gc_threshold,
+        "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
+        "elastic_ep_backend": get_exec().moe.elastic_ep_backend,
+        "enable_streaming_session": get_serving().enable_streaming_session,
+        "engine_info_bootstrap_url": scheduler.server_args.engine_info_bootstrap_url,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,

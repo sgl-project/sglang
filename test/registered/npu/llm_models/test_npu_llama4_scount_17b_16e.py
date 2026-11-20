@@ -31,7 +31,8 @@ class TestLlama4(GSM8KAscendMixin, CustomTestCase):
         "8192",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--disable-radix-cache",
     ]
 

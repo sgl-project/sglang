@@ -79,7 +79,11 @@ fn receive_body(
     let snapshot = log.snapshot_body(body, None, headers);
     let decoded: api::GenerateRequest = serde_json::from_value(body.clone()).unwrap();
     let (requests, batch) = into_requests(decoded, &GenerationPolicy::default()).unwrap();
-    log.receive(&requests, ReceivedAs::Body(snapshot), batch, true)
+    let received = ReceivedAs::Body {
+        snapshot,
+        started_at: None,
+    };
+    log.receive(&requests, received, batch, true)
 }
 
 /// Every fixture case renders exactly Python's `Receive` and `Finish` lines at
@@ -302,6 +306,7 @@ fn incremental_stream_logs_last_delta() {
         server_added_custom_params: Vec::new(),
         default_priority: None,
         weight_version: Some(Arc::from("default")),
+        dp_rank: None,
         incremental_streaming_output: true,
     });
     let body = serde_json::json!({"rid": "r-inc", "text": "hi", "stream": true});
@@ -423,16 +428,13 @@ fn finish_latency_counts_the_wait_before_generate() {
         false,
     );
     let body = serde_json::json!({"rid": "a", "text": "x"});
-    let snapshot = log
-        .snapshot_body(&body, None, &http::HeaderMap::new())
-        .map(|snapshot| {
-            snapshot.started_at(Some(
-                std::time::Instant::now() - std::time::Duration::from_secs(2),
-            ))
-        });
+    let received = ReceivedAs::Body {
+        snapshot: log.snapshot_body(&body, None, &http::HeaderMap::new()),
+        started_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(2)),
+    };
     let decoded: api::GenerateRequest = serde_json::from_value(body).unwrap();
     let (requests, batch) = into_requests(decoded, &GenerationPolicy::default()).unwrap();
-    let mut records = log.receive(&requests, ReceivedAs::Body(snapshot), batch, true);
+    let mut records = log.receive(&requests, received, batch, true);
     log.logged_lines();
     records[0].observe(&ResponseItem::Done(chunk(
         &Rid::from_client("a"),

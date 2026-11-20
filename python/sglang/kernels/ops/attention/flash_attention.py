@@ -50,6 +50,7 @@ def flash_attn_with_kvcache(
     out=None,
     max_seqlen_k: Optional[int] = None,
     mask_mod=None,
+    rel_bias_presheared=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -217,6 +218,7 @@ def flash_attn_with_kvcache(
             sfk=sfk,
             sfv=sfv,
             rel_bias=rel_bias,
+            rel_bias_presheared=rel_bias_presheared,
             rel_bias_prep_cache=rel_bias_prep_cache,
             return_softmax_lse=return_softmax_lse,
             out=out,

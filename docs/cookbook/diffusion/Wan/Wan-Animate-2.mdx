@@ -131,8 +131,8 @@ the canvas size. At the default `640`×`800` (512,000 pixels) a
 9:16 reference gives `528`×`944`, a 1:1 reference gives `704`×`704`, and only a 4:5
 reference gives exactly `640`×`800`. To obtain a specific output size, request a
 budget with the same aspect ratio as the reference image (for a 9:16 image,
-`576`×`1024` maps onto itself). This differs from the OpenAI Videos API and from the
-other SGLang diffusion pipelines, where `size` is the literal output resolution.
+`576`×`1024` maps onto itself). Changing the aspect ratio of the requested
+`size` without changing its pixel area does not change this canvas.
 
 **Audio.** The output MP4 carries the reference video's audio track, as the
 official pipeline does. Set `enable_audio=false` on a request (a `--config` field

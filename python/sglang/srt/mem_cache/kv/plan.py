@@ -619,6 +619,7 @@ def _spec_for(
             v_head_dim=geometry.v_head_dim,
             store_dtype=_store_dtype_for(geometry.kv_cache_dtype),
             kv_cache_dtype=geometry.kv_cache_dtype,
+            is_mxfp8=geometry.is_mxfp8,
             grow_direction=grow_direction,
             draft_region=draft_region,
         )
