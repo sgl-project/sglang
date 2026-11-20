@@ -25,6 +25,7 @@ from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
+    from sgl_kernel_npu.operators.indexer import mlp_lightning_indexer
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -239,7 +240,7 @@ class DSANPUIndexerMixin:
         q_ends = actual_seq_lengths_q.to(device=query.device, dtype=torch.int64)
         kv_lengths = actual_seq_lengths_kv.to(device=query.device, dtype=torch.int64)
         zero = q_ends.new_zeros(1)
-        indices, _ = torch.ops.npu.mlp_lightning_indexer(
+        indices, _ = mlp_lightning_indexer(
             query,
             key,
             weights.float(),
@@ -479,7 +480,30 @@ class DSANPUIndexerMixin:
                 pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
-        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
+        if getattr(pool, "layer_shard_enabled", False):
+            # The split pool caches the CP-gathered full-sequence index rows
+            # on non-owner ranks, skipping the get-time owner broadcast.
+            # Only safe when this write covers the whole read range (no
+            # cached prefix), same guard as the main-KV store path.
+            # cp_gathered_chunk covers the prefix-chunk patch-write: the
+            # gather above ran (full-chunk rows) but a prefix remains, so
+            # the write only completes a one-layer-ahead prefix broadcast.
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            no_prefix = prefix_lens is not None and all(n == 0 for n in prefix_lens)
+            gather_ran = (
+                is_prefill
+                and self.dsa_enable_prefill_cp
+                and forward_batch.attn_cp_metadata is not None
+            )
+            pool.set_index_k_buffer(
+                layer_id,
+                indexer_cache_loc,
+                k,
+                cp_gathered_full=(gather_ran and no_prefix),
+                cp_gathered_chunk=(gather_ran and not no_prefix),
+            )
+        else:
+            pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp

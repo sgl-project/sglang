@@ -753,6 +753,13 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
         if variant is BatchVariant.ORDINARY and stage.ordinary_tp_group is not None
         else stage.tp_group
     )
+    if (
+        tp_group is SumGroup.TP
+        and sp
+        and get_parallel().attn_tp_size == get_parallel().tp_size
+    ):
+        # The compute gathers and reduce-scatters over the one TP group.
+        tp_group = SumGroup.ATTN_TP
     if tp_group is SumGroup.TP:
         parallel = get_parallel()
         if parallel.attn_dp_size != 1 or sp or scattered:
