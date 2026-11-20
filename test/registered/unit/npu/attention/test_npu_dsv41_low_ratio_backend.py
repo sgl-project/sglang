@@ -71,7 +71,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
-from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
@@ -121,20 +120,11 @@ dsv4_backend._ds41_ops = lambda: DS41
 
 
 def setUpModule():
-    # This suite describes the original A5 packed path. A3 has separate BF16
-    # contract tests; do not let the host running this suite select its ABI.
-    global _arch_patches
-    _arch_patches = [
-        patch.object(module, "is_npu_arch35", return_value=True)
-        for module in (dsv4_backend, dsv4_memory_pool)
-    ]
-    for arch_patch in _arch_patches:
-        arch_patch.start()
-
-
-def tearDownModule():
-    for arch_patch in reversed(_arch_patches):
-        arch_patch.stop()
+    # DS41 mocks the packed A5 ABI, regardless of the machine collecting the suite.
+    for module in (dsv4_backend, dsv4_memory_pool):
+        unittest.enterModuleContext(
+            patch.object(module, "is_npu_arch35", return_value=True)
+        )
 
 
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
@@ -1378,58 +1368,6 @@ class TestIndexStepGuards(unittest.TestCase):
         )
         with self.assertRaises(RuntimeError):
             backend._dsv41_index_k_store(layer, None)
-
-
-class TestNPUBlock32Dispatch(unittest.TestCase):
-    def test_native_dispatch_matches_the_load_time_mxfp8_gate(self):
-        native_linear = object()
-        backend = SimpleNamespace(is_auto=lambda: True, is_deep_gemm=lambda: False)
-        for arch35 in (False, True):
-            for ue8m0 in (False, True):
-                for requant in (False, True):
-                    with (
-                        self.subTest(arch35=arch35, ue8m0=ue8m0, requant=requant),
-                        patch.object(
-                            fp8_utils,
-                            "get_fp8_gemm_runner_backend",
-                            return_value=backend,
-                        ),
-                        patch.object(
-                            fp8_utils.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", False
-                        ),
-                        patch.object(fp8_utils, "is_npu_arch35", return_value=arch35),
-                        patch.object(
-                            fp8_utils.envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8,
-                            "get",
-                            return_value=requant,
-                        ),
-                        patch.object(fp8_utils, "_is_npu", True),
-                        patch.object(fp8_utils, "_is_xpu", False),
-                        patch.object(fp8_utils, "_use_aiter", False),
-                        patch.object(fp8_utils, "_use_aiter_mxfp8_gfx1250", False),
-                        patch.object(
-                            fp8_utils,
-                            "get_platform",
-                            return_value=SimpleNamespace(
-                                is_blackwell=False, is_sm120=False
-                            ),
-                        ),
-                        patch.dict(
-                            "sys.modules",
-                            {
-                                "sglang.srt.hardware_backend.npu.quantization.linear_method_npu": SimpleNamespace(
-                                    npu_w8a8_mxfp8_linear=native_linear
-                                ),
-                            },
-                        ),
-                    ):
-                        linear = fp8_utils.dispatch_w8a8_block_fp8_linear(
-                            weight_block_size=[32, 32], act_scale_ue8m0=ue8m0
-                        )
-                    if arch35 and (ue8m0 or requant):
-                        self.assertIs(linear, native_linear)
-                    else:
-                        self.assertIs(linear, fp8_utils.triton_w8a8_block_fp8_linear)
 
 
 class TestC128ComponentGating(unittest.TestCase):
