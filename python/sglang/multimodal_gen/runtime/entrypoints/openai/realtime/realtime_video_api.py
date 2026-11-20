@@ -489,6 +489,14 @@ async def generate(websocket: WebSocket):
                 code=1000,
                 reason="generation complete",
             )
+        elif generate_task.done():
+            # the loop stopped on an error it has already reported; close with a
+            # code so the client does not see an abnormal disconnect (1006)
+            await _close_realtime_websocket(
+                websocket,
+                code=1011,
+                reason="generation failed",
+            )
 
     except WebSocketDisconnect:
         logger.info("client disconnected, session_id=%s", session.id)
