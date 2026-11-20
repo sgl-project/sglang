@@ -11,7 +11,8 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host import base, rocm_budget
+from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context, get_memory
@@ -326,6 +327,56 @@ class TestHiCacheAutoSize(CustomTestCase):
             else:
                 self.assertEqual(names, ["free", "barrier"])
                 calls.barrier.assert_called_once_with(group="cpu")
+
+    def _explicit_size_scope(self, *, mode, available, hugetlb, gfx950, mappings):
+        """Snapshot an explicit-size scope on a mocked host; return its budget
+        and the preflight (allocation, available) for the given mappings."""
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace(device="cuda")
+            )
+        )
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(sizing, "ranks_per_host", return_value=1),
+            patch.object(base, "available_host_memory_bytes", return_value=available),
+            patch.object(base, "hugepage_size_requested", return_value=2 << 20),
+            patch.object(base, "hugepage_mode", return_value=mode),
+            patch.object(base, "device_uses_allocator", return_value=True),
+            patch.object(base, "is_gfx95_supported", return_value=gfx950),
+            patch.object(rocm_budget, "is_gfx95_supported", return_value=gfx950),
+            patch.object(
+                rocm_budget,
+                "rocm_pinnable_share_bytes",
+                return_value=(20 << 30) if gfx950 else None,
+            ),
+            patch.object(
+                HostTensorAllocator,
+                "free_hugetlb_bytes",
+                classmethod(lambda cls: hugetlb),
+            ),
+            patch.object(sizing, "get_allocator_type", return_value="default"),
+            sizing.auto_size_hicache(params, None, enabled=True),
+        ):
+            scope = base._host_memory_budget.get()
+            result = base.host_memory_preflight(mappings, HostTensorAllocator, "cuda")
+        return scope, result
+
+    def test_explicit_size_admits_a_hugepage_pool_when_plain_ram_is_below_the_reserve(
+        self,
+    ):
+        scope, (allocation, available) = self._explicit_size_scope(
+            mode=base.HUGEPAGE_MODE_REQUIRED,
+            available=9 << 30,
+            hugetlb=8 << 30,
+            gfx950=False,
+            mappings=[4 << 30],
+        )
+        self.assertLessEqual(allocation, available)
+        self.assertEqual(scope, (0, 8 << 30))
 
 
 if __name__ == "__main__":

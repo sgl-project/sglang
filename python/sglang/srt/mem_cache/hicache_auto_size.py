@@ -122,14 +122,15 @@ def _explicit_size_budget(params: CacheInitParams):
     # One snapshot per rank: sampling per pool charges a late rank for its peers' pools.
     # On gfx950 the snapshot is already clamped to the rank's TTM pinnable share.
     allocator, kvcache_device = _host_allocator_and_device(params)
-    budget = host_memory_budget_plain_hugetlb(
+    plain, hugetlb = host_memory_budget_plain_hugetlb(
         allocator=allocator, device=kvcache_device
     )
     if ranks_per_host() > 1:
         # Peers on this host must all sample before any pins a pool;
         # ranks_per_host() is uniform, so every rank enters or skips the barrier.
         torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
-    with host_memory_budget_scope(budget):
+    # A reserve above free RAM must not reject mappings that charge only the hugetlb pool.
+    with host_memory_budget_scope((max(plain, 0), hugetlb)):
         yield
 
 
