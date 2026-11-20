@@ -67,15 +67,31 @@ def _async_d2h_top_logprobs(
 def allocate_distinct_stream(device_module, avoid_streams):
     """Draw a stream that aliases none of ``avoid_streams``.
 
-    CUDA/HIP streams come from a fixed round-robin pool, so a fresh ``Stream()``
-    may hand back one that is already in use.
+    CUDA/HIP and XPU streams come from a fixed round-robin pool, so a fresh
+    ``Stream()`` may hand back one that is already in use. ``stream_id`` names
+    the pool slot on every backend (XPU streams have no ``cuda_stream``).
     """
-    avoid = {stream.cuda_stream for stream in avoid_streams}
+    avoid = {stream.stream_id for stream in avoid_streams}
     for _ in range(65):
         stream = device_module.Stream(priority=0)
-        if stream.cuda_stream not in avoid:
+        if stream.stream_id not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def create_pp_comm_stream(*, device: str, device_module, avoid_streams):
+    """A dedicated PP communication stream, or None where overlap is unsupported."""
+    if not str(device).startswith(("cuda", "xpu")):
+        logger.warning(
+            f"SGLANG_PP_COMM_OVERLAP is ignored on {device}: PP communication "
+            "overlap runs only on CUDA, ROCm and Intel XPU."
+        )
+        return None
+    stream = allocate_distinct_stream(device_module, avoid_streams)
+    logger.info(
+        f"PP tensor communication overlap enabled on a dedicated {device} stream"
+    )
+    return stream
 
 
 def is_war_barrier_enabled() -> bool:

@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
-    allocate_distinct_stream,
+    create_pp_comm_stream,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
@@ -691,19 +691,18 @@ class SchedulerPPMixin:
         # scheduler stream. Otherwise they stay on the current stream.
         self.pp_comm_stream = None
         self.pp_comm_stream_ctx = nullcontext()
-        if (
-            envs.SGLANG_PP_COMM_OVERLAP.get()
-            and torch.cuda.is_available()
-            and str(self.device).startswith("cuda")
-        ):
-            self.pp_comm_stream = allocate_distinct_stream(
-                self.device_module,
-                (self.schedule_stream, self.forward_stream, self.copy_stream),
+        if envs.SGLANG_PP_COMM_OVERLAP.get():
+            self.pp_comm_stream = create_pp_comm_stream(
+                device=self.device,
+                device_module=self.device_module,
+                avoid_streams=(
+                    self.schedule_stream,
+                    self.forward_stream,
+                    self.copy_stream,
+                ),
             )
+        if self.pp_comm_stream is not None:
             self.pp_comm_stream_ctx = self.device_module.stream(self.pp_comm_stream)
-            logger.info(
-                "PP tensor communication overlap enabled on a dedicated CUDA stream"
-            )
 
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]

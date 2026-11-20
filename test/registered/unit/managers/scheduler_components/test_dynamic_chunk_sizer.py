@@ -1,6 +1,7 @@
 """Synthetic chunk profiling must stay within request bounds and release on failure."""
 
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -121,6 +122,125 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
         self._profile(
             context=8192, mapping=8196, prefill=16384, base=512, fail_forward=True
         )
+
+
+class TestDynamicChunkSizerCacheRelease(CustomTestCase):
+    """PP0 hands the probes' cached memory back before serving, whether or not they fit.
+
+    Left cached, it starves allocations made outside the framework allocator (oneCCL,
+    Level Zero) and the first request hangs or fails; after a failed probe the release
+    frees nothing while the handler's traceback still holds the probe's activations.
+    """
+
+    def _profile_and_fit(self, *, probe_fails):
+        probe_refs = []
+        probe_freed_at_release = []
+
+        def probe():
+            activations = torch.empty(8)
+            probe_refs.append(weakref.ref(activations))
+            if probe_fails:
+                raise torch.OutOfMemoryError("probe ran out of memory")
+            lengths = list(range(4096, 1024, -256))
+            return lengths, [1e-6 * n * n + 1e-2 * n + 5 for n in lengths]
+
+        def empty_cache():
+            probe_freed_at_release.append(probe_refs[0]() is None)
+
+        parallel = SimpleNamespace(
+            pp_rank=0,
+            pp_group=SimpleNamespace(is_first_rank=True),
+            world_group=SimpleNamespace(rank=0, cpu_group=None),
+        )
+        with (
+            patch.object(module, "get_parallel", return_value=parallel),
+            patch.object(
+                module, "broadcast_pyobj", side_effect=lambda data, *_a, **_k: data
+            ),
+            patch.object(
+                module.current_platform, "empty_cache", side_effect=empty_cache
+            ),
+        ):
+            sizer = module.DynamicChunkSizer(
+                model_runner=Mock(),
+                model_config=Mock(),
+                tree_cache=Mock(),
+                req_to_token_pool=Mock(),
+                token_to_kv_pool_allocator=Mock(),
+                spec_algorithm=Mock(),
+                chunked_prefill_size=2048,
+                max_prefill_tokens=16384,
+                page_size=1,
+                device="cpu",
+            )
+            with patch.object(sizer, "_profile_prefill_latency", side_effect=probe):
+                ready = sizer.profile_and_fit()
+        return ready, probe_freed_at_release
+
+    def test_probe_memory_is_released_after_profiling(self):
+        for probe_fails in (False, True):
+            with self.subTest(probe_fails=probe_fails):
+                ready, freed = self._profile_and_fit(probe_fails=probe_fails)
+                self.assertEqual(ready, not probe_fails)
+                self.assertEqual(freed, [True])
+
+
+class TestChunkSizePredictorSmoothing(CustomTestCase):
+    """The smoothing factor and floor semantics the PP long-context guide promises."""
+
+    BASE = 12288
+    PAGE = 128
+    # Coefficients fitted on Llama-3.1-8B PP4 on Intel Arc Pro B60 (ms, tokens).
+    COEFFS = (1.18e-06, 3.85e-02, 22.5)
+    HISTORY = (12288, 32768, 65536, 98304, 131072, 262144, 524288)
+
+    def _predictor(self):
+        a, b, c = self.COEFFS
+        # Same probe shape as the profiler: 128 descending lengths up to 1.25x base.
+        top = int(self.BASE * 1.25)
+        lengths = [top - i * (top // 128) for i in range(128)]
+        predictor = module.ChunkSizePredictor()
+        predictor.fit(lengths, [a * n * n + b * n + c for n in lengths])
+        predictor.set_target_latency(self.BASE)
+        predictor.is_ready = True
+        return predictor
+
+    def _schedule(self, smooth_factor):
+        predictor = self._predictor()
+        with module.envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.override(smooth_factor):
+            return [
+                predictor.predict_next_chunk_size(
+                    history_len=history,
+                    base_chunk_size=self.BASE,
+                    page_size=self.PAGE,
+                    context_len=1 << 20,
+                    max_chunk_size=16384,
+                )
+                for history in self.HISTORY
+            ]
+
+    def test_zero_smoothing_keeps_the_fixed_chunk_size(self):
+        self.assertEqual(self._schedule(0.0), [self.BASE] * len(self.HISTORY))
+
+    def test_chunks_shrink_with_history_down_to_a_quarter_of_the_base(self):
+        for smooth_factor in (0.65, 0.75, 1.0):
+            with self.subTest(smooth_factor=smooth_factor):
+                sizes = self._schedule(smooth_factor)
+                self.assertEqual(sizes, sorted(sizes, reverse=True))
+                self.assertLess(sizes[-1], self.BASE)
+                for size in sizes:
+                    self.assertEqual(size % self.PAGE, 0)
+                    self.assertGreaterEqual(size, self.BASE // 4)
+        # Strict smoothing reaches the floor well inside a 512K prefix.
+        self.assertEqual(self._schedule(1.0)[-1], self.BASE // 4)
+
+    def test_larger_smoothing_factor_shrinks_chunks_faster(self):
+        gentle, default, strict = (self._schedule(s) for s in (0.65, 0.75, 1.0))
+        for g, d, s in zip(gentle, default, strict):
+            self.assertGreaterEqual(g, d)
+            self.assertGreaterEqual(d, s)
+        self.assertGreater(sum(gentle), sum(default))
+        self.assertGreater(sum(default), sum(strict))
 
 
 if __name__ == "__main__":

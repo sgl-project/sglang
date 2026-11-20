@@ -429,7 +429,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
-from sglang.srt.utils.device import is_confidential_compute, is_npu
+from sglang.srt.utils.device import is_confidential_compute, is_npu, is_xpu
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -500,6 +500,7 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 class Scheduler(
@@ -2147,16 +2148,15 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (
+        elif (is_cuda() or _is_hip or _is_xpu) and (
             self.enable_overlap or get_parallel().pp_size > 1
         ):
-            # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
-            # stream aliases forward_stream, which would eliminate scheduler
-            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
-            # other accelerators (e.g. NPU/XPU) skip the alias check.
+            # CUDA/HIP and XPU streams come from a fixed round-robin pool. Redraw if
+            # this stream aliases forward_stream, which would eliminate scheduler
+            # overlap. NPU streams skip the alias check.
             if self._gpu_work_on_forward_stream():
                 self.schedule_stream = self.forward_stream
-            elif self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
+            elif self.schedule_stream.stream_id == self.forward_stream.stream_id:
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
