@@ -254,6 +254,151 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
     )
 
 
+@pytest.mark.parametrize("deterministic", (False, True))
+@pytest.mark.parametrize("sliding_layers_only", (False, True))
+def test_gemma4_image_mask_layer_scope(deterministic, sliding_layers_only):
+    """Full layers stay causal; image bidirectionality survives interleaved layers.
+
+    DiffusionGemma explicitly opts out of the sliding-only restriction.
+    Exercise the real model mask producer and both backend dispatch paths.
+    """
+    from unittest.mock import patch
+
+    from sglang.srt.models import gemma4_mm
+
+    recorded = []
+
+    def record_two_stage(*args, **kwargs):
+        recorded.append((args[9], args[11]))
+
+    def record_unified(*args, **kwargs):
+        recorded.append((kwargs["custom_mask"], kwargs["mask_indptr"]))
+
+    batch_size = 2
+    backend = TritonAttnBackend.__new__(TritonAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.dcp_size = 1
+    backend.enable_deterministic = deterministic
+    backend.use_dense_fp8_chunked_prefill = False
+    backend.allow_bidirectional_attention_in_extend = False
+    backend.page_size = 1
+    backend.use_sliding_window_kv_pool = False
+    backend.window_write_sub_pools = ()
+    layer_kv = SimpleNamespace(
+        key=lambda: torch.zeros((1, 1, 4)), value=lambda: torch.zeros((1, 1, 4))
+    )
+    # The window layer's KV lives in the full sub-pool; its one rail reads it.
+    backend.token_to_kv_pool = SimpleNamespace(
+        layer_router=SimpleNamespace(
+            read=lambda _layer_id: layer_kv,
+            route=lambda _layer_id: SimpleNamespace(sub_pool="full"),
+        )
+    )
+    backend.forward_metadata = ForwardMetadata(
+        attn_logits=None,
+        attn_lse=None,
+        max_extend_len=7,
+        num_kv_splits=None,
+        kv_indptr=torch.zeros(batch_size + 1, dtype=torch.int32),
+        kv_indices=torch.zeros(1, dtype=torch.int64),
+        qo_indptr=torch.tensor([0, 7, 14], dtype=torch.int32),
+        custom_mask=None,
+        mask_indptr=None,
+        windows={
+            "full": WindowRail(
+                kv_indptr=torch.zeros(3, dtype=torch.int32),
+                kv_indices=torch.zeros(20, dtype=torch.int64),
+            )
+        },
+    )
+    backend.dllm_attention = None
+    backend.draft_bf16_dot = False
+    backend.use_verify_gfx115 = False
+    backend.verify_mla_draft_fwd = None
+    backend.use_verify_shared_kv = False
+    backend.use_verify_splitkv = False
+    backend.extend_attention_fwd = record_two_stage
+    backend.extend_attention_fwd_unified = record_unified
+    backend.build_unified_kv_indices = lambda *args: (
+        torch.tensor([0, 7, 14], dtype=torch.int32),
+        torch.arange(14),
+        torch.zeros(2, dtype=torch.int32),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        qk_head_dim=4,
+        v_head_dim=4,
+        tp_q_head_num=1,
+        k_scale=None,
+        v_scale=None,
+        logit_capping_method="tanh",
+        logit_cap=0.0,
+        is_cross_attention=False,
+        attn_type=AttentionType.DECODER,
+        sliding_window_size=16,
+        scaling=0.5,
+        xai_temperature_len=None,
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=batch_size,
+        forward_mode=ForwardMode.EXTEND,
+        mha_one_shot=False,
+        out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
+        extend_seq_lens_cpu=[7, 7],
+        extend_seq_lens=torch.tensor([7, 7], dtype=torch.int32),
+        extend_start_loc=torch.tensor([0, 7], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
+        seq_lens=torch.tensor([32, 64], dtype=torch.int64),
+        mm_inputs=[
+            SimpleNamespace(
+                mm_items=[SimpleNamespace(is_image=lambda: True, offsets=[(0, 6)])]
+            )
+        ]
+        * 2,
+    )
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention="vision")
+        )
+    )
+    with patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
+        gemma4_mm.Gemma4ForConditionalGeneration.prepare_attn_masks(
+            model,
+            forward_batch,
+            torch.arange(14),
+            torch.bool,
+            sliding_layers_only=sliding_layers_only,
+        )
+    image_mask = backend.forward_metadata.custom_mask
+    image_indptr = backend.forward_metadata.mask_indptr
+    q = torch.zeros((14, 4))
+    for window in (16, None, -1, 16):
+        layer.sliding_window_size = window
+        backend.forward_extend(q, q, q, layer, forward_batch, save_kv_cache=False)
+        mask, indptr = recorded[-1]
+        expected_image = not sliding_layers_only or window == 16
+        if expected_image:
+            torch.testing.assert_close(
+                mask.view(2, 7, 7), torch.ones(2, 7, 7, dtype=torch.bool)
+            )
+            assert indptr is image_indptr
+        else:
+            assert mask is None
+            assert indptr is None
+        # Applying the kernel's effective mask must keep a future image token
+        # visible only on the layers allowed by the model's attention contract.
+        allowed = (
+            mask.view(2, 7, 7)[0]
+            if mask is not None
+            else torch.ones(7, 7, dtype=torch.bool).tril()
+        )
+        values = torch.arange(7, dtype=torch.float32)
+        first_row = values[allowed[0]].mean().item()
+        assert first_row == (3.0 if expected_image else 0.0)
+        assert backend.forward_metadata.custom_mask is image_mask
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 

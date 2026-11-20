@@ -470,6 +470,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_mask_indptr
             )
             prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask_sliding_layers_only = (
+                sliding_layers_only
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
