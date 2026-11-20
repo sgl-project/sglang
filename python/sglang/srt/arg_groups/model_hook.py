@@ -257,7 +257,10 @@ def handle_model_specific_adjustments(server_args: Any):
         if model_arch == "KimiK31ForConditionalGeneration" and get_platform().is_gfx95:
             from sglang.srt.models.kimi_k3_amd import env_defaults
 
-            env_defaults.apply_kimi_k31_rocm_env_defaults()
+            env_defaults.apply_kimi_k31_rocm_env_defaults(
+                verifies_drafts=cfg.speculative_algorithm is not None
+                and cfg.disaggregation_mode != "prefill"
+            )
 
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (

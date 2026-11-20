@@ -1099,6 +1099,9 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
+    # CSV of exact-shape decode GEMM kernels for gfx950 under AITER (empty: none);
+    # Kimi-K3 loads its kernels at startup, about 2.7 GiB a rank outside torch
+    SGLANG_ROCM_DECODE_GEMM_TABLE = EnvStr("")
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)

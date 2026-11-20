@@ -4302,6 +4302,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
 
+        if _is_gfx95:
+            from sglang.srt.layers.quantization.unquant_hip import (
+                prepare_decode_gemm_table,
+            )
+
+            usable, rows, held = prepare_decode_gemm_table()
+            if rows:
+                rank0_log(
+                    f"ROCm decode GEMM table: {usable} of {rows} rows usable, "
+                    f"{held / 2**20:.0f} MiB of kernels outside torch."
+                )
+
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     import torch
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 # (n, k) -> the largest num_tokens where the tiny GEMM still beats cuBLAS.
 _K3_TINY_GEMM_MAX_TOKENS = {
@@ -30,4 +31,9 @@ def kimi_k3_tiny_gemm(
     max_num_tokens = _K3_TINY_GEMM_MAX_TOKENS.get((n, k))
     if not _is_npu and max_num_tokens is not None and 0 < m <= max_num_tokens:
         return tiny_gemm_bf16(x, w)
+    if _is_hip:
+        from sglang.srt.layers.quantization.unquant_hip import decode_gemm
+
+        if (out := decode_gemm(x, w)) is not None:
+            return out
     return torch.nn.functional.linear(x, w)
