@@ -676,6 +676,13 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def record_storage_backup_event(self, node_id: NodeId, backed_tokens: int) -> bool:
+        """Queue a storage-tier (EXTERNAL) store event for a node whose backup of
+        ``backed_tokens`` reached storage whole; False, queueing nothing, when
+        the node no longer spans that backup."""
+        ...
+
+    @abstractmethod
     def build_hicache_transfers(
         self,
         component_type: ComponentType,
