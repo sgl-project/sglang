@@ -15,14 +15,6 @@ register_npu_ci(
     suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
-# TEMP: single-case validation suite. It contains only this file so the
-# pinned host memory fix (lower --max-running-requests / eval_batch_size) can
-# be verified in isolation; remove once the fix is validated.
-register_npu_ci(
-    est_time=8400,
-    suite="nightly-acc-test-2-npu-a3-temp-qwen36-27b-w8a8-3k5-gpqa",
-    nightly=True,
-)
 
 logger = logging.getLogger(__name__)
 
