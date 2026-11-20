@@ -161,29 +161,34 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
             causal=attn_type != AttentionType.ENCODER_ONLY,
         )
 
-    def test_encoder_only_verify_is_bidirectional_within_the_block(self):
-        """An ENCODER_ONLY draft (DSpark) must see its whole block from every row,
-        on the 2D and split-KV kernels and on the shape the causal-only
-        unified_attention_3d_mtp serves; the backend used to mask the block."""
+    def _check_against_the_reference(self, attn_type):
         for name, shape in _SHAPES.items():
             kv_dtypes = (
                 (fp8_dtype,) if name == "mtp_shape" else (torch.bfloat16, fp8_dtype)
             )
             for kv_dtype in kv_dtypes:
-                # ENCODER_ONLY needs an AITER unified_attention that takes causal=False.
-                attn_types = (AttentionType.DECODER,) + (
-                    (AttentionType.ENCODER_ONLY,) if _NON_CAUSAL else ()
-                )
-                for attn_type in attn_types:
-                    with self.subTest(
-                        shape=name, kv_dtype=kv_dtype, attn_type=attn_type.name
-                    ):
-                        out, expected = self._run_verify(
-                            shape=shape, attn_type=attn_type, kv_dtype=kv_dtype
-                        )
-                        torch.testing.assert_close(
-                            out.float(), expected, atol=3e-2, rtol=3e-2
-                        )
+                with self.subTest(
+                    shape=name, kv_dtype=kv_dtype, attn_type=attn_type.name
+                ):
+                    out, expected = self._run_verify(
+                        shape=shape, attn_type=attn_type, kv_dtype=kv_dtype
+                    )
+                    torch.testing.assert_close(
+                        out.float(), expected, atol=3e-2, rtol=3e-2
+                    )
+
+    def test_causal_layers_match_the_reference(self):
+        self._check_against_the_reference(AttentionType.DECODER)
+
+    @unittest.skipUnless(
+        _NON_CAUSAL,
+        "installed AITER unified_attention has no causal=False (ROCm/aiter#7244)",
+    )
+    def test_encoder_only_verify_is_bidirectional_within_the_block(self):
+        """An ENCODER_ONLY draft (DSpark) must see its whole block from every row,
+        on the 2D and split-KV kernels and on the shape the causal-only
+        unified_attention_3d_mtp serves; the backend used to mask the block."""
+        self._check_against_the_reference(AttentionType.ENCODER_ONLY)
 
 
 if __name__ == "__main__":

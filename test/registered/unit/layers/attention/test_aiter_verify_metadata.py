@@ -10,6 +10,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -204,6 +205,119 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "no flat CUDA-graph KV indices"):
             backend._flat_graph_kv_indices()
+
+
+class _FakeKVPool:
+    def __init__(self, cache):
+        self.cache = cache
+        self.start_layer = 0
+        self.layer_num = 1
+        self.layer_transfer_counter = None
+        self.layer_router = PlainPoolRouter(self, "full")
+
+    def get_kv_buffer(self, _layer_id):
+        return self.cache, self.cache
+
+
+class TestUnifiedVerifyCausalFlag(CustomTestCase):
+    """aiter target verify ran ENCODER_ONLY layers with a causal mask, and sent the
+    mtp shape to the causal-only 3d_mtp kernel; the registered AITER has no
+    causal=False, so the GPU reference cannot see this."""
+
+    def _verify(self, attn_type, *, num_q_heads, head_dim, kv_dtype, prefix_lens):
+        bs, draft_num, page_size, num_kv_heads = len(prefix_lens), 4, 16, 2
+        pages = -(-(max(prefix_lens) + draft_num) // page_size)
+        backend = object.__new__(aiter_backend.AiterAttnBackend)
+        backend.use_mla = False
+        backend._use_unified_verify = True
+        backend.kv_cache_dtype = kv_dtype
+        backend.page_size = page_size
+        backend.use_muse_attention_paths = False
+        backend.muse_verify_kernels = frozenset()
+        backend.k_scale = backend.v_scale = torch.ones(1)
+        backend.token_to_kv_pool = _FakeKVPool(
+            torch.zeros(bs * pages, page_size, num_kv_heads, head_dim, dtype=kv_dtype)
+        )
+        backend.forward_metadata = SimpleNamespace(
+            kv_indices=torch.arange(bs * pages, dtype=torch.int32).view(bs, pages),
+            swa_page_table=None,
+            qo_indptr=torch.arange(0, bs * draft_num + 1, draft_num, dtype=torch.int32),
+            max_q_len=draft_num,
+            verify_seqused_k=None,
+            verify_seqlen_k=None,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            attn_type=attn_type,
+            is_cross_attention=False,
+            sliding_window_size=None,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            tp_v_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=None,
+            v_scale=None,
+            scaling=head_dim**-0.5,
+            logit_cap=0.0,
+        )
+        forward_batch = SimpleNamespace(
+            attn_attend_prefix_cache=False,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            out_cache_loc=None,
+            seq_lens=torch.tensor(prefix_lens, dtype=torch.int64),
+        )
+        calls = []
+        with (
+            patch.object(
+                aiter_backend,
+                "unified_attention",
+                lambda **kw: calls.append(("unified", kw["causal"])),
+                create=True,
+            ),
+            patch.object(
+                aiter_backend,
+                "unified_attention_3d_mtp_func",
+                lambda **_kw: calls.append(("mtp", None)),
+                create=True,
+            ),
+            patch.object(aiter_backend, "_muse_gfx95_like", lambda: True),
+            patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        ):
+            backend.forward_extend(
+                torch.zeros(bs * draft_num, num_q_heads, head_dim, dtype=torch.bfloat16),
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+            )
+        return calls
+
+    def test_encoder_only_verify_is_not_causal_and_skips_the_mtp_kernel(self):
+        shapes = {
+            "dspark": dict(
+                num_q_heads=8,
+                head_dim=64,
+                kv_dtype=torch.bfloat16,
+                prefix_lens=(37, 3000),
+            ),
+            "mtp": dict(
+                num_q_heads=32,
+                head_dim=256,
+                kv_dtype=aiter_backend.fp8_dtype,
+                prefix_lens=(600, 1500),
+            ),
+        }
+        expected = {
+            ("dspark", AttentionType.DECODER): [("unified", True)],
+            ("dspark", AttentionType.ENCODER_ONLY): [("unified", False)],
+            ("mtp", AttentionType.DECODER): [("mtp", None)],
+            ("mtp", AttentionType.ENCODER_ONLY): [("unified", False)],
+        }
+        for (name, attn_type), calls in expected.items():
+            with self.subTest(shape=name, attn_type=attn_type.name):
+                self.assertEqual(self._verify(attn_type, **shapes[name]), calls)
 
 
 _DCP_SIZE = 8
