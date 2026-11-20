@@ -16,6 +16,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import share_kv_cache_scales
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import add_prefix
@@ -668,6 +669,14 @@ class Gemma3nTextModel(PreTrainedModel):
             ),
             prefix=add_prefix("layers", prefix),
         )
+        # KV-shared layers read the KV cache of an earlier layer, so they use
+        # that layer's KV-cache scales.
+        for layer in self.layers:
+            index = layer.self_attn.kv_shared_layer_index
+            if index is not None:
+                share_kv_cache_scales(
+                    self.layers[index].self_attn.attn, layer.self_attn.attn
+                )
 
         # Per-layer input embeddings
         self.hidden_size = config.hidden_size
