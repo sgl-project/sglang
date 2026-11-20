@@ -92,6 +92,30 @@ response = requests.post(url + "/v1/embeddings", json=payload).json()
 print("Embeddings:", [x.get("embedding") for x in response.get("data", [])])
 ```
 
+### Chat-style input (`messages`)
+
+`/v1/embeddings` also accepts vLLM's chat-style input. Each conversation is rendered with the model's chat template and gives one embedding, with text, `image_url`, `video_url`, `audio_url` and `input_audio` parts kept in the order they are sent, so one embedding can mix several media items. `messages` holds one conversation, or a list of conversations for a batch; the same conversations may also be sent in `input`.
+
+```python Example
+payload = {
+    "model": "gme-qwen2-vl",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_path}},
+                {"type": "text", "text": text_input},
+            ],
+        }
+    ],
+}
+
+response = requests.post(url + "/v1/embeddings", json=payload).json()
+print("Embedding:", response["data"][0]["embedding"][:8])
+```
+
+As in vLLM, `add_generation_prompt` defaults to `false` and `chat_template_kwargs` is passed to a Jinja chat template. A registered conversation template such as `gme-qwen2-vl` always ends with the assistant turn and accepts only the `system`, `user` and `assistant` roles; a Jinja template accepts any role it renders, such as `query` or `document`.
+
 ## Matryoshka Embedding Example
 
 [Matryoshka Embeddings](https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#matryoshka-embeddings) or [Matryoshka Representation Learning (MRL)](https://arxiv.org/abs/2205.13147) is a technique used in training embedding models. It allows user to trade off between performance and cost.
