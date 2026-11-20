@@ -379,5 +379,19 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertEqual(scope, (0, 8 << 30))
 
 
+    def test_explicit_size_on_gfx950_books_hugepage_pools_against_the_pinnable_share(
+        self,
+    ):
+        scope, (allocation, available) = self._explicit_size_scope(
+            mode=base.HUGEPAGE_MODE_PREFER,
+            available=200 << 30,
+            hugetlb=64 << 30,
+            gfx950=True,
+            mappings=[40 << 30],
+        )
+        self.assertEqual(scope, (20 << 30, 0))
+        self.assertGreater(allocation, available)
+
+
 if __name__ == "__main__":
     unittest.main()
