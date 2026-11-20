@@ -32,7 +32,6 @@ from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
     derive_attn_tp_size,
     get_platform,
-    shared_experts_tp_spans_dp,
 )
 from sglang.srt.utils.common import parse_connector_type
 
@@ -198,22 +197,13 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    if cfg.enable_shared_experts_attn_tp and size != attn_tp_size:
-        raise ValueError(
-            f"--shared-experts-tp-size ({size}) conflicts with "
-            f"--enable-shared-experts-attn-tp (attention TP {attn_tp_size})."
-        )
-    across_dp = shared_experts_tp_spans_dp(
-        attn_tp_size=attn_tp_size,
-        attn_cp_size=view.attn_cp_size,
-        attn_dp_size=cfg.attn_dp_size,
-    )
     replica_size = attn_tp_size * view.attn_cp_size
-    width = cfg.tp_size if across_dp else replica_size
-    if size < 1 or width % size != 0:
+    spans_dp = replica_size == 1 and size == cfg.tp_size
+    if size < 1 or not (replica_size % size == 0 or spans_dp):
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must divide attention TP x CP "
-            f"({replica_size}), or TP ({cfg.tp_size}) for attention DP with TP1/CP1."
+            f"({replica_size}), or equal TP size ({cfg.tp_size}) under attention "
+            "DP with attention TP 1 and CP 1."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(

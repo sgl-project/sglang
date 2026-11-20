@@ -198,20 +198,23 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                     allocation.assert_not_called()
 
     def test_moe_shared_consumer_preserves_selection_and_execution_handle(self):
+        def publish_case(rank, dp, **shared_flags):
+            reset_context()
+            # Under DP attention the dense MLP shards over attention TP;
+            # without an a2a backend the shared experts stay on full TP.
+            server = ServerArgs(
+                model_path="dummy",
+                device="cpu",
+                tp_size=4,
+                attn_dp_size=dp,
+                enable_dense_mlp_attn_tp=dp > 1,
+                **shared_flags,
+            )
+            publish(server, role="test", ranks=SpawnRanks(world_rank=rank))
+            initialize_dp_attention_flags(server)
+
         for rank in range(4):
             for dp in (1, 2):
-                reset_context()
-                # Under DP attention the dense MLP shards over attention TP;
-                # without an a2a backend the shared experts stay on full TP.
-                server = ServerArgs(
-                    model_path="dummy",
-                    device="cpu",
-                    tp_size=4,
-                    attn_dp_size=dp,
-                    enable_dense_mlp_attn_tp=dp > 1,
-                )
-                publish(server, role="test", ranks=SpawnRanks(world_rank=rank))
-                initialize_dp_attention_flags(server)
                 attn_tp = 4 // dp
                 attn = SimpleNamespace(world_size=attn_tp, rank_in_group=rank % attn_tp)
                 shared = SimpleNamespace(world_size=2, rank_in_group=rank % 2)
@@ -222,10 +225,13 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                     (True, 2, False, 2),
                     (True, None, True, attn_tp),
                 ):
-                    with parallel_scope(
+                    publish_case(
+                        rank,
+                        dp,
                         shared_experts_tp_size=requested,
                         enable_shared_experts_attn_tp=enabled,
-                        shared_experts_tp_width=attn_tp if enabled else requested,
+                    )
+                    with parallel_scope(
                         shared_experts_tp_group=attn if enabled else shared,
                         attn_tp_group=attn,
                     ):
@@ -240,6 +246,7 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                 owner._shared_experts_tp.group,
                                 shared if requested == 2 else attn,
                             )
+                            self.assertFalse(owner._shared_experts_tp.across_dp)
                         self.assertFalse(module._dense_attn_tp)
                         for name in ("gate_up_proj", "down_proj"):
                             layer = getattr(module, name)
@@ -251,20 +258,18 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                             torch.testing.assert_close(layer.weight, expected)
                         self.assertFalse(module.down_proj.reduce_results)
                         self.assertFalse(module.down_proj.use_dp_attention_reduce)
+                publish_case(rank, dp, shared_experts_tp_size=2)
+                with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
+                    build_shared_experts(ep_a2a=False)
+                publish_case(rank, dp, shared_experts_tp_size=3)
                 with parallel_scope(
-                    shared_experts_tp_size=2, shared_experts_tp_width=2
-                ):
-                    with self.assertRaisesRegex(ValueError, "requires an EP a2a"):
-                        build_shared_experts(ep_a2a=False)
-                with parallel_scope(
-                    shared_experts_tp_size=3,
-                    shared_experts_tp_width=3,
                     shared_experts_tp_group=SimpleNamespace(
                         world_size=3, rank_in_group=rank % 3
                     ),
                 ):
                     with self.assertRaisesRegex(ValueError, "must be divisible"):
                         build_shared_experts()
+                publish_case(rank, dp)
                 _, disabled = build_shared_experts(shared=0)
                 self.assertIsNone(disabled)
 

@@ -76,13 +76,6 @@ def derive_attn_tp_size(*, tp_size: int, attn_cp_size: int, attn_dp_size: int) -
     return tp_size // attn_dp_size // attn_cp_size
 
 
-def shared_experts_tp_spans_dp(
-    *, attn_tp_size: int, attn_cp_size: int, attn_dp_size: int
-) -> bool:
-    """Whether a --shared-experts-tp-size group spans attention-DP ranks."""
-    return attn_dp_size > 1 and attn_tp_size == 1 and attn_cp_size == 1
-
-
 def derive_attention_ranks(
     *, tp_rank: int, attn_tp_size: int, attn_cp_size: int
 ) -> tuple:
@@ -202,15 +195,6 @@ def shared_experts_tp_width_of(cfg: Any) -> Optional[int]:
     if cfg.enable_shared_experts_attn_tp:
         return attn_tp_size_of(cfg)
     return None
-
-
-def shared_experts_tp_spans_dp_of(cfg: Any) -> bool:
-    """`shared_experts_tp_spans_dp`, computed at publish."""
-    return shared_experts_tp_spans_dp(
-        attn_tp_size=attn_tp_size_of(cfg),
-        attn_cp_size=cfg.attn_cp_size,
-        attn_dp_size=cfg.attn_dp_size,
-    )
 
 
 def attn_dp_enabled_of(cfg: Any) -> bool:

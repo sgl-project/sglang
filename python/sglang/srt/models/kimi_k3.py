@@ -49,6 +49,10 @@ from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     _note_dp_gather_in_prefill_graph,
+    dp_gather_partial,
+    dp_reduce_scatter_tensor,
+    dp_scatter,
+    get_global_dp_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -547,28 +551,58 @@ class _SharedExpertsTp:
 
     def __init__(self, group, across_dp: bool):
         self.group = group
-        # Spans DP ranks: rows differ per rank and idle ranks must join the collectives.
+        # Spans DP ranks: every rank's rows take the DP gather, idle ranks included.
         self.across_dp = across_dp
-        self._rows = k3_sp_collective.RowCollective(
-            group, "shared_tp_all_gather", push=across_dp
+        self._k3 = (
+            k3_sp_collective.GroupCollective(group, "shared_tp_all_gather")
+            if across_dp
+            else None
         )
 
-    def gather(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        rows = hidden_states.shape[0]
-        if self.across_dp:
-            rows = k3_sp_collective.dp_max_rows(rows)
-            # A prefill graph holding this replays only when every DP rank runs its bucket.
-            _note_dp_gather_in_prefill_graph()
-        # The direct strategy's output stays valid until the next layer's gather.
-        return self._rows.all_gather(hidden_states, rows, symmetric_fallback=True)
+    def gather(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> torch.Tensor:
+        group = self.group
+        if not self.across_dp:
+            # The attention DP buffer spans the entire attention-TP replica.
+            # Size this buffer from the subgroup's actual token shards instead.
+            with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+                gathered = hidden_states.new_empty(
+                    (
+                        hidden_states.shape[0] * group.world_size,
+                        *hidden_states.shape[1:],
+                    )
+                )
+            group.all_gather_into_tensor(gathered, hidden_states)
+            return gathered
+        if forward_batch.dp_padding_mode.is_max_len():
+            # The direct strategy's output stays valid until the next layer's gather.
+            gathered = self._k3.all_gather(hidden_states)
+            if gathered is not None:
+                _note_dp_gather_in_prefill_graph()
+                return gathered
+        gathered = get_global_dp_buffer(group)
+        dp_gather_partial(gathered, hidden_states, forward_batch)
+        return gathered
 
     def reduce_scatter(
-        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        shared_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
     ) -> torch.Tensor:
-        # The down_proj output is not in symmetric storage.
-        return self._rows.reduce_scatter(
-            shared_output, hidden_states.shape[0], input_symmetric=False
-        )
+        if self.across_dp and forward_batch.dp_padding_mode.is_max_len():
+            output = self._k3.reduce_scatter(shared_output)
+            if output is not None:
+                return output
+        output = torch.empty_like(hidden_states)
+        if not self.across_dp:
+            self.group.reduce_scatter_tensor(output, shared_output)
+        elif forward_batch.dp_padding_mode.is_max_len():
+            dp_reduce_scatter_tensor(output, shared_output)
+        else:
+            dp_scatter(output, self.group.all_reduce(shared_output), forward_batch)
+        return output
 
 
 class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
@@ -735,14 +769,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         self._shared_experts_tp1 = _replicates_shared_experts()
         self._shared_experts_tp: Optional[_SharedExpertsTp] = None
         shared_experts_parallel_group = None
+        shared_tp_group = None
         if self._shared_experts_tp1:
             shared_experts_parallel_group = "replicated"
         elif self._ep_a2a and shared_tp is not None and shared_tp > 1:
-            group = parallel.shared_experts_tp_group
-            assert group.world_size == shared_tp
-            self._shared_experts_tp = _SharedExpertsTp(
-                group, across_dp=parallel.shared_experts_tp_spans_dp
-            )
+            shared_tp_group = parallel.shared_experts_tp_group
+            assert shared_tp_group.world_size == shared_tp
             shared_experts_parallel_group = "shared_experts_tp"
         else:
             # The full TP group, which _reduce_shared sums over, whatever the
@@ -754,6 +786,12 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 raise ValueError(
                     f"Shared-expert intermediate size ({shared_intermediate_size}) "
                     f"must be divisible by shared-expert TP size ({shared_tp})."
+                )
+            if shared_tp_group is not None:
+                self._shared_experts_tp = _SharedExpertsTp(
+                    shared_tp_group,
+                    across_dp=shared_tp_group.world_size
+                    > parallel.attn_tp_size * parallel.attn_cp_size,
                 )
             self.shared_experts = KimiK3MLP(
                 hidden_size=config.hidden_size,
@@ -1268,13 +1306,19 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_shared_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
         shared_tp = self._shared_experts_tp
         if shared_tp is None:
             return self.shared_experts(hidden_states)
-        gathered_shared_output = self.shared_experts(shared_tp.gather(hidden_states))
-        return shared_tp.reduce_scatter(gathered_shared_output, hidden_states)
+        gathered = shared_tp.gather(hidden_states, forward_batch)
+        return shared_tp.reduce_scatter(
+            self.shared_experts(gathered), hidden_states, forward_batch
+        )
 
     def _can_overlap_shared_experts_npu(self, hidden_states: torch.Tensor) -> bool:
         if not (
@@ -1310,6 +1354,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         *,
         prefix_sum: Optional[torch.Tensor],
         valid_token_count: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1342,7 +1387,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 hidden_states.record_stream(self.alt_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_input = self._shared_experts_tp.gather(hidden_states)
+                    shared_input = self._shared_experts_tp.gather(
+                        hidden_states, forward_batch
+                    )
                     shared_input.record_stream(self.alt_stream)
                 return
             if self._sbo_shared_overlap:
@@ -1351,14 +1398,18 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 # stream only executes the shared-expert MLP.
                 shared_input = hidden_states
                 if self._shared_experts_tp is not None:
-                    shared_input = self._shared_experts_tp.gather(hidden_states)
+                    shared_input = self._shared_experts_tp.gather(
+                        hidden_states, forward_batch
+                    )
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, forward_batch
+                )
 
         def run_experts(expert_input, topk_output):
             if not fine_grained_overlap:
@@ -1388,7 +1439,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self._shared_experts_tp.reduce_scatter(
-                        shared_output, hidden_states
+                        shared_output, hidden_states, forward_batch
                     )
                     shared_event = self.alt_stream.record_event()
                 current_stream.wait_event(shared_compute_event)
@@ -1417,7 +1468,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             shared_output.record_stream(current_stream)
             if self._shared_experts_tp is not None and not fine_grained_overlap:
                 shared_output = self._shared_experts_tp.reduce_scatter(
-                    shared_output, hidden_states
+                    shared_output, hidden_states, forward_batch
                 )
 
         # Give the NPU shared-expert branch a head start. At this point
@@ -1485,7 +1536,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             if (
                 self.tp_size > 1
                 and not self._shared_experts_tp1
-                and not self._shared_experts_tp is not None
+                and self._shared_experts_tp is None
             ):
                 shared_output = self._reduce_shared(shared_output)
             out = _add3(out, shared_output, prefix_sum)
@@ -1825,6 +1876,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         prefix_sum: Optional[torch.Tensor] = None,
         cp_shard_rows: bool = False,
         valid_token_count: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1849,6 +1901,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 hidden_states,
                 prefix_sum=prefix_sum,
                 valid_token_count=valid_token_count,
+                forward_batch=forward_batch,
             )
         return out.view(num_tokens, hidden_size)
 
@@ -3287,14 +3340,18 @@ class KimiK3DecoderLayer(nn.Module):
                     else None
                 ),
                 valid_token_count=valid_token_count,
+                forward_batch=forward_batch,
             )
         elif self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=residual_batch.written_residual(forward_batch),
+                forward_batch=forward_batch,
             )
         elif self.ffn_boundary.outputs_on_cp_shards(forward_batch):
             hidden_states = self.mlp(hidden_states, cp_shard_rows=True)
+        elif isinstance(self.mlp, KimiK3MoE):
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         else:
             hidden_states = self.mlp(hidden_states)
         return self.ffn_boundary.finish(hidden_states, forward_batch)

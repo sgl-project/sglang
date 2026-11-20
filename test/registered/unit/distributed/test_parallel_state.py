@@ -172,9 +172,10 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
 
 
 @pytest.mark.parametrize(
-    "tp,cp,dp,pp,shared", [(8, 8, 1, 1, 8), (16, 8, 2, 2, 8), (8, 4, 1, 2, 4)]
+    "tp,cp,dp,pp,shared",
+    [(8, 8, 1, 1, 8), (16, 8, 2, 2, 8), (8, 4, 1, 2, 4), (8, 1, 8, 1, 8)],
 )
-def test_shared_tp_spans_pcp_without_crossing_dp_or_pp(tp, cp, dp, pp, shared):
+def test_shared_tp_spans_pcp_or_whole_tp_without_crossing_pp(tp, cp, dp, pp, shared):
     from contextlib import ExitStack
 
     created = {}
@@ -227,14 +228,18 @@ def test_shared_tp_spans_pcp_without_crossing_dp_or_pp(tp, cp, dp, pp, shared):
         )
         try:
             parallel_state.initialize_model_parallel()
-            groups = created["shared_experts_tp"]
+            groups = created["tp" if shared == tp else "shared_experts_tp"]
             assert groups == [
                 list(range(start, start + shared))
                 for start in range(0, tp * pp, shared)
             ]
             for ranks in groups:
                 assert len({r // tp for r in ranks}) == 1
-                assert len({(r % tp) // (tp // dp) for r in ranks}) == 1
+                assert len({(r % tp) // (tp // dp) for r in ranks}) == (
+                    max(1, shared * dp // tp)
+                )
+            if shared == tp:
+                assert parallel_state._SHARED_EXPERTS_TP is parallel_state._TP
         finally:
             parallel_state.destroy_model_parallel()
 
