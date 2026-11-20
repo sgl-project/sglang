@@ -1220,6 +1220,9 @@ class Envs:
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
+    # GDN packed decode kernel: "aiter" runs AITER's FlyDSL GDR decode where it
+    # covers the launch; anything else keeps the Triton packed decode.
+    SGLANG_USE_HIP_GDN_PACKED_DECODE_BACKEND = EnvStr("triton")
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
