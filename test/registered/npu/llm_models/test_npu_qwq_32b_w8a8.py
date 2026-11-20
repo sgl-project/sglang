@@ -6,7 +6,7 @@ from sglang.test.ascend.test_ascend_utils import QWQ_32B_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="full-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-2-npu-a3", nightly=True)
 
 
 class TestQWQ32BW8A8(GSM8KAscendMixin, CustomTestCase):
@@ -24,7 +24,8 @@ class TestQWQ32BW8A8(GSM8KAscendMixin, CustomTestCase):
         "0.8",
         "--attention-backend",
         "ascend",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--tp-size",
         "2",
         "--quantization",

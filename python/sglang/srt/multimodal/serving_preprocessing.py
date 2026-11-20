@@ -71,7 +71,10 @@ def fast_image_processor_device(
     if _is_xpu:
         return "xpu"
     if _is_npu:
-        return None if processor.__class__.__name__ == "Glm4vProcessor" else "npu"
+        if processor.__class__.__name__ == "Glm4vProcessor":
+            # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
+            return "cpu"
+        return "npu"
     platform = platforms.current_platform
     if not platform.is_cuda_alike():
         return None
@@ -95,6 +98,12 @@ def apply_npu_image_preprocess_patches(processor) -> None:
             and processor.video_processor is not None
         ):
             npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+    elif processor.__class__.__name__ == "Glm5NextProcessor":
+        from sglang.srt.hardware_backend.npu.modules.glm5_next_processor import (
+            npu_apply_glm5_next_preprocess_patch,
+        )
+
+        npu_apply_glm5_next_preprocess_patch(processor)
     elif processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
         # For qwen-vl, the processor hits a reshape issue from the Ascend
         # dims restriction.

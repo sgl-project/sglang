@@ -1,12 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-"""
-DiffGenerator module for sglang-diffusion.
-
-This module provides a consolidated interface for generating videos using
-diffusion models.
-"""
+"""Shared entrypoint helpers: build a Req from SamplingParams and materialize/save generated images, videos and actions."""
 
 import atexit
 import io
@@ -257,10 +252,6 @@ def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
     # 2. Handle (C, L) -> (L, C)
     if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
         audio_np = audio_np.transpose(1, 0)
-
-    # 3. Final safety check: if still 2D and channels (dim 1) is huge, something is wrong
-    if audio_np.ndim == 2 and audio_np.shape[1] > 256 and audio_np.shape[0] == 1:
-        audio_np = audio_np.flatten()
 
     return audio_np
 
@@ -1062,9 +1053,10 @@ def attach_audio_to_video_sample(
     sample: Any,
     audio: Any,
     output_idx: int,
+    num_outputs: int,
 ) -> Any:
     """Attach per-sample audio for video outputs when available."""
-    audio = select_output_audio(audio, output_idx)
+    audio = select_output_audio(audio, output_idx, num_outputs)
     if audio is None:
         return sample
     if not (isinstance(sample, (tuple, list)) and len(sample) == 2):
@@ -1072,12 +1064,20 @@ def attach_audio_to_video_sample(
     return sample
 
 
-def select_output_audio(audio: Any, output_idx: int) -> Any:
-    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-        return audio[output_idx] if audio.shape[0] > output_idx else None
-    if isinstance(audio, np.ndarray) and audio.ndim >= 2:
-        return audio[output_idx] if audio.shape[0] > output_idx else None
-    return audio
+def select_output_audio(
+    audio: Any, output_idx: int, num_outputs: int | None = None
+) -> Any:
+    """Audio of output ``output_idx``.
+
+    A leading dim is indexed as the output dim for 3D+ audio. 2D audio is indexed
+    only when ``num_outputs`` is unknown or equals ``shape[0]``; otherwise it is one
+    track (``(C, L)`` or ``(L, C)``, e.g. stereo) and kept whole.
+    """
+    if not isinstance(audio, (torch.Tensor, np.ndarray)) or audio.ndim < 2:
+        return audio
+    if audio.ndim == 2 and num_outputs is not None and audio.shape[0] != num_outputs:
+        return audio
+    return audio[output_idx] if audio.shape[0] > output_idx else None
 
 
 def _split_sample_audio(sample: Any) -> tuple[Any, Any]:
@@ -1355,7 +1355,7 @@ def save_outputs(
     output_paths: list[str] = []
     samples = (
         [
-            attach_audio_to_video_sample(sample, audio, idx)
+            attach_audio_to_video_sample(sample, audio, idx, len(outputs))
             for idx, sample in enumerate(outputs)
         ]
         if data_type == DataType.VIDEO
@@ -1421,7 +1421,7 @@ def save_outputs(
                     if samples_out is not None:
                         samples_out.append(sample)
                     if audios_out is not None:
-                        audios_out.append(select_output_audio(audio, idx))
+                        audios_out.append(select_output_audio(audio, idx, len(outputs)))
                     output_paths.append(save_file_path)
                     logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
                     continue
@@ -1449,7 +1449,7 @@ def save_outputs(
             samples_out.append(sample)
         if audios_out is not None:
             if data_type == DataType.VIDEO:
-                audios_out.append(select_output_audio(audio, idx))
+                audios_out.append(select_output_audio(audio, idx, len(outputs)))
             else:
                 audios_out.append(audio)
         if frames_out is not None:

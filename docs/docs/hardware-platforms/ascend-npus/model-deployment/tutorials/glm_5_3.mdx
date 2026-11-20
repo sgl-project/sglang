@@ -20,14 +20,14 @@ The multi-node and prefill-decode disaggregation examples use a locally prepared
 | Feature                       | Example usage                                                                                           |
 |-------------------------------|---------------------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 16` or `--tp-size 32`                                                                          |
-| Data Parallelism              | `--dp-size 16` (mixed) or `--dp-size 32` (decode) with `--enable-dp-attention`                                                      |
+| Data Parallelism              | `--attn-dp-size 16` (mixed) or `--attn-dp-size 32` (decode)                                                      |
 | Expert Parallelism            | `--ep-size 32` with `--moe-a2a-backend deepep` and `--deepep-mode low_latency`                             |
 | Pipeline Parallelism          | `--pp-size 4` with `SGLANG_PP_LAYER_PARTITION=18,20,24,16`                                                |
 | Prefill Context Parallelism   | `--attn-cp-size 8` with `--enable-prefill-cp` and `--cp-strategy interleave`                                |
 | PD Disaggregation             | `--disaggregation-mode prefill` / `decode` with `--disaggregation-transfer-backend ascend`                  |
 | Quantization                  | `--quantization modelslim`                                                                               |
 | Chunked Prefill               | `--chunked-prefill-size 65536` / `--max-prefill-tokens 280000` (mixed deployment)                    |
-| NPU Graph                     | `--cuda-graph-bs-decode 2` (mixed); `--disable-cuda-graph` (prefill); `--cuda-graph-bs-decode 1 2 3` (decode)                               |
+| NPU Graph                     | `--cuda-graph-bs-decode 2` (mixed); `--disable-decode-cuda-graph --disable-prefill-cuda-graph` (prefill); `--cuda-graph-bs-decode 1 2 3` (decode)                               |
 | Speculative Decoding          | `--speculative-algorithm NEXTN` with `--speculative-num-steps 3` and `--speculative-num-draft-tokens 4`     |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                             |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                                    |
@@ -71,7 +71,7 @@ identical checkpoint to the same local path on every node.
 
 <Info>
 The deployment examples below use a W8A8 checkpoint with `--quantization modelslim`. The PD disaggregation topology
-uses **two A3 series nodes for prefill and two additional A3 nodes for decode**. Make sure that the checkpoint
+uses **two A3 Series nodes for prefill and two additional A3 nodes for decode**. Make sure that the checkpoint
 contains the required MTP weights before enabling NEXTN speculative decoding.
 </Info>
 
@@ -91,7 +91,7 @@ The commands below start CANN 9.1.0 base images. Follow
 to install SGLang and the required runtime components inside the container. Use the matching image for your hardware.
 
 <Tabs>
-  <Tab title="A3 series">
+  <Tab title="A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
@@ -126,7 +126,7 @@ quay.io/ascend/sglang:cann9.1.0-a3-B080
 ```
 
   </Tab>
-  <Tab title="A2 series">
+  <Tab title="A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
@@ -223,7 +223,7 @@ python3 -m sglang.launch_server \
 
 ### Multi-node deployment
 
-For co-located (mixed) serving across **two A3 series nodes**, both nodes participate in a single GLM-5.3
+For co-located (mixed) serving across **two A3 Series nodes**, both nodes participate in a single GLM-5.3
 inference instance. The following script is adapted from the supplied GLM-5.3 W8A8 multi-node configuration, using
 **TP=32**, **DP=16**, DeepEP `auto`, and NEXTN speculative decoding.
 
@@ -233,7 +233,7 @@ initialization address. In this script, the mixed-serving HTTP port is **6688** 
 
 ```shell
 #!/usr/bin/env bash
-# GLM-5.3 W8A8: two-node co-located (mixed) deployment (A3 series).
+# GLM-5.3 W8A8: two-node co-located (mixed) deployment (A3 Series).
 # Run the same script on both nodes after replacing the variables below.
 
 # ============================================================
@@ -275,7 +275,7 @@ export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 # export HCCL_OP_EXPANSION_MODE=AIV
 # export SGLANG_NPU_USE_MULTI_STREAM=1
 # export SGLANG_USE_AG_AFTER_QLORA=1
-# export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+# (and --enable-prefill-delayer on the launch command)
 
 # Match the configured node IP against all local IPv4 addresses.
 LOCAL_IPS=( $(hostname -I) )
@@ -297,7 +297,7 @@ for i in "${!IPS[@]}"; do
             --device npu \
             --dist-init-addr "${IPS[0]}:5000" \
             --tp-size 32 --nnodes 2 --node-rank "$i" \
-            --dp-size 16 --enable-dp-attention \
+            --attn-dp-size 16 \
             --chunked-prefill-size 65536 --max-prefill-tokens 280000 \
             --trust-remote-code \
             --host "${IPS[$i]}" \
@@ -323,7 +323,7 @@ exit 1
 ### Prefill-decode disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate node groups, reducing interference between
-long-prompt processing and autoregressive generation. This configuration uses **four A3 series nodes**:
+long-prompt processing and autoregressive generation. This configuration uses **four A3 Series nodes**:
 
 - **Prefill group:** 2 nodes, `TP=8`, `PP=4`, `DP=1`, and prefill context parallelism `CP=8`. It runs DeepEP in `normal`
   mode and disables NPU graph capture.
@@ -337,7 +337,7 @@ bootstrap and should be started before the router.
 
 ```shell
 #!/usr/bin/env bash
-# GLM-5.3 W8A8: 2 prefill nodes + 2 decode nodes (A3 series).
+# GLM-5.3 W8A8: 2 prefill nodes + 2 decode nodes (A3 Series).
 # Run this same script on all four nodes, after replacing the placeholders below.
 # The IP addresses must match addresses returned by `hostname -I` on each node.
 
@@ -411,16 +411,16 @@ for i in "${!P_IP[@]}"; do
             --mem-fraction-static 0.72 \
             --attention-backend ascend --device npu \
             --quantization modelslim --dtype bfloat16 \
-            --tp-size 8 --pp-size 4 --dp-size 1 \
+            --tp-size 8 --pp-size 4 --attn-dp-size 1 \
             --attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave \
-            --enable-dp-attention --enable-dp-lm-head \
+ --enable-dp-lm-head \
             --moe-dense-tp 1 --load-balance-method round_robin \
             --disaggregation-transfer-backend ascend \
             --max-running-requests 64 \
             --served-model-name glm-5 \
             --chunked-prefill-size 4096 --max-prefill-tokens 180000 \
             --moe-a2a-backend deepep --deepep-mode normal \
-            --disable-shared-experts-fusion --disable-cuda-graph \
+            --disable-shared-experts-fusion --disable-decode-cuda-graph --disable-prefill-cuda-graph \
             --speculative-algorithm NEXTN \
             --speculative-num-steps 1 \
             --speculative-eagle-topk 1 \
@@ -444,7 +444,7 @@ for i in "${!D_IP[@]}"; do
             --trust-remote-code \
             --dist-init-addr "${D_IP[0]}:5000" \
             --nnodes 2 --node-rank "$i" \
-            --tp-size 32 --dp-size 32 --enable-dp-attention --ep-size 32 \
+            --tp-size 32 --attn-dp-size 32 --ep-size 32 \
             --mem-fraction-static 0.97 --max-running-requests 32 \
             --attention-backend ascend --device npu \
             --quantization modelslim --dtype bfloat16 \

@@ -117,6 +117,8 @@ sglang serve                         \
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
 
+To run the vision encoder and the language model of a multimodal model as separate servers, see [EPD disaggregation on Intel XPU](/docs/advanced_features/epd_disaggregation#intel-xpu).
+
 ## MXFP4 MoE Quantization
 
 Native MXFP4 MoE checkpoints (OCP microscaling FP4: packed `e2m1` weights plus
@@ -310,8 +312,8 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 
 | Feature | Status |
 |---|---|
+| In-graph event synchronization | Not supported (use `SGLANG_ENABLE_WAR_BARRIER=1` and `SGLANG_FORCE_COARSE_WAR_BARRIER=1` for stream-level sync) |
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Supported |
 | Decode breakable graph (`--cuda-graph-backend-decode breakable`) | Not yet supported |
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
@@ -411,7 +413,7 @@ SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](h
 
 Mooncake supports Intel XPU through its TENT engine. The PyPI `mooncake-transfer-engine` wheel does not include it, so either use the XPU Docker image, which builds Mooncake from a pinned upstream commit (see `docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`. The image builds Mooncake without its store (`-DWITH_STORE=OFF`), so the Mooncake store HiCache L3 backend (`--hicache-storage-backend mooncake`) is not available on XPU.
 
-**Prerequisites:** Mooncake with XPU support (above) and the `sgl-router` binary, which the XPU Docker image installs at `/usr/local/bin/sgl-router` (outside the image, build it as described in [PD Disaggregation](../advanced_features/pd_disaggregation#router-integration)).
+**Prerequisites:** Mooncake with XPU support (above) and the `sgl-router` binary, which the XPU Docker image installs at `/usr/local/bin/sgl-router` (outside the image, install it with `pip install sgl-router` or see [installing sgl-router](../advanced_features/dp_dpa_router_guide#quick-start-for-sgl-router)).
 
 Set `MC_USE_TENT=1` on both the prefill and decode servers, and leave `MOONCAKE_PROTOCOL` at its default. On one node, the TENT engine then copies KV card to card through Level Zero IPC, so no RDMA NIC is needed.
 

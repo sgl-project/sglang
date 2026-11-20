@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.models.dits.wan_animate_2 import (
     WanAnimate2Config,
     WanAnimate2DistilledConfig,
 )
+from sglang.multimodal_gen.configs.models.dits.wan_s2v import WanS2VConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "MiniMaxH3DiTConfig",
     "WanAnimate2Config",
     "WanAnimate2DistilledConfig",
+    "WanS2VConfig",
     "WanVideoConfig",
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",

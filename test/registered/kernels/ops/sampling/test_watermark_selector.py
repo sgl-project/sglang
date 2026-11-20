@@ -8,13 +8,13 @@ from sglang.kernels.ops.sampling.textseal_selector import (
     force_watermark_tokens_triton,
     prepare_watermark_contexts_triton,
 )
-from sglang.srt.sampling.watermarking.core import (
-    WatermarkState,
-    _hash_contexts,
+from sglang.srt.sampling.watermarking.gumbel.algorithm import (
     _truncate_probabilities,
     _watermark_hash32_torch,
+    hash_contexts,
     select_watermark_tokens_torch,
 )
+from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -288,14 +288,12 @@ def test_fused_context_state_matches_torch():
         max_num_reqs=8,
         context_window=4,
         max_contexts_per_req=max_contexts,
-        key="0123456789abcdef",
         device="cuda",
     )
     actual = WatermarkState(
         max_num_reqs=8,
         context_window=4,
         max_contexts_per_req=max_contexts,
-        key="0123456789abcdef",
         device="cuda",
     )
     req_pool_indices = torch.tensor([1, 3, 5, 7], dtype=torch.int32, device="cuda")
@@ -323,7 +321,7 @@ def test_fused_context_state_matches_torch():
     contexts, context_lengths = reference.contexts_tail(
         req_pool_indices, context_windows
     )
-    expected_hashes = _hash_contexts(contexts, context_lengths)
+    expected_hashes = hash_contexts(contexts, context_lengths)
     reference.watermarked_context_hashes[req_pool_indices[1], 0] = expected_hashes[
         1
     ].to(torch.int32)

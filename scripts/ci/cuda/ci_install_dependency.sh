@@ -642,9 +642,9 @@ install_sglang() {
 }
 
 install_nccl() {
-    # DeepEP needs NCCL 2.30.7 whatever torch pins, so this must run
+    # DeepEP needs NCCL 2.31.2 whatever torch pins, so this must run
     # after every command that resolves Python dependencies (including lmms-eval).
-    $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
+    $PIP_CMD install "nvidia-nccl-cu13==2.31.2" \
         --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
@@ -844,9 +844,9 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        # pyarrow 26 needs NumPy 2 at import, but lmms_eval pins numpy 1.26.4;
-        # drop the cap once lmms_eval allows NumPy 2.
-        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" $PIP_INSTALL_SUFFIX
+        # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
+        # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
+        $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
         # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
@@ -935,17 +935,17 @@ import ctypes
 import importlib.metadata
 import os
 
-if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+if importlib.metadata.version("nvidia-nccl-cu13") != "2.31.2":
     raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
 nccl = ctypes.CDLL("libnccl.so.2")
 nccl_version = ctypes.c_int()
 status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
-if status != 0 or nccl_version.value != 23007:
+if status != 0 or nccl_version.value != 23102:
     raise SystemExit(
-        f"expected NCCL runtime 2.30.7, got status={status}, "
+        f"expected NCCL runtime 2.31.2, got status={status}, "
         f"raw_version={nccl_version.value}"
     )
-print("NCCL package and runtime versions are 2.30.7")
+print("NCCL package and runtime versions are 2.31.2")
 
 import torch
 print(torch.version.cuda)
