@@ -250,6 +250,7 @@ class TestHostSizing(CustomTestCase):
                     token_to_kv_pool_allocator=allocator,
                     req_to_token_pool=getattr(bundle, "req_to_token_pool", None),
                     mtp_draft_device_pools=(),
+                    mtp_draft_mamba_pools=(),
                 )
                 by_plan = sizing._estimate_hicache_bytes(params, None)
                 with patch.object(allocator, "storage", None):

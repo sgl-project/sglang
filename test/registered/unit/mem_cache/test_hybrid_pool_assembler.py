@@ -15,6 +15,13 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
+from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
+    Mamba2CacheParams,
+    Mamba2StateDType,
+    Mamba2StateShape,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -60,6 +67,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.ple_state_pool import NGramPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -68,6 +76,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -2178,6 +2187,250 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
                 ),
             ):
                 self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
+
+
+class TestMambaHostShare(CustomTestCase):
+    def test_explicit_size_weighs_mamba_by_what_its_host_pool_mirrors(self):
+        """--hicache-size gives the Mamba host pool the share of the bytes it mirrors:
+        draft layers and side states registered after the pool, never spec scratch."""
+
+        def make_pool(layer_ids, draft_tokens=None):
+            return MambaPool(
+                size=8,
+                spec_state_size=8,
+                cache_params=InklingConvCacheParams(
+                    shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                    layers=list(layer_ids),
+                    dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+                ),
+                mamba_layer_ids=list(layer_ids),
+                speculative_num_draft_tokens=draft_tokens,
+                device="cpu",
+            )
+
+        mamba_pool = make_pool([0, 1], draft_tokens=4)
+        mamba_pool.register_slot_state(
+            NGramPool(size=8, context_len=3, eos_token_id=0, device="cpu")
+        )
+        drafts = (make_pool([2]),)
+        kv = MHATokenToKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        kv_bytes = sum(kv.get_kv_size_bytes())
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            page_size=1,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=drafts,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                swa_attn_allocator=allocator, state_slots=allocator
+            ),
+            tp_cache_group=None,
+            pp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+        )
+        for tri_pool in (False, True):
+            with (
+                self.subTest(tri_pool=tri_pool),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    hicache_ratio=2,
+                    hicache_mem_layout="page_first_direct",
+                    hicache_write_policy="write_through",
+                    hicache_io_backend="direct",
+                ),
+                get_memory().override(hicache_size=1e-5),
+                patch.object(
+                    hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_kv_host_pool",
+                    return_value=SimpleNamespace(
+                        layer_num=1,
+                        layout="page_first_direct",
+                        page_size=1,
+                        device="cpu",
+                        size=17,
+                        logical_size=17,
+                        can_use_write_back_jit=False,
+                    ),
+                ) as build_kv_host_pool,
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_mamba_host_pool",
+                    wraps=hybrid_pool_assembler.build_mamba_host_pool,
+                ) as build_mamba_host_pool,
+                patch.object(
+                    hybrid_pool_assembler,
+                    "MambaPoolHost",
+                    partial(MambaPoolHost, pin_memory=False),
+                ),
+                patch.object(hybrid_pool_assembler, "HybridCacheController"),
+            ):
+                common = dict(
+                    params=params,
+                    mamba_pool=mamba_pool,
+                    full_layer_mapping={0: 0},
+                    start_layer=0,
+                    load_cache_event=None,
+                    storage_backend=None,
+                )
+                if tri_pool:
+                    group, _ = hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                        **common,
+                        full_kv_pool=kv,
+                        swa_kv_pool=kv,
+                        swa_layer_mapping={1: 0},
+                    )
+                else:
+                    group, _, _ = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                        **common, kv_pool=kv
+                    )
+                host = group.entry_map[PoolName.MAMBA].host_pool
+                self.addCleanup(host.destroy)
+                mirrored_bytes = host.size_per_token * mamba_pool.size
+                self.assertLess(
+                    mirrored_bytes,
+                    sum(pool.get_kv_size_bytes() for pool in (mamba_pool, *drafts)),
+                )
+                kv_shares = [
+                    call.kwargs["host_size"]
+                    for call in build_kv_host_pool.call_args_list
+                ]
+                mamba_share = build_mamba_host_pool.call_args.kwargs["host_size"]
+                self.assertEqual(len(kv_shares), 2 if tri_pool else 1)
+                self.assertAlmostEqual(sum(kv_shares) + mamba_share, 1e-5)
+                for share in kv_shares:
+                    self.assertAlmostEqual(
+                        mamba_share / share, mirrored_bytes / kv_bytes
+                    )
+
+
+class TestMambaHostShareForModelGeometries(CustomTestCase):
+    """--hicache-size weighs the Mamba host pool by checkpoint bytes for real hybrid
+    geometries, whatever spec verify scratch sits beside them.
+
+    "mtp" is the recurrent verify with per-draft-token snapshots; "replayssm" is
+    --enable-linear-replayssm-spec. Pools are on the meta device; the KV side is a
+    byte count.
+    """
+
+    HICACHE_SIZE_GB = 100
+
+    @staticmethod
+    def _qwen3_next_80b(tp_size: int) -> Mamba2CacheParams:
+        # Qwen3-Next-80B-A3B: 48 layers, every 4th full attention, 32 value heads,
+        # 16 key heads, head dims 128, conv kernel 4.
+        return Mamba2CacheParams(
+            shape=Mamba2StateShape.create(
+                tp_world_size=tp_size,
+                intermediate_size=32 * 128,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+                conv_shard_groups=[16 * 128, 16 * 128, 32 * 128],
+            ),
+            layers=[layer for layer in range(48) if (layer + 1) % 4],
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+        )
+
+    @staticmethod
+    def _kimi_k31(tp_size: int) -> KimiLinearCacheParams:
+        # Kimi-K3.1: 93 layers, 69 KDA, 96 heads of dim 128, conv kernel 4.
+        return KimiLinearCacheParams(
+            shape=KimiLinearStateShape.create(
+                tp_world_size=tp_size, num_heads=96, head_dim=128, conv_kernel_size=4
+            ),
+            layers=list(range(69)),
+            dtype=Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32),
+        )
+
+    def test_mamba_share_is_the_same_in_every_spec_mode(self):
+        gib = 1024**3
+        # (model, cache params, KV bytes, Mamba slots, draft tokens, bytes per slot,
+        #  {spec mode: Mamba GiB})
+        cases = (
+            (
+                # TP4; 1M tokens of 12 GQA layers, one 256-dim bf16 KV head per rank.
+                "qwen3-next-80b",
+                self._qwen3_next_80b(tp_size=4),
+                1_000_000 * 12 * 2 * 256 * 2,
+                256,
+                4,
+                36 * (2048 * 3 * 2 + 8 * 128 * 128 * 4),
+                {
+                    "none": 28.70,
+                    "mtp": 28.70,
+                    "replayssm": 28.70,
+                },
+            ),
+            (
+                # TP8; 500k tokens of 24 bf16 MLA layers (512 + 64 per token).
+                "kimi-k3.1",
+                self._kimi_k31(tp_size=8),
+                500_000 * 24 * 576 * 2,
+                128,
+                8,
+                69 * (3 * 4608 * 2 + 12 * 128 * 128 * 4),
+                {
+                    "none": 34.22,
+                    "mtp": 34.22,
+                    "replayssm": 34.22,
+                },
+            ),
+        )
+        for (
+            model,
+            cache_params,
+            kv_bytes,
+            slots,
+            draft_tokens,
+            slot_bytes,
+            shares,
+        ) in cases:
+            kv_pool = SimpleNamespace(
+                host_capacity_bytes=None, get_kv_size_bytes=lambda b=kv_bytes: b
+            )
+            for mode, after_gib in shares.items():
+                with self.subTest(model=model, mode=mode):
+                    spec = (
+                        {}
+                        if mode == "none"
+                        else dict(
+                            speculative_num_draft_tokens=draft_tokens,
+                            enable_linear_replayssm_spec=mode == "replayssm",
+                        )
+                    )
+                    mamba_pool = MambaPool(
+                        size=slots,
+                        spec_state_size=slots,
+                        cache_params=cache_params,
+                        mamba_layer_ids=cache_params.layers,
+                        device="meta",
+                        **spec,
+                    )
+                    self.assertEqual(mamba_pool.host_capacity_bytes, slots * slot_bytes)
+                    _, mamba_share = hybrid_pool_assembler._split_hicache_size(
+                        hicache_size=self.HICACHE_SIZE_GB,
+                        kv_pools=(kv_pool, mamba_pool),
+                    )
+                    self.assertAlmostEqual(mamba_share, after_gib, places=2)
+                    if mode != "none":
+                        self.assertLess(
+                            mamba_pool.host_capacity_bytes,
+                            mamba_pool.get_kv_size_bytes(),
+                        )
 
 
 class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):

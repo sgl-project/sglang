@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import device_capacity_tokens
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -58,7 +59,7 @@ def _pool_bytes(pool) -> int:
 
 
 def _leaf_bytes(pool) -> int:
-    sizes = getattr(pool, "host_capacity_bytes", None)
+    sizes = pool.host_capacity_bytes
     if sizes is None:
         sizes = pool.get_kv_size_bytes()
     return sum(sizes) if isinstance(sizes, tuple) else sizes
@@ -104,10 +105,23 @@ def _estimate_hicache_bytes(
     total = _pool_bytes(pool)
     if params.req_to_token_pool.holds_state_slots:
         total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
+    # Packed draft state rides in the target's Mamba host slots.
+    total += sum(_leaf_bytes(draft) for draft in params.mtp_draft_mamba_pools)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
+
+
+def _mamba_host_row_bytes(params: CacheInitParams) -> int:
+    # MambaPoolHost pads its slot count by one row of target and packed draft layers.
+    if not params.req_to_token_pool.holds_state_slots:
+        return 0
+    pools = (
+        params.token_to_kv_pool_allocator.state.pool,
+        *params.mtp_draft_mamba_pools,
+    )
+    return sum(_leaf_bytes(pool) // device_capacity_tokens(pool) for pool in pools)
 
 
 @contextmanager
@@ -141,7 +155,8 @@ def auto_size_hicache(
         )
         * fraction
     )
-    ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
+    usable = budget * (1 - _ALLOCATION_SLACK_FRACTION) - _mamba_host_row_bytes(params)
+    ratio = min(requested, usable / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
     if torch.distributed.is_initialized():

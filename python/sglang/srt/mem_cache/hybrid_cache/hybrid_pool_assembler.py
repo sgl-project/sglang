@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     MHABufferInfo,
     MLABufferInfo,
     PageRowBufferInfo,
+    device_capacity_tokens,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -121,18 +122,11 @@ def _dsv4_transfer_layer_mapping(
     return {layer - start_layer: index for index, layer in enumerate(layer_ids)}
 
 
-def _device_capacity_tokens(pool) -> int:
-    # Unified views size host storage from their configured token cap, not the buffer.
-    if pool.host_capacity_tokens is None:
-        return pool.size
-    return pool.host_capacity_tokens
-
-
 def _mha_host_inputs(pool, info, drafts=()):
     return (
         get_mha_host_pool_cls(info),
         dict(
-            device_capacity_tokens=_device_capacity_tokens(pool),
+            device_capacity_tokens=device_capacity_tokens(pool),
             start_layer=pool.start_layer,
             end_layer=pool.end_layer,
             draft_buffer_infos=tuple(
@@ -185,7 +179,7 @@ def build_kv_host_pool(
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
         kwargs.update(
-            device_capacity_tokens=_device_capacity_tokens(kv_pool),
+            device_capacity_tokens=device_capacity_tokens(kv_pool),
             start_layer=kv_pool.start_layer,
             end_layer=kv_pool.end_layer,
             draft_buffer_infos=tuple(
@@ -1130,7 +1124,7 @@ def build_mamba_host_pool(
         pool_info.buffer_info,
         mamba_host_ratio(get_memory().hicache_ratio),
         host_size,
-        device_capacity=_device_capacity_tokens(mamba_pool),
+        device_capacity=device_capacity_tokens(mamba_pool),
         mtp_draft_buffer_infos=draft_buffer_infos,
         allocator_type=_get_allocator_type(),
         layout=layout,
@@ -1221,9 +1215,11 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
+        kv_host_size, *mamba_shares = _split_hicache_size(
+            hicache_size=get_memory().hicache_size,
+            kv_pools=(kv_pool, mamba_pool, *params.mtp_draft_mamba_pools),
         )
+        mamba_host_size = sum(mamba_shares)
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1294,9 +1290,16 @@ def build_hybrid_mamba_swa_stack(
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     kv_host_size, swa_host_size, mamba_host_size = None, None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, swa_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool, mamba_pool)
+        kv_host_size, swa_host_size, *mamba_shares = _split_hicache_size(
+            hicache_size=get_memory().hicache_size,
+            kv_pools=(
+                full_kv_pool,
+                swa_kv_pool,
+                mamba_pool,
+                *params.mtp_draft_mamba_pools,
+            ),
         )
+        mamba_host_size = sum(mamba_shares)
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,
         full_kv_pool=full_kv_pool,
@@ -1737,7 +1740,7 @@ def _build_mha_mla_host_pool(
         return host_cls(buffer_info, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
         buffer_info,
-        device_capacity_tokens=_device_capacity_tokens(pool),
+        device_capacity_tokens=device_capacity_tokens(pool),
         start_layer=pool.start_layer,
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
