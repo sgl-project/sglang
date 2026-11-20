@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import itertools
 from typing import List, Optional
 
 from sglang.srt.debug_utils.schedule_simulator.request import SimRequest
@@ -31,7 +32,12 @@ class GPUState:
     def total_seq_len(self, extra_reqs: Optional[List[SimRequest]] = None) -> int:
         seen_groups = set()
         total = 0
-        for req in self.running_requests + (extra_reqs or []):
+        reqs = (
+            self.running_requests
+            if not extra_reqs
+            else itertools.chain(self.running_requests, extra_reqs)
+        )
+        for req in reqs:
             is_shared = req.group_id is not None and req.group_id in seen_groups
             total += req.seq_len() - (req.prefix_len if is_shared else 0)
             if req.group_id is not None:
@@ -42,13 +48,19 @@ class GPUState:
         return self.total_seq_len() <= self.max_total_tokens
 
     def start_request(self, req: SimRequest) -> None:
-        assert req in self.pending_requests
-        self.pending_requests.remove(req)
+        if self.pending_requests and self.pending_requests[0] is req:
+            self.pending_requests.pop(0)
+        else:
+            assert req in self.pending_requests
+            self.pending_requests.remove(req)
         self.running_requests.append(req)
 
     def evict_request(self, req: SimRequest) -> None:
-        assert req in self.running_requests
-        self.running_requests.remove(req)
+        if self.running_requests and self.running_requests[-1] is req:
+            self.running_requests.pop()
+        else:
+            assert req in self.running_requests
+            self.running_requests.remove(req)
         self.pending_requests.insert(0, req)
 
     def execute_step(self) -> None:
