@@ -316,14 +316,17 @@ class MinimaxM2Detector(BaseFormatDetector):
 
             # Parse parameters incrementally
             if self._function_name_sent:
-                # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf, tools)
+                # Only parse parameters of the current invoke; the buffer may
+                # already hold the next invoke's parameters.
+                end_pos = self._buf.find(self.tool_call_function_end_token)
+                current_invoke = self._buf if end_pos == -1 else self._buf[:end_pos]
+                parameter_calls = self._parse_and_stream_parameters(
+                    current_invoke, tools
+                )
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
-                if self.tool_call_function_end_token in self._buf:
-                    end_pos = self._buf.find(self.tool_call_function_end_token)
-
+                if end_pos != -1:
                     # Add closing brace to complete the JSON object
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
                     if current_streamed:
