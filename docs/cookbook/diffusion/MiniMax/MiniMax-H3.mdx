@@ -878,9 +878,10 @@ A tensor weight update replaces a head stack when it carries it as
 `final_layer.pdd_fused_heads.<key>`, with the key and the full tensor of
 `pdd_fused_heads.safetensors` (for example
 `final_layer.pdd_fused_heads.video_out.weight`, `[steps, out_features,
-in_features]`); a stack with another step count fails the update. A disk
-weight update reloads `transformer/` only and keeps the heads the server
-started with.
+in_features]`). The stacks of one update are checked together: a stack with
+another step count fails the update before any of them is replaced. A disk
+weight update reloads `transformer/` only and leaves the head stacks as they
+are, the startup file's or the last tensor update's.
 
 Use the requests in [Generate video and audio](#4-generate-video-and-audio)
 with `num_inference_steps: 8`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.

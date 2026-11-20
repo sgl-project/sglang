@@ -61,6 +61,11 @@ grid. Omit `num_inference_steps`, or set it to 6. It runs one positive branch:
 omit guidance parameters and `negative_prompt`. It returns one image per
 request. Audio and video inputs and outputs are not supported.
 
+The heads are served from `pdd_fused_heads.safetensors`, outside the
+transformer's parameters. See
+[PDD acceleration LoRAs](/cookbook/diffusion/MiniMax/MiniMax-H3#pdd-acceleration-loras)
+for how a weight update reaches them.
+
 | Task | Endpoint | Input |
 | --- | --- | --- |
 | Text to image | `/v1/images/generations` | JSON prompt |
