@@ -236,6 +236,9 @@ class MambaMixer1(nn.Module):
             "Mamba-1 (Falcon-Mamba) does not support radix mamba-state tracking; "
             "serve with --disable-radix-cache"
         )
+        assert metadata.mis_metadata is None, (
+            "Mamba-1 (Falcon-Mamba) does not support multi-item scoring (--enable-mis)"
+        )
 
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal  # (slots, intermediate/tp, 1, state)

@@ -15,7 +15,10 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.distributed import (
     divide,
 )
-from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    Mamba2Metadata,
+    Mamba2MISMetadata,
+)
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -532,9 +535,8 @@ class MambaMixer2(torch.nn.Module):
         state_indices_tensor_d = state_indices_tensor[
             num_prefills : num_prefills + num_decodes
         ]
-        query_start_loc_p = query_start_loc[: num_prefills + 1] if has_prefill else None
 
-        # Preallocate output tensor to avoid memcpy cost for merging prefill
+        # Preallocated output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
 
         preallocated_ssm_out = torch.empty(
@@ -557,87 +559,93 @@ class MambaMixer2(torch.nn.Module):
 
         # Process prefill requests
         if has_prefill:
-            mixed_metadata = metadata.mixed_metadata
-            assert mixed_metadata is not None
-            # 2. Convolution sequence transformation
-            # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "state_indices_tensor"
-            has_initial_states_p = mixed_metadata.has_initial_states
-            prep_initial_states = mixed_metadata.prep_initial_states
-            cache_indices = state_indices_tensor_p
-            x = hidden_states_B_C_p.transpose(
-                0, 1
-            )  # this is the form that causal-conv see
-            # Runs once per mamba layer
-            if (
-                metadata.has_mamba_track_mask
-                and metadata.track_conv_indices is not None
-            ):
-                x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
-                conv_state[metadata.conv_states_mask_indices] = x_to_track
-            ccfn = (
-                causal_conv1d_fn
-                if not use_triton_causal_conv
-                else causal_conv1d_fn_triton
-            )
-            hidden_states_B_C_p = ccfn(
-                x,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_states_p,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc_p,
-                seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:num_prefill_tokens]
+            if metadata.mis_metadata is None:
+                mixed_metadata = metadata.mixed_metadata
+                assert mixed_metadata is not None
+                query_start_loc_p = query_start_loc[: num_prefills + 1]
+                # 2. Convolution sequence transformation
+                # - "cache_indices" updates the conv_state cache in positions
+                #   pointed to by "state_indices_tensor"
+                has_initial_states_p = mixed_metadata.has_initial_states
+                prep_initial_states = mixed_metadata.prep_initial_states
+                cache_indices = state_indices_tensor_p
+                x = hidden_states_B_C_p.transpose(
+                    0, 1
+                )  # this is the form that causal-conv see
+                # Runs once per mamba layer
+                if (
+                    metadata.has_mamba_track_mask
+                    and metadata.track_conv_indices is not None
+                ):
+                    x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
+                    conv_state[metadata.conv_states_mask_indices] = x_to_track
 
-            hidden_states_p, B_p, C_p = split_hidden_states_B_C_fn(hidden_states_B_C_p)
+                # 3. State Space Model sequence transformation
+                initial_states = None
+                if has_initial_states_p is not None and prep_initial_states:
+                    initial_states = torch.where(
+                        has_initial_states_p[:, None, None, None],
+                        ssm_state[state_indices_tensor_p],
+                        0,
+                    )
 
-            # 3. State Space Model sequence transformation
-            initial_states = None
-            if has_initial_states_p is not None and prep_initial_states:
-                initial_states = torch.where(
-                    has_initial_states_p[:, None, None, None],
-                    ssm_state[state_indices_tensor_p],
-                    0,
+                # NOTE: final output is an in-place update of out tensor
+                intermediate_states, varlen_state, track_states = (
+                    self._run_prefill_conv_and_ssd(
+                        x=x,
+                        dt=dt_p,
+                        num_tokens=num_prefill_tokens,
+                        conv_weights=conv_weights,
+                        conv_states=conv_state,
+                        has_initial_states=has_initial_states_p,
+                        conv_cache_indices=cache_indices,
+                        query_start_loc=query_start_loc_p,
+                        seq_lens_cpu=mixed_metadata.extend_seq_lens_cpu,
+                        chunk_size=mixed_metadata.chunk_size,
+                        seq_idx=mixed_metadata.seq_idx,
+                        chunk_indices=mixed_metadata.chunk_indices,
+                        chunk_offsets=mixed_metadata.chunk_offsets,
+                        initial_ssm_states=initial_states,
+                        ssm_out=preallocated_ssm_out_p,
+                        ssm_state_dtype=ssm_state.dtype,
+                        split_hidden_states_B_C_fn=split_hidden_states_B_C_fn,
+                        local_num_heads=local_num_heads,
+                        local_num_groups=local_num_groups,
+                        use_triton_causal_conv=use_triton_causal_conv,
+                        return_track_states=True,
+                        track_seq_idx=metadata.track_ssm_seq_idx,
+                        track_end_locs=metadata.track_ssm_end_locs,
+                    )
                 )
 
-            # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
-                hidden_states_p.view(
-                    1, num_prefill_tokens, local_num_heads, self.head_dim
-                ),
-                dt_p.unsqueeze(0),
-                self.A,
-                B_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                C_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                chunk_size=mixed_metadata.chunk_size,
-                D=self.D,
-                z=None,
-                dt_bias=self.dt_bias,
-                seq_idx=mixed_metadata.seq_idx,
-                chunk_indices=mixed_metadata.chunk_indices,
-                chunk_offsets=mixed_metadata.chunk_offsets,
-                cu_seqlens=query_start_loc_p,
-                initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
-                return_track_states=True,
-                track_seq_idx=metadata.track_ssm_seq_idx,
-                track_end_locs=metadata.track_ssm_end_locs,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
-                out=preallocated_ssm_out_p.view(
-                    1, num_prefill_tokens, -1, self.head_dim
-                ),
-                state_dtype=ssm_state.dtype,
-            )
-
-            # update ssm states
-            # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
-            if varlen_state is not None:
-                ssm_state[state_indices_tensor_p] = varlen_state
+                # update ssm states
+                # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
+                if varlen_state is not None:
+                    ssm_state[state_indices_tensor_p] = varlen_state
+            else:
+                assert not metadata.has_mamba_track_mask, (
+                    "Mamba-2 multi-item scoring requires --disable-radix-cache"
+                )
+                assert metadata.num_decodes == 0, (
+                    "Mamba-2 multi-item scoring only supports prefill-only batches"
+                )
+                assert not metadata.is_target_verify, (
+                    "Mamba-2 multi-item scoring is only supported for prefill-only requests"
+                )
+                self._forward_mis_prefill(
+                    hidden_states_B_C_p=hidden_states_B_C_p,
+                    dt_p=dt_p,
+                    conv_weights=conv_weights,
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    preallocated_ssm_out_p=preallocated_ssm_out_p,
+                    split_hidden_states_B_C_fn=split_hidden_states_B_C_fn,
+                    mis_metadata=metadata.mis_metadata,
+                    chunk_size=metadata.mis_metadata.chunk_size,
+                    local_num_heads=local_num_heads,
+                    local_num_groups=local_num_groups,
+                    use_triton_causal_conv=use_triton_causal_conv,
+                )
 
         # Process decode requests
         if has_decode:
@@ -770,6 +778,221 @@ class MambaMixer2(torch.nn.Module):
             output[:padded_num_tokens].copy_(mixer_out)
 
         return mixer_out, intermediate_states, track_states
+
+    def _run_prefill_conv_and_ssd(
+        self,
+        *,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        num_tokens: int,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        has_initial_states: Optional[torch.Tensor],
+        conv_cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens_cpu: Optional[list[int]],
+        chunk_size: int,
+        seq_idx: torch.Tensor,
+        chunk_indices: Optional[torch.Tensor],
+        chunk_offsets: Optional[torch.Tensor],
+        initial_ssm_states: Optional[torch.Tensor],
+        ssm_out: torch.Tensor,
+        ssm_state_dtype: torch.dtype,
+        split_hidden_states_B_C_fn: Callable[
+            [torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ],
+        local_num_heads: int,
+        local_num_groups: int,
+        use_triton_causal_conv: bool,
+        return_track_states: bool = False,
+        track_seq_idx: Optional[torch.Tensor] = None,
+        track_end_locs: Optional[torch.Tensor] = None,
+    ):
+        ccfn = (
+            causal_conv1d_fn if not use_triton_causal_conv else causal_conv1d_fn_triton
+        )
+        # Keep the first three arguments positional for NPU causal_conv1d_fn_npu compatibility.
+        x_bc = ccfn(
+            x,
+            conv_weights,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_states,
+            cache_indices=conv_cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+        ).transpose(0, 1)[:num_tokens]
+        hidden_p, B_p, C_p = split_hidden_states_B_C_fn(x_bc)
+        # return_varlen_states=True is required so ssd_combined keeps cu_seqlens active.
+        return mamba_chunk_scan_combined(
+            x=hidden_p.view(1, num_tokens, local_num_heads, self.head_dim),
+            dt=dt.unsqueeze(0),
+            A=self.A,
+            B=B_p.view(1, num_tokens, local_num_groups, -1),
+            C=C_p.view(1, num_tokens, local_num_groups, -1),
+            chunk_size=chunk_size,
+            D=self.D,
+            z=None,
+            dt_bias=self.dt_bias,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            cu_seqlens=query_start_loc,
+            initial_states=initial_ssm_states,
+            return_varlen_states=True,
+            return_final_states=False,
+            return_track_states=return_track_states,
+            track_seq_idx=track_seq_idx,
+            track_end_locs=track_end_locs,
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            out=ssm_out.view(1, num_tokens, -1, self.head_dim),
+            state_dtype=ssm_state_dtype,
+        )
+
+    def _run_mis_segment(
+        self,
+        *,
+        hidden_states_B_C_p: torch.Tensor,
+        dt_p: torch.Tensor,
+        token_indices: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_cache_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_lens_cpu: list[int],
+        seq_idx: torch.Tensor,
+        chunk_size: int,
+        chunk_indices: Optional[torch.Tensor],
+        chunk_offsets: Optional[torch.Tensor],
+        initial_ssm_states: Optional[torch.Tensor],
+        ssm_state_dtype: torch.dtype,
+        split_hidden_states_B_C_fn: Callable[
+            [torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ],
+        preallocated_ssm_out_p: torch.Tensor,
+        local_num_heads: int,
+        local_num_groups: int,
+        use_triton_causal_conv: bool,
+    ) -> torch.Tensor:
+        seg_x_bc = hidden_states_B_C_p.index_select(0, token_indices)
+        seg_dt = dt_p.index_select(0, token_indices)
+        num_seg_tokens = token_indices.numel()
+        seg_ssm_out = torch.empty(
+            (num_seg_tokens, preallocated_ssm_out_p.shape[1]),
+            dtype=preallocated_ssm_out_p.dtype,
+            device=preallocated_ssm_out_p.device,
+        )
+        varlen_state = self._run_prefill_conv_and_ssd(
+            x=seg_x_bc.transpose(0, 1),
+            dt=seg_dt,
+            num_tokens=num_seg_tokens,
+            conv_weights=conv_weights,
+            conv_states=conv_states,
+            has_initial_states=has_initial_states,
+            conv_cache_indices=conv_cache_indices,
+            query_start_loc=cu_seqlens,
+            seq_lens_cpu=seq_lens_cpu,
+            chunk_size=chunk_size,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            initial_ssm_states=initial_ssm_states,
+            ssm_out=seg_ssm_out,
+            ssm_state_dtype=ssm_state_dtype,
+            split_hidden_states_B_C_fn=split_hidden_states_B_C_fn,
+            local_num_heads=local_num_heads,
+            local_num_groups=local_num_groups,
+            use_triton_causal_conv=use_triton_causal_conv,
+            return_track_states=False,
+        )
+        preallocated_ssm_out_p.index_copy_(0, token_indices, seg_ssm_out)
+        return varlen_state
+
+    def _forward_mis_prefill(
+        self,
+        *,
+        hidden_states_B_C_p: torch.Tensor,
+        dt_p: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        preallocated_ssm_out_p: torch.Tensor,
+        split_hidden_states_B_C_fn: Callable[
+            [torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ],
+        mis_metadata: Mamba2MISMetadata,
+        chunk_size: int,
+        local_num_heads: int,
+        local_num_groups: int,
+        use_triton_causal_conv: bool,
+    ) -> None:
+        # Keep skipped delimiter rows finite (0.0) and clear stale request slots.
+        preallocated_ssm_out_p.zero_()
+        conv_state.index_fill_(0, mis_metadata.reset_cache_indices, 0)
+        ssm_state.index_fill_(0, mis_metadata.reset_cache_indices, 0)
+
+        if mis_metadata.query_token_indices.numel() > 0:
+            query_varlen_state = self._run_mis_segment(
+                hidden_states_B_C_p=hidden_states_B_C_p,
+                dt_p=dt_p,
+                token_indices=mis_metadata.query_token_indices,
+                conv_weights=conv_weights,
+                conv_states=conv_state,
+                conv_cache_indices=mis_metadata.query_cache_indices,
+                has_initial_states=mis_metadata.query_has_initial_states,
+                cu_seqlens=mis_metadata.query_cu_seqlens,
+                seq_lens_cpu=mis_metadata.query_seq_lens_cpu,
+                seq_idx=mis_metadata.query_seq_idx,
+                chunk_size=chunk_size,
+                chunk_indices=None,
+                chunk_offsets=None,
+                initial_ssm_states=None,
+                ssm_state_dtype=ssm_state.dtype,
+                split_hidden_states_B_C_fn=split_hidden_states_B_C_fn,
+                preallocated_ssm_out_p=preallocated_ssm_out_p,
+                local_num_heads=local_num_heads,
+                local_num_groups=local_num_groups,
+                use_triton_causal_conv=use_triton_causal_conv,
+            )
+            ssm_state.index_copy_(
+                0,
+                mis_metadata.query_cache_indices_i64,
+                query_varlen_state.to(dtype=ssm_state.dtype),
+            )
+
+        if mis_metadata.item_token_indices.numel() > 0:
+            # Give every item a private conv state copy so siblings never interfere.
+            item_conv_states = conv_state.index_select(
+                0, mis_metadata.item_ssm_indices_i64
+            ).contiguous()
+            item_initial_ssm = ssm_state.index_select(
+                0, mis_metadata.item_ssm_indices_i64
+            )
+            self._run_mis_segment(
+                hidden_states_B_C_p=hidden_states_B_C_p,
+                dt_p=dt_p,
+                token_indices=mis_metadata.item_token_indices,
+                conv_weights=conv_weights,
+                conv_states=item_conv_states,
+                conv_cache_indices=mis_metadata.item_conv_indices,
+                has_initial_states=mis_metadata.item_has_initial_states,
+                cu_seqlens=mis_metadata.item_cu_seqlens,
+                seq_lens_cpu=mis_metadata.item_seq_lens_cpu,
+                seq_idx=mis_metadata.item_seq_idx,
+                chunk_size=chunk_size,
+                chunk_indices=mis_metadata.item_chunk_indices,
+                chunk_offsets=mis_metadata.item_chunk_offsets,
+                initial_ssm_states=item_initial_ssm,
+                ssm_state_dtype=ssm_state.dtype,
+                split_hidden_states_B_C_fn=split_hidden_states_B_C_fn,
+                preallocated_ssm_out_p=preallocated_ssm_out_p,
+                local_num_heads=local_num_heads,
+                local_num_groups=local_num_groups,
+                use_triton_causal_conv=use_triton_causal_conv,
+            )
 
     @property
     def mamba_type(self) -> str:

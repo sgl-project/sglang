@@ -1182,9 +1182,21 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
     needs_cpu_seq_lens: bool = False
+    supports_mis: bool = True
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.enable_mis = get_exec().features.enable_mis
+        if self.enable_mis:
+            from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+
+            if isinstance(
+                model_runner.model_config.hf_config,
+                (MambaConfig, FalconMambaConfig),
+            ):
+                raise ValueError(
+                    "Mamba-1 models do not support multi-item scoring (--enable-mis)."
+                )
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
 
         if get_exec().mamba.enable_mamba_extra_buffer:
@@ -1227,11 +1239,35 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        metadata = self._forward_metadata(forward_batch)
-        self.forward_metadata = Mamba2Metadata.prepare_mixed(
-            metadata,
-            self.mamba_chunk_size,
-            forward_batch,
+        if forward_batch.multi_item_delimiter_indices is None:
+            metadata = self._forward_metadata(forward_batch)
+            self.forward_metadata = Mamba2Metadata.prepare_mixed(
+                metadata,
+                self.mamba_chunk_size,
+                forward_batch,
+            )
+            return
+        if not self.enable_mis:
+            raise ValueError("Mamba2 MIS metadata requires --enable-mis")
+        cache_indices, replayssm_ring_indices = self._get_mis_pool_indices(
+            req_pool_indices=forward_batch.req_pool_indices,
+            batch_size=forward_batch.batch_size,
+        )
+        self.forward_metadata = Mamba2Metadata.prepare_mis(
+            cache_indices=cache_indices,
+            replayssm_ring_indices=replayssm_ring_indices,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
+            num_input_tokens=forward_batch.input_ids.numel(),
+            chunk_size=self.mamba_chunk_size,
+            device=forward_batch.input_ids.device,
+            is_prefill_only=forward_batch.is_prefill_only,
+            is_extend=forward_batch.forward_mode.is_extend(),
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            mamba_prefill_track_mask_cpu=forward_batch.mamba_prefill_track_mask_cpu,
+            has_mamba_track_mask=forward_batch.mamba_track_mask is not None,
+            has_mamba_track_indices=forward_batch.mamba_track_indices is not None,
         )
 
     def forward(
@@ -1293,6 +1329,22 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         raise NotImplementedError(
             "Mamba2AttnBackend's forward is called directly instead of through HybridLinearAttnBackend, as it supports mixed prefill and decode"
         )
+
+    def _get_mis_pool_indices(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        mamba_cache_indices = self._translate_mamba_indices(
+            self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        )
+        replayssm_ring_indices = None
+        if self._replayssm_request_ring():
+            replayssm_ring_indices = self._ring_ids.ids(
+                req_pool_indices[:batch_size]
+            ).to(dtype=torch.int32)
+        return mamba_cache_indices, replayssm_ring_indices
 
 
 class HybridLinearAttnBackend(AttentionBackend):

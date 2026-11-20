@@ -102,6 +102,11 @@ class TokenizerManagerScoreMixin:
         delimiter_indices = []
 
         for item in items:
+            if not item:
+                raise ValueError(
+                    "Multi-item scoring (--enable-mis) does not support empty items; "
+                    "each item must contain at least one token."
+                )
             delimiter_indices.append(len(combined_sequence))
             combined_sequence.append(delimiter_token_id)  # Add delimiter
             combined_sequence.extend(item)  # Add item tokens

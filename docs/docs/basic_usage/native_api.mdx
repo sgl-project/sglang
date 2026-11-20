@@ -272,6 +272,8 @@ Parameters:
 
 The response contains `scores` - a list of probability lists, one per item, each in the order of `label_token_ids`.
 
+When the server is launched with `--enable-mis`, Multi-Item Scoring (MIS) packs a shared query prefix and candidate items into one prefill request (requiring `--attention-backend flashinfer` and auto-disabling CUDA graphs, radix cache, and chunked prefill). Alongside FlashInfer full-attention layers, MIS also supports Gated DeltaNet and Mamba-2 linear attention layers (for example, Falcon-H1 hybrid models); Mamba-1 models (`MambaConfig`, `FalconMambaConfig`) are unsupported, and empty items (`items=[[]]` or `items=[""]`) are rejected when `--enable-mis` is enabled (while `items=[]` returns empty scores).
+
 ```python Example
 score_process, port = launch_server_cmd("""
 python3 -m sglang.launch_server --model-path qwen/qwen2.5-0.5b-instruct \

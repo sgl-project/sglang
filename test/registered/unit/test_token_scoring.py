@@ -17,6 +17,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerSc
 from sglang.srt.runtime_context import publish, restore_context, snapshot_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -113,16 +114,8 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.token_logprobs)
 
     async def test_mis_text_items_do_not_add_special_tokens(self):
-        vocab = {"[UNK]": 0, "[BOS]": 1, "Rate": 2, ":": 3, "Option": 4, "A": 5, "B": 6}
-        tokenizer = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = Whitespace()
-        tokenizer.post_processor = TemplateProcessing(
-            single="[BOS] $A", special_tokens=[("[BOS]", vocab["[BOS]"])]
-        )
         manager = ScoringManager(enable_mis=True)
-        manager.tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=tokenizer, bos_token="[BOS]", unk_token="[UNK]"
-        )
+        manager.tokenizer = _make_word_tokenizer()
         items = [" Option A", " Option B"]
         for query in ("Rate:", ""):
             with self.subTest(query=query):
@@ -260,6 +253,70 @@ class TestSyncTokenScoring(unittest.TestCase):
         finally:
             engine.loop.run_until_complete(engine.loop.shutdown_asyncgens())
             engine.loop.close()
+
+
+class TestMisEmptyItemRejection(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    def test_mis_rejects_empty_items(self):
+        asyncio.run(self._check_mis_rejects_empty_items())
+
+    async def _check_mis_rejects_empty_items(self):
+        for bad_items in ([[]], [[4], []]):
+            with self.subTest(bad_items=bad_items):
+                manager = ScoringManager(enable_mis=True)
+                with self.assertRaisesRegex(ValueError, "empty items"):
+                    await manager.score_request(
+                        query=[4], items=bad_items, label_token_ids=[1, 3]
+                    )
+                self.assertEqual(manager.requests, [])
+
+        for bad_text_items in ([""], [" Option A", ""]):
+            with self.subTest(bad_text_items=bad_text_items):
+                manager = ScoringManager(enable_mis=True)
+                manager.tokenizer = _make_word_tokenizer()
+                with self.assertRaisesRegex(ValueError, "empty items"):
+                    await manager.score_request(
+                        query="Rate:", items=bad_text_items, label_token_ids=[5, 6]
+                    )
+                self.assertEqual(manager.requests, [])
+
+        manager = ScoringManager(enable_mis=True)
+        request = ScoringRequest(
+            query=[4],
+            items=[[]],
+            label_token_ids=[1, 3],
+            apply_softmax=True,
+        )
+        response = await OpenAIServingScore(manager)._handle_non_streaming_request(
+            adapted_request=request,
+            request=request,
+            raw_request=None,
+        )
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.body)
+        self.assertEqual(body["type"], "BadRequestError")
+        self.assertIn("empty items", body["message"])
+        self.assertEqual(manager.requests, [])
+
+        empty_result = await manager.score_request(
+            query=[4], items=[], label_token_ids=[1, 3]
+        )
+        self.assertEqual(empty_result.scores, [])
+        self.assertEqual(manager.requests, [])
+
+
+def _make_word_tokenizer() -> PreTrainedTokenizerFast:
+    vocab = {"[UNK]": 0, "[BOS]": 1, "Rate": 2, ":": 3, "Option": 4, "A": 5, "B": 6}
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    tokenizer.post_processor = TemplateProcessing(
+        single="[BOS] $A", special_tokens=[("[BOS]", vocab["[BOS]"])]
+    )
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, bos_token="[BOS]", unk_token="[UNK]"
+    )
 
 
 if __name__ == "__main__":
