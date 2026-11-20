@@ -7,8 +7,75 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 
 logger = logging.getLogger(__name__)
+
+
+def ngram_namespace_mask(
+    extra_key: str | None = None,
+    cache_salt: str | None = None,
+) -> int:
+    """XOR mask for one request's ngram tokens. 0 when the request is unnamespaced."""
+    seed = storage_namespace_seed(extra_key, cache_salt)
+    if seed is None:
+        return 0
+    mask = int(seed[:8], 16)
+    return mask if mask else 1
+
+
+def ngram_namespace_mask_from_req(req) -> int:
+    return ngram_namespace_mask(
+        getattr(req, "extra_key", None),
+        getattr(req, "cache_salt", None),
+    )
+
+
+def _xor_int32(token: int, mask: int) -> int:
+    return int(np.int32(np.uint32(token) ^ np.uint32(mask)))
+
+
+def _xor_token_batch(
+    batch_tokens: list[list[int]], masks: Sequence[int] | None
+) -> list[list[int]]:
+    if not masks:
+        return batch_tokens
+    if len(masks) != len(batch_tokens):
+        raise ValueError(
+            f"namespace mask count ({len(masks)}) must match batch size "
+            f"({len(batch_tokens)})"
+        )
+    if all(mask == 0 for mask in masks):
+        return batch_tokens
+    encoded: list[list[int]] = []
+    for tokens, mask in zip(batch_tokens, masks):
+        if not mask:
+            encoded.append(tokens)
+        else:
+            encoded.append([_xor_int32(token, mask) for token in tokens])
+    return encoded
+
+
+def _xor_draft_tokens(
+    drafts: np.ndarray, masks: Sequence[int] | None, draft_token_num: int
+) -> np.ndarray:
+    if not masks or all(mask == 0 for mask in masks):
+        return drafts
+    if len(masks) * draft_token_num != drafts.shape[0]:
+        raise ValueError(
+            f"namespace mask count ({len(masks)}) is not compatible with "
+            f"{drafts.shape[0]} draft tokens and draft_token_num={draft_token_num}"
+        )
+    decoded = drafts.copy()
+    for i, mask in enumerate(masks):
+        if not mask:
+            continue
+        sl = slice(i * draft_token_num, (i + 1) * draft_token_num)
+        bits = np.array(decoded[sl], dtype=np.int32, copy=True)
+        decoded[sl] = (
+            (bits.view(np.uint32) ^ np.uint32(mask)).view(np.int32).astype(np.int64)
+        )
+    return decoded
 
 
 class NgramCorpus:
@@ -49,8 +116,12 @@ class NgramCorpus:
             self._req_id_to_state_id[req_id] = sid
         return sid
 
-    def batch_put(self, batch_tokens: List[List[int]]):
-        self._obj.insert(batch_tokens)
+    def batch_put(
+        self,
+        batch_tokens: List[List[int]],
+        namespace_masks: Sequence[int] | None = None,
+    ):
+        self._obj.insert(_xor_token_batch(batch_tokens, namespace_masks))
 
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
@@ -102,9 +173,15 @@ class NgramCorpus:
         req_ids: List[str],
         batch_tokens: List[List[int]],
         total_lens: List[int],
+        namespace_masks: Sequence[int] | None = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
-        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+        drafts, mask = self._obj.match_stateful(
+            state_ids,
+            _xor_token_batch(batch_tokens, namespace_masks),
+            total_lens,
+        )
+        return _xor_draft_tokens(drafts, namespace_masks, self.draft_token_num), mask
 
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []

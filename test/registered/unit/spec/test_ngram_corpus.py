@@ -9,7 +9,10 @@ import numpy as np
 from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
-from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.cpp_ngram.ngram_corpus import (
+    NgramCorpus,
+    ngram_namespace_mask,
+)
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -863,6 +866,135 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             any(4 in path or 5 in path for path in leaf_paths),
             f"Expected tokens from corpus 'a' in {leaf_paths}",
         )
+
+
+class TestNgramCorpusNamespaceIsolation(CustomTestCase):
+    def test_unnamespaced_mask_is_zero_and_salts_differ(self):
+        self.assertEqual(ngram_namespace_mask(None, None), 0)
+        mask_a = ngram_namespace_mask(None, "tenant-A")
+        mask_b = ngram_namespace_mask(None, "tenant-B")
+        self.assertNotEqual(mask_a, 0)
+        self.assertNotEqual(mask_b, 0)
+        self.assertNotEqual(mask_a, mask_b)
+        self.assertNotEqual(
+            ngram_namespace_mask("lora-1", None),
+            ngram_namespace_mask("lora-2", None),
+        )
+
+    def _accepted(self, drafts, target):
+        n = 0
+        for d, t in zip(drafts[1:], target):
+            if d != t:
+                break
+            n += 1
+        return n
+
+    def test_cross_salt_does_not_draft_foreign_tokens(self):
+        # Reproduces sgl-project/sglang#49626: a second tenant that shares a
+        # known prefix must not draft another tenant's secret tokens, and the
+        # greedy accept length must not reveal that secret.
+        depth, k = 18, 8
+        known = [5001, 5002, 5003, 5004]
+        secret = [7101, 7102, 7103, 7104, 7105, 7106]
+        corpus = NgramCorpus(
+            min_bfs_breadth=1,
+            max_bfs_breadth=10,
+            match_type="BFS",
+            capacity=10_000,
+            max_trie_depth=depth,
+            draft_token_num=k,
+        )
+        mask_a = ngram_namespace_mask(None, "tenant-A")
+        mask_b = ngram_namespace_mask(None, "tenant-B")
+
+        a_prompt, a_output = list(range(100, 140)), []
+        for tok in known + secret + [9000, 9001]:
+            a_output.append(tok)
+            window = a_output[-depth:]
+            if len(window) < depth:
+                window = a_prompt[-(depth - len(window)) :] + window
+            corpus.batch_put([window], namespace_masks=[mask_a])
+        corpus.synchronize()
+
+        b_prompt, b_output = list(range(300, 340)), list(known)
+        b_window = b_output[-depth:]
+        if len(b_window) < depth:
+            b_window = b_prompt[-(depth - len(b_window)) :] + b_window
+        drafts, _ = corpus.batch_get(
+            ["req-B"],
+            [b_window],
+            [len(b_prompt) + len(b_output)],
+            namespace_masks=[mask_b],
+        )
+        drafts = drafts.tolist()
+        self.assertFalse(any(tok in secret for tok in drafts))
+        self.assertEqual(self._accepted(drafts, secret), 0)
+
+        # The same prefix under tenant A's salt still drafts the secret.
+        drafts_a, _ = corpus.batch_get(
+            ["req-A"],
+            [b_window],
+            [len(b_prompt) + len(b_output)],
+            namespace_masks=[mask_a],
+        )
+        drafts_a = drafts_a.tolist()
+        self.assertTrue(any(tok in secret for tok in drafts_a))
+        self.assertEqual(self._accepted(drafts_a, secret), len(secret))
+
+    def test_same_namespace_still_matches(self):
+        corpus = _make_corpus()
+        mask = ngram_namespace_mask(None, "tenant-A")
+        corpus.batch_put([[1, 2, 3, 10, 11, 12]], namespace_masks=[mask])
+        corpus.synchronize()
+        drafts, _ = corpus.batch_get(
+            ["req-same"],
+            [[1, 2, 3]],
+            [3],
+            namespace_masks=[mask],
+        )
+        self.assertIn(10, drafts.tolist())
+
+    def test_extra_key_isolates_lora_identities(self):
+        corpus = _make_corpus()
+        mask_a = ngram_namespace_mask("lora-a", None)
+        mask_b = ngram_namespace_mask("lora-b", None)
+        corpus.batch_put([[1, 2, 3, 40, 41]], namespace_masks=[mask_a])
+        corpus.synchronize()
+        drafts_b, _ = corpus.batch_get(
+            ["req-b"],
+            [[1, 2, 3]],
+            [3],
+            namespace_masks=[mask_b],
+        )
+        self.assertNotIn(40, drafts_b.tolist())
+        drafts_a, _ = corpus.batch_get(
+            ["req-a"],
+            [[1, 2, 3]],
+            [3],
+            namespace_masks=[mask_a],
+        )
+        self.assertIn(40, drafts_a.tolist())
+
+    def test_mixed_batch_does_not_cross_namespaces(self):
+        corpus = _make_corpus()
+        mask_a = ngram_namespace_mask(None, "tenant-A")
+        mask_b = ngram_namespace_mask(None, "tenant-B")
+        corpus.batch_put(
+            [[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]],
+            namespace_masks=[mask_a, mask_b],
+        )
+        corpus.synchronize()
+        drafts, _ = corpus.batch_get(
+            ["ra", "rb"],
+            [[1, 2, 3], [1, 2, 3]],
+            [3, 3],
+            namespace_masks=[mask_a, mask_b],
+        )
+        drafts = drafts.reshape(2, corpus.draft_token_num)
+        self.assertIn(10, drafts[0].tolist())
+        self.assertNotIn(20, drafts[0].tolist())
+        self.assertIn(20, drafts[1].tolist())
+        self.assertNotIn(10, drafts[1].tolist())
 
 
 if __name__ == "__main__":
