@@ -75,7 +75,7 @@ class FunctionCallParser:
     Parser for function/tool calls in model outputs.
 
     This class handles both streaming and non-streaming parsing of function calls using a detector.
-    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_chunk
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
@@ -245,26 +245,8 @@ class FunctionCallParser:
         """
         if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        final_normal_text = sp_result.normal_text
-        final_calls = list(sp_result.calls)
-        # A chunk can hold more than one step of work for the detector, such
-        # as a whole call or several calls (batched detokenization,
-        # stream_interval > 1, speculative decoding). Detectors handle one
-        # step per call, so keep stepping until one makes no progress.
-        while True:
-            buffer = self.detector._buffer
-            sp_result = self.detector.parse_streaming_increment("", self.tools)
-            if not (
-                sp_result.normal_text
-                or sp_result.calls
-                or self.detector._buffer != buffer
-            ):
-                break
-            final_normal_text += sp_result.normal_text
-            final_calls.extend(sp_result.calls)
-
-        return final_normal_text, final_calls
+        sp_result = self.detector.parse_streaming_chunk(chunk_text, self.tools)
+        return sp_result.normal_text, sp_result.calls
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.

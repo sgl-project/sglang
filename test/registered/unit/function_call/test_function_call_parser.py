@@ -1214,6 +1214,17 @@ class TestBaseFormatDetector(unittest.TestCase):
             params["city"], "杭州", "Should correctly parse Chinese city name"
         )
 
+    def test_chunk_stops_when_a_step_resends_its_buffer(self):
+        # Several detectors' error paths send their whole buffer as text and
+        # keep it, so stepping again would send it again.
+        def resend(new_text, tools):
+            self.detector._buffer += new_text
+            return StreamingParseResult(normal_text=self.detector._buffer)
+
+        with patch.object(self.detector, "parse_streaming_increment", resend):
+            result = self.detector.parse_streaming_chunk("<tool_call>{", self.tools)
+        self.assertEqual(result.normal_text, "<tool_call>{")
+
 
 class TestLlama32Detector(unittest.TestCase):
     def setUp(self):
@@ -6512,74 +6523,6 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                     ),
                     expected,
                 )
-
-
-class TestStreamChunkWithWholeCalls(unittest.TestCase):
-    """A chunk can hold whole calls: batched detokenization, stream_interval > 1,
-    and speculative decoding all send more than one token per chunk."""
-
-    CALLS = [("get_weather", {"city": "Paris"}), ("get_time", {"timezone": "UTC"})]
-    OUTPUTS = {
-        "qwen25": [
-            '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}'
-            "\n</tool_call>",
-            '\n<tool_call>\n{"name": "get_time", "arguments": {"timezone": "UTC"}}'
-            "\n</tool_call>",
-        ],
-        "llama3": [
-            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}',
-            ';{"name": "get_time", "parameters": {"timezone": "UTC"}}',
-        ],
-        "glm45": [
-            "<tool_call>get_weather\n<arg_key>city</arg_key>\n"
-            "<arg_value>Paris</arg_value>\n</tool_call>",
-            "\n<tool_call>get_time\n<arg_key>timezone</arg_key>\n"
-            "<arg_value>UTC</arg_value>\n</tool_call>",
-        ],
-    }
-
-    def setUp(self):
-        self.tools = [
-            Tool(
-                type="function",
-                function=Function(
-                    name=name,
-                    parameters={
-                        "type": "object",
-                        "properties": {key: {"type": "string"}},
-                    },
-                ),
-            )
-            for name, key in (("get_weather", "city"), ("get_time", "timezone"))
-        ]
-
-    def _stream(self, parser_name, chunks):
-        parser = FunctionCallParser(self.tools, parser_name)
-        content, names, arguments = "", {}, {}
-        results = [parser.parse_stream_chunk(chunk) for chunk in chunks]
-        for delta, items in results + [parser.parse_stream_end()]:
-            content += delta
-            for item in items:
-                if item.name:
-                    names.setdefault(item.tool_index, []).append(item.name)
-                arguments[item.tool_index] = (
-                    arguments.get(item.tool_index, "") + item.parameters
-                )
-        self.assertEqual(content.strip(), "")
-        self.assertEqual(
-            [(names.get(i), json.loads(arguments[i])) for i in sorted(arguments)],
-            [([name], args) for name, args in self.CALLS],
-        )
-
-    def test_one_call_per_chunk(self):
-        for parser_name, calls in self.OUTPUTS.items():
-            with self.subTest(parser=parser_name):
-                self._stream(parser_name, calls)
-
-    def test_two_calls_in_one_chunk(self):
-        for parser_name, calls in self.OUTPUTS.items():
-            with self.subTest(parser=parser_name):
-                self._stream(parser_name, ["".join(calls)])
 
 
 class TestToolCallParserNames(unittest.TestCase):

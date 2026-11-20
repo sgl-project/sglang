@@ -28,6 +28,9 @@ from sglang.srt.function_call.utils import (
 
 logger = logging.getLogger(__name__)
 
+# A call takes a few steps; the bound only stops a detector that never idles.
+_MAX_STEPS_PER_CHUNK = 1024
+
 
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
@@ -342,6 +345,40 @@ class BaseFormatDetector(ABC):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
+
+    def parse_streaming_chunk(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        """Parse a streamed chunk, stepping until the detector emits nothing.
+
+        A step of parse_streaming_increment can emit as little as one name or
+        one argument diff, while a chunk can hold whole calls (batched
+        detokenization, stream_interval > 1, speculative decoding). Work left
+        after the last chunk is never stepped again.
+        """
+        result = self.parse_streaming_increment(new_text, tools)
+        normal_text, calls = result.normal_text, list(result.calls)
+        for _ in range(_MAX_STEPS_PER_CHUNK):
+            if not (result.normal_text or result.calls):
+                break
+            buffer = self._buffer
+            result = self.parse_streaming_increment("", tools)
+            if not result.calls and self._buffer == buffer:
+                # Text sent without consuming the buffer is a resend: several
+                # detectors' error paths send their whole buffer and keep it.
+                # A detector that keeps its text outside _buffer must send it
+                # in one step.
+                break
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        else:
+            logger.error(
+                "%s still emits output after %d steps on one chunk; the rest "
+                "of the chunk waits for the next one",
+                type(self).__name__,
+                _MAX_STEPS_PER_CHUNK,
+            )
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:

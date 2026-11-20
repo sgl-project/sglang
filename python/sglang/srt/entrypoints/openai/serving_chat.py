@@ -3749,7 +3749,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, effective_tools)
+            result = parser.parse_streaming_chunk(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
             if flush:
                 end = parser.finish(effective_tools)
