@@ -215,20 +215,17 @@ _use_fp8_prefill_attn = (
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
-# SGLANG_AITER_MLA_DECODE_BACKEND value that runs decode and target verify on
-# aiter's persistent fp8-query ASM MLA kernel where _fp8_q_asm_mla_skip_reason allows.
+# SGLANG_AITER_MLA_DECODE_BACKEND value for the persistent fp8-query ASM MLA route,
+# taken where _fp8_q_asm_mla_skip_reason allows.
 _MLA_FP8_Q_ASM_DECODE_BACKEND = "asm_fp8q"
-# Windows the fp8-query ASM kernel runs correctly at 16 padded heads. 2-4 return
-# wrong output (ROCm/aiter#7007). 5-8 fold onto aiter's 128-row qlen-4 kernel,
-# which on MI355X beats Gluon only from about 128K tokens of context; that
-# crossover is why the route is an explicit backend choice, not a default.
+# 2-4 token windows return wrong output at 16 padded heads (ROCm/aiter#7007);
+# 5-8 fold onto aiter's qlen-4 kernel, faster than Gluon on MI355X only past ~128K context.
 _MLA_FP8_Q_ASM_QLENS = frozenset((1, *range(5, 8 + 1)))
 
 
 @functools.cache
 def _is_gfx950() -> bool:
-    """Exactly gfx950 (MI350X/MI355X), not any gfx95x: the fp8-Q ASM MLA route's
-    only arch. False off HIP."""
+    """Exactly gfx950 (MI350X/MI355X), not any gfx95x; False off HIP."""
     from sglang.kernels.arch import current_arch
 
     hip = current_arch().hip
@@ -1356,8 +1353,8 @@ class AiterAttnBackend(AttentionBackend):
                     "aiter MLA: aiter plans the KV splits "
                     "(SGLANG_AITER_MLA_AUTO_KV_SPLITS=1)"
                 )
-                # Draft extend reads the module modes; the fp8-Q opt-in alone must not
-                # flip them, it takes its own from _mla_decode_metadata_modes.
+                # Draft extend reads the module modes, so the fp8-Q opt-in must not flip them;
+                # it takes its own from _mla_decode_metadata_modes.
                 if use_module_mla_persist:
                     fast_mode = True
                     intra_batch_mode = False
