@@ -28,6 +28,10 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    run_release_ops,
+    stream_then_release,
+)
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -192,17 +196,25 @@ class SchedulerBatchResultProcessor:
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
+        release_ops: List[Callable[[], None]] = []
         for req in batch.reqs:
             req.time_stats.set_decode_prebuilt_finish_time()
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.request_retirer.release(req, checkpoint=True)
+                release_ops.append(
+                    partial(self.request_retirer.release, req, checkpoint=True)
+                )
 
         # Running requests send the prefill token with their first decode output.
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(
-            [req for req in batch.reqs if req.finished()], batch.return_logprob
+        finished_reqs = [req for req in batch.reqs if req.finished()]
+        stream_then_release(
+            stream=lambda: self.output_streamer.stream_output(
+                finished_reqs, batch.return_logprob
+            ),
+            reqs=finished_reqs,
+            release_ops=release_ops,
         )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
@@ -370,21 +382,22 @@ class SchedulerBatchResultProcessor:
         kv_ops: List[Callable[[], None]],
         skip_stream_req: Optional[Req],
     ) -> None:
-        """Run a prefill batch's queued KV calls in order, end the free group, then
-        send the outputs of ``stream_reqs``, the requests still in the batch.
+        """Send the outputs of ``stream_reqs``, the requests still in the batch, then
+        run the batch's queued KV calls in order and end the free group.
 
         The loop queues each row's KV work (HiSparse finish, release, checkpoint,
-        staging admit) in row order, so an override that sends first moves only the
-        send. The send and the KV calls are coupled both ways: stream_output sets
-        finished_output and fills finished_len where it is None, and release_kv_cache
-        reads finished_len.
+        staging admit) in row order. The send and the KV calls are coupled both
+        ways: stream_output sets finished_output and fills finished_len where it is
+        None, and release_kv_cache reads finished_len; see stream_then_release.
         """
-        for op in kv_ops:
-            op()
-        self.token_to_kv_pool_allocator.free_group_end()
-        self.output_streamer.stream_output(
-            stream_reqs, batch.return_logprob, skip_stream_req
+        stream_then_release(
+            stream=lambda: self.output_streamer.stream_output(
+                stream_reqs, batch.return_logprob, skip_stream_req
+            ),
+            reqs=stream_reqs,
+            release_ops=kv_ops,
         )
+        self.token_to_kv_pool_allocator.free_group_end()
 
     def process_batch_result_prefill(
         self,
@@ -394,7 +407,7 @@ class SchedulerBatchResultProcessor:
         skip_stream_req = None
         still_in_batch_rows = self._rows_still_in_batch(batch)
         self.token_to_kv_pool_allocator.free_group_begin()
-        # Each generation row's KV work, queued in row order for _flush_prefill.
+        # Each row's KV work, queued in row order for _flush_prefill.
         kv_ops: List[Callable[[], None]] = []
         checkpoint_reqs: List[Req] = []
 
@@ -634,7 +647,9 @@ class SchedulerBatchResultProcessor:
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
-                    self.request_retirer.release(req, checkpoint=False)
+                    kv_ops.append(
+                        partial(self.request_retirer.release, req, checkpoint=False)
+                    )
                     req.time_stats.set_completion_time()
                     continue
 
@@ -652,10 +667,14 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        self.request_retirer.release(req, checkpoint=True)
+                        kv_ops.append(
+                            partial(self.request_retirer.release, req, checkpoint=True)
+                        )
                         req.time_stats.set_completion_time()
                     else:
-                        checkpoint_kv_cache(req, self.tree_cache)
+                        kv_ops.append(
+                            partial(checkpoint_kv_cache, req, self.tree_cache)
+                        )
                 else:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
@@ -1201,6 +1220,8 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        # Finished rows' KV releases, run after their outputs are sent.
+        release_ops: List[Callable[[], None]] = []
 
         # Folds the relay point's selection into the DAG and sets the finish
         # states the loop below observes. Beam + spec is rejected at admission.
@@ -1219,7 +1240,7 @@ class SchedulerBatchResultProcessor:
             if req.beam_group is not None:
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
+                    req, batch, result, i, logits_output, release_ops=release_ops
                 )
                 continue
 
@@ -1246,11 +1267,17 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
-                self._handle_sampling_mask_abort(req)
+                self._handle_sampling_mask_abort(req, release_ops=release_ops)
                 continue
 
             self._handle_finish_state_updated_req(
-                req, batch, result, i, logits_output, new_accept_len
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                new_accept_len,
+                release_ops=release_ops,
             )
 
             if req.return_logprob:
@@ -1289,13 +1316,22 @@ class SchedulerBatchResultProcessor:
                 req.grammar.finished = req.finished()
 
         if auxiliary_output is not None:
+            # The consumer may defer a finished response, which deferred_output
+            # allows only after its release.
+            run_release_ops(release_ops)
             self.consume_auxiliary_output(
                 batch,
                 auxiliary_output,
                 auxiliary_output_starts,
             )
 
-        self.output_streamer.stream_output(reqs_still_in_batch, batch.return_logprob)
+        stream_then_release(
+            stream=lambda: self.output_streamer.stream_output(
+                reqs_still_in_batch, batch.return_logprob
+            ),
+            reqs=reqs_still_in_batch,
+            release_ops=release_ops,
+        )
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -1555,15 +1591,33 @@ class SchedulerBatchResultProcessor:
         if callable(prepare_release):
             prepare_release(req)
 
-    def _handle_sampling_mask_abort(self, req: Req) -> None:
-        """Release a request whose sampled token must not be committed."""
-        if req.multimodal_inputs is not None and req.session is None:
-            req.multimodal_inputs.release_features()
+    def _release_finished_req(self, req: Req, *, cache: bool) -> None:
+        """Release a finished request's KV; ``cache`` offloads or checkpoints it."""
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
+            if cache:
+                # The release waits for every Device->Host copy of the request to land.
+                self.decode_offload_manager.offload_kv_cache(req)
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
             self._prepare_kv_cache_release(req)
-            self.request_retirer.release(req, checkpoint=False)
+            checkpoint = cache and (
+                req.mamba_lazy_checkpoint
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy
+                else True
+            )
+            self.request_retirer.release(req, checkpoint=checkpoint)
+
+    def _handle_sampling_mask_abort(
+        self, req: Req, release_ops: Optional[List[Callable[[], None]]] = None
+    ) -> None:
+        """Release a request whose sampled token must not be committed."""
+        if req.multimodal_inputs is not None and req.session is None:
+            req.multimodal_inputs.release_features()
+        release = partial(self._release_finished_req, req, cache=False)
+        if release_ops is None:
+            release()
+        else:
+            release_ops.append(release)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1574,6 +1628,7 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
         num_new_tokens: int = 1,
+        release_ops: Optional[List[Callable[[], None]]] = None,
     ):
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
@@ -1639,18 +1694,11 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
-            if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # The release waits for every Device->Host copy of the request to land.
-                self.decode_offload_manager.offload_kv_cache(req)
-                self.decode_offload_manager.finalize_release_on_finish(req)
+            release = partial(self._release_finished_req, req, cache=True)
+            if release_ops is None:
+                release()
             else:
-                self._prepare_kv_cache_release(req)
-                checkpoint = (
-                    req.mamba_lazy_checkpoint
-                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
-                    else True
-                )
-                self.request_retirer.release(req, checkpoint=checkpoint)
+                release_ops.append(release)
 
             req.time_stats.set_completion_time()
 

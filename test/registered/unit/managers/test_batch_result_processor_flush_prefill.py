@@ -1,6 +1,5 @@
 """SchedulerBatchResultProcessor._flush_prefill: a generation prefill's per-request
-KV calls are queued and run in order, before free_group_end and the send. A subclass
-that sends first gets the same KV calls, in the same order and one free group."""
+KV calls are queued and run in order after the send, inside one free group."""
 
 import unittest
 from array import array
@@ -43,18 +42,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 BRP = "sglang.srt.managers.scheduler_components.batch_result_processor"
 RETIRER = "sglang.srt.managers.scheduler_components.request_retirer"
 PROMPT = 12
-
-
-class _StreamFirst(SchedulerBatchResultProcessor):
-    __slots__ = ()
-
-    def _flush_prefill(self, batch, stream_reqs, kv_ops, skip_stream_req):
-        self.output_streamer.stream_output(
-            stream_reqs, batch.return_logprob, skip_stream_req
-        )
-        for op in kv_ops:
-            op()
-        self.token_to_kv_pool_allocator.free_group_end()
 
 
 def _req(rid, max_new_tokens=8, *, mask=False):
@@ -168,12 +155,8 @@ KV_CALLS = [("release", "r0", True), ("checkpoint", "r1"), ("release", "r3", Fal
 
 
 class TestFlushPrefill(CustomTestCase):
-    def test_kv_calls_run_before_the_send(self):
+    def test_kv_calls_run_after_the_send(self):
         log = _run(SchedulerBatchResultProcessor)
-        self.assertEqual(log, ["free_group_begin", *KV_CALLS, "free_group_end", SEND])
-
-    def test_override_sends_before_the_kv_calls(self):
-        log = _run(_StreamFirst)
         self.assertEqual(log, ["free_group_begin", SEND, *KV_CALLS, "free_group_end"])
 
     def test_hisparse_calls_are_queued_in_row_order(self):
@@ -189,10 +172,6 @@ class TestFlushPrefill(CustomTestCase):
         ]
         self.assertEqual(
             _run(SchedulerBatchResultProcessor, hisparse=True),
-            ["free_group_begin", *kv_calls, "free_group_end", SEND],
-        )
-        self.assertEqual(
-            _run(_StreamFirst, hisparse=True),
             ["free_group_begin", SEND, *kv_calls, "free_group_end"],
         )
 

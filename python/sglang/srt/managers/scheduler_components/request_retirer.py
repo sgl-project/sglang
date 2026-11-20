@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
@@ -178,6 +178,47 @@ class RequestRetirer:
             req.session.abort_req()
         if self.uocr_runtime is not None:
             self.uocr_runtime.on_req_dropped(req)
+
+
+def stream_then_release(
+    stream: Callable[[], None],
+    reqs: Sequence[Req],
+    release_ops: List[Callable[[], None]],
+) -> None:
+    """Send the outputs of ``reqs``, then run ``release_ops`` before returning,
+    even if the send raises.
+
+    The send fills a missing ``finished_len``, which a release reads for the KV
+    range it frees; the releases see the value from before the send.
+    """
+    lens_before = [req.finished_len for req in reqs]
+    try:
+        stream()
+    finally:
+        lens_sent = [req.finished_len for req in reqs]
+        for req, finished_len in zip(reqs, lens_before):
+            req.finished_len = finished_len
+        try:
+            run_release_ops(release_ops)
+        finally:
+            for req, finished_len in zip(reqs, lens_sent):
+                req.finished_len = finished_len
+
+
+def run_release_ops(release_ops: List[Callable[[], None]]) -> None:
+    """Run and drain ``release_ops`` in order. A failing op does not skip the
+    rest; the first error is raised after all have run."""
+    first_error = None
+    while release_ops:
+        # Taken out before it runs, so a failed release is never retried.
+        op = release_ops.pop(0)
+        try:
+            op()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def _leave_owner_list(req: Req) -> None:

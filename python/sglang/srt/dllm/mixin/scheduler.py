@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from array import array
+from functools import partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.dllm.config import DllmConfig
@@ -13,6 +14,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     move,
+)
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    stream_then_release,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -118,6 +122,7 @@ class SchedulerDllmMixin:
             algo_states = result.dllm_algo_state
 
             self.token_to_kv_pool_allocator.free_group_begin()
+            release_ops: List[Callable[[], None]] = []
             for idx in range(batch.batch_size()):
                 req = batch.reqs[idx]
 
@@ -134,7 +139,7 @@ class SchedulerDllmMixin:
 
                     req.output_ids.extend(next_token_ids)
                     req.update_finish_state(new_accepted_len=new_tokens)
-                    self._finish_dllm_request_if_needed(req)
+                    self._finish_dllm_request_if_needed(req, release_ops)
                     continue
 
                 next_token_ids = result.next_token_ids[idx]
@@ -172,9 +177,15 @@ class SchedulerDllmMixin:
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
-                self._finish_dllm_request_if_needed(req)
+                self._finish_dllm_request_if_needed(req, release_ops)
 
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+            stream_then_release(
+                stream=lambda: self.output_streamer.stream_output(
+                    batch.reqs, batch.return_logprob
+                ),
+                reqs=batch.reqs,
+                release_ops=release_ops,
+            )
             self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.report_prefill_stats(
@@ -184,7 +195,9 @@ class SchedulerDllmMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
-    def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
+    def _finish_dllm_request_if_needed(
+        self: Scheduler, req: Req, release_ops: List[Callable[[], None]]
+    ) -> None:
         if (
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
@@ -192,9 +205,12 @@ class SchedulerDllmMixin:
             req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
-            self.request_retirer.release(
-                req,
-                checkpoint=not self.dllm_config.requires_separate_context_encoding,
+            release_ops.append(
+                partial(
+                    self.request_retirer.release,
+                    req,
+                    checkpoint=not self.dllm_config.requires_separate_context_encoding,
+                )
             )
             req.time_stats.set_completion_time()
 

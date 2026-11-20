@@ -24,8 +24,9 @@ import logging
 import time
 from array import array
 from collections import deque
+from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -81,6 +82,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     ReqList,
     move,
+)
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    stream_then_release,
 )
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1361,6 +1365,8 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         done_reqs = []
+        # Concluded transfers' releases, run after their outputs are sent.
+        release_ops: List[Callable[[], None]] = []
 
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
@@ -1431,13 +1437,14 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
-                self.request_retirer.release(req, checkpoint=True)
-                # FIXME: clean up req's data in transfer engine
-                req.disagg_kv_sender.clear()
+                release_ops.append(partial(self._release_transferred_req, req))
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
+                release_ops.append(
+                    partial(self.request_retirer.release, req, checkpoint=False)
+                )
                 done_reqs.append(req)
             else:
                 raise RuntimeError(
@@ -1466,10 +1473,14 @@ class SchedulerDisaggregationPrefillMixin:
                     self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
-        self.output_streamer.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
-            None,
+        stream_then_release(
+            stream=lambda: self.output_streamer.stream_output(
+                done_reqs,
+                any(req.return_logprob for req in done_reqs),
+                None,
+            ),
+            reqs=done_reqs,
+            release_ops=release_ops,
         )
         for req in done_reqs:
             req: Req
@@ -1481,10 +1492,16 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
+    def _release_transferred_req(self: Scheduler, req: Req) -> None:
+        self.request_retirer.release(req, checkpoint=True)
+        # FIXME: clean up req's data in transfer engine
+        req.disagg_kv_sender.clear()
+
     def handle_inflight_transfer_failure(
         self: Scheduler, req: Req
     ) -> Optional[Exception]:
-        """Conclude an inflight request whose KV transfer failed."""
+        """Conclude an inflight request whose KV transfer failed; the caller
+        releases it."""
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1505,7 +1522,6 @@ class SchedulerDisaggregationPrefillMixin:
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
