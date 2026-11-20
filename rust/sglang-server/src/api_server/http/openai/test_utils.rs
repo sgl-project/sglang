@@ -197,7 +197,7 @@ fn answering_app_state_logged(
         server_args(),
         formatter.unwrap(),
         None,
-        |rid| chunk(rid, "ok", true),
+        |req| chunk(req.rid.as_str(), "ok", true),
         Some(request_log),
     )
 }
@@ -221,14 +221,20 @@ pub(super) fn answering_app_state_with_item(
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     answer: impl Fn(&str) -> ResponseItem + Send + 'static,
 ) -> Arc<super::AppState> {
-    answering_app_state_built(server_args, formatter, tokenizer, answer, None)
+    answering_app_state_built(
+        server_args,
+        formatter,
+        tokenizer,
+        move |req| answer(req.rid.as_str()),
+        None,
+    )
 }
 
 fn answering_app_state_built(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
-    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+    answer: impl Fn(&crate::message::request::Request) -> ResponseItem + Send + 'static,
     request_log: Option<Arc<crate::api_server::core::RequestLog>>,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
@@ -237,7 +243,7 @@ fn answering_app_state_built(
         let mut open = Vec::new();
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            request.sink.try_send(answer(request.rid.as_str())).unwrap();
+            request.sink.try_send(answer(&request)).unwrap();
             open.push(request);
         }
     });
@@ -303,6 +309,113 @@ pub(super) async fn body_json(response: Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn responses_sampling_reaches_core_after_http_chat_redispatch() {
+    use crate::message::config::DefaultSamplingParams;
+    use crate::message::request::RequestKind;
+    use sglang_processor::dynamo_tokenizers::Tokenizer;
+
+    const MODEL_TEMPERATURE: f64 = 0.365432198765;
+    for lowered in [true, false] {
+        for has_model_defaults in [false, true] {
+            let mut args = (*server_args()).clone();
+            if has_model_defaults {
+                args.model_config.default_sampling_params = DefaultSamplingParams {
+                    temperature: Some(MODEL_TEMPERATURE),
+                    top_p: Some(0.875),
+                    top_k: Some(29),
+                    min_p: Some(0.0625),
+                    repetition_penalty: Some(1.125),
+                };
+            }
+            let tokenizer = lowered.then(|| {
+                Tokenizer::from_file(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/special_token_tokenizer.json"
+                ))
+                .unwrap()
+            });
+            let (tx, rx) = flume::unbounded();
+            let state = answering_app_state_built(
+                Arc::new(args),
+                chatml_formatter(),
+                tokenizer,
+                move |request| {
+                    let RequestKind::Generate(generation) = &request.kind else {
+                        unreachable!()
+                    };
+                    assert_eq!(generation.input_ids.is_some(), lowered);
+                    tx.send(generation.sampling_params.clone()).unwrap();
+                    chunk(request.rid.as_str(), "ok", true)
+                },
+                None,
+            );
+            let app = crate::api_server::http::responses::mount(
+                routes().with_state(state.clone()),
+                state,
+            );
+            let (temperature, top_p, extensions) = if has_model_defaults {
+                (MODEL_TEMPERATURE, 0.875, (29, 0.0625, 1.125))
+            } else {
+                (0.7, 1.0, (1 << 30, 0.0, 1.0))
+            };
+            for (params, expected_temperature, expected_top_p, expected_extensions) in [
+                (json!({}), temperature, top_p, extensions),
+                (
+                    json!({"temperature": null, "top_p": null}),
+                    temperature,
+                    top_p,
+                    extensions,
+                ),
+                (
+                    json!({"temperature": 0.125, "top_p": 0.75, "top_k": 17,
+                        "min_p": 0.125, "repetition_penalty": 1.25}),
+                    0.125,
+                    0.75,
+                    (17, 0.125, 1.25),
+                ),
+                (
+                    json!({"temperature": 0.0}),
+                    1.0,
+                    top_p,
+                    (1, extensions.1, extensions.2),
+                ),
+            ] {
+                let mut body = params.clone();
+                body["input"] = json!("hi");
+                let response = post_json(app.clone(), "/v1/responses", body).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let response = body_json(response).await;
+                assert_eq!(response["temperature"], params["temperature"]);
+                assert_eq!(response["top_p"], params["top_p"]);
+                let sampling = rx.try_recv().unwrap();
+                let (temperature, top_k) = sampling.sampled_temperature_top_k();
+                assert_eq!(temperature as f32, expected_temperature as f32, "{params}");
+                assert_eq!(sampling.top_p, expected_top_p, "{params}");
+                if lowered {
+                    assert_eq!(
+                        (top_k, sampling.min_p, sampling.repetition_penalty),
+                        expected_extensions
+                    );
+                } else if params["temperature"].as_f64() == Some(0.0) {
+                    assert_eq!(top_k, 1);
+                }
+            }
+            let chat = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+            let response = post_json(app.clone(), "/v1/chat/completions", chat).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                rx.try_recv().unwrap().temperature,
+                if has_model_defaults {
+                    MODEL_TEMPERATURE
+                } else {
+                    1.0
+                }
+            );
+        }
+    }
 }
 
 #[tokio::test]
