@@ -232,14 +232,11 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
         ),
     )
 
-    @unittest.skipIf(
-        is_hip(),
-        "split-op extend runner exercises the piecewise-CUDA-graph path "
-        "(TcPiecewiseForwardContext.num_tokens), which is not wired on ROCm.",
-    )
     def test_runner_mode_split_op_extend_cases(self):
+        # tc_piecewise is retired; ROCm runs only the breakable variant.
+        breakable_modes = (True,) if is_hip() else (False, True)
         for case, static_num_tokens in self.SPLIT_OP_CASES:
-            for breakable in (False, True):
+            for breakable in breakable_modes:
                 runner = "bcg" if breakable else "pcg"
                 with self.subTest(
                     case=case.name,
