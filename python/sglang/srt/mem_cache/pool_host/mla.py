@@ -619,6 +619,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices = maybe_dcp_kernel_indices(
             device_indices, self.dcp_size, self.dcp_rank
         )
+        self._load_to_device_per_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
+
+    def _load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
+    ) -> None:
+        assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
+        # Indices arrive already translated by load_to_device_all_layer or the
+        # public load_to_device_per_layer wrapper; do NOT re-translate here.
         # Draft transfer IDs follow all target device layers, while host rows
         # follow only this rank's target layers.
         host_layer_id = self._host_layer_by_controller[layer_id]
@@ -1011,6 +1033,80 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 host_t.dtype,
             )
         return False
+
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        assert not self._is_dummy, "load on a dummy (non-src MLA) host pool"
+        host_indices = maybe_dcp_kernel_indices(
+            host_indices, self.dcp_size, self.dcp_rank
+        )
+        device_indices = maybe_dcp_kernel_indices(
+            device_indices, self.dcp_size, self.dcp_rank
+        )
+        # AOT all-layer H2D regressed measured H100 preload latency. Keep
+        # per-layer AOT transfers and share the ownership-aware fallback with
+        # sharded pools and layouts without a batched H2D kernel.
+        if (
+            self._layer_shard_enabled
+            or io_backend == "kernel_ascend"
+            or (
+                io_backend == "kernel"
+                and self.layout == "layer_first"
+                and not self.can_use_jit
+            )
+            or (io_backend, self.layout)
+            in (
+                ("kernel", "page_first"),
+                ("kernel", "page_unified"),
+                ("direct", "page_first_direct"),
+            )
+        ):
+            for layer_id in self._target_layer_indices:
+                self._load_to_device_per_layer(
+                    device_pool, host_indices, device_indices, layer_id, io_backend
+                )
+            for draft_layer_id in range(self._draft_layer_num):
+                self._load_to_device_per_layer(
+                    device_pool,
+                    host_indices,
+                    device_indices,
+                    self._device_layer_num + draft_layer_id,
+                    io_backend,
+                    is_draft=True,
+                )
+            return
+
+        device_data_ptrs = self.device_data_ptrs
+        device_kv_buffers = self.device_kv_buffers
+
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                jit_transfer_hicache_all_layer_mla(
+                    page_size=self.page_size,
+                    ptr_dst=device_data_ptrs,
+                    indices_dst=device_indices,
+                    ptr_src=self.data_ptrs,
+                    indices_src=host_indices,
+                    cache_dst_stride_bytes=self.device_row_stride_bytes,
+                    cache_src_stride_bytes=self.token_stride_size,
+                    element_size=self.kv_cache_dim * self.dtype.itemsize,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=self.data_refs,
+                    dst_layers=device_kv_buffers,
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend

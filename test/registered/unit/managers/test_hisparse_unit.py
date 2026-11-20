@@ -11,7 +11,7 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -36,6 +36,7 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
@@ -81,7 +82,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
     return req
 
 
-class TestHiSparseUnit(unittest.TestCase):
+class TestHiSparseUnit(CustomTestCase):
     """Test class that builds a minimal HiSparse component stack."""
 
     # ==================================================================
@@ -731,6 +732,58 @@ class TestHiSparseUnit(unittest.TestCase):
     # ==================================================================
     # Test: Direct-to-host (PD separated) path
     # ==================================================================
+    def test_request_lifecycle_direct_short_preloads_all_layers(self):
+        """Short PD requests must restore host KV before the swap-in fast path."""
+        host_pool = self.coordinator.mem_pool_host
+        for use_jit in sorted({False, host_pool.can_use_jit}):
+            for fill_len in (1, self.page_size + 1, DEVICE_BUFFER_SIZE):
+                with self.subTest(jit=use_jit, fill_len=fill_len):
+                    initial = self._get_initial_sizes()
+                    req = _make_req("direct-short", list(range(fill_len)))
+                    self._alloc_req_slot(req)
+                    kv_loc = self._alloc_kv(req, fill_len, logical_only=True)
+                    rounded_len = (
+                        (fill_len + self.page_size - 1) // self.page_size
+                    ) * self.page_size
+                    host_indices = self._populate_host_pool(req, rounded_len)
+                    for layer in self.device_pool.kv_buffer:
+                        layer.fill_(-1)
+
+                    with (
+                        patch.object(host_pool, "can_use_jit", use_jit),
+                        patch.object(
+                            host_pool,
+                            "load_to_device_all_layer",
+                            wraps=host_pool.load_to_device_all_layer,
+                        ) as preload,
+                    ):
+                        self.coordinator.admit_request_direct(req)
+
+                    preload.assert_called_once()
+                    self.assertFalse(req.hisparse_staging)
+                    device_locs = self.coordinator.req_to_device_buffer[
+                        req.kv.req_pool_idx, :fill_len
+                    ]
+                    capacity = int(
+                        self.coordinator.req_device_buffer_size[req.kv.req_pool_idx]
+                    )
+                    unused_locs = self.coordinator.req_to_device_buffer[
+                        req.kv.req_pool_idx, fill_len:capacity
+                    ]
+                    host_locs_cpu = host_indices[:fill_len].cpu()
+                    for layer_id, layer in enumerate(self.device_pool.kv_buffer):
+                        self.assertTrue(
+                            torch.equal(
+                                layer[device_locs],
+                                host_pool.kv_buffer[layer_id][host_locs_cpu].to(DEVICE),
+                            ),
+                            f"Layer {layer_id}: short PD preload changed KV",
+                        )
+                        self.assertTrue(torch.all(layer[unused_locs] == -1))
+
+                    self._cleanup_req(req, kv_loc, logical_only=True)
+                    self._assert_sizes_restored(initial, "direct_short")
+
     def test_request_lifecycle_direct_path(self):
         """alloc_logical_only -> host write -> admit_direct -> swap-in -> finish."""
         initial = self._get_initial_sizes()
