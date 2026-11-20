@@ -195,6 +195,10 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     "--tokenizer-worker-num",
     16,
     "--disable-shared-experts-fusion",
+    # DP LM head keeps the logits all-gather inside the attention TP group and
+    # skips the multimem gatherer, which probes NVML on every multi-node TP
+    # group. The released NPU image predates the is_cuda() guard for that probe.
+    "--enable-dp-lm-head",
     "--dtype",
     "bfloat16",
     "--load-balance-method",
