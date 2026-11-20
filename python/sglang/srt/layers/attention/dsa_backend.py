@@ -3009,9 +3009,9 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if dsa_impl == "triton_sparse_mla":
-                if q_rope is not None:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
                 return self._forward_triton_sparse_mla(
                     q_all=q_all,
                     kv_cache=kv_cache,
@@ -3029,7 +3029,6 @@ class DeepseekSparseAttnBackend(
                 topk_length=metadata.dsa_cache_seqlens_int32,
                 attn_sink=attn_sink,
                 allow_small_heads=True,
-                q_parts=(q_nope, q_rope) if q_rope is not None else None,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -3227,19 +3226,8 @@ class DeepseekSparseAttnBackend(
             )
 
         if dsa_impl == "flashmla_sparse":
-            if self._use_triton_sink_decode(
-                q_nope, q_rope, kv_cache, page_table_1, attn_sink
-            ):
-                return self._forward_triton_sink_decode(
-                    q_nope=q_nope,
-                    q_rope=q_rope,
-                    kv_cache=kv_cache,
-                    page_table_1=page_table_1,
-                    sm_scale=layer.scaling,
-                    v_head_dim=layer.v_head_dim,
-                    topk_length=metadata.dsa_cache_seqlens_int32,
-                    attn_sink=attn_sink,
-                )
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -3248,7 +3236,6 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
                 attn_sink=attn_sink,
-                q_parts=(q_nope, q_rope) if q_rope is not None else None,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -3433,34 +3420,23 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
         allow_small_heads: bool = False,
-        q_parts: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """`q_parts` (q_nope, q_rope) replaces `q_all`: the concatenation is then
-        written straight into the head-padded query when padding is needed."""
         # FlashMLA sparse kernels are instantiated at 64 heads (Hopper and
         # Blackwell) and 128 heads (Blackwell); with TP the local head count may
         # be smaller (e.g., 64 // 4 = 16) and is padded up.
-        if q_parts is not None:
-            num_tokens, num_heads = q_parts[0].shape[:2]
-            head_dim = q_parts[0].shape[-1] + q_parts[1].shape[-1]
-            q_dtype = q_parts[0].dtype
-        else:
-            num_tokens, num_heads, head_dim = q_all.shape
-            q_dtype = q_all.dtype
+        num_tokens, num_heads, head_dim = q_all.shape
         use_small_heads = (
             allow_small_heads
             and self.sparse_prefill_small_heads
             and 0 < num_heads <= 32
             and head_dim in (512, 576)
             and kv_cache.dtype == torch.bfloat16
-            and q_dtype == torch.bfloat16
+            and q_all.dtype == torch.bfloat16
             and v_head_dim == 512
             and page_table_1.shape[-1] >= 128
             and page_table_1.shape[-1] % 64 == 0
         )
 
-        # The compact kernel computes 8 or 32 heads out of a Q64 tile.
-        active_heads = 8 if num_heads <= 8 else 32
         # Compact calls use Q64; native calls retain their existing padding.
         required_padding = (
             64 if use_small_heads else (128 if self.device_sm_major >= 10 else 64)
@@ -3474,31 +3450,11 @@ class DeepseekSparseAttnBackend(
                 f"TP size may be too large for this model."
             )
 
-            device = (q_parts[0] if q_parts is not None else q_all).device
-            if use_small_heads:
-                # The compact kernel reads only the first `active_heads` heads,
-                # so zero just the gap up to them instead of all 64.
-                q_padded = torch.empty(
-                    (num_tokens, required_padding, head_dim),
-                    dtype=q_dtype,
-                    device=device,
-                )
-                if active_heads > num_heads:
-                    q_padded[:, num_heads:active_heads, :].zero_()
-            else:
-                q_padded = torch.zeros(
-                    (num_tokens, required_padding, head_dim),
-                    dtype=q_dtype,
-                    device=device,
-                )
-            if q_parts is not None:
-                concat_mla_absorb_q_general(*q_parts, out=q_padded[:, :num_heads, :])
-            else:
-                q_padded[:, :num_heads, :] = q_all
+            # Pad q to required size
+            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            q_padded[:, :num_heads, :] = q_all
             q_input = q_padded
         else:
-            if q_parts is not None:
-                q_all = concat_mla_absorb_q_general(*q_parts)
             q_input = q_all
 
         sink_input = attn_sink
@@ -3524,14 +3480,6 @@ class DeepseekSparseAttnBackend(
             # helpers keep them aligned); fall back to full-width compute if
             # they ever diverge.
             topk_length = None
-        if (
-            topk_length is not None
-            and self.dsa_index_topk is not None
-            and page_table_1.shape[-1] < self.dsa_index_topk
-        ):
-            # A narrower selection (e.g. a sliding window) holds at most its
-            # width of valid indices; don't scan past it.
-            topk_length = topk_length.clamp(max=page_table_1.shape[-1])
 
         if use_small_heads:
             o, _, _ = self._call_flash_mla_sparse_fwd_small_heads(
@@ -3539,7 +3487,7 @@ class DeepseekSparseAttnBackend(
                 kv_cache,
                 indices_input,
                 sm_scale,
-                active_heads,
+                8 if num_heads <= 8 else 32,
                 sink_input,
                 topk_length,
             )
@@ -4269,62 +4217,6 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
-        ).squeeze(0)
-
-    # B300, <=16 local heads: Triton beats head-padded FlashMLA up to rows x width
-    # of 64K (4 heads x 2048: 20.4 vs 32.3 us at bs 32, 42.1 vs 40.5 us at bs 64).
-    _TRITON_SINK_DECODE_MAX_WORK = 64 * 1024
-
-    def _use_triton_sink_decode(
-        self, q_nope, q_rope, kv_cache, page_table_1, attn_sink
-    ):
-        rope_dim = q_rope.shape[-1] if q_rope is not None else 0
-        return (
-            attn_sink is not None
-            and _is_cuda
-            and q_nope.shape[1] <= 16
-            and q_nope.shape[-1] % 128 == 0
-            and rope_dim > 0
-            and rope_dim & (rope_dim - 1) == 0
-            and q_nope.dtype == torch.bfloat16
-            and kv_cache.dtype == torch.bfloat16
-            and q_nope.shape[0] * page_table_1.shape[-1]
-            <= self._TRITON_SINK_DECODE_MAX_WORK
-        )
-
-    def _forward_triton_sink_decode(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        kv_cache: torch.Tensor,
-        page_table_1: torch.Tensor,
-        sm_scale: float,
-        v_head_dim: int,
-        topk_length: Optional[torch.Tensor],
-        attn_sink: torch.Tensor,
-    ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
-            triton_sparse_mla_decode_splitk,
-        )
-
-        rows, width = page_table_1.shape
-        if topk_length is not None and topk_length.shape[0] == rows:
-            lengths = topk_length.clamp(max=width).to(torch.int32)
-        else:
-            lengths = None
-        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
-        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
-        return triton_sparse_mla_decode_splitk(
-            q_nope=q_nope,
-            q_rope=q_rope,
-            kv=kv_cache,
-            indices=page_table_1.unsqueeze(1),
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            workspace=workspace,
-            lengths=lengths,
-            attn_sink=attn_sink,
-            lengths_tail_invalid=False,
         ).squeeze(0)
 
     def _forward_triton_decode(

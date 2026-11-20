@@ -706,13 +706,8 @@ def _sparse_mla_fused_kernel(
     # topk, leaving the -1 tail to slot >= 0.
     TOPK_TAIL_INVALID: tl.constexpr = False,
     KV_SCALED: tl.constexpr = False,
-    sink_ptr=None,
-    HAS_SINK: tl.constexpr = False,
 ):
-    """Single-pass with head-block splitting. grid=(seq, head_blocks).
-
-    HAS_SINK adds a per-head learnable sink logit (natural-log units, like the
-    scaled scores) to the softmax denominator."""
+    """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
@@ -834,9 +829,6 @@ def _sparse_mla_fused_kernel(
 
     denom = tl.maximum(l_i, 1.0e-30)
     inv_denom = 1.0 / denom
-    if HAS_SINK:
-        sink2 = tl.load(sink_ptr + h_offs, mask=h_mask, other=0.0) * 1.4426950408889634
-        inv_denom = 1.0 / (denom + tl.exp2(sink2 - m_i))
     acc0 = tl.where(l_i[:, None] > 0.0, acc0 * inv_denom[:, None], 0.0)
     if NUM_GROUPS >= 2:
         acc1 = tl.where(l_i[:, None] > 0.0, acc1 * inv_denom[:, None], 0.0)
@@ -960,7 +952,6 @@ def _sparse_mla_split_k_kernel(
         tile_start = pid_k * tiles_per_segment
         tile_end = tl.minimum(tile_start + tiles_per_segment, num_tiles)
     else:
-        valid_topk = topk
         tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
         if pid_k * tiles_per_segment * BLOCK_K >= topk:
             return
@@ -983,7 +974,7 @@ def _sparse_mla_split_k_kernel(
     for j in tl.range(tile_start, tile_end, num_stages=3):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
-        valid = k_pos < valid_topk
+        valid = k_pos < topk
 
         slot = tl.load(idx_ptr + t * topk + k_pos, mask=valid, other=0)
         valid = valid & (slot >= 0)
@@ -1097,12 +1088,8 @@ def _sparse_mla_reduce_kernel(
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
     NATURAL_LSE: tl.constexpr = False,
-    sink_ptr=None,
-    HAS_SINK: tl.constexpr = False,
 ):
-    """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks).
-
-    HAS_SINK adds a per-head sink logit to the softmax denominator."""
+    """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
     t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
     dc = tl.program_id(2)
@@ -1140,10 +1127,6 @@ def _sparse_mla_reduce_kernel(
     w_sum = tl.sum(weights, axis=0)
     scale = tl.exp2(lse_p - lse_max - tl.log2(tl.maximum(w_sum, 1.0e-30)))
     out = tl.sum(a_p * scale[:, None], axis=0)
-    if HAS_SINK:
-        lse_all = lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30))
-        sink2 = tl.load(sink_ptr + h) * 1.4426950408889634
-        out = out / (1.0 + tl.exp2(sink2 - lse_all))
 
     tl.store(
         out_ptr + t * H * D_V + h * D_V + d_offs,
