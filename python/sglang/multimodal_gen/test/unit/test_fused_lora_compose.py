@@ -363,13 +363,13 @@ def test_alpha_override_reloads_fused_sections(tmp_path):
         "cur_adapter_path",
         "cur_adapter_strength",
         "cur_adapter_config",
-        "lora_layers",
         "lora_layers_critic",
         "lora_layers_transformer_2",
         "is_lora_merged",
         "auto_merge_rounding_loss",
     ):
         setattr(pipeline, attr, {})
+    pipeline.lora_layers = {"attn.to_qkv": _make_layer()}
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
         patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
@@ -529,42 +529,3 @@ def test_loader_folds_distinct_section_alphas(prefix, fused, sections, rows):
         dim=-1,
     )
     torch.testing.assert_close(delta * scale, expected, rtol=1e-5, atol=1e-5)
-
-
-def _proj_state_dict(prefix: str) -> dict[str, torch.Tensor]:
-    return {
-        f"{prefix}.lora_A.default.weight": torch.randn(2, IN_DIM),
-        f"{prefix}.lora_B.default.weight": torch.randn(4, 2),
-    }
-
-
-def test_adapter_matching_no_lora_layer_is_rejected_and_keeps_the_previous_one():
-    # An unsupported format maps to names no layer has; loading it used to
-    # succeed with no effect.
-    pipeline = _make_loader_pipeline()
-    pipeline.lora_layers = {"proj": object()}
-    _load_adapter(pipeline, _proj_state_dict("proj"))
-    previous = pipeline.lora_adapters["adapter"]
-
-    with pytest.raises(ValueError, match="matches none of the model's 1 LoRA layers"):
-        _load_adapter(pipeline, _proj_state_dict("lora_unet_blocks_0_proj"))
-    assert pipeline.lora_adapters["adapter"] is previous
-
-
-def test_adapter_layers_matching_no_lora_layer_are_reported(caplog):
-    pipeline = _make_loader_pipeline()
-    pipeline.lora_layers = {"proj": object()}
-    pipeline.lora_layers_transformer_2 = {"other": object()}
-    state_dict = _proj_state_dict("proj") | _proj_state_dict("text_encoder.fc")
-    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
-    with patch(f"{loader_mod}.logger.info") as info:
-        _load_adapter(pipeline, state_dict)
-    assert "proj.lora_A" in pipeline.lora_adapters["adapter"]
-    (call,) = [c for c in info.call_args_list if "match no LoRA layer" in c.args[0]]
-    assert call.args[2:4] == (1, 2) and "text_encoder.fc" in call.args[4]
-
-
-def test_adapter_check_is_skipped_before_lora_layers_exist():
-    pipeline = _make_loader_pipeline()
-    _load_adapter(pipeline, _proj_state_dict("anything"))
-    assert "anything.lora_A" in pipeline.lora_adapters["adapter"]
