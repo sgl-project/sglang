@@ -449,6 +449,38 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         self.assertFalse(be._use_mla_decode_persist_metadata())
 
 
+class TestMlaDcpGluonDecodeEmptyRows(CustomTestCase):
+    def test_rank_without_kv_hands_the_merge_a_zero_partial_with_no_weight(self):
+        """A rank with no KV for a request must hand the merge a zero partial with no weight."""
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.use_mla_dcp_asm = False
+        be.forward_metadata = mock.Mock(
+            kv_indptr=torch.tensor([0, 3, 3, 5], dtype=torch.int32),
+            kv_indices=torch.arange(5, dtype=torch.int32),
+        )
+        layer = TestMlaDcpAsmDecode._make_layer(None)
+        layer._aiter_kv_scale_float = 1.0
+        stale_out = torch.full((3, 96, 512), 7.0, dtype=torch.bfloat16)
+        stale_lse = torch.full((3, 1, 96), 5.0)
+        with mock.patch(
+            "sglang.srt.layers.attention.aiter_backend.mla_gluon_decode",
+            return_value=(stale_out, stale_lse),
+        ):
+            out, lse = be._forward_decode_dcp(
+                torch.zeros(3, 96, 576, dtype=torch.bfloat16),
+                torch.zeros(5, 576, dtype=fp8_dtype),
+                layer,
+                k_descale=1.0,
+            )
+
+        self.assertTrue(torch.all(out[1] == 0))
+        self.assertTrue(torch.all(lse[1] == -1e30))
+        self.assertTrue(torch.all(out[[0, 2]] == 7.0))
+        self.assertTrue(torch.all(lse[[0, 2]] == 5.0))
+
+
 class TestMlaDcpDecodeRoute(CustomTestCase):
     """The asm DCP decode needs the fp8 KV cache's scale;
     any other KV dtype must route DCP decode to Gluon, not asm."""
