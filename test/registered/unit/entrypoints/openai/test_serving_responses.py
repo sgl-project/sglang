@@ -480,37 +480,70 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(request_prompts, [[4, 5, 6]])
         self.assertEqual(engine_prompts, [[4, 5, 6]])
 
-    def test_k2_output_parser_reuses_effective_template_default(self):
+    def test_k2_output_parser_reuses_effective_template_effort(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            TokenizeRequest,
+        )
+        from sglang.srt.entrypoints.openai.serving_tokenize import OpenAIServingTokenize
+
         serving = make_serving()
         serving.reasoning_parser = "k2_horizon"
-        serving.default_chat_template_kwargs = {"reasoning_effort": "low"}
         serving.template_manager.chat_template_name = None
-        serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
-        request = ResponsesRequest(
-            model="IFM/K2-Horizon-7B",
-            input="hi",
-            # Template kwargs are the final render inputs, so the server default
-            # below takes precedence over this API convenience field.
-            reasoning={"effort": "medium"},
-            store=False,
-        )
+        tokenizer = serving.tokenizer_manager.tokenizer
+        tokenizer.apply_chat_template.return_value = [4, 5, 6]
+        tokenize = OpenAIServingTokenize.__new__(OpenAIServingTokenize)
+        tokenize.chat_serving = serving
+        tokenize.tokenizer_manager = serving.tokenizer_manager
 
-        asyncio.run(
-            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
-        )
+        low = {"reasoning_effort": "low"}
+        for defaults, template_kwargs, native_effort in (
+            (low, {}, "medium"),
+            (low, {"reasoning_effort": None}, "medium"),
+            ({}, low, None),
+            ({"reasoning_effort": "high"}, low, "medium"),
+        ):
+            with self.subTest(defaults=defaults, template_kwargs=template_kwargs):
+                serving.default_chat_template_kwargs = defaults
+                request = ResponsesRequest(
+                    model="IFM/K2-Horizon-7B",
+                    input="hi",
+                    chat_template_kwargs=template_kwargs,
+                    reasoning={"effort": native_effort} if native_effort else None,
+                    store=False,
+                )
 
-        render_call = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
-        self.assertEqual(render_call.kwargs["reasoning_effort"], "low")
-        self.assertEqual(request.chat_template_kwargs["reasoning_effort"], "low")
+                asyncio.run(serving._make_request(request, None, tokenizer))
 
-        output_items = serving._make_response_output_items(
-            request,
-            "work</ifm|think_faster>\nanswer",
-            tokenizer=Mock(),
-            require_reasoning=True,
-        )
-        self.assertEqual(output_items[0].content[0].text, "work")
-        self.assertEqual(output_items[1].content[0].text, "\nanswer")
+                render_call = tokenizer.apply_chat_template.call_args
+                self.assertEqual(render_call.kwargs["reasoning_effort"], "low")
+                output_items = serving._make_response_output_items(
+                    request,
+                    "work</ifm|think_faster>\nanswer",
+                    tokenizer=tokenizer,
+                    require_reasoning=True,
+                )
+                self.assertEqual(output_items[0].content[0].text, "work")
+                self.assertEqual(output_items[1].content[0].text, "\nanswer")
+
+                chat_fields = dict(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    chat_template_kwargs=template_kwargs,
+                    reasoning_effort=native_effort,
+                )
+                for prepare, request_type in (
+                    (serving._convert_to_internal_request, ChatCompletionRequest),
+                    (tokenize._tokenize_chat_request, TokenizeRequest),
+                ):
+                    tokenizer.apply_chat_template.reset_mock()
+                    prepare(request_type(**chat_fields))
+                    self.assertEqual(
+                        tokenizer.apply_chat_template.call_args.kwargs[
+                            "reasoning_effort"
+                        ],
+                        "low",
+                    )
 
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):

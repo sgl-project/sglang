@@ -203,58 +203,25 @@ class TestHandlerRequestSemantics(CustomTestCase):
             self._prompt(chat, reasoning_effort="low", **thinking).prompt_ids, low
         )
 
-    def test_tokenize_matches_chat_template_effort(self):
-        from sglang.srt.entrypoints.openai.protocol import (
-            ChatCompletionRequest,
-            TokenizeRequest,
-        )
-        from sglang.srt.entrypoints.openai.serving_tokenize import OpenAIServingTokenize
-
-        chat = _serving(self, self.tokenizer)
-        tokenize = OpenAIServingTokenize.__new__(OpenAIServingTokenize)
-        tokenize.chat_serving = chat
-        tokenize.tokenizer_manager = chat.tokenizer_manager
-
-        for effort, top_level_effort, budget in (
-            ("low", None, 50),
-            ("max", None, 100),
-            (30, None, 30),
-            ("low", "max", 50),
-        ):
-            with self.subTest(effort=effort, top_level_effort=top_level_effort):
-                body = {
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "reasoning_effort": top_level_effort,
-                    "chat_template_kwargs": {
-                        "thinking": True,
-                        "reasoning_effort": effort,
-                    },
-                }
-                generated, _ = chat._convert_to_internal_request(
-                    ChatCompletionRequest(**deepcopy(body))
-                )
-                token_ids = tokenize._tokenize_chat_request(
-                    TokenizeRequest(**deepcopy(body))
-                )
-                self.assertEqual(token_ids, generated.input_ids)
-                self.assertIn(
-                    f"Reasoning Effort: {budget} ",
-                    self.tokenizer.decode(token_ids, skip_special_tokens=False),
-                )
-
-    def test_responses_matches_chat_template_effort(self):
+    def test_reasoning_effort_matches_across_endpoints(self):
         from sglang.srt.entrypoints.openai.protocol import (
             ChatCompletionRequest,
             ResponsesRequest,
+            TokenizeRequest,
         )
         from sglang.srt.entrypoints.openai.serving_responses import (
             OpenAIServingResponses,
         )
+        from sglang.srt.entrypoints.openai.serving_tokenize import OpenAIServingTokenize
 
         chat = _serving(self, self.tokenizer)
         responses = OpenAIServingResponses(
             chat.tokenizer_manager, chat.template_manager
         )
+        tokenize = OpenAIServingTokenize.__new__(OpenAIServingTokenize)
+        tokenize.chat_serving = chat
+        tokenize.tokenizer_manager = chat.tokenizer_manager
+
         for effort, native_effort, budget in (
             ("low", None, 50),
             ("max", None, 100),
@@ -266,13 +233,17 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 template_kwargs = {"thinking": True}
                 if effort is not None:
                     template_kwargs["reasoning_effort"] = effort
+                body = dict(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": "hi"}],
+                    reasoning_effort=native_effort,
+                    chat_template_kwargs=template_kwargs,
+                )
                 generated, _ = chat._convert_to_internal_request(
-                    ChatCompletionRequest(
-                        model=MODEL,
-                        messages=[{"role": "user", "content": "hi"}],
-                        reasoning_effort=native_effort,
-                        chat_template_kwargs=dict(template_kwargs),
-                    )
+                    ChatCompletionRequest(**deepcopy(body))
+                )
+                token_ids = tokenize._tokenize_chat_request(
+                    TokenizeRequest(**deepcopy(body))
                 )
                 _, _, engine_prompts, _ = asyncio.run(
                     responses._make_request(
@@ -290,8 +261,11 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 )
                 self.assertIn(
                     f"Reasoning Effort: {budget} ",
-                    self.tokenizer.decode(engine_prompts[0], skip_special_tokens=False),
+                    self.tokenizer.decode(
+                        generated.input_ids, skip_special_tokens=False
+                    ),
                 )
+                self.assertEqual(token_ids, generated.input_ids)
                 self.assertEqual(engine_prompts, [generated.input_ids])
 
     def test_trailing_assistant_follows_sglang_rules(self):
