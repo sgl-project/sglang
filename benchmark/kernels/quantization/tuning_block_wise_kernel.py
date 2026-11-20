@@ -28,6 +28,10 @@ from tqdm import tqdm
 mp.set_start_method("spawn", force=True)
 
 from sglang.benchmark.deepseek_utils import get_weight_shapes
+from sglang.benchmark.tuning_configs import (
+    get_configs_compute_bound,
+    get_cuda_block_k_tiles,
+)
 from sglang.kernels.ops.gemm.fp8_kernel import _w8a8_block_fp8_matmul
 from sglang.kernels.ops.gemm.int8_kernel import _w8a8_block_int8_matmul
 from sglang.srt.utils import (
@@ -131,53 +135,6 @@ def w8a8_block_matmul(
     return C
 
 
-def get_rocm_configs_compute_bound():
-    configs = []
-    waves_per_eu_range = 0
-    for num_stages in [2]:
-        for block_m in [32, 64, 128, 256]:
-            for block_k in [32, 64, 128, 256]:
-                for block_n in [16, 32, 64, 128, 256]:
-                    for num_warps in [4, 8]:
-                        for group_size in [1, 4, 8, 16, 32]:
-                            configs.append(
-                                {
-                                    "BLOCK_SIZE_M": block_m,
-                                    "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k,
-                                    "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps,
-                                    "num_stages": num_stages,
-                                    "waves_per_eu": waves_per_eu_range,
-                                }
-                            )
-    return configs
-
-
-def get_configs_compute_bound():
-    configs = []
-    if _is_hip:
-        configs = get_rocm_configs_compute_bound()
-    else:
-        for num_stages in [2, 3, 4, 5]:
-            for block_m in [16, 32, 64, 128, 256]:
-                for block_k in [64, 128]:
-                    for block_n in [32, 64, 128, 256]:
-                        for num_warps in [4, 8]:
-                            for group_size in [1, 16, 32, 64]:
-                                configs.append(
-                                    {
-                                        "BLOCK_SIZE_M": block_m,
-                                        "BLOCK_SIZE_N": block_n,
-                                        "BLOCK_SIZE_K": block_k,
-                                        "GROUP_SIZE_M": group_size,
-                                        "num_warps": num_warps,
-                                        "num_stages": num_stages,
-                                    }
-                                )
-    return configs
-
-
 def benchmark_config(
     A, B, As, Bs, block_size, config, out_dtype=torch.float16, num_iters=10
 ):
@@ -275,7 +232,12 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
             best_config = config
     now = datetime.now()
     print(f"{now.ctime()}] Completed tuning for batch_size={M}")
-    assert best_config is not None
+    if best_config is None:
+        raise RuntimeError(
+            f"No kernel configuration ran successfully for M={M}, N={N}, K={K}, "
+            f"block_size={block_size}; the search space was empty or every "
+            "candidate failed to compile."
+        )
     return best_config
 
 
@@ -333,10 +295,16 @@ def tune_on_gpu(args_dict):
     save_path = args.save_path
     input_type = args.input_type
 
-    search_space = get_configs_compute_bound()
+    search_space = get_configs_compute_bound(_is_hip, block_k)
     search_space = [
         config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
     ]
+    if not search_space:
+        raise ValueError(
+            f"No CUDA kernel configuration has a BLOCK_SIZE_K that divides "
+            f"block_k={block_k}. Supported block sizes are multiples of 16 "
+            "(for example 16, 32, 64 or 128)."
+        )
 
     start = time.perf_counter()
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
@@ -375,6 +343,11 @@ def distribute_batch_sizes(batch_sizes, num_gpus):
 
 def main(args):
     print(args)
+
+    if not _is_hip:
+        # Validate the quantization block size before initializing the devices
+        # so an unsupported value fails fast with a clear message.
+        get_cuda_block_k_tiles(args.block_k)
 
     num_gpus = get_device_count()
     if num_gpus == 0:
