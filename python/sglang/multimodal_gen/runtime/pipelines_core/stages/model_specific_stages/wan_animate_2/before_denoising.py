@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from einops import rearrange
 
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -407,7 +408,8 @@ def build_clip_conditioning(
         # [16, reference_video_latent_t, reference_video_latent_h, reference_video_latent_w] fp32
         # Stays fp32 (vae.encode returns .float()); forward_ref cats it with the
         # bf16 reference_video_condition under autocast type promotion.
-        reference_video_latents = vae_encoder([reference_video_pixels])[0]
+        with use_gpu_conditioning_hash():
+            reference_video_latents = vae_encoder([reference_video_pixels])[0]
         (
             _,
             reference_video_latent_t,
