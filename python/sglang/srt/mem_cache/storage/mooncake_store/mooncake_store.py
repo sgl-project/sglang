@@ -1302,6 +1302,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
+    def batch_remove_pool_keys(self, pool_name, page_keys: List[str]) -> List[int]:
+        """Remove one pool's objects for ``page_keys``; leased objects are kept."""
+        transfer = PoolTransfer(name=pool_name, keys=list(page_keys))
+        key_strs, _ = self._get_hybrid_page_component_keys(list(page_keys), transfer)
+        return list(self.store.batch_remove(self._tag_keys(key_strs), False))
+
     def _batch_io_v2(
         self,
         transfers: List[PoolTransfer],

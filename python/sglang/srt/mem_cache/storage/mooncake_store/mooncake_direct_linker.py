@@ -616,8 +616,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 f"transferred={result}, expected={expected}"
             )
 
+    supports_mamba_state_removal = True
+
     def offload(
-        self, transfers: list[PoolTransfer], session_id: str | None = None
+        self,
+        transfers: list[PoolTransfer],
+        session_id: str | None = None,
+        remove_mamba_keys: list[str] | None = None,
     ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
@@ -630,7 +635,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready = self.record_transfer_ready()
-        self.offload_queue.put((expanded, tokens, ready, session_id))
+        self.offload_queue.put((expanded, tokens, ready, session_id, remove_mamba_keys))
         return True
 
     def offload_thread_func(self) -> None:
@@ -639,7 +644,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready, session_id = task
+                expanded, tokens, ready, session_id, remove_mamba_keys = task
                 ready.synchronize()
                 extra_info = (
                     HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
@@ -648,6 +653,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 )
                 results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
+                if success and remove_mamba_keys:
+                    self._remove_mamba_states(remove_mamba_keys)
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
@@ -658,6 +665,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+
+    def _remove_mamba_states(self, keys: list[str]) -> None:
+        # Runs after the newer state is stored, so a path never loses its last state.
+        try:
+            results = self.storage.batch_remove_pool_keys(PoolName.MAMBA, keys)
+        except Exception:
+            logger.warning("Mooncake superseded Mamba removal failed", exc_info=True)
+            return
+        removed = sum(1 for r in results if r == 0)
+        self.stats["mamba_removed"] = self.stats.get("mamba_removed", 0) + removed
+        self.stats["mamba_remove_skipped"] = (
+            self.stats.get("mamba_remove_skipped", 0) + len(results) - removed
+        )
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()

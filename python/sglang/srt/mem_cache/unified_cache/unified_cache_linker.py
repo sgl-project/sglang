@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -348,6 +349,12 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        self._drop_superseded_mamba = (
+            envs.SGLANG_LINKER_DROP_SUPERSEDED_MAMBA.get()
+            and getattr(cache_linker, "supports_mamba_state_removal", False)
+        )
+        # Mamba keys this rank stored and has not yet superseded.
+        self._own_mamba_keys: set[str] = set()
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -799,7 +806,9 @@ class UnifiedCacheLinkerWrapper:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
                     continue
-            self._offload_node(node_id, transfers)
+            self._offload_node(
+                node_id, transfers, self._superseded_mamba_keys(node_id, transfers)
+            )
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -840,12 +849,48 @@ class UnifiedCacheLinkerWrapper:
             kept.append(transfer)
         return kept
 
-    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+    def _superseded_mamba_keys(
+        self, node_id: NodeId, transfers: list[PoolTransfer]
+    ) -> Optional[list[str]]:
+        """Keys of Mamba states this rank stored on non-fork ancestors of a node
+        that now stores a newer state on the same path."""
+        if not self._drop_superseded_mamba or self.cache.tree_core.is_eagle:
+            return None
+        mamba = next((t for t in transfers if t.name == PoolName.MAMBA), None)
+        if mamba is None or not mamba.keys:
+            return None
+        page = self.cache.page_size
+        hashes = self.cache.get_prefix_hash_values(node_id)
+        keys = []
+        for info in self.cache.tree_core.collect_path_info([node_id])[0]:
+            if info.node_id == node_id or info.num_children != 1:
+                continue
+            end = info.path_end
+            if end <= 0 or end % page or end // page > len(hashes):
+                continue
+            key = hashes[end // page - 1]
+            if key in self._own_mamba_keys:
+                self._own_mamba_keys.discard(key)
+                keys.append(key)
+        self._own_mamba_keys.add(mamba.keys[-1])
+        return keys or None
+
+    def _offload_node(
+        self,
+        node_id: NodeId,
+        transfers: list[PoolTransfer],
+        remove_mamba_keys: Optional[list[str]] = None,
+    ) -> None:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
+            kwargs = (
+                {"remove_mamba_keys": remove_mamba_keys} if remove_mamba_keys else {}
+            )
             queued = self.cache_linker.offload(
-                transfers, session_id=getattr(cache, "insert_session_id", None)
+                transfers,
+                session_id=getattr(cache, "insert_session_id", None),
+                **kwargs,
             )
         except BaseException:
             cache.dec_lock_ref(node_id, lock_params)
