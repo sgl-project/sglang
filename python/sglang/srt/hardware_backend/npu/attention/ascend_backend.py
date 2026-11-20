@@ -149,6 +149,10 @@ class ForwardMetadata:
     # None means the local prefix pages are full and need no token compaction.
     prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+    # A5 C8 publication addresses are refreshed by the first target layer.
+    sparse_kv_publication_rows: Optional[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
 
 
 class AscendAttnMaskBuilder:

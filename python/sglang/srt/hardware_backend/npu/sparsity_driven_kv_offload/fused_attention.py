@@ -31,7 +31,22 @@ def forward_fused_sparse_kv_offload(
     is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
-    current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch)
+    offload_kwargs = {}
+    if not is_prefill and getattr(manager, "packed_c8", False):
+        metadata = backend.forward_metadata
+        # Capture warmup may reuse ForwardMetadata. Always record the producer
+        # when the layer stack starts, then let following layers reuse its rows.
+        if (
+            layer.layer_id == manager.start_layer
+            or metadata.sparse_kv_publication_rows is None
+        ):
+            metadata.sparse_kv_publication_rows = manager.prepare_publication_rows(
+                forward_batch, k_nope.shape[0], k_nope.device
+            )
+        offload_kwargs["publication_rows"] = metadata.sparse_kv_publication_rows
+    current_inputs = manager.offload_v2(
+        k_nope, k_pe, layer, forward_batch, **offload_kwargs
+    )
     if not is_prefill:
         plan = backend.forward_metadata.sparse_kv_lim_plan
         rows = forward_batch.batch_size * plan.query_width

@@ -91,6 +91,19 @@ class C8DecodeAdapter(LIMDecodeAdapter):
             miss_slots=self.miss_slots[:batch],
             miss_counts=self.miss_counts[:batch],
         )
+        # This metadata belongs to the shared LIM plan.  Prepare it once on the
+        # owner layer so IndexShare consumers can submit CopySFA directly.
+        prepare_copy_sfa_metadata(
+            source_ids=self.source_ids[:rows],
+            valid_rows=self._pre_valid[:batch],
+            sparse_rows=self._pre_sparse[:batch],
+            request_slots=self.resident_safe_slots[:batch],
+            actual_seq_lengths_kv=self._pre_lengths[:batch],
+            hbm_block_table=manager.planner_hbm_block_table[:batch],
+            capacity=self.capacity,
+            query_width=width,
+            hbm_row_offset=1,
+        )
         return self.finish(layer, batch, width)
 
 
@@ -101,9 +114,12 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
     def _load_copy_sfa_operator():
         if not (
             hasattr(torch.ops.npu, "a5_copy_sfa_capabilities")
-            and torch.ops.npu.a5_copy_sfa_capabilities().get("full_visible") == 1
+            and torch.ops.npu.a5_copy_sfa_capabilities().get("resident_source_gather")
+            == 1
         ):
-            raise RuntimeError("A5 C8 requires the paired fully visible CopySFA wheel.")
+            raise RuntimeError(
+                "A5 C8 requires the paired native-LIM source-gather CopySFA wheel."
+            )
         return torch.ops.npu.fused_quant_scatter_copy_sparse_flash_attention_v2
 
     def _make_decode_adapter(self):
@@ -132,17 +148,16 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         if resident_id:
             self.reset_requests([request_id], [resident_id])
 
-    def offload_v2(self, k, k_rope, layer, forward_batch):
-        layer_index = layer.layer_id - self.start_layer
-        current = self.paged_kv_cache._pack_dsa_fp8_kv_cache(k, k_rope).view(torch.int8)
+    def prepare_publication_rows(self, forward_batch, tokens, device):
+        """Build layer-independent row addresses for this target forward."""
         prefill = forward_batch.forward_mode.is_extend_without_speculative()
-        src, dst, positions, valid = prepare_sparse_kv_rows(
+        return prepare_sparse_kv_rows(
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             None if prefill else forward_batch.positions,
             forward_batch.out_cache_loc,
-            tokens=current.shape[0],
-            device=current.device,
+            tokens=tokens,
+            device=device,
             request_rows=self.size,
             context_len=self.logical_max_context_len,
             host_capacity=self.host_token_capacity,
@@ -151,8 +166,18 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             extend_prefix_lens=forward_batch.extend_prefix_lens if prefill else None,
             compact_prefill=prefill
             and sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
-            == current.shape[0],
+            == tokens,
         )
+
+    def offload_v2(self, k, k_rope, layer, forward_batch, publication_rows=None):
+        layer_index = layer.layer_id - self.start_layer
+        current = self.paged_kv_cache._pack_dsa_fp8_kv_cache(k, k_rope).view(torch.int8)
+        prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        if publication_rows is None:
+            publication_rows = self.prepare_publication_rows(
+                forward_batch, current.shape[0], current.device
+            )
+        src, dst, positions, valid = publication_rows
         if self.host_pool.rank == 0:
             _copy_packed(current, self.host_kv_buffer[layer_index], src, dst, valid)
         self.host_pool.publish()
@@ -163,78 +188,14 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
                 self.lim_adapter.last_prefix[layer_index].index_fill_(0, requests, -1)
         return current, positions, valid
 
-    def _restore_short_and_refresh(self, layer, plan, lengths, current_inputs):
-        """Restore short identity rows and refresh any newly rewritten resident."""
-        current, positions, valid = current_inputs
-        batch, width = lengths.numel(), plan.query_width
-        capacity = self.cache_capacity
-        reqs = torch.where(plan.valid_rows, plan.request_safe_slots, 0).long()
-        base = (plan.resident_safe_slots.long() - 1) * capacity
-        short = plan.valid_rows & ~plan.sparse_rows
-        first = lengths - width
-        old_end = self.resident_end[layer].index_select(0, reqs).clamp_min(0)
-        table = self.req_to_token_pool.req_to_token
-        history = torch.arange(min(capacity, table.shape[1]), device=self.device)
-        host_sources = table[reqs[:, None], history]
-        present = short[:, None] & (history >= torch.minimum(old_end, first)[:, None])
-        present = present & (history < first[:, None])
-        present = (
-            present & (host_sources >= 0) & (host_sources < self.host_token_capacity)
-        )
-        cache = self.device_kv_buffer[layer]
-        _copy_packed(
-            self.host_kv_buffer[layer],
-            cache,
-            host_sources,
-            base[:, None] + history,
-            present,
-        )
-
-        rows = batch * width
-        pos = positions[:rows].reshape(batch, width)
-        resident = plan.resident_safe_slots.long()[:, None]
-        # IndexShare consumers must use the mapping produced at the owner layer.
-        source_map = self.device_slot_map[plan.owner_layer]
-        mapped = source_map[resident, pos.clamp(0, source_map.shape[1] - 1)]
-        mapped_ok = (
-            (pos >= 0)
-            & (pos < source_map.shape[1])
-            & (mapped >= 0)
-            & (mapped < capacity)
-        )
-        valid_now = valid[:rows].reshape_as(pos) & plan.valid_rows[:, None]
-        valid_now = valid_now & torch.where(
-            short[:, None], (pos >= 0) & (pos < capacity), mapped_ok
-        )
-        slots = torch.where(short[:, None], pos, mapped)
-        _copy_packed(
-            current,
-            cache,
-            torch.arange(rows, device=self.device),
-            base[:, None] + slots,
-            valid_now,
-        )
-        self.resident_end[layer].index_copy_(0, reqs, torch.where(short, lengths, -1))
-
     def copy_sfa_attention(self, layer, query_nope, query_rope, plan, current_inputs):
         layer_index = layer.layer_id - self.start_layer
         batch, width = plan.valid_rows.numel(), plan.query_width
         rows, heads = batch * width, query_nope.shape[1]
         padded_heads = self.budget.copy_sfa_query_heads
         lengths = self.lim_adapter._pre_lengths[:batch]
-        self._restore_short_and_refresh(layer_index, plan, lengths, current_inputs)
+        current, positions, valid = current_inputs
         hbm_table = self.planner_hbm_block_table[:batch]
-        prepare_copy_sfa_metadata(
-            source_ids=plan.source_ids,
-            valid_rows=plan.valid_rows,
-            sparse_rows=plan.sparse_rows,
-            request_slots=plan.resident_safe_slots,
-            actual_seq_lengths_kv=lengths,
-            hbm_block_table=hbm_table,
-            capacity=self.cache_capacity,
-            query_width=width,
-            hbm_row_offset=1,
-        )
         if heads < padded_heads:
             padding = (0, 0, 0, padded_heads - heads)
             query_nope = torch.nn.functional.pad(query_nope, padding)
@@ -261,7 +222,14 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
             plan.miss_counts,
             layer.scaling,
             output,
+            current=current[:rows],
+            positions=positions[:rows],
+            current_valid=valid[:rows],
+            request_slots=plan.request_safe_slots,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            resident_end=self.resident_end[layer_index, : self.actual_request_rows],
+            native_lim_plan=True,
         )
-        valid = plan.valid_rows[:, None].expand(batch, width).reshape(rows)
-        output.masked_fill_(~valid[:, None, None], 0)
+        # Invalid requests have positive TND query width and zero KV length.
+        # CopySFA initializes their output before skipping them in attention.
         return output[:, :heads].reshape(rows, -1)
