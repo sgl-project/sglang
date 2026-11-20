@@ -2287,7 +2287,8 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
                     )
                     self.assertEqual(mamba_pool.host_capacity_bytes, slots * slot_bytes)
                     _, mamba_share = hybrid_pool_assembler._split_hicache_size(
-                        self.HICACHE_SIZE_GB, (kv_pool, mamba_pool)
+                        hicache_size=self.HICACHE_SIZE_GB,
+                        kv_pools=(kv_pool, mamba_pool),
                     )
                     # The rule before: every device Mamba byte, scratch included.
                     device_bytes = mamba_pool.get_kv_size_bytes()
