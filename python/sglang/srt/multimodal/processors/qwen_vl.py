@@ -55,8 +55,8 @@ from sglang.srt.multimodal.qwen_vl_media_processing import smart_resize as smart
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +266,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             hf_config = hf_config.thinker_config
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+        self._tp_image_preprocess = self._enable_tp_image_preprocessing(
+            server_args, _processor
+        )
 
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
@@ -294,6 +297,54 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    def _enable_tp_image_preprocessing(self, server_args, processor) -> bool:
+        if not envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get() or self.model_type not in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        ):
+            return False
+
+        parallel = get_parallel()
+        disagg = get_disagg()
+        pure_tp = (
+            server_args.nnodes == 1
+            and parallel.tp_size > 1
+            and parallel.dp_size
+            == parallel.pp_size
+            == parallel.attn_dp_size
+            == parallel.attn_cp_size
+            == parallel.ep_size
+            == 1
+        )
+        colocated = (
+            disagg.disaggregation_mode == "null"
+            and not disagg.language_only
+            and not disagg.encoder_only
+            and not disagg.enable_adaptive_dispatch_to_encoder
+            and not get_mm().mm_enable_dp_encoder
+        )
+        fast_gpu_preprocessing = (
+            not self.keep_mm_features_on_device
+            and not self.disable_fast_image_processor
+            and isinstance(processor.image_processor, BaseImageProcessor)
+            and not envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        )
+        if not (
+            is_cuda()
+            and pure_tp
+            and colocated
+            and fast_gpu_preprocessing
+            and server_args.disable_prefill_cuda_graph
+            and not envs.SGLANG_RUST_SERVER.get()
+            and envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
+        ):
+            raise ValueError(
+                "Qwen-VL TP image preprocessing requires single-node pure CUDA TP, "
+                "fast GPU processing with CPU feature transport, and eager prefill"
+            )
+        logger.info("Enabled Qwen-VL rank-local TP image preprocessing")
+        return True
 
     @property
     def spatial_merge_size(self):
@@ -814,6 +865,42 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             processor_device = self._fast_image_processor_device(processor)
             if processor_device is not None:
                 image_kwargs["device"] = processor_device
+
+        if (
+            self._tp_image_preprocess
+            and processor_device
+            and processor_device.startswith("cuda")
+        ):
+            from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
+                DEFERRED_IMAGE_PATCH_WIDTH_KEY,
+                prepare_deferred_image,
+            )
+
+            deferred = [
+                prepare_deferred_image(
+                    entry.media, processor.image_processor, image_kwargs
+                )
+                for entry in entries
+            ]
+            if all(item is not None for item in deferred):
+                return [
+                    QwenVLImagePreprocessArtifact(
+                        content_digest=entry.content_digest,
+                        artifact_key=entry.artifact_key,
+                        feature_hash=resolve_multimodal_item_hash(
+                            # The artifact key already commits to the media bytes
+                            # and processor settings; only the derived grid is new.
+                            feature=("qwen-vl-tp-image-v1", grid),
+                            namespace=entry.artifact_key,
+                        ),
+                        feature=pixels,
+                        model_specific_data={
+                            "image_grid_thw": grid,
+                            DEFERRED_IMAGE_PATCH_WIDTH_KEY: patch_width,
+                        },
+                    )
+                    for entry, (pixels, grid, patch_width) in zip(entries, deferred)
+                ]
 
         features, image_grid_thw = self._run_image_processor_chunked(
             processor, entries, image_kwargs, processor_device

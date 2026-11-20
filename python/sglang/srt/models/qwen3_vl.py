@@ -88,7 +88,13 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_mm,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, round_up
 
 _is_npu = is_npu()
@@ -1425,10 +1431,75 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             _require_vision(self)
         return pad_mm_tokens(input_ids, mm_inputs)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_feature(
+        self, items: List[MultimodalDataItem]
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         _require_vision(self)
+        if envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get():
+            from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
+                DEFERRED_IMAGE_PATCH_WIDTH_KEY,
+            )
+
+            needs_preprocessing = [
+                DEFERRED_IMAGE_PATCH_WIDTH_KEY in item.model_specific_data
+                for item in items
+            ]
+            if any(needs_preprocessing):
+                return self._encode_tp_image_features(items, needs_preprocessing)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         return self._get_visual_feature(items, image_grid_thw)
+
+    def _encode_tp_image_features(
+        self, items: List[MultimodalDataItem], needs_preprocessing: List[bool]
+    ) -> List[torch.Tensor]:
+        from sglang.srt.multimodal.qwen_vl_tp_preprocess import encode_tp_images
+
+        deferred_items = [
+            item for item, deferred in zip(items, needs_preprocessing) if deferred
+        ]
+        preprocessed_items = [
+            item for item, deferred in zip(items, needs_preprocessing) if not deferred
+        ]
+        mm_config = get_mm().mm_process_config or {}
+        deferred_embeddings = iter(
+            encode_tp_images(
+                deferred_items,
+                self.visual,
+                self._get_tp_image_processor,
+                mm_config.get("image", {}),
+                self.visual.device,
+                self.visual.dtype,
+                get_parallel().tp_group,
+            )
+        )
+        preprocessed_embeddings = iter(())
+        if preprocessed_items:
+            grids = torch.cat(
+                [item.image_grid_thw for item in preprocessed_items], dim=0
+            )
+            embeddings = self._get_visual_feature(preprocessed_items, grids)
+            token_counts = [
+                item.offsets[0][1] - item.offsets[0][0] + 1
+                for item in preprocessed_items
+            ]
+            preprocessed_embeddings = iter(embeddings.split(token_counts, dim=0))
+        return [
+            next(deferred_embeddings if deferred else preprocessed_embeddings)
+            for deferred in needs_preprocessing
+        ]
+
+    def _get_tp_image_processor(self):
+        serving = get_serving()
+        model = get_model()
+        return cached_get_processor(
+            serving.tokenizer_path,
+            tokenizer_mode=serving.tokenizer_mode,
+            trust_remote_code=model.trust_remote_code,
+            revision=model.revision,
+            image_processor_backend=get_mm().image_processor_backend,
+            tokenizer_backend=serving.tokenizer_backend,
+            model_name=model.model_path,
+        ).image_processor
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)

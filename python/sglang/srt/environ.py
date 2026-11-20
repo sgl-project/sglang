@@ -1898,6 +1898,7 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS = EnvBool(False)
     # Read by the Rust preprocessing extension (rust/sglang-mm), not by Python:
     # its CPU pool's thread count. None = unset = min(8, CPU cores).
     SGLANG_MM_RS_THREADS = EnvInt(None)
