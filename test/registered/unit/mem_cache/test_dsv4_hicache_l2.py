@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -699,6 +700,32 @@ class TestDSV4LowRatioHostPages(CustomTestCase):
             .shape,
             (2, 64, 1, 64),
         )
+
+    def test_ratio2_compressor_state_is_cleared_at_page_boundary(self):
+        pool = CompressStatePool(
+            size=4,
+            ring_size=4,
+            overlap=False,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+            enable_memory_saver=False,
+            ratio=2,
+            request_scoped=True,
+            state_cache_page_size=4,
+        )
+        pool.kv_score_buffer.kv_score.fill_(1.0)
+        fake_owner = SimpleNamespace(compress_state_pools=[pool])
+
+        DeepSeekV4TokenToKVPool.clear_request_scoped_state(fake_owner, 1)
+
+        start = 1 * pool.ring_size
+        ring = pool.kv_score_buffer[start : start + pool.ring_size]
+        self.assertEqual(torch.count_nonzero(ring.kv).item(), 0)
+        self.assertTrue(torch.isneginf(ring.score).all())
+        # 768 is an even, page-aligned boundary: no pending half-pair.
+        self.assertEqual(len(pool.transfer_indices(1, 768)), 0)
+        self.assertEqual(pool.transfer_indices(1, 769).tolist(), [1])
 
     def test_draft_swa_row_bytes_must_match_target(self):
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler

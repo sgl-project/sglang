@@ -861,8 +861,13 @@ def build_deepseek_v4_hicache_stack(
             DeepSeekV4TokenToKVPool,
         )
 
+        # Sidecar drafts get their own DRAFT_SWA host pool; only packed drafts
+        # share the target's SWA rows.
+        sidecar_draft_ids = {id(pool) for pool in params.sidecar_draft_device_pools}
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         for pool in params.mtp_draft_device_pools:
+            if id(pool) in sidecar_draft_ids:
+                continue
             if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool.swa_layer_ids():
                 # A draft with no SWA layer has no SWA buffer to pack.
                 continue
