@@ -1,6 +1,4 @@
 import json
-import os
-import tempfile
 
 import requests
 import torch
@@ -11,7 +9,7 @@ from sglang.srt.sampling.watermarking.synthid.algorithm import (
 )
 from sglang.srt.sampling.watermarking.synthid.state import SynthIDStatePool
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.synthid_utils import REFERENCE_SYNTHID_KEYS
+from sglang.test.synthid_utils import SYNTHID_TEST_KEYS
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -24,7 +22,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-small")
 
-_CONFIG = SynthIDConfig(keys=REFERENCE_SYNTHID_KEYS)
+_CONFIG = SynthIDConfig(keys=SYNTHID_TEST_KEYS)
 # Each prompt is over 64 tokens, so a 64-token chunked prefill splits it.
 _PROMPTS = [
     f"{prompt} Write for a general audience that enjoys detail. Use concrete "
@@ -74,16 +72,9 @@ class SynthIDServerTest(CustomTestCase):
     model = "Qwen/Qwen2.5-0.5B-Instruct"
     extra_args = []
     process = None
-    config_file = None
 
     @classmethod
     def setUpClass(cls):
-        cls.config_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        )
-        json.dump({"keys": list(_CONFIG.keys)}, cls.config_file)
-        cls.config_file.close()
-        os.chmod(cls.config_file.name, 0o600)
         cls.process = popen_launch_server(
             cls.model,
             DEFAULT_URL_FOR_TEST,
@@ -93,7 +84,7 @@ class SynthIDServerTest(CustomTestCase):
                 "--watermark-algorithm",
                 "synthid",
                 "--watermark-config",
-                cls.config_file.name,
+                json.dumps({"keys": list(_CONFIG.keys)}),
                 *cls.extra_args,
             ],
         )
@@ -102,11 +93,8 @@ class SynthIDServerTest(CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
-        if cls.config_file is not None:
-            os.unlink(cls.config_file.name)
 
     def generate(self, enabled, *, top_p=0.95, max_new_tokens=256):
-        """One /generate batch; request ``i`` is watermarked iff ``enabled[i]``."""
         response = requests.post(
             f"{DEFAULT_URL_FOR_TEST}/generate",
             json={
@@ -127,7 +115,6 @@ class SynthIDServerTest(CustomTestCase):
         return response.json()
 
     def assert_watermarked(self, outputs, enabled):
-        """Watermarked outputs score above 0.5 and the others do not."""
         for on in set(enabled):
             g_values = [
                 g
@@ -155,7 +142,6 @@ class TestSynthIDWatermark(SynthIDServerTest):
         for output, on in zip(outputs, enabled, strict=True):
             if on:
                 z_score = _z_score(_g_values(output["output_ids"]))
-                print(f"watermarked output: z-score {z_score:.1f}")
                 self.assertGreater(z_score, 4)
 
     def test_all_watermarked_batch(self):

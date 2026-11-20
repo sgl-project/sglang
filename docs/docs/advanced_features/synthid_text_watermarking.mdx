@@ -29,8 +29,6 @@ python -m sglang.launch_server \
   --watermark-config /run/secrets/synthid.json
 ```
 
-`--watermark-config` also accepts the JSON object inline; a file keeps the keys out of the command line.
-
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `keys` | Required | 1 to 64 distinct signed 64-bit integer layer keys. |
@@ -39,11 +37,11 @@ python -m sglang.launch_server \
 | `context_history_size` | `1024` | Number of recent context hashes kept per request, from 1 to 2,048; a repeated context is not watermarked again. |
 | `skip_first_ngram_calls` | `false` | Do not watermark the first `ngram_len - 1` generated tokens. |
 
-`default_enabled` and `enforce_all` work as for Gumbel; see [Server configuration](/docs/advanced_features/text_watermarking#server-configuration). The Gumbel fields (`key`, `key_b`, `context_window`, `mixing_probability`, `max_probability`) are rejected with `synthid`, even when they restate a Gumbel default, and the SynthID fields with `gumbel`. Keys and the other settings are server-wide. Server info, crash dumps, and logs redact the keys; protect process and GPU core dumps, which can hold them in memory.
+`default_enabled` and `enforce_all` work as for Gumbel; see [Server configuration](/docs/advanced_features/text_watermarking#server-configuration). Fields of the other algorithm are rejected.
 
 ## Request control
 
-Requests turn watermarking on and off with the `watermark` object described in [Per-request control](/docs/advanced_features/text_watermarking#per-request-control); with `synthid` only its `enabled` field is accepted. A request `key` or `context_window` is rejected: those are Gumbel controls. Greedy requests (`top_k` 1 or temperature 0) are never watermarked.
+Requests turn watermarking on and off with the `watermark` object described in [Per-request control](/docs/advanced_features/text_watermarking#per-request-control); with `synthid` only its `enabled` field is accepted. Greedy requests (`top_k` 1 or temperature 0) are never watermarked.
 
 ## Sampling
 
@@ -54,13 +52,11 @@ A watermarked row is sampled as follows:
 3. The tournament reweights the remaining candidates by their g-values for the row's context.
 4. The stock sampler draws from the result.
 
-Unwatermarked rows in the same batch draw the same tokens as on a server without watermarking. A batch whose rows are all watermarked and need no request filter, seed, logprobs, or sampling mask is drawn by one fused kernel when `num_candidates` is at most 1,024 and tensor parallelism is 1.
-
-Returned logprobs describe the logits before the watermark; an unwatermarked row's match a server without watermarking up to float rounding (about 1e-7), with identical tokens. `SGLANG_RETURN_ORIGINAL_LOGPROB` keeps its meaning. A returned sampling mask describes the watermarked support the token was drawn from.
+Unwatermarked rows in the same batch draw the same tokens as on a server without watermarking. Returned logprobs describe the logits before the watermark; an unwatermarked row's match a server without watermarking up to float rounding (about 1e-7). `SGLANG_RETURN_ORIGINAL_LOGPROB` keeps its meaning. A returned sampling mask describes the watermarked support the token was drawn from.
 
 ## Speculative decoding
 
-SynthID supports EAGLE and EAGLE3 with `--speculative-eagle-topk 1`, `--speculative-use-rejection-sampling`, and at most 8 `--speculative-num-draft-tokens`. EAGLE3 has an end-to-end test; EAGLE, `--speculative-token-map`, and `--enable-multi-layer-eagle` verify through the same path without end-to-end tests of their own:
+SynthID supports EAGLE and EAGLE3 with `--speculative-eagle-topk 1`, `--speculative-use-rejection-sampling`, and at most 8 `--speculative-num-draft-tokens`:
 
 ```bash
 python -m sglang.launch_server \
@@ -76,16 +72,14 @@ python -m sglang.launch_server \
   --watermark-config /run/secrets/synthid.json
 ```
 
-The watermark applies to the target distribution at verification; the draft model proposes as usual. A draft with a reduced vocabulary (an EAGLE3 draft or a token map) has its proposal mapped onto the target vocabulary first. Rejection sampling then emits tokens from the watermarked target distribution, and only accepted tokens, including the bonus token, advance a request's watermark state.
+The watermark applies to the target distribution at verification; the draft model proposes as usual. Rejection sampling then emits tokens from the watermarked target distribution, and only accepted tokens, including the bonus token, advance a request's watermark state.
 
 ## Unsupported configurations
 
 `--watermark-algorithm synthid` is rejected with:
 
-- a speculative algorithm other than EAGLE and EAGLE3 (NGRAM, DSPARK, STANDALONE, and others), speculative decoding without `--speculative-use-rejection-sampling` (which itself requires `--speculative-eagle-topk 1`), or more than 8 `--speculative-num-draft-tokens`;
 - `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`;
-- `--rl-on-policy-target`, since the watermark changes the sampling distribution;
-- a device other than NVIDIA CUDA.
+- `--rl-on-policy-target`, since the watermark changes the sampling distribution.
 
 The restrictions of `--enable-watermark` that hold for every algorithm, such as PD disaggregation and custom logit processors, are listed under [Compatibility](/docs/advanced_features/text_watermarking#compatibility).
 

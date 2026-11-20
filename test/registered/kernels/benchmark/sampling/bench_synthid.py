@@ -9,7 +9,7 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.srt.sampling.watermarking.synthid.algorithm import SynthIDConfig
 from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.synthid_utils import REFERENCE_SYNTHID_KEYS
+from sglang.test.synthid_utils import SYNTHID_TEST_KEYS
 
 register_cuda_ci(
     est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
@@ -23,7 +23,7 @@ VOCAB_SIZE = 248_320
 @marker.parametrize("batch_size", BATCH_SIZES, CI_BATCH_SIZES)
 @marker.benchmark("provider", ["transform", "fused"])
 def benchmark_stochastic(batch_size: int, provider: str):
-    config = SynthIDConfig(keys=REFERENCE_SYNTHID_KEYS, num_candidates=1024)
+    config = SynthIDConfig(keys=SYNTHID_TEST_KEYS, num_candidates=1024)
     watermark = SynthIDWatermark(config, max(BATCH_SIZES), "cuda")
     slots = torch.arange(batch_size, device="cuda")
     watermark.seed(slots, [[] for _ in range(batch_size)])

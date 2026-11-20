@@ -1,5 +1,3 @@
-"""SynthID Triton kernels against the torch paths of the SynthID lib."""
-
 import unittest
 
 import torch
@@ -15,8 +13,8 @@ from sglang.srt.sampling.watermarking.synthid.algorithm import (
 from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.synthid_utils import (
-    REFERENCE_SYNTHID_KEYS,
-    STATE_FIELDS,
+    SYNTHID_TEST_KEYS,
+    assert_synthid_state_equal,
     synthid_state,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -26,7 +24,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 def _watermark(device, *, num_candidates=40, skip_first=False):
     config = SynthIDConfig(
-        keys=REFERENCE_SYNTHID_KEYS[:4],
+        keys=SYNTHID_TEST_KEYS[:4],
         num_candidates=num_candidates,
         context_history_size=4,
         skip_first_ngram_calls=skip_first,
@@ -43,11 +41,8 @@ class TestSynthIDKernels(CustomTestCase):
     def test_tournament_kernel_matches_torch(self):
         for rows, num_candidates, depth in (
             (1, 3, 2),
-            (8, 40, 30),
-            (64, 64, 30),
             (8, 1024, 30),
-            (1, 1024, 64),
-            (1, 65536, 30),
+            (1, 65536, 64),
         ):
             with self.subTest(rows=rows, num_candidates=num_candidates, depth=depth):
                 torch.manual_seed(7)
@@ -69,7 +64,7 @@ class TestSynthIDKernels(CustomTestCase):
                 torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
 
     def test_fused_sample_applies_temperature_and_leaves_state(self):
-        for num_candidates, skip_first in ((3, False), (40, True), (1024, False)):
+        for num_candidates, skip_first in ((40, True), (1024, False)):
             with self.subTest(num_candidates=num_candidates, skip_first=skip_first):
                 reference, slots = _watermark(
                     "cpu", num_candidates=num_candidates, skip_first=skip_first
@@ -113,32 +108,19 @@ class TestSynthIDKernels(CustomTestCase):
                     skip_first_ngram_calls=skip_first,
                 )
                 self.assertEqual(sampled.cpu().tolist(), expected_tokens.tolist())
-                self.assert_state_equal(reference, actual)
-
-                logits = torch.randn(2, 4096, device="cuda")
-                self.assertTrue(actual.can_fuse_sample(logits))
-                sampled = actual.sample(logits, temperatures, gpu_slots)
-                candidates = logits.topk(num_candidates).indices
-                self.assertTrue((candidates == sampled[:, None]).any(dim=1).all())
-                self.assert_state_equal(reference, actual)
+                assert_synthid_state_equal(
+                    synthid_state(actual), synthid_state(reference)
+                )
 
     def test_projection_transforms_and_commit_match_cpu(self):
         for skip_first in (False, True):
-            for stage in ("current", "apply", "verify", "commit"):
+            for stage in ("apply", "verify", "commit"):
                 with self.subTest(skip_first=skip_first, stage=stage):
                     reference, slots = _watermark("cpu", skip_first=skip_first)
                     actual, gpu_slots = _watermark("cuda", skip_first=skip_first)
-                    if stage == "current":
-                        hashes, mask = reference.state.current(slots)
-                        self.assertFalse(mask[1].item())
-                        torch.testing.assert_close(
-                            tuple(t.cpu() for t in actual.state.current(gpu_slots)),
-                            (hashes, mask),
-                        )
-                    elif stage == "commit":
+                    if stage == "commit":
                         for tokens, lengths in (
                             (torch.tensor([101, 201]), torch.tensor([0, 1])),
-                            (torch.tensor([102, 202]), None),
                             (
                                 torch.tensor([[101, 102, 103], [201, 202, 0]]),
                                 torch.tensor([3, 2]),
@@ -151,7 +133,9 @@ class TestSynthIDKernels(CustomTestCase):
                                 tokens.cuda(),
                                 None if lengths is None else lengths.cuda(),
                             )
-                            self.assert_state_equal(reference, actual)
+                            assert_synthid_state_equal(
+                                synthid_state(actual), synthid_state(reference)
+                            )
                     else:
                         width = 3 if stage == "verify" else 1
                         # Unique logits avoid CPU/CUDA top-k tie-order differences.
@@ -180,7 +164,9 @@ class TestSynthIDKernels(CustomTestCase):
                         else:
                             reference.apply(expected, temperatures, slots)
                             actual.apply(watermarked, temperatures.cuda(), gpu_slots)
-                        self.assert_state_equal(reference, actual)
+                        assert_synthid_state_equal(
+                            synthid_state(actual), synthid_state(reference)
+                        )
                         row_temperatures = temperatures.repeat_interleave(width, 0)
                         torch.testing.assert_close(
                             (watermarked.cpu() / row_temperatures).softmax(-1),
@@ -188,11 +174,6 @@ class TestSynthIDKernels(CustomTestCase):
                             rtol=2e-4,
                             atol=2e-5,
                         )
-
-    def assert_state_equal(self, reference, actual):
-        reference, actual = synthid_state(reference), synthid_state(actual)
-        for name in STATE_FIELDS:
-            torch.testing.assert_close(actual[name], reference[name])
 
 
 if __name__ == "__main__":

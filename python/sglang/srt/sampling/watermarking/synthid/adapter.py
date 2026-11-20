@@ -1,7 +1,3 @@
-"""SynthID Text behind the engine's watermark interface: request policy,
-per-batch rows, server checks, and the engine that binds them to the SynthID
-watermark."""
-
 from __future__ import annotations
 
 import dataclasses
@@ -40,7 +36,6 @@ class SynthIDRows(msgspec.Struct, frozen=True):
     def from_candidates(
         cls, candidates_host: list[bool], device: torch.device | str
     ) -> Optional[SynthIDRows]:
-        """The rows whose ``candidates_host`` entry is set, or None for none."""
         indices = [index for index, on in enumerate(candidates_host) if on]
         if not indices:
             return None
@@ -78,13 +73,10 @@ class SynthIDRows(msgspec.Struct, frozen=True):
         )
 
     def take(self, tensor: torch.Tensor) -> torch.Tensor:
-        """The watermarked rows of a per-row tensor."""
         return tensor if self.all_on else tensor[self.indices]
 
     @property
     def take_index(self) -> Optional[torch.Tensor]:
-        """The index ``take`` applies, None when every row is watermarked: the
-        row selector ``SynthIDWatermark`` takes."""
         return None if self.all_on else self.indices
 
 
@@ -149,8 +141,6 @@ def request_enabled(sampling_params: SamplingParams, *, features: ExecFeatures) 
 
 
 def _synthid_config(cfg: ExecFeatures | ResolvingConfig) -> SynthIDConfig:
-    """The SynthID config of resolved server args; unset fields keep the
-    SynthIDConfig defaults."""
     optional = {
         name: getattr(cfg, f"watermark_{name}")
         for name in SYNTHID_CONFIG_FIELDS
@@ -186,8 +176,6 @@ class SynthIDEngine:
     def seed_payload(
         self, batch: ScheduleBatch
     ) -> Optional[tuple[list[int], list[list[int]]]]:
-        """The watermarked prefill rows of an extend batch, and the generated
-        tokens each one replays (none for a fresh request)."""
         rows = batch.sampling_info.watermark
         if rows is None or not batch.forward_mode.is_extend_without_speculative():
             return None
@@ -335,8 +323,6 @@ class SynthIDSample:
         )
 
     def _can_fuse(self, logits: torch.Tensor, keep_logits: bool) -> bool:
-        """Whether one fused SynthID kernel can replace the stock sampler for
-        this batch."""
         sampling_info = self.forward_batch.sampling_info
         return (
             self.allow_fused_sample
@@ -352,9 +338,8 @@ class SynthIDSample:
 
 
 class SynthIDVerify:
-    """One EAGLE verify's transform. ``check_server_args`` requires rejection
-    sampling, which allows only topk=1 drafts, so each row's draft is a chain
-    whatever ``custom_mask`` holds."""
+    """``check_server_args`` requires rejection sampling, which allows only
+    topk=1 drafts, so each row's draft is a chain whatever ``custom_mask`` holds."""
 
     def __init__(self, watermark: SynthIDWatermark, rows: SynthIDRows) -> None:
         self.watermark = watermark

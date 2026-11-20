@@ -1,16 +1,3 @@
-# Copyright 2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """SynthID applied to sampling logits.
 
 The transform rewrites the logits of watermarked rows so that a stock sampler,
@@ -45,8 +32,6 @@ FilterProbs = Callable[[torch.Tensor], torch.Tensor]
 
 
 class SynthIDWatermark:
-    """SynthID keys, per-slot state, and the logits transforms."""
-
     def __init__(
         self,
         config: SynthIDConfig,
@@ -60,7 +45,6 @@ class SynthIDWatermark:
     def seed(
         self, slots: torch.Tensor, replay_token_ids: Sequence[Sequence[int]]
     ) -> None:
-        """See ``SynthIDStatePool.seed``."""
         self.state.seed(slots, replay_token_ids)
 
     def commit(
@@ -69,7 +53,6 @@ class SynthIDWatermark:
         token_ids: torch.Tensor,
         lengths: Optional[torch.Tensor] = None,
     ) -> None:
-        """See ``SynthIDStatePool.commit``."""
         self.state.commit(slots, token_ids, lengths)
 
     def apply(
@@ -86,8 +69,7 @@ class SynthIDWatermark:
         ``logits`` is ``[B, V]`` float32. ``rows`` (int64, ``[N]``) picks the
         watermarked rows, all ``B`` when None; ``temperatures`` ``[N, 1]`` and
         ``slots`` ``[N]`` belong to those rows, and ``filter_probs`` sees them
-        in that order. Other rows are left untouched. The caller samples the
-        watermarked rows under the module's caller contract (top_p=1, min_p=0).
+        in that order. Other rows are left untouched.
         """
         context_hashes, apply_mask = self.state.current(slots)
         self._watermark_rows(
@@ -129,7 +111,6 @@ class SynthIDWatermark:
         )
 
     def can_fuse_sample(self, logits: torch.Tensor) -> bool:
-        """Whether ``sample`` supports these logits and this config."""
         return (
             self.state.use_triton
             and logits.dtype == torch.float32

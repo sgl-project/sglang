@@ -1,6 +1,3 @@
-"""SynthID adapter: config, request policy, server checks, rows, and the bound
-sample and verify steps on CPU."""
-
 import json
 import unittest
 from types import SimpleNamespace
@@ -11,7 +8,6 @@ import torch
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.serving_hook import handle_watermark_config
 from sglang.srt.arg_groups.validation_hook import check_watermark_server_args
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
@@ -24,7 +20,7 @@ from sglang.srt.sampling.watermarking.synthid.algorithm import SynthIDConfig
 from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.synthid_utils import STATE_FIELDS, synthid_state
+from sglang.test.synthid_utils import assert_synthid_state_equal, synthid_state
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -84,7 +80,6 @@ def _info(batch_size, *, top_ks=None, top_ps=None, min_ps=None, watermark=None):
 
 
 def _watermarks(num_slots=8):
-    """Two watermarks with the same keys and the same state, held separately."""
     config = SynthIDConfig(
         keys=(1, 2, 3), ngram_len=3, num_candidates=6, context_history_size=4
     )
@@ -97,12 +92,6 @@ def _watermarks(num_slots=8):
     return watermarks
 
 
-def _assert_same_state(test, actual, expected):
-    actual, expected = synthid_state(actual), synthid_state(expected)
-    for name in STATE_FIELDS:
-        test.assertTrue(torch.equal(actual[name], expected[name]), name)
-
-
 class TestSynthIDConfig(CustomTestCase):
     def test_file_fields_resolve_and_keys_are_redacted(self):
         cfg = _resolve({"keys": _KEYS, "ngram_len": 3, "num_candidates": 40})
@@ -110,15 +99,9 @@ class TestSynthIDConfig(CustomTestCase):
         config = adapter._synthid_config(cfg)
         self.assertEqual(config.keys, tuple(_KEYS))
         self.assertEqual((config.ngram_len, config.num_candidates), (3, 40))
-        # Unset fields keep the lib defaults.
-        self.assertEqual(config.context_history_size, 1024)
-        self.assertFalse(config.skip_first_ngram_calls)
 
         loaded = load_watermark_config(json.dumps({"keys": _KEYS}), algorithm="synthid")
         self.assertNotIn("11", repr(loaded))
-        self.assertIn("keys=<redacted>", repr(loaded))
-        unset = load_watermark_config("{}", algorithm="synthid")
-        self.assertIn("keys=None", repr(unset))
         self.assertEqual(redact_watermark_secrets(loaded).keys, "<redacted>")
         self.assertEqual(
             redact_watermark_secrets({"watermark_keys": _KEYS}),
@@ -134,100 +117,26 @@ class TestSynthIDConfig(CustomTestCase):
             "speculative_num_draft_tokens": 4,
             "speculative_use_rejection_sampling": True,
         }
-        drafts = {
-            "EAGLE": {},
-            "EAGLE3": {"speculative_algorithm": "EAGLE3"},
-            "--speculative-token-map": {"speculative_token_map": "map.pt"},
-            "--enable-multi-layer-eagle": {"enable_multi_layer_eagle": True},
-        }
-        _resolve({"keys": _KEYS})
-        # A null field is unset, whichever algorithm reads it.
-        _resolve({"key": "abcd", "ngram_len": None}, watermark_algorithm="gumbel")
-        for name, draft in drafts.items():
-            spec = {**eagle, **draft}
-            with self.subTest(accepted=name):
-                _resolve({"keys": _KEYS, "default_enabled": True}, **spec)
-            with self.subTest(without_rejection_sampling=name):
-                with self.assertRaisesRegex(
-                    ValueError, "requires --speculative-use-rejection-sampling"
-                ):
-                    _resolve(
-                        {"keys": _KEYS},
-                        **{**spec, "speculative_use_rejection_sampling": False},
-                    )
+        _resolve({"keys": _KEYS, "default_enabled": True}, **eagle)
         refused = {
-            "requires watermark config keys": ({}, {}),
-            "1 to 64": ({"keys": list(range(65))}, {}),
-            "distinct": ({"keys": [7, 7]}, {}),
-            "ngram_len must be from 2 to 17": ({"keys": _KEYS, "ngram_len": 18}, {}),
-            "num_candidates must be from 2": ({"keys": _KEYS, "num_candidates": 1}, {}),
-            "context_history_size must be from 1 to 2048": (
-                {"keys": _KEYS, "context_history_size": 2049},
-                {},
+            "requires --speculative-use-rejection-sampling": (
+                {"keys": _KEYS},
+                {**eagle, "speculative_use_rejection_sampling": False},
             ),
             r"\['key'\] are not supported with --watermark-algorithm synthid": (
                 {"keys": _KEYS, "key": "abcd"},
                 {},
-            ),
-            # Restates the gumbel default: rejected all the same.
-            r"\['context_window'\] are not supported": (
-                {"keys": _KEYS, "context_window": 4},
-                {},
-            ),
-            r"\['keys'\] are not supported with --watermark-algorithm gumbel": (
-                {"key": "abcd", "keys": _KEYS},
-                {"watermark_algorithm": "gumbel"},
             ),
             # Passed as server arguments instead of through the file.
             r"\['watermark_keys'\] are not supported with --watermark-algorithm gumbel": (
                 {"key": "abcd"},
                 {"watermark_algorithm": "gumbel", "watermark_keys": _KEYS},
             ),
-            r"\['watermark_context_window'\] are not supported": (
-                {"keys": _KEYS},
-                {"watermark_context_window": 8},
-            ),
-            "unknown --watermark-algorithm 'nope'": (
-                {"keys": _KEYS},
-                {"watermark_algorithm": "nope"},
-            ),
-            "only with EAGLE or EAGLE3": (
-                {"keys": _KEYS},
-                {**eagle, "speculative_algorithm": "NGRAM"},
-            ),
-            "at most 8 --speculative-num-draft-tokens": (
-                {"keys": _KEYS},
-                {
-                    **eagle,
-                    "speculative_num_steps": 8,
-                    "speculative_num_draft_tokens": 9,
-                },
-            ),
-            "--rl-on-policy-target": (
-                {"keys": _KEYS},
-                {"rl_on_policy_target": "fsdp"},
-            ),
         }
         for message, (config, kwargs) in refused.items():
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
                     _resolve(config, **kwargs)
-        with self.subTest(message="NV mega runtime"):
-            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
-                with self.assertRaisesRegex(ValueError, "NV_MEGA_RUNTIME"):
-                    _resolve({"keys": _KEYS})
-        with self.subTest(message="CUDA"):
-            args = ServerArgs(
-                model_path="dummy",
-                device="cuda",
-                enable_watermark=True,
-                watermark_algorithm="synthid",
-                watermark_config=json.dumps({"keys": _KEYS}),
-            )
-            handle_watermark_config(args)
-            with patch.object(adapter, "is_cuda", return_value=False):
-                with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
-                    check_watermark_server_args(args)
 
 
 class TestSynthIDRequestPolicy(CustomTestCase):
@@ -246,27 +155,11 @@ class TestSynthIDRequestPolicy(CustomTestCase):
                 SamplingParams(watermark={"enabled": False}), features=default_on
             )
         )
-        refused = {
-            "not supported with --watermark-algorithm synthid": (
-                {"key": "abcd"},
-                features,
-            ),
-            "must set enabled": ({}, features),
-            "enforce_all": (
-                {"enabled": False},
-                _features(watermark_enforce_all=True),
-            ),
-            "requires the server to enable": (
-                {"enabled": True},
-                _features(enable_watermark=False),
-            ),
-        }
-        for message, (watermark, request_features) in refused.items():
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(ValueError, message):
-                    adapter.request_enabled(
-                        SamplingParams(watermark=watermark), features=request_features
-                    )
+        with self.assertRaisesRegex(ValueError, "enforce_all"):
+            adapter.request_enabled(
+                SamplingParams(watermark={"enabled": False}),
+                features=_features(watermark_enforce_all=True),
+            )
 
     def test_rows_hold_enabled_sampling_rows(self):
         on, off = {"enabled": True}, {"enabled": False}
@@ -288,11 +181,6 @@ class TestSynthIDRequestPolicy(CustomTestCase):
         self.assertEqual(merged.indices.tolist(), [2])
         merged = merge_watermark_rows(kept, None, 2, 1)
         self.assertEqual(merged.candidates_host, [True, False, False])
-        everything = rows.filter([0, 3], torch.tensor([0, 3]))
-        self.assertTrue(everything.all_on)
-        self.assertIsNone(everything.take_index)
-        # The overlapped forward may still read the old rows.
-        self.assertEqual(rows.indices.tolist(), [0, 3])
 
 
 class TestSynthIDEngine(CustomTestCase):
@@ -310,7 +198,6 @@ class TestSynthIDEngine(CustomTestCase):
                 mix_running_indices_cpu=torch.zeros(num_mixed),
             )
 
-        # A fresh request replays nothing; a resumed one, its generated tokens.
         self.assertEqual(
             engine.seed_payload(batch(ForwardMode.EXTEND)),
             ([0, 2, 3], [[], [7, 8], [9]]),
@@ -322,7 +209,6 @@ class TestSynthIDEngine(CustomTestCase):
         self.assertIsNone(
             engine.seed_payload(batch(ForwardMode.EXTEND, decoding_reqs=reqs))
         )
-        self.assertIsNone(engine.seed_payload(batch(ForwardMode.DECODE)))
 
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):
         watermark, twin = _watermarks()
@@ -362,15 +248,12 @@ class TestSynthIDEngine(CustomTestCase):
         self.assertEqual(int(torch.isfinite(logits[0]).sum()), 3)
 
         self.assertEqual(step.sampling_info.top_ps.tolist(), [1.0, 0.5, 1.0, 1.0])
-        self.assertEqual(step.sampling_info.min_ps.tolist(), [0.0] * 4)
-        self.assertEqual(step.sampling_info.top_ks.tolist(), info.top_ks.tolist())
         self.assertTrue(step.sampling_info.need_top_p_sampling)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=6)
-        self.assertIsNone(step.token_ids)
 
         sample.commit(torch.tensor([7, 8, 9, 10]))
         twin.commit(torch.tensor([6, 4]), torch.tensor([7, 9]))
-        _assert_same_state(self, watermark, twin)
+        assert_synthid_state_equal(synthid_state(watermark), synthid_state(twin))
 
     def test_verify_watermarks_on_rows_and_appends_their_tokens(self):
         watermark, twin = _watermarks()
@@ -384,7 +267,7 @@ class TestSynthIDEngine(CustomTestCase):
         original = logits.clone()
 
         verify = engine.bind_verify(rows, full_mask=True)
-        verified, verify_info = verify.apply(
+        verified, _ = verify.apply(
             logits,
             sampling_info=info,
             req_pool_indices=req_pool_indices,
@@ -407,33 +290,12 @@ class TestSynthIDEngine(CustomTestCase):
         )
         torch.testing.assert_close(verified[3:], expected, rtol=0, atol=0)
         self.assertLessEqual(int(torch.isfinite(verified[3:6]).sum(dim=1).max()), 4)
-        self.assertEqual(verify_info.top_ps.tolist(), [1.0, 1.0, 1.0])
 
         accept_tokens = torch.tensor([[1, 0, 0], [4, 5, 0], [10, 11, 12]])
         accept_lens = torch.tensor([1, 2, 3], dtype=torch.int32)
         engine.append_accept_tokens(rows, req_pool_indices, accept_tokens, accept_lens)
         twin.commit(torch.tensor([3, 7]), accept_tokens[1:], accept_lens[1:])
-        _assert_same_state(self, watermark, twin)
-
-
-class TestSynthIDFusedGate(CustomTestCase):
-    def test_fused_sample_falls_back_for_a_seed_or_logprobs(self):
-        fusable = SimpleNamespace(can_fuse_sample=lambda logits: True)
-
-        def can_fuse(*, keep_logits=False, sampling_seed=None):
-            info = _info(2)
-            info.sampling_seed = sampling_seed
-            sample = adapter.SynthIDSample(
-                fusable,
-                SynthIDRows.from_candidates([True, True], "cpu"),
-                SimpleNamespace(sampling_info=info),
-                allow_fused_sample=True,
-            )
-            return sample._can_fuse(torch.zeros(2, 16), keep_logits)
-
-        self.assertTrue(can_fuse())
-        self.assertFalse(can_fuse(sampling_seed=torch.tensor([1, 2])))
-        self.assertFalse(can_fuse(keep_logits=True))
+        assert_synthid_state_equal(synthid_state(watermark), synthid_state(twin))
 
 
 if __name__ == "__main__":

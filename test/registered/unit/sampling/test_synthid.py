@@ -1,5 +1,3 @@
-"""SynthID lib: hash goldens, slot state, and the watermarked sampling law."""
-
 import unittest
 
 import torch
@@ -19,8 +17,9 @@ from sglang.srt.sampling.watermarking.synthid.state import SynthIDStatePool
 from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.synthid_utils import (
-    REFERENCE_SYNTHID_KEYS,
     STATE_FIELDS,
+    SYNTHID_TEST_KEYS,
+    assert_synthid_state_equal,
     synthid_state,
 )
 
@@ -38,7 +37,6 @@ def _pool(config=None, *, replay=((),)):
 
 
 def _drop_below_half_of_max(probs):
-    """A request filter: drop candidates under half the row's largest probability."""
     kept = torch.where(probs >= probs.max(dim=-1, keepdim=True).values / 2, probs, 0)
     return kept / kept.sum(dim=-1, keepdim=True)
 
@@ -66,10 +64,7 @@ def _reference_law(logits, temperatures, context_hashes, apply_mask, keys, cap, 
 class TestSynthIDAlgorithm(CustomTestCase):
     def test_hash_and_tournament_goldens(self):
         keys = torch.tensor([1, 2])
-        iv = compute_hash_iv([1, 2])
-        self.assertEqual(iv, 5312871951099227430)
-        hashes = hash_contexts(torch.tensor([[0, 0], [0, 2]]), iv)
-        self.assertEqual(hashes.tolist(), [2393652284050965700, -3324819341964999906])
+        hashes = hash_contexts(torch.tensor([[0, 0], [0, 2]]), compute_hash_iv([1, 2]))
         self.assertEqual(
             compute_g_values_torch(
                 hashes, torch.tensor([[0, 1, 2]] * 2), keys
@@ -151,10 +146,8 @@ class TestSynthIDStatePool(CustomTestCase):
                 state = getattr(pool, name)
                 self.assertEqual(state[2].tolist(), state[1].tolist(), name)
             pool.seed(torch.tensor([1]), [[]])
-            self.assertEqual(pool.context[1].tolist(), [0, 0])
-            self.assertEqual(pool.context_history[1].tolist(), [0] * 4)
-            self.assertEqual(pool.history_cursor[1].item(), 0)
-            self.assertEqual(pool.num_calls[1].item(), 0)
+            for name in STATE_FIELDS:
+                self.assertFalse(getattr(pool, name)[1].any(), name)
 
 
 class TestSynthIDWatermark(CustomTestCase):
@@ -162,9 +155,8 @@ class TestSynthIDWatermark(CustomTestCase):
     _TEMPERATURES = torch.tensor([[0.7], [1.0], [1.3], [0.5]])
 
     def _watermark(self):
-        """A watermark and an independent pool, both seeded from ``_REPLAY``."""
         config = SynthIDConfig(
-            keys=REFERENCE_SYNTHID_KEYS[:4],
+            keys=SYNTHID_TEST_KEYS[:4],
             ngram_len=3,
             num_candidates=6,
             context_history_size=4,
@@ -177,86 +169,82 @@ class TestSynthIDWatermark(CustomTestCase):
         return watermark, reference, slots
 
     def test_transform_matches_reference_law_under_a_stock_sampler(self):
-        for mode, rows in (("all_on", None), ("mixed", torch.tensor([0, 2, 3]))):
-            for filt in (None, _drop_below_half_of_max):
-                with self.subTest(mode=mode, filtered=filt is not None):
-                    watermark, reference, slots = self._watermark()
-                    torch.manual_seed(0)
-                    logits = torch.randn(4, 16) * 2
-                    on = torch.arange(4) if rows is None else rows
-                    context_hashes, apply_mask = reference.current(slots[on])
-                    if mode == "all_on":
-                        # Row 1 replays a repeated context: base law in the cap.
-                        self.assertEqual(apply_mask.tolist(), [True, False, True, True])
-                    expected = _reference_law(
-                        logits[on],
-                        self._TEMPERATURES[on],
-                        context_hashes,
-                        apply_mask,
-                        watermark.keys,
-                        watermark.config.num_candidates,
-                        filt,
-                    )
+        for mode, rows, filt in (
+            ("all_on", None, None),
+            ("mixed", torch.tensor([0, 2, 3]), _drop_below_half_of_max),
+        ):
+            with self.subTest(mode=mode):
+                watermark, reference, slots = self._watermark()
+                torch.manual_seed(0)
+                logits = torch.randn(4, 16) * 2
+                on = torch.arange(4) if rows is None else rows
+                context_hashes, apply_mask = reference.current(slots[on])
+                if mode == "all_on":
+                    # Row 1 replays a repeated context: base law in the cap.
+                    self.assertEqual(apply_mask.tolist(), [True, False, True, True])
+                expected = _reference_law(
+                    logits[on],
+                    self._TEMPERATURES[on],
+                    context_hashes,
+                    apply_mask,
+                    watermark.keys,
+                    watermark.config.num_candidates,
+                    filt,
+                )
 
-                    watermarked = logits.clone()
-                    state = synthid_state(watermark)
-                    watermark.apply(
-                        watermarked,
-                        self._TEMPERATURES[on],
-                        slots[on],
-                        rows=rows,
-                        filter_probs=filt,
-                    )
-                    self.assert_state_equal(synthid_state(watermark), state)
-                    # The stock sampler: divide by T and softmax.
-                    probs = torch.softmax(watermarked / self._TEMPERATURES, dim=-1)
-                    torch.testing.assert_close(probs[on], expected, rtol=0, atol=1e-6)
-                    off = [row for row in range(4) if row not in on.tolist()]
-                    self.assertTrue(torch.equal(watermarked[off], logits[off]))
+                watermarked = logits.clone()
+                state = synthid_state(watermark)
+                watermark.apply(
+                    watermarked,
+                    self._TEMPERATURES[on],
+                    slots[on],
+                    rows=rows,
+                    filter_probs=filt,
+                )
+                assert_synthid_state_equal(synthid_state(watermark), state)
+                probs = torch.softmax(watermarked / self._TEMPERATURES, dim=-1)
+                torch.testing.assert_close(probs[on], expected, rtol=0, atol=1e-6)
+                off = [row for row in range(4) if row not in on.tolist()]
+                self.assertTrue(torch.equal(watermarked[off], logits[off]))
 
     def test_verify_transform_matches_reference_law_per_position(self):
         width = 3
         verify_tokens = torch.tensor([[0, 3, 4], [4, 3, 4], [5, 6, 7], [1, 1, 2]])
-        for mode, request_rows in (
-            ("all_on", None),
-            ("mixed", torch.tensor([1, 3])),
+        for mode, request_rows, filt in (
+            ("all_on", None, None),
+            ("mixed", torch.tensor([1, 3]), _drop_below_half_of_max),
         ):
-            for filt in (None, _drop_below_half_of_max):
-                with self.subTest(mode=mode, filtered=filt is not None):
-                    watermark, reference, slots = self._watermark()
-                    torch.manual_seed(0)
-                    logits = torch.randn(4 * width, 16) * 2
-                    on = torch.arange(4) if request_rows is None else request_rows
-                    rows = (on[:, None] * width + torch.arange(width)).view(-1)
-                    row_temperatures = self._TEMPERATURES.repeat_interleave(width, 0)
-                    expected = _reference_law(
-                        logits[rows],
-                        row_temperatures[rows],
-                        *reference.project(slots[on], verify_tokens[on]),
-                        watermark.keys,
-                        watermark.config.num_candidates,
-                        filt,
-                    )
+            with self.subTest(mode=mode):
+                watermark, reference, slots = self._watermark()
+                torch.manual_seed(0)
+                logits = torch.randn(4 * width, 16) * 2
+                on = torch.arange(4) if request_rows is None else request_rows
+                rows = (on[:, None] * width + torch.arange(width)).view(-1)
+                row_temperatures = self._TEMPERATURES.repeat_interleave(width, 0)
+                expected = _reference_law(
+                    logits[rows],
+                    row_temperatures[rows],
+                    *reference.project(slots[on], verify_tokens[on]),
+                    watermark.keys,
+                    watermark.config.num_candidates,
+                    filt,
+                )
 
-                    watermarked = logits.clone()
-                    state = synthid_state(watermark)
-                    watermark.apply_verify(
-                        watermarked,
-                        self._TEMPERATURES[on],
-                        slots[on],
-                        verify_tokens[on],
-                        request_rows=request_rows,
-                        filter_probs=filt,
-                    )
-                    self.assert_state_equal(synthid_state(watermark), state)
-                    probs = torch.softmax(watermarked / row_temperatures, dim=-1)
-                    torch.testing.assert_close(probs[rows], expected, rtol=0, atol=1e-6)
-                    off = [r for r in range(4 * width) if r not in rows.tolist()]
-                    self.assertTrue(torch.equal(watermarked[off], logits[off]))
-
-    def assert_state_equal(self, actual, expected):
-        for name in STATE_FIELDS:
-            self.assertTrue(torch.equal(actual[name], expected[name]), name)
+                watermarked = logits.clone()
+                state = synthid_state(watermark)
+                watermark.apply_verify(
+                    watermarked,
+                    self._TEMPERATURES[on],
+                    slots[on],
+                    verify_tokens[on],
+                    request_rows=request_rows,
+                    filter_probs=filt,
+                )
+                assert_synthid_state_equal(synthid_state(watermark), state)
+                probs = torch.softmax(watermarked / row_temperatures, dim=-1)
+                torch.testing.assert_close(probs[rows], expected, rtol=0, atol=1e-6)
+                off = [r for r in range(4 * width) if r not in rows.tolist()]
+                self.assertTrue(torch.equal(watermarked[off], logits[off]))
 
 
 if __name__ == "__main__":

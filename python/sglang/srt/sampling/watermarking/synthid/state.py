@@ -1,17 +1,5 @@
 # Copyright 2024 DeepMind Technologies Limited
-# Copyright 2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+# SPDX-License-Identifier: Apache-2.0
 # Modified by the SGLang Team: adapted from google-deepmind/synthid-text@addb4a15
 # (src/synthid_text/logits_processing.py and src/synthid_text/hashing_function.py).
 """SynthID state per request slot.
@@ -35,8 +23,8 @@ from sglang.srt.sampling.watermarking.synthid.algorithm import (
 
 
 class SynthIDStatePool:
-    """SynthID state for every request slot, on one device: Triton kernels on
-    CUDA, torch on CPU (the reference the kernels are tested against)."""
+    """SynthID state for every request slot, on one device: Triton on CUDA; the
+    CPU torch path is the reference the kernel tests compare against."""
 
     def __init__(
         self,

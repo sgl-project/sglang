@@ -1,20 +1,7 @@
 # Copyright 2024 DeepMind Technologies Limited
-# Copyright 2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+# SPDX-License-Identifier: Apache-2.0
 # Modified by the SGLang Team: adapted from google-deepmind/synthid-text@addb4a15
 # (src/synthid_text/logits_processing.py and src/synthid_text/hashing_function.py).
-"""SynthID Text hashing, configuration, and the tournament transform."""
 
 from __future__ import annotations
 
@@ -72,10 +59,6 @@ def compute_hash_iv(keys: Sequence[int]) -> int:
 
 @dataclass(frozen=True)
 class SynthIDConfig:
-    """Watermark parameters. ``num_candidates`` caps the candidates the
-    tournament sees; ``context_history_size`` bounds the ring of recent context
-    hashes that suppresses repeated contexts. The upper bounds are the kernels'."""
-
     keys: tuple[int, ...] = field(repr=False)
     ngram_len: int = 5
     num_candidates: int = 1024
@@ -115,7 +98,6 @@ def _accumulate_hash_torch(
 
 
 def hash_contexts(contexts: torch.Tensor, hash_iv: int) -> torch.Tensor:
-    """Hash the final dimension of an int64 context tensor."""
     result = torch.full(
         contexts.shape[:-1],
         hash_iv,

@@ -1,22 +1,7 @@
 # Copyright 2024 DeepMind Technologies Limited
-# Copyright 2026 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+# SPDX-License-Identifier: Apache-2.0
 # Modified by the SGLang Team: adapted from google-deepmind/synthid-text@addb4a15
 # (src/synthid_text/logits_processing.py and src/synthid_text/hashing_function.py).
-"""Triton kernels for SynthID: the top-k tournament, the fused sample, the
-state projection (context hashes and apply masks along a chain), and the state
-commit."""
 
 from __future__ import annotations
 
@@ -52,7 +37,6 @@ def _accumulate_hash(value, data):
 
 @triton.jit
 def _g_value(candidate_hashes, key):
-    """The int64 0/1 g-value of each candidate under one key."""
     hashes = _accumulate_hash(candidate_hashes, key)
     for _ in range(_HASH_ROUNDS):
         hashes = _accumulate_hash(hashes, 1) >> _HASH_SHIFT
