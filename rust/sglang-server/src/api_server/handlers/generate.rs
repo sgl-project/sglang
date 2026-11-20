@@ -28,6 +28,8 @@ impl CoreHandle {
         request: GenerateRequest,
         received: ReceivedAs,
     ) -> Result<CoreCall, CoreError> {
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         // Counted from admission, media prefetch included: the drain waits
         // for it.
         let in_flight = self.inner.drain.track();
@@ -128,7 +130,7 @@ impl CoreHandle {
         mut generation: Generation,
         in_flight: InFlight,
     ) -> Result<CoreCall, CoreError> {
-        let created_at = Instant::now();
+        let created_at = received.created_at();
         self.set_default_priority(&mut request);
         let record = self
             .receive(std::slice::from_ref(&request), received, false, true)
@@ -204,16 +206,18 @@ impl CoreHandle {
         mut requests: Vec<GenerateRequest>,
         received: ReceivedAs,
     ) -> Result<Vec<CoreCall>, CoreError> {
-        let created_at = Instant::now();
+        let created_at = received.created_at();
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         for request in &mut requests {
             self.set_default_priority(request);
         }
         // A body is a batch here even with one item (a list); the core's own
         // requests are one only when they are several.
-        let batch = matches!(received, ReceivedAs::Body(_)) || requests.len() > 1;
+        let batch = matches!(received, ReceivedAs::Body { .. }) || requests.len() > 1;
         let mut records = self
             .receive(&requests, received, batch, true)
             .into_iter()
@@ -305,7 +309,7 @@ impl CoreHandle {
         CoreCall::new(
             runtime,
             self.inner.metadata.weight_version.clone(),
-            Some(self.inner.dp_rank),
+            self.inner.metadata.deployment_info.reported_dp_rank(),
             metrics,
             record,
             in_flight,
@@ -670,6 +674,12 @@ struct Entry {
 }
 
 impl Generations {
+    /// Whether any client generation is between registration and its
+    /// terminal response.
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
     fn register(&self, rid: Rid, abort_tx: flume::Sender<AbortSource>) -> Generation {
         let admission = RequestAdmission::pending();
         let (cancelled, cancellation) = oneshot::channel();
@@ -990,9 +1000,11 @@ mod tests {
 
     /// A generation that sets no priority is scheduled and counted under the
     /// configured default, as Python's `_set_default_priority` runs before
-    /// `collect_metrics` picks the label.
+    /// `collect_metrics` picks the label; and its TTFT and e2e latency count
+    /// from when an HTTP layer started it, as Python's do from before the
+    /// work such a layer does.
     #[tokio::test]
-    async fn unset_priority_takes_the_default_before_metrics() {
+    async fn metrics_take_the_default_priority_and_the_layer_start() {
         let dir = std::env::temp_dir().join(format!("core-priority-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = crate::message::config::MetricsConfig {
@@ -1023,8 +1035,13 @@ mod tests {
                 abort_hook: None,
             },
         );
+        let layer_work = 5.0;
+        let received = ReceivedAs::Body {
+            snapshot: None,
+            started_at: Some(Instant::now() - Duration::from_secs_f64(layer_work)),
+        };
         let mut call = handle
-            .generate(GenerateRequest::default(), ReceivedAs::without_headers())
+            .generate(GenerateRequest::default(), received)
             .await
             .unwrap();
         let request = accept_intake(intake_rx.recv().unwrap());
@@ -1057,6 +1074,19 @@ mod tests {
             text.contains(r#"sglang:num_requests_total{is_streaming="false",priority="5"} 1.0"#),
             "{text}"
         );
+        for family in [
+            "sglang:time_to_first_token_seconds",
+            "sglang:e2e_request_latency_seconds",
+        ] {
+            let prefix = format!(r#"{family}_sum{{is_streaming="false",priority="5"}} "#);
+            let sum: f64 = text
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("{family}: {text}"))
+                .parse()
+                .unwrap();
+            assert!(sum >= layer_work, "{family}: {sum}");
+        }
     }
 
     #[tokio::test]
@@ -1408,23 +1438,22 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
+    async fn assert_duplicate_abort_and_reuse(public_id: &str) {
         let harness = Harness::unbounded(8);
         let mut first = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let mut second = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let old_a = accept_intake(harness.intake_rx.recv().unwrap());
         let old_b = accept_intake(harness.intake_rx.recv().unwrap());
-        assert!(harness.handle.abort(Some("same"), CancelledError));
-        assert!(!harness.handle.abort(Some("same"), CancelledError));
+        assert!(harness.handle.abort(Some(public_id), CancelledError));
+        assert!(!harness.handle.abort(Some(public_id), CancelledError));
         // Backend cancellation does not depend on polling either response.
         let aborted: std::collections::HashSet<_> = (0..2)
             .map(|_| harness.abort_rx.try_recv().unwrap().rid().clone())
@@ -1433,7 +1462,7 @@ mod tests {
 
         let new = harness
             .handle
-            .generate(public_request("same"), ReceivedAs::without_headers())
+            .generate(public_request(public_id), ReceivedAs::without_headers())
             .await
             .unwrap();
         let new_request = accept_intake(harness.intake_rx.recv().unwrap());
@@ -1446,10 +1475,20 @@ mod tests {
         }
         drop((first, second));
         assert!(harness.abort_rx.try_recv().is_err());
-        assert!(harness.handle.abort(Some("same"), CancelledError));
+        assert!(harness.handle.abort(Some(public_id), CancelledError));
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &new_request.rid);
         drop(new);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_cancels_duplicates_but_not_later_id_reuse() {
+        assert_duplicate_abort_and_reuse("same").await;
+    }
+
+    #[tokio::test]
+    async fn long_public_id_abort_cancels_duplicates_but_not_later_reuse() {
+        assert_duplicate_abort_and_reuse(&"x".repeat(200)).await;
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=60, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 

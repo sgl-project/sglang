@@ -75,7 +75,6 @@ from sglang.srt.hf_transformers import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
-    resolve_image_processor_backend,
 )
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
     CanaryInfoTokenizerManagerHook,
@@ -151,6 +150,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
@@ -200,10 +202,9 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     supports_sampling_mask,
 )
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import (
-    resolve_watermark_request,
-)
+from sglang.srt.sampling.watermarking.runtime import watermark_request_enabled
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -213,7 +214,7 @@ from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
 from sglang.srt.utils import (
-    configure_gc_warning,
+    configure_gc_logging,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -242,16 +243,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
-    watermark = sampling_params.watermark
-    features = get_exec().features
-    _, _, enabled = resolve_watermark_request(
-        watermark,
-        server_enabled=features.enable_watermark,
-        default_key=features.watermark_key,
-        default_context_window=features.watermark_context_window,
-        default_enabled=features.watermark_default_enabled,
-        enforce_all=features.watermark_enforce_all,
-    )
+    enabled = watermark_request_enabled(sampling_params)
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
 
@@ -301,6 +293,8 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # obj.input_ids was dropped after dispatch, so the request cannot be dumped.
+    prompt_released: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -366,6 +360,9 @@ class ReqState:
         default_factory=list
     )
     output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
+        default_factory=list
+    )
+    output_token_sampling_mask_chunks: List[SamplingMaskChunk] = dataclasses.field(
         default_factory=list
     )
 
@@ -478,6 +475,61 @@ def _build_flat_top_logprobs_fields_from_arrays(
     return fields
 
 
+def _build_flat_sampling_mask_fields(
+    chunks: List[SamplingMaskChunk], return_b64: bool
+) -> Dict[str, Any]:
+    """A finished request's sampling masks as flat arrays; base64 if ``return_b64``."""
+    fields: Dict[str, Any] = {
+        "output_token_sampling_mask_length": sum(len(c.lengths) for c in chunks)
+    }
+    for name, attr, dtype in (
+        ("output_token_sampling_mask_flat", "token_ids", np.int32),
+        ("output_token_sampling_mask_row_lengths", "lengths", np.int32),
+        ("output_token_sampling_logprobs_flat", "logprobs", np.float32),
+    ):
+        values = np.concatenate(
+            [np.empty(0, dtype)] + [getattr(c, attr) for c in chunks]
+        )
+        if return_b64:
+            fields[f"{name}_b64"] = pybase64.b64encode(values.tobytes()).decode("utf-8")
+            fields[f"{name}_b64_dtype"] = values.dtype.name
+        else:
+            fields[name] = values.tolist()
+    return fields
+
+
+def _add_sampling_mask_to_meta_info(
+    meta_info: dict,
+    state: ReqState,
+    chunk: Optional[SamplingMaskChunk],
+    finished: bool,
+):
+    if chunk is not None:
+        if state.obj.return_flat_raw_sampling_mask:
+            state.output_token_sampling_mask_chunks.append(chunk)
+        else:
+            masks, logprobs = chunk.to_lists(
+                support_logprobs=state.obj.sampling_logprobs_mode == "support"
+            )
+            state.output_token_sampling_mask.extend(masks)
+            state.output_token_sampling_logprobs.extend(logprobs)
+            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+            meta_info["output_token_sampling_logprobs"] = (
+                state.output_token_sampling_logprobs
+            )
+            meta_info["output_token_sampling_mask_length"] = len(
+                state.output_token_sampling_mask
+            )
+    # Built once on the finished response; streaming is rejected.
+    if state.obj.return_flat_raw_sampling_mask and finished:
+        meta_info.update(
+            _build_flat_sampling_mask_fields(
+                state.output_token_sampling_mask_chunks,
+                return_b64=state.obj.return_flat_raw_sampling_mask_b64,
+            )
+        )
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -501,6 +553,27 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 # Grace period from ShutdownReq to SIGKILL for each scheduler.
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
+
+
+def wait_for_schedulers_to_exit() -> None:
+    deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+    while time.monotonic() < deadline and collect_scheduler_processes():
+        time.sleep(0.1)
+    stragglers = [proc.pid for proc in collect_scheduler_processes()]
+    if stragglers:
+        # SIGKILL here lands mid-release,
+        # which is how GPU memory survives a shutdown. Name the pids.
+        logger.warning(
+            f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+            f"ShutdownReq, killing them before they released: {stragglers}"
+        )
+
+
+def _requested_token_ids(obj: GenerateReqInput) -> Optional[list]:
+    """The token ids a request asked log-probabilities at, in either form."""
+    if obj.token_ids_logprob is not None:
+        return obj.token_ids_logprob
+    return obj.token_ids_logprob_rows
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -663,6 +736,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal and not get_disagg().language_model_only:
             import_processors("sglang.srt.multimodal.processors")
+            register_token_space_models()
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
             _processor = get_processor_wrapper()
@@ -905,8 +979,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        configure_gc_logging("Tokenizer Manager")
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
@@ -1018,6 +1091,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     await self._send_one_request(tokenized_obj)
+                    if obj.input_ids is not None and not self._reads_input_ids_late():
+                        obj.input_ids = None
+                        state.prompt_released = True
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1461,11 +1537,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(obj, EmbeddingReqInput):
             self._validate_for_matryoshka_dim(obj)
 
+        self._validate_token_indices_to_pool(obj, input_ids)
+
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
             self._validate_top_logprobs_num(obj)
             self._validate_logprob_start_len(obj)
+            self._validate_token_ids_logprob_rows(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1507,6 +1586,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
                 raise ValueError(
                     "sampling_logprobs_mode can only be set when "
+                    "return_sampling_mask=true."
+                )
+            if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
+                raise ValueError(
+                    "return_flat_raw_sampling_mask can only be set when "
                     "return_sampling_mask=true."
                 )
 
@@ -1586,6 +1670,45 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Provided dimensions are greater than max embedding dimension: {self.model_config.hidden_size}"
             )
 
+    def _validate_token_ids_logprob_rows(self, obj: GenerateReqInput) -> None:
+        rows = obj.token_ids_logprob_rows
+        if rows is None:
+            return
+        if (
+            obj.input_ids is None
+            or not obj.return_logprob
+            or obj.stream
+            or obj.logprob_start_len < 0
+            or (obj.sampling_params or {}).get("max_new_tokens") != 0
+            or obj.token_ids_logprob is not None
+            or obj.multi_item_delimiter_indices is not None
+            or obj.token_indices_to_pool is not None
+            or obj.session_params is not None
+            or self.model_config.is_encoder_decoder
+            or self.disaggregation_mode != DisaggregationMode.NULL
+        ):
+            raise ValueError(
+                "token_ids_logprob_rows requires input_ids, return_logprob, "
+                "max_new_tokens=0 and logprob_start_len >= 0, and no other mode."
+            )
+        # The first reported position has no predecessor in the scored range.
+        scored = len(obj.input_ids) - obj.logprob_start_len - 1
+        vocab_size = self.model_config.token_id_vocab_size
+        if (
+            not isinstance(rows, list)
+            or len(rows) != scored
+            or not all(isinstance(row, list) for row in rows)
+            or any(
+                type(i) is not int or not 0 <= i < vocab_size
+                for row in rows
+                for i in row
+            )
+        ):
+            raise ValueError(
+                f"token_ids_logprob_rows must be {scored} lists (len(input_ids) - "
+                f"logprob_start_len - 1) of token ids in [0, {vocab_size})."
+            )
+
     def _validate_token_ids_logprob(self, obj: GenerateReqInput) -> None:
         # Batch requests are split into per-request sub-objects before this
         # runs (normalize_batch_and_arguments + __getitem__), so the only
@@ -1596,7 +1719,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not isinstance(token_ids_logprob, list):
             raise ValueError("token_ids_logprob must be a flat list of integers.")
-        vocab_size = self.model_config.vocab_size
+        vocab_size = self.model_config.token_id_vocab_size
         for token_id in token_ids_logprob:
             if not isinstance(token_id, int):
                 raise ValueError("token_ids_logprob must be a flat list of integers.")
@@ -1616,6 +1739,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 f"top_logprobs must be an integer in [0, {vocab_size}], "
                 f"got {top_logprobs_num!r}."
+            )
+
+    def _validate_token_indices_to_pool(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_ids: Optional[List[int]],
+    ) -> None:
+        # The forward indexes the prompt's hidden states with these positions;
+        # an empty list or an out-of-range position crashes it.
+        indices = obj.token_indices_to_pool
+        if indices is None:
+            return
+        # Only a prompt-only request reads these positions; any other request
+        # would ignore them.
+        if obj.sampling_params.get("max_new_tokens") != 0:
+            raise ValueError("token_indices_to_pool requires max_new_tokens=0.")
+        if input_ids is not None:
+            seq_len = len(input_ids)
+        elif obj.input_embeds is not None:
+            seq_len = len(obj.input_embeds)
+        else:
+            return
+        if (
+            not isinstance(indices, list)
+            or not indices
+            or any(type(i) is not int or not 0 <= i < seq_len for i in indices)
+        ):
+            raise ValueError(
+                "token_indices_to_pool must be a non-empty list of prompt "
+                f"positions in [0, {seq_len}), got {indices!r}."
             )
 
     def _validate_logprob_start_len(self, obj: GenerateReqInput) -> None:
@@ -1664,7 +1817,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+        sampling_params.verify(self.model_config.token_id_vocab_size)
         _validate_watermark_request(sampling_params)
 
         # Build return object
@@ -1697,6 +1850,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # A logprob batch gathers every request's count, including disabled ones.
                 top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
+                token_ids_logprob_rows=obj.token_ids_logprob_rows,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
@@ -1879,6 +2033,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (not get_parallel().attn_dp_enabled)
                 and (not self._batch_has_text(batch_size, requests))
             )
+        )
+
+    def _reads_input_ids_late(self) -> bool:
+        return (
+            self.request_logger.logs_field_on_finish("input_ids")
+            or self.request_metrics_exporter_manager.exporter_enabled()
+            or bool(self.dump_requests_folder)
+            or bool(self.crash_dump_folder)
         )
 
     async def _send_one_request(
@@ -2149,6 +2311,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        # 0.0 polls on the first output, catching a client lost while queued.
+        next_disconnect_poll = 0.0
         while True:
             try:
                 if request is None:
@@ -2248,17 +2412,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            # is_disconnected() costs an event-loop pass, so poll at most once per wait
+            # timeout; StreamingResponse cancels a disconnected stream without polling.
+            now = time.monotonic()
             if (
                 request is not None
                 and not obj.background
-                and await request.is_disconnected()
+                and now >= next_disconnect_poll
             ):
-                # Abort the request for disconnected requests (running)
-                self.abort_request(obj.rid)
-                # Use exception to kill the whole call stack and asyncio task
-                raise ValueError(
-                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                )
+                next_disconnect_poll = now + _REQUEST_STATE_WAIT_TIMEOUT
+                if await request.is_disconnected():
+                    # Abort the request for disconnected requests (running)
+                    self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
+                    raise ValueError(
+                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                    )
 
             if is_stream:
                 # Record response sent time right before we send response.
@@ -2360,9 +2529,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.sampling_params = (
+                        tokenized_obj.sampling_params.for_sample(sample_index)
+                    )
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
@@ -2787,7 +2959,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info,
                     state,
                     state.obj.top_logprobs_num,
-                    state.obj.token_ids_logprob,
+                    _requested_token_ids(state.obj),
                     state.obj.return_text_in_logprobs and not self.skip_tokenizer_init,
                     recv_obj,
                     i,
@@ -2798,21 +2970,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and state.obj.return_sampling_mask
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                if output_sampling_mask is not None:
-                    masks, logprobs = output_sampling_mask[i].to_lists(
-                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
-                    )
-                    state.output_token_sampling_mask.extend(masks)
-                    state.output_token_sampling_logprobs.extend(logprobs)
-                    meta_info["output_token_sampling_mask"] = (
-                        state.output_token_sampling_mask
-                    )
-                    meta_info["output_token_sampling_logprobs"] = (
-                        state.output_token_sampling_logprobs
-                    )
-                    meta_info["output_token_sampling_mask_length"] = len(
-                        state.output_token_sampling_mask
-                    )
+                _add_sampling_mask_to_meta_info(
+                    meta_info,
+                    state,
+                    None if output_sampling_mask is None else output_sampling_mask[i],
+                    finished=recv_obj.finished_reasons[i] is not None,
+                )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
@@ -3051,9 +3214,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i, request_stats)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+            dumpable = (
+                state.finished and state.obj.log_metrics and not state.prompt_released
+            )
+            if self.dump_requests_folder and dumpable:
                 self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+            if self.crash_dump_folder and dumpable:
                 self.record_request_for_crash_dump(state, out_dict)
 
         # handle_loop awaits next recv immediately
@@ -3357,7 +3523,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             meta_info,
             state,
             state.obj.top_logprobs_num,
-            state.obj.token_ids_logprob,
+            _requested_token_ids(state.obj),
             return_text_in_logprobs,
             finished=finished,
         )
@@ -3633,7 +3799,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Add unfinished requests from rid_to_state
             unfinished_requests = []
             for rid, state in self.rid_to_state.items():
-                if not state.finished:
+                if not state.finished and not state.prompt_released:
                     state.time_stats.set_finished_time()
                     unfinished_requests.append(
                         (
@@ -3696,6 +3862,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await asyncio.sleep(5)
 
         # Drain requests
+        forced = False
         while True:
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
@@ -3707,6 +3874,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.dump_requests_before_crash()
                 self.force_exit_handler()
+                forced = True
                 break
 
             elif envs.SGLANG_FORCE_SHUTDOWN.get():
@@ -3715,6 +3883,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 self.force_exit_handler()
+                forced = True
                 break
 
             logger.info(
@@ -3728,22 +3897,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
-        # Ask schedulers to release resources in userspace and exit (see
-        # ShutdownReq), then wait for them before hard-killing the rest.
-        self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
-        while time.monotonic() < deadline and collect_scheduler_processes():
-            time.sleep(0.1)
-        stragglers = [proc.pid for proc in collect_scheduler_processes()]
-        if stragglers:
-            # SIGKILL here lands mid-release,
-            # which is how GPU memory survives a shutdown. Name the pids.
-            logger.warning(
-                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
-                f"ShutdownReq, killing them before they released: {stragglers}"
+        if self._subprocess_watchdog is not None or self.tokenizer_ipc_name is None:
+            # Ask schedulers to release resources in userspace and exit (see
+            # ShutdownReq), then wait for them before hard-killing the rest.
+            self._dispatch_to_scheduler(ShutdownReq())
+            wait_for_schedulers_to_exit()
+        else:
+            logger.info(
+                "Drained. The process that launched the schedulers shuts them down."
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
-        if self._server_stop_hook is not None:
+        if self._server_stop_hook is not None and not forced:
             # sys.exit() here raises SystemExit into the loop and kills it,
             # so the ASGI server never runs its lifespan shutdown.
             # The loop outlives this coroutine now, so drop our own tasks first;
@@ -3792,34 +3956,59 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
         }
+        is_generate = isinstance(state.obj, GenerateReqInput)
+        is_stream = is_generate and state.obj.stream
+        # The scheduler echoes an abort only for a request that holds no KV
+        # (queued, retracted or mid-chunk), so the routed experts of the tokens
+        # it produced are gone. A non-streaming reply then carries no output
+        # tokens rather than tokens without routed-experts rows.
+        drop_output = is_generate and not is_stream and state.obj.return_routed_experts
         if recv_obj.weight_versions is not None:
             add_weight_versions_to_meta_info(
                 meta_info,
                 recv_obj.weight_versions,
-                num_output_tokens=len(state.output_ids),
+                num_output_tokens=(0 if drop_output else len(state.output_ids)),
             )
         if prefill_spans := recv_obj.prefill_weight_versions:
             meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
                 prefill_spans
             )
-        is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
                 meta_info,
                 state,
                 state.obj.top_logprobs_num,
-                state.obj.token_ids_logprob,
+                _requested_token_ids(state.obj),
                 state.obj.return_text_in_logprobs
                 and not get_serving().skip_tokenizer_init,
                 finished=True,
             )
 
         output_ids = state.output_ids
+        text = state.get_text()
+        if drop_output:
+            output_ids, text = [], ""
+            meta_info["routed_experts"] = ""
+            for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+                if key in meta_info:
+                    meta_info[key] = []
+            if "output_token_logprobs_length" in meta_info:
+                meta_info["output_token_logprobs_length"] = 0
+            if "output_top_logprobs_shape" in meta_info:
+                meta_info.update(
+                    _build_flat_top_logprobs_fields(
+                        "output",
+                        [],
+                        [],
+                        state.obj.top_logprobs_num,
+                        return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                    )
+                )
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.get_text(),
+            "text": text,
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
@@ -4243,7 +4432,7 @@ def get_processor_wrapper():
         tokenizer_mode=get_serving().tokenizer_mode,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_model().revision,
-        image_processor_backend=resolve_image_processor_backend(get_mm()),
+        image_processor_backend=get_mm().image_processor_backend,
         tokenizer_backend=get_serving().tokenizer_backend,
         model_name=get_model().model_path,
     )

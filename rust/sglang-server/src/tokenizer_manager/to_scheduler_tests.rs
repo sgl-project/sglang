@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::message::buffers::{Buffer, BufferData, find};
+use crate::message::config::{HiddenStatesMode, ServerArgs};
 use crate::message::request::{GenerateRequest, TokenizeInput};
 use crate::message::response::ResponseSink;
 use crate::message::sampling::SamplingParams;
@@ -214,7 +215,7 @@ fn test_limits() -> Limits {
         context_len: NO_CONTEXT_CEILING,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
-        enable_return_hidden_states: false,
+        return_hidden_states_mode: HiddenStatesMode::Null,
     }
 }
 
@@ -472,9 +473,8 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7));
 }
 
-/// `return_hidden_states` on a server not launched for it is a 400: the
-/// scheduler never computes them, so the request would otherwise 200 with
-/// `meta_info.hidden_states` silently missing.
+/// A request above the server's hidden-states mode is a 400
+/// (Python `TokenizerManager._validate_one_request`).
 #[test]
 fn hidden_states_gated_on_server_support() {
     let req = |want| {
@@ -488,18 +488,54 @@ fn hidden_states_gated_on_server_support() {
     let err = validate(&mut req(true), &disabled).unwrap_err();
     assert!(matches!(err, Error::Validation(_)));
     assert!(
-        err.to_string().contains("--enable-return-hidden-states"),
-        "message must name the flag: {err}"
+        err.to_string().contains(
+            "not configured to return hidden states. Please set `--return-hidden-states-mode last`"
+        ),
+        "message must name the flags: {err}"
     );
     // Not asking for them (the client sent `false`, or sent nothing and
     // `into_requests` resolved the default), or asking on a server that
     // supports them, is fine.
     assert!(validate(&mut req(false), &disabled).is_ok());
     let enabled = Limits {
-        enable_return_hidden_states: true,
+        return_hidden_states_mode: HiddenStatesMode::Full,
         ..test_limits()
     };
     assert!(validate(&mut req(true), &enabled).is_ok());
+    // `true` asks for `full`, above a server launched with `last`.
+    let last = Limits {
+        return_hidden_states_mode: HiddenStatesMode::Last,
+        ..test_limits()
+    };
+    let err = validate(&mut req(true), &last).unwrap_err();
+    assert!(matches!(err, Error::Validation(_)));
+    assert!(
+        err.to_string()
+            .contains("exceeds the server maximum `last`. Please launch with `--return-hidden-states-mode full`"),
+        "message must name the mode and the flag: {err}"
+    );
+    assert!(validate(&mut req(false), &last).is_ok());
+}
+
+/// The server's hidden-state mode survives the handoff from Python's resolved `server_args`
+/// (Python `get_server_return_hidden_states_mode`).
+#[test]
+fn limits_resolve_the_hidden_states_mode() {
+    let mode = |mode: Option<&str>, enable| {
+        Limits::from(&ServerArgs {
+            return_hidden_states_mode: mode.map(str::to_owned),
+            enable_return_hidden_states: enable,
+            ..Default::default()
+        })
+        .return_hidden_states_mode
+    };
+    assert_eq!(mode(None, false), HiddenStatesMode::Null);
+    assert_eq!(mode(Some("last"), true), HiddenStatesMode::Last);
+    assert_eq!(mode(Some("full"), true), HiddenStatesMode::Full);
+    // The legacy `--enable-return-hidden-states` alone means `full`.
+    assert_eq!(mode(None, true), HiddenStatesMode::Full);
+    // `--enable-return-aux-hidden-states` alone resolves to `full` and leaves the bool unset.
+    assert_eq!(mode(Some("full"), false), HiddenStatesMode::Full);
 }
 
 /// End-to-end through `drive`: an over-context request is rejected on the way
@@ -774,7 +810,7 @@ fn one_way_control_bypasses_request_ring_capacity() {
 #[test]
 fn oversized_rid_is_rejected() {
     let mut req = generate_req(51, SamplingParams::default());
-    req.rid = "x".repeat(MAX_RID_LEN + 1).into();
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
     let err = validate(&mut req, &test_limits()).expect_err("must be rejected");
     assert!(matches!(err, Error::Validation(_)));
     assert!(err.to_string().contains("over the"), "{err}");
@@ -783,6 +819,47 @@ fn oversized_rid_is_rejected() {
     let mut req = generate_req(52, SamplingParams::default());
     req.rid = "0123456789abcdef0123456789abcdef".into();
     assert!(validate(&mut req, &test_limits()).is_ok());
+}
+
+#[test]
+fn namespaced_rids_are_accepted_without_rewriting() {
+    for byte_len in [32, 128, 129, 200, MAX_RID_LEN] {
+        let public_id = format!("caller_namespace_{}", "x".repeat(byte_len - 17));
+        assert_eq!(public_id.len(), byte_len);
+        let mut req = generate_req(53, SamplingParams::default());
+        req.rid = Rid::from_client(&public_id);
+        assert!(validate(&mut req, &test_limits()).is_ok(), "{byte_len}");
+        assert_eq!(req.rid.client_facing(), public_id);
+    }
+}
+
+#[test]
+fn rid_limit_counts_client_utf8_bytes_not_private_suffix() {
+    let public_id = "é".repeat(MAX_RID_LEN / 2);
+    let mut req = generate_req(54, SamplingParams::default());
+    req.rid = Rid::from_client(&public_id);
+    assert!(req.rid.len() > MAX_RID_LEN);
+    assert!(validate(&mut req, &test_limits()).is_ok());
+    assert_eq!(req.rid.client_facing(), public_id);
+
+    let oversized = format!("{public_id}x");
+    req.rid = Rid::from_client(&oversized);
+    let error = validate(&mut req, &test_limits()).expect_err("one extra byte exceeds the cap");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("rid is {} bytes", MAX_RID_LEN + 1))
+    );
+}
+
+#[test]
+fn oversized_client_rid_never_registers_or_reaches_scheduler() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut req = generate_req(55, SamplingParams::default());
+    req.rid = Rid::from_client(&"x".repeat(MAX_RID_LEN + 1));
+    intake.drive(req);
+    assert!(detok_rx.try_recv().is_err());
+    assert!(consumer.drain(8).is_empty());
 }
 
 /// A request rejected BEFORE `register_detok` must not send `Deregister`: the
@@ -972,6 +1049,38 @@ fn admitted_request_keeps_registration() {
     assert!(
         detok_rx.try_recv().is_err(),
         "admitted request must not be deregistered",
+    );
+}
+
+/// A request's dispatch finish time is stamped once the scheduler channel
+/// takes it, and never for one a full channel refuses.
+#[test]
+fn dispatch_finish_time_is_stamped_when_the_channel_takes_the_request() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let dispatch_finish_time = |req: &Request| match &req.kind {
+        RequestKind::Generate(g) => g.dispatch_finish_time.clone(),
+        other => panic!("not a generate request: {other:?}"),
+    };
+    let before = std::time::SystemTime::now();
+    // The test channel holds 16; the 17th request is refused.
+    let stamps: Vec<_> = (0..17)
+        .map(|id| {
+            let req = generate_req(id, SamplingParams::default());
+            let stamp = dispatch_finish_time(&req);
+            assert_eq!(stamp.get(), None, "unstamped before dispatch");
+            intake.drive(req);
+            stamp
+        })
+        .collect();
+    assert_eq!(consumer.drain(32).len(), 16);
+    for stamp in &stamps[..16] {
+        let stamped = stamp.get().expect("dispatched");
+        assert!(before <= stamped && stamped <= std::time::SystemTime::now());
+    }
+    assert_eq!(
+        stamps[16].get(),
+        None,
+        "a refused request was never dispatched"
     );
 }
 

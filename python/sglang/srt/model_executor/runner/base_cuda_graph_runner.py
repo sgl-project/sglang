@@ -48,11 +48,13 @@ def freeze_gc(enable_cudagraph_gc: bool):
     """Optimize garbage collection during CUDA graph capture.
 
     Clean up first. If GC is disabled during capture, freeze the remaining
-    objects and pause automatic collection until capture ends.
+    objects and pause automatic collection until capture ends. A heap frozen
+    before the capture, as after warmup, is frozen again after it.
     """
     gc.collect()
     should_freeze = not enable_cudagraph_gc
     gc_was_enabled = gc.isenabled()
+    heap_was_frozen = gc.get_freeze_count() > 0
     if should_freeze:
         gc.freeze()
         # A collection can finalize a Triton kernel, and unloading its module
@@ -66,6 +68,8 @@ def freeze_gc(enable_cudagraph_gc: bool):
                 gc.enable()
             gc.unfreeze()
             gc.collect()
+            if heap_was_frozen:
+                gc.freeze()
 
 
 def get_batch_sizes_to_capture(

@@ -9,8 +9,8 @@ use axum::Router;
 
 use super::generate_hook::GenerateHook;
 use super::{
-    auth, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
-    request_decompression,
+    anthropic, auth, connections, corpus, dp_relay, hicache, info, loads, metrics, native_api,
+    ollama, openai, parsers, pre_generate, request_decompression, responses, weights, wrappers,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -156,9 +156,15 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
         .merge(info::routes())
+        .merge(weights::routes())
+        .merge(parsers::routes())
+        .merge(corpus::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
-        .merge(openai::routes());
+        .merge(openai::routes())
+        .merge(ollama::routes())
+        .merge(anthropic::routes())
+        .merge(responses::routes());
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
     }
@@ -178,6 +184,7 @@ pub async fn serve(
 
     // No body limit, matching the Python server.
     let core = state.core.clone();
+    let responses_state = state.clone();
     let mut app = router
         .with_state(state)
         .merge(hicache::routes(hicache_manager))
@@ -203,6 +210,13 @@ pub async fn serve(
     };
     // Outside the embedding package's layers, so they read decompressed bodies.
     app = request_decompression::apply(app, &server_args);
+    // Python's generation wrappers (`/vertex_generate`, `/invocations`)
+    // rewrite the request and send it back through everything above, so a
+    // wrapped generate is relayed and parsed like a direct one.
+    app = wrappers::apply(app);
+    // `POST /v1/responses` plans a chat request and sends it back through
+    // the chat route, so the served model's own chat path answers it.
+    app = responses::mount(app, responses_state);
     // Outside the extension layer, so its routes are keyed too. The bootstrap
     // registry below stays open, as Python serves it on its own server. Auth
     // runs before decompression, so an unauthenticated body is never inflated.
@@ -232,26 +246,24 @@ pub async fn serve(
             return;
         }
     };
-    // `with_connect_info` exposes the peer address to the access-log middleware.
+    if let Some(http2) = &server_args.http2 {
+        tracing::info!(
+            max_concurrent_streams = http2.max_concurrent_streams,
+            initial_connection_window_size = http2.initial_connection_window_size,
+            "HTTP/2 (h2c) enabled on the HTTP listener, beside HTTP/1.1"
+        );
+    }
     // Once a drain ends, stop accepting, let the requests still on open
     // connections finish (the last bytes of the drained responses, or one
     // that raced the close), close idle keep-alive connections, and return.
     let graceful = drain.clone();
-    let serve = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    let serve = connections::serve(listener, app, server_args.http2.as_ref(), async move {
         if graceful.drain_ended().await == DrainEnd::Drained {
             tracing::info!("drain: no request left in flight; closing the HTTP listener");
         }
     });
     tokio::select! {
-        r = serve => {
-            if let Err(e) = r {
-                tracing::error!(error = %e, "axum serve exited");
-            }
-        }
+        () = serve => {}
         // Dropping `serve` closes the listener without waiting; the requests
         // still in flight end with the api runtime.
         () = drain.drain_close_deadline() => {

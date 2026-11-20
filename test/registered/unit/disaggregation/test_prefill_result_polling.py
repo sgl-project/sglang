@@ -144,6 +144,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
+    _release_mm_inputs = Scheduler._release_mm_inputs
 
     def __init__(
         self,
@@ -572,8 +573,7 @@ def _attention_dp_worker(rank, rendezvous, attn_tp_size):
         shard = rank // attn_tp_size
         topology = dict(
             tp_size=world_size,
-            dp_size=2,
-            enable_dp_attention=True,
+            attn_dp_size=2,
             ranks={"world_rank": rank},
         )
         # Copies finish after the slowest rank of the shard: 3 queries vs 6.
@@ -753,7 +753,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 if mode == "independent_dp":
                     topology = {"dp_size": 2}
                 elif mode == "attention_dp":
-                    topology = {"dp_size": 2, "tp_size": 2, "enable_dp_attention": True}
+                    topology = {"attn_dp_size": 2, "tp_size": 2}
                 elif mode == "cp":
                     topology = {"attn_cp_size": 2, "tp_size": 2}
                 elif mode == "speculation":
@@ -931,7 +931,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 if mode == "independent_dp":
                     topology = {"dp_size": 2}
                 elif mode == "attention_dp":
-                    topology = {"dp_size": 2, "tp_size": 2, "enable_dp_attention": True}
+                    topology = {"attn_dp_size": 2, "tp_size": 2}
                 elif mode == "cp":
                     topology = {"attn_cp_size": 2, "tp_size": 2}
                 elif mode == "speculation":

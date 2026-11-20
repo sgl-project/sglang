@@ -25,7 +25,7 @@ import subprocess
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import byref
-from functools import lru_cache, partial
+from functools import lru_cache
 from importlib.util import find_spec
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -88,6 +88,7 @@ __all__ = [
     "device_stream_context",
     "is_device_stream_capturing",
     "create_device_event",
+    "current_device_stream",
     "get_amdgpu_memory_capacity",
     "get_device_sm",
     "get_nvgpu_memory_capacity",
@@ -291,66 +292,65 @@ def _check_cuda_device_version(
     )
 
 
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+@lru_cache(maxsize=1)
+def is_hopper_with_cuda_12_3() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[9], cuda_version=(12, 3)
     )
-)
 
 
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
+@lru_cache(maxsize=1)
+def is_blackwell_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10, 11, 12], cuda_version=(12, 8)
     )
-)
 
 
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
+is_blackwell = is_blackwell_supported
+
+
+@lru_cache(maxsize=1)
+def is_sm120_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[12], cuda_version=(12, 8)
     )
-)
 
 
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
+@lru_cache(maxsize=1)
+def is_sm100_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10], cuda_version=(12, 8)
     )
-)
 
 
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
+@lru_cache(maxsize=1)
+def is_sm100_or_sm110_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10, 11], cuda_version=(12, 8)
     )
-)
 
 
-is_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
+@lru_cache(maxsize=1)
+def is_sm110_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[11], cuda_version=(12, 8)
     )
-)
 
 
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+@lru_cache(maxsize=1)
+def is_sm80_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[8], cuda_version=(11, 0)
     )
-)
 
 
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+@lru_cache(maxsize=1)
+def is_sm90_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[9], cuda_version=(12, 3)
     )
-)
 
 
 # RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
@@ -721,6 +721,13 @@ def create_device_event(device):
     if not isinstance(device, torch.device):
         device = torch.device(device)
     return torch.get_device_module(device).Event()
+
+
+def current_device_stream(device):
+    """The calling thread's current stream on ``device``."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).current_stream(device)
 
 
 def get_amdgpu_memory_capacity():
@@ -1281,11 +1288,14 @@ def get_compiler_backend(mode=None) -> str:
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
             )
+        if mode == "npugraph_ex":
+            from sglang.srt.hardware_backend.npu.compile_backend import (
+                get_npugraph_ex_backend,
+            )
+
+            return get_npugraph_ex_backend()
         compiler_config = CompilerConfig()
         compiler_config.mode = "max-autotune"
-        if mode == "npugraph_ex":
-            compiler_config.mode = "reduce-overhead"
-            compiler_config.debug.run_eagerly = True
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
