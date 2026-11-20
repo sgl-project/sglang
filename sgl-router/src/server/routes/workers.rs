@@ -29,7 +29,7 @@ pub async fn create_worker(
     headers: HeaderMap,
     input: Result<Json<WorkerInput>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    if let Err(response) = require_mutation_auth(&context, &headers) {
+    if let Some(response) = mutation_auth_rejection(&context, &headers) {
         return Ok(response);
     }
     let accepted = control(&context)?.create(worker_input(input)?)?;
@@ -69,7 +69,7 @@ pub async fn replace_worker(
     headers: HeaderMap,
     input: Result<Json<WorkerInput>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    if let Err(response) = require_mutation_auth(&context, &headers) {
+    if let Some(response) = mutation_auth_rejection(&context, &headers) {
         return Ok(response);
     }
     let accepted = control(&context)?.replace(
@@ -85,7 +85,7 @@ pub async fn remove_worker(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    if let Err(response) = require_mutation_auth(&context, &headers) {
+    if let Some(response) = mutation_auth_rejection(&context, &headers) {
         return Ok(response);
     }
     let accepted = control(&context)?.remove(&WorkerId(id), expected_revision(&headers)?)?;
@@ -99,14 +99,14 @@ fn control(context: &AppContext) -> Result<&Arc<WorkerControlService>, ApiError>
         .ok_or_else(|| WorkerControlError::Unavailable.into())
 }
 
-fn require_mutation_auth(context: &AppContext, headers: &HeaderMap) -> Result<(), Response> {
+fn mutation_auth_rejection(context: &AppContext, headers: &HeaderMap) -> Option<Response> {
     let Some(expected) = context.config.server.worker_management_auth.as_ref() else {
-        return Err(ApiError::from(WorkerControlError::Unavailable).into_response());
+        return Some(ApiError::from(WorkerControlError::Unavailable).into_response());
     };
     if headers.get(AUTHORIZATION) != Some(expected) {
-        return Err(StatusCode::UNAUTHORIZED.into_response());
+        return Some(StatusCode::UNAUTHORIZED.into_response());
     }
-    Ok(())
+    None
 }
 
 fn worker_input(
