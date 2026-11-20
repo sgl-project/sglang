@@ -16,7 +16,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=8, suite="base-a-test-npu")
+register_npu_ci(est_time=8, suite="extra-a-test-npu")
 
 # apply_all_hf_patches() imports transformers submodules that pull in
 # accelerate, whose state module probes find_spec("torch_npu") at import

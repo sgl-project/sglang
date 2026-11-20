@@ -15,9 +15,6 @@
 import torch
 
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_npu
-
-_is_npu = is_npu()
 
 E2M1_MAX = 6.0
 MAX_BLOCK_SCALE_FP8 = 448.0  # Maximum FP8 E4M3 value
@@ -57,7 +54,7 @@ class FP4MXBlock16KVQuantizeUtil:
     """
 
     @staticmethod
-    @torch.compile(disable=_is_npu)
+    @torch.compile
     def batched_quantize(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
 
@@ -100,7 +97,7 @@ class FP4MXBlock16KVQuantizeUtil:
         return packed, scale_factors
 
     @staticmethod
-    @torch.compile(disable=_is_npu)
+    @torch.compile
     def batched_dequantize(
         quant_tensor: torch.Tensor,
         scale_factors: torch.Tensor,

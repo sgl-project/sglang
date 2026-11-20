@@ -34,8 +34,6 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
 
-_is_npu = is_npu()
-
 if is_cuda():
     try:
         import deep_gemm
@@ -246,19 +244,19 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    @torch.compile(dynamic=True, disable=_is_npu)
+    @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    @torch.compile(dynamic=True, disable=_is_npu)
+    @torch.compile(dynamic=True)
     def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
         weights, _ = self.weights_proj(x.float())
         return weights * self.n_heads**-0.5
 
-    @torch.compile(dynamic=True, disable=_is_npu)
+    @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ) -> torch.Tensor:
@@ -1844,3 +1842,76 @@ class IndexerKPool(MultiPlatformOp):
                 "kpool indexer is only supported on CUDA and ROCm"
             )
         return topk_result
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        layer_scatter_modes=None,
+        dynamic_scale: torch.Tensor = None,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """BF16 compression and request-level pooled-key selection on A3/A5."""
+
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return None
+
+        assert forward_batch.seq_lens_cpu is not None
+        mode = forward_batch.forward_mode
+        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0 or x.shape[0] == 0:
+            return torch.full(
+                (x.shape[0], self.index_topk + self.index_kpool - 1),
+                -1,
+                dtype=torch.int,
+                device=x.device,
+            )
+
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        gate_score = F.linear(x, self.index_kpool_compress_gate)
+        query, _ = self.wq_b(q_lora)  # [T,H*D]
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)  # [T,H,D]
+        if self.rope_head_dim > 0 and not self.skip_rope:  # with RoPE
+            q_rope = query[..., : self.rope_head_dim]
+            k_rope = key[..., : self.rope_head_dim]
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope
+
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+            _compress_write_npu,
+            _get_topk_npu,
+        )
+
+        # --- Write Phase ---
+        _compress_write_npu(
+            key=key,
+            gate_score=gate_score,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            compress_ape=self.index_kpool_compress_ape,
+            index_kpool=self.index_kpool,
+        )
+
+        if not return_indices:
+            return None
+
+        # --- Read Phase ---
+        # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
+        weights, _ = self.weights_proj(x.float())  # [T,H]
+        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+        return _get_topk_npu(
+            layer_id=layer_id,
+            query=query,
+            weights=weights,
+            positions=positions,
+            metadata=metadata,
+            index_topk=self.index_topk,
+            index_kpool=self.index_kpool,
+        )  # [T, index_topk + index_kpool - 1]

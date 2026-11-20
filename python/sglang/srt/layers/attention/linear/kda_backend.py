@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -45,6 +46,7 @@ elif is_cpu():
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -486,6 +488,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    # gfx950's one-kernel chain verify (kda_backend_hip), set in __init__.
+    _hip_chain_verify_fn = None
+
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
 
@@ -538,6 +543,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
+        if is_gfx95_supported() and verify_backend.is_triton():
+            from sglang.srt.layers.attention.linear.kda_backend_hip import (
+                kda_chain_verify_gfx950,
+            )
+
+            self._hip_chain_verify_fn = kda_chain_verify_gfx950
+        if is_gfx95_supported():
+            from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+
+            # Breakable prefill graphs capture the HIP extend; load it before capture.
+            kda_gfx950_prefill.preload()
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -1286,6 +1302,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         speculative `intermediate_ssm` scratch so the central post-verify rollback
         (update_mamba_state_after_mtp_verify) can commit the accepted-length state.
         """
+        if mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         fm = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
         query_start_loc = fm.query_start_loc
@@ -1335,7 +1353,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
             self.req_to_token_pool.size,
         )
 
@@ -1376,6 +1394,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
+            if self._hip_chain_verify_fn is not None:
+                core_attn_out = self._hip_chain_verify_fn(
+                    layer,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    draft_token_num=draft_token_num,
+                    conv_states=conv_states,
+                    conv_state_indices=conv_state_indices,
+                    ssm_states=ssm_states,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                    ring_kwargs=ring_kwargs,
+                )
+                if core_attn_out is not None:
+                    return core_attn_out
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
@@ -1792,9 +1830,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
             return False
-        if importlib.util.find_spec("cutlass") is None:
+        cuda_arch = current_arch().cuda
+        if cuda_arch is None or cuda_arch.major not in (9, 10):
             return False
-        if torch.cuda.get_device_capability()[0] != 10:
+        # SM90 runs it only in CUDA graphs: an eager verify is bound by the
+        # launcher's host time, and Triton's kernels launch faster.
+        if cuda_arch.major == 9 and not get_is_capture_mode():
+            return False
+        if importlib.util.find_spec("cutlass") is None:
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
