@@ -22,6 +22,8 @@ ServerArgsValidator = Callable[["ServerArgs"], None]
 
 logger = logging.getLogger(__name__)
 
+DUCK_TYPED_PREDICATE_PREFIXES = ("is_", "supports_", "uses_")
+
 
 class CustomSpecAlgo:
     """A plugin-registered speculative algorithm. Duck-types
@@ -81,6 +83,9 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_dfly(self) -> bool:
+        return False
+
     def is_uno(self) -> bool:
         return False
 
@@ -88,6 +93,9 @@ class CustomSpecAlgo:
         return False
 
     def is_dflash_family(self) -> bool:
+        return False
+
+    def uses_block_verify(self) -> bool:
         return False
 
     def is_standalone(self) -> bool:
@@ -201,8 +209,9 @@ def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     duck-typing contract.
 
     ``from_string`` returns either type and callers dispatch on the shared
-    ``is_*()`` / ``supports_*()`` interface without isinstance checks, so every
-    such method on the enum must also exist on the registered spec class —
+    ``is_*()`` / ``supports_*()`` / ``uses_*()`` interface without isinstance
+    checks, so every such method on the enum must also exist on the registered
+    spec class —
     otherwise a plugin-registered algo hits ``AttributeError`` at a call site
     (this is how ``is_some`` / ``is_frozen_kv_mtp`` silently went missing). New
     predicates are covered automatically; no second list to maintain.
@@ -220,7 +229,7 @@ def _assert_custom_spec_algo_conforms(spec_class: Type[CustomSpecAlgo]) -> None:
     interface = {
         name
         for name in vars(SpeculativeAlgorithm)
-        if name.startswith(("is_", "supports_"))
+        if name.startswith(DUCK_TYPED_PREDICATE_PREFIXES)
     }
     missing = sorted(interface - set(dir(spec_class)))
     if missing:

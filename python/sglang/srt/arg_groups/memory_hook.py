@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any
+from typing import Any, Optional, Sequence
 
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
@@ -342,12 +342,22 @@ def handle_gpu_memory_settings(server_args: Any):
 
         # Multimodal models need more memory for the image processing.
         if is_vlm:
+            # A fixed reserve needs a capacity; otherwise keep the relative cut.
+            hy4_vl = gpu_mem is not None and _is_hy4_vl(
+                model_config.hf_config.architectures
+            )
             mem_fraction_static = adjust_mem_fraction_for_vlm(
                 mem_fraction_static,
                 model_config,
-                post_capture_kv_sizing,
-                gpu_mem,
+                fixed_encoder_headroom=post_capture_kv_sizing or hy4_vl,
+                gpu_mem=gpu_mem,
             )
+            # The KV sizer leaves the request table to non-static memory, where it would
+            # eat the encoder reserve. Speculative modes declare their 48 rows later.
+            if hy4_vl and cfg.speculative_algorithm is None:
+                mem_fraction_static -= (
+                    _req_to_token_table_mb(cfg, model_config.context_len) / gpu_mem
+                )
 
         declare_resolution(
             server_args,
@@ -427,15 +437,33 @@ def reserve_for_deepep_a2a_mb(server_args: Any) -> float:
     return 0.0
 
 
+def _is_hy4_vl(architectures: Optional[Sequence[str]]) -> bool:
+    return bool(architectures) and architectures[0] == "HYV4VLForConditionalGeneration"
+
+
+def _req_to_token_table_mb(cfg: Any, context_len: int) -> float:
+    """ReqToTokenPool's int32 table: one row per request plus a padding row."""
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        MIN_DEFAULT_MAX_RUNNING_REQUESTS,
+    )
+
+    if cfg.max_running_requests is None:
+        rows = MIN_DEFAULT_MAX_RUNNING_REQUESTS
+    else:
+        rows = max(1, cfg.max_running_requests // cfg.attn_dp_size)
+    return (rows + 1) * context_len * 4 / (1 << 20)
+
+
 def adjust_mem_fraction_for_vlm(
     mem_fraction_static: float,
     model_config,
-    post_capture_kv_sizing: bool,
+    *,
+    fixed_encoder_headroom: bool,
     gpu_mem,
 ) -> float:
-    if post_capture_kv_sizing:
-        # Graph and activation memory will be measured after capture, so only
-        # reserve a fixed 8 GiB of VLM headroom for image-encoder execution here.
+    if fixed_encoder_headroom:
+        # Fixed 8 GiB for the image encoder: post-capture sizing measures the rest,
+        # and a relative cut can shrink Hy4-VL's static budget below its weights.
         return (
             mem_fraction_static - 8 * 1024 / gpu_mem
             if gpu_mem is not None

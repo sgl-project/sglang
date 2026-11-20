@@ -89,6 +89,20 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
 
+    def test_hy4_dfly_distinguishes_unset_and_explicit_sampling(self):
+        self.sc.tokenizer_manager.model_config.hf_config.architectures = [
+            "HYV4ForCausalLM"
+        ]
+        with get_context().override_server_args(speculative_algorithm="DFLY"):
+            default = self.sc._build_sampling_params(
+                CompletionRequest(model="hy4", prompt="Hi")
+            )
+            self.assertEqual((default["temperature"], default["top_k"]), (0, 1))
+            explicit = self.sc._build_sampling_params(
+                CompletionRequest(model="hy4", prompt="Hi", temperature=0.9)
+            )
+            self.assertEqual((explicit["temperature"], explicit["top_k"]), (0.9, -1))
+
     def test_validate_request_bounds_logprobs_to_vocab(self):
         """logprobs outside [0, vocab_size] must be a 400, not a topk that
         kills the scheduler."""

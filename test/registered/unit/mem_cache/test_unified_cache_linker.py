@@ -1976,13 +1976,31 @@ def test_layer_counter_times_only_blocked_waits():
     index = counter.update_producer()
     counter.set_consumer(index)
     counter.complete(index, 0)
-    loader = threading.Timer(0.05, counter.complete, (index, 1))
-    loader.start()
+    clock = SimpleNamespace(now=1000.0)
+    waiting = threading.Event()
 
-    counter.wait_until(0)  # already landed: not a blocked wait
-    assert counter.blocked_seconds.get(index, 0.0) == 0.0
-    counter.wait_until(1)
-    loader.join()
+    def perf_counter():
+        clock.now += 0.001
+        now = clock.now
+        waiting.set()
+        return now
+
+    def load_layer_1():
+        # Only a pending wait reads the clock, so layer 1 lands while one is blocked.
+        waiting.wait(5)
+        clock.now += 0.05
+        counter.complete(index, 1)
+
+    loader = threading.Thread(target=load_layer_1)
+    with patch(
+        "sglang.srt.mem_cache.unified_cache.unified_cache_linker.time",
+        SimpleNamespace(perf_counter=perf_counter),
+    ):
+        loader.start()
+        counter.wait_until(0)  # already landed: not a blocked wait
+        assert counter.blocked_seconds.get(index, 0.0) == 0.0
+        counter.wait_until(1)
+        loader.join()
 
     assert counter.finish(index) is True
     assert counter.pop_blocked_seconds(index) >= 0.04

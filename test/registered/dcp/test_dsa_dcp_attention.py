@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_trtllm_sparse_attention,
+    fold_attention_sink,
     trtllm_rows_per_call,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -117,6 +118,55 @@ class TestDsaDcpAttention(CustomTestCase):
                     torch.testing.assert_close(
                         merged_lse, expected_lse, atol=0.003, rtol=0.002
                     )
+
+    def test_sink_folded_on_owner_ranks_matches_flashmla_sink(self):
+        """Each rank folds only its own heads' sinks; the merge must equal the
+        FlashMLA kernel that applies the sink to the unsharded softmax."""
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+        generator = torch.Generator().manual_seed(2)
+        capacity, heads = 8192, 128
+        page_table = torch.full((3, TOPK), -1, dtype=torch.int32)
+        page_table[0, 0] = capacity - 3
+        page_table[1, :127] = torch.randperm(capacity, generator=generator)[:127]
+        page_table[2] = torch.randperm(capacity, generator=generator)[:TOPK]
+        page_table = page_table.cuda()
+        query = (torch.randn(3, 1, heads, 576, generator=generator) * 0.25).cuda()
+        kv = (torch.randn(capacity, 576, generator=generator) * 0.25).cuda()
+        query, kv = query.to(torch.bfloat16), kv.to(torch.bfloat16)
+        sink = (torch.randn(heads, generator=generator) * 2).cuda()
+        expected, _, _ = flash_mla_sparse_fwd(
+            q=query.squeeze(1),
+            kv=kv.unsqueeze(1),
+            indices=page_table.unsqueeze(1),
+            sm_scale=SCALE,
+            d_v=512,
+            attn_sink=sink,
+        )
+        for dcp_size in (1, 2, 4):
+            local_heads = heads // dcp_size
+            outputs, lses = [], []
+            for rank in range(dcp_size):
+                local_page_table, counts = transform_index_page_table_dcp(
+                    page_table, dcp_size, rank
+                )
+                output, lse = _sparse_attention(
+                    query, kv[rank::dcp_size].contiguous(), local_page_table, counts
+                )
+                output = output.squeeze(1)
+                fold_attention_sink(
+                    output,
+                    lse,
+                    sink[rank * local_heads : (rank + 1) * local_heads],
+                    head_offset=rank * local_heads,
+                )
+                outputs.append(output)
+                lses.append(lse)
+            merged, _ = dcp_lse_combine_triton(
+                torch.stack(outputs), torch.stack(lses), is_lse_base_on_e=False
+            )
+            with self.subTest(dcp_size=dcp_size):
+                torch.testing.assert_close(merged, expected, atol=0.003, rtol=0.02)
 
     def test_rows_split_to_fit_the_workspace(self):
         """A workspace too small for one call's softmax slab must split the rows, not overflow."""

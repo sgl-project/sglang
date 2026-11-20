@@ -1275,6 +1275,9 @@ class OpenAIServingChat(OpenAIServingBase):
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
+        sampling_params = self._resolve_speculative_sampling_defaults(
+            request, sampling_params
+        )
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
@@ -1827,10 +1830,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
                 )
+                # Hunyuan excludes think tokens only inside the call payload, where
+                # the reasoning parser would otherwise split them out of an argument.
                 if (
                     tool_call_constraint is not None
                     and tool_call_constraint[0] == "structural_tag"
                     and self._reasoning_detector is not None
+                    and self.tool_call_parser != "hunyuan"
                     # Template tags exclude their own field closers,
                     # which can be the think literals (Beam's <|end|>).
                     and not isinstance(parser.detector, ResponseTemplateToolDetector)
@@ -1911,6 +1917,22 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
+        # With no reasoning parser to gate the grammar, a prompt that opens the
+        # thinking span needs the native tag to cover that span itself.
+        if (
+            tool_call_constraint is not None
+            and self.tool_call_parser == "hunyuan"
+            and self.reasoning_parser is None
+            and self._prompt_ends_with(
+                result.prompt_ids, parser.detector.think_start_token
+            )
+        ):
+            tool_call_constraint = parser.get_structure_constraint(
+                request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                thinking_mode=True,
+            )
+
         if tool_call_stop is not None:
             if isinstance(result.stop, str):
                 result.stop = [result.stop]
@@ -1959,6 +1981,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             result.reasoning_end_token_ids = list(token_ids)
         return result
+
+    def _string_content_media_placeholders(
+        self, content_format: Optional[str], is_multimodal: bool
+    ) -> Optional[Dict[str, str]]:
+        if content_format != "string" or not is_multimodal:
+            return None
+        mm_processor = self.tokenizer_manager.mm_processor
+        if mm_processor is None:
+            return None
+        return mm_processor.string_content_media_placeholders
 
     def _apply_jinja_template(
         self,
@@ -2081,6 +2113,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages = self._canonicalize_tool_message_order(
                     messages, sort_text_runs=self.is_minimax_m3
                 )
+            media_placeholders = self._string_content_media_placeholders(
+                template_content_format, is_multimodal
+            )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
@@ -2093,6 +2128,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
+                    media_placeholders=media_placeholders,
                 )
 
                 processed_msg["content"] = normalize_tool_content(
@@ -3599,6 +3635,17 @@ class OpenAIServingChat(OpenAIServingBase):
         return (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()
         )
+
+    def _prompt_ends_with(self, prompt_ids: str | list[int], token: str) -> bool:
+        if isinstance(prompt_ids, str):
+            tail = prompt_ids
+        elif prompt_ids:
+            tail = self.tokenizer_manager.tokenizer.decode(
+                prompt_ids[-4:], skip_special_tokens=False
+            )
+        else:
+            return False
+        return tail.rstrip().endswith(token)
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.

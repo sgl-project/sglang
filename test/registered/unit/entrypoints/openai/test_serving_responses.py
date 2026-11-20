@@ -746,7 +746,7 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
     """The skip_special_tokens override from _process_messages must reach the
     engine sampling params; muse's channel markers die in detok otherwise."""
 
-    def _create_responses_sampling_params(self, serving):
+    def _create_responses_sampling_params(self, serving, **sampling):
         serving.default_chat_template_kwargs = None
         rendered = MessageProcessingResult(
             prompt="prompt",
@@ -786,6 +786,7 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
             input="answer",
             request_id="resp_skip_special",
             store=False,
+            **sampling,
         )
 
         with (
@@ -801,6 +802,18 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
 
         self.assertEqual(response.status, "completed")
         return captured["sampling_params"]
+
+    def test_hy4_dfly_sampling_defaults_and_explicit_policy(self):
+        serving = make_serving()
+        serving.default_sampling_params = {"temperature": 0.9, "top_k": -1}
+        serving.tokenizer_manager.model_config.hf_config.architectures = [
+            "HYV4VLForConditionalGeneration"
+        ]
+        with get_context().override_server_args(speculative_algorithm="DFLY"):
+            default = self._create_responses_sampling_params(serving)
+            self.assertEqual((default["temperature"], default["top_k"]), (0, 1))
+            explicit = self._create_responses_sampling_params(serving, temperature=0.9)
+            self.assertEqual((explicit["temperature"], explicit["top_k"]), (0.9, -1))
 
     def test_marker_preserving_parser_disables_skip_special_tokens(self):
         serving = make_serving()

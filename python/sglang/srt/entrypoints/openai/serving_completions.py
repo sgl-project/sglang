@@ -192,7 +192,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 request.response_format.model_dump(by_alias=True)
             )
 
-        return sampling_params
+        return self._resolve_speculative_sampling_defaults(request, sampling_params)
 
     async def _handle_streaming_request(
         self,

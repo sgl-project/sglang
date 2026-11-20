@@ -17,6 +17,7 @@ import json
 import unittest
 import uuid
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import Mock, patch
 
@@ -24,11 +25,12 @@ from fastapi import HTTPException, Request
 from tokenizers import Tokenizer as BackendTokenizer
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
-from transformers import PreTrainedTokenizerFast
+from transformers import GenerationConfig, PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.kimi_k3_wire import (
     GENERATION_STUB_TOKENS,
@@ -58,6 +60,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.req_types import get_return_hidden_states_mode
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
@@ -74,9 +77,11 @@ from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    SamplingParams,
     get_request_reasoning_in_grammar,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dfly_validation import validate_dfly_request
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1003,6 +1008,89 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+
+    def test_hy4_dfly_unset_sampling_overrides_official_generation_defaults(self):
+        # Official fp8-generation_config.json would otherwise select sampling.
+        model = SimpleNamespace(
+            sampling_defaults="model",
+            hf_generation_config=GenerationConfig(
+                do_sample=True, temperature=0.9, top_k=-1
+            ),
+        )
+        defaults = ModelConfig.get_default_sampling_params(model)
+        self.chat.default_sampling_params = defaults
+        self.tm.model_config.hf_config.architectures = [
+            "HYV4VLForConditionalGeneration"
+        ]
+        cases = [
+            ({}, None),
+            ({"temperature": None}, None),
+            ({"temperature": 0}, None),
+            ({"top_k": 1}, None),
+            ({"temperature": 0.9}, "verifies greedily"),
+            ({"top_k": 8}, "verifies greedily"),
+            ({"response_format": {"type": "json_object"}}, "grammar"),
+            ({"frequency_penalty": 0.1}, "penalties"),
+            ({"logprobs": True}, "logprobs"),
+        ]
+        processed = MessageProcessingResult("Hi", [1, 2], None, None, [], [], None)
+        with (
+            get_context().override_server_args(speculative_algorithm="DFLY"),
+            patch.object(self.chat, "_process_messages", return_value=processed),
+        ):
+            for fields, error in cases:
+                with self.subTest(fields=fields):
+                    request = ChatCompletionRequest(
+                        model="hy4",
+                        messages=[{"role": "user", "content": "Hi"}],
+                        **fields,
+                    )
+                    adapted, _ = self.chat._convert_to_internal_request(request)
+                    if not fields or fields == {"temperature": None}:
+                        self.assertEqual(adapted.sampling_params["temperature"], 0)
+                        self.assertEqual(adapted.sampling_params["top_k"], 1)
+                    if fields == {"temperature": 0.9}:
+                        self.assertEqual(adapted.sampling_params["temperature"], 0.9)
+                        self.assertEqual(adapted.sampling_params["top_k"], -1)
+                    req = SimpleNamespace(
+                        sampling_params=SamplingParams(**adapted.sampling_params),
+                        grammar=None,
+                        custom_logit_processor=adapted.custom_logit_processor,
+                        return_logprob=adapted.return_logprob,
+                        return_hidden_states_mode=get_return_hidden_states_mode(False),
+                    )
+                    refusal = validate_dfly_request(
+                        req, enable_overlap=True, targets_hy4_flash=False
+                    )
+                    if error is None:
+                        self.assertIsNone(refusal)
+                    else:
+                        self.assertIn(error, refusal)
+        self.assertEqual(defaults["temperature"], 0.9)
+        self.assertEqual(defaults["top_k"], -1)
+        self.assertTrue(model.hf_generation_config.do_sample)
+
+    def test_other_generation_defaults_are_not_changed_by_hy4_dfly(self):
+        defaults = {"temperature": 0.9, "top_k": -1}
+        self.chat.default_sampling_params = defaults
+        processed = MessageProcessingResult("Hi", [1, 2], None, None, [], [], None)
+        for algorithm, architecture in [
+            (None, "HYV4VLForConditionalGeneration"),
+            ("DFLY", "HYV4FlashForConditionalGeneration"),
+            (None, "LlamaForCausalLM"),
+        ]:
+            with (
+                self.subTest(algorithm=algorithm, architecture=architecture),
+                get_context().override_server_args(speculative_algorithm=algorithm),
+                patch.object(self.chat, "_process_messages", return_value=processed),
+            ):
+                self.tm.model_config.hf_config.architectures = [architecture]
+                request = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi"}]
+                )
+                adapted, _ = self.chat._convert_to_internal_request(request)
+                self.assertEqual(adapted.sampling_params["temperature"], 0.9)
+                self.assertEqual(adapted.sampling_params["top_k"], -1)
 
     def test_response_template_prefix_uses_prompt_token_ids(self):
         class ResponseTemplateAlias(ResponseTemplateToolDetector):
@@ -3791,6 +3879,245 @@ class ServingChatTestCase(CustomTestCase):
                                 ],
                                 ["tool_calls" if finish == "stop" else finish],
                             )
+
+    _HY = ":opensource"
+    _HY_WEATHER = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+
+    def _hunyuan_call(self, city):
+        s = self._HY
+        return (
+            f"<tool_calls{s}><tool_call{s}>get_weather"
+            f"<arg_key{s}>city</arg_key{s}><arg_value{s}>{city}</arg_value{s}>"
+            f"</tool_call{s}></tool_calls{s}>"
+        )
+
+    def _use_hunyuan_parsers(self, reasoning_parser="hunyuan"):
+        self.tm.tokenizer.get_vocab.return_value = {
+            f"<{name}{self._HY}>": i
+            for i, name in enumerate(
+                ("tool_calls", "tool_call", "arg_key", "arg_value", "think")
+            )
+        }
+        self.tm._config_overrides.update(
+            tool_call_parser="hunyuan", reasoning_parser=reasoning_parser
+        )
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="hunyuan_effort"
+        )
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+
+    def _stream_hunyuan(self, req, wire, chunk_size):
+        async def generate():
+            for end in range(chunk_size, len(wire) + chunk_size, chunk_size):
+                yield {
+                    "text": wire[:end],
+                    "meta_info": {
+                        "id": "chatcmpl-hunyuan-forced",
+                        "prompt_tokens": 1,
+                        "completion_tokens": min(end, len(wire)),
+                        "finish_reason": (
+                            {"type": "stop", "matched": None}
+                            if end >= len(wire)
+                            else None
+                        ),
+                    },
+                    "index": 0,
+                }
+
+        self.tm.generate_request.return_value = generate()
+        chunks = self._parse_chunks(self._run_chat_stream(None, req))
+        choices = [c for chunk in chunks for c in chunk.get("choices", [])]
+        deltas = [c.get("delta", {}) for c in choices]
+        calls = [c for d in deltas for c in (d.get("tool_calls") or [])]
+        return choices, deltas, calls
+
+    def _assert_one_streamed_weather_call(self, choices, calls, city):
+        self.assertEqual(
+            [c["function"]["name"] for c in calls if c["function"].get("name")],
+            ["get_weather"],
+        )
+        self.assertEqual(
+            json.loads("".join(c["function"].get("arguments") or "" for c in calls)),
+            {"city": city},
+        )
+        self.assertEqual(
+            [c["finish_reason"] for c in choices if c.get("finish_reason")],
+            ["tool_calls"],
+        )
+
+    def test_hunyuan_forced_tool_choice_is_grammar_constrained(self):
+        """Required/named tool_choice with the Hunyuan parsers must constrain the
+        post-reasoning output to a native tool call instead of leaving it free."""
+        import xgrammar as xgr
+        from xgrammar.testing import _is_grammar_accept_string
+
+        self._use_hunyuan_parsers()
+        call = self._hunyuan_call("Paris")
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        for choice in ("required", named):
+            for effort, reasoning in (("high", "work"), ("none", "")):
+                with self.subTest(choice=choice, effort=effort):
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Weather in Paris?"}],
+                        input_ids=[1],
+                        tools=[self._HY_WEATHER],
+                        tool_choice=choice,
+                        reasoning_effort=effort,
+                        stream=True,
+                    )
+                    processed = self.chat._process_messages(req, False)
+                    self.assertEqual(processed.require_reasoning, bool(reasoning))
+                    kind, tag = processed.tool_call_constraint
+                    self.assertEqual(kind, "structural_tag")
+                    # The reasoning parser gates the grammar, so the tag starts
+                    # at the tool call rather than at the reasoning text.
+                    grammar = xgr.Grammar.from_structural_tag(tag)
+                    self.assertTrue(_is_grammar_accept_string(grammar, call))
+                    self.assertFalse(_is_grammar_accept_string(grammar, "Sunny."))
+
+                    wire = (
+                        f"{reasoning}</think{self._HY}>" if reasoning else ""
+                    ) + call
+                    choices, deltas, calls = self._stream_hunyuan(req, wire, 4)
+                    self.assertEqual(
+                        "".join(d.get("reasoning_content") or "" for d in deltas),
+                        reasoning,
+                    )
+                    self.assertEqual(
+                        "".join(d.get("content") or "" for d in deltas), ""
+                    )
+                    self._assert_one_streamed_weather_call(choices, calls, "Paris")
+
+    def test_hunyuan_forced_argument_value_cannot_close_the_call(self):
+        """A grammar-accepted argument value must not end the selected call early,
+        smuggle in an unselected call, or carry think markers that the reasoning
+        parser would split out of the argument."""
+        import xgrammar as xgr
+        from xgrammar.testing import _is_grammar_accept_string
+
+        s = self._HY
+        self._use_hunyuan_parsers()
+        tools = [
+            self._HY_WEATHER,
+            {"type": "function", "function": {"name": "get_current_date"}},
+        ]
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            input_ids=[1],
+            tools=tools,
+            tool_choice=named,
+            parallel_tool_calls=False,
+            reasoning_effort="none",
+            stream=True,
+        )
+        _, tag = self.chat._process_messages(req, False).tool_call_constraint
+        grammar = xgr.Grammar.from_structural_tag(tag)
+        for harmful in (
+            f"x</tool_call{s}><tool_call{s}>get_current_date</tool_call{s}>y",
+            f"a<think{s}>b</think{s}>c",
+            f"a<think{s}>b",
+            f"a</think{s}>b",
+        ):
+            with self.subTest(harmful=harmful):
+                self.assertFalse(
+                    _is_grammar_accept_string(grammar, self._hunyuan_call(harmful))
+                )
+
+        city = f'a < b, "c" </tool_call\nd <think{s} </think e'
+        wire = self._hunyuan_call(city)
+        self.assertTrue(_is_grammar_accept_string(grammar, wire))
+        calls, _, finish_reason = self.chat._process_tool_calls(
+            text=wire,
+            tools=req.tools,
+            finish_reason={"type": "stop", "matched": None},
+            tool_choice=named,
+        )
+        self.assertEqual(
+            [(c.function.name, json.loads(c.function.arguments)) for c in calls],
+            [("get_weather", {"city": city})],
+        )
+        self.assertEqual(finish_reason["type"], "tool_calls")
+        # Chunk sizes 1 and 4 cut through every closer and marker prefix.
+        for chunk_size in (1, 4, len(wire)):
+            with self.subTest(chunk_size=chunk_size):
+                choices, _, calls = self._stream_hunyuan(req, wire, chunk_size)
+                self._assert_one_streamed_weather_call(choices, calls, city)
+
+    def test_hunyuan_forced_tool_without_reasoning_parser_keeps_thinking(self):
+        """Without a reasoning parser, a rendered prompt that opens the thinking
+        span must let the model finish thinking before the forced tool call."""
+        import xgrammar as xgr
+        from xgrammar.testing import _is_grammar_accept_string
+
+        s = self._HY
+        backend = BackendTokenizer(
+            tokenizer_models.WordLevel(vocab={"[UNK]": 0}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        tokenizer.add_tokens(
+            [
+                f"<{name}{s}>"
+                for name in ("tool_calls", "tool_call", "arg_key", "arg_value", "think")
+            ]
+            + [f"</think{s}>", f"<｜hy_start{s}｜>", f"<｜hy_middle{s}｜>"]
+        )
+        # Generation prompt of the Hy4 chat template.
+        tokenizer.chat_template = (
+            "{%- if not reasoning_effort is defined %}"
+            "{%- set reasoning_effort = 'high' %}{%- endif %}"
+            "{%- for m in messages %}{{ m.content }}{%- endfor %}"
+            "{%- if add_generation_prompt %}"
+            "{%- if reasoning_effort == 'no_think' %}"
+            "{{- '<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>"
+            "<think:opensource></think:opensource>' -}}"
+            "{%- else %}"
+            "{{- '<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>"
+            "<think:opensource>' -}}"
+            "{%- endif %}{%- endif %}"
+        )
+        self.tm.tokenizer = tokenizer
+        self.tm._config_overrides.update(tool_call_parser="hunyuan")
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        call = self._hunyuan_call("Paris")
+        thought = f"Need the weather.</think{s}>" + call
+        for template_kwargs, accepted, rejected in (
+            (None, thought, call),
+            ({"reasoning_effort": "no_think"}, call, thought),
+        ):
+            with self.subTest(template_kwargs=template_kwargs):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather in Paris?"}],
+                    tools=[self._HY_WEATHER],
+                    tool_choice="required",
+                    chat_template_kwargs=template_kwargs,
+                )
+                processed = self.chat._process_messages(req, False)
+                rendered = tokenizer.decode(processed.prompt_ids)
+                self.assertEqual(
+                    rendered.endswith(f"<think{s}>"), template_kwargs is None
+                )
+                _, tag = processed.tool_call_constraint
+                grammar = xgr.Grammar.from_structural_tag(tag)
+                self.assertTrue(_is_grammar_accept_string(grammar, accepted))
+                self.assertFalse(_is_grammar_accept_string(grammar, rejected))
 
     def test_iquest_named_tool_rejects_invalid_arguments(self):
         self.chat.tool_call_parser = "iquest_q1"

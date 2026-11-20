@@ -172,8 +172,8 @@ def get_req_to_token_extra_context_len() -> int:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         spec_algo = SpeculativeAlgorithm.from_string(spec_algorithm)
-        if page_size > 1 or spec_algo.is_uno():
-            # UNO's double-buffer reserve applies at every page size. Larger
-            # pages may additionally round the allocation up by page_size - 1.
+        if page_size > 1 or spec_algo.is_uno() or spec_algo.is_dfly():
+            # UNO's and DFLY's double-buffer reserves apply at every page size.
+            # Larger pages may additionally round the allocation up by page_size - 1.
             extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
     return extra

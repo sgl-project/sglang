@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
+from sglang.srt.speculative.dfly_validation import dfly_targets_hy4_flash
 from sglang.srt.speculative.spec_registry import (
     _RESERVED_ALIASES,
     CustomSpecAlgo,
@@ -36,6 +37,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DFLY = auto()
     UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
@@ -116,6 +118,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dfly(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLY
+
     def is_uno(self) -> bool:
         return self == SpeculativeAlgorithm.UNO
 
@@ -124,6 +129,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_dflash_family(self) -> bool:
         return self.is_dflash() or self.is_dspark()
+
+    def uses_block_verify(self) -> bool:
+        return self.is_dflash_family() or self.is_dfly()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -238,6 +246,7 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dfly,
             _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
@@ -253,6 +262,8 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_dfly():
+            _handle_dfly(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
         elif self.is_dspark():
@@ -327,14 +338,25 @@ class SpeculativeAlgorithm(Enum):
 
             return DFlashWorkerV2
 
+        if self.is_dfly():
+            if dfly_targets_hy4_flash(
+                model_config_of(server_args).hf_config.architectures
+            ):
+                from sglang.srt.speculative.dfly_flash_worker_v2 import (
+                    DFlyFlashWorkerV2,
+                )
+
+                return DFlyFlashWorkerV2
+            from sglang.srt.speculative.dfly_worker_v2 import DFlyWorkerV2
+
+            return DFlyWorkerV2
+
         if self.is_uno():
             from sglang.srt.speculative.uno_worker_v2 import UnoWorkerV2
 
             return UnoWorkerV2
 
         if self.is_dspark():
-            from sglang.srt.arg_groups.model_override_base import model_config_of
-
             if model_config_of(server_args).hf_config.architectures == [
                 "Inkling2ForConditionalGeneration"
             ]:
@@ -516,7 +538,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash_family():
+    elif spec_algorithm.uses_block_verify():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

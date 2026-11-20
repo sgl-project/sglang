@@ -15,8 +15,9 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_spec
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dfly_validation import resolve_hy4_dfly_sampling_defaults
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -35,6 +36,18 @@ class OpenAIServingBase(ABC):
             if isinstance(self.tokenizer_manager.server_args, ServerArgs)
             and get_observability().tokenizer_metrics_allowed_custom_labels
             else None
+        )
+
+    def _resolve_speculative_sampling_defaults(self, request, sampling_params):
+        if get_spec().speculative_algorithm != "DFLY":
+            return sampling_params
+        return resolve_hy4_dfly_sampling_defaults(
+            sampling_params,
+            request_sampling=request.model_dump(
+                include={"temperature", "top_k", "top_p", "min_p"},
+                exclude_unset=True,
+            ),
+            architectures=self.tokenizer_manager.model_config.hf_config.architectures,
         )
 
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:

@@ -76,6 +76,10 @@ class Spec(msgspec.Struct):
         int,
         "Domino only. Size of the approximate block-shared base-logit candidate pool. Set to 0 to score the full vocabulary.",
     ] = 2048
+    speculative_dfly_block_size: A[
+        Optional[int],
+        "DFLY only. Block size (verify window length: the bonus token plus the drafts). Sets --speculative-num-draft-tokens. Omit to read it from the checkpoint config, else 6.",
+    ] = None
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

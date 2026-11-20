@@ -12,10 +12,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -25,6 +27,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
     should_ignore_layer,
+)
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    DeepseekV2WeightLoaderMixin,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -124,6 +129,32 @@ WNA16_GROUP = {
         "dynamic": False,
     },
     "input_activations": None,
+}
+
+
+KV_B_TARGET = "re:.*self_attn\\.kv_b_proj$"
+O_PROJ_TARGET = "re:.*self_attn\\.o_proj$"
+
+# Block FP8 W8A8 with per-group-128 dynamic activations.
+BLOCK_FP8_GROUP = {
+    "format": "float-quantized",
+    "targets": [O_PROJ_TARGET],
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "block",
+        "block_structure": [128, 128],
+        "dynamic": False,
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "group",
+        "group_size": 128,
+        "dynamic": True,
+    },
 }
 
 
@@ -402,6 +433,72 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+
+class TestMixedBlockLayout(CustomTestCase):
+    """A block-FP8 group must not hand its block layout to a channel-FP8 layer."""
+
+    def _post_load_kv_b(self, kv_b_group, other_group, scale):
+        config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(
+                dict(kv_b_group, targets=[KV_B_TARGET]), other_group
+            )
+        )
+        with mock.patch.object(
+            torch.cuda, "get_device_capability", return_value=(10, 0)
+        ):
+            kv_b = ReplicatedLinear(
+                128,
+                256,
+                bias=False,
+                quant_config=config,
+                prefix="model.layers.0.self_attn.kv_b_proj",
+            )
+        kv_b.weight.data.fill_(1)
+        kv_b.weight_scale.data.copy_(scale)
+        attn = SimpleNamespace(
+            kv_b_proj=kv_b,
+            qk_nope_head_dim=64,
+            v_head_dim=64,
+            w_kc=None,
+            w_vc=None,
+            w_scale=None,
+        )
+        model = SimpleNamespace(
+            start_layer=0, end_layer=1, layers=[SimpleNamespace(self_attn=attn)]
+        )
+        DeepseekV2WeightLoaderMixin.post_load_weights(
+            SimpleNamespace(quant_config=config, model=model)
+        )
+        # w_kc is [heads, nope, in] and w_vc [heads, in, v]; both share w_scale.
+        rows = torch.cat([attn.w_kc.float(), attn.w_vc.float().transpose(1, 2)], 1)
+        return rows.flatten(0, 1) * attn.w_scale
+
+    def test_channel_kv_b_beside_a_block_group_dequantizes_per_channel(self):
+        scale = torch.arange(1, 257, dtype=torch.float32).view(256, 1)
+        kv_b = self._post_load_kv_b(FP8_GROUP, BLOCK_FP8_GROUP, scale)
+        # Per-tensor FP8 requantization keeps 3 mantissa bits.
+        torch.testing.assert_close(kv_b, scale.expand(256, 128), rtol=0.07, atol=0)
+
+    def test_block_kv_b_beside_a_channel_group_keeps_its_blocks(self):
+        scale = torch.tensor([[1.0], [2.0]])
+        channel_o_proj = dict(FP8_GROUP, targets=[O_PROJ_TARGET])
+        kv_b = self._post_load_kv_b(BLOCK_FP8_GROUP, channel_o_proj, scale)
+        torch.testing.assert_close(
+            kv_b, scale.repeat_interleave(128, dim=0).expand(256, 128)
+        )
+
+    def test_global_block_size_requires_every_weighted_group_blocked(self):
+        """Model-level loaders apply `weight_block_size` to every layer."""
+        mixed = _mixed_precision_config(BLOCK_FP8_GROUP, FP8_GROUP)
+        self.assertIsNone(CompressedTensorsConfig.from_config(mixed).weight_block_size)
+        all_block = _mixed_precision_config(
+            BLOCK_FP8_GROUP, dict(BLOCK_FP8_GROUP, targets=[KV_B_TARGET])
+        )
+        self.assertEqual(
+            CompressedTensorsConfig.from_config(all_block).weight_block_size,
+            [128, 128],
+        )
 
 
 if __name__ == "__main__":

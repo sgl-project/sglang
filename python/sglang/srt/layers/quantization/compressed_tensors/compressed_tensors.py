@@ -9,6 +9,7 @@ from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -156,6 +157,12 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        # Model adapters set these when their checkpoints name only quantized
+        # modules in `targets`, when layer prefixes differ from those names, or
+        # when every routed expert of a fused bank must resolve one scheme.
+        self.ignore_unmatched_layers = False
+        self.checkpoint_layer_name: Optional[Callable[[str], str]] = None
+        self.check_all_experts = False
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -245,6 +252,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+
+        if self.checkpoint_layer_name is not None:
+            prefix = self.checkpoint_layer_name(prefix)
 
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
@@ -341,6 +351,16 @@ class CompressedTensorsConfig(QuantizationConfig):
             weights_config = self.target_scheme_map["Linear"].get("weights")
             if weights_config and hasattr(weights_config, "block_structure"):
                 return weights_config.block_structure
+            return None
+        # Name-targeted configs publish a block size only when every weighted
+        # group shares it; a non-block group must not inherit another's blocks.
+        block_structures = {
+            tuple(weights.block_structure) if weights.block_structure else None
+            for scheme in self.target_scheme_map.values()
+            if (weights := scheme.get("weights")) is not None
+        }
+        if len(block_structures) == 1 and (block := block_structures.pop()):
+            return list(block)
         return None
 
     @classmethod
@@ -1027,9 +1047,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         # FusedMoE was made by combining multiple Linears so need to
         # make sure quantization config for Linear can target it
         self._add_fused_moe_to_target_scheme_map()
+        # One scheme serves the whole bank: under unmatched-layer fallback, or
+        # when a model opts in, every routed expert must resolve to it.
+        expert_ids = (
+            range(layer.num_global_routed_experts)
+            if self.ignore_unmatched_layers or self.check_all_experts
+            else (0,)
+        )
         unfused_names = [
-            layer_name + proj_name
-            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+            f"{layer_name}.{expert_id}.{proj_name}"
+            for expert_id in expert_ids
+            for proj_name in ("gate_proj", "up_proj", "down_proj")
         ]
         # TODO: refactor this to use expert_mapping and check all layer numbers
         all_scheme_dicts = [self.get_scheme_dict(layer, name) for name in unfused_names]
@@ -1039,7 +1067,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if not all(d == scheme_dict for d in all_scheme_dicts):
             raise ValueError(
                 "All MoE projections need to have same "
-                "quantization scheme but found multiple"
+                f"quantization scheme but found multiple in {layer_name}"
             )
 
         if scheme_dict is None:  # ignored layer
@@ -1329,12 +1357,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
             if matched_target is None:
-                matched_target = find_matched_target(
-                    layer_name=layer_name,
-                    module=layer,
-                    targets=self.target_scheme_map.keys(),
-                    fused_mapping=self.packed_modules_mapping,
-                )
+                try:
+                    matched_target = find_matched_target(
+                        layer_name=layer_name,
+                        module=layer,
+                        targets=self.target_scheme_map.keys(),
+                        fused_mapping=self.packed_modules_mapping,
+                    )
+                except ValueError:
+                    if self.ignore_unmatched_layers:
+                        return None
+                    raise
 
             return self.target_scheme_map[matched_target]
 
