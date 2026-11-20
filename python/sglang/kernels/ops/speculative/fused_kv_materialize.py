@@ -13,8 +13,9 @@
 # ==============================================================================
 """Fused Triton kernel for DFlash KV materialization.
 
-Projects all layers together, then applies RMSNorm and RoPE. A strided
-cache can receive the committed prefix in the norm/RoPE kernel itself.
+Projects all layers in one GEMM, then applies RMSNorm and RoPE in one kernel.
+Rows go to a workspace for the pool's writer or, given the cache buffers and
+physical slot ids, straight to the committed prefix's cache rows.
 """
 
 from typing import Callable, List, Optional
@@ -59,8 +60,8 @@ def _fused_norm_rope_kernel_stacked(
     rotary_dim: tl.constexpr,
     half_rotary_dim: tl.constexpr,
     BLOCK_HD: tl.constexpr,
-    loc_ptr,
-    commit_len_ptr,
+    loc_ptr,  # [batch, WIDTH]
+    commit_len_ptr,  # [batch]
     WIDTH: tl.constexpr,
     loc_batch_stride,
     loc_col_stride,
@@ -78,7 +79,7 @@ def _fused_norm_rope_kernel_stacked(
         batch, col = ctx_id // WIDTH, ctx_id % WIDTH
         if col >= tl.load(commit_len_ptr + batch * commit_stride):
             return
-        # The arena's strided row offset can exceed signed int32.
+        # Slot id times the cache row stride can exceed int32.
         dst_row = tl.load(loc_ptr + batch * loc_batch_stride + col * loc_col_stride).to(
             tl.int64
         )

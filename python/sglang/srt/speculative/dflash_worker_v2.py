@@ -1158,7 +1158,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_kv_cache_uses_window = not routes[0].owner
             if self._draft_kv_cache_buffers is not None and get_parallel().tp_rank == 0:
                 logger.info(
-                    "DFLASH fused prefix writes bound to %s.", routes[0].route.sub_pool
+                    "DFLASH fused prefix writes bound to %s.",
+                    router.storage_name(routes[0].route.sub_pool),
                 )
 
     def _init_draft_kv_ring(self) -> None:

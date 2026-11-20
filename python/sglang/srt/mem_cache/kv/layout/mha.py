@@ -815,16 +815,21 @@ class DraftMHAView(MHAView):
             return None
 
         def stack(buffers):
-            first = buffers[layer_ids[0] - self.start_layer]
+            rows = [buffers[layer_id - self.start_layer] for layer_id in layer_ids]
+            first = rows[0]
             layer_stride = 0
-            if len(lanes) > 1:
-                second = buffers[layer_ids[1] - self.start_layer]
-                layer_stride = second.storage_offset() - first.storage_offset()
+            if len(rows) > 1:
+                layer_stride = rows[1].storage_offset() - first.storage_offset()
+            for i, row in enumerate(rows):
+                offset = first.storage_offset() + i * layer_stride
+                if row.storage_offset() != offset or row.stride() != first.stride():
+                    return None
             return first.as_strided(
-                (len(lanes), *first.shape), (layer_stride, *first.stride())
+                (len(rows), *first.shape), (layer_stride, *first.stride())
             )
 
-        return stack(self.k_buffer), stack(self.v_buffer)
+        k, v = stack(self.k_buffer), stack(self.v_buffer)
+        return None if k is None or v is None else (k, v)
 
     def get_contiguous_buf_infos(self):
         raise NotImplementedError(

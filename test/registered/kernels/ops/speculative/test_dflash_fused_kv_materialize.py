@@ -39,7 +39,7 @@ def test_prefix_write_matches_materialize_then_scatter(dtype):
     )
     expected = raw.clone()
     locs = (
-        torch.randperm(slots, dtype=torch.int32, device=device, generator=gen)[
+        torch.randperm(slots, dtype=torch.int64, device=device, generator=gen)[
             : batch * width
         ]
         .view(width, batch)
@@ -47,7 +47,7 @@ def test_prefix_write_matches_materialize_then_scatter(dtype):
     )
     lengths = torch.tensor([0, 1, 3, width], device=device, dtype=torch.int32)
     valid = torch.arange(width, device=device)[None, :] < lengths[:, None]
-    dst = locs[valid].long()
+    dst = locs[valid]
     for idx, src in enumerate((k, v)):
         expected[dst, 1 : 1 + layers, idx, :, :dim] = src[:, valid.flatten()].transpose(
             0, 1
