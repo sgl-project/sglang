@@ -282,9 +282,8 @@ def _prepare_ple_batch(
     get_req_to_token_pool().ple_window_cache = None
     if mode.is_idle():
         return None
-    use_decode_fast_path = (
-        envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get() and mode.is_decode()
-    )
+    is_decode = mode.is_decode()
+    use_decode_fast_path = is_decode and envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
 
     if input_ids.dim() > 1:
         input_ids = input_ids.reshape(-1)
@@ -323,7 +322,7 @@ def _prepare_ple_batch(
             )
         req_indices = torch.div(positions, row_width, rounding_mode="floor")
         token_offsets = positions - req_indices * row_width
-    elif mode.is_decode():
+    elif is_decode:
         lengths = torch.ones(processed_tokens, dtype=torch.long, device=tokens.device)
         row_width = 1
         req_indices = positions
@@ -361,19 +360,22 @@ def _prepare_ple_batch(
         .working.long()
         .clamp(min=0)
     )
-    valid_rows = lengths.ne(0) & state_indices.ne(0)
     out_cache_loc = forward_batch.out_cache_loc
-    if out_cache_loc is not None and mode.is_decode():
-        valid_rows = valid_rows & out_cache_loc[:sequence_count].ne(0)
-    elif out_cache_loc is not None and mode.is_target_verify():
-        valid_rows = valid_rows & out_cache_loc[:processed_tokens].reshape(
-            sequence_count, row_width
-        ).ne(0).any(dim=1)
-    state_indices = torch.where(valid_rows, state_indices, 0)
-
-    if use_decode_fast_path:
+    if is_decode:
+        if out_cache_loc is not None:
+            state_indices = torch.where(
+                out_cache_loc[:sequence_count].ne(0), state_indices, 0
+            )
+        # Decode has one token per row. The masked slots already encode padding.
+        valid_rows = state_indices.ne(0)
         valid_tokens = valid_rows
     else:
+        valid_rows = lengths.ne(0) & state_indices.ne(0)
+        if out_cache_loc is not None and mode.is_target_verify():
+            valid_rows = valid_rows & out_cache_loc[:processed_tokens].reshape(
+                sequence_count, row_width
+            ).ne(0).any(dim=1)
+        state_indices = torch.where(valid_rows, state_indices, 0)
         valid_tokens = (
             token_offsets < lengths.index_select(0, req_indices)
         ) & valid_rows.index_select(0, req_indices)
