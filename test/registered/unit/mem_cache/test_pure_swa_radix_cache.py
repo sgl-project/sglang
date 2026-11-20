@@ -8,15 +8,18 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import retire_window
+from sglang.srt.mem_cache.allocator.swa import PureSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -155,6 +158,72 @@ class TestPureSWARadixCache(CustomTestCase):
         self.assertEqual(cache.total_size(), 4)
         self.assertEqual(allocator.freed, [6, 7])
         self.assertEqual(allocator.skipped, [4, 5])
+
+    def test_window_evicted_slots_are_not_shared_with_the_next_request(self):
+        # Real pool and allocator: the window frees slots back to the allocator,
+        # and the next request must not get slots the tree still serves.
+        size, window = 32, 2
+        kv_pool = SWAKVPool(
+            size=0,
+            size_swa=size,
+            page_size=1,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=4,
+            swa_attention_layer_ids=[0],
+            full_attention_layer_ids=[],
+            device="cpu",
+        )
+        allocator = PureSWATokenToKVPoolAllocator(
+            size,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        pool = ReqToTokenPool(
+            size=2, max_context_len=size, device="cpu", enable_memory_saver=False
+        )
+        kv_storage_of(pool, allocator).bind_window_retention(window, None)
+        cache = PureSWARadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                sliding_window_size=window,
+            )
+        )
+        token_ids = array("q", range(1, 12))
+        pool.req_to_token[0, :11] = allocator.alloc(11)
+        req = SimpleNamespace(
+            origin_input_ids=token_ids[:4],
+            output_ids=token_ids[4:],
+            full_untruncated_fill_ids=token_ids,
+            extra_key=None,
+            cache_salt=None,
+            last_node=cache.root_node,
+            lock=None,
+            priority=0,
+            kv=ReqKvInfo(req_pool_idx=0),
+        )
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = 11
+
+        # The prompt is cached, then decode retires window rows past it.
+        cache.checkpoint(req, up_to=4)
+        retire_window(req, 10, cache)
+        self.assertGreater(req.kv.get_evicted_seqlen("swa"), req.kv.cache_protected_len)
+        cache.checkpoint(req, up_to=11)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 11)])
+        cache.unlock(req.lock)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        tree_slots = set(cache.path_device_indices(match.last_device_node).tolist())
+        self.assertEqual(allocator.available_size() + cache.evictable_size(), size)
+        # The next request takes every free slot; none may still belong to the tree.
+        next_slots = set(allocator.alloc(allocator.available_size()).tolist())
+        self.assertEqual(tree_slots & next_slots, set())
 
 
 class TestDisabledPureSWARadixCache(CustomTestCase):
