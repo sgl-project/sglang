@@ -1272,5 +1272,32 @@ class TestSharedExpertOnlineMxfp4CreateWeightsGuards(CustomTestCase):
                 self.assertNotIn("MX block size", str(past_the_guards.exception))
 
 
+class TestMxfp4IntermediateAlignDeclaration(CustomTestCase):
+    """A layer that declares its kernels' alignment (FusedMoE.mxfp4_intermediate_align)
+    keeps the checkpoint intermediate width; otherwise AITER pads it to 128."""
+
+    def test_the_declared_alignment_decides_whether_the_width_is_padded(self):
+        for align, pad in ((None, 128), (128, 0)):
+            scheme = object.__new__(QuarkW4A4MXFp4MoE)
+            scheme.dequantization_config = None
+            scheme.quantize_shared_expert_online = False
+            layer = SimpleNamespace(
+                use_presharded_weights=True,
+                moe_tp_size=1,
+                mxfp4_intermediate_align=align,
+            )
+            with self.subTest(align=align), patch.object(quark_moe, "_use_aiter", True):
+                # The stub layer fails after intermediate_pad is set.
+                with self.assertRaises(Exception):
+                    scheme.create_weights(
+                        layer=layer,
+                        num_experts=4,
+                        hidden_size=quark_moe.OCP_MX_BLOCK_SIZE * 2,
+                        intermediate_size_per_partition=384,
+                        params_dtype=torch.bfloat16,
+                    )
+                self.assertEqual(layer.intermediate_pad, pad)
+
+
 if __name__ == "__main__":
     unittest.main()
