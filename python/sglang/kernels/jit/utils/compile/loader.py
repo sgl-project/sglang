@@ -9,7 +9,7 @@ import os
 import pathlib
 import shutil
 import uuid
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 
@@ -66,6 +66,7 @@ def load_jit(
     extra_dependencies: List[str] | None = None,
     header_only: bool = True,
     cuda_units: List[List[str]] | None = None,
+    post_build: Callable[[pathlib.Path], None] | None = None,
 ) -> Module:
     """Load a JIT module, compiling it if no cached build still applies.
 
@@ -92,6 +93,9 @@ def load_jit(
                        macros, includes `cuda_files` and exports nothing; ninja
                        builds the units in parallel, so a module can split its
                        kernel instantiations across them.
+    :param post_build: Check run on a fresh build before it is loaded or
+                       cached; raising rejects the build. A cached build passed
+                       it when it was made (the build key covers the toolchain).
     """
     if cuda_units and not (header_only and cuda_files):
         raise ValueError("cuda_units needs a header-only module with cuda_files.")
@@ -217,6 +221,8 @@ def load_jit(
         staging = scope / f".staging-{uuid.uuid4().hex}"
         try:
             library = ninja.build(spec=spec, build_dir=staging, build_file=build_file)
+            if post_build is not None:
+                post_build(library)
             # Loaded before publishing, so a broken artifact never becomes a
             # leaf that later runs have to discover and discard.
             module = _load(library)

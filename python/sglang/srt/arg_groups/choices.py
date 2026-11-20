@@ -213,6 +213,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "aiter",
     "marlin",
     "humming",
+    "nvfp4_w4a16_sm90",
     "experimental_sgl_marlin",
     "lora_cutedsl",
     "lora_triton",
