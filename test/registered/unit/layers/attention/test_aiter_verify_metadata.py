@@ -291,7 +291,9 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
             patch("torch.cuda.is_current_stream_capturing", return_value=False),
         ):
             backend.forward_extend(
-                torch.zeros(bs * draft_num, num_q_heads, head_dim, dtype=torch.bfloat16),
+                torch.zeros(
+                    bs * draft_num, num_q_heads, head_dim, dtype=torch.bfloat16
+                ),
                 None,
                 None,
                 layer,
