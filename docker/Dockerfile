@@ -2,7 +2,7 @@
 
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 
-ARG CUDA_VERSION=13.0.3
+ARG CUDA_VERSION=13.4.1
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
 
@@ -44,6 +44,10 @@ fi
 # create virtual env for sglang to avoid conflict with system python packages
 ARG PYTHON_VERSION
 COPY --from=uv /uv /uvx /usr/local/bin/
+# torch 2.15: its NCCL2 path crashes EPLB rebalance (#45456); Triton uses the image's ptxas.
+ENV TORCH_DIST_USE_NCCL2=0 \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+
 ENV UV_PYTHON_INSTALL_DIR=/opt/python \
     UV_PYTHON_PREFERENCE=only-managed \
     UV_LINK_MODE=copy \
@@ -201,11 +205,13 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --upgrade pip setuptools wheel html5lib six \
     && case "$CUDA_VERSION" in \
-        13.0.3) ;; \
+        13.0.3) KERNEL_INDEX="" ;; \
+        # PyPI carries the cu130 build; the torch 2.15 / cu134 build comes from the sglang wheel index.
+        13.4.1) KERNEL_INDEX="--index-url https://docs.sglang.ai/whl/cu134/" ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     # --no-deps prevents uv from pulling torch from default PyPI
-    && uv pip install sglang-kernel==${SGL_KERNEL_VERSION} --reinstall --no-deps
+    && uv pip install sglang-kernel==${SGL_KERNEL_VERSION} ${KERNEL_INDEX} --reinstall --no-deps
 
 # Copy the dependency spec, Rust extension sources, and shared API types.
 # Split from the pip install so changes to these build inputs invalidate the
@@ -221,6 +227,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
         13.0.3) CUINDEX=130 ;; \
+        13.4.1) CUINDEX=134 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && cd /tmp/sglang_deps/python \
@@ -309,6 +316,7 @@ ARG FLASHINFER_VERSION
 RUN --mount=type=cache,target=/root/.cache/uv \
     case "$CUDA_VERSION" in \
         13.0.3) CUINDEX=130 ;; \
+        13.4.1) CUINDEX=134 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \

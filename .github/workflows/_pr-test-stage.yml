@@ -83,6 +83,11 @@ on:
 # workflow-level env across the workflow_call boundary, so anything pr-test.yml
 # defines must be redeclared here for the called job to see the same context.
 env:
+  # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
+  # some self-hosted runners export an older CU_VERSION into the job environment.
+  CU_VERSION: cu134
+  # torch 2.15's NCCL2 path crashes EPLB rebalance (#45456, docker/Dockerfile.cu134).
+  TORCH_DIST_USE_NCCL2: "0"
   SGLANG_IS_IN_CI: true
   NCCL_NVLS_ENABLE: "0"
   # base-a runs the fwd-occupancy sanity kit; async-assert probes add GPU work
@@ -101,7 +106,8 @@ env:
   HF_HUB_ETAG_TIMEOUT: 300
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  USE_VENV: false
+  # Trial branch: each job installs into its own /tmp venv (deleted after the job), so torch 2.15 never lands in the runners' shared env.
+  USE_VENV: "1"
 
 jobs:
   run:
@@ -183,6 +189,27 @@ jobs:
         if: ${{ !startsWith(inputs.runner_config, '1-gpu') }}
         with:
           artifact_name: ${{ inputs.sgl_router_artifact }}
+
+      # [CI trial] torch 2.15 builds of sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla from
+      # this run (_pr-test-dep-wheels-build.yml), installed over the pinned releases.
+      - name: Download dependency wheels (v4)
+        if: steps.rc.outputs.artifact_version == 'v4'
+        uses: actions/download-artifact@v4
+        with:
+          path: dep-wheels/
+          merge-multiple: true
+          pattern: dep-wheel-*
+
+      - name: Download dependency wheels (v6)
+        if: steps.rc.outputs.artifact_version == 'v6'
+        uses: actions/download-artifact@v6
+        with:
+          path: dep-wheels/
+          merge-multiple: true
+          pattern: dep-wheel-*
+
+      - name: Use dependency wheels
+        run: echo "SGLANG_CI_DEP_WHEELS_DIR=$GITHUB_WORKSPACE/dep-wheels" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}

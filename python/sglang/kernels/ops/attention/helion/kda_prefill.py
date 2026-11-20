@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
+from sglang.kernels.ops.attention.helion import kda_state_rows
 
 CHUNK_SIZE = 64
 # Rounded identically to flash-linear-attention/SGLang before FP32 multiply.
@@ -1070,6 +1071,7 @@ def _chunk_state(
     u: torch.Tensor,
     chunk_decay: torch.Tensor,
     initial_state: torch.Tensor,
+    state_rows: torch.Tensor,
     initial_state_indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
@@ -1126,7 +1128,9 @@ def _chunk_state(
     u_rows = u.view(B * T * H, V)
     decay_rows = chunk_decay.view(-1, K)
     v_new_rows = v_new.view(B * T * H, V)
-    h_rows = h.view(B * total_chunks * H, V, K)
+    h_rows = h.view(B * total_chunks * H * V, K)
+    slot_pitch = hl.specialize(initial_state.stride(0) // K)
+    head_pitch = hl.specialize(initial_state.stride(1) // K)
     block_v = hl.register_block_size(1, V)
 
     for tile_sequence, tile_h, tile_v in hl.tile(
@@ -1143,23 +1147,17 @@ def _chunk_state(
             output_offset = tile_sequence.id * chunks_per_batch
         sequence_length = end - begin
         state_index = initial_state_indices[tile_sequence.id].long()
-        state = initial_state[
-            state_index,
-            tile_h.id,
-            tile_v.index,
-            :,
-        ].float()
+        rows = state_index * slot_pitch + tile_h.id * head_pitch + tile_v.index
+        state = state_rows[rows, :].float()
 
         if has_track:
             i_track = track_chunk_idx[tile_sequence.id]
 
         for token_tile in hl.tile(sequence_length, block_size=64):
             global_chunk = output_offset + token_tile.id
-            h_rows[
-                global_chunk * H + tile_h.id,
-                tile_v,
-                :,
-            ] = state.to(h.dtype)
+            h_rows[(global_chunk * H + tile_h.id) * V + tile_v.index, :] = state.to(
+                h.dtype
+            )
             if has_track:
                 # Snapshot the fp32 accumulator at the tracked chunk boundary
                 # (the h store above rounds to the activation dtype; -1 marks
@@ -1199,12 +1197,7 @@ def _chunk_state(
                 out_dtype=torch.float32,
             )
 
-        initial_state[
-            state_index,
-            tile_h.id,
-            tile_v.index,
-            :,
-        ] = state.to(initial_state.dtype)
+        state_rows[rows, :] = state.to(state_rows.dtype)
 
     return h, v_new
 
@@ -1490,6 +1483,7 @@ def chunk_kda(
         u,
         chunk_decay,
         initial_state,
+        kda_state_rows(initial_state),
         initial_state_indices,
         metadata,
         (

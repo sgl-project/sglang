@@ -58,14 +58,14 @@ jobs:
       # Live-fetched labels, not event-payload expressions, which do not
       # refresh on rerun. A draft PR, a missing `run-ci`, or a missing opt-in
       # tier label (scripts/ci/opt_in_ci_tiers.json) runs this step, and the
-      # caller's test jobs skip on opted-in=false instead of failing. The slash
+      # caller's test jobs skip on opted-in=false instead of failing.
+      # [CI trial] drafts run too, so the validation PR can stay a draft. Revert before merge. The slash
       # command handler and pr-states.yml find such runs by this step's name.
       - name: Skip tests
         id: skip
         if: >-
           env.IS_PR_EVENT == 'true' && (
-            fromJson(steps.pr.outputs.draft)
-            || !contains(fromJson(steps.pr.outputs.labels), 'run-ci')
+            !contains(fromJson(steps.pr.outputs.labels), 'run-ci')
             || inputs.require-label != '' && !contains(fromJson(steps.pr.outputs.labels), inputs.require-label)
           )
         env:

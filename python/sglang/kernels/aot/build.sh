@@ -151,6 +151,15 @@ export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS} 
 echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"
 echo "GitHub mirror: GITHUB_ARTIFACTORY=${GITHUB_ARTIFACTORY}"
 
+# Pin the wheel to the torch it is built against (Dockerfile picks it per CUDA version).
+TORCH_VER=$(${PYTHON_ROOT_PATH}/bin/python -c "import torch; print(torch.__version__)")
+TORCH_VER=${TORCH_VER%%+*}
+if ! grep -q "\"torch==${TORCH_VER}\"" pyproject.toml; then
+  cp pyproject.toml /tmp/pyproject.toml.orig
+  trap "cat /tmp/pyproject.toml.orig > pyproject.toml" EXIT
+  sed "s/\"torch==[0-9.]*\"/\"torch==${TORCH_VER}\"/g" /tmp/pyproject.toml.orig > pyproject.toml
+fi
+
 ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation
 PYTHON=${PYTHON_ROOT_PATH}/bin/python ./rename_wheels.sh
 

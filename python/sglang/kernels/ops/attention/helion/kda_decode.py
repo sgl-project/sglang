@@ -6,7 +6,10 @@ import helion
 import helion.language as hl
 import torch
 
-from sglang.kernels.ops.attention.helion import KDA_SMALL_VALUE_HEAD_THRESHOLD
+from sglang.kernels.ops.attention.helion import (
+    KDA_SMALL_VALUE_HEAD_THRESHOLD,
+    kda_state_rows,
+)
 
 # SGLang initializes torch.distributed, but this kernel has no collectives.
 _IGNORED_WARNINGS = [helion.exc.ProcessGroupNameNotFound]
@@ -75,6 +78,7 @@ def _helion_fused_recurrent_kda_packed_decode_body(
     initial_state: torch.Tensor,
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
+    state_rows: torch.Tensor,
     use_qk_l2norm_in_kernel: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     use_fast_rsqrt: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
     use_lower_bound: hl.constexpr = False,  # pyrefly: ignore[bad-function-definition]
@@ -109,6 +113,8 @@ def _helion_fused_recurrent_kda_packed_decode_body(
         )
     )
 
+    slot_pitch = hl.specialize(initial_state.stride(0) // K)
+    head_pitch = hl.specialize(initial_state.stride(1) // K)
     block_v = hl.register_block_size(1, V)
 
     for tile_b, tile_hv, tile_v in hl.tile([B, HV, V], block_size=[1, 1, block_v]):
@@ -141,7 +147,8 @@ def _helion_fused_recurrent_kda_packed_decode_body(
                 log_decay = -A * softplus
             beta = torch.sigmoid(b[i_b, i_hv].float())
 
-            state = initial_state[state_index, i_hv, tile_v.index, k_offsets].float()
+            rows = state_index * slot_pitch + i_hv * head_pitch + tile_v.index
+            state = state_rows[rows, k_offsets].float()
             decay = torch.exp2(log_decay * _LOG2_E)
             state = state * decay[None, :]
 
@@ -168,7 +175,7 @@ def _helion_fused_recurrent_kda_packed_decode_body(
             output = (state * q[None, :]).sum(-1)
 
             out[i_b, 0, i_hv, tile_v] = output.to(out.dtype)
-            initial_state[state_index, i_hv, tile_v.index, k_offsets] = state
+            state_rows[rows, k_offsets] = state.to(state_rows.dtype)
 
     return out
 
@@ -386,6 +393,7 @@ def helion_fused_recurrent_kda_packed_decode(
         initial_state,
         out,
         ssm_state_indices,
+        kda_state_rows(initial_state),
         use_qk_l2norm_in_kernel,
         is_bf16_state,
         use_lower_bound,

@@ -61,7 +61,8 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  USE_VENV: false
+  # Trial branch: each job installs into its own /tmp venv (deleted after the job), so torch 2.15 never lands in the runners' shared env.
+  USE_VENV: "1"
 
 permissions:
   actions: write
@@ -76,7 +77,7 @@ jobs:
     with:
       git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
-      force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+      force_continue_on_error: true  # [CI trial] run every test; revert before merge
     secrets: inherit
 
   call-pr-test-extra:
@@ -175,6 +176,13 @@ jobs:
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
+
+  # [CI trial] torch 2.15 builds of sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla. GPU test
+  # jobs install them over the pinned releases and skip if this fails. Revert before merge.
+  dep-wheels-build:
+    needs: [check-changes, call-gate]
+    if: needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false'
+    uses: ./.github/workflows/_pr-test-dep-wheels-build.yml
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
@@ -275,7 +283,7 @@ jobs:
     secrets: inherit
 
   call-sgl-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build]
     if: |
       (github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
@@ -294,7 +302,7 @@ jobs:
   # =============================================== jit-kernel ====================================================
 
   call-jit-kernel-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build]
     # Run on scheduled/parallel-dispatch runs (same pattern as the base-* stages) so the
     # jit_kernel suite is exercised on main 3x daily, not only on PRs that touch kernels/**.
     # check-changes already forces jit_kernel='true' on scheduled runs (run_all_tests).
@@ -324,7 +332,7 @@ jobs:
   # and check-pr-test-health carves h20 out by the same name.
   base-a-test:
     name: base-a-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build]
     if: ${{ (!failure() && !cancelled()) && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
@@ -364,7 +372,7 @@ jobs:
 
   base-b-test:
     name: base-b-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build, sgl-router-build]
     # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
     if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
@@ -390,7 +398,7 @@ jobs:
     secrets: inherit
 
   call-multimodal-gen-tests:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, dep-wheels-build]
     if: |
       (always() &&
       !cancelled() &&
@@ -415,7 +423,7 @@ jobs:
     name: base-c-test-${{ matrix.runner_config }}
     # wait-for-base-a is listed only to read its result: when it is cancelled,
     # wait-for-base-b ends `skipped`, which alone would let this stage through.
-    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build, sgl-router-build]
     if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
@@ -441,7 +449,7 @@ jobs:
   # the aarch64 build, and neither table should wait on the other's.
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64, sgl-router-build-aarch64]
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, dep-wheels-build, rust-ext-build-aarch64, sgl-router-build-aarch64]
     if: ${{ (!failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled') && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
@@ -472,6 +480,7 @@ jobs:
 
         sgl-kernel-build-wheels,
         sgl-kernel-build-wheels-arm,
+        dep-wheels-build,
         call-sgl-kernel-tests,
 
         rust-ext-build,

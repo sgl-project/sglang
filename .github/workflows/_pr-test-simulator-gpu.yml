@@ -17,6 +17,11 @@ on:
         default: ''
 
 env:
+  # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
+  # some self-hosted runners export an older CU_VERSION into the job environment.
+  CU_VERSION: cu134
+  # torch 2.15's NCCL2 path crashes EPLB rebalance (#45456, docker/Dockerfile.cu134).
+  TORCH_DIST_USE_NCCL2: "0"
   SGLANG_IS_IN_CI: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
@@ -48,6 +53,18 @@ jobs:
       - uses: ./.github/actions/download-rust-ext
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
+
+      # [CI trial] torch 2.15 builds of sgl-deep-gemm / sgl-deep-ep / sgl-flash-mla from
+      # this run (_pr-test-dep-wheels-build.yml), installed over the pinned releases.
+      - name: Download dependency wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dep-wheels/
+          merge-multiple: true
+          pattern: dep-wheel-*
+
+      - name: Use dependency wheels
+        run: echo "SGLANG_CI_DEP_WHEELS_DIR=$GITHUB_WORKSPACE/dep-wheels" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         timeout-minutes: 20
