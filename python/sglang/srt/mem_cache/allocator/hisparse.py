@@ -464,6 +464,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.free_group is None:
             self.logical_attn_allocator.free_full(free_indices)
+            self.free_hisparse(free_indices)
         else:
             self.full_free_group.append(self._copy_for_free_group(free_indices))
 
