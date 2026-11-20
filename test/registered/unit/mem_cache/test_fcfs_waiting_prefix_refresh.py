@@ -85,7 +85,7 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         )
         planner = SchedulePlanner("fcfs", cache, False, False, False)
         # Isolate the scheduler clock from the radix cache's recency timestamps.
-        with patch("sglang.srt.managers.prefill_adder.time", create=True) as clock:
+        with patch("sglang.srt.managers.schedule_policy.time", create=True) as clock:
             clock.monotonic.return_value = 100.0
             queue = planner.calc_priority(queue)
             if second_refresh_time is not None:

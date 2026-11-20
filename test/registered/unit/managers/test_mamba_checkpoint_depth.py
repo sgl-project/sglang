@@ -14,14 +14,14 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
-from sglang.srt.managers.prefill_adder import (
-    PrefillAdder,
-    mamba_prefill_chunk_grid,
-)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
+)
+from sglang.srt.managers.schedule_policy import (
+    PrefillAdder,
+    mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, mamba_track_grid

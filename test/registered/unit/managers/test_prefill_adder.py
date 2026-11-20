@@ -5,20 +5,20 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-import sglang.srt.managers.prefill_adder as prefill_adder
+import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     max_bootstrap_input_len,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.managers.prefill_adder import (
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     estimate_prefill_extend_tile_metrics,
 )
-from sglang.srt.managers.req_types import FINISH_LENGTH
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -510,7 +510,9 @@ class TestPrefillAdder(CustomTestCase):
                     supports_mamba=supports_mamba,
                     supports_prefix_sharing=supports_prefix_sharing,
                 ),
-                patch.object(prefill_adder, "_use_exact_chunk_fill", return_value=True),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=True
+                ),
             ):
                 self.mock_tree_cache.supports_mamba.return_value = supports_mamba
                 self.mock_tree_cache.supports_prefix_sharing.return_value = (
@@ -1298,7 +1300,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result3, AddReqResult.OTHER)
 
     @patch(
-        "sglang.srt.managers.prefill_adder.page_interleave_shard_size",
+        "sglang.srt.managers.schedule_policy.page_interleave_shard_size",
         return_value=4,
     )
     def test_ignore_eos_reserves_all_shard_class_pages(self, _shard_size):
@@ -2093,7 +2095,7 @@ class TestPrefillAdder(CustomTestCase):
     def _build_mamba_restore_admission(self, *, holds_state, available_slots):
         self.mock_token_allocator = self.create_token_allocator(available_size=100_000)
         self.mock_tree_cache = self.create_tree_cache()
-        self.mock_tree_cache.mock_add_spec(prefill_adder.UnifiedRadixCache)
+        self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
         allocator = self.mock_token_allocator
         allocator.window_pool_names.return_value = ()
@@ -2707,7 +2709,7 @@ class TestPrefillAdder(CustomTestCase):
         # out a request that has already generated >= CLIP tokens but still has a
         # long decode ahead, under-reserving its SWA window -> OOM risk on resume
         # of a long-generation request.
-        from sglang.srt.managers.prefill_adder import CLIP_MAX_NEW_TOKENS as CLIP
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS as CLIP
 
         adder = self.create_adder(self.create_running_batch())
         cases = [
@@ -2892,16 +2894,16 @@ class TestPrefillAdder(CustomTestCase):
         # The tile-budget admission is gated on HIP in production; force the gate
         # on so this vendor-neutral admission-math check runs on any CI runner.
         with (
-            patch.object(prefill_adder, "_IS_HIP", True),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET", 6),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET_MODE", "compact"),
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "compact"),
         ):
             self.assertIsNone(adder._check_prefill_tile_budget(129))
 
         with (
-            patch.object(prefill_adder, "_IS_HIP", True),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET", 6),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
         ):
             self.assertEqual(adder._check_prefill_tile_budget(129), AddReqResult.OTHER)
 
@@ -2909,8 +2911,8 @@ class TestPrefillAdder(CustomTestCase):
         adder = self._adder_with_extend_lens([])
 
         with (
-            patch.object(prefill_adder, "_IS_HIP", True),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET", 1),
+            patch.object(schedule_policy, "_IS_HIP", True),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 1),
         ):
             self.assertIsNone(adder._check_prefill_tile_budget(4096))
 
@@ -2920,9 +2922,9 @@ class TestPrefillAdder(CustomTestCase):
         adder = self._adder_with_extend_lens([1, 7, 13])
 
         with (
-            patch.object(prefill_adder, "_IS_HIP", False),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET", 6),
-            patch.object(prefill_adder, "PREFILL_TILE_BUDGET_MODE", "legacy"),
+            patch.object(schedule_policy, "_IS_HIP", False),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET", 6),
+            patch.object(schedule_policy, "PREFILL_TILE_BUDGET_MODE", "legacy"),
         ):
             self.assertIsNone(adder._check_prefill_tile_budget(129))
 

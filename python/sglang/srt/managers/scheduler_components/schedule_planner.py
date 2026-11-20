@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policies.base import (
     WAITING_QUEUE_PREFIX_MATCH_MAX,
@@ -28,6 +27,7 @@ from sglang.srt.managers.schedule_policies.shortest_prefill import (
     ShortestPrefillFirstRanker,
 )
 from sglang.srt.managers.schedule_policies.uniboost import UniBoostRanker
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InsertParams,
@@ -452,7 +452,7 @@ class SchedulePlanner:
             # re-matches the prefix, but a longer page-aligned match adds at most
             # as many replay rows as it drops extend tokens, so this still fits.
             cached = len(req.origin_input_ids) + len(req.output_ids) - work
-            charge += PrefillAdder.replay_len(req, cached)
+            charge += PrefillAdder._replay_len(req, cached)
             if (
                 self.ranker.prefill_rank(req, work, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size

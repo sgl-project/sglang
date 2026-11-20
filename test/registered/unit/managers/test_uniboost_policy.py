@@ -7,7 +7,6 @@ import itertools
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.managers.prefill_adder import PrefillAdder
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_policies import uniboost_gamma_ada
 from sglang.srt.managers.schedule_policies.policy import SchedulePolicy
@@ -17,6 +16,7 @@ from sglang.srt.managers.schedule_policies.uniboost_gamma_ada import (
     GAMMA_ADA_REFIT_EVERY,
     GammaAdaController,
 )
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler_components import schedule_planner
 from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -278,7 +278,7 @@ class TestUniboostChunkLimit(UniboostTestBase):
         chunked = FakeReq("chunked", 0)
         chunked.full_untruncated_fill_ids = list(range(30000))
         chunked.prefix_len = 0
-        with patch.object(PrefillAdder, "replay_len", return_value=0):
+        with patch.object(PrefillAdder, "_replay_len", return_value=0):
             return planner.chunked_req_limit(
                 chunked, waiting_queue, 8192, 16, processed_tokens=0
             )
