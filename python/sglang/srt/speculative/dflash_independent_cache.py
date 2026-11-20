@@ -77,6 +77,7 @@ class DraftSlotLayout:
 def independent_draft_reservation_bytes(kvc):
     from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
     from sglang.srt.runtime_context import (
+        get_disagg,
         get_schedule,
         get_spec,
     )
@@ -117,6 +118,16 @@ def independent_draft_reservation_bytes(kvc):
     )
     if row is None:
         raise ValueError("Cannot price independent draft KV geometry")
+    if spec.speculative_draft_pd_lane and get_disagg().disaggregation_mode == "prefill":
+        layout = DraftSlotLayout(
+            requests,
+            schedule.chunked_prefill_size,
+            kvc.page_size,
+            spec.speculative_num_draft_tokens,
+        )
+        return layout.reservation_bytes(
+            row_bytes=row, full_layers=len(types), window_layers=0
+        )
     return layout.reservation_bytes(
         row_bytes=row, full_layers=full, window_layers=windows
     )
@@ -235,6 +246,7 @@ class IndependentDraftCache:
 def allocate_independent_draft_cache(worker, target_requests, *, mixed):
     """Build a runner's storage without invoking the target's allocator."""
 
+    from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
     from sglang.srt.mem_cache.allocator import (
         PagedTokenToKVPoolAllocator,
         TokenToKVPoolAllocator,
@@ -243,8 +255,13 @@ def allocate_independent_draft_cache(worker, target_requests, *, mixed):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.runtime_context import get_spec
 
-    allowed = (ReqToTokenPool,)
+    allowed = (
+        (ReqToTokenPool, DecodeReqToTokenPool)
+        if get_spec().speculative_draft_pd_lane
+        else (ReqToTokenPool,)
+    )
     if (
         type(target_requests) not in allowed
         or target_requests._aux_cache is not None
@@ -395,3 +412,73 @@ def allocate_independent_draft_cache(worker, target_requests, *, mixed):
     )
     runner._init_post_memory_pool_components()
     return cache
+
+
+class PrefillContextSlab:
+    """Per-request bounded source rows, consumed synchronously before reuse."""
+
+    def __init__(self, layout):
+        self.layout = layout
+
+    def locations(self, slots, positions, lengths):
+        import torch
+
+        owners = torch.repeat_interleave(slots.to(torch.int64), lengths.to(torch.int64))
+        return (
+            self.layout.page_size
+            + (owners - 1) * self.layout.stride
+            + positions.remainder(self.layout.stride)
+        )
+
+
+def allocate_prefill_context_slab(worker, target_requests):
+    from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.runtime_context import get_schedule
+
+    runner = worker.draft_model_runner
+    layout = DraftSlotLayout(
+        target_requests.size,
+        get_schedule().chunked_prefill_size,
+        worker.page_size,
+        worker.block_size,
+    )
+    attention = worker.draft_model.layers[0].self_attn
+    pool = MHATokenToKVPool(
+        size=layout.full_capacity,
+        page_size=layout.page_size,
+        dtype=runner.kv_cache_dtype,
+        head_num=attention.num_kv_heads,
+        head_dim=attention.head_dim,
+        layer_num=len(worker.draft_model.layers),
+        device=worker.device,
+        enable_memory_saver=False,
+    )
+    requests = ReqToTokenPool(
+        layout.slots, layout.stride, worker.device, enable_memory_saver=False
+    )
+    allocator = PagedTokenToKVPoolAllocator(
+        layout.full_capacity,
+        layout.page_size,
+        runner.kv_cache_dtype,
+        worker.device,
+        pool,
+        False,
+    )
+    runner.req_to_token_pool, runner.token_to_kv_pool = requests, pool
+    runner.token_to_kv_pool_allocator = allocator
+    runner.max_total_num_tokens, runner.max_running_requests = (
+        layout.full_capacity,
+        layout.slots,
+    )
+    runner.memory_pool_config = MemoryPoolConfig(
+        max_total_num_tokens=layout.full_capacity, max_running_requests=layout.slots
+    )
+    worker._draft_worker.req_to_token_pool = requests
+    worker._draft_worker.token_to_kv_pool_allocator = allocator
+    runner.init_kv_cache_configurator(
+        draft_parallel_layout=worker.draft_parallel_layout
+    )
+    runner._init_post_memory_pool_components()
+    return PrefillContextSlab(layout)

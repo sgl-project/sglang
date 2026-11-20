@@ -219,6 +219,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1604,11 +1605,18 @@ class ModelRunner:
     @property
     def logical_max_total_num_tokens(self):
         """Request-token capacity in logical tokens, not per-rank DCP rows."""
-        return self.req_to_token_pool.schedulable_token_capacity(
-            self.kv_cache_configurator.logical_token_capacity(
-                max_total_num_tokens=self.max_total_num_tokens
-            )
+        capacity = self.kv_cache_configurator.logical_token_capacity(
+            max_total_num_tokens=self.max_total_num_tokens
         )
+        if (
+            not self.is_draft_worker
+            and self.enable_hisparse
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            # PD receives complete target history directly in registered Host
+            # memory; its hot/scratch GPU rows are a separate request budget.
+            capacity = self.token_to_kv_pool_allocator.size_full
+        return self.req_to_token_pool.schedulable_token_capacity(capacity)
 
     @property
     def effective_logical_max_total_num_tokens(self):

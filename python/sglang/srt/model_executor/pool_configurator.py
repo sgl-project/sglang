@@ -151,7 +151,10 @@ def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
         and not get_spec().speculative_dflash_draft_kv_ring
         and not (
             kvc.spec_algorithm.is_dflash()
-            and (get_spec().speculative_draft_kv_layout != "shared" or False)
+            and (
+                get_spec().speculative_draft_kv_layout != "shared"
+                or get_spec().speculative_draft_pd_lane
+            )
         )
     )
 
@@ -344,7 +347,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             not kvc.is_draft_worker
             and kvc.spec_algorithm.is_dflash()
-            and (get_spec().speculative_draft_kv_layout != "shared" or False)
+            and (
+                get_spec().speculative_draft_kv_layout != "shared"
+                or get_spec().speculative_draft_pd_lane
+            )
         ):
             from sglang.srt.speculative.dflash_independent_cache import (
                 independent_draft_reservation_bytes,

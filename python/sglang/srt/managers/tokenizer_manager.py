@@ -255,6 +255,8 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> None:
         default_enabled=features.watermark_default_enabled,
         enforce_all=features.watermark_enforce_all,
     )
+    if enabled and (sampling_params.beam_width or 1) > 1:
+        raise ValueError("beam search is not supported with watermarking")
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1776,6 +1778,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_args.speculative_algorithm == "DFLASH"
+            and self.server_args.speculative_draft_kv_layout != "shared"
+        ):
+            from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+
+            if obj.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+                sampling_params.top_k = 1
+                sampling_params.top_p = 1.0
+                sampling_params.temperature = 1.0
         if (
             isinstance(obj, GenerateReqInput)
             and self.server_args.speculative_algorithm == "DFLASH"

@@ -61,7 +61,7 @@ from sglang.srt.models.utils import (
     bind_or_assign,
     keeps_no_quant_config,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -1420,6 +1420,10 @@ class DFlashDraftModel(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        if getattr(self, "context_only", False):
+            raise RuntimeError(
+                "A slim DFlash context encoder cannot execute draft decoding"
+            )
         if input_embeds is None:
             if self.embed_tokens is not None:
                 input_embeds = self.embed_tokens(input_ids)
@@ -1469,6 +1473,10 @@ class DFlashDraftModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        if getattr(self, "context_only", False):
+            from sglang.srt.models.dflash_context import load_context_encoder_weights
+
+            return load_context_encoder_weights(self, weights)
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1892,6 +1900,15 @@ class DFlash2DraftModel(DFlashDraftModel):
     """DFlash backbone + candidate selector. Reuses the DFLASH speculative worker."""
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        if (
+            get_disagg().disaggregation_mode == "prefill"
+            and get_spec().speculative_prefill_context_mode == "slim"
+        ):
+            nn.Module.__init__(self)
+            from sglang.srt.models.dflash_context import initialize_context_encoder
+
+            initialize_context_encoder(self, config, quant_config)
+            return
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         # On the ROCm Muse attention path the block attends to its own K/V directly, and the
         # worker rewrites the block's committed cache rows from the target's hidden states

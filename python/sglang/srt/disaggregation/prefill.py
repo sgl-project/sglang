@@ -288,7 +288,10 @@ class PrefillBootstrapQueue:
     ):
         parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
-        self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        # The typed lane owns private regions, independently of target MLA IDs.
+        self.draft_token_to_kv_pool = (
+            None if get_spec().speculative_draft_pd_lane else draft_token_to_kv_pool
+        )
         self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
@@ -470,6 +473,13 @@ class PrefillBootstrapQueue:
             if self.transfer_backend == TransferBackend.ASCEND
             else {}
         )
+        if get_spec().speculative_draft_pd_lane:
+            from sglang.srt.disaggregation.draft_lane_runtime import DraftPDLane
+
+            kv_args.draft_lane = DraftPDLane(
+                self.scheduler.draft_worker, self.scheduler, prefill=True
+            )
+            kv_args.draft_lane_regions = kv_args.draft_lane.registerable_regions()
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
@@ -477,6 +487,8 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
+        if kv_args.draft_lane is not None:
+            kv_args.draft_lane.start()
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1350,6 +1362,7 @@ class SchedulerDisaggregationPrefillMixin:
         Only these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own sender reports.
         """
+        self.disagg_prefill_bootstrap_queue.kv_manager.service_draft_lane()
         if len(self.disagg_prefill_transfer_queue) == 0:
             return []
 

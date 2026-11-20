@@ -295,9 +295,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         _validate_efa_allocator_compatibility(
             enable_custom_mem_pool, custom_mem_pool_type
         )
+        self.draft_lane = args.draft_lane
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.init_engine()
         self.register_buffer_to_engine()
+        if self.draft_lane is not None:
+            self.draft_lane.bind_engine(self)
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
@@ -445,6 +448,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     regions.append((ptr, length))
 
         add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        for ptr, length in self.kv_args.draft_lane_regions:
+            add([ptr], [length])
         add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
@@ -3356,6 +3361,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                if self.draft_lane is not None and self.draft_lane.handle_control(
+                    waiting_req_bytes
+                ):
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -3439,6 +3448,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             while not self._stopped:
                 msg = recv()
                 if msg is None:
+                    continue
+                if self.draft_lane is not None and self.draft_lane.handle_control(msg):
                     continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
@@ -3703,14 +3714,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.get_session_id().encode("ascii"),
             kv_indices.tobytes() if not is_dummy else b"",
             str(aux_index).encode("ascii") if not is_dummy else b"",
-            pack_int_lists(state_indices, "i")
-            if not is_dummy and state_indices
-            else b"",
+            (
+                pack_int_lists(state_indices, "i")
+                if not is_dummy and state_indices
+                else b""
+            ),
             str(required_dst_info_num).encode("ascii"),
             str(decode_prefix_len or 0).encode("ascii"),
-            np.asarray(device_kv_indices, dtype=np.int32).tobytes()
-            if not is_dummy and device_kv_indices is not None
-            else b"",
+            (
+                np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                if not is_dummy and device_kv_indices is not None
+                else b""
+            ),
         ]
 
 

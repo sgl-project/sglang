@@ -625,8 +625,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
         self._independent_cache = None
+        self._context_source_cache = None
+        self._draft_pd_lane = None
         self._cohort = None
         self._independent_kv_mode = get_spec().speculative_draft_kv_layout
+        self._prefill_context_role = (
+            get_spec().speculative_prefill_context_mode != "legacy"
+        )
         from sglang.srt.speculative.dflash_cohort import (
             validate_target_verify_graph_mode,
         )
@@ -641,7 +646,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if get_spec().speculative_draft_cohort_cuda_graph and (
             not is_cuda()
-            or False
+            or self._prefill_context_role
             or self._independent_kv_mode == "shared"
             or get_spec().speculative_draft_cohort_size not in (2, 4)
             or get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
@@ -676,7 +681,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             collapse_cp=True,
         )
-        if get_spec().speculative_draft_cohort_size > 1:
+        if self._prefill_context_role and get_spec().speculative_draft_pd_lane:
+            from sglang.srt.speculative.draft_parallel import (
+                resolve_prefill_context_parallel_layout,
+            )
+
+            self.draft_parallel_layout = resolve_prefill_context_parallel_layout(
+                get_spec().speculative_prefill_context_tp_size
+            )
+        elif get_spec().speculative_draft_cohort_size > 1:
             from sglang.srt.speculative.dflash_cohort import DFlashCohort
 
             self._cohort = DFlashCohort(self, get_spec().speculative_draft_cohort_size)
@@ -801,6 +814,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self._prefill_context_role:
+            self._use_fused_kv_materialize = False
+            self._fused_kv_helper = None
+            self._use_aux_graph = self._aux_overlap = self._aux_pending = False
+            self._aux_stream = self._aux_done = None
+            self._target_logits_processor = None
+            self._tail_graph = False
+            self._megakernel_aux = self._megakernel_accept = self._megakernel_embed = (
+                None
+            )
+            logger.info(
+                "DFLASH prefill context role=%s, tensors=%d, parameter_bytes=%d",
+                get_spec().speculative_prefill_context_mode,
+                len(getattr(self.draft_model, "context_loaded_tensors", [])),
+                sum(
+                    p.numel() * p.element_size() for p in self.draft_model.parameters()
+                ),
+            )
+            return
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
                 "DFLASH Domino requires speculative_num_draft_tokens > 1, "
@@ -1152,6 +1184,16 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         if not self._hosts_draft:
             return
+        if self._prefill_context_role and get_spec().speculative_draft_pd_lane:
+            from sglang.srt.speculative.dflash_independent_cache import (
+                allocate_prefill_context_slab,
+            )
+
+            with draft_tp_context(self.draft_parallel_layout):
+                self._context_source_cache = allocate_prefill_context_slab(
+                    self, req_to_token_pool
+                )
+            return
         if self._independent_kv_mode != "shared":
             from sglang.srt.speculative.dflash_independent_cache import (
                 allocate_independent_draft_cache,
@@ -1249,7 +1291,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         if not self._hosts_draft:
             return
-        if self._cohort is not None or False:
+        if self._cohort is not None or self._prefill_context_role:
             # The target and union-draft capture grids belong to different
             # scopes. CPU PLAN/COMMIT and PD context encoding stay eager.
             with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
@@ -3851,7 +3893,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             from sglang.srt.speculative.dflash_tail import select_eager_phase
 
             select_eager_phase(self, batch)
-        self._validate_phase1_sampling_support(batch)
+        if not self._prefill_context_role:
+            self._validate_phase1_sampling_support(batch)
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
@@ -3940,7 +3983,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             swa_keep_mask = None
             independent_swa_loc = None
-            if self._independent_cache is not None:
+            if self._context_source_cache is not None:
+                draft_cache_loc = self._context_source_cache.locations(
+                    batch.req_pool_indices, positions, ctx_lens
+                )
+            elif self._independent_cache is not None:
                 self._independent_cache.alloc_to_lengths(
                     req_pool_indices_cpu=batch.req_pool_indices.cpu(),
                     target_seq_lens_cpu=torch.tensor(
@@ -3971,16 +4018,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=draft_cache_loc,
                 swa_cache_loc=(
-                    independent_swa_loc
-                    if self._independent_cache is not None
-                    else self._draft_write_ids(
-                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    draft_cache_loc
+                    if self._context_source_cache is not None
+                    else (
+                        independent_swa_loc
+                        if self._independent_cache is not None
+                        else self._draft_write_ids(
+                            iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                        )
                     )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
                 swa_keep_mask=swa_keep_mask,
             )
+
+            if self._draft_pd_lane is not None:
+                self._draft_pd_lane.send_context_chunk(
+                    batch, positions, draft_cache_loc
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -3992,6 +4048,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             return batch_output
 
         # Decode / target-verify stage.
+        if self._prefill_context_role:
+            raise RuntimeError("A DFLASH prefill context worker cannot execute decode")
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
 

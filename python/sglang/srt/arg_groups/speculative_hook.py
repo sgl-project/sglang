@@ -295,6 +295,19 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
 
+def validate_typed_dflash_target_storage(cfg) -> None:
+    if (
+        cfg.dsa_prefill_backend != "flashmla_kv"
+        or cfg.dsa_decode_backend != "flashmla_kv"
+        or cfg.kv_cache_dtype != "fp8_e4m3"
+    ):
+        raise ValueError(
+            "The initial typed DFLASH target lane requires explicit "
+            "flashmla_kv prefill/decode and fp8_e4m3 KV (scaled656); "
+            "raw576 conversion is not implemented"
+        )
+
+
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -305,6 +318,76 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         raise ValueError(
             "Independent DFlash KV and the native draft KV ring are mutually exclusive"
         )
+
+    prefill_context = cfg.speculative_prefill_context_mode != "legacy"
+    if prefill_context:
+        if cfg.disaggregation_mode != "prefill" or cfg.pp_size != 1:
+            raise ValueError(
+                "DFLASH context encoder role currently requires PD prefill with PP1."
+            )
+        if cfg.attn_cp_size > 1 and (
+            not cfg.enable_prefill_cp or cfg.cp_strategy != "interleave"
+        ):
+            raise ValueError(
+                "DFLASH context encoder currently supports interleave prefill CP only."
+            )
+        if cfg.enable_hierarchical_cache or cfg.enable_session_radix_cache:
+            raise ValueError(
+                "DFLASH context encoder prefix component restore is not yet supported."
+            )
+
+    typed_pd = cfg.speculative_draft_pd_lane
+    if typed_pd:
+        validate_typed_dflash_target_storage(cfg)
+        if (
+            cfg.disaggregation_mode not in ("prefill", "decode")
+            or cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError("The typed DFLASH lane requires Mooncake PD serving")
+        if (
+            not cfg.disable_overlap_schedule
+            or not cfg.disable_radix_cache
+            or cfg.pp_size != 1
+        ):
+            raise ValueError(
+                "The initial typed DFLASH lane requires synchronous cold PD and PP1"
+            )
+        if (
+            cfg.enable_hierarchical_cache
+            or cfg.enable_session_radix_cache
+            or cfg.enable_unified_memory
+        ):
+            raise ValueError("Typed DFLASH cache component restore is not implemented")
+        if cfg.speculative_prefill_context_tp_size != 2:
+            raise ValueError("The initial typed DFLASH lane uses context encoder TP2")
+        if cfg.tp_size // (cfg.attn_dp_size * cfg.attn_cp_size) != 1:
+            raise ValueError(
+                "The initial typed DFLASH lane requires target attention TP1"
+            )
+        if cfg.disaggregation_mode == "prefill":
+            if cfg.optimistic_prefill_attempts != 0:
+                raise ValueError(
+                    "Typed DFLASH synchronous slabs require --optimistic-prefill-attempts 0"
+                )
+            if not prefill_context or cfg.attn_cp_size < 2 or cfg.attn_cp_size % 2:
+                raise ValueError(
+                    "Typed DFLASH prefill requires a context role and even CP width"
+                )
+            if (
+                cfg.speculative_draft_kv_layout != "shared"
+                or cfg.chunked_prefill_size <= 0
+            ):
+                raise ValueError(
+                    "Typed DFLASH prefill uses a bounded synchronous context slab"
+                )
+        elif (
+            cfg.speculative_draft_kv_layout != "hybrid"
+            or cfg.speculative_draft_cohort_size not in (2, 4)
+            or cfg.disaggregation_decode_extra_slots != 0
+        ):
+            raise ValueError(
+                "Typed DFLASH decode requires hybrid KV, cohort2/4 and explicit zero extra preallocation slots"
+            )
 
     cohort = cfg.speculative_draft_cohort_size
     if cohort < 1 or cfg.attn_dp_size % cohort:
@@ -324,9 +407,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             raise ValueError(
                 "Independent DFLASH storage requires --max-running-requests."
             )
-        if (cfg.disaggregation_mode != "null") or not cfg.disable_radix_cache:
+        if (
+            cfg.disaggregation_mode != "null" and not typed_pd
+        ) or not cfg.disable_radix_cache:
             raise ValueError(
-                "Independent DFLASH cache requires cold aggregated serving"
+                "Independent DFLASH cache requires cold AGG or the explicit typed PD lane"
             )
         if (
             not cfg.disable_overlap_schedule
@@ -370,9 +455,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         if not cfg.device.startswith("cuda"):
             raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
         # Both greedy projection and the selector borrow the target head.
-        if not cfg.enable_dp_lm_head:
+        if not cfg.enable_dp_lm_head and not prefill_context:
             raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
-        if cfg.attn_cp_size != 1:
+        if cfg.attn_cp_size != 1 and not prefill_context:
             raise ValueError(
                 "DFLASH with dp attention does not support context parallel."
             )

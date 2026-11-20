@@ -354,6 +354,7 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.draft_lane = getattr(args, "draft_lane", None)
         self.customized_info_enabled = (
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
         )
@@ -552,6 +553,11 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def service_draft_lane(self):
+        lane = getattr(self, "draft_lane", None)
+        if lane is not None:
+            lane.service()
 
     def prepare_send_state_indices(
         self, state_indices: Optional[List]
@@ -1899,9 +1905,11 @@ class CommonKVManager(BaseKVManager):
             sock.setsockopt(zmq.RECONNECT_IVL, -1)
             sock.setsockopt(
                 zmq.SNDTIMEO,
-                envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000
-                if self.defer_decode_allocation
-                else 30000,
+                (
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000
+                    if self.defer_decode_allocation
+                    else 30000
+                ),
             )
             sock.setsockopt(zmq.LINGER, 0)
             sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
@@ -2816,6 +2824,12 @@ class CommonKVReceiver(BaseKVReceiver):
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        lane = getattr(self.kv_mgr, "draft_lane", None)
+        if status == KVPoll.Success and lane is not None:
+            if not lane.ready(self.bootstrap_room):
+                status = KVPoll.Transferring
+            else:
+                lane.mark_admitted(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
         elif status == KVPoll.Bootstrapping and self._prefill_wait_start is not None:
@@ -3070,6 +3084,19 @@ class CommonKVReceiver(BaseKVReceiver):
         destination: KVTransferDestination = KVTransferDestination.DEVICE,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        lane = getattr(self.kv_mgr, "draft_lane", None)
+        if lane is not None and lane.defer_metadata(
+            self,
+            dict(
+                kv_indices=kv_indices,
+                aux_index=aux_index,
+                state_indices=state_indices,
+                decode_prefix_len=decode_prefix_len,
+                destination=destination,
+                device_kv_indices=device_kv_indices,
+            ),
+        ):
+            return
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,

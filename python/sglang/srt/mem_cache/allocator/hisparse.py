@@ -119,6 +119,25 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    def check_decode_capacity(
+        self, *, num_tokens, tree_cache, requests=None, spec_algorithm=None
+    ):
+        from sglang.srt.runtime_context import get_disagg
+
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and self._spec_scratch_capacity > 0
+        ):
+            # Fixed spec requests reserve their complete hot/extra/scratch
+            # buffers at admission. Every later allocation is logical-only.
+            return self.logical_attn_allocator.available_size() >= num_tokens
+        return super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        )
+
     def get_kvcache(self):
         return self._kvcache
 
