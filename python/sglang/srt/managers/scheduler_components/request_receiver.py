@@ -38,6 +38,9 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     ShmTagExchange,
     get_shm_exchange,
 )
+from sglang.srt.multimodal.processors.gemma4_validation import (
+    validate_gemma4_vision_inputs,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_RECV_REQUESTS,
     SchedulerStageMetricsRecorder,
@@ -268,7 +271,7 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
-        """Materialize SHM features or mark the request failed on every rank."""
+        """Prepare features and reject bad Gemma 4 inputs before model collectives."""
         if not recv_reqs or not self.model_config.is_multimodal:
             return
 
@@ -281,7 +284,13 @@ class SchedulerRequestReceiver:
                 (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
             ):
                 tokenized_reqs.extend(req.batch)
-        if not tokenized_reqs or not has_shm_features(tokenized_reqs):
+        if not tokenized_reqs:
+            return
+        hf_config = getattr(self.model_config, "hf_config", None)
+        validate_vision = getattr(hf_config, "model_type", None) == "gemma4" and any(
+            req.mm_inputs is not None for req in tokenized_reqs
+        )
+        if not validate_vision and not has_shm_features(tokenized_reqs):
             return
 
         # 1. wait until every rank has opened the shared feature segments
@@ -297,13 +306,14 @@ class SchedulerRequestReceiver:
         # 2. materialize independently so one bad VLM request does not stop the loop
         failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
         for index, req in enumerate(tokenized_reqs):
-            if not has_shm_features([req]):
-                continue
             try:
-                unwrap_shm_features(req)
+                if has_shm_features([req]):
+                    unwrap_shm_features(req)
+                if validate_vision:
+                    validate_gemma4_vision_inputs(req.mm_inputs, hf_config)
             except Exception:
                 logger.exception(
-                    "Failed to materialize shared-memory multimodal features for rid=%s",
+                    "Failed to prepare multimodal features for rid=%s",
                     req.rid,
                 )
                 discard_shm_features(req)
@@ -323,11 +333,13 @@ class SchedulerRequestReceiver:
             all_reduce(failed, op=ReduceOp.MAX, group=parallel.tp_group.cpu_group)
 
         error = MMInputsProcessError(
-            "Failed to materialize shared-memory multimodal features on a scheduler rank."
+            "Failed to prepare multimodal features on a scheduler rank."
         )
         for index, req in enumerate(tokenized_reqs):
             if failed[index].item():
                 discard_shm_features(req)
+                for item in getattr(req.mm_inputs, "mm_items", ()):
+                    item.release_transport_proxies()
                 req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
