@@ -35,6 +35,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_kimi_k31,
     is_minimax_sparse,
+    is_q8_raw_fp8_nope_layout,
     is_unlimited_ocr_v2,
     mla_attention_dcp_size,
     uses_compressed_kv_attention,
@@ -1156,6 +1157,7 @@ class KVCacheConfigurator:
                 head_dim=geometry.head_dim,
                 v_head_dim=geometry.v_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
+                is_mxfp8=self.kv_cache_dtype_str == "mxfp8",
             )
         else:
             full_geometry = MHAGeometry(
@@ -1165,6 +1167,7 @@ class KVCacheConfigurator:
                 head_dim=self.model_config.head_dim,
                 v_head_dim=self.model_config.v_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
+                is_mxfp8=self.kv_cache_dtype_str == "mxfp8",
             )
         window = {}
         if has_window:
@@ -1176,6 +1179,7 @@ class KVCacheConfigurator:
                     head_dim=geometry.swa_head_dim,
                     v_head_dim=geometry.swa_v_head_dim,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    is_mxfp8=self.kv_cache_dtype_str == "mxfp8",
                 ),
                 # The window the layers attend over, as the runner resolved it.
                 window=self.sliding_window_size,
@@ -2372,6 +2376,16 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
         from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
+        # NPU mirror of the GPU DSA cache layer split: under prefill CP, swap
+        # in an owned-layers-only pool with owner-broadcast reads.
+        dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = None, 1
+        if is_dsa_model and not self.is_draft_worker:
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = (
+                get_glm_dsa_cp_layer_shard_info(self)
+            )
+
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
         if self.is_draft_worker:
@@ -2416,7 +2430,17 @@ class KVCacheConfigurator:
                     ]
                 ),
             }
-        token_to_kv_pool = NPUMLATokenToKVPool(
+        pool_cls = NPUMLATokenToKVPool
+        pool_kwargs = {}
+        if dsa_cp_layer_shard_rank is not None:
+            from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                LayerSplitNPUMLATokenToKVPool,
+            )
+
+            pool_cls = LayerSplitNPUMLATokenToKVPool
+            pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+            pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+        token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
@@ -2445,6 +2469,7 @@ class KVCacheConfigurator:
             use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
             **dsa_pool_kwargs,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
@@ -3890,11 +3915,16 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
-    # validation requires both consumers to use the same TileLang layout.
+    # CUDA TileLang uses raw FP8 rows without per-block scales. Q8 prefill
+    # shares this layout only for 512-dim NoPE latents with TileLang decode.
     if (
         get_exec().kernel.dsa_prefill_backend == "tilelang"
         and get_exec().kernel.dsa_decode_backend == "tilelang"
+    ) or is_q8_raw_fp8_nope_layout(
+        prefill_backend=get_exec().kernel.dsa_prefill_backend,
+        decode_backend=get_exec().kernel.dsa_decode_backend,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     ):
         return kv_cache_dim
 

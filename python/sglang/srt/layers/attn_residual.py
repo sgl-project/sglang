@@ -25,8 +25,9 @@ import triton.language as tl
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.models.utils import bind_or_assign
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
 
+_is_gfx95 = is_gfx95_supported()
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _SCORE_MAX_BLOCK_H: int = 8192  # one _score_kernel block spans H up to this
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -456,13 +457,21 @@ class AttnResidual:
     One instance lives for one model forward pass.
     """
 
+    # gfx950: a read attn_residual_hip.gather_tail_read staged for the next
+    # forward() of its prefix (a StagedRead).
+    staged = None
+
     def __init__(
         self,
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        *,
+        num_rows: Optional[int] = None,
     ) -> None:
         num_tokens, hidden_size = hidden_states.shape
+        if num_rows is not None:
+            num_tokens = num_rows
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
@@ -509,6 +518,12 @@ class AttnResidual:
                 "a read of every row after a write of this rank's slice of "
                 "them would aggregate stale snapshots"
             )
+        if _is_gfx95 and self.staged is not None:
+            read = self.staged.take(
+                self, hidden_states, prefix_sum, score_proj, rows, write
+            )
+            if read is not None:
+                return read
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:

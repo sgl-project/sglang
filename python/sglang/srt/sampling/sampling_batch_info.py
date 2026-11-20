@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import operator
+import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -13,7 +14,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
@@ -22,9 +23,10 @@ from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_pena
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
 from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
@@ -38,6 +40,49 @@ def _rows_to_device_indices(
     if pin is None:
         pin = is_pin_memory_available(device)
     return torch.tensor(rows, dtype=torch.long, pin_memory=pin).to(
+        device, non_blocking=True
+    )
+
+
+def _rows_with_seed(
+    reqs: List[Req], *, enable_deterministic: bool
+) -> Optional[List[bool]]:
+    """Which rows sample with their request's own seed, outside deterministic mode.
+
+    None when no row does, in deterministic mode (which seeds every row), and under
+    speculative decoding, whose draft graphs have seed buffers only in deterministic
+    mode. A greedy row never draws, so its seed does not count.
+    """
+    if enable_deterministic:
+        return None
+    rows = [
+        r.sampling_params.sampling_seed is not None and r.sampling_params.top_k > 1
+        for r in reqs
+    ]
+    if not any(rows):
+        return None
+    if get_spec().speculative_algorithm is not None:
+        print_warning_once(
+            "sampling_seed is ignored with speculative decoding unless "
+            "--enable-deterministic-inference is set."
+        )
+        return None
+    return rows
+
+
+# TP ranks sample independently, so their filler seeds must match. Every rank builds
+# the same batches, but other code (e.g. tracing) may draw from the global `random`
+# on one rank and not another, which would put the ranks' sequences out of step.
+_FILLER_SEED_RNG = random.Random(0)  # Any constant works; it must match across ranks.
+
+
+def _filler_seed() -> int:
+    # The seeded samplers hash each seed as uint64; any int64 works.
+    return _FILLER_SEED_RNG.getrandbits(63)
+
+
+def _filler_seeds(n: int, device: str) -> torch.Tensor:
+    return torch.tensor([_filler_seed() for _ in range(n)], dtype=torch.int64).to(
         device, non_blocking=True
     )
 
@@ -94,8 +139,10 @@ class SamplingBatchInfo:
     # Custom logit processor
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
-    # Used for deterministic sampling
+    # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
+    # Outside deterministic mode, which rows sample with their own seed; None if none do.
+    rows_with_seed: Optional[List[bool]] = None
 
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
@@ -159,22 +206,21 @@ class SamplingBatchInfo:
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
-        sampling_seed = (
-            torch.tensor(
-                [
-                    (
-                        r.sampling_params.sampling_seed
-                        if r.sampling_params.sampling_seed is not None
-                        else 42
-                    )
-                    for r in reqs
-                ],
-                dtype=torch.int64,
-                pin_memory=_pin,
-            ).to(device, non_blocking=True)
-            if enable_deterministic
-            else None
+        rows_with_seed = _rows_with_seed(
+            reqs, enable_deterministic=enable_deterministic
         )
+        sampling_seed = None
+        if enable_deterministic or rows_with_seed is not None:
+            seeds = []
+            for r in reqs:
+                seed = r.sampling_params.sampling_seed
+                if seed is None:
+                    # A deterministic run defaults to 42; otherwise the row stays random.
+                    seed = 42 if enable_deterministic else _filler_seed()
+                seeds.append(seed)
+            sampling_seed = torch.tensor(seeds, dtype=torch.int64, pin_memory=_pin).to(
+                device, non_blocking=True
+            )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -300,6 +346,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
+            rows_with_seed=rows_with_seed,
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             **_top_k_flags([r.sampling_params.top_k for r in reqs]),
@@ -469,6 +516,13 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
+        if self.rows_with_seed is not None:
+            self.rows_with_seed = [self.rows_with_seed[i] for i in keep_indices]
+            if not any(self.rows_with_seed):
+                # The last seeded row left; go back to the unseeded samplers.
+                self.rows_with_seed = None
+                self.sampling_seed = None
+
         for item in [
             "temperatures",
             "top_ps",
@@ -604,6 +658,16 @@ class SamplingBatchInfo:
             self.sampling_mask_top_ks = (
                 self.sampling_mask_top_ks or [1] * self_len
             ) + (other.sampling_mask_top_ks or [1] * other_len)
+
+        if self.rows_with_seed is not None or other.rows_with_seed is not None:
+            self.rows_with_seed = (self.rows_with_seed or [False] * self_len) + (
+                other.rows_with_seed or [False] * other_len
+            )
+            # Rows of an unseeded side sample with random seeds, as in from_schedule_batch.
+            if self.sampling_seed is None:
+                self.sampling_seed = _filler_seeds(self_len, self.device)
+            if other.sampling_seed is None:
+                other.sampling_seed = _filler_seeds(other_len, self.device)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
