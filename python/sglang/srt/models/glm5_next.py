@@ -99,6 +99,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
     _use_aiter_gfx95,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
@@ -1481,6 +1482,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 return (
                     "Shared experts fusion is not supported when Deepep MoE backend "
                     "is enabled."
+                )
+            # ModelOpt FP4 exclusions are checked per layer above.
+            if (
+                quant_config is not None
+                and quant_config.get_name() != "modelopt_fp4"
+                and quant_blocks_shared_experts_fusion(quant_config)
+            ):
+                return (
+                    "Shared and routed experts have different quantization and "
+                    "cannot share fused expert buffers."
                 )
         else:
             if not _use_aiter_gfx95:
