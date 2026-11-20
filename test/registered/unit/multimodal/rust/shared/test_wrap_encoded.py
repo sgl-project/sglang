@@ -399,6 +399,58 @@ class TestDrainShmOwnership(TestWrapEncodedShm):
         (obj,) = drained
         self.assertEqual(obj.mm_inputs.mm_items[0].identity, item.identity)
 
+    def test_python_fallback_hashes_items_as_the_python_frontend_does(self):
+        """An item the Python processor leaves unhashed must get the identity
+        the Python frontend gives it (bind the processor namespace, then hash),
+        so caches keyed by identity agree across the two servers."""
+        import pickle
+        from types import MethodType
+
+        import torch
+
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.rust_server.multimodal import PythonMmFallback
+
+        def unhashed_item():
+            return MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(2, 3))
+
+        async def process_mm_data_async(**kwargs):
+            return MultimodalProcessorOutput(mm_items=[unhashed_item()])
+
+        processor = SimpleNamespace(
+            processor_fingerprint="sha256:" + "ab" * 32,
+            prefer_tokenized_input=True,
+            process_mm_data_async=process_mm_data_async,
+        )
+        for name in ("_bind_cache_namespaces", "finalize_cache_identities"):
+            method = getattr(BaseMultimodalProcessor, name)
+            setattr(processor, name, MethodType(method, processor))
+        with (
+            patch(
+                "sglang.srt.managers.multimodal_processor.get_mm_processor",
+                return_value=processor,
+            ),
+            patch("sglang.srt.hf_transformers.common.get_tokenizer_from_processor"),
+        ):
+            fallback = PythonMmFallback(
+                server_args=None,
+                model_config=SimpleNamespace(hf_config=None),
+                processor=None,
+                max_req_input_len=16,
+            )
+        try:
+            _, payload = fallback([1, 2], [b"image"], [], [])
+        finally:
+            fallback._loop.call_soon_threadsafe(fallback._loop.stop)
+
+        expected = unhashed_item()
+        expected.bind_processor_fingerprint(processor.processor_fingerprint)
+        expected.set_pad_value()
+        (item,) = pickle.loads(payload).mm_items
+        self.assertEqual(item.identity, expected.identity)
+
     def test_external_wrapper_never_touches_ownership(self):
         """An external package's `_wrap_mm_result` builds stubs from the
         segment names and knows nothing about release/discard. Its segments

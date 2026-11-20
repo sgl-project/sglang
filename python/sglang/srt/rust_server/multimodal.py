@@ -491,9 +491,9 @@ class PythonMmFallback:
         )
         output = asyncio.run_coroutine_threadsafe(coro, self._loop).result()
         # The drain requires a full identity on every item; hash here, off the scheduler loop.
+        self._mm_processor.finalize_cache_identities(output)
         for item in output.mm_items:
             item.set_pad_value()
-        self._mm_processor.finalize_cache_identities(output)
         ids = input_ids if output.input_ids is None else output.input_ids
         return ids, pickle.dumps(output, protocol=pickle.HIGHEST_PROTOCOL)
 
