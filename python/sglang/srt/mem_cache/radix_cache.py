@@ -187,14 +187,96 @@ class RadixKey:
             raise ValueError("RadixKey operations require matching bigram modes")
         if offset < 0 or offset > len(other):
             raise IndexError(f"RadixKey offset out of range: {offset}")
+
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(self._raw_len(), other._raw_len() - offset)
 
-        # Exponential search for the first diverging token: gallop in doubling
-        # windows (one C-level slice compare each), then binary-search the window
-        # holding the divergence -- no per-token Python loop on long shared prefixes.
-        matched_tokens = n
+        len0 = self._raw_len()
+        len1 = other._raw_len()
+
+        if self.is_bigram:
+            max_rows = min(
+                len0 - 1 if len0 > 0 else 0,
+                (len1 - offset) - 1 if len1 > offset else 0,
+            )
+            if max_rows <= 0:
+                return 0
+            if page_size > 1:
+                num_pages = max_rows // page_size
+                lo_page = 0
+                step_pages = 1
+                while lo_page < num_pages:
+                    hi_page = (
+                        lo_page + step_pages
+                        if lo_page + step_pages < num_pages
+                        else num_pages
+                    )
+                    lo_tok = lo_page * page_size
+                    hi_tok = hi_page * page_size + 1
+                    if t0[lo_tok:hi_tok] != t1[offset + lo_tok : offset + hi_tok]:
+                        while hi_page - lo_page > 1:
+                            mid_page = (lo_page + hi_page) // 2
+                            mid_tok = mid_page * page_size + 1
+                            if (
+                                t0[lo_tok:mid_tok]
+                                == t1[offset + lo_tok : offset + mid_tok]
+                            ):
+                                lo_page = mid_page
+                                lo_tok = mid_page * page_size
+                            else:
+                                hi_page = mid_page
+                        return lo_page * page_size
+                    lo_page = hi_page
+                    step_pages *= 2
+                return num_pages * page_size
+
+            n = min(len0, len1 - offset)
+            lo = 0
+            step = 1
+            while lo < n:
+                hi = lo + step if lo + step < n else n
+                if t0[lo:hi] != t1[offset + lo : offset + hi]:
+                    while hi - lo > 1:
+                        mid = (lo + hi) // 2
+                        if t0[lo:mid] == t1[offset + lo : offset + mid]:
+                            lo = mid
+                        else:
+                            hi = mid
+                    return max(0, min(lo - 1, len(self), len(other) - offset))
+                lo = hi
+                step *= 2
+            return max(0, min(n - 1, len(self), len(other) - offset))
+
+        n = min(len0, len1 - offset)
+        if n <= 0:
+            return 0
+
+        if page_size > 1:
+            num_pages = n // page_size
+            lo_page = 0
+            step_pages = 1
+            while lo_page < num_pages:
+                hi_page = (
+                    lo_page + step_pages
+                    if lo_page + step_pages < num_pages
+                    else num_pages
+                )
+                lo_tok = lo_page * page_size
+                hi_tok = hi_page * page_size
+                if t0[lo_tok:hi_tok] != t1[offset + lo_tok : offset + hi_tok]:
+                    while hi_page - lo_page > 1:
+                        mid_page = (lo_page + hi_page) // 2
+                        mid_tok = mid_page * page_size
+                        if t0[lo_tok:mid_tok] == t1[offset + lo_tok : offset + mid_tok]:
+                            lo_page = mid_page
+                            lo_tok = mid_tok
+                        else:
+                            hi_page = mid_page
+                    return lo_page * page_size
+                lo_page = hi_page
+                step_pages *= 2
+            return num_pages * page_size
+
         lo = 0
         step = 1
         while lo < n:
@@ -206,19 +288,10 @@ class RadixKey:
                         lo = mid
                     else:
                         hi = mid
-                matched_tokens = lo
-                break
+                return lo
             lo = hi
             step *= 2
-
-        if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
-            return (matched // page_size) * page_size if page_size > 1 else matched
-
-        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
-        if page_size == 1:
-            return matched_tokens
-        return (matched_tokens // page_size) * page_size
+        return n
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
