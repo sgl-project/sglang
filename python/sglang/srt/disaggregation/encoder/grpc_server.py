@@ -100,7 +100,7 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
         self.server_args = server_args
         info = None
         if (
-            encoder.transfer_backend == "zmq_to_scheduler"
+            encoder.transfer_backend in ("zmq_to_scheduler", "nixl")
             and get_parallel().tp_size == get_parallel().num_dp_ranks == 1
             and encoder.model_type
             in {"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"}
@@ -111,9 +111,12 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
                 tokenizer_path=get_serving().tokenizer_path or model,
                 served_model_name=get_serving().served_model_name or model,
             )
+        nixl_enabled = encoder.transfer_backend == "nixl"
         super().__init__(
             encode=self._stage_ordered_images,
-            send=self._deliver_part,
+            send=None if nixl_enabled else self._deliver_part,
+            describe=self._describe_part if nixl_enabled else None,
+            write=self._write_part if nixl_enabled else None,
             release=self._release_staged_part,
             make_part_id=create_part_req_id,
             info=info,
@@ -162,6 +165,17 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
             )
         return layouts
 
+    def _describe_part(self, part_id):
+        tensor = self.encoder.req_states[part_id].embedding_data.embedding
+        return encoder_pb2.DescribeResponse(
+            shape=tensor.shape, dtype=str(tensor.dtype).removeprefix("torch.")
+        )
+
+    async def _write_part(self, part_id, target):
+        await self.encoder.send_to_destination(
+            self.encoder.req_states[part_id], SendDestination(nixl_target=target)
+        )
+
     async def _deliver_part(self, part_id, receive_url):
         await self.encoder.send_to_destination(
             self.encoder.req_states[part_id],
@@ -181,6 +195,11 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
     async def Encode(
         self, request: encoder_pb2.EncodeRequest, context
     ) -> encoder_pb2.EncodeResponse:
+        if self.encoder.transfer_backend == "nixl":
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "NIXL encoders require Stage/Deliver",
+            )
         try:
             request_dict = {
                 "mm_items": list(request.mm_items),
@@ -276,6 +295,11 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
     async def Send(
         self, request: encoder_pb2.SendRequest, context
     ) -> encoder_pb2.SendResponse:
+        if self.encoder.transfer_backend == "nixl":
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "NIXL encoders require Stage/Deliver",
+            )
         try:
             await self.encoder.send(
                 req_id=request.req_id,
@@ -308,6 +332,11 @@ class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
     async def SchedulerReceiveUrl(
         self, request: encoder_pb2.SchedulerReceiveUrlRequest, context
     ) -> encoder_pb2.SchedulerReceiveUrlResponse:
+        if self.encoder.transfer_backend == "nixl":
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "NIXL encoders require Stage/Deliver",
+            )
         try:
             await self.encoder.register_embedding_destinations(
                 request.req_id,

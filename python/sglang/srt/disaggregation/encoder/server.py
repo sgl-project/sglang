@@ -373,11 +373,12 @@ class ReqState:
 class SendDestination:
     """One normalized destination for exactly one transfer."""
 
-    endpoint: str
+    endpoint: str = ""
     session_id: Optional[str] = None
     buffer_address: Optional[int] = None
     # A staged transfer can target a new PULL socket for every request.
     ephemeral: bool = False
+    nixl_target: bytes = b""
 
     @classmethod
     def from_host_port(
@@ -458,6 +459,21 @@ class MooncakeDelivery(EncoderDelivery):
         mm_data = state.embedding_data
         if mm_data is not None:
             self.encoder._deregister_shared_mr(mm_data)
+
+
+class NixlDelivery(EncoderDelivery):
+    async def send(self, state: ReqState, destination: SendDestination) -> None:
+        from sglang.srt.disaggregation.encoder.nixl import write_embedding
+
+        data = await self.encoder._wait_for_embedding(state)
+        await write_embedding(
+            data.embedding.contiguous(),
+            destination.nixl_target,
+            self.encoder.send_timeout,
+        )
+
+    async def release(self, state: ReqState) -> None:
+        """Each write owns and drains its memory registration inside send()."""
 
 
 class ZmqDelivery(EncoderDelivery):
@@ -719,6 +735,8 @@ class MMEncoder:
                 # Embeddings live here, so registry cleanup uses the common release.
                 meta_registry.on_release = self.release_request
                 meta_registry.sweep_timeout = self.send_timeout
+            elif self.transfer_backend == "nixl":
+                self.delivery = NixlDelivery(self)
             else:
                 self.delivery = ZmqDelivery(
                     self,

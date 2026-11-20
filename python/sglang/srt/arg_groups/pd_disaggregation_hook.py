@@ -352,6 +352,24 @@ def handle_encoder_disaggregation(server_args: Any):
     # Validate model type for encoder disaggregation
     hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
+    if cfg.encoder_transfer_backend == "nixl":
+        if not (
+            (cfg.encoder_only and cfg.grpc_mode)
+            or (cfg.language_only and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get())
+        ):
+            raise ValueError(
+                "--encoder-transfer-backend nixl requires --encoder-only --grpc-mode "
+                "or --language-only with SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
+            )
+        if cfg.tp_size != 1 or cfg.pp_size != 1 or num_dp_ranks_of(cfg) != 1:
+            raise ValueError("Staged NIXL embeddings require TP=PP=DP=1")
+        if model_arch not in {
+            "Qwen2VLForConditionalGeneration",
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+        }:
+            raise ValueError(f"Staged NIXL embeddings do not support {model_arch}")
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(
             server_args,

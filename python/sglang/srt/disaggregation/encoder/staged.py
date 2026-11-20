@@ -27,9 +27,22 @@ class StagedImageService:
     """
 
     def __init__(
-        self, *, encode, send, release, make_part_id, info, stage_timeout, ttl, capacity
+        self,
+        *,
+        encode,
+        send,
+        release,
+        make_part_id,
+        info,
+        stage_timeout,
+        ttl,
+        capacity,
+        describe=None,
+        write=None,
     ):
         self._encode = encode
+        self._describe = describe
+        self._write = write
         self._send = send
         self._release = release
         self._make_part_id = make_part_id
@@ -38,6 +51,7 @@ class StagedImageService:
         self._ttl = ttl
         self._capacity = capacity
         self._active = 0  # includes queued encodes, staged parts and active sends
+        self._writing: dict[str, asyncio.Event] = {}
         self._leases: dict[str, _Lease] = {}
         self._cleanup_tasks: set[asyncio.Task] = set()
 
@@ -50,7 +64,7 @@ class StagedImageService:
         ):
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Staged images require Qwen-VL, zmq_to_scheduler, TP=DP=1 "
+                "Staged images require Qwen-VL, zmq_to_scheduler or nixl, TP=DP=1 "
                 "and positive staging limits",
             )
 
@@ -142,8 +156,8 @@ class StagedImageService:
             lease.expiry.cancel()
             self._start_retirement(lease.transfer.part_id)
 
-    async def Deliver(self, request, context):
-        transfer_id = request.transfer.transfer_id
+    async def _lookup(self, transfer, context):
+        transfer_id = transfer.transfer_id
         lease = self._leases.get(transfer_id)
         # A long synchronous model forward can delay the timer callback. The
         # deadline itself governs a claim even if the callback is still queued.
@@ -157,10 +171,29 @@ class StagedImageService:
             await context.abort(
                 grpc.StatusCode.NOT_FOUND, "transfer expired or consumed"
             )
-        if request.transfer != lease.transfer or not request.receive_url:
+        if transfer != lease.transfer:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "invalid transfer identity"
+            )
+        return lease
+
+    async def Describe(self, request, context):
+        lease = await self._lookup(request.transfer, context)
+        if self._describe is None:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION, "NIXL is not enabled"
+            )
+        return self._describe(lease.transfer.part_id)
+
+    async def Deliver(self, request, context):
+        lease = await self._lookup(request.transfer, context)
+        use_nixl = bool(request.nixl_target)
+        if (use_nixl and (request.receive_url or self._write is None)) or (
+            not use_nixl and (not request.receive_url or self._send is None)
+        ):
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                "invalid transfer identity or receiver",
+                "missing destination or incompatible encoder transfer backend",
             )
         # Claim before the first send. A retry cannot send the same tensor to
         # another scheduler while the first transfer is still in flight.
@@ -172,19 +205,26 @@ class StagedImageService:
             lease.transfer.part_id,
         )
         send_error = None
+        if use_nixl:
+            # A cancelled Deliver may still be draining a posted WRITE. Release
+            # is the receiver's fence for safely deregistering its destination.
+            finished = self._writing[lease.transfer.transfer_id] = asyncio.Event()
         try:
-            # Also bound clients that omit a gRPC deadline. The native ZMQ
-            # sender drains any in-flight zero-copy operation on cancellation,
-            # with its own finite SNDTIMEO and MessageTracker.wait timeout.
-            await asyncio.wait_for(
-                self._send(lease.transfer.part_id, request.receive_url),
-                self._ttl,
-            )
+            # Keep the deadline in the RPC task. A second cancellation must
+            # never detach the native sender before it fences a posted write.
+            async with asyncio.timeout(self._ttl):
+                if use_nixl:
+                    await self._write(lease.transfer.part_id, request.nixl_target)
+                else:
+                    await self._send(lease.transfer.part_id, request.receive_url)
         except asyncio.TimeoutError:
             send_error = "staged image delivery timed out"
         except Exception as exc:
             send_error = str(exc)
         finally:
+            if use_nixl:
+                self._writing.pop(lease.transfer.transfer_id)
+                finished.set()
             await asyncio.shield(self._start_retirement(lease.transfer.part_id))
         if send_error is not None:
             await context.abort(grpc.StatusCode.UNAVAILABLE, send_error)
@@ -200,4 +240,6 @@ class StagedImageService:
         if lease is not None:
             lease.expiry.cancel()
             await asyncio.shield(self._start_retirement(lease.transfer.part_id))
+        elif (finished := self._writing.get(request.transfer_id)) is not None:
+            await finished.wait()
         return pb.ReleaseResponse()

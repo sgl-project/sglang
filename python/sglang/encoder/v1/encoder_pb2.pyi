@@ -66,13 +66,29 @@ class StageResponse(_message.Message):
     transfer: StagedImageTransfer
     def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ...) -> None: ...
 
+class DescribeRequest(_message.Message):
+    __slots__ = ("transfer",)
+    TRANSFER_FIELD_NUMBER: _ClassVar[int]
+    transfer: StagedImageTransfer
+    def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ...) -> None: ...
+
+class DescribeResponse(_message.Message):
+    __slots__ = ("shape", "dtype")
+    SHAPE_FIELD_NUMBER: _ClassVar[int]
+    DTYPE_FIELD_NUMBER: _ClassVar[int]
+    shape: _containers.RepeatedScalarFieldContainer[int]
+    dtype: str
+    def __init__(self, shape: _Optional[_Iterable[int]] = ..., dtype: _Optional[str] = ...) -> None: ...
+
 class DeliverRequest(_message.Message):
-    __slots__ = ("transfer", "receive_url")
+    __slots__ = ("transfer", "receive_url", "nixl_target")
     TRANSFER_FIELD_NUMBER: _ClassVar[int]
     RECEIVE_URL_FIELD_NUMBER: _ClassVar[int]
+    NIXL_TARGET_FIELD_NUMBER: _ClassVar[int]
     transfer: StagedImageTransfer
     receive_url: str
-    def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ..., receive_url: _Optional[str] = ...) -> None: ...
+    nixl_target: bytes
+    def __init__(self, transfer: _Optional[_Union[StagedImageTransfer, _Mapping]] = ..., receive_url: _Optional[str] = ..., nixl_target: _Optional[bytes] = ...) -> None: ...
 
 class DeliverResponse(_message.Message):
     __slots__ = ()

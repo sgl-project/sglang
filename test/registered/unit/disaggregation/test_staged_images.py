@@ -130,6 +130,99 @@ class TestStagedImages(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.backends[i].released, [transfer.part_id])
             self.assertEqual(self.backends[i].parts, {})
 
+    async def test_nixl_description_and_one_shot_destination(self):
+        backend, peer = self.backends[0], self.peers[0]
+        transfer = await self.stage(0)
+        describe = pb.DescribeRequest(transfer=transfer)
+        deliver = pb.DeliverRequest(transfer=transfer, nixl_target=b"registered buffer")
+        await self.error(grpc.StatusCode.FAILED_PRECONDITION, peer.Describe(describe))
+        await self.error(grpc.StatusCode.INVALID_ARGUMENT, peer.Deliver(deliver))
+        backend._send = None
+        backend._write = AsyncMock()
+        descriptor = pb.DescribeResponse(shape=[2, 2048], dtype="bfloat16")
+        backend._describe = lambda part_id: descriptor
+        self.assertEqual(descriptor, await peer.Describe(describe))
+        invalid = pb.DescribeRequest(transfer=transfer)
+        invalid.transfer.images[0].identity = "another image"
+        await self.error(grpc.StatusCode.INVALID_ARGUMENT, peer.Describe(invalid))
+        deliver.receive_url = "127.0.0.1:12345"
+        await self.error(grpc.StatusCode.INVALID_ARGUMENT, peer.Deliver(deliver))
+        deliver.ClearField("receive_url")
+        await peer.Deliver(deliver)
+        backend._write.assert_awaited_once_with(transfer.part_id, b"registered buffer")
+        await self.error(grpc.StatusCode.NOT_FOUND, peer.Deliver(deliver))
+        await self.error(grpc.StatusCode.NOT_FOUND, peer.Describe(describe))
+
+    async def test_release_fences_cancelled_nixl_write(self):
+        backend, peer = self.backends[0], self.peers[0]
+        backend._capacity = 1
+        posted, draining, complete = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def write(rid, descriptor):
+            posted.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                draining.set()
+                await complete.wait()
+
+        backend._send, backend._write = None, write
+        transfer = await self.stage(0)
+        deliver = peer.Deliver(pb.DeliverRequest(transfer=transfer, nixl_target=b"dst"))
+        await asyncio.wait_for(posted.wait(), 2)
+        deliver.cancel()
+        await asyncio.wait_for(draining.wait(), 2)
+        release = peer.Release(pb.ReleaseRequest(transfer_id=transfer.transfer_id))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(release), 0.05)
+        await self.error(grpc.StatusCode.RESOURCE_EXHAUSTED, self.stage(0))
+        complete.set()
+        await asyncio.wait_for(release, 2)
+        await asyncio.wait_for(backend.release_done.wait(), 2)
+        self.assertFalse(backend._writing)
+        self.assertEqual(backend.released, [transfer.part_id])
+
+    async def test_repeated_cancel_cannot_detach_an_active_write(self):
+        backend = self.backends[0]
+        transfer = await self.stage(0)
+        posted, draining, second_cancel, done = (asyncio.Event() for _ in range(4))
+
+        async def write(rid, descriptor):
+            posted.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                draining.set()
+                try:
+                    await done.wait()
+                except asyncio.CancelledError:
+                    second_cancel.set()
+                    await done.wait()
+                raise
+
+        backend._write = write
+        delivery = asyncio.create_task(
+            backend.Deliver(
+                pb.DeliverRequest(transfer=transfer, nixl_target=b"dst"), None
+            )
+        )
+        await asyncio.wait_for(posted.wait(), 2)
+        delivery.cancel()
+        await asyncio.wait_for(draining.wait(), 2)
+        delivery.cancel()
+        await asyncio.wait_for(second_cancel.wait(), 2)
+        release = asyncio.create_task(
+            backend.Release(pb.ReleaseRequest(transfer_id=transfer.transfer_id), None)
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(release.done())
+        self.assertIn(transfer.part_id, backend.parts)
+        done.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await delivery
+        await release
+        self.assertEqual(backend.released, [transfer.part_id])
+
     async def test_expiry_and_capacity(self):
         backend = self.backends[0]
         backend._capacity = 1

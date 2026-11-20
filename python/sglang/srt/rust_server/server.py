@@ -620,10 +620,12 @@ class RustServer:
         # Checked here too, not only in the validation hook: `auto` and a
         # derived DP size resolve after it.
         backend = get_disagg().encoder_transfer_backend
-        if backend != "zmq_to_scheduler":
+        if backend != "zmq_to_scheduler" and not (
+            backend == "nixl" and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+        ):
             raise RuntimeError(
                 "SGLANG_RUST_SERVER=1 with --language-only needs "
-                f"--encoder-transfer-backend zmq_to_scheduler, got {backend}. "
+                f"--encoder-transfer-backend zmq_to_scheduler or nixl with external handoff, got {backend}. "
                 "Unset SGLANG_RUST_SERVER to serve it."
             )
         if get_parallel().num_dp_ranks > 1:

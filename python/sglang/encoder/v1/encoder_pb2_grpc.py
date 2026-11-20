@@ -61,6 +61,11 @@ class SglangEncoderStub:
                 request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageRequest.SerializeToString,
                 response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageResponse.FromString,
                 _registered_method=True)
+        self.Describe = channel.unary_unary(
+                '/sglang.grpc.encoder.SglangEncoder/Describe',
+                request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DescribeRequest.SerializeToString,
+                response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DescribeResponse.FromString,
+                _registered_method=True)
         self.Deliver = channel.unary_unary(
                 '/sglang.grpc.encoder.SglangEncoder/Deliver',
                 request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverRequest.SerializeToString,
@@ -101,13 +106,19 @@ class SglangEncoderServicer:
 
     def GetEncoderInfo(self, request, context):
         """Two-phase image handoff for an external router. Stage does not require
-        a receiver. Deliver transfers the already-staged buffer over native ZMQ.
+        a receiver. For NIXL, Describe sizes the language worker's destination.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def Stage(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Describe(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -152,6 +163,11 @@ def add_SglangEncoderServicer_to_server(servicer, server):
                     servicer.Stage,
                     request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageRequest.FromString,
                     response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageResponse.SerializeToString,
+            ),
+            'Describe': grpc.unary_unary_rpc_method_handler(
+                    servicer.Describe,
+                    request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DescribeRequest.FromString,
+                    response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DescribeResponse.SerializeToString,
             ),
             'Deliver': grpc.unary_unary_rpc_method_handler(
                     servicer.Deliver,
@@ -301,6 +317,33 @@ class SglangEncoder:
             '/sglang.grpc.encoder.SglangEncoder/Stage',
             sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageRequest.SerializeToString,
             sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Describe(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.encoder.SglangEncoder/Describe',
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.DescribeRequest.SerializeToString,
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.DescribeResponse.FromString,
             options,
             channel_credentials,
             insecure,

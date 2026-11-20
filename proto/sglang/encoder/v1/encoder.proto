@@ -27,9 +27,10 @@ service SglangEncoder {
   rpc SchedulerReceiveUrl(SchedulerReceiveUrlRequest) returns (SchedulerReceiveUrlResponse);
 
   // Two-phase image handoff for an external router. Stage does not require
-  // a receiver. Deliver transfers the already-staged buffer over native ZMQ.
+  // a receiver. For NIXL, Describe sizes the language worker's destination.
   rpc GetEncoderInfo(GetEncoderInfoRequest) returns (GetEncoderInfoResponse);
   rpc Stage(StageRequest) returns (StageResponse);
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
   rpc Deliver(DeliverRequest) returns (DeliverResponse);
   rpc Release(ReleaseRequest) returns (ReleaseResponse);
 }
@@ -57,7 +58,7 @@ message StagedImageTransfer {
   uint32 version = 1;
   string request_id = 2;  // router request, shared by E, P and D
   string transfer_id = 3; // unique on each successful stage attempt
-  string part_id = 4;     // exact EmbeddingData.req_id on ZMQ
+  string part_id = 4;     // exact EmbeddingData.req_id
   uint32 part_idx = 5;
   uint32 num_parts = 6;
   uint32 image_count = 7;
@@ -65,11 +66,19 @@ message StagedImageTransfer {
 }
 
 message StageResponse { StagedImageTransfer transfer = 1; }
+message DescribeRequest { StagedImageTransfer transfer = 1; }
+message DescribeResponse {
+  repeated uint64 shape = 1; // [tokens, hidden dimensions] of the staged part
+  string dtype = 2; // bfloat16, float16 or float32
+}
 message DeliverRequest {
   StagedImageTransfer transfer = 1;
-  string receive_url = 2; // scheduler host:port, IPv6 in brackets
+  // Supply exactly one destination, matching the encoder transfer backend.
+  string receive_url = 2; // ZMQ scheduler host:port, IPv6 in brackets
+  bytes nixl_target = 3; // registered NIXL destination descriptor
 }
 message DeliverResponse {}
+// Release also fences a claimed NIXL write before the receiver frees its memory.
 message ReleaseRequest { string transfer_id = 1; }
 message ReleaseResponse {}
 

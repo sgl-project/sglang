@@ -1,9 +1,15 @@
 """Version 1 of the private, single-receiver image handoff."""
 
+import asyncio
 import re
 from urllib.parse import urlsplit
 
 import msgspec
+
+# Keep one recovery task per ambiguous registered destination until the original
+# write completes or E fences it. The receiver's admission limit bounds this set
+# for each scheduler, including when an encoder remains unreachable.
+_fence_tasks: set[asyncio.Task] = set()
 
 
 class ImageLayout(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -121,6 +127,80 @@ class EncoderHandoff(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
                 ),
                 timeout=timeout,
             )
+
+    async def receive_nixl(self, receiver, shape: tuple[int, int], timeout: float):
+        import grpc
+        import torch
+        from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        transfer = self.native_transfer()
+        async with grpc.aio.insecure_channel(urlsplit(self.peer).netloc) as channel:
+            stub = encoder_pb2_grpc.SglangEncoderStub(channel)
+            spec = await stub.Describe(
+                encoder_pb2.DescribeRequest(transfer=transfer), timeout=timeout
+            )
+            if tuple(spec.shape) != shape:
+                raise ValueError(
+                    "NIXL embedding shape differs from staged image layout/model"
+                )
+            if spec.dtype not in ("bfloat16", "float16", "float32"):
+                raise ValueError(f"unsupported staged embedding dtype: {spec.dtype}")
+            dtype = getattr(torch, spec.dtype)
+            nbytes = shape[0] * shape[1] * dtype.itemsize
+            target = receiver.allocate(nbytes)
+            try:
+                tensor = target.tensor.view(dtype).view(shape)
+                destination = encoder_pb2.DeliverRequest(
+                    transfer=transfer, nixl_target=target.descriptor
+                )
+            except BaseException:
+                target.close()
+                raise
+            try:
+                await stub.Deliver(
+                    destination,
+                    timeout=max(0, deadline - asyncio.get_running_loop().time()),
+                )
+            except BaseException:
+                # A lost Deliver response can leave E writing this memory. Release
+                # retires the transfer and fences any writer that already claimed it.
+                fenced = False
+                try:
+                    await stub.Release(
+                        encoder_pb2.ReleaseRequest(transfer_id=self.transfer_id),
+                        timeout=timeout,
+                    )
+                    fenced = True
+                finally:
+                    if fenced:
+                        target.close()
+                    else:
+                        target.abandon()
+                        task = asyncio.create_task(
+                            self._refence_target(target, timeout)
+                        )
+                        _fence_tasks.add(task)
+                        task.add_done_callback(_fence_tasks.discard)
+                raise
+            target.close()
+            return tensor
+
+    async def _refence_target(self, target, timeout: float):
+        import grpc
+
+        delay = 0.25
+        while not target.reaped():
+            await asyncio.sleep(delay)
+            if target.reaped():
+                return
+            try:
+                await self.release(timeout)
+            except grpc.RpcError:
+                delay = min(delay * 2, 30)
+            else:
+                target.close()
+                return
 
     async def release(self, timeout: float):
         import grpc

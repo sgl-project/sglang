@@ -890,6 +890,8 @@ class WaitingMMRequestBase(ABC):
     TP-consistent status. Subclasses bind the transport.
     """
 
+    needs_recv_socket = True
+
     def __init__(
         self,
         rid: str,
@@ -916,7 +918,7 @@ class WaitingMMRequestBase(ABC):
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
         self.zmq_context = zmq_context or zmq.Context()
-        if embedding_port is None:
+        if embedding_port is None and self.needs_recv_socket:
             self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
                 self.zmq_context, zmq.PULL, host=host_name
             )
@@ -1369,6 +1371,64 @@ class WaitingStagedImage(WaitingZmqRequest):
         if not getattr(self, "_release_submitted", False) and self.registration_runner:
             self._release_submitted = True
             self.registration_runner.submit(self._release_transfer())
+
+
+class WaitingStagedNixlImage(WaitingStagedImage):
+    """Wait for E's NIXL WRITE without blocking the scheduler thread."""
+
+    needs_recv_socket = False
+
+    def __init__(self, *args, nixl_receiver, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nixl_receiver = nixl_receiver
+
+    def send_encode_request(self):
+        handoff = self.recv_req.encoder_handoff
+        merge = self.mm_processor.spatial_merge_size
+        rows = sum(t * (h // merge) * (w // merge) for t, h, w in handoff.grids())
+        vision = self.mm_processor.hf_config.vision_config
+        if self.model_type == "qwen2_vl":
+            width = vision.hidden_size
+        elif getattr(vision, "disable_merger_proj", False):
+            width = vision.hidden_size * merge**2
+        else:
+            width = vision.out_hidden_size
+        width *= 1 + len(getattr(vision, "deepstack_visual_indexes", None) or ())
+        self._start_registration(
+            handoff.receive_nixl(
+                self.nixl_receiver,
+                (rows, width),
+                envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get(),
+            )
+        )
+
+    def _try_recv_mm_data(self):
+        if self.status != WaitingMMRequestStatus.PENDING:
+            return
+        if self.recv_embedding_data is None:
+            future = self.registration_future
+            if future is None or not future.done():
+                return
+            if future.cancelled():
+                self._fail_and_release(
+                    "NIXL embedding receive cancelled", HTTPStatus.BAD_GATEWAY
+                )
+                return
+            try:
+                tensor = future.result()
+                handoff = self.recv_req.encoder_handoff
+                part = EmbeddingData(
+                    self.rid, 1, 0, handoff.grids(), Modality.IMAGE, embedding=tensor
+                )
+                self.recv_embedding_data = _aggregate_embedding_part(
+                    None, part, self.model_type
+                )
+            except Exception as exc:
+                self._fail_and_release(
+                    f"NIXL embedding receive failed: {exc}", HTTPStatus.BAD_GATEWAY
+                )
+                return
+        self._assemble_mm_inputs_from_embeddings()
 
 
 class WaitingZmqRequestGrpc(WaitingZmqRequest):
@@ -1984,13 +2044,28 @@ class MMReceiverBase(ABC):
         self.registration_runner = None
         self.scheduler_embedding_port = None
         self.scheduler_recv_socket = None
-        if (
-            self.encoder_transfer_backend == "zmq_to_scheduler"
-            and scheduler is not None
+        self.nixl_receiver = None
+        if scheduler is not None and self.encoder_transfer_backend in (
+            "zmq_to_scheduler",
+            "nixl",
         ):
             self.registration_runner = _ReceiveRegistrationRunner(
                 f"encoder-receive-registration-{self.tp_rank}"
             )
+        if (
+            scheduler is not None
+            and self.encoder_transfer_backend == "nixl"
+            and get_disagg().disaggregation_mode != "decode"
+        ):
+            from sglang.srt.disaggregation.encoder.nixl import NixlReceiver
+
+            self.nixl_receiver = NixlReceiver(
+                capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get()
+            )
+        if (
+            scheduler is not None
+            and self.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
             (
                 self.scheduler_embedding_port,
                 self.scheduler_recv_socket,
@@ -2045,7 +2120,7 @@ class MMReceiverBase(ABC):
                     self.embedding_pool = None
             if hf_config is not None:
                 self._init_mm_processor(server_args, hf_config)
-        elif self.encoder_transfer_backend == "zmq_to_scheduler":
+        elif self.encoder_transfer_backend in ("zmq_to_scheduler", "nixl"):
             # Unlike mooncake, do NOT apply the default pool size: explicitly
             # set SGLANG_EMBEDDING_POOL_SIZE_MB=<MB> to bound received
             # embeddings on GPU; unset/0 keeps the unpooled CPU receive.
@@ -2421,7 +2496,8 @@ class MMReceiverBase(ABC):
                 # back to ``self.encode_urls`` would only matter if the
                 # tokenizer never set encoder_urls (legacy / static path).
                 handoff = recv_req.encoder_handoff
-                cls = WaitingStagedImage if handoff is not None else waiting_cls
+                cls = waiting_cls
+                transport_kwargs = extra_kwargs
                 encode_urls = (
                     []
                     if handoff is not None
@@ -2448,6 +2524,17 @@ class MMReceiverBase(ABC):
                             recv_req.input_ids = array("q", mm.input_ids)
                             new_recv_reqs.append(recv_req)
                             continue
+                        cls = WaitingStagedImage
+                        if self.encoder_transfer_backend == "nixl":
+                            cls = WaitingStagedNixlImage
+                            transport_kwargs = {
+                                **extra_kwargs,
+                                "nixl_receiver": self.nixl_receiver,
+                            }
+                    elif self.encoder_transfer_backend == "nixl":
+                        raise ValueError(
+                            "NIXL embedding receive requires a staged image handoff"
+                        )
                     waiting_req = cls(
                         rid=recv_req.rid,
                         recv_req=recv_req,
@@ -2465,7 +2552,7 @@ class MMReceiverBase(ABC):
                         embedding_port=None
                         if handoff is not None
                         else self.scheduler_embedding_port,
-                        **extra_kwargs,
+                        **transport_kwargs,
                     )
                     self.waiting_by_rid[waiting_req.rid] = waiting_req
                     waiting_req.send_encode_request()

@@ -240,14 +240,14 @@ class TestEncoderCacheIdentity(CustomTestCase):
 
 class TestStagedNativeTransfer(CustomTestCase):
     @contextmanager
-    def native_encoder(self):
+    def native_encoder(self, backend="zmq_to_scheduler"):
         from sglang.srt.disaggregation.encoder import grpc_server
 
         grids = [[1, 2, 2], [1, 4, 2]]
         tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         enc = MMEncoder.__new__(MMEncoder)
         enc.model_type = "qwen3_vl"
-        enc.transfer_backend = "zmq_to_scheduler"
+        enc.transfer_backend = backend
         enc.use_mooncake = enc.mm_global_cache_enabled = False
         enc.rank = 0
         enc.profiler = None
@@ -258,7 +258,10 @@ class TestStagedNativeTransfer(CustomTestCase):
         enc.preprocessor.model_type = enc.model_type
         enc.preprocessor.image_processor = SimpleNamespace(merge_size=2)
         enc.send_timeout = 1
-        enc.delivery = encoder_server.ZmqDelivery(enc, cleanup_receive_state=True)
+        if backend == "nixl":
+            enc.delivery = encoder_server.NixlDelivery(enc)
+        else:
+            enc.delivery = encoder_server.ZmqDelivery(enc, cleanup_receive_state=True)
 
         enc._embedding_dims = {Modality.IMAGE: 4}
         enc._embedding_dtype = tensor.dtype
@@ -370,6 +373,41 @@ class TestStagedNativeTransfer(CustomTestCase):
                     with self.assertRaisesRegex(RuntimeError, "delivery failed"):
                         await asyncio.wait_for(svc.Deliver(request, context), 2)
                 self.assertEqual(enc.req_states, {})
+
+        asyncio.run(run())
+
+    def test_nixl_describes_and_writes_the_staged_tensor(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder import nixl
+
+        async def run():
+            with self.native_encoder("nixl") as (svc, enc, _, _, tensor):
+                response = await svc.Stage(
+                    pb.StageRequest(request_id="request", mm_items=["a", "b"]), Mock()
+                )
+                transfer = response.transfer
+                shape = await svc.Describe(
+                    pb.DescribeRequest(transfer=transfer), Mock()
+                )
+                self.assertEqual(tuple(shape.shape), tuple(tensor.shape))
+                self.assertEqual(shape.dtype, "float32")
+                state = enc.req_states[transfer.part_id]
+
+                async def inspect_write(source, descriptor, timeout):
+                    self.assertEqual(state.active_sends, 1)
+                    self.assertEqual(descriptor, b"destination")
+                    self.assertEqual(timeout, enc.send_timeout)
+                    torch.testing.assert_close(source, tensor)
+
+                with patch.object(nixl, "write_embedding", new=inspect_write):
+                    await svc.Deliver(
+                        pb.DeliverRequest(
+                            transfer=transfer, nixl_target=b"destination"
+                        ),
+                        Mock(),
+                    )
+                self.assert_retired(svc, enc, [state])
+                enc._compute_embedding.assert_awaited_once()
 
         asyncio.run(run())
 

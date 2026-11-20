@@ -1,12 +1,13 @@
 """A native Qwen request rebuilt on CPU at P and D after a staged encode."""
 
 import asyncio
+import importlib.util
 import pickle
 import unittest
 from array import array
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import grpc
 import msgspec
@@ -87,7 +88,7 @@ def scheduler(context):
 
 
 @asynccontextmanager
-async def staged_encoder(sock, grids, tensor, identities):
+async def staged_encoder(sock, grids, tensor, identities, writer=None):
     """Only the model forward is represented by a deterministic CPU tensor."""
     calls, held = [], set()
 
@@ -108,6 +109,15 @@ async def staged_encoder(sock, grids, tensor, identities):
         ).copy_without_embedding()
         sock.send_multipart([pickle.dumps(frame), tensor.numpy().tobytes()])
 
+    def describe(part_id):
+        assert part_id in held
+        return pb.DescribeResponse(shape=tensor.shape, dtype="float32")
+
+    async def write(part_id, destination):
+        assert part_id in held
+        calls.append(("write", part_id))
+        await writer(tensor, destination, 3)
+
     async def release(part_id):
         held.remove(part_id)
 
@@ -116,7 +126,9 @@ async def staged_encoder(sock, grids, tensor, identities):
 
     service = Service(
         encode=encode,
-        send=send,
+        send=send if writer is None else None,
+        describe=describe if writer is not None else None,
+        write=write if writer is not None else None,
         release=release,
         make_part_id=receiver.create_part_req_id,
         info=pb.GetEncoderInfoResponse(),
@@ -242,8 +254,66 @@ class TestStagedImageReceiver(unittest.TestCase):
             with self.subTest(fail=fail):
                 asyncio.run(run(fail))
 
+    def test_nixl_uncertain_delivery_keeps_registration_until_fenced(self):
+        async def run(fence_ok):
+            transfer_id = "11" * 16
+            handoff = EncoderHandoff.parse(
+                msgspec.json.encode(
+                    {
+                        "version": 1,
+                        "peer": "grpc://127.0.0.1:1",
+                        "request_id": "r",
+                        "transfer_id": transfer_id,
+                        "part_id": transfer_id + "_local_part_0",
+                        "part_idx": 0,
+                        "num_parts": 1,
+                        "image_count": 1,
+                        "images": [{"t": 1, "h": 2, "w": 2, "identity": "aa" * 32}],
+                    }
+                ),
+                1,
+            )
+            stub = SimpleNamespace(
+                Describe=AsyncMock(
+                    return_value=pb.DescribeResponse(shape=[1, 4], dtype="bfloat16")
+                ),
+                Deliver=AsyncMock(side_effect=RuntimeError("lost Deliver response")),
+                Release=AsyncMock(
+                    side_effect=[None]
+                    if fence_ok
+                    else [grpc.RpcError("lost fence"), None]
+                ),
+            )
+            target = Mock(
+                tensor=torch.empty(8, dtype=torch.uint8), descriptor=b"destination"
+            )
+            target.reaped.return_value = False
+            released = asyncio.Event()
+            target.close.side_effect = released.set
+            rx = Mock()
+            rx.allocate.return_value = target
+            with patch.object(rpc, "SglangEncoderStub", return_value=stub):
+                with self.assertRaisesRegex(ValueError, "shape differs"):
+                    await handoff.receive_nixl(rx, (2, 4), 1)
+                rx.allocate.assert_not_called()
+                with self.assertRaises((RuntimeError, grpc.RpcError)):
+                    await handoff.receive_nixl(rx, (1, 4), 1)
+                if fence_ok:
+                    target.abandon.assert_not_called()
+                    stub.Release.assert_awaited_once()
+                else:
+                    target.close.assert_not_called()
+                    target.abandon.assert_called_once()
+                    await asyncio.wait_for(released.wait(), 2)
+                    self.assertEqual(stub.Release.await_count, 2)
+                target.close.assert_called_once()
+
+        for fenced in (True, False):
+            with self.subTest(fenced=fenced):
+                asyncio.run(run(fenced))
+
     def test_native_part_to_prefill_and_decode_layout_only(self):
-        async def run():
+        async def run(backend):
             prompt = [42, 7, 8, 9, 43, 7, 8, 9, 44]
             grids = [[1, 2, 2], [1, 4, 2]]
             tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -258,7 +328,40 @@ class TestStagedImageReceiver(unittest.TestCase):
             with zmq.Context() as ctx, ctx.socket(zmq.PUSH) as sock:
                 sock.linger = 0
                 rx = scheduler(ctx)
-                async with staged_encoder(sock, grids, tensor, identities) as (
+                use_nixl = backend != "zmq_to_scheduler"
+                rx.encoder_transfer_backend = "nixl" if use_nixl else backend
+                writer = None
+                if use_nixl:
+                    rx.mm_processor.hf_config.vision_config = SimpleNamespace(
+                        out_hidden_size=2, deepstack_visual_indexes=None
+                    )
+                if backend == "nixl-native":
+                    from sglang.srt.disaggregation.encoder.nixl import (
+                        NixlReceiver,
+                        write_embedding,
+                    )
+
+                    rx.nixl_receiver, writer = NixlReceiver(capacity=1), write_embedding
+                elif backend == "nixl-mock":
+                    targets = {}
+
+                    async def writer(source, destination, timeout):
+                        targets[destination].tensor.copy_(
+                            source.view(torch.uint8).flatten()
+                        )
+
+                    def allocate(size):
+                        self.assertEqual(size, tensor.nbytes)
+                        target = SimpleNamespace(
+                            tensor=torch.empty(size, dtype=torch.uint8),
+                            descriptor=b"target",
+                            close=lambda: targets.pop(b"target"),
+                        )
+                        targets[target.descriptor] = target
+                        return target
+
+                    rx.nixl_receiver = SimpleNamespace(allocate=allocate)
+                async with staged_encoder(sock, grids, tensor, identities, writer) as (
                     metadata,
                     calls,
                     held,
@@ -284,17 +387,19 @@ class TestStagedImageReceiver(unittest.TestCase):
                             rx.process_waiting_requests([prefill]), ([], [])
                         )
                         waiting = rx.waiting_by_rid[prefill.rid]
-                        self.assertIsNotNone(waiting.recv_socket)
                         await asyncio.wait_for(waiting.registration_future, 3)
+                        if use_nixl:
+                            self.assertIsNone(waiting.recv_socket)
+                            delivery = ("write", metadata["part_id"])
+                            if backend == "nixl-mock":
+                                self.assertFalse(targets)
+                        else:
+                            self.assertTrue(waiting.recv_socket.poll(2000))
+                            delivery = ("send", f"127.0.0.1:{waiting.embedding_port}")
                         self.assertEqual(
-                            calls,
-                            [
-                                ("encode", ["first", "second"]),
-                                ("send", f"127.0.0.1:{waiting.embedding_port}"),
-                            ],
+                            calls, [("encode", ["first", "second"]), delivery]
                         )
                         self.assertFalse(held)
-                        self.assertTrue(waiting.recv_socket.poll(2000))
                         self.assertEqual(
                             rx.process_waiting_requests([]), ([prefill], [])
                         )
@@ -334,7 +439,12 @@ class TestStagedImageReceiver(unittest.TestCase):
             )
             rust._encoder_dispatcher.send_encode_request.assert_not_called()
 
-        asyncio.run(run())
+        backends = ["zmq_to_scheduler", "nixl-mock"]
+        if importlib.util.find_spec("nixl") is not None:
+            backends.append("nixl-native")
+        for backend in backends:
+            with self.subTest(backend=backend):
+                asyncio.run(run(backend))
 
 
 if __name__ == "__main__":

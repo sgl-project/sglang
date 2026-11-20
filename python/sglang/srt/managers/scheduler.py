@@ -1774,6 +1774,7 @@ class Scheduler(
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
             "zmq_to_scheduler",
             "mooncake",
+            "nixl",
         ]:
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
