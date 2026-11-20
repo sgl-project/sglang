@@ -236,23 +236,20 @@ class QuickAllReduce:
         # before graph capture, and serves each payload with FlyDSL or with its own
         # HIP INT4 kernel. It reads AITER_* variables, the quantization already at
         # import, and AITER_FLY_AR also switches aiter's custom all-reduce, so they
-        # are set only while the dispatcher is imported and built.
+        # are set only while the dispatcher is imported and built. The switch is
+        # opt-in and needs the AITER bundled with the SGLang ROCm image; an AITER
+        # without the dispatcher fails here with its ImportError instead of
+        # silently serving QuickReduce from the HIP kernel.
         with temp_set_env(
             AITER_QUICK_REDUCE_QUANTIZATION=self.qr_quant_level.name,
             AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=self.use_fp16_kernels,
             AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB=qr_max_size // MB,
             AITER_FLY_AR=1,
         ):
-            try:
-                from aiter.dist.device_communicators.quick_all_reduce import (
-                    QuickAllReduce as AiterQuickAllReduce,
-                )
-            except ImportError as e:
-                print_warning_once(
-                    "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter has no "
-                    f"QuickAllReduce dispatcher ({e}); QuickReduce INT4 uses the HIP kernel."
-                )
-                return False
+            from aiter.dist.device_communicators.quick_all_reduce import (
+                QuickAllReduce as AiterQuickAllReduce,
+            )
+
             dispatcher = AiterQuickAllReduce(group=self.group, device=self.device)
         if dispatcher.disabled:
             dispatcher.close()

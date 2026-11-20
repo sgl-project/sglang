@@ -1,6 +1,5 @@
 """Unit tests for srt/distributed/device_communicators/quick_all_reduce.py"""
 
-import logging
 import os
 import sys
 import types
@@ -156,36 +155,25 @@ class TestQuickAllReduceAiterDispatcher(CustomTestCase):
         self.assertFalse(quick_reduce.disabled)
         self.assertIn("QuickAllReduce dispatcher", "\n".join(logs.output))
 
-    def test_missing_dispatcher_falls_back_to_hip_visibly(self):
-        """Without aiter's dispatcher, QuickReduce stays on the HIP kernel, warns once and says so."""
-        print_warning_once.cache_clear()
+    def test_missing_dispatcher_fails_at_init(self):
+        """Opting in with an aiter that has no dispatcher fails loudly instead of using the HIP kernel."""
+        quick_reduce = _make_uninitialized_quick_reduce()
         with (
             patch.dict(sys.modules, {_AITER_QR_MODULE: _aiter_module()}),
             envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.override(True),
             temp_set_env(ROCM_QUICK_REDUCE_QUANTIZATION="INT4"),
             patch(f"{_QR_MODULE}.is_gfx95_supported", return_value=True),
-            patch.object(ops, "init_custom_qr", create=True, return_value=1),
-            patch.object(ops, "qr_max_size", create=True, return_value=2048 * MB),
-            patch.object(ops, "qr_destroy", create=True),
-            patch.object(QuickAllReduce, "create_shared_buffer"),
-            self.assertLogs(level="INFO") as logs,
+            patch.object(ops, "init_custom_qr", create=True) as init_custom_qr,
         ):
-            for _ in range(2):
-                quick_reduce = _make_uninitialized_quick_reduce()
+            with self.assertRaises(ImportError):
                 quick_reduce.init_quick_all_reduce()
-                self.assertIsNone(quick_reduce._flydsl_int4)
-                self.assertFalse(quick_reduce.disabled)
-                quick_reduce.close()
-
-        warnings = [r for r in logs.records if r.levelno == logging.WARNING]
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("uses the HIP kernel", warnings[0].getMessage())
-        activation = [
-            r
-            for r in logs.records
-            if r.getMessage().startswith("QuickReduce INT4 uses the HIP kernel")
-        ]
-        self.assertEqual(len(activation), 2)
+            init_custom_qr.assert_not_called()
+        self.assertIsNone(quick_reduce._flydsl_int4)
+        self.assertTrue(quick_reduce.disabled)
+        self.assertEqual(
+            {key: os.environ.get(key) for key in _AITER_ENV},
+            {key: None for key in _AITER_ENV},
+        )
 
     def test_disabled_dispatcher_falls_back_to_hip(self):
         print_warning_once.cache_clear()
