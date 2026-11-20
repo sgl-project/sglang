@@ -8,7 +8,6 @@ set -euxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 # docker/ci.Dockerfile points this at a fixed path: a job container's HOME changes per job.
-# FlashInfer's own JIT cache must agree, via FLASHINFER_WORKSPACE_BASE.
 CI_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}"
 
 # shellcheck source=scripts/ci/utils/git_clone_with_retry.sh

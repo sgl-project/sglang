@@ -16,11 +16,15 @@ ARG CU_VERSION=cu134
 ARG IS_BLACKWELL=1
 
 # A job container's HOME is per job (/github/home), so everything the install
-# script would keep under HOME lives in /opt instead.
+# script would keep under HOME lives in /opt instead. Compiled kernels get their
+# own directory, empty in the image, so a runner can mount a persistent volume
+# there without hiding anything baked in. Model weights come from the runner's
+# HF_HOME / HF_HUB_CACHE.
 ENV CU_VERSION=${CU_VERSION} \
-    XDG_CACHE_HOME=/opt/sglang-ci/.cache \
-    FLASHINFER_WORKSPACE_BASE=/opt/sglang-ci \
-    TRITON_CACHE_DIR=/opt/sglang-ci/.cache/triton \
+    XDG_CACHE_HOME=/opt/sglang-ci/cache \
+    SGLANG_CACHE_DIR=/opt/sglang-ci/kernels \
+    FLASHINFER_WORKSPACE_BASE=/opt/sglang-ci/kernels \
+    TRITON_CACHE_DIR=/opt/sglang-ci/kernels/triton \
     CARGO_HOME=/opt/sglang-ci/cargo \
     RUSTUP_HOME=/opt/sglang-ci/rustup \
     UV_PYTHON_INSTALL_DIR=/opt/sglang-ci/python
@@ -45,7 +49,8 @@ RUN --mount=type=bind,source=.,target=/sgl-src,rw \
     && IS_BLACKWELL=${IS_BLACKWELL} INSTALL_GDRCOPY=1 LD_LIBRARY_PATH=/tmp/cuda-stub \
         bash scripts/ci/cuda/ci_install_dependency.sh \
     && : > /opt/sglang-ci-py3.12/env.sh \
-    && rm -rf /tmp/cuda-stub "${XDG_CACHE_HOME}/uv" /root/.cache \
+    && rm -rf /tmp/cuda-stub "${XDG_CACHE_HOME}/uv" /root/.cache "${SGLANG_CACHE_DIR}" \
+    && mkdir -p "${SGLANG_CACHE_DIR}" \
     && chgrp -R 0 /opt/sglang-ci /opt/sglang-ci-py3.12 \
     && chmod -R g=u /opt/sglang-ci /opt/sglang-ci-py3.12 \
     && chmod g+w /opt
