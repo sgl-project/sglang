@@ -529,7 +529,7 @@ class Gemma4VisionPooler(nn.Module):
         if isinstance(length, (list, tuple)):
             length = length[0]
         if hidden_states.shape[1] == length:
-            mask = padding_positions
+            mask = ~padding_positions
         else:
             if self.mask_pad_before_pool:
                 hidden_states = hidden_states.masked_fill(
