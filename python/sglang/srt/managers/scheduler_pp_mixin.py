@@ -312,6 +312,7 @@ class SchedulerPPMixin:
             self.disagg_prefill_early_sent_rids = set()
             self.disagg_prefill_early_send_pending = deque()
             self.disagg_prefill_early_send_stats = {"early": 0, "deferred": 0}
+            self.disagg_prefill_deferred_frees = {}
             logger.info(
                 "PP PD prefill: each stage sends a request's last KV chunk when its "
                 "own forward ends (SGLANG_PP_PD_PREFILL_EARLY_SEND)."

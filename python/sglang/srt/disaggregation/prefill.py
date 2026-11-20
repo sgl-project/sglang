@@ -25,7 +25,8 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -681,6 +682,8 @@ class SchedulerDisaggregationPrefillMixin:
     # Rids whose last KV chunk this stage sent when its forward ended
     # (SGLANG_PP_PD_PREFILL_EARLY_SEND); the PP prefill loop sets a real set.
     disagg_prefill_early_sent_rids: frozenset = frozenset()
+    # Their results' checkpoint device frees, held until the transfer ends.
+    disagg_prefill_deferred_frees: Mapping[str, list] = MappingProxyType({})
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -1289,10 +1292,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.batch_result_processor._maybe_collect_customized_info(
                     i, req, logits_output
                 )
-                if self._early_sent_transfer_running(req):
-                    # The checkpoint's dedup may free pages this stage's transfer
-                    # still reads; the release after the transfer publishes them.
-                    self.disagg_prefill_early_send_stats["deferred"] += 1
+                if req.rid in self.disagg_prefill_early_sent_rids:
+                    self._checkpoint_early_sent(req)
                 else:
                     self.checkpoint_disagg_prefill(req)
                 move(
@@ -1517,12 +1518,14 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
+                self._apply_deferred_frees(req)
                 self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                self._apply_deferred_frees(req)
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
@@ -1876,18 +1879,30 @@ class SchedulerDisaggregationPrefillMixin:
         if stats["early"] & (stats["early"] - 1) == 0:  # 1, 2, 4, ... sends
             logger.info(
                 "PP PD prefill early send: %d last chunks sent at forward end; "
-                "%d results deferred their checkpoint to the transfer's end.",
+                "%d results held their checkpoint frees until the transfer's end.",
                 stats["early"],
                 stats["deferred"],
             )
 
-    def _early_sent_transfer_running(self: Scheduler, req: Req) -> bool:
-        """Whether req's last chunk left at forward end and this stage's transfer
-        of it has not ended yet. Never waits."""
-        if req.rid not in self.disagg_prefill_early_sent_rids:
-            return False
-        status = req.disagg_kv_sender.kv_mgr.request_status.get(req.bootstrap_room)
-        return status not in (None, KVPoll.Success, KVPoll.Failed)
+    def _checkpoint_early_sent(self: Scheduler, req: Req) -> None:
+        """Checkpoint a result whose last chunk left at forward end. The transfer
+        may still read pages the checkpoint's dedup frees, so those frees wait for
+        the inflight release. Decided by early-send membership, never by this
+        stage's transfer status, so every PP rank's tree and pools change alike."""
+        self.disagg_prefill_early_send_stats["deferred"] += 1
+        if not isinstance(self.tree_cache, UnifiedRadixCache):
+            return  # The release after the transfer publishes the KV.
+        frees = []
+        with self.tree_cache.defer_device_frees(frees):
+            self.checkpoint_disagg_prefill(req)
+        if frees:
+            self.disagg_prefill_deferred_frees[req.rid] = frees
+
+    def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
+        frees = self.disagg_prefill_deferred_frees.get(req.rid)
+        if frees is not None:
+            del self.disagg_prefill_deferred_frees[req.rid]
+            self.tree_cache.apply_deferred_frees(frees)
 
     def _forget_early_sent_last_chunk(self: Scheduler, req: Req) -> bool:
         """Whether req's last chunk already left at forward end."""
