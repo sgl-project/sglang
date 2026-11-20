@@ -15,9 +15,8 @@ three whole phases; everything else stays SGLang's:
 
 The class pulls worker state on demand, by name, through ``DFlashBinding.pull``:
 only the ``EXPORTS`` it lists in ``exports``. It lists in ``invariants`` the value
-it expects for each ``GUARD`` key it depends on (a frozenset accepts any of its
-members). ``bind_dflash_runtime`` checks both on every TP rank before it builds the
-runtime. A name SGLang does not have raises; a guard value the runtime does not
+it expects for each ``GUARD`` key it depends on. ``bind_dflash_runtime`` checks both
+on every TP rank before it builds the runtime. A name SGLang does not have raises; a guard value the runtime does not
 serve declines it (one warning naming each key), and SGLang's stock round runs.
 """
 
@@ -117,10 +116,6 @@ EXPORTS: dict[str, Export] = {
 }
 
 
-def _env_tristate(env) -> Optional[bool]:
-    return env.get() if env.is_set() else None
-
-
 # key -> (where SGLang reads it, how); read at the end of the worker's __init__.
 # parallel/schedule/spec/memory/lora name the runtime_context getters.
 GUARD: dict[str, tuple[str, Callable[[Any], Any]]] = {
@@ -161,9 +156,12 @@ GUARD: dict[str, tuple[str, Callable[[Any], Any]]] = {
         "env",
         lambda w: envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get(),
     ),
-    "defer_plain_gather": (
-        "env, None when unset",
-        lambda w: _env_tristate(envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER),
+    "defer_plain_gather_refused": (
+        "env set to 0",
+        lambda w: (
+            envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.is_set()
+            and not envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
+        ),
     ),
     "info_dump": ("env", lambda w: bool(resolve_enabled_components())),
     "hierarchical_cache": (
@@ -205,10 +203,6 @@ class DFlashBinding:
         return value
 
 
-def _accepts(expected: Any, actual: Any) -> bool:
-    return actual in expected if isinstance(expected, frozenset) else actual == expected
-
-
 def check_dflash_runtime(cls: Any, worker: Any, path: str) -> list[str]:
     """The guard values ``cls`` does not serve here, after raising on an export or
     guard key SGLang lacks. Collective: every TP rank must read the same
@@ -224,7 +218,7 @@ def check_dflash_runtime(cls: Any, worker: Any, path: str) -> list[str]:
     return [
         f"{key} is {actual[key]!r} ({GUARD[key][0]}), expected {expected!r}"
         for key, expected in sorted(cls.invariants.items())
-        if not _accepts(expected, actual[key])
+        if actual[key] != expected
     ]
 
 

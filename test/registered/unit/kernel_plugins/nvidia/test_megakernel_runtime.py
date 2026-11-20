@@ -317,13 +317,13 @@ class TestDFlashBinding(CustomTestCase):
         wrong_tp = type(
             "Runtime",
             (FakeDFlashRuntime,),
-            {"invariants": {"tp_size": frozenset({8, 16}), "block_size": 8}},
+            {"invariants": {"tp_size": 16, "block_size": 8}},
         )
         with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
             self.assertIsNone(self._bind(names, runtime=wrong_tp, block_size=5))
         (warning,) = logs.output
         self.assertRegex(warning, r"does not serve this DFLASH setup \(block_size is 5")
-        self.assertRegex(warning, r"tp_size is 4 .*expected frozenset\(\{8, 16\}\)")
+        self.assertRegex(warning, r"tp_size is 4 .*expected 16")
         self.assertIn("DFlash phases run stock", warning)
         with (
             get_parallel().override(tp_rank=1),
