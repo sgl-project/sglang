@@ -4,7 +4,11 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components import dspark_verify
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    DsparkStepObservers,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -131,6 +135,15 @@ class TestAcceptTpSplit(CustomTestCase):
                 rows_per_request=rows,
             )
             self.assertTrue(torch.equal(got, want_rows))
+
+    def test_block_accept_recording_reads_logits_on_every_rank(self):
+        # Only rank 0 holds the recorder; a peer must still take the full layout.
+        peer = SimpleNamespace(_sts_collect_path=None, _block_accept_recorder=None)
+        reads = DsparkStepObservers.reads_target_logits.fget
+        with envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.override(0):
+            self.assertFalse(reads(peer))
+        with envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.override(10):
+            self.assertTrue(reads(peer))
 
 
 if __name__ == "__main__":
