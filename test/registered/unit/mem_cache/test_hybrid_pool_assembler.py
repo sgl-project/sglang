@@ -5,7 +5,7 @@ import unittest
 from functools import partial
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import msgspec
 import torch
@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1805,15 +1806,36 @@ class TestHicacheMambaSize(CustomTestCase):
                 # One padding slot on top of what 1 GB holds.
                 self.assertEqual(host.size, int(1e9 // (layers * layer_bytes)) + 1)
 
-    def test_pin_warns_only_for_a_model_without_mamba_state(self):
-        """Every HiCache build checks the pin, not only the hybrid stacks."""
+    def test_pin_warns_when_no_mamba_host_pool_was_built(self):
+        """Every HiCache build checks the pin against the host pools that exist,
+        so FlexKV, LMCache and non-hybrid models warn too."""
         logger = kv_cache_builder.logger
+        with_mamba = Mock(
+            spec=UnifiedRadixCache,
+            host_pool_group=SimpleNamespace(entry_map={PoolName.MAMBA: object()}),
+        )
+        without_mamba = Mock(
+            spec=UnifiedRadixCache,
+            host_pool_group=SimpleNamespace(entry_map={PoolName.KV: object()}),
+        )
+        no_group = Mock(spec=UnifiedRadixCache, host_pool_group=None)
         with self._hicache_args(mamba_size=70):
-            with self.assertLogs(logger, "WARNING") as logs:
-                kv_cache_builder._warn_unused_hicache_mamba_size(is_hybrid_ssm=False)
-            self.assertIn("--hicache-mamba-size has no effect", logs.output[0])
-            with self.assertNoLogs(logger, "WARNING"):
-                kv_cache_builder._warn_unused_hicache_mamba_size(is_hybrid_ssm=True)
+            with self.subTest(tree_cache="mamba host pool"):
+                with self.assertNoLogs(logger, "WARNING"):
+                    kv_cache_builder._warn_unused_hicache_mamba_size(
+                        tree_cache=with_mamba
+                    )
+            for name, tree_cache in (
+                ("kv host pool only", without_mamba),
+                ("no host pool group", no_group),
+                ("plain radix cache", object()),
+            ):
+                with self.subTest(tree_cache=name):
+                    with self.assertLogs(logger, "WARNING") as logs:
+                        kv_cache_builder._warn_unused_hicache_mamba_size(
+                            tree_cache=tree_cache
+                        )
+                    self.assertIn("--hicache-mamba-size has no effect", logs.output[0])
 
 
 class TestDeclaredPoolVerification(CustomTestCase):

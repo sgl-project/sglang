@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
@@ -367,11 +368,17 @@ def validate_decode_radix_cache(
         )
 
 
-def _warn_unused_hicache_mamba_size(*, is_hybrid_ssm: bool) -> None:
-    if get_memory().hicache_mamba_size and not is_hybrid_ssm:
+def _warn_unused_hicache_mamba_size(*, tree_cache) -> None:
+    if not get_memory().hicache_mamba_size:
+        return
+    group = (
+        tree_cache.host_pool_group
+        if isinstance(tree_cache, UnifiedRadixCache)
+        else None
+    )
+    if group is None or PoolName.MAMBA not in group.entry_map:
         logger.warning(
-            "--hicache-mamba-size has no effect: this model has no HiCache Mamba "
-            "host pool."
+            "--hicache-mamba-size has no effect: no HiCache Mamba host pool was built."
         )
 
 
@@ -525,7 +532,6 @@ def build_kv_cache(
         tp_rank=parallel.tp_rank,
         tp_group=parallel.tp_group,
     )
-    _warn_unused_hicache_mamba_size(is_hybrid_ssm=is_hybrid_ssm)
     with auto_size_hicache(
         params,
         hicache_draft_plan,
@@ -540,6 +546,8 @@ def build_kv_cache(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
             )
+
+    _warn_unused_hicache_mamba_size(tree_cache=tree_cache)
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):
