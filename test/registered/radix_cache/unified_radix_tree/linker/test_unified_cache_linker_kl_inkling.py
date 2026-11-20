@@ -112,7 +112,7 @@ class TestInklingUnifiedCacheLinkerKL(CustomTestCase):
             cached_tokens = result["meta_info"]["cached_tokens"]
             details = result["meta_info"].get("cached_tokens_details") or {}
             self.assertGreaterEqual(cached_tokens, expected)
-            self.assertEqual(int(details.get("host", 0)), cached_tokens)
+            self.assertEqual(int(details.get("storage", 0)), cached_tokens)
             sequences.append(ids + result["output_ids"])
             logprobs.append(_extract_output_logprobs(result))
 
@@ -168,7 +168,7 @@ class TestInklingUnifiedCacheLinkerMTP(CustomTestCase):
                 details = meta.get("cached_tokens_details") or {}
                 self.assertGreater(meta["cached_tokens"], 0)
                 self.assertEqual(
-                    int(details.get("host" if from_l3 else "device", 0)),
+                    int(details.get("storage" if from_l3 else "device", 0)),
                     meta["cached_tokens"],
                 )
                 turns.append((meta["spec_verify_ct"], result["output_ids"]))
