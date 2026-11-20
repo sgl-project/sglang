@@ -5,8 +5,10 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import msgspec
 import torch
 
+from sglang.srt.managers.overlap_utils import FutureRelayBuffers
 from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
@@ -159,29 +161,58 @@ class TestDeferredCommit(CustomTestCase):
 
 
 class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
-    def _run(self, projected: bool, *, bs=2, ring=False, device="cpu"):
+    def _run(
+        self,
+        projected: bool,
+        *,
+        bs=2,
+        ring=False,
+        device="cpu",
+        fused_tail=False,
+        commits=False,
+        live=None,
+        armed=True,
+    ):
+        """``commits``: also an engram history and the in-graph FutureMap relay;
+        ``live`` rows of ``bs`` are verified (the rest padded)."""
         injector = _Injector()
         if ring:
             injector.swa_ring_size = 8
         deferred_draft_kv = _deferred_draft_kv(injector, device)
         deferred_draft_kv.join_projection = lambda: projected
+        deferred_draft_kv.will_join_projection = lambda: projected
         if ring:
             deferred_draft_kv._one_launch_stage = True
+        if fused_tail:
+            # The fused accept tail stages the commit in its own launch.
+            deferred_draft_kv.stage = lambda **_: self.fail("staged separately")
+        history = torch.arange(8 * 3, device=device).view(8, 3)
         epilogue = DsparkVerifyEpilogue(
             max_bs=MAX_BS,
             verify_num_draft_tokens=STRIDE,
             device=device,
-            tp_sync=SimpleNamespace(sync=lambda site, values: values),
+            tp_sync=SimpleNamespace(
+                sync=lambda site, values: values, enabled=lambda site: False
+            ),
             commit_ctx=CommitInjectCtx(
                 draft_model=None,
                 block_pos_offsets=torch.arange(STRIDE),
                 resolve_pool=lambda: injector.draft_model_runner.token_to_kv_pool,
                 resolve_req_to_token=lambda: None,
                 kv_injector=injector,
+                resolve_engram_hasher=(
+                    (lambda: SimpleNamespace(history=history)) if commits else None
+                ),
             ),
             deferred_draft_kv=deferred_draft_kv,
+            fused_accept_tail=fused_tail,
+            post_fold=commits,
         )
-        epilogue.begin_static_step(bs, armed=True)
+        if commits:
+            epilogue.future_relay = FutureRelayBuffers(req_pool_size=8, device=device)
+            epilogue.future_relay.new_seq_lens.fill_(-1)
+            epilogue.future_relay.output_tokens.fill_(-1)
+        epilogue.begin_static_step(bs if live is None else live, armed=armed)
         torch.manual_seed(0)
         out = SimpleNamespace(
             next_token_logits=torch.randn(bs * STRIDE, VOCAB, device=device),
@@ -197,6 +228,11 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
             positions=torch.arange(bs * STRIDE, device=device),
             req_pool_indices=req_pool_indices,
         )
+        # The target agrees with every draft of request 0 and the first of request 1.
+        drafts = fb.input_ids.view(bs, STRIDE)[:, 1:]
+        for b, num_correct in enumerate((STRIDE - 1, 1)[:bs]):
+            for i in range(num_correct):
+                out.next_token_logits[b * STRIDE + i, drafts[b, i]] = 100.0
         epilogue._static_epilogue(out, fb)
         return injector, deferred_draft_kv, epilogue, bs
 
@@ -234,6 +270,40 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
                 self.assertTrue(
                     torch.equal(deferred_draft_kv.state_slot[: bs * STRIDE], want)
                 )
+
+    @unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")
+    def test_fused_greedy_tail_writes_what_the_separate_launches_write(self):
+        """The fused accept tail's relay scatter, engram history commit and staging
+        leave every buffer as the separate launches do, also with a padded row and
+        in the gate-0 epilogue the verify graph of a sampled step runs."""
+        for bs, live, armed in (
+            (1, 1, True),
+            (2, 2, True),
+            (2, 1, True),
+            (2, 2, False),
+        ):
+            with self.subTest(bs=bs, live=live, armed=armed):
+                written = []
+                for fused in (False, True):
+                    _, kv, epilogue, _ = self._run(
+                        projected=True,
+                        bs=bs,
+                        ring=True,
+                        device=_TRITON_DEVICE,
+                        fused_tail=fused,
+                        commits=True,
+                        live=live,
+                        armed=armed,
+                    )
+                    relay = epilogue.future_relay
+                    written.append(
+                        [kv.cache_loc, kv.positions, kv.commit_lens, kv.state_slot]
+                        + [epilogue.engram_history(), relay.new_seq_lens]
+                        + [relay.output_tokens]
+                        + list(msgspec.structs.astuple(epilogue.read_accept(bs)))
+                    )
+                for i, (separate, fused) in enumerate(zip(*written)):
+                    self.assertTrue(torch.equal(separate, fused), i)
 
 
 @unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")
