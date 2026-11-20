@@ -148,8 +148,12 @@ class TestReceiverControlMessages(CustomTestCase):
         if stub is not None:
             stub.start()
             cls.addClassCleanup(stub.stop)
-        from sglang.srt.disaggregation.mori.conn import MoriKVManager
+        from sglang.srt.disaggregation.mori.conn import (
+            KVArgsRegisterInfo,
+            MoriKVManager,
+        )
 
+        cls.mori_registration_type = KVArgsRegisterInfo
         cls.backends = {
             "mooncake": MooncakeKVManager,
             "nixl": NixlKVManager,
@@ -298,19 +302,30 @@ class TestReceiverControlMessages(CustomTestCase):
                 receiver.kv_mgr.customized_info_enabled = enabled
                 receiver.kv_mgr.exchange_aux_item_lens = exchange
                 expected_frames = list(expected[backend])
-                if backend != "mori":
-                    # aux_item_lens follows aux_ptrs; empty when disabled.
+                # aux_item_lens is empty when disabled. It follows aux_ptrs, or is
+                # the last frame on mori, whose older prefills read frames by index.
+                aux_item_lens = struct.pack("Q", 64) if exchange else b""
+                if backend == "mori":
+                    expected_frames.append(aux_item_lens)
+                else:
                     expected_frames.insert(
-                        expected_frames.index(aux) + 1,
-                        struct.pack("Q", 64) if exchange else b"",
+                        expected_frames.index(aux) + 1, aux_item_lens
                     )
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
                     sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
                 )
-                if backend == "mori":
-                    continue
                 frames = sent[0][1]
+                if backend == "mori":
+                    mori_conn = "sglang.srt.disaggregation.mori.conn"
+                    with (
+                        patch(f"{mori_conn}.EngineDesc.unpack", create=True),
+                        patch(f"{mori_conn}.MemoryDesc.unpack", create=True),
+                    ):
+                        info = self.mori_registration_type.from_zmq(frames[1:])
+                    self.assertEqual(info.dst_aux_item_lens, [64] if exchange else None)
+                    self.assertEqual(info.dst_kv_layer_ids, [7])
+                    continue
                 if backend == "nixl":
                     frames = frames[1:]
                     registration_type = NixlKVArgsRegisterInfo

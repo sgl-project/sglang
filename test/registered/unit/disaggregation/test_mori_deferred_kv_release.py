@@ -325,15 +325,20 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
 
 class TestMoriAuxLayout(CustomTestCase):
-    def test_prefill_refuses_a_decode_with_another_aux_buffer_count(self):
-        """Mori pairs metadata buffers by position and exchanges no item sizes.
-        Where the layout differs across builds, a decode that registered another
-        number of buffers must fail the transfer before any KV is written; only
-        the KV checksum buffer, the last one, may be on one side alone."""
+    def test_prefill_refuses_a_decode_with_another_aux_layout(self):
+        """Mori pairs metadata buffers by position. Where the layout differs
+        across builds, a decode that reports other buffers, or none because its
+        build predates the report, must fail the transfer before any KV is
+        written. A buffer count alone cannot tell: an older decode's KV checksum
+        buffer makes up for the buffer it lacks."""
+        item_lens = [8] * 15 + [64]
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.disaggregation_mode = DisaggregationMode.PREFILL
         manager.transfer_lock = threading.Lock()
-        manager.kv_args = SimpleNamespace(aux_data_ptrs=[0] * 16)
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[0] * 16, aux_item_lens=item_lens
+        )
+        manager.customized_info_enabled = False
         manager.pp_group = SimpleNamespace(is_last_rank=True)
         manager.state_mem_descs = []
         manager.update_status = MagicMock()
@@ -345,12 +350,13 @@ class TestMoriAuxLayout(CustomTestCase):
         )
         manager.transfer_infos = {11: {"decode": info}}
 
-        def submit(num_remote, exchange_aux_item_lens=True):
+        def submit(dst_aux_item_lens, num_remote=16, exchange_aux_item_lens=True):
             manager.exchange_aux_item_lens = exchange_aux_item_lens
             manager.request_status = {11: KVPoll.WaitingForInput}
             manager.decode_kv_args_table = {
                 "decode": SimpleNamespace(
                     dst_aux_mem_descs=[object()] * num_remote,
+                    dst_aux_item_lens=dst_aux_item_lens,
                     requires_dcp_relayout=False,
                 )
             }
@@ -363,18 +369,70 @@ class TestMoriAuxLayout(CustomTestCase):
         with get_context().override_server_args(
             disaggregation_enable_kv_checksum=False
         ):
-            for num_remote in (15, 18):
+            for name, kwargs in (
+                ("older decode, same count", {"dst_aux_item_lens": None}),
+                ("shorter row", {"dst_aux_item_lens": [8] * 14 + [4, 64]}),
+                (
+                    "one buffer fewer",
+                    {"dst_aux_item_lens": item_lens[:15], "num_remote": 15},
+                ),
+                (
+                    "two buffers more",
+                    {"dst_aux_item_lens": item_lens + [64, 64], "num_remote": 18},
+                ),
+            ):
                 with (
-                    self.subTest(num_remote=num_remote),
+                    self.subTest(name=name),
                     self.assertRaisesRegex(ValueError, "layout mismatch"),
                 ):
-                    submit(num_remote)
+                    submit(**kwargs)
                 manager.send_kvcache.assert_not_called()
                 manager.send_aux.assert_not_called()
-            for num_remote, exchange in ((16, True), (17, True), (15, False)):
-                with self.subTest(num_remote=num_remote, exchange=exchange):
-                    submit(num_remote, exchange_aux_item_lens=exchange)
+            for name, kwargs in (
+                ("same layout", {"dst_aux_item_lens": item_lens}),
+                (
+                    "decode adds the KV checksum buffer",
+                    {"dst_aux_item_lens": item_lens + [64], "num_remote": 17},
+                ),
+                (
+                    "nothing exchanged",
+                    {"dst_aux_item_lens": None, "exchange_aux_item_lens": False},
+                ),
+            ):
+                with self.subTest(name=name):
+                    submit(**kwargs)
                     manager.send_aux.assert_called_once()
+
+    def test_rdma_aux_write_lands_on_the_decode_row(self):
+        """A decode may register longer rows than the prefill sends (a larger
+        --disaggregation-max-top-logprobs-num), so the remote offset of a row is
+        the decode's row size times the row index, not the prefill's."""
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.aux_mem_descs = ["src0", "src1"]
+        manager.kv_args = SimpleNamespace(aux_item_lens=[8, 16])
+        manager.engine = MagicMock()
+        manager.engine.batch_write.return_value = []
+        manager._record_submitted_statuses = MagicMock()
+
+        def remote_offsets_and_sizes(dst_aux_item_lens):
+            manager.engine.batch_write.reset_mock()
+            manager.send_aux_rdma(
+                SimpleNamespace(
+                    dst_aux_mem_descs=["dst0", "dst1"],
+                    dst_aux_item_lens=dst_aux_item_lens,
+                ),
+                prefill_aux_index=2,
+                dst_aux_index=3,
+                room=11,
+            )
+            args = manager.engine.batch_write.call_args.args
+            self.assertEqual(args[1], [[16], [32]])
+            return args[3], args[4]
+
+        self.assertEqual(
+            remote_offsets_and_sizes([8, 40]), ([[24], [120]], [[8], [16]])
+        )
+        self.assertEqual(remote_offsets_and_sizes(None), ([[24], [48]], [[8], [16]]))
 
     def test_decode_drops_an_aux_item_longer_than_its_buffer(self):
         """A prefill with another buffer layout sends another buffer's item to this
