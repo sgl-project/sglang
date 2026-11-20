@@ -667,6 +667,9 @@ class SchedulerBatchResultProcessor:
                 batch=batch,
                 prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
+                tail_cuda_graph_replayed=getattr(
+                    result, "tail_cuda_graph_replayed", None
+                ),
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
 

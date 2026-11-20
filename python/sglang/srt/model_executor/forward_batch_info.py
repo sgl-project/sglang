@@ -722,6 +722,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # Host-side verdict for this forward; None when decoder tail graphs are unused.
+    tail_cuda_graph_replayed: Optional[bool] = None
+
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
     # Capture-stable local views, populated only by PrefillCPBCGInput.prepare.
     cp_positions: Optional[torch.Tensor] = None

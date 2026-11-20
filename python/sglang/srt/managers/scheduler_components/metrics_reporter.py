@@ -726,6 +726,7 @@ class SchedulerMetricsReporter:
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
+        tail_cuda_graph_replayed: Optional[bool] = None,
     ):
         if (
             not self.is_stats_logging_rank
@@ -784,6 +785,8 @@ class SchedulerMetricsReporter:
             )
 
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+        if tail_cuda_graph_replayed is not None:
+            msg += f"tail cuda graph: {tail_cuda_graph_replayed}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:

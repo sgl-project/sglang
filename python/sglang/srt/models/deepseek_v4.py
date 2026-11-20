@@ -204,6 +204,7 @@ from sglang.srt.models.deepseek_v4_platform_stage import (
 from sglang.srt.models.deepseek_v4_replay_tail import (
     DecoderReplayTail,
     bcg_tail_kv_store,
+    gather_cp_tail_ids,
     in_replay_tail_graph,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
@@ -1874,7 +1875,8 @@ class MQALayer(MqaAttentionBase):
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         q_rope ([T, H, head_dim]) has its query heads roped by the same launch.
         """
-        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
+        cp = is_cp_active(forward_batch)
+        if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get() and not cp:
             assert q_rope is None
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
@@ -1888,6 +1890,19 @@ class MQALayer(MqaAttentionBase):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        if cp:
+            # Gather raw projected KV in live logical order before the fused
+            # FP32 norm/RoPE/store. Tail graphs execute this in an eager break.
+            assert self.is_dsv41 and q_rope is None
+            kv = cp_materialize_global_token_order(
+                kv.contiguous(), forward_batch, torch.cuda.current_stream()
+            )
+            tail = attn_backend.forward_metadata.late_layer_tail
+            positions = (
+                tail.pos_global
+                if tail is not None
+                else forward_batch.positions[: kv.shape[0]]
+            )
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -2540,6 +2555,10 @@ class MQALayer(MqaAttentionBase):
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
+            elif in_replay_tail_graph():
+                assert not fuse_q_rope
+                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                kv = None
             elif use_cp and not self.is_dsv41:
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 kv = cp_materialize_global_token_order(
@@ -2553,35 +2572,10 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             elif use_cp:
-                # every rank writes the whole chunk's window KV with the fused fp32 store
-                if qkv_a is not None:
-                    kv = qkv_a[..., self.q_lora_rank :]
-                else:
-                    kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
+                # Every rank writes the logical chunk's KV.
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
                 )
-                tail = attn_backend.forward_metadata.late_layer_tail
-                global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
-                get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
-                    layer_id=self.layer_id,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
-                    kv=kv,
-                    kv_weight=self.kv_norm.weight.data,
-                    eps=self.eps,
-                    freqs_cis=self.freqs_cis,
-                    positions=global_positions,
-                )
-                kv = None
-            elif in_replay_tail_graph():
-                assert not fuse_q_rope
-                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
                 kv = None
             else:
                 self._compute_kv_to_cache(
@@ -3989,9 +3983,9 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
-            stage_facts=functools.partial(hc_boundary.stages, config)
-            if _is_cuda
-            else None,
+            stage_facts=(
+                functools.partial(hc_boundary.stages, config) if _is_cuda else None
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4190,6 +4184,9 @@ class DeepseekV4Model(nn.Module):
             and tail.scatter_indices is not None
             and is_in_breakable_cuda_graph()
         )
+        cp_tail_in_graph = (
+            tail is not None and cp_extend and is_in_breakable_cuda_graph()
+        )
         late_dp_counts = None
         saved_dp = None
         if (
@@ -4267,6 +4264,25 @@ class DeepseekV4Model(nn.Module):
                             forward_batch=forward_batch,
                         )
                 # Decode reaches back at most SWA_WINDOW positions.
+                if cp_tail_in_graph:
+                    assert self.decoder_replay_tail is not None
+                    residual, pre, aux = (
+                        self.decoder_replay_tail.run_cp_in_prefill_graph(
+                            state=state,
+                            input_ids=input_ids,
+                            capture_dspark=capture_dspark,
+                            source_kv_layer_id=(
+                                self.late_layer_start
+                                if self.tail_writes_source_kv
+                                else None
+                            ),
+                        )
+                    )
+                    if capture_dspark:
+                        dspark_aux_hidden_states.extend(aux)
+                    residual_batch.clear(forward_batch)
+                    # The bridge has already scattered into the full CP shard.
+                    return residual, pre, None
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
                     # live batch's tail metadata; the gathers below are captured
@@ -4306,7 +4322,10 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
                 if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+                    get_moe_a2a_backend().is_none()
+                    and (
+                        get_parallel().attn_dp_size > 1 or tail.cp_metadata is not None
+                    )
                 ):
                     input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
@@ -4327,6 +4346,10 @@ class DeepseekV4Model(nn.Module):
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
+                if tail.cp_metadata is not None and get_moe_a2a_backend().is_none():
+                    input_ids_global = gather_cp_tail_ids(
+                        input_ids, self.late_layer_vl_routing
+                    )
             if use_tail_graph and tail is None and i == self.late_layer_start:
                 residual, pre, aux = self.decoder_replay_tail.run_idle(
                     state=state,
@@ -4369,7 +4392,11 @@ class DeepseekV4Model(nn.Module):
 
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
-                if tail is not None and i < self.late_layer_start:
+                if (
+                    tail is not None
+                    and i < self.late_layer_start
+                    and not cp_tail_in_graph
+                ):
                     aux = tail.rows(aux)
                 mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
@@ -5164,12 +5191,18 @@ class DeepseekV4ForCausalLM(
         """Gather the model's output layout before logits and DSpark KV injection."""
         tail = self._get_dspark_prefill_tail(forward_batch)
         full_cp_metadata = forward_batch.attn_cp_metadata
+        # CP BCG's eager tail bridge scatters to the original shard. Eager CP
+        # returns compact tail shards and must gather using the tail layout.
+        full_graph_output = (
+            tail is not None and get_attn_backend().forward_metadata.prefill_graph_tail
+        )
         if tail is not None:
             if tail.cp_metadata is None or tail.global_token_indices is None:
                 raise RuntimeError(
                     "CP bounded replay output is missing its tail layout"
                 )
-            forward_batch.attn_cp_metadata = tail.cp_metadata
+            if not full_graph_output:
+                forward_batch.attn_cp_metadata = tail.cp_metadata
         try:
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
@@ -5184,6 +5217,20 @@ class DeepseekV4ForCausalLM(
                 )
         finally:
             forward_batch.attn_cp_metadata = full_cp_metadata
+        # BCG gathers the padded capture bucket using its static CP geometry.
+        # Restore live rows before logits or selecting the compact DSpark tail.
+        num_tokens = forward_batch.input_ids.shape[0]
+        hidden_states = tuple(
+            t[:num_tokens] if t.shape[0] > num_tokens else t for t in hidden_states
+        )
+        if aux_hidden_states is not None and aux_hidden_states.shape[0] > num_tokens:
+            aux_hidden_states = aux_hidden_states[:num_tokens]
+        if full_graph_output:
+            indices = tail.global_token_indices
+            assert indices is not None
+            hidden_states = tuple(t[indices] for t in hidden_states)
+            if aux_hidden_states is not None:
+                aux_hidden_states = aux_hidden_states[indices]
         if self.capture_aux_hidden_states:
             hidden_states = hidden_states, aux_hidden_states
         return self._postprocess_output(

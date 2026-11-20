@@ -716,6 +716,13 @@ class ExecGraph(msgspec.Struct):
             type_parser=parse_cuda_graph_backend_arg,
         ),
     ] = None
+    enable_decoder_tail_cuda_graph: A[
+        bool,
+        "Enable dedicated CUDA graphs for the DeepSeek-V4.1 bounded decoder "
+        "tail. Warm and capture at server startup; replay supported buckets "
+        "during serving. Requires decoder SWA bounded replay. Disabled by "
+        "default and independent of --cuda-graph-backend-prefill.",
+    ] = False
     cuda_graph_max_bs_decode: A[
         Optional[int], "Maximum batch size captured for the decode cuda graph."
     ] = None

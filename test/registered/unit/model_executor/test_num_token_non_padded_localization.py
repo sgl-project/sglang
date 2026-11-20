@@ -29,6 +29,11 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.models.deepseek_v4_replay_tail as replay_tail
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp.interleave import (
+    InterleaveContextParallelMetadata,
+    InterleaveCPStrategy,
+)
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -46,8 +51,10 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
     RowBucketGraphRunner,
+    _Graph,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.models.deepseek_v4_mhc import HcState
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
@@ -532,6 +539,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 tail_layers = replay_tail.DecoderReplayTail.__new__(
                     replay_tail.DecoderReplayTail
                 )
+                tail_layers._startup_warming = False
                 tail_layers.runner = SimpleNamespace(
                     ready=Mock(), warm=True, bucket_rows=lambda n: 8
                 )
@@ -570,6 +578,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                 original_global = batch.global_num_token_non_padded
                 output = torch.tensor([11])
                 tail_layers = SimpleNamespace(
+                    _last_run_replayed=True,
                     runner=SimpleNamespace(warm=True, bucket_rows=lambda n: 8),
                     _can_capture_moe_bound=(
                         replay_tail.DecoderReplayTail._can_capture_moe_bound
@@ -644,6 +653,172 @@ class TestDecoderReplayTailBridge(CustomTestCase):
         tail._write_bridge(key, 4, small, [torch.full((2, 2), 5.0), None])
         self.assertEqual(small[0][:2].tolist(), [[5.0, 5.0]] * 2)
         self.assertEqual(tail._bridge(key, 8)[0][:2].tolist(), [[1.0, 1.0]] * 2)
+
+
+class TestCPDecoderTailGraph(CustomTestCase):
+    def test_cp_plan_uses_global_warm_size_and_supported_moe_transports(self):
+        """CP tail eligibility must include its externally owned MoE count."""
+        with (
+            get_parallel().override(
+                attn_cp_size=4, attn_cp_rank=0, attn_tp_size=1, attn_dp_size=1
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            patch.object(cp_base, "_STRATEGY", InterleaveCPStrategy(cp_size=4)),
+            patch.object(replay_tail, "get_is_capture_mode", return_value=False),
+            patch.object(
+                replay_tail,
+                "get_global_expert_distribution_recorder",
+                return_value=SimpleNamespace(recording=False),
+            ),
+        ):
+            batch = _forward_batch(sharded=False, forward_mode=ForwardMode.EXTEND)
+            cp = InterleaveContextParallelMetadata(
+                per_rank_actual_token=[32] * 4,
+                per_rank_logical_token=[32] * 4,
+                local_index=torch.arange(32),
+                gather_index=torch.arange(128),
+            )
+            batch.attn_cp_metadata = cp
+            tail = SimpleNamespace(positions=torch.arange(32), cp_metadata=cp)
+            layers = replay_tail.DecoderReplayTail(
+                model=None, layer_ids=range(1), row_step=32, max_rows=64
+            )
+            layers.runner._warm = True
+            with patch.object(layers.runner, "ready") as ready:
+                enabled, dp_rows = layers.plan(
+                    tail, forward_batch=batch, num_tokens=2048, tail_in_graph=False
+                )
+            self.assertTrue(enabled)
+            self.assertIsNone(dp_rows)
+            self.assertEqual(ready.call_args.args, (8192,))
+            self.assertIsNot(cp.moe_local_token_count, batch.num_token_non_padded)
+            for backend, tp, dp in (
+                (MoeA2ABackend.DEEPEP, 1, 1),
+                (MoeA2ABackend.MEGAMOE, 2, 1),
+                (MoeA2ABackend.MEGAMOE, 1, 2),
+            ):
+                with (
+                    self.subTest(backend=backend, tp=tp, dp=dp),
+                    get_flags().moe.override(a2a_backend=backend),
+                    get_parallel().override(attn_tp_size=tp, attn_dp_size=dp),
+                ):
+                    self.assertFalse(layers._can_capture_cp_tail(tail))
+
+    def test_cp_replay_refreshes_its_count_without_mutating_the_parent(self):
+        """A bucket must retain its own CP count across new metadata objects."""
+        with (
+            get_parallel().override(
+                attn_cp_size=4, attn_cp_rank=0, attn_tp_size=1, attn_dp_size=1
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            patch.object(cp_base, "_STRATEGY", InterleaveCPStrategy(cp_size=4)),
+        ):
+            batch = _forward_batch(sharded=False, forward_mode=ForwardMode.EXTEND)
+            tail = replay_tail.DecoderReplayTail(
+                model=SimpleNamespace(late_layer_vl_routing=False),
+                layer_ids=range(1),
+                row_step=4,
+                max_rows=8,
+            )
+            tail._startup_capture = True
+            captures = []
+            body_inputs = []
+
+            def layers(state, **kwargs):
+                count = get_forward_context().moe_num_token_non_padded()
+                x = state.streams[:, 0]
+                body_inputs.append((x, count))
+                return x + count, None, []
+
+            def record(body, rows, count, capture_batch, start, free_before):
+                outputs = body()
+                x, bound = body_inputs[-1]
+                # Emulate a recorded kernel's fixed input addresses, not Python
+                # metadata lookup on replay; no CUDA or distributed runtime.
+                graph = SimpleNamespace(replay=lambda: outputs[0].copy_(x + bound))
+                captures.append((rows, bound))
+                return _Graph(graph, count, outputs, (capture_batch,))
+
+            with (
+                forward_context(ForwardContext(attn_backend=None), forward_batch=batch),
+                patch.object(tail, "_layer_stack", side_effect=layers),
+                patch.object(
+                    tail, "_break_context", side_effect=lambda batch: nullcontext()
+                ),
+                patch.object(tail.runner, "_record", side_effect=record),
+                patch.object(torch.cuda, "mem_get_info", return_value=(1, 2)),
+                patch(
+                    "sglang.srt.model_executor.runner.row_bucket_graph_runner.graph_pool_replay_scope",
+                    side_effect=nullcontext,
+                ),
+            ):
+                for step, (physical, logical) in enumerate(
+                    ((6, 5), (3, 0), (3, 2), (6, 6))
+                ):
+                    parent_count = torch.tensor(99, dtype=torch.int32)
+                    metadata = InterleaveContextParallelMetadata(
+                        per_rank_actual_token=[physical] * 4,
+                        per_rank_logical_token=[logical, physical, physical, physical],
+                        local_index=torch.arange(physical),
+                        gather_index=torch.arange(physical * 4),
+                        moe_local_token_count=parent_count,
+                    )
+                    batch.attn_cp_metadata = metadata
+                    x = torch.arange(physical).float() + step * 100
+                    value, _, _ = tail.run(
+                        state=HcState(x[:, None, None]),
+                        positions=torch.arange(physical),
+                        input_ids=torch.arange(physical),
+                        input_ids_global=None,
+                        forward_batch=batch,
+                        capture_dspark=False,
+                    )
+                    torch.testing.assert_close(value, (x + logical)[:, None])
+                    self.assertEqual(value.shape[0], physical)
+                    self.assertIs(batch.attn_cp_metadata, metadata)
+                    self.assertEqual(parent_count.item(), 99)
+                    self.assertEqual(batch.num_token_non_padded.item(), LOCAL)
+                    self.assertEqual(batch.global_num_token_non_padded.item(), GLOBAL)
+                # The same static inputs may serve CP and ordinary prefill,
+                # but their Python branches must have separate recordings.
+                batch.attn_cp_metadata = None
+                x = torch.arange(3).float()
+                value, _, _ = tail.run(
+                    state=HcState(x[:, None, None]),
+                    positions=torch.arange(3),
+                    input_ids=torch.arange(3),
+                    input_ids_global=None,
+                    forward_batch=batch,
+                    capture_dspark=False,
+                )
+                torch.testing.assert_close(value, (x + 3)[:, None])
+                self.assertEqual(len(tail.runner._graphs), 3)
+            self.assertEqual([rows for rows, _ in captures], [8, 4, 4])
+            self.assertEqual(len({count.data_ptr() for _, count in captures}), 3)
+            self.assertTrue(
+                all(
+                    count.data_ptr() != parent_count.data_ptr() for _, count in captures
+                )
+            )
+
+    def test_cp_buckets_preserve_the_global_row_budget(self):
+        """CP4 must capture 32-row windows, not four times their local work."""
+        model = SimpleNamespace(
+            tail_writes_source_kv=True, late_layer_start=20, end_layer=40
+        )
+        with (
+            get_context().override_server_args(
+                tp_size=4, attn_cp_size=4, enable_decoder_tail_cuda_graph=True
+            ),
+            replay_tail.envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(2048),
+            replay_tail.envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+            patch.object(replay_tail, "is_cuda", return_value=True),
+        ):
+            runner = replay_tail.DecoderReplayTail.maybe_create(model).runner
+        self.assertEqual(runner.row_step, 32)
+        self.assertEqual(runner.max_rows, 512)
+        for count, bucket in ((1, 32), (32, 32), (33, 64), (512, 512), (513, None)):
+            self.assertEqual(runner.bucket_rows(count), bucket)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -324,6 +325,17 @@ def execute_prefill_cp_bcg(
             # are packed inside it). Send the rows an eager stage would send,
             # so the next stage may replay or run eagerly on the same shard.
             return _slice_output_rows(local_output, cp_input.eager_local_tokens)
+
+        # Model-owned CP output layouts (DSV4 bounded replay / DSpark) must be
+        # gathered before the generic full-row trimming and logits adapter.
+        postprocess_cp_output = getattr(model, "postprocess_cp_output", None)
+        if postprocess_cp_output is not None:
+            # load_batch prepares CP geometry on the static graph batch only.
+            # Logits still need the live request lengths and token IDs. A view
+            # keeps the caller's raw batch unchanged, including on failures.
+            postprocess_batch = copy.copy(forward_batch)
+            postprocess_batch.attn_cp_metadata = static_forward_batch.attn_cp_metadata
+            return postprocess_cp_output(local_output, postprocess_batch)
 
         local_output = _slice_output_rows(local_output, cp_input.live_local_tokens)
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)

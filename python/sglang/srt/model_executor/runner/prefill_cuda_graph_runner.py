@@ -2533,6 +2533,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch, shared_read_ends = self.load_batch(
                 forward_batch, **kwargs
             )
+            # load_batch may reuse a private graph batch from the previous step.
+            static_forward_batch.tail_cuda_graph_replayed = (
+                forward_batch.tail_cuda_graph_replayed
+            )
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
@@ -2574,4 +2578,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
+            forward_batch.tail_cuda_graph_replayed = (
+                static_forward_batch.tail_cuda_graph_replayed
+            )
             return self._finalize_execute_output(output)

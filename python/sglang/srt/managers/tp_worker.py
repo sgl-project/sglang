@@ -673,6 +673,11 @@ class TpModelWorker(BaseTpWorker):
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+        # Reset even when a caller reuses a ForwardBatch. Snapshot on the result
+        # before overlap scheduling or speculative draft work starts another forward.
+        forward_batch.tail_cuda_graph_replayed = (
+            False if get_exec().features.enable_decoder_swa_bounded_replay else None
+        )
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
@@ -709,6 +714,7 @@ class TpModelWorker(BaseTpWorker):
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
+                tail_cuda_graph_replayed=forward_batch.tail_cuda_graph_replayed,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=merge_relayed_routed_experts(
                     output=out.routed_experts_output, relayed=relayed_routed_experts
@@ -804,6 +810,7 @@ class TpModelWorker(BaseTpWorker):
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
+                tail_cuda_graph_replayed=forward_batch.tail_cuda_graph_replayed,
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=routed_experts_output,
             )
