@@ -301,6 +301,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
         request_rows: Optional[int] = None,
+        window_share_rows: Optional[int] = None,
     ):
         # Token bands share widened virtual pages. A replicated draft carries
         # every token inside its entries; target views select the rank's rows.
@@ -317,6 +318,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         self.arena = arena
         self.roles = roles
+        # Per-rank row share of each window sub-pool;
+        # set only on CUDA without a state sub-pool.
+        self.window_share_rows = window_share_rows
         # Views used by each band's move, zero and copy operations.
         self.views = dict(views)
         # The ends compact lazily, behind the forwards that may still read the
@@ -886,6 +890,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def size_swa(self) -> int:
         return self._size_swa
 
+    def window_share_tokens(self, name: str) -> Optional[int]:
+        if self.window_share_rows is None:
+            return None
+        window = self.window_allocators[name]
+        return self.window_share_rows * window.page_size // window.pool_page_size
+
     @property
     def draft_virtual_id_space(self) -> int:
         owner = self.full_attn_allocator
@@ -1339,6 +1349,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 else None
             ),
         )
+        if (
+            self.window_share_rows is not None
+            and config.swa_max_total_num_tokens is not None
+        ):
+            self.window_share_rows = config.swa_max_total_num_tokens
         self.get_kvcache().size = (
             config.full_max_total_num_tokens
             if self.swa_attn_allocator is None
