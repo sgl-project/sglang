@@ -112,10 +112,10 @@ def _get_allocator_class_from_storage(
     get_allocator_from_storage() sees at instantiation (and falls back to the
     default allocator); tensorcast's SCRATCH transfer mode resolves there too.
     """
-    if allocator_type == "egm":
-        from sglang.srt.mem_cache.pool_host.egm import EgmHostTensorAllocator
+    if allocator_type == "egm_remote":
+        from sglang.srt.mem_cache.pool_host.egm import EgmRemoteTensorAllocator
 
-        return EgmHostTensorAllocator
+        return EgmRemoteTensorAllocator
     if allocator_type == "mooncake":
         # MooncakeHostTensorAllocator.__init__ imports this.
         from mooncake.store import MooncakeHostMemAllocator  # noqa: F401
@@ -191,7 +191,12 @@ def get_allocator_type() -> str:
             raise ValueError(
                 "EGM host allocation does not yet support storage backends"
             )
-        return "egm"
+        if (
+            get_memory().hicache_mem_layout != "layer_first"
+            or get_memory().hicache_io_backend != "kernel"
+        ):
+            raise ValueError("remote EGM requires layer_first layout and kernel I/O")
+        return "egm_remote"
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
@@ -546,9 +551,9 @@ def alloc_with_host_register(
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    from sglang.srt.mem_cache.pool_host.egm import EgmHostTensorAllocator
+    from sglang.srt.mem_cache.pool_host.egm import EgmRemoteTensorAllocator
 
-    if isinstance(allocator, EgmHostTensorAllocator):
+    if isinstance(allocator, EgmRemoteTensorAllocator):
         # VMM already grants device access; cudaHostRegister is for ordinary
         # host allocations and cannot turn them into exportable EGM.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])

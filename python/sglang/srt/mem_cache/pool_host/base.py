@@ -291,10 +291,12 @@ def host_memory_preflight(
     aggregate stack-level checks whose constituent pools bill themselves at
     construction.
     """
-    mapping_lengths = tuple(mapping_lengths)
-    round_lengths = getattr(allocator, "round_mapping_lengths", None)
-    if mapping_lengths and round_lengths is not None:
-        mapping_lengths = round_lengths(mapping_lengths)
+    allocator_cls = allocator if isinstance(allocator, type) else type(allocator)
+    round_lengths = getattr(allocator_cls, "round_mapping_lengths", None)
+    if round_lengths is not None:
+        mapping_lengths = tuple(mapping_lengths)
+        if mapping_lengths:
+            mapping_lengths = round_lengths(mapping_lengths, device)
     available = _host_memory_budget.get()
     if available is not None:
         plain_rem, pool_rem = available
@@ -499,9 +501,20 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         budget_device = self._transfer_device
-        allocation_bytes, available_bytes = host_memory_preflight(
-            self.get_mapping_lengths(), self.allocator, budget_device
-        )
+        from sglang.srt.mem_cache.pool_host.egm import EgmRemoteTensorAllocator
+
+        if isinstance(self.allocator, EgmRemoteTensorAllocator):
+            from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+            allocation_bytes, available_bytes = self.allocator.preflight(
+                self.get_mapping_lengths(),
+                budget_device,
+                supported=type(self) is MHATokenToKVPoolHost,
+            )
+        else:
+            allocation_bytes, available_bytes = host_memory_preflight(
+                self.get_mapping_lengths(), self.allocator, budget_device
+            )
         if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -563,6 +576,14 @@ class HostKVCache(abc.ABC):
                 if buf is not None:
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
+        from sglang.srt.mem_cache.pool_host.egm import EgmRemoteTensorAllocator
+
+        if isinstance(self.allocator, EgmRemoteTensorAllocator):
+            try:
+                self.allocator.close()
+            except Exception:
+                self._destroyed = False
+                raise
 
     # Bytes between strided device KV rows; None (the default, and what a pool
     # built without `_init_device_row_stride` keeps) means packed rows.

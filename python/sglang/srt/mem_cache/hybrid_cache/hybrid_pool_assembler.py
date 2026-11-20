@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
@@ -2599,6 +2600,26 @@ def attach_hybrid_pool_to_unified_cache(
 
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        if envs.SGLANG_HICACHE_EGM.get():
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+            parallel = get_parallel()
+            if (
+                type(kvcache) is not MHATokenToKVPool
+                or kvcache.kv_cache_layout != "nhd"
+                or kvcache.head_dim != kvcache.v_head_dim
+                or set(cache.components) != {ComponentType.FULL}
+                or params.pp_size != 1
+                or params.is_eagle
+                or params.mtp_draft_device_pools
+                or params.sidecar_draft_device_pools
+                or parallel.attn_cp_size != 1
+                or parallel.dcp_size != 1
+            ):
+                raise ValueError(
+                    "remote EGM requires full-attention NHD MHA, PP=1, "
+                    "CP=1 and no draft KV pools"
+                )
         storage = kv_storage_of(
             params.req_to_token_pool, params.token_to_kv_pool_allocator
         )
