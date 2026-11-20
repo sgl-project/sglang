@@ -440,6 +440,7 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
+        self.spec_algorithm = model_runner.spec_algorithm
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -1249,9 +1250,20 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}
         self.draft_extend_cuda_graph_metadata = {}
 
+        self._cuda_graph_max_num_tokens = max_num_tokens
         if kv_indices_buf is None:
+            if (
+                self.spec_algorithm is not None
+                and self.spec_algorithm.is_dflash_family()
+            ):
+                # DFLASH verify is linear (topk=1): each request owns one KV
+                # sequence of <= (max_context_len + 2 * draft_token_num) tokens,
+                # rather than draft_token_num separate sequences.
+                kv_indices_len = max_bs * self.max_context_len + 2 * max_num_tokens
+            else:
+                kv_indices_len = max_num_tokens * self.max_context_len
             cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
+                (kv_indices_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -1283,12 +1295,8 @@ class FlashInferAttnBackend(AttentionBackend):
             if len(self.cuda_graph_kv_indices[i]) > 0:
                 self.cuda_graph_kv_indices[i][0] = 0
 
+        self.cuda_graph_custom_mask = None
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -1330,6 +1338,12 @@ class FlashInferAttnBackend(AttentionBackend):
         # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
         # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
         # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+        if use_custom_mask and self.cuda_graph_custom_mask is None:
+            self.cuda_graph_custom_mask = torch.zeros(
+                (self._cuda_graph_max_num_tokens * self.max_context_len,),
+                dtype=torch.uint8,
+                device="cuda",
+            )
         wrappers = []
         for i in range(self.num_wrappers):
             extra = (

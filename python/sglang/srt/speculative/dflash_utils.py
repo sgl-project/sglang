@@ -1280,6 +1280,7 @@ def build_speculative_verify_target_probs(
                 topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
 
             topk_probs = F.softmax(topk_logits, dim=-1)
+            scaled_logits = None
             if need_top_p:
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
@@ -1298,7 +1299,11 @@ def build_speculative_verify_target_probs(
                     adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
-            target_probs = topk_probs.new_zeros(next_token_logits.shape)
+            if scaled_logits is not None and scaled_logits.dtype == topk_probs.dtype:
+                target_probs = scaled_logits.zero_()
+            else:
+                del scaled_logits
+                target_probs = topk_probs.new_zeros(next_token_logits.shape)
             target_probs.scatter_(1, topk_indices, topk_probs)
             sparse_topk_applied = True
 
