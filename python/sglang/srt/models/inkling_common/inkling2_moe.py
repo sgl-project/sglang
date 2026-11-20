@@ -62,6 +62,10 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 from sglang.srt.runtime_context import (
@@ -1032,6 +1036,13 @@ def _expert_placement(layer_id, num_experts):
     return None if torch.equal(placement, order) else placement
 
 
+def _moe_num_token_non_padded():
+    if not has_forward_context():
+        return None
+    bound = get_forward_context().moe_num_token_non_padded
+    return None if bound is None else bound()
+
+
 class Inkling2MoE(nn.Module):
     def __init__(
         self, config, layer_id, prefix, quant_config: Inkling2QuantConfig | None
@@ -1043,6 +1054,14 @@ class Inkling2MoE(nn.Module):
         ):
             raise ValueError("Inkling2 experts support tensor or expert parallelism")
         placement = _expert_placement(layer_id, config.n_routed_experts)
+        record_mode = get_exec().moe.expert_distribution_recorder_mode
+        # Each rank records only its share of the tokens; per-token rows would not line up.
+        if record_mode == "per_token" and parallel.moe_ep_size > 1:
+            raise ValueError(
+                "Inkling2 under expert parallelism records expert counts with "
+                "--expert-distribution-recorder-mode stat, stat_approx or per_pass."
+            )
+        self.record_experts = record_mode is not None
         self.gate = Inkling2Gate(config, placement=placement)
         checkpoint_prefix = "model." + prefix + ".experts."
         self.experts = Inkling2Experts(
@@ -1051,6 +1070,23 @@ class Inkling2MoE(nn.Module):
             checkpoint_prefix,
             quant_config,
             placement=placement,
+        )
+
+    def _record_experts(self, ids, total_tokens):
+        """Hand the recorder each real token once after it sums the EP ranks: rows
+        past the non-padded count drop out, and replicated rows are split across
+        ranks the way the local MegaMoE input already is."""
+        local = total_tokens is not None
+        start, count = self.experts.mega_token_slice(
+            total_tokens if local else ids.shape[0]
+        )
+        rows = torch.arange(ids.shape[0], device=ids.device) + (start if local else 0)
+        keep = (rows >= start) & (rows < start + count)
+        non_padded = _moe_num_token_non_padded()
+        if non_padded is not None:
+            keep &= rows < non_padded
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=ids.masked_fill(~keep[:, None], -1)
         )
 
     def local_input_rows(self, tokens, combine):
@@ -1065,7 +1101,8 @@ class Inkling2MoE(nn.Module):
         if x.shape[0] == 0:
             return x
         weights, ids = self.gate(x)
-        get_global_expert_distribution_recorder().on_select_experts(topk_ids=ids)
+        if self.record_experts:
+            self._record_experts(ids, total_tokens)
         if total_tokens is not None:
             return self.experts._forward_mega(
                 x, weights, ids, combine, tokens=total_tokens

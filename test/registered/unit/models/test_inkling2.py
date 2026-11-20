@@ -460,12 +460,11 @@ def test_expert_placement_hook_and_rejections(monkeypatch):
                 )
             ),
         )
+        metadata = SimpleNamespace(
+            physical_to_logical_map_cpu=torch.tensor([physical_to_logical])
+        )
         monkeypatch.setattr(
-            moe,
-            "get_global_expert_location_metadata",
-            lambda: SimpleNamespace(
-                physical_to_logical_map_cpu=torch.tensor([physical_to_logical])
-            ),
+            moe, "get_global_expert_location_metadata", lambda: metadata
         )
 
     runtime([0, 1, 2, 3])
@@ -479,6 +478,81 @@ def test_expert_placement_hook_and_rejections(monkeypatch):
     runtime([0, 0, 2, 3])
     with pytest.raises(ValueError, match="exactly once"):
         moe._expert_placement(0, 4)
+
+
+def test_moe_layer_wires_placement_and_records_each_token_once(monkeypatch):
+    """The router and the experts get the same placement, and the recorder sees each
+    real token once over the EP ranks, from replicated rows or this rank's local rows."""
+    placement = torch.tensor([2, 0, 3, 1, 6, 4, 7, 5])
+    metadata = SimpleNamespace(physical_to_logical_map_cpu=placement[None])
+    recorded = []
+    mode = ["stat"]
+    monkeypatch.setattr(
+        moe,
+        "get_exec",
+        lambda: SimpleNamespace(
+            moe=SimpleNamespace(
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                expert_distribution_recorder_mode=mode[0],
+            )
+        ),
+    )
+    monkeypatch.setattr(moe, "get_global_expert_location_metadata", lambda: metadata)
+    monkeypatch.setattr(
+        moe,
+        "get_global_expert_distribution_recorder",
+        lambda: SimpleNamespace(on_select_experts=recorded.append),
+    )
+    monkeypatch.setattr(moe, "_moe_num_token_non_padded", lambda: torch.tensor(13))
+    monkeypatch.setattr(moe.Inkling2Experts, "prepare_routed_exchange", lambda _: None)
+    config = SimpleNamespace(
+        intermediate_size=128,
+        hidden_size=64,
+        mlp_gate_softcap=0,
+        mlp_up_softcap=0,
+        num_experts_per_tok=2,
+        route_scale=8.0,
+        n_routed_experts=8,
+        use_gate_bias=True,
+    )
+    tokens, ep = 16, 4
+    ids = (torch.arange(tokens * 2, dtype=torch.int32) % 8).view(tokens, 2)
+    seen = {"replicated": torch.zeros(tokens, dtype=torch.long)}
+    seen["local"] = seen["replicated"].clone()
+
+    def build(rank):
+        parallel = SimpleNamespace(
+            moe_dp_size=1,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            moe_ep_size=ep,
+            moe_ep_rank=rank,
+        )
+        monkeypatch.setattr(moe, "get_parallel", lambda: parallel)
+        with set_default_torch_dtype(torch.bfloat16):
+            return moe.Inkling2MoE(config, 0, "llm.layers.0.mlp", None)
+
+    for rank in range(ep):
+        layer = build(rank)
+        assert torch.equal(layer.gate.placement, placement)
+        assert torch.equal(
+            layer.experts.local_logical_experts, placement[rank * 2 : rank * 2 + 2]
+        )
+        start, count = layer.experts.mega_token_slice(tokens)
+        recorded.clear()
+        layer._record_experts(ids, None)
+        layer._record_experts(ids[start : start + count], tokens)
+        for name, out, offset in zip(seen, recorded, (0, start)):
+            kept = (out >= 0).all(1)
+            assert torch.equal(kept | (out < 0).all(1), torch.ones_like(kept))
+            assert torch.equal(out[kept], ids[offset : offset + out.shape[0]][kept])
+            seen[name][torch.arange(out.shape[0])[kept] + offset] += 1
+    real = (torch.arange(tokens) < 13).long()
+    assert torch.equal(seen["replicated"], real) and torch.equal(seen["local"], real)
+    mode[0] = "per_token"
+    with pytest.raises(ValueError, match="stat, stat_approx or per_pass"):
+        build(0)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
