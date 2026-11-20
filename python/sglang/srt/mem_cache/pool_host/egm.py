@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
-import socket
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 import torch
 
@@ -135,11 +135,11 @@ class EgmAllocation:
 
 @dataclass
 class _RemoteMapping:
-    address: int
-    size: int
-    owned: EgmAllocation
-    mapped: bool = True
-    reserved: bool = True
+    owned: EgmAllocation | None
+    address: int | None = None
+    size: int = 0
+    handle: object = None
+    mapped: bool = False
 
     def unmap(self):
         from cuda.bindings import driver as drv
@@ -147,12 +147,15 @@ class _RemoteMapping:
         if self.mapped:
             _check(drv.cuMemUnmap(self.address, self.size), "cuMemUnmap(remote EGM)")
             self.mapped = False
-        if self.reserved:
+        if self.address is not None:
             _check(
                 drv.cuMemAddressFree(self.address, self.size),
                 "cuMemAddressFree(remote EGM)",
             )
-            self.reserved = False
+            self.address = None
+        if self.handle is not None:
+            _check(drv.cuMemRelease(self.handle), "cuMemRelease(remote EGM)")
+            self.handle = None
 
 
 class EgmRemoteTensorAllocator(HostTensorAllocator):
@@ -207,7 +210,13 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         error = None
         try:
             _, numa, _ = _allocation_properties(self.device_id)
-            locality = (socket.gethostname(), numa)
+            # boot_id identifies the kernel, including across container UTS namespaces.
+            locality = (
+                Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                numa,
+            )
+            if not locality[0]:
+                raise ValueError("host boot ID is empty")
         except Exception as exc:
             error = repr(exc)
         localities = self._exchange((locality, error))
@@ -279,15 +288,24 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
             descriptor = None
         descriptors = self._exchange((descriptor, error))
         if any(item[1] is not None for item in descriptors):
-            if owned is not None:
-                owned.close()
+            region = _RemoteMapping(owned=owned)
+            self._regions.append(region)
+            release_error = None
+            try:
+                if owned is not None:
+                    owned.close()
+            except Exception as exc:
+                release_error = repr(exc)
+            release_errors = self._exchange(release_error)
+            if not any(item is not None for item in release_errors):
+                self._regions.remove(region)
             raise RuntimeError(
-                f"remote EGM allocation failed: {[x[1] for x in descriptors]}"
+                f"remote EGM allocation failed: {[x[1] for x in descriptors]}; "
+                f"owner release: {release_errors}"
             )
 
-        handle = None
-        va = None
-        mapped = False
+        region = _RemoteMapping(owned=owned)
+        self._regions.append(region)
         error = None
         tensor = None
         peer_size = 0
@@ -297,28 +315,38 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
                 raise ValueError("invalid remote EGM FABRIC handle")
             if not isinstance(peer_size, int) or peer_size < nbytes:
                 raise ValueError("remote EGM allocation is smaller than the pool")
-            handle = _check(
+            region.handle = _check(
                 drv.cuMemImportFromShareableHandle(
                     peer_handle, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
                 ),
                 "cuMemImportFromShareableHandle",
             )
-            va = int(
+            region.size = peer_size
+            region.address = int(
                 _check(
                     drv.cuMemAddressReserve(peer_size, 0, 0, 0), "cuMemAddressReserve"
                 )
             )
-            _check(drv.cuMemMap(va, peer_size, 0, handle, 0), "cuMemMap")
-            mapped = True
+            _check(
+                drv.cuMemMap(region.address, peer_size, 0, region.handle, 0), "cuMemMap"
+            )
+            region.mapped = True
             access = drv.CUmemAccessDesc()
             access.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
             access.location.id = self.device_id
             access.flags = drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-            _check(drv.cuMemSetAccess(va, peer_size, [access], 1), "cuMemSetAccess")
-            _check(drv.cuMemRelease(handle), "cuMemRelease(import)")
-            handle = None
+            _check(
+                drv.cuMemSetAccess(region.address, peer_size, [access], 1),
+                "cuMemSetAccess",
+            )
+            _check(drv.cuMemRelease(region.handle), "cuMemRelease(import)")
+            region.handle = None
             tensor = tensor_from_pointer(
-                va, nbytes, shape=dims, dtype=dtype, device_id=self.device_id
+                region.address,
+                nbytes,
+                shape=dims,
+                dtype=dtype,
+                device_id=self.device_id,
             )
         except Exception as exc:
             error = repr(exc)
@@ -326,24 +354,23 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         if any(item is not None for item in errors):
             cleanup_error = None
             try:
-                if mapped:
-                    _check(drv.cuMemUnmap(va, peer_size), "cuMemUnmap(rollback)")
-                if va is not None:
-                    _check(
-                        drv.cuMemAddressFree(va, peer_size),
-                        "cuMemAddressFree(rollback)",
-                    )
-                if handle is not None:
-                    _check(drv.cuMemRelease(handle), "cuMemRelease(rollback)")
+                region.unmap()
             except Exception as exc:
                 cleanup_error = repr(exc)
             cleanup_errors = self._exchange(cleanup_error)
+            release_error = None
             if not any(item is not None for item in cleanup_errors):
-                owned.close()
+                try:
+                    owned.close()
+                except Exception as exc:
+                    release_error = repr(exc)
+            release_errors = self._exchange(release_error)
+            if not any(item is not None for item in cleanup_errors + release_errors):
+                self._regions.remove(region)
             raise RuntimeError(
-                f"remote EGM import failed: {errors}; rollback: {cleanup_errors}"
+                f"remote EGM import failed: {errors}; rollback: {cleanup_errors}; "
+                f"owner release: {release_errors}"
             )
-        self._regions.append(_RemoteMapping(va, peer_size, owned))
         logger.info("Mapped remote EGM host pool from TP rank %d", 1 - self.rank)
         return tensor
 
@@ -370,7 +397,8 @@ class EgmRemoteTensorAllocator(HostTensorAllocator):
         error = None
         try:
             for region in self._regions:
-                region.owned.close()
+                if region.owned is not None:
+                    region.owned.close()
         except Exception as exc:
             error = repr(exc)
         errors = self._exchange(error)

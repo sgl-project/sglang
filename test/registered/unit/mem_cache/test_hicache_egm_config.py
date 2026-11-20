@@ -15,6 +15,36 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestEgmConfiguration(CustomTestCase):
+    def test_locality_uses_kernel_identity_across_containers(self):
+        group = SimpleNamespace(world_size=2, rank_in_group=0, cpu_group=object())
+        with (
+            patch(
+                "sglang.srt.distributed.parallel_state.get_tp_group", return_value=group
+            ),
+            patch("torch.cuda.current_device", return_value=0),
+            patch.object(egm, "_allocation_properties", return_value=(None, 0, 1024)),
+            patch.object(egm.Path, "read_text", return_value="same-kernel\n"),
+            patch.object(
+                egm.EgmRemoteTensorAllocator,
+                "_exchange",
+                side_effect=lambda local: [local, (("same-kernel", 0), None)],
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "distinct hosts or host NUMA"):
+                egm.EgmRemoteTensorAllocator()
+            for peer in (("same-kernel", 1), ("other-kernel", 0)):
+                with (
+                    self.subTest(peer=peer),
+                    patch.object(
+                        egm.EgmRemoteTensorAllocator,
+                        "_exchange",
+                        side_effect=lambda local: [local, (peer, None)],
+                    ),
+                ):
+                    self.assertIsInstance(
+                        egm.EgmRemoteTensorAllocator(), egm.EgmRemoteTensorAllocator
+                    )
+
     def test_allocator_selection_and_storage_conflict(self):
         with (
             envs.SGLANG_HICACHE_EGM.override(True),

@@ -8,7 +8,7 @@ metatags:
 SGLang HiCache extends the traditional RadixAttention with a three-tier hierarchical KV caching system that dramatically improves performance for long-context and multi-turn conversation scenarios. By intelligently managing KV caches across GPU memory, host memory, and external storage backends, HiCache addresses the fundamental capacity bottleneck that limits cache hit rates in conventional systems.
 
 <Note>
-L1 and L2 are private to a single inference instance; only L3 can be shared. Host memory cannot be pooled across instances or across hosts, not even for two instances on the same node. Raising `--hicache-ratio` or `--hicache-size` only enlarges the instance's own private L2. Cross-instance reuse is the job of L3, which needs `--hicache-storage-backend` and a backend configured for the scope you want: the `file` backend defaults to the node-local `/tmp/hicache`, whereas `mooncake`, `hf3fs`, `nixl` and `aibrix` reach cluster scope when every instance shares the same namespace. See [Tier Sharing Scope](/docs/advanced_features/hicache_design#tier-sharing-scope).
+L1 and L2 are private to a single inference instance; only L3 can be shared across instances. By default, L2 uses local host memory. The remote EGM option below places an instance's private L2 in a TP peer's Grace memory, including on another host in the same fabric. Raising `--hicache-ratio` or `--hicache-size` enlarges the instance's own private L2. Cross-instance reuse is the job of L3, which needs `--hicache-storage-backend` and a backend configured for the scope you want: the `file` backend defaults to the node-local `/tmp/hicache`, whereas `mooncake`, `hf3fs`, `nixl` and `aibrix` reach cluster scope when every instance shares the same namespace. See [Tier Sharing Scope](/docs/advanced_features/hicache_design#tier-sharing-scope).
 </Note>
 
 ## Configuration Guidelines
@@ -23,6 +23,8 @@ HiCache enabled. Each TP rank keeps its own logical L2 pages in the other
 rank's Grace memory and accesses them through a CUDA FABRIC mapping. Select
 GPUs attached to different host NUMA nodes when running on one machine; a
 multi-node deployment requires both workers in the same IMEX fabric domain.
+Workers identify their host by Linux kernel boot ID, which must be readable from
+`/proc/sys/kernel/random/boot_id`.
 The current path supports matching full-attention MHA pools without an L3
 storage backend. The worker's current CUDA device must match its KV pool.
 The default host allocator remains in use when the option is unset.

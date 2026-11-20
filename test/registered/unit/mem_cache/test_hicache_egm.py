@@ -2,6 +2,7 @@
 
 import ctypes
 import socket
+import threading
 import unittest
 from array import array
 from contextlib import nullcontext
@@ -16,7 +17,7 @@ import torch.multiprocessing as mp
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=180, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=220, stage="base-c", runner_config="4-gpu-gb300")
 
 
 def _worker(rank, port, scenario, devices):
@@ -85,7 +86,7 @@ def _worker(rank, port, scenario, devices):
                 else:
                     raise AssertionError("expected synchronized pool preflight failure")
                 return
-            if scenario not in ("transfer", "transfer_page16"):
+            if scenario not in ("transfer", "transfer_page16", "controller"):
                 pool = egm.EgmRemoteTensorAllocator()
                 if scenario == "preflight":
                     target = f"cuda:{devices[1]}"
@@ -126,6 +127,68 @@ def _worker(rank, port, scenario, devices):
                             raise AssertionError("expected peer allocation failure")
                     assert not pool._regions
                     pool.close()
+                    return
+                if scenario == "allocation_rollback_retry":
+                    original = egm.EgmAllocation
+                    failure = (
+                        patch.object(
+                            egm,
+                            "EgmAllocation",
+                            side_effect=RuntimeError("injected owner failure"),
+                        )
+                        if rank == 0
+                        else patch.object(
+                            original,
+                            "close",
+                            side_effect=RuntimeError("injected owner release failure"),
+                        )
+                    )
+                    with failure:
+                        try:
+                            pool.allocate((2, 2, 33, 2, 64), torch.float16, "cpu")
+                        except RuntimeError as exc:
+                            assert "remote EGM allocation failed" in str(exc)
+                            assert "injected owner release failure" in str(exc)
+                        else:
+                            raise AssertionError(
+                                "expected allocation and release failure"
+                            )
+                    assert len(pool._regions) == 1
+                    owner = pool._regions[0].owned
+                    assert (owner is None) == (rank == 0)
+                    pool.close()
+                    if owner is not None:
+                        assert owner.handle is None and owner.address is None
+                    assert not pool._regions
+                    return
+                if scenario == "rollback_retry":
+                    from cuda.bindings import driver as drv
+
+                    if rank == 0:
+                        failure = patch.object(
+                            drv,
+                            "cuMemUnmap",
+                            return_value=(drv.CUresult.CUDA_ERROR_INVALID_VALUE,),
+                        )
+                    else:
+                        failure = patch.object(
+                            drv,
+                            "cuMemImportFromShareableHandle",
+                            return_value=(drv.CUresult.CUDA_ERROR_INVALID_HANDLE,),
+                        )
+                    with failure:
+                        try:
+                            pool.allocate((2, 2, 33, 2, 64), torch.float16, "cpu")
+                        except RuntimeError as exc:
+                            assert "remote EGM import failed" in str(exc)
+                        else:
+                            raise AssertionError("expected import and rollback failure")
+                    assert len(pool._regions) == 1
+                    owner = pool._regions[0].owned
+                    assert owner.handle is not None
+                    pool.close()
+                    assert owner.handle is None and owner.address is None
+                    assert not pool._regions
                     return
                 if scenario in ("import", "descriptor"):
                     from cuda.bindings import driver as drv
@@ -270,6 +333,60 @@ def _worker(rank, port, scenario, devices):
                 assert torch.equal(physical[kind, layer, peer_slots], want)
         match = cache.match_prefix(MatchPrefixParams(key=key))
         assert match.host_hit_length == token_count
+        if scenario == "controller":
+            from sglang.srt.mem_cache.hicache_storage import PoolName
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+                HybridCacheController,
+            )
+            from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+
+            group = HostPoolGroup(
+                [PoolEntry(PoolName.KV, host, device, lambda layer: layer)]
+            )
+            controller = HybridCacheController(
+                token_to_kv_pool_allocator=allocator,
+                mem_pool_host=group,
+                page_size=page_size,
+                tp_group=dist.group.WORLD,
+                load_cache_event=threading.Event(),
+                io_backend="kernel",
+            )
+            cache.host_pool_group = group
+            cache.cache_controller = controller
+            cache.load_back_threshold = 0
+            assert cache.load_back(match.best_match_node)
+            fence = torch.cuda.Stream()
+            with torch.cuda.stream(fence):
+                torch.cuda._sleep(1_000_000_000)
+            controller.load_fence_stream = fence
+            cache.ready_to_load_host_cache()
+            ack = controller.ack_load_queue[0]
+            assert not ack.finish_event.query(), "expected an unfinished transfer"
+            cache.loading_check(finish_count=0)
+            assert (
+                cache.tree_core.get_component_host_lock_ref(
+                    match.best_match_node, ComponentType.FULL
+                )
+                > 0
+            )
+            assert cache.evict_host(token_count) == 0
+            ack.finish_event.synchronize()
+            cache.loading_check(finish_count=1)
+            assert (
+                cache.tree_core.get_component_host_lock_ref(
+                    match.best_match_node, ComponentType.FULL
+                )
+                == 0
+            )
+            assert (
+                cache.evict(EvictParams(num_tokens=token_count)).num_tokens_evicted
+                == token_count
+            )
+            assert cache.evict_host(token_count) == token_count
+            del physical, raw
+            host.destroy()
+            assert owner.handle is None and owner.address is None
+            return
         receipt = cache.inc_host_lock_ref(match.best_match_node).to_dec_params()
         assert cache.evict_host(token_count) == 0
         dst = allocator.alloc(token_count)
@@ -317,11 +434,14 @@ class TestRemoteEgmHiCache(CustomTestCase):
         for scenario in (
             "transfer",
             "transfer_page16",
+            "controller",
             "same_numa",
             "pool_preflight",
             "preflight",
             "shape",
             "allocation",
+            "allocation_rollback_retry",
+            "rollback_retry",
             "import",
             "descriptor",
             "drain",
