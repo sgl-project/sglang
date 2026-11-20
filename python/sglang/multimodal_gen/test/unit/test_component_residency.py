@@ -1,4 +1,5 @@
 import sys
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +14,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.runtime.loader.utils import component_residency_bytes
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as residency_strategies,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    host_memory_breakdown,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
@@ -507,6 +511,49 @@ def test_request_tail_uses_dynamic_component_instance():
     strategy.finish_request.assert_called_once_with(
         module, use, manager.state, preferred=False
     )
+
+
+def test_host_memory_debug_report_runs_at_the_request_tail(monkeypatch):
+    """With SGLANG_DIFFUSION_DEBUG_HOST_MEMORY set on a device that shares host
+    memory, the request tail reports the pipeline's components; the report must
+    not fail a request whose forward already finished."""
+    pipeline = SimpleNamespace(
+        modules={"encoder": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    manager = ComponentResidencyManager(pipeline, _server_args())
+    # The report walks every live object; a proxy to a collected object is one of them.
+    referent = torch.nn.Identity()
+    dead_proxy = weakref.proxy(referent)
+    del referent
+    reports = []
+    real_report = host_memory_breakdown.log_host_memory_breakdown
+
+    def report(modules, *, label):
+        reports.append((modules, label))
+        real_report(modules, label=label)
+
+    monkeypatch.setenv("SGLANG_DIFFUSION_DEBUG_HOST_MEMORY", "1")
+    monkeypatch.setattr(current_platform, "device_shares_host_memory", lambda: True)
+    monkeypatch.setattr(
+        torch,
+        "get_device_module",
+        lambda: SimpleNamespace(is_available=lambda: True, empty_cache=lambda: None),
+    )
+    monkeypatch.setattr(host_memory_breakdown, "log_host_memory_breakdown", report)
+
+    manager.finish_request()
+    manager.finish_request()
+
+    assert reports == [
+        (pipeline.modules, "after request 1"),
+        (pipeline.modules, "after request 2"),
+    ]
+    # The per-mapping tensor count walks the same objects.
+    count, _ = host_memory_breakdown._tensor_ptrs_inside(0, 1 << 62)
+    assert count >= 1
+    del dead_proxy
 
 
 def test_strategy_cache_replaces_stale_component_instance():
