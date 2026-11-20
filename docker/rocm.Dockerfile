@@ -73,7 +73,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -83,6 +83,9 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+# Held at the pre-581579ab5 pin: the FlyDSL MoE/MegaMoE AOT replay added
+# between these commits reaches the HIP runtime on this torch 2.9 base and
+# fails in `docker build`, which has no GPU. Bump once that is fixed upstream.
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
@@ -94,7 +97,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -118,7 +121,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -128,6 +131,9 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
+# Held at the pre-581579ab5 pin: the FlyDSL MoE/MegaMoE AOT replay added
+# between these commits reaches the HIP runtime on this torch 2.9 base and
+# fails in `docker build`, which has no GPU. Bump once that is fixed upstream.
 ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
 ENV TRITON_COMMIT_DEFAULT="42270451990532c67e69d753fbd026f28fcc4840"
 
@@ -139,7 +145,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -316,7 +322,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 # Same reasoning as the rocm724 stages: keep pip from resolving the image's
 # ROCm torch away to a PyPI CUDA build. Populated after the stack is in place.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
@@ -337,7 +343,7 @@ ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="285579b6211b0da30f35b91a890c29c823597cd1"
+ENV AITER_COMMIT_DEFAULT="581579ab51ca26ddd4a08a6aa6aa983a78aaf276"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -767,7 +773,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
 ARG BUILD_TYPE=all
 
 # Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
-# pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
+# pip install RUN so it does not affect AITER, sgl-router, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
 
 RUN pip install IPython \
@@ -776,8 +782,9 @@ RUN pip install IPython \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
-# (sglang.srt.rust_extensions._multimodal) during the sglang pip install below
-# and later by sgl-model-gateway. Must precede the sglang install.
+# (sglang.srt.rust_extensions._multimodal) during the sglang pip install below,
+# and by CI jobs that reinstall sglang or build sgl-router from their checkout.
+# Must precede the sglang install.
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 3 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
@@ -867,17 +874,14 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
-# Rust toolchain already installed above (before the sglang install).
-
-# Build and install sgl-model-gateway
-RUN python3 -m pip install --no-cache-dir "maturin<1.14" \
-    && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
-           /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
-    && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
-    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --force-reinstall dist/*.whl \
-    && rm -rf /root/.cache
+# sgl-router, the PD router. Built at the toolchain sgl-router pins, which is
+# removed with the target and the crate cache; the default toolchain above stays.
+RUN cd /sgl-workspace/sglang/sgl-router \
+    && rustup toolchain install \
+    && CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router \
+    && install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router \
+    && rustup toolchain uninstall "$(rustup show active-toolchain | cut -d' ' -f1)" \
+    && rm -rf /tmp/sgl-router-target /root/.cargo/registry /root/.cargo/git
 
 # -----------------------
 # TileLang

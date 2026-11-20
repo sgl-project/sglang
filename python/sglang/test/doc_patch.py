@@ -51,7 +51,7 @@ def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
     extra_flags = (
         f"--max-running-requests {DEFAULT_MAX_RUNNING_REQUESTS} "
         f"--max-total-tokens {DEFAULT_MAX_TOTAL_TOKENS} "
-        f"--disable-cuda-graph "
+        f"--disable-decode-cuda-graph --disable-prefill-cuda-graph "
         f"--cuda-graph-max-bs-decode 4"
     )
 

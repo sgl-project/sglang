@@ -27,24 +27,24 @@ Then run the **Python** output of the command panel below in that environment.
 
 <Tab title="Docker">
 
-**NVIDIA GPUs** (H200 / B200 / B300 / GB300) — the launch image, since this is a day-0 model with no release cut yet:
+**NVIDIA GPUs** (H200 / B200 / B300 / GB300):
 
 ```bash Command
-docker pull lmsysorg/sglang:qwen38
+docker pull lmsysorg/sglang:latest
 ```
 
-**AMD GPUs** — pinned `v0.5.17` builds. The two are **not** interchangeable: they target different GPU architectures *and* different ROCm versions, so pick the one matching your hardware or AITER's kernels won't load.
+**AMD GPUs** — the two ROCm builds are **not** interchangeable: they target different GPU architectures, so pick the one matching your hardware or AITER's kernels won't load.
 
 MI350X / MI355X (CDNA4, gfx950 — ROCm 7.20):
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261113
 ```
 
-MI300X (CDNA3, gfx942 — ROCm 7.00):
+MI300X (CDNA3, gfx942 — ROCm 7.20):
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813
+docker pull lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028
 ```
 
 For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
@@ -192,7 +192,7 @@ For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker
 
 ### AllReduce fusion
 
-The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — set `SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION`, the Qwen3.5 CuteDSL path whose single workspace fuses AllReduce + Residual + RMSNorm with the MoE finalize. Worth 6–13% over the legacy path. Don't pass `--flashinfer-allreduce-fusion-backend` alongside it — the env suppresses the flag with a warning.
+The four cells running one flat TP group — GB300 FP8 Low Latency, GB300 NVFP4 Low Latency, GB300 BF16, B300 NVFP4 — pass `--flashinfer-allreduce-fusion-backend cutedsl`, the Qwen3.5 CuteDSL path whose single workspace fuses AllReduce + Residual + RMSNorm with the MoE finalize. Worth 6–13% over the legacy path.
 
 Nothing else can use it: the fusion needs DP-attention off and the built-in TP MoE, so the wide-EP tiers are out, and the pipelined cells put their cross-node traffic on IB rather than NVLink. The three GB300 cells also carry `NCCL_NVLS_ENABLE=1`, because SGLang forces NVLS collectives off when that variable is unset.
 

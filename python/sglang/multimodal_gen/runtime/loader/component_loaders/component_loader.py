@@ -1023,7 +1023,6 @@ class GenericComponentLoader(ComponentLoader):
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
         super().__init__()
-        self.library = library
         self.component_architecture = component_architecture
 
     def component_attention_backend_context(
