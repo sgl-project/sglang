@@ -406,11 +406,15 @@ def _get_stage_config(
         elif K_dim >= 64:
             default_block_k = 64
         else:
-            default_block_k = max(16, K_dim)
+            default_block_k = max(16, triton.next_power_of_2(K_dim))
+        # `tl.arange` requires a power-of-two range, and the caps below can
+        # leave a non-power-of-two tile: a LoRA rank of 24 gives K_dim = 24 for
+        # the expand stage, and N_dim = 24 for the shrink stage. The kernels'
+        # masks and modulo handle the padded rows/columns.
         cfg = {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": min(64, max(16, N_dim)),
-            "BLOCK_SIZE_K": min(default_block_k, max(16, K_dim)),
+            "BLOCK_SIZE_N": min(64, max(16, triton.next_power_of_2(N_dim))),
+            "BLOCK_SIZE_K": default_block_k,
             "GROUP_SIZE_M": 1,
             "num_warps": 4,
             "num_stages": 4,
