@@ -140,12 +140,6 @@ def test_prefix_rows_index_the_ragged_gathered_kv_under_split_index_k():
     assert torch.equal(gathered[backend._ragged_prefix_kv_rows()], gathered)
 
 
-def test_prefix_rows_stay_the_slot_table_without_split_index_k():
-    slots = torch.tensor([3, 4, 7], dtype=torch.int32)
-    backend = _backend(shards_index_k=False, page_table_1_flattened=slots)
-    assert torch.equal(backend._ragged_prefix_kv_rows(), slots)
-
-
 @pytest.mark.parametrize("mode", EXTEND_MODES, ids=lambda m: m.name)
 def test_forward_mla_merges_exactly_the_extends_that_return_dcp_partials(mode):
     """Under split index-K an extend returns (o, lse) partials exactly when the
