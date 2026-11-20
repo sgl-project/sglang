@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -351,10 +350,8 @@ class UnifiedCacheLinkerWrapper:
         self.offload_skip_prefix_len = 0
         # A device hit never reaches the store, so its read leases lapse and
         # eviction drops a live conversation's head pages first.
-        self._lease_renewer = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="linker-lease")
-            if envs.SGLANG_LINKER_RENEW_DEVICE_HIT_LEASES.get()
-            else None
+        self._lease_renewer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="linker-lease"
         )
         self._lease_renewed_rids: set[str] = set()
 
@@ -647,7 +644,7 @@ class UnifiedCacheLinkerWrapper:
     def _maybe_renew_device_hit_leases(
         self, req: Req, result: MatchResult, device_hit_len: int
     ) -> None:
-        if self._lease_renewer is None or req.rid in self._lease_renewed_rids:
+        if req.rid in self._lease_renewed_rids:
             return
         num_pages = device_hit_len // self.cache.page_size
         if num_pages == 0:
@@ -1029,7 +1026,6 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
 
     def close(self) -> None:
-        if self._lease_renewer is not None:
-            self._lease_renewer.shutdown(wait=False, cancel_futures=True)
+        self._lease_renewer.shutdown(wait=False, cancel_futures=True)
         self.cache_linker.close()
         self._clear_state()
