@@ -1037,7 +1037,15 @@ class SWAComponent(TreeComponent):
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
         if self.sliding_window_size is None:
             return
-        self.cache.kv_storage().advance(
+        storage = self.cache.kv_storage()
+        # Between two chunks of its prompt, the forward storing the last one may
+        # still be running.
+        defer = (
+            getattr(storage, "defers_window_release", False)
+            and req.extend_end is not None
+            and req.extend_end < len(req.origin_input_ids)
+        )
+        storage.advance(
             req,
             pre_len,
             window=self.sliding_window_size,
@@ -1046,6 +1054,7 @@ class SWAComponent(TreeComponent):
             ),
             window_sub_pool=self.window_sub_pool,
             shares_prefixes=True,
+            **({"defer_release": True} if defer else {}),
         )
 
     def free_out_of_window_slots(

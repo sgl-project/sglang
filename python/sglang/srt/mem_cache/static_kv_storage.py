@@ -425,6 +425,7 @@ class StaticKVStorage:
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
         window_sub_pool: Optional[str] = None,
+        defer_release: bool = False,
     ) -> None:
         if tracking is not None:
             advance_tracking(self, req, tracking)
@@ -444,7 +445,13 @@ class StaticKVStorage:
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
             window_sub_pool=window_sub_pool or _WINDOW,
+            defer_release=defer_release,
         )
+
+    @property
+    def defers_window_release(self) -> bool:
+        """Whether `advance` takes ``defer_release``."""
+        return getattr(self._allocator, "defers_swa_release", False)
 
     def record_forward(
         self,
@@ -490,6 +497,10 @@ class StaticKVStorage:
         """See `KVStorage.end_receive_hold`: nothing was held."""
 
     def release_row(self, req: Req) -> None:
+        # Nothing may reuse the request's slots under a deferred mapping clear.
+        settle = getattr(self._allocator, "settle_deferred_swa_frees", None)
+        if settle is not None:
+            settle(owner=req.kv.req_pool_idx)
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
         self.requests.free(req)
 
