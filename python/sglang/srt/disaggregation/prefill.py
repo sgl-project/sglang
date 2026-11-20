@@ -768,6 +768,52 @@ class SchedulerDisaggregationPrefillMixin:
             for req in self.waiting_queue
         )
 
+    def yield_storage_prefetch(self: Scheduler) -> None:
+        """Make room for the parked storage hit of a bootstrapped request.
+
+        A buffer-mode prefetch holds host staging and an anchor pin until its
+        request is admitted. Parked hits commit in scheduler order:
+        bootstrapped requests first, because they hold their decode
+        reservation. While the hit of one of them cannot commit, one request
+        without a reservation gives up its prefetch per call and starts the
+        lookup again."""
+        pipeline = self.tree_cache.buffer_pipeline
+        if (
+            pipeline is None
+            or not pipeline.pending_hit_allocs
+            or get_parallel().pp_size > 1
+            or get_disagg().disaggregation_decode_allocation_policy
+            == "prefill_complete"
+        ):
+            return
+        bootstrapped = [req for req in self.waiting_queue if not req.pending_bootstrap]
+        unreserved = [
+            *(req for req in self.waiting_queue if req.pending_bootstrap),
+            *self.disagg_prefill_bootstrap_queue.queue,
+        ]
+        # The two queues hold every live owner of a parked hit. A hit of another
+        # handle is left over from an ended attempt: it leads the line, where
+        # the next drain drops it.
+        blocked = pipeline.order_parked_hits(
+            [req.cache_request_handle for req in (*bootstrapped, *unreserved)]
+        )
+        if not any(
+            req.cache_request_handle == blocked and not is_aborted(req)
+            for req in bootstrapped
+        ):
+            return
+        # The request farthest from prefill yields first.
+        for req in reversed(unreserved):
+            if not pipeline.holds_staging(req.cache_request_handle):
+                continue
+            logger.info(
+                f"Req {req.rid} yields its L3 prefetch to a bootstrapped request"
+            )
+            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+            req.advance_cache_request_handle()
+            self._prefetch_kvcache(req)
+            return
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
@@ -779,6 +825,8 @@ class SchedulerDisaggregationPrefillMixin:
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
+        if self.enable_hicache_storage:
+            self.yield_storage_prefetch()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
