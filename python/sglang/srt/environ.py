@@ -1726,6 +1726,9 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Set from --enable-exact-reduce-scatter: the deterministic reduce-scatter
+    # receives only each rank's own rows and adds them in the all-reduce's order.
+    SGLANG_ENABLE_EXACT_REDUCE_SCATTER = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

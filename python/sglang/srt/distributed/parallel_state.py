@@ -1175,10 +1175,32 @@ class GroupCoordinator:
             reduce_scatter_single(output, input, group=self.device_group)
         return output
 
+    def _exact_reduce_scatter(self, output: torch.Tensor, input: torch.Tensor) -> bool:
+        """The all-reduce's bits for this rank's chunk without the all-reduce
+        (--enable-exact-reduce-scatter). False leaves the work to the caller."""
+        if not envs.SGLANG_ENABLE_EXACT_REDUCE_SCATTER.get():
+            return False
+        # It reads results on the host, which a traced region cannot.
+        if torch.compiler.is_compiling():
+            return False
+        exact = getattr(self, "_exact_reduce_scatter_op", None)
+        if exact is None:
+            from sglang.srt.distributed.exact_reduce_scatter import ExactReduceScatter
+
+            exact = self._exact_reduce_scatter_op = ExactReduceScatter(
+                all_reduce=lambda tensor: self.all_reduce(tensor),
+                all_to_all_single=self.all_to_all_single,
+                world_size=self.world_size,
+                rank=self.rank_in_group,
+            )
+        return exact(output, input)
+
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             assert input.numel() == output.numel() * self.world_size
             # Reduction order must be independent of the receiving rank.
+            if self._exact_reduce_scatter(output, input):
+                return
             # Preserve input even when all_reduce mutates its argument.
             reduced = self.all_reduce(input.clone())
             output.copy_(

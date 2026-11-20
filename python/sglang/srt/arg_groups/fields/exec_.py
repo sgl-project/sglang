@@ -1318,6 +1318,16 @@ class ExecDeterministic(msgspec.Struct):
     enable_deterministic_inference: A[
         bool, "Enable deterministic inference mode with batch invariant ops."
     ] = False
+    enable_exact_reduce_scatter: A[
+        bool,
+        "With --enable-deterministic-inference, a reduce-scatter runs as an "
+        "all-reduce followed by a slice. This flag replaces it by an all-to-all "
+        "of each rank's own rows and a local sum in the all-reduce's order: the "
+        "same bits, and a rank receives only the rows it keeps. The order is "
+        "found per tensor shape by probing the all-reduce and checked on every "
+        "rank; a shape that does not reproduce keeps the all-reduce. 16-bit "
+        "floats only.",
+    ] = False
     rl_on_policy_target: A[
         Optional[str],
         Arg(
