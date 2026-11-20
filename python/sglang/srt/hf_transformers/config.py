@@ -171,6 +171,24 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_sarvam_mla_config(model, revision: Optional[str], **kwargs):
+    """Load Sarvam-MLA checkpoints with the native config class.
+
+    The checkpoint's remote `configuration_sarvam_moe.py` calls
+    `validate_rope(ignore_keys=...)`, which the pinned transformers rejects,
+    so `AutoConfig` with `trust_remote_code` cannot build it.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    if config_dict.get("model_type") != "sarvam_mla":
+        return None
+
+    return _CONFIG_REGISTRY["sarvam_mla"].from_pretrained(
+        model, revision=revision, **kwargs
+    )
+
+
 def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
     """Recognize the original state-spaces Mamba-1 checkpoints.
 
@@ -222,6 +240,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         **kwargs,
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_sarvam_mla_config(model, revision, **kwargs)
         if config is None:
             config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:

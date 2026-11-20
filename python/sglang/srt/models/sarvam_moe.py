@@ -76,10 +76,12 @@ from sglang.srt.utils import (
     BumpAllocator,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
+    is_xpu,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 if _is_cuda:
@@ -1345,6 +1347,14 @@ class SarvamMLAForCausalLM(nn.Module):
                     and self_attn.kv_b_proj.scale is not None
                 ):
                     weight_scale = self_attn.kv_b_proj.scale
+
+            if _is_xpu and w.dtype == torch.float8_e4m3fn:
+                # torch.bmm on XPU silently returns fp8 for a bf16 x fp8 pair,
+                # so absorb the per-tensor scale and keep w_kc/w_vc in bf16.
+                w = (w.float() * weight_scale.float()).to(
+                    self_attn.kv_b_proj.orig_dtype
+                )
+                weight_scale = None
 
             w_reshaped = w.unflatten(
                 0,
