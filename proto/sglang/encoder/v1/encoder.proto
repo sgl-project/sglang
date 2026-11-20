@@ -25,7 +25,53 @@ service SglangEncoder {
 
   // Register scheduler receive URL (for zmq_to_scheduler backend)
   rpc SchedulerReceiveUrl(SchedulerReceiveUrlRequest) returns (SchedulerReceiveUrlResponse);
+
+  // Two-phase image handoff for an external router. Stage does not require
+  // a receiver. Deliver transfers the already-staged buffer over native ZMQ.
+  rpc GetEncoderInfo(GetEncoderInfoRequest) returns (GetEncoderInfoResponse);
+  rpc Stage(StageRequest) returns (StageResponse);
+  rpc Deliver(DeliverRequest) returns (DeliverResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
 }
+
+message GetEncoderInfoRequest {}
+message GetEncoderInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  string served_model_name = 3;
+}
+
+message StageRequest {
+  string request_id = 1;
+  repeated string mm_items = 2; // image URLs in prompt order
+}
+
+message ImageLayout {
+  uint32 t = 1;
+  uint32 h = 2;
+  uint32 w = 3;
+  string identity = 4; // native full EPD cache key, lowercase hex
+}
+
+message StagedImageTransfer {
+  uint32 version = 1;
+  string request_id = 2;  // router request, shared by E, P and D
+  string transfer_id = 3; // unique on each successful stage attempt
+  string part_id = 4;     // exact EmbeddingData.req_id on ZMQ
+  uint32 part_idx = 5;
+  uint32 num_parts = 6;
+  uint32 image_count = 7;
+  repeated ImageLayout images = 8;
+}
+
+message StageResponse { StagedImageTransfer transfer = 1; }
+message DeliverRequest {
+  StagedImageTransfer transfer = 1;
+  string receive_url = 2; // scheduler host:port, IPv6 in brackets
+}
+message DeliverResponse {}
+message ReleaseRequest { string transfer_id = 1; }
+message ReleaseResponse {}
 
 // =====================
 // Encode Request/Response

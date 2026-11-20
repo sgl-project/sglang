@@ -262,6 +262,8 @@ class RustServer:
         # --language-only: ready events since the last drain; errors for the next one.
         self._encoder_dispatcher: Optional[MMReceiverBase] = None
         self._encoder_bootstrap_server = None
+        self._external_image_token_id = None
+        self._external_image_limit = None
         self._encoder_dispatch_ready: List[threading.Event] = []
         self._encoder_dispatch_errors: deque[EncoderDispatchErrorReq] = deque()
 
@@ -545,7 +547,14 @@ class RustServer:
         instance.server_args = scheduler.server_args
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
-        if get_disagg().language_only:
+        if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+            instance._external_image_token_id = (
+                scheduler.model_config.hf_config.image_token_id
+            )
+            instance._external_image_limit = (
+                get_mm().limit_mm_data_per_request or {}
+            ).get("image")
+        elif get_disagg().language_only:
             instance._start_encoder_dispatch()
 
         if rust_mm:
@@ -1061,7 +1070,36 @@ class RustServer:
         # Last: a request rejected after its dispatch would leave the encoders
         # pushing embeddings nobody waits for.
         media = buffers.get("epd.media")
-        if media is not None:
+        handoff = buffers.get("epd.handoff")
+        if handoff is not None:
+            from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
+
+            if self._external_image_token_id is None:
+                raise ValueError(
+                    "encoder_handoff requires SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
+                )
+            obj.encoder_handoff = EncoderHandoff.parse(
+                memoryview(handoff), obj.input_ids.count(self._external_image_token_id)
+            )
+            if (
+                self._external_image_limit is not None
+                and obj.encoder_handoff.image_count > self._external_image_limit
+            ):
+                raise ValueError(
+                    "staged image count exceeds --limit-mm-data-per-request"
+                )
+            hashes = buffers.get("epd.hashes")
+            if hashes is not None:
+                obj.encoder_routing_hashes = msgspec.msgpack.decode(memoryview(hashes))
+            obj.need_wait_for_mm_inputs = True
+        elif self._external_image_token_id is not None:
+            if media is not None or (
+                ids is not None and self._external_image_token_id in obj.input_ids
+            ):
+                raise NoEncoderError(
+                    "An image prompt requires a staged encoder_handoff"
+                )
+        elif media is not None:
             self._dispatch_to_encoders(obj, media)
 
     def push_control_output(self, recv_req, output) -> None:

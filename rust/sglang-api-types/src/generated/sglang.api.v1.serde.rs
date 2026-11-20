@@ -7469,6 +7469,14 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.modalities {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
         }
+        if let Some(v) = &self.encoder_handoff {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "encoder_handoff",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -7524,6 +7532,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_routed_experts_start_len = None;
                 let mut f_return_sampling_mask = None;
                 let mut f_modalities = None;
+                let mut f_encoder_handoff = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -7808,6 +7817,15 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
                         }
+                        "encoder_handoff" => {
+                            if f_encoder_handoff.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("encoder_handoff"));
+                            }
+                            f_encoder_handoff = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -7853,6 +7871,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
+                    encoder_handoff: f_encoder_handoff.flatten(),
                 })
             }
         }
@@ -24411,6 +24430,11 @@ impl ::serde::Serialize for GetServerInfoResponse {
             &self.num_reserved_tokens,
         )?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "instance_id", &self.instance_id)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "accepts_encoder_handoff",
+            &self.accepts_encoder_handoff,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24443,6 +24467,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_skip_tokenizer_init = None;
                 let mut f_num_reserved_tokens = None;
                 let mut f_instance_id = None;
+                let mut f_accepts_encoder_handoff = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24568,6 +24593,14 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             f_instance_id =
                                 Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
+                        "accepts_encoder_handoff" => {
+                            if f_accepts_encoder_handoff.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "accepts_encoder_handoff",
+                                ));
+                            }
+                            f_accepts_encoder_handoff = Some(map.next_value::<bool>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24591,6 +24624,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     skip_tokenizer_init: f_skip_tokenizer_init.unwrap_or_default(),
                     num_reserved_tokens: f_num_reserved_tokens.unwrap_or_default(),
                     instance_id: f_instance_id.unwrap_or_default(),
+                    accepts_encoder_handoff: f_accepts_encoder_handoff.unwrap_or_default(),
                 })
             }
         }

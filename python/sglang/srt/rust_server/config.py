@@ -502,6 +502,8 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
+    if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+        info["accepts_encoder_handoff"] = True
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

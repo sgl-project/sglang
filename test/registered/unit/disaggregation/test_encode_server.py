@@ -1,13 +1,17 @@
 import asyncio
 import pickle
+import socket
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import torch
+import zmq
+import zmq.asyncio
 
 import sglang.srt.disaggregation.encoder.server as encoder_server
 from sglang.srt.disaggregation.encoder import http_server
@@ -232,6 +236,357 @@ class TestEncoderCacheIdentity(CustomTestCase):
         self.assertNotEqual(original[1], changed[1])
         encoder.cache_namespace = "sha256:" + "34" * 32
         self.assertTrue(all(a != b for a, b in zip(changed, keys())))
+
+
+class TestStagedNativeTransfer(CustomTestCase):
+    @contextmanager
+    def native_encoder(self):
+        from sglang.srt.disaggregation.encoder import grpc_server
+
+        grids = [[1, 2, 2], [1, 4, 2]]
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        enc = MMEncoder.__new__(MMEncoder)
+        enc.model_type = "qwen3_vl"
+        enc.transfer_backend = "zmq_to_scheduler"
+        enc.use_mooncake = enc.mm_global_cache_enabled = False
+        enc.rank = 0
+        enc.profiler = None
+        enc.abandoned_req_ids = set()
+        enc.req_states = {}
+        enc.encode_dispatch_lock = asyncio.Lock()
+        enc.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        enc.preprocessor.model_type = enc.model_type
+        enc.preprocessor.image_processor = SimpleNamespace(merge_size=2)
+        enc.send_timeout = 1
+        enc.delivery = encoder_server.ZmqDelivery(enc, cleanup_receive_state=True)
+
+        enc._embedding_dims = {Modality.IMAGE: 4}
+        enc._embedding_dtype = tensor.dtype
+        enc._element_size = tensor.element_size()
+
+        async def prepare(requests, modality, **kwargs):
+            ctx = SimpleNamespace(
+                req_id=requests[0]["req_id"],
+                items_per_req=[2],
+                preprocess_result=SimpleNamespace(grid_thw=grids, token_counts=[1, 2]),
+                modality=modality,
+                aux_data={},
+            )
+            # Publish the same early metadata as native preprocessing.
+            await enc._publish_preprocess_metadata(ctx, requests)
+            return ctx
+
+        enc._compute_embedding = AsyncMock(return_value=tensor)
+        enc._prepare_encode_context_on_all_ranks = AsyncMock(side_effect=prepare)
+        cfg = SimpleNamespace(encoder_transfer_backend=enc.transfer_backend)
+        with (
+            patch.object(encoder_server, "get_disagg", return_value=cfg),
+            patch.object(
+                grpc_server,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=1, num_dp_ranks=1),
+            ),
+            patch.object(
+                grpc_server,
+                "get_model",
+                return_value=SimpleNamespace(model_path="qwen"),
+            ),
+            patch.object(
+                grpc_server,
+                "get_serving",
+                return_value=SimpleNamespace(
+                    tokenizer_path=None, served_model_name="qwen-vl"
+                ),
+            ),
+            zmq.Context() as enc.sync_context,
+            ThreadPoolExecutor(4) as enc.executor,
+            zmq.asyncio.Context() as receivers,
+        ):
+            svc = grpc_server.SGLangEncoderServer(enc, [], Mock())
+
+            yield svc, enc, receivers, grids, tensor
+
+    def test_cpu_tensor_is_staged_once_then_sent_to_late_receiver(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.managers.req_types import MultimodalDataItem
+
+        async def run():
+            with self.native_encoder() as (svc, enc, receivers, grids, tensor):
+                transfer = (
+                    await svc.Stage(
+                        pb.StageRequest(request_id="request", mm_items=["a", "b"]),
+                        Mock(),
+                    )
+                ).transfer
+                self.assertEqual(
+                    [x.identity for x in transfer.images],
+                    [
+                        MultimodalDataItem(
+                            modality=Modality.IMAGE, precomputed_embeddings=chunk
+                        ).cache_key.hex()
+                        for chunk in [tensor[:1], tensor[1:]]
+                    ],
+                )
+                self.assertEqual(list(enc.req_states), [transfer.part_id])
+                with receivers.socket(zmq.PULL) as receiver:
+                    port = receiver.bind_to_random_port("tcp://127.0.0.1")
+                    await svc.Deliver(
+                        pb.DeliverRequest(
+                            transfer=transfer, receive_url=f"127.0.0.1:{port}"
+                        ),
+                        Mock(),
+                    )
+                    header, payload = await asyncio.wait_for(
+                        receiver.recv_multipart(), 2
+                    )
+                    part = safe_pickle_loads(header)
+                    self.assertEqual(
+                        (part.req_id, part.part_idx, part.num_parts),
+                        (transfer.part_id, 0, 1),
+                    )
+                    self.assertEqual(part.grid_dim, grids)
+                    self.assertIsNone(part.embedding)
+                    self.assertEqual(payload, tensor.numpy().tobytes())
+                self.assertEqual(enc.req_states, {})
+                self.assertEqual(enc._compute_embedding.await_count, 1)
+
+                # Keep a port reserved with no listening peer. Native ZMQ must
+                # abandon the send and retire its tensor without an RPC deadline.
+                transfer = (
+                    await svc.Stage(
+                        pb.StageRequest(request_id="no-receiver", mm_items=["a", "b"]),
+                        Mock(),
+                    )
+                ).transfer
+                enc.send_timeout = 0.05
+                context = AsyncMock()
+                context.abort.side_effect = RuntimeError("delivery failed")
+                with socket.socket() as unused:
+                    unused.bind(("127.0.0.1", 0))
+                    port = unused.getsockname()[1]
+                    request = pb.DeliverRequest(
+                        transfer=transfer, receive_url=f"127.0.0.1:{port}"
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "delivery failed"):
+                        await asyncio.wait_for(svc.Deliver(request, context), 2)
+                self.assertEqual(enc.req_states, {})
+
+        asyncio.run(run())
+
+    def assert_retired(self, svc, enc, states):
+        self.assertEqual(svc._leases, {})
+        self.assertEqual(svc._active, 0)
+        self.assertFalse(svc._cleanup_tasks)
+        self.assertFalse(enc.has_pending_embeddings())
+        for state in states:
+            self.assertIsNone(state.embedding_data)
+            self.assertEqual((state.active_encodes, state.active_sends), (0, 0))
+            rid = state.req_id
+            for registry in (
+                enc.abandoned_req_ids,
+                encoder_server.meta_registry._rid_to_meta,
+                encoder_server.meta_registry._pending_at,
+                encoder_server.rid_to_cond,
+                encoder_server.rid_to_receive_endpoint,
+                encoder_server.rid_to_receive_count,
+            ):
+                self.assertNotIn(rid, registry)
+
+    def test_competing_stage_deliver_abort_release_and_expiry(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+
+        async def run():
+            with self.native_encoder() as (svc, enc, receivers, _, _):
+                states = []
+
+                async def stage():
+                    t = (
+                        await svc.Stage(
+                            pb.StageRequest(
+                                request_id="same-public-id", mm_items=["a", "b"]
+                            ),
+                            Mock(),
+                        )
+                    ).transfer
+                    self.assertIn(t.part_id, meta_registry._rid_to_meta)
+                    self.assertIn(t.part_id, encoder_server.rid_to_cond)
+                    states.append(enc.req_states[t.part_id])
+                    return t
+
+                async def release(t):
+                    await svc.Release(
+                        pb.ReleaseRequest(transfer_id=t.transfer_id), Mock()
+                    )
+
+                # Use one public ID for every request. All native state must
+                # remain isolated by the minted part ID.
+                svc._ttl = 5
+                initial = await asyncio.gather(*(stage() for _ in range(24)))
+                svc._ttl = 0.05
+                expiring = await asyncio.gather(*(stage() for _ in range(8)))
+                svc._ttl = 5
+                self.assertEqual(len(states), 32)
+
+                aborting = {t.part_id for t in initial[8:16]}
+                entered = set()
+                sending = asyncio.Event()
+                native_send = enc.delivery.send
+
+                async def send(state, dest):
+                    if state.req_id in aborting:
+                        self.assertEqual(state.active_sends, 1)
+                        entered.add(state.req_id)
+                        if entered == aborting:
+                            sending.set()
+                        await asyncio.Event().wait()
+                    await native_send(state, dest)
+
+                async def fresh():
+                    await release(await stage())
+
+                enc.delivery.send = send
+                with receivers.socket(zmq.PULL) as pull:
+                    port = pull.bind_to_random_port("tcp://127.0.0.1")
+
+                    def deliver(t):
+                        return svc.Deliver(
+                            pb.DeliverRequest(
+                                transfer=t, receive_url=f"127.0.0.1:{port}"
+                            ),
+                            Mock(),
+                        )
+
+                    aborted = [asyncio.create_task(deliver(t)) for t in initial[8:16]]
+                    mixed = asyncio.gather(
+                        *(deliver(t) for t in initial[:8]),
+                        *(release(t) for t in initial[16:]),
+                        *(fresh() for _ in range(8)),
+                    )
+                    await asyncio.wait_for(sending.wait(), 2)
+                    # Release on an already claimed handle cannot free the
+                    # underlying tensor while the native send is using it.
+                    await asyncio.gather(*(release(t) for t in initial[8:16]))
+                    for t, task in zip(initial[8:16], aborted):
+                        self.assertEqual(enc.req_states[t.part_id].active_sends, 1)
+                        task.cancel()
+                    errors = await asyncio.gather(*aborted, return_exceptions=True)
+                    self.assertTrue(
+                        all(isinstance(e, asyncio.CancelledError) for e in errors)
+                    )
+                    await mixed
+                    received = []
+                    for _ in range(8):
+                        header, _ = await asyncio.wait_for(pull.recv_multipart(), 2)
+                        received.append(safe_pickle_loads(header).req_id)
+                    self.assertCountEqual(received, [t.part_id for t in initial[:8]])
+
+                async def drained():
+                    while svc._active or svc._cleanup_tasks:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(drained(), 2)
+                self.assertEqual(enc._compute_embedding.await_count, 40)
+                self.assertEqual(len({t.part_id for t in initial + expiring}), 32)
+                self.assertEqual(len(states), 40)
+                self.assert_retired(svc, enc, states)
+
+        asyncio.run(run())
+
+    def test_queued_and_preprocessing_stages_have_a_server_deadline(self):
+        import grpc
+
+        from sglang.encoder.v1 import encoder_pb2 as pb
+
+        async def run():
+            with self.native_encoder() as (svc, enc, _, _, _):
+                prepared = asyncio.Event()
+                states = []
+                native_prepare = enc._prepare_encode_context_on_all_ranks
+
+                async def stalled(*args, **kwargs):
+                    await native_prepare(*args, **kwargs)
+                    states.extend(enc.req_states.values())
+                    prepared.set()
+                    await asyncio.Event().wait()
+
+                enc._prepare_encode_context_on_all_ranks = stalled
+                svc._stage_timeout = 0.1
+
+                async def time_out():
+                    context = AsyncMock()
+                    context.abort.side_effect = RuntimeError("stage timeout")
+                    with self.assertRaisesRegex(RuntimeError, "stage timeout"):
+                        await svc.Stage(
+                            pb.StageRequest(request_id="timeout", mm_items=["a", "b"]),
+                            context,
+                        )
+                    context.abort.assert_awaited_once_with(
+                        grpc.StatusCode.DEADLINE_EXCEEDED, "image staging timed out"
+                    )
+
+                async with enc.encode_dispatch_lock:
+                    # Timeout before entering encode must leave no native marker.
+                    await asyncio.wait_for(time_out(), 1)
+                    self.assertFalse(prepared.is_set())
+                await asyncio.wait_for(time_out(), 1)
+                self.assertEqual(len(states), 1)
+                self.assertTrue(prepared.is_set())
+                self.assertFalse(enc.encode_dispatch_lock.locked())
+                self.assertEqual(enc._compute_embedding.await_count, 0)
+                self.assert_retired(svc, enc, states)
+
+                # A remote key lookup can stall before the cache owns copies.
+                # It obeys the staging deadline even with the global cache on.
+                from sglang.srt.mem_cache.embedding_cache_controller import (
+                    EmbeddingCacheController,
+                )
+
+                enc.mm_global_cache_enabled = True
+                cache = EmbeddingCacheController.__new__(EmbeddingCacheController)
+                cache.lock = threading.Lock()
+                cache.ongoing_prefetch = {}
+                enc.mm_global_cache = cache
+                enc._prepare_encode_context_on_all_ranks = native_prepare
+
+                async def stalled_lookup(ctx):
+                    states.append(enc.req_states[ctx.req_id])
+                    await asyncio.Event().wait()
+
+                enc._lookup_global_cache = stalled_lookup
+                await asyncio.wait_for(time_out(), 1)
+                self.assertEqual(len(states), 2)
+                self.assert_retired(svc, enc, states)
+
+                # Conversely a cache transfer already holding native references
+                # must reach its safe point before its waiter/part can retire.
+                started, resume = asyncio.Event(), asyncio.Event()
+
+                async def in_flight_cache(ctx, **kwargs):
+                    states.append(enc.req_states[ctx.req_id])
+                    cache.ongoing_prefetch[ctx.req_id] = object()
+                    started.set()
+                    await resume.wait()
+
+                enc._compute_embedding = in_flight_cache
+                enc._lookup_global_cache = AsyncMock(return_value=([], [0, 1]))
+                call = asyncio.create_task(
+                    svc.Stage(
+                        pb.StageRequest(request_id="aborted", mm_items=["a", "b"]),
+                        Mock(),
+                    )
+                )
+                await asyncio.wait_for(started.wait(), 1)
+                call.cancel()
+                await asyncio.sleep(0)
+                self.assertEqual(svc._active, 1)
+                self.assertEqual(states[-1].active_encodes, 1)
+                resume.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await call
+                self.assertEqual(cache.ongoing_prefetch, {})
+                self.assert_retired(svc, enc, states)
+
+        asyncio.run(run())
 
 
 class TestEncoderMetaRegistry(CustomTestCase):

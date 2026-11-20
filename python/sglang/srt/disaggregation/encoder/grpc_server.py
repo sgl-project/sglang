@@ -22,16 +22,22 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
+from sglang.srt.disaggregation.encoder.receiver import create_part_req_id
 from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
 from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
+    SendDestination,
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.disaggregation.encoder.staged import StagedImageService
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_model,
     get_parallel,
     get_serving,
     publish,
@@ -78,7 +84,7 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         yield await self.Check(request, context)
 
 
-class SGLangEncoderServer(SGLangEncoderServicer):
+class SGLangEncoderServer(StagedImageService, SGLangEncoderServicer):
     """
     gRPC service implementation for SGLang encoder.
     """
@@ -92,6 +98,80 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self.encoder = encoder
         self.send_sockets = send_sockets
         self.server_args = server_args
+        info = None
+        if (
+            encoder.transfer_backend == "zmq_to_scheduler"
+            and get_parallel().tp_size == get_parallel().num_dp_ranks == 1
+            and encoder.model_type
+            in {"qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"}
+        ):
+            model = get_model().model_path
+            info = encoder_pb2.GetEncoderInfoResponse(
+                model_path=model,
+                tokenizer_path=get_serving().tokenizer_path or model,
+                served_model_name=get_serving().served_model_name or model,
+            )
+        super().__init__(
+            encode=self._stage_ordered_images,
+            send=self._deliver_part,
+            release=self._release_staged_part,
+            make_part_id=create_part_req_id,
+            info=info,
+            stage_timeout=envs.SGLANG_ENCODER_REQ_TIMEOUT.get(),
+            ttl=encoder.send_timeout,
+            capacity=envs.SGLANG_ENCODER_MAX_STAGED_REQUESTS.get(),
+        )
+
+    async def _stage_ordered_images(self, part_id, images):
+        request = {
+            "modality": Modality.IMAGE.name,
+            "req_id": part_id,
+            "num_parts": 1,
+            "part_idx": 0,
+            "mm_items": images,
+        }
+        # Stage is single-rank. A timeout can cancel queueing and preprocessing
+        # directly. Once the global cache owns native copy handles it must drain
+        # those copies before releasing its buffers.
+        async with self.encoder.encode_dispatch_lock:
+            (result,) = await self.encoder.batch_encode(
+                [request], Modality.IMAGE, drain_global_cache_on_cancel=True
+            )
+        _, _, _, error_msg, error_code = result
+        if error_msg is not None:
+            if error_code == HTTPStatus.BAD_REQUEST:
+                raise ValueError(error_msg)
+            raise RuntimeError(error_msg)
+        data = self.encoder.req_states[part_id].embedding_data
+        grids = data.get_grid()
+        counts = [
+            self.encoder.preprocessor.get_num_tokens(g, Modality.IMAGE) for g in grids
+        ]
+        slices = self.encoder.slice_embedding(data.embedding, counts)
+        # Match QwenVL's get_mm_data: identity is over each image's native
+        # precomputed tensor (dtype, shape and content). Router labels never
+        # substitute for content identity. This lets D reproduce P's pads.
+        layouts = []
+        for grid, tensor in zip(grids, slices):
+            t, h, w = map(int, grid)
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE, precomputed_embeddings=tensor
+            )
+            layouts.append(
+                encoder_pb2.ImageLayout(t=t, h=h, w=w, identity=item.cache_key.hex())
+            )
+        return layouts
+
+    async def _deliver_part(self, part_id, receive_url):
+        await self.encoder.send_to_destination(
+            self.encoder.req_states[part_id],
+            SendDestination(endpoint=receive_url, ephemeral=True),
+        )
+
+    async def _release_staged_part(self, part_id):
+        await self.encoder.release_request(part_id)
+        if self.encoder.mm_global_cache_enabled:
+            self.encoder.mm_global_cache.discard_prefetch_waiter(part_id)
 
     async def _dispatch_encode(self, request_dict: dict):
         for socket in self.send_sockets:

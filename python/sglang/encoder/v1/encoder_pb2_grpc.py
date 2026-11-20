@@ -51,6 +51,26 @@ class SglangEncoderStub:
                 request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.SchedulerReceiveUrlRequest.SerializeToString,
                 response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.SchedulerReceiveUrlResponse.FromString,
                 _registered_method=True)
+        self.GetEncoderInfo = channel.unary_unary(
+                '/sglang.grpc.encoder.SglangEncoder/GetEncoderInfo',
+                request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.GetEncoderInfoRequest.SerializeToString,
+                response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.GetEncoderInfoResponse.FromString,
+                _registered_method=True)
+        self.Stage = channel.unary_unary(
+                '/sglang.grpc.encoder.SglangEncoder/Stage',
+                request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageRequest.SerializeToString,
+                response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageResponse.FromString,
+                _registered_method=True)
+        self.Deliver = channel.unary_unary(
+                '/sglang.grpc.encoder.SglangEncoder/Deliver',
+                request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverRequest.SerializeToString,
+                response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverResponse.FromString,
+                _registered_method=True)
+        self.Release = channel.unary_unary(
+                '/sglang.grpc.encoder.SglangEncoder/Release',
+                request_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.ReleaseRequest.SerializeToString,
+                response_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.ReleaseResponse.FromString,
+                _registered_method=True)
 
 
 class SglangEncoderServicer:
@@ -79,6 +99,32 @@ class SglangEncoderServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetEncoderInfo(self, request, context):
+        """Two-phase image handoff for an external router. Stage does not require
+        a receiver. Deliver transfers the already-staged buffer over native ZMQ.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Stage(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Deliver(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Release(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_SglangEncoderServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -96,6 +142,26 @@ def add_SglangEncoderServicer_to_server(servicer, server):
                     servicer.SchedulerReceiveUrl,
                     request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.SchedulerReceiveUrlRequest.FromString,
                     response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.SchedulerReceiveUrlResponse.SerializeToString,
+            ),
+            'GetEncoderInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetEncoderInfo,
+                    request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.GetEncoderInfoRequest.FromString,
+                    response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.GetEncoderInfoResponse.SerializeToString,
+            ),
+            'Stage': grpc.unary_unary_rpc_method_handler(
+                    servicer.Stage,
+                    request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageRequest.FromString,
+                    response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageResponse.SerializeToString,
+            ),
+            'Deliver': grpc.unary_unary_rpc_method_handler(
+                    servicer.Deliver,
+                    request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverRequest.FromString,
+                    response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverResponse.SerializeToString,
+            ),
+            'Release': grpc.unary_unary_rpc_method_handler(
+                    servicer.Release,
+                    request_deserializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.ReleaseRequest.FromString,
+                    response_serializer=sglang_dot_encoder_dot_v1_dot_encoder__pb2.ReleaseResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -181,6 +247,114 @@ class SglangEncoder:
             '/sglang.grpc.encoder.SglangEncoder/SchedulerReceiveUrl',
             sglang_dot_encoder_dot_v1_dot_encoder__pb2.SchedulerReceiveUrlRequest.SerializeToString,
             sglang_dot_encoder_dot_v1_dot_encoder__pb2.SchedulerReceiveUrlResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetEncoderInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.encoder.SglangEncoder/GetEncoderInfo',
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.GetEncoderInfoRequest.SerializeToString,
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.GetEncoderInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Stage(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.encoder.SglangEncoder/Stage',
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageRequest.SerializeToString,
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.StageResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Deliver(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.encoder.SglangEncoder/Deliver',
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverRequest.SerializeToString,
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.DeliverResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Release(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/sglang.grpc.encoder.SglangEncoder/Release',
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.ReleaseRequest.SerializeToString,
+            sglang_dot_encoder_dot_v1_dot_encoder__pb2.ReleaseResponse.FromString,
             options,
             channel_credentials,
             insecure,

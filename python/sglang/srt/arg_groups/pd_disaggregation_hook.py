@@ -327,7 +327,11 @@ def handle_encoder_disaggregation(server_args: Any):
             "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
         )
 
-    if cfg.language_only and len(cfg.encoder_urls) == 0:
+    if (
+        cfg.language_only
+        and not cfg.encoder_urls
+        and not envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+    ):
         logger.info(
             "--language-only is set without --encoder-urls. Encoders are "
             "expected to register dynamically via the "

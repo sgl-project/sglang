@@ -376,6 +376,8 @@ class SendDestination:
     endpoint: str
     session_id: Optional[str] = None
     buffer_address: Optional[int] = None
+    # A staged transfer can target a new PULL socket for every request.
+    ephemeral: bool = False
 
     @classmethod
     def from_host_port(
@@ -469,7 +471,18 @@ class ZmqDelivery(EncoderDelivery):
         destination: SendDestination,
     ) -> None:
         mm_data = await self.encoder._wait_for_embedding(state)
-        await self.encoder._send(mm_data.embedding, mm_data, url=destination.endpoint)
+        if destination.ephemeral:
+            peer = NetworkAddress.parse(destination.endpoint)
+            await self.encoder._send(
+                mm_data.embedding,
+                mm_data,
+                prefill_host=peer.host,
+                embedding_port=peer.port,
+            )
+        else:
+            await self.encoder._send(
+                mm_data.embedding, mm_data, url=destination.endpoint
+            )
 
     async def release(self, state: ReqState) -> None:
         if not self.cleanup_receive_state:
@@ -1646,9 +1659,12 @@ class MMEncoder:
         ctx: EncodeContext,
         *,
         keep_on_gpu: bool,
+        lookup: Optional[Tuple[List[int], List[int]]] = None,
     ) -> Optional[torch.Tensor]:
         """Resolve cache hits, compute misses, assemble output, and insert misses."""
-        missing_indices, hit_indices = await self._lookup_global_cache(ctx)
+        missing_indices, hit_indices = (
+            lookup if lookup is not None else await self._lookup_global_cache(ctx)
+        )
         hit_hashes, prefetch_failed = self._prefetch_global_cache_hits(ctx, hit_indices)
 
         new_slices = []
@@ -1869,11 +1885,12 @@ class MMEncoder:
         ctx: EncodeContext,
         *,
         keep_on_gpu: bool,
+        lookup: Optional[Tuple[List[int], List[int]]] = None,
     ) -> Optional[torch.Tensor]:
         """Compute one flattened request with global cache as an optional stage."""
         if ctx.use_global_cache:
             mm_embedding = await self._compute_global_cache_embedding(
-                ctx, keep_on_gpu=keep_on_gpu
+                ctx, keep_on_gpu=keep_on_gpu, lookup=lookup
             )
             if mm_embedding is not None:
                 self._validate_embedding_token_count(ctx, mm_embedding)
@@ -2243,7 +2260,11 @@ class MMEncoder:
         return [(0, 0, 0, msg, code)] * len(requests)
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self,
+        requests: List[dict],
+        modality: Modality,
+        *,
+        drain_global_cache_on_cancel: bool = False,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
@@ -2266,7 +2287,19 @@ class MMEncoder:
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+            if use_global_cache and drain_global_cache_on_cancel:
+                # A stalled key lookup has no copy or GPU resource to drain.
+                lookup = await self._lookup_global_cache(ctx)
+                compute = self._compute_embedding(
+                    ctx, keep_on_gpu=keep_on_gpu, lookup=lookup
+                )
+                mm_embedding = await await_task_completion_on_cancel(
+                    asyncio.create_task(compute), f"Global cache encode {ctx.req_id}"
+                )
+            else:
+                mm_embedding = await self._compute_embedding(
+                    ctx, keep_on_gpu=keep_on_gpu
+                )
 
             if self.profiler is not None:
                 for _ in requests:

@@ -116,6 +116,7 @@ pub fn into_requests(
         routed_dp_rank,
         disagg_prefill_dp_rank,
         image_data,
+        encoder_handoff,
         mm_hashes,
         video_data,
         audio_data,
@@ -539,6 +540,26 @@ pub fn into_requests(
         },
     )
     .collect();
+    // A staged embedding has a single receiver. Passing the descriptor as a
+    // named buffer preserves it across native gRPC/HTTP and the scheduler ring.
+    if let Some(handoff) = encoder_handoff {
+        let g = &mut requests[0];
+        if is_batch || g.input_ids.is_none() || g.mm.is_some() || g.sampling_params.n != 1 {
+            return Err(Error::Validation(
+                "encoder_handoff requires one tokenized prompt, n=1 and no raw media".into(),
+            ));
+        }
+        g.mm_buffers
+            .push(Buffer::inline("epd.handoff", handoff.into_bytes()));
+        if !mm_hashes.is_empty() {
+            let hashes: Vec<_> = mm_hashes
+                .iter()
+                .map(|h| crate::multi_modality::worker::parse_caller_hash(h))
+                .collect();
+            let hashes = rmp_serde::to_vec(&hashes).map_err(|e| Error::Internal(e.to_string()))?;
+            g.mm_buffers.push(Buffer::inline("epd.hashes", hashes));
+        }
+    }
     // Single requests only (batches rejected above). Malformed entries are
     // dropped here and warned about in `mm::apply_caller_hashes`, never a 400.
     if let Some(mm) = requests.first_mut().and_then(|req| req.mm.as_deref_mut()) {
@@ -1261,6 +1282,43 @@ mod tests {
             serde_json::from_str::<api_v1::GenerateRequest>(body).unwrap(),
             policy,
         )
+    }
+
+    #[test]
+    fn staged_handoff_keeps_unexpanded_ids_without_media_work() {
+        let (mut parsed, _) = requests(
+            r#"{"input_ids":[4,2,4],"encoder_handoff":{"version":1},"mm_hashes":["0xff","bogus"]}"#,
+        )
+        .unwrap();
+        let g = &mut parsed[0];
+        assert!(g.mm.is_none());
+        assert_eq!(g.input_ids.as_deref(), Some(&[4, 2, 4][..]));
+        let names: Vec<_> = g
+            .mm_buffers
+            .iter()
+            .map(|buffer| buffer.name.as_str())
+            .collect();
+        assert_eq!(names, ["epd.handoff", "epd.hashes"]);
+        let super::super::buffers::BufferStore::Inline(hashes) = &g.mm_buffers[1].store else {
+            panic!("expected routing hash metadata inline");
+        };
+        assert_eq!(
+            rmp_serde::from_slice::<Vec<Option<u64>>>(hashes.as_bytes()).unwrap(),
+            [Some(255), None]
+        );
+        for body in [
+            r#"{"input_ids":[4],"encoder_handoff":{},"image_data":"source"}"#,
+            r#"{"input_ids":[[4]],"encoder_handoff":{}}"#,
+            r#"{"input_ids":[4],"encoder_handoff":{},"sampling_params":{"n":2}}"#,
+            r#"{"text":"image","encoder_handoff":{}}"#,
+        ] {
+            assert!(
+                requests(body)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("encoder_handoff")
+            );
+        }
     }
 
     #[test]

@@ -24,25 +24,45 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1fsglang/encoder/v1/encoder.proto\x12\x13sglang.grpc.encoder\"\x84\x01\n\rEncodeRequest\x12\x10\n\x08mm_items\x18\x01 \x03(\t\x12\x0e\n\x06req_id\x18\x02 \x01(\t\x12\x11\n\tnum_parts\x18\x03 \x01(\r\x12\x10\n\x08part_idx\x18\x04 \x01(\r\x12\x14\n\x0cprefill_host\x18\x05 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x06 \x03(\r\"V\n\x0e\x45ncodeResponse\x12\x16\n\x0e\x65mbedding_size\x18\x01 \x01(\x04\x12\x15\n\rembedding_len\x18\x02 \x01(\x04\x12\x15\n\rembedding_dim\x18\x03 \x01(\x04\"w\n\x0bSendRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x14\n\x0cprefill_host\x18\x02 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x03 \x01(\r\x12\x12\n\nsession_id\x18\x04 \x01(\t\x12\x16\n\x0e\x62uffer_address\x18\x05 \x01(\x04\"\x0e\n\x0cSendResponse\"X\n\x1aSchedulerReceiveUrlRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x13\n\x0breceive_url\x18\x02 \x01(\t\x12\x15\n\rreceive_count\x18\x03 \x01(\r\"\x1d\n\x1bSchedulerReceiveUrlResponse2\xa9\x02\n\rSglangEncoder\x12Q\n\x06\x45ncode\x12\".sglang.grpc.encoder.EncodeRequest\x1a#.sglang.grpc.encoder.EncodeResponse\x12K\n\x04Send\x12 .sglang.grpc.encoder.SendRequest\x1a!.sglang.grpc.encoder.SendResponse\x12x\n\x13SchedulerReceiveUrl\x12/.sglang.grpc.encoder.SchedulerReceiveUrlRequest\x1a\x30.sglang.grpc.encoder.SchedulerReceiveUrlResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1fsglang/encoder/v1/encoder.proto\x12\x13sglang.grpc.encoder\"\x17\n\x15GetEncoderInfoRequest\"_\n\x16GetEncoderInfoResponse\x12\x12\n\nmodel_path\x18\x01 \x01(\t\x12\x16\n\x0etokenizer_path\x18\x02 \x01(\t\x12\x19\n\x11served_model_name\x18\x03 \x01(\t\"4\n\x0cStageRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x10\n\x08mm_items\x18\x02 \x03(\t\"@\n\x0bImageLayout\x12\t\n\x01t\x18\x01 \x01(\r\x12\t\n\x01h\x18\x02 \x01(\r\x12\t\n\x01w\x18\x03 \x01(\r\x12\x10\n\x08identity\x18\x04 \x01(\t\"\xcc\x01\n\x13StagedImageTransfer\x12\x0f\n\x07version\x18\x01 \x01(\r\x12\x12\n\nrequest_id\x18\x02 \x01(\t\x12\x13\n\x0btransfer_id\x18\x03 \x01(\t\x12\x0f\n\x07part_id\x18\x04 \x01(\t\x12\x10\n\x08part_idx\x18\x05 \x01(\r\x12\x11\n\tnum_parts\x18\x06 \x01(\r\x12\x13\n\x0bimage_count\x18\x07 \x01(\r\x12\x30\n\x06images\x18\x08 \x03(\x0b\x32 .sglang.grpc.encoder.ImageLayout\"K\n\rStageResponse\x12:\n\x08transfer\x18\x01 \x01(\x0b\x32(.sglang.grpc.encoder.StagedImageTransfer\"a\n\x0e\x44\x65liverRequest\x12:\n\x08transfer\x18\x01 \x01(\x0b\x32(.sglang.grpc.encoder.StagedImageTransfer\x12\x13\n\x0breceive_url\x18\x02 \x01(\t\"\x11\n\x0f\x44\x65liverResponse\"%\n\x0eReleaseRequest\x12\x13\n\x0btransfer_id\x18\x01 \x01(\t\"\x11\n\x0fReleaseResponse\"\x84\x01\n\rEncodeRequest\x12\x10\n\x08mm_items\x18\x01 \x03(\t\x12\x0e\n\x06req_id\x18\x02 \x01(\t\x12\x11\n\tnum_parts\x18\x03 \x01(\r\x12\x10\n\x08part_idx\x18\x04 \x01(\r\x12\x14\n\x0cprefill_host\x18\x05 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x06 \x03(\r\"V\n\x0e\x45ncodeResponse\x12\x16\n\x0e\x65mbedding_size\x18\x01 \x01(\x04\x12\x15\n\rembedding_len\x18\x02 \x01(\x04\x12\x15\n\rembedding_dim\x18\x03 \x01(\x04\"w\n\x0bSendRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x14\n\x0cprefill_host\x18\x02 \x01(\t\x12\x16\n\x0e\x65mbedding_port\x18\x03 \x01(\r\x12\x12\n\nsession_id\x18\x04 \x01(\t\x12\x16\n\x0e\x62uffer_address\x18\x05 \x01(\x04\"\x0e\n\x0cSendResponse\"X\n\x1aSchedulerReceiveUrlRequest\x12\x0e\n\x06req_id\x18\x01 \x01(\t\x12\x13\n\x0breceive_url\x18\x02 \x01(\t\x12\x15\n\rreceive_count\x18\x03 \x01(\r\"\x1d\n\x1bSchedulerReceiveUrlResponse2\x90\x05\n\rSglangEncoder\x12Q\n\x06\x45ncode\x12\".sglang.grpc.encoder.EncodeRequest\x1a#.sglang.grpc.encoder.EncodeResponse\x12K\n\x04Send\x12 .sglang.grpc.encoder.SendRequest\x1a!.sglang.grpc.encoder.SendResponse\x12x\n\x13SchedulerReceiveUrl\x12/.sglang.grpc.encoder.SchedulerReceiveUrlRequest\x1a\x30.sglang.grpc.encoder.SchedulerReceiveUrlResponse\x12i\n\x0eGetEncoderInfo\x12*.sglang.grpc.encoder.GetEncoderInfoRequest\x1a+.sglang.grpc.encoder.GetEncoderInfoResponse\x12N\n\x05Stage\x12!.sglang.grpc.encoder.StageRequest\x1a\".sglang.grpc.encoder.StageResponse\x12T\n\x07\x44\x65liver\x12#.sglang.grpc.encoder.DeliverRequest\x1a$.sglang.grpc.encoder.DeliverResponse\x12T\n\x07Release\x12#.sglang.grpc.encoder.ReleaseRequest\x1a$.sglang.grpc.encoder.ReleaseResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'sglang.encoder.v1.encoder_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_ENCODEREQUEST']._serialized_start=57
-  _globals['_ENCODEREQUEST']._serialized_end=189
-  _globals['_ENCODERESPONSE']._serialized_start=191
-  _globals['_ENCODERESPONSE']._serialized_end=277
-  _globals['_SENDREQUEST']._serialized_start=279
-  _globals['_SENDREQUEST']._serialized_end=398
-  _globals['_SENDRESPONSE']._serialized_start=400
-  _globals['_SENDRESPONSE']._serialized_end=414
-  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_start=416
-  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_end=504
-  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_start=506
-  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_end=535
-  _globals['_SGLANGENCODER']._serialized_start=538
-  _globals['_SGLANGENCODER']._serialized_end=835
+  _globals['_GETENCODERINFOREQUEST']._serialized_start=56
+  _globals['_GETENCODERINFOREQUEST']._serialized_end=79
+  _globals['_GETENCODERINFORESPONSE']._serialized_start=81
+  _globals['_GETENCODERINFORESPONSE']._serialized_end=176
+  _globals['_STAGEREQUEST']._serialized_start=178
+  _globals['_STAGEREQUEST']._serialized_end=230
+  _globals['_IMAGELAYOUT']._serialized_start=232
+  _globals['_IMAGELAYOUT']._serialized_end=296
+  _globals['_STAGEDIMAGETRANSFER']._serialized_start=299
+  _globals['_STAGEDIMAGETRANSFER']._serialized_end=503
+  _globals['_STAGERESPONSE']._serialized_start=505
+  _globals['_STAGERESPONSE']._serialized_end=580
+  _globals['_DELIVERREQUEST']._serialized_start=582
+  _globals['_DELIVERREQUEST']._serialized_end=679
+  _globals['_DELIVERRESPONSE']._serialized_start=681
+  _globals['_DELIVERRESPONSE']._serialized_end=698
+  _globals['_RELEASEREQUEST']._serialized_start=700
+  _globals['_RELEASEREQUEST']._serialized_end=737
+  _globals['_RELEASERESPONSE']._serialized_start=739
+  _globals['_RELEASERESPONSE']._serialized_end=756
+  _globals['_ENCODEREQUEST']._serialized_start=759
+  _globals['_ENCODEREQUEST']._serialized_end=891
+  _globals['_ENCODERESPONSE']._serialized_start=893
+  _globals['_ENCODERESPONSE']._serialized_end=979
+  _globals['_SENDREQUEST']._serialized_start=981
+  _globals['_SENDREQUEST']._serialized_end=1100
+  _globals['_SENDRESPONSE']._serialized_start=1102
+  _globals['_SENDRESPONSE']._serialized_end=1116
+  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_start=1118
+  _globals['_SCHEDULERRECEIVEURLREQUEST']._serialized_end=1206
+  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_start=1208
+  _globals['_SCHEDULERRECEIVEURLRESPONSE']._serialized_end=1237
+  _globals['_SGLANGENCODER']._serialized_start=1240
+  _globals['_SGLANGENCODER']._serialized_end=1896
 # @@protoc_insertion_point(module_scope)

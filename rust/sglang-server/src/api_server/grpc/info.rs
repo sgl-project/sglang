@@ -45,7 +45,7 @@ pub(super) fn model_info(info: ModelInfo) -> Result<api::GetModelInfoResponse, S
 
 pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse, String> {
     let ServerInfo {
-        launch_fields: _,
+        launch_fields,
         model_path,
         served_model_name,
         tokenizer_path,
@@ -74,6 +74,10 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("internal_states are not JSON: {error}"))?;
     Ok(api::GetServerInfoResponse {
+        accepts_encoder_handoff: launch_fields
+            .get("accepts_encoder_handoff")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         model_path,
         served_model_name,
         tokenizer_path,

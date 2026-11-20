@@ -572,7 +572,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             grid = input_data[0].get(key)
         return grid
 
+    def get_decode_image_layout(self, prompt, img_grid_thw):
+        """Rebuild Qwen's token layout and M-RoPE from encoder metadata on D."""
+        return self._get_mm_data(prompt, None, img_grid_thw=img_grid_thw)
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
+        return self._get_mm_data(prompt, embeddings, **kwargs)
+
+    def _get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
@@ -645,9 +652,11 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         for modality, offset in zip(modality_list, offsets):
             num_tokens = offset[1] - offset[0] + 1
             embedding_start = consumed_per_modality.get(modality, 0)
-            embedding_slice = embeddings[modality][
-                embedding_start : embedding_start + num_tokens
-            ]
+            embedding_slice = (
+                embeddings[modality][embedding_start : embedding_start + num_tokens]
+                if embeddings is not None
+                else None
+            )
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(

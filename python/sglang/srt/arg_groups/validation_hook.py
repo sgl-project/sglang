@@ -177,6 +177,18 @@ def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueErr
 def validate_rust_server_unsupported_args(server_args: Any) -> None:
     """Refuse, in Rust-server mode, every argument the Rust server would ignore
     (``rust_server_unsupported_args``)."""
+    if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+        cfg = resolving_view(server_args)
+        if (
+            not envs.SGLANG_RUST_SERVER.get()
+            or not cfg.language_only
+            or cfg.tp_size != 1
+            or cfg.pp_size != 1
+        ):
+            raise ValueError(
+                "SGLANG_EXTERNAL_ENCODER_HANDOFF=1 requires SGLANG_RUST_SERVER=1, "
+                "--language-only and TP=PP=1"
+            )
     if not envs.SGLANG_RUST_SERVER.get():
         return
     offending = rust_server_unsupported_args(server_args)

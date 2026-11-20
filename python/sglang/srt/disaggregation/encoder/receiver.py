@@ -1312,6 +1312,65 @@ class WaitingZmqRequest(WaitingMMRequestBase):
         return True
 
 
+class WaitingStagedImage(WaitingZmqRequest):
+    """One private PULL socket. The native part and local scheduler rid differ."""
+
+    def send_encode_request(self):
+        self._release_submitted = False
+        handoff = self.recv_req.encoder_handoff
+        receive_url = NetworkAddress(
+            self.host_name, self.embedding_port
+        ).to_host_port_str()
+        self._start_registration(
+            handoff.deliver(receive_url, envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get())
+        )
+
+    def _is_valid_embedding_part(self, recv_obj):
+        handoff = self.recv_req.encoder_handoff
+        if (
+            not isinstance(recv_obj, EmbeddingData)
+            or recv_obj.req_id != handoff.part_id
+        ):
+            return False  # A stale frame from an earlier user of this port.
+        if (recv_obj.num_parts, recv_obj.part_idx, recv_obj.modality) != (
+            1,
+            0,
+            Modality.IMAGE,
+        ):
+            raise ValueError("received part metadata differs from staged descriptor")
+        if (
+            not recv_obj.error_msg
+            and _cat_grid([recv_obj.grid_dim]).tolist() != handoff.grids()
+        ):
+            raise ValueError("received image grid differs from staged descriptor")
+        recv_obj.req_id = self.rid
+        return True
+
+    def _finish_assemble(self, recv_embedding):
+        super()._finish_assemble(recv_embedding)
+        self.recv_req.encoder_handoff.bind_identities(
+            self.recv_req.mm_inputs.mm_items, self.recv_req.encoder_routing_hashes
+        )
+
+    async def _release_transfer(self):
+        try:
+            await self.recv_req.encoder_handoff.release(
+                envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
+            )
+        except Exception as exc:
+            logger.warning(
+                "Early release of staged image for rid=%s failed; encoder lease will expire: %s",
+                self.rid,
+                exc,
+            )
+
+    def release_resources(self):
+        super().release_resources()
+        if not getattr(self, "_release_submitted", False) and self.registration_runner:
+            self._release_submitted = True
+            self.registration_runner.submit(self._release_transfer())
+
+
 class WaitingZmqRequestGrpc(WaitingZmqRequest):
     def send_encode_request(self):
         async def send_embedding_port(req_id, receive_count, host_name, embedding_port):
@@ -2361,12 +2420,35 @@ class MMReceiverBase(ABC):
                 # that assignment must index into this exact list.  Falling
                 # back to ``self.encode_urls`` would only matter if the
                 # tokenizer never set encoder_urls (legacy / static path).
-                encode_urls = recv_req.encoder_urls or list(self.encode_urls)
+                handoff = recv_req.encoder_handoff
+                cls = WaitingStagedImage if handoff is not None else waiting_cls
+                encode_urls = (
+                    []
+                    if handoff is not None
+                    else (recv_req.encoder_urls or list(self.encode_urls))
+                )
 
                 waiting_req = None
                 local_error = None
                 try:
-                    waiting_req = waiting_cls(
+                    if handoff is not None:
+                        handoff.validate_layout(
+                            self.mm_processor.spatial_merge_size,
+                            len(recv_req.input_ids),
+                            self.scheduler.max_req_input_len,
+                        )
+                        if get_disagg().disaggregation_mode == "decode":
+                            mm = self.mm_processor.get_decode_image_layout(
+                                list(recv_req.input_ids), torch.tensor(handoff.grids())
+                            )
+                            handoff.bind_identities(
+                                mm.mm_items, recv_req.encoder_routing_hashes
+                            )
+                            recv_req.mm_inputs = mm
+                            recv_req.input_ids = array("q", mm.input_ids)
+                            new_recv_reqs.append(recv_req)
+                            continue
+                    waiting_req = cls(
                         rid=recv_req.rid,
                         recv_req=recv_req,
                         mm_processor=self.mm_processor,
@@ -2376,10 +2458,13 @@ class MMReceiverBase(ABC):
                         receive_count=self.tp_size,
                         zmq_context=(
                             None
-                            if self.scheduler_recv_socket is not None
+                            if handoff is None
+                            and self.scheduler_recv_socket is not None
                             else self.scheduler_context
                         ),
-                        embedding_port=self.scheduler_embedding_port,
+                        embedding_port=None
+                        if handoff is not None
+                        else self.scheduler_embedding_port,
                         **extra_kwargs,
                     )
                     self.waiting_by_rid[waiting_req.rid] = waiting_req
