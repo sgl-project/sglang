@@ -24,6 +24,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
 from sglang.srt.function_call.utils import (
     get_schema_properties,
+    infer_type_from_json_schema,
     safe_literal_eval,
 )
 
@@ -36,7 +37,8 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
         if tool.function.name == func_name:
             props = get_schema_properties(tool.function.parameters)
             if param_name in props:
-                return props[param_name].get("type", "string")
+                param_type = infer_type_from_json_schema(props[param_name])
+                return str(param_type or "string").strip().lower()
     return "string"
 
 
@@ -84,7 +86,7 @@ def _convert_param_value(
                 if float_param_value - int(float_param_value) != 0
                 else int(float_param_value)
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             logger.warning(
                 "Parsed value '%s' of parameter '%s' is not a float "
                 "in tool '%s', degenerating to string.",
@@ -202,29 +204,44 @@ class MiMoDetector(BaseFormatDetector):
         Streaming parsing: buffer until complete tool call block.
         """
         self._buffer += new_text
-        current_text = self._buffer
+        normal_text = ""
+        calls = []
 
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            if self.current_tool_id > 0:
-                # Already processing tool calls, keep buffering
-                # (more tool calls might come, don't discard text yet)
-                return StreamingParseResult(normal_text="")
-            else:
-                # No tool calls seen yet, return as normal text
-                self._buffer = ""
-                return StreamingParseResult(normal_text=current_text)
+        # A single chunk can carry several complete blocks (MTP, stream_interval > 1).
+        while True:
+            current_text = self._buffer
 
-        # Find end token AFTER the start token
-        end = current_text.find(self.eot_token, start)
-        if end == -1:
-            # Incomplete tool call, return text before start and keep buffering
-            normal_text = current_text[:start]
-            self._buffer = current_text[start:]
-            return StreamingParseResult(normal_text=normal_text)
+            start = current_text.find(self.bot_token)
+            if start == -1:
+                if self.current_tool_id <= 0:
+                    # No tool calls seen yet, return as normal text
+                    self._buffer = ""
+                    normal_text += current_text
+                # Otherwise keep buffering: more tool calls might come
+                break
 
-        # Parse the complete tool call block
-        result = self.detect_and_parse(current_text[: end + len(self.eot_token)], tools)
+            # Find end token AFTER the start token
+            end = current_text.find(self.eot_token, start)
+            if end == -1:
+                # Incomplete tool call, return text before start and keep buffering
+                normal_text += current_text[:start]
+                self._buffer = current_text[start:]
+                break
+
+            # Parse the complete tool call block
+            result = self._parse_complete_block(
+                current_text[: end + len(self.eot_token)], tools
+            )
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+            self._buffer = current_text[end + len(self.eot_token) :]
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def _parse_complete_block(
+        self, text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        result = self.detect_and_parse(text, tools)
 
         if result.calls:
             # Valid tool call - initialize tracking if first one
@@ -247,7 +264,6 @@ class MiMoDetector(BaseFormatDetector):
             call.tool_index = self.current_tool_id
             self.current_tool_id += 1
 
-        self._buffer = current_text[end + len(self.eot_token) :]
         return result
 
     def _parse_tool_call(
