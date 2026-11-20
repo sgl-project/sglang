@@ -37,6 +37,9 @@ SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION = (
     "User Prompt: "
 )
 
+_DEFAULT_PROMPT_LENGTH = 300
+_COMPACT_PROMPT_LENGTH = 64
+
 
 def select_sana_video_prompt_window(
     tensor: torch.Tensor, max_sequence_length: int
@@ -50,6 +53,52 @@ def select_sana_video_prompt_window(
     if max_sequence_length == 1:
         return tensor[:, :1]
     return torch.cat([tensor[:, :1], tensor[:, -(max_sequence_length - 1) :]], dim=1)
+
+
+def _compact_sana_video_text_outputs(outputs, max_sequence_length: int):
+    """Compact default SANA outputs only when both masks mark the suffix empty."""
+    if max_sequence_length != _DEFAULT_PROMPT_LENGTH:
+        return outputs
+    if not isinstance(outputs, (list, tuple)) or len(outputs) != 5:
+        return outputs
+
+    embedding_slot, attention_mask_slot, _, hidden_states_mask_slot, _ = outputs
+    if not all(
+        isinstance(slot, (list, tuple)) and len(slot) == 1
+        for slot in (embedding_slot, attention_mask_slot, hidden_states_mask_slot)
+    ):
+        return outputs
+
+    embeddings = embedding_slot[0]
+    attention_mask = attention_mask_slot[0]
+    hidden_states_mask = hidden_states_mask_slot[0]
+    if (
+        not torch.is_tensor(embeddings)
+        or embeddings.ndim != 3
+        or embeddings.shape[1] != _DEFAULT_PROMPT_LENGTH
+        or not torch.is_tensor(attention_mask)
+        or attention_mask.ndim != 2
+        or not torch.is_tensor(hidden_states_mask)
+        or hidden_states_mask.ndim != 2
+        or attention_mask.shape != embeddings.shape[:2]
+        or hidden_states_mask.shape != embeddings.shape[:2]
+    ):
+        return outputs
+
+    suffix_is_masked = (attention_mask[:, _COMPACT_PROMPT_LENGTH:] == 0).all()
+    suffix_is_masked &= (hidden_states_mask[:, _COMPACT_PROMPT_LENGTH:] == 0).all()
+    if not bool(suffix_is_masked.item()):
+        return outputs
+
+    compacted = list(outputs)
+    compacted[0] = type(embedding_slot)((embeddings[:, :_COMPACT_PROMPT_LENGTH],))
+    compacted[1] = type(attention_mask_slot)(
+        (attention_mask[:, :_COMPACT_PROMPT_LENGTH],)
+    )
+    compacted[3] = type(hidden_states_mask_slot)(
+        (hidden_states_mask[:, :_COMPACT_PROMPT_LENGTH],)
+    )
+    return tuple(compacted) if isinstance(outputs, tuple) else compacted
 
 
 class SanaVideoTextEncodingStage(TextEncodingStage):
@@ -105,11 +154,17 @@ class SanaVideoTextEncodingStage(TextEncodingStage):
             [int(value) for value in mask.sum(dim=1).tolist()]
             for mask in positive_outputs[1]
         ]
+        positive_outputs = _compact_sana_video_text_outputs(
+            positive_outputs, max_sequence_length
+        )
 
         self._append_positive_text_outputs(batch, *positive_outputs)
         if batch.do_classifier_free_guidance:
             negative_outputs = self._encode_negative_text(
                 batch, server_args, all_indices
+            )
+            negative_outputs = _compact_sana_video_text_outputs(
+                negative_outputs, max_sequence_length
             )
             self._append_negative_text_outputs(
                 batch,
