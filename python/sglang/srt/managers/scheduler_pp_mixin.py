@@ -279,16 +279,17 @@ class SchedulerPPMixin:
         ====================================================================
         Stage P
         recv ith req from previous stage
+        send release req received last iteration to next stage
+        send ith req to next stage
         pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
         recv ith transferred req from previous stage
+        send ith transferred req to next stage
         recv ith proxy from previous stage
         run ith batch
         recv prev (i+1) % mb_size th release req from previous stage
         local consensus on release req
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
-        send ith req to next stage
-        send ith transferred req to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
 
@@ -330,12 +331,26 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
+                    # Release ids, requests, the capacity digest and transferred
+                    # ids share one channel, so they go out in the order the next
+                    # stage receives them. Sending each once it is known lets the
+                    # next stage schedule while this one launches its batch.
+                    if release_rids is not None:
+                        send_release_work = self._pp_send_pyobj_to_next_stage(
+                            release_rids, async_send=True
+                        )
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
 
                 self.process_bootstrapped_queue()
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                if not self.pp_group.is_last_rank:
+                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
+                        transferred_rids, async_send=True
+                    )
 
                 self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
@@ -382,11 +397,12 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                if self.pp_group.is_last_rank:
+                    send_release_work, release_rids = (
+                        self._pp_pd_send_consensus_release_ids(
+                            tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                        )
                     )
-                )
 
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -402,14 +418,8 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
-                    self._pp_send_capacity_digest()
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if cur_batch:
-                        self._pp_send_proxy_to_next_stage(result)
+                if not self.pp_group.is_last_rank and cur_batch:
+                    self._pp_send_proxy_to_next_stage(result)
                 self._pp_answer_release_requests()
 
                 self.pp_outputs = next_pp_outputs
