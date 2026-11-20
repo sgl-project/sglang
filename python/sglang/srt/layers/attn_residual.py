@@ -466,8 +466,12 @@ class AttnResidual:
         hidden_states: torch.Tensor,
         block_num: int,
         block_residual: Optional[torch.Tensor] = None,
+        *,
+        num_rows: Optional[int] = None,
     ) -> None:
         num_tokens, hidden_size = hidden_states.shape
+        if num_rows is not None:
+            num_tokens = num_rows
         # Frozen snapshot rows [T, NB, H]; raw tensor for PP transfer and the
         # legacy kernel path.
         self.block_residual = hidden_states.new_empty(
