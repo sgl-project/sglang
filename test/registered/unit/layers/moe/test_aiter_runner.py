@@ -44,6 +44,7 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter.__path__ = []
     fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+    fake_aiter.dtypes = SimpleNamespace(fp8="fp8")
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -245,6 +246,89 @@ def test_mori_pre_permute_consumes_dispatcher_cap(
     if not low_latency:
         assert result.output.shape[0] == expected_rows
         assert result.output.data_ptr() == dispatched.expert_output.data_ptr()
+
+
+def _deterministic_mode(monkeypatch, enabled):
+    monkeypatch.setattr(
+        aiter_runner,
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=enabled)
+        ),
+    )
+
+
+_SWIGLU_OAI = dict(
+    activation="silu", gemm1_alpha=1.702, gemm1_beta=1.0, gemm1_clamp_limit=7.0
+)
+
+
+@pytest.mark.parametrize(
+    "deterministic_mode, weight_dtype, swiglu, expert_mask, supports_option, expected",
+    [
+        (True, torch.uint8, True, None, True, True),  # MXFP4 SwiGLU experts
+        (
+            True,
+            torch.uint8,
+            "swiglu",
+            None,
+            True,
+            True,
+        ),  # activation="swiglu" (gpt-oss)
+        (False, torch.uint8, True, None, True, False),  # normal mode is unchanged
+        (True, torch.bfloat16, True, None, True, False),  # only MXFP4 experts
+        (True, torch.uint8, "silu", None, True, True),  # gated SiLU (GLM-5.3)
+        (True, torch.uint8, False, None, True, False),  # ungated SiLU: not covered
+        (True, torch.uint8, True, torch.ones(2), True, False),  # expert parallel
+        (True, torch.uint8, True, None, False, False),  # AITER without the option
+    ],
+)
+def test_aiter_runner_requests_deterministic_mxfp4_moe(
+    monkeypatch,
+    deterministic_mode,
+    weight_dtype,
+    swiglu,
+    expert_mask,
+    supports_option,
+    expected,
+):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    sys.modules["aiter"].ActivationType = SimpleNamespace(Silu="Silu", Swiglu="Swiglu")
+    _deterministic_mode(monkeypatch, deterministic_mode)
+    monkeypatch.setattr(aiter_runner, "is_gfx95_supported", lambda: True)
+    monkeypatch.setattr(
+        aiter_runner, "_aiter_fused_moe_supports_deterministic", lambda: supports_option
+    )
+    monkeypatch.setattr(aiter_runner, "_SMALLM_MOE_ON", False)
+    if swiglu == "swiglu":
+        config = MoeRunnerConfig(activation="swiglu")
+    elif swiglu == "silu":
+        config = MoeRunnerConfig(activation="silu")
+    elif swiglu:
+        config = MoeRunnerConfig(**_SWIGLU_OAI)
+    else:
+        config = MoeRunnerConfig(activation="silu", is_gated=False)
+    runner = AiterRunnerCore(config)
+
+    runner.run(
+        _runner_input(),
+        _quant_info(
+            w13_weight=torch.empty((2, 8, 2), dtype=weight_dtype),
+            w2_weight=torch.empty((2, 4, 2), dtype=weight_dtype),
+            expert_mask=expert_mask,
+        ),
+        running_state={},
+    )
+
+    assert captured.get("deterministic", False) is expected
+    # Deterministic mode passes its one activation dtype explicitly.
+    assert (captured.get("quant_dtype_a") == "fp8") is expected
 
 
 if __name__ == "__main__":
