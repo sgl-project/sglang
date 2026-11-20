@@ -33,6 +33,11 @@ class DllmConfig:
     def validate_request(self, req) -> str | None:
         from sglang.srt.dllm.algorithm import get_algorithm_cls
 
+        if req.return_sampling_logprobs or req.return_sampling_mask:
+            return (
+                "Diffusion LLM decoding does not support return_sampling_logprobs "
+                "or return_sampling_mask."
+            )
         return get_algorithm_cls(self.algorithm).validate_request(req)
 
     @staticmethod

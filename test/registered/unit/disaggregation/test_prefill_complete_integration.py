@@ -508,7 +508,7 @@ class TestAllocationIntegration(CustomTestCase):
             reset_for_retract=Mock(),
             advance_cache_request_handle=Mock(),
             time_stats=MagicMock(),
-            return_sampling_mask=True,
+            captures_sampling=True,
             sampling_mask_rows=rows,
             metadata_buffer_index=0,
             cached_tokens=0,
@@ -532,7 +532,7 @@ class TestAllocationIntegration(CustomTestCase):
                 top_logprobs_val=[top_val],
                 top_logprobs_idx=[top_idx],
             )
-            rows.append(np.array(mask_idx, np.int32), np.array(mask_val, "f4"))
+            rows.append(logprob, np.array(mask_idx, np.int32), np.array(mask_val, "f4"))
 
         sample_first_token(
             token_id=101,
@@ -584,8 +584,9 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(buffers.output_token_sampling_mask_len[0, 0].item(), 2)
         self.assertEqual(buffers.output_token_sampling_mask_idx[0, :2].tolist(), [4, 5])
         self.assertEqual(
-            buffers.output_token_sampling_logprobs[0, :2].tolist(), [-0.5, -1.0]
+            buffers.output_sampling_mask_logprobs[0, :2].tolist(), [-0.5, -1.0]
         )
+        self.assertEqual(buffers.output_token_sampling_logprobs[0, 0].item(), -0.5)
 
     def test_chunked_prefill_does_not_yield_for_decode_admission(self):
         for policy in ("early", "prefill_complete"):

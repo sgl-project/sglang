@@ -377,6 +377,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
     "return_meta_info",
     "return_input_ids_in_sglext",
     "return_output_ids_in_sglext",
+    "return_sampling_logprobs",
     "return_sampling_mask",
     "return_flat_raw_output_top_logprobs",
     "return_flat_raw_sampling_mask",

@@ -547,6 +547,8 @@ class Sampler(nn.Module):
         support_capture_indices: Optional[torch.Tensor],
     ) -> SamplingMaskOutput:
         """Pack captured positive support into the fixed-cap device result."""
+        # None exactly when no captured row returns its support.
+        return_support = support_capture_indices is not None
         batch_indices = sampling_mask_capture.batch_rows
         weights = sampling_mask_capture.weights
         token_ids = sampling_mask_capture.token_ids
@@ -582,7 +584,11 @@ class Sampler(nn.Module):
             & (support_mass > 0)
             & torch.isfinite(selected_logprobs)
         )
-        realized_lengths = support.sum(dim=-1, dtype=torch.int32)
+        realized_lengths = (
+            support.sum(dim=-1, dtype=torch.int32)
+            if return_support
+            else torch.zeros_like(selected_weight, dtype=torch.int32)
+        )
         overflow = realized_lengths > self.sampling_mask_max_tokens
         statuses = torch.where(
             invalid,
@@ -608,8 +614,15 @@ class Sampler(nn.Module):
                     statuses, op=dist.ReduceOp.MAX, group=self.cp_sync_group
                 )
 
-        packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
-        if token_ids is None:
+        packed_size = (
+            min(self.sampling_mask_max_tokens, weights.shape[-1])
+            if return_support
+            else 0
+        )
+        if packed_size == 0:
+            packed_weights = weights[:, :0]
+            packed_token_ids = torch.empty_like(packed_weights, dtype=torch.int32)
+        elif token_ids is None:
             packed_weights, packed_positions = torch.topk(
                 weights, k=packed_size, dim=-1, largest=True, sorted=True
             )

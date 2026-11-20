@@ -104,7 +104,6 @@ from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     ReturnHiddenStatesMode,
-    SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -449,8 +448,8 @@ class Req(ReqDllmMixin):
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
+        return_sampling_logprobs: bool = False,
         return_sampling_mask: bool = False,
-        sampling_logprobs_mode: SamplingLogprobsMode = "selected",
         return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
@@ -701,8 +700,9 @@ class Req(ReqDllmMixin):
         )
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
+        self.return_sampling_logprobs = return_sampling_logprobs
         self.return_sampling_mask = return_sampling_mask
-        self.sampling_logprobs_mode = sampling_logprobs_mode
+        self.captures_sampling = return_sampling_logprobs or return_sampling_mask
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
@@ -718,7 +718,7 @@ class Req(ReqDllmMixin):
         if return_logprob:
             self.logprob.reset_output_records()
         self.sampling_mask_rows: Optional[SamplingMaskRows] = (
-            SamplingMaskRows() if return_sampling_mask else None
+            SamplingMaskRows() if self.captures_sampling else None
         )
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP

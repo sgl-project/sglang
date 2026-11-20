@@ -113,7 +113,7 @@ class _FakeReq(FakeReq):
         self.return_hidden_states = False
         self.return_routed_experts = False
         self.return_indexer_topk = False
-        self.return_sampling_mask = sampling_mask_rows is not None
+        self.captures_sampling = sampling_mask_rows is not None
         self.sampling_mask_rows = sampling_mask_rows
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
@@ -138,7 +138,7 @@ class _FakeReq(FakeReq):
 
 def _accumulator(
     current_weight_version="default",
-    return_sampling_mask=False,
+    captures_sampling=False,
     request_level_keys=frozenset(),
     output_sink=OutputSink.DETOKENIZER,
 ):
@@ -147,7 +147,7 @@ def _accumulator(
         return_hidden_states=False,
         return_routed_experts=False,
         return_indexer_topk=False,
-        return_sampling_mask=return_sampling_mask,
+        captures_sampling=captures_sampling,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         disaggregation_mode=DisaggregationMode.NULL,
         default_stream_interval=1,
@@ -969,67 +969,71 @@ _IPC_ROUND_TRIPS = {
 }
 
 
+def _chunk_lists(chunk):
+    """A chunk's sampled logprobs, support IDs and support logprobs, row by row."""
+    return (chunk.selected_logprobs.tolist(), *chunk.support_rows())
+
+
 class TestOutputStreamerSamplingMasks(unittest.TestCase):
     def test_rows_stream_once_and_expand_to_response_lists(self):
         """Queued rows cross either IPC codec once, in batch order, as per-token lists;
         rows queued later never overwrite a chunk that is still referenced."""
+        no_ids = np.empty(0, np.int32)
+        no_logprobs = np.empty(0, np.float32)
         for codec, round_trip in _IPC_ROUND_TRIPS.items():
             with (
                 self.subTest(codec=codec),
                 patch.object(io_struct, "_USE_PICKLE_IPC", codec == "pickle"),
             ):
-                selected_rows = SamplingMaskRows()
-                selected_rows.append(
-                    np.array([5, 3], np.int32), np.array([-0.5], np.float32)
-                )
-                selected_rows.append(
-                    np.array([7], np.int32), np.array([0.0], np.float32)
-                )
+                logprob_rows = SamplingMaskRows()
+                logprob_rows.append(-0.5, no_ids, no_logprobs)
+                logprob_rows.append(0.0, no_ids, no_logprobs)
                 support_rows = SamplingMaskRows()
                 support_rows.append(
-                    np.array([9, 8], np.int32), np.array([-0.25, -1.5], np.float32)
+                    -1.5,
+                    np.array([9, 8], np.int32),
+                    np.array([-0.25, -1.5], np.float32),
                 )
                 support_rows.append(
-                    np.array([6], np.int32), np.array([0.0], np.float32)
+                    0.0, np.array([6], np.int32), np.array([0.0], np.float32)
                 )
-                selected = _FakeReq(
-                    "selected", array("q", [5, 7]), sampling_mask_rows=selected_rows
+                logprob_only = _FakeReq(
+                    "logprobs", array("q", [5, 7]), sampling_mask_rows=logprob_rows
                 )
                 support = _FakeReq(
-                    "support", array("q", [9, 6]), sampling_mask_rows=support_rows
+                    "support", array("q", [8, 6]), sampling_mask_rows=support_rows
                 )
-                accumulator = _accumulator(return_sampling_mask=True)
-                for req in (selected, _FakeReq("plain", array("q", [1])), support):
+                accumulator = _accumulator(captures_sampling=True)
+                for req in (logprob_only, _FakeReq("plain", array("q", [1])), support):
                     accumulator.accept(req=req)
                 payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
-                masks = round_trip(payload).output_token_sampling_mask
+                chunks = round_trip(payload).output_token_sampling_mask
                 self.assertEqual(
-                    masks[0].to_lists(support_logprobs=False),
-                    ([[5, 3], [7]], [-0.5, 0.0]),
+                    _chunk_lists(chunks[0]), ([-0.5, 0.0], [[], []], [[], []])
                 )
-                self.assertIsNone(masks[1])
+                self.assertIsNone(chunks[1])
                 self.assertEqual(
-                    masks[2].to_lists(support_logprobs=True),
-                    ([[9, 8], [6]], [[-0.25, -1.5], [0.0]]),
+                    _chunk_lists(chunks[2]),
+                    ([-1.5, 0.0], [[9, 8], [6]], [[-0.25, -1.5], [0.0]]),
                 )
 
-                selected.output_ids.append(4)
-                selected.sampling_mask_rows.append(
-                    np.array([4], np.int32), np.array([-2.0], np.float32)
+                support.output_ids.append(4)
+                support.sampling_mask_rows.append(
+                    -2.0,
+                    np.array([4, 3], np.int32),
+                    np.array([-2.0, -0.125], np.float32),
                 )
                 self.assertEqual(
-                    payload.output_token_sampling_mask[0].to_lists(
-                        support_logprobs=False
-                    ),
-                    ([[5, 3], [7]], [-0.5, 0.0]),
+                    _chunk_lists(payload.output_token_sampling_mask[2]),
+                    ([-1.5, 0.0], [[9, 8], [6]], [[-0.25, -1.5], [0.0]]),
                 )
-                accumulator = _accumulator(return_sampling_mask=True)
-                accumulator.accept(req=selected)
-                masks = round_trip(
+                accumulator = _accumulator(captures_sampling=True)
+                accumulator.accept(req=support)
+                chunks = round_trip(
                     accumulator.to_payload(dp_rank=0, is_idle_batch=False)
                 ).output_token_sampling_mask
                 self.assertEqual(
-                    masks[0].to_lists(support_logprobs=False), ([[4]], [-2.0])
+                    _chunk_lists(chunks[0]), ([-2.0], [[4, 3]], [[-2.0, -0.125]])
                 )
 
     def test_clients_receive_the_sampler_rows_unchanged(self):
@@ -1038,9 +1042,10 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
         processor = SchedulerBatchResultProcessor(
             **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)}
         )
-        modes = ["selected", "support", None, "support", "selected"]
-        mask_reqs = [i for i, mode in enumerate(modes) if mode is not None]
-        support_reqs = [i for i in mask_reqs if modes[i] == "support"]
+        # Whether each request captures its support; None is not captured at all.
+        captures_support = [False, True, None, True, False]
+        captured_reqs = [i for i, x in enumerate(captures_support) if x is not None]
+        support_reqs = [i for i in captured_reqs if captures_support[i]]
         for codec, round_trip in _IPC_ROUND_TRIPS.items():
             with (
                 self.subTest(codec=codec),
@@ -1048,22 +1053,22 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
             ):
                 generator = torch.Generator().manual_seed(0)
                 reqs = []
-                for i, mode in enumerate(modes):
-                    rows = None if mode is None else SamplingMaskRows()
+                for i, support in enumerate(captures_support):
+                    rows = None if support is None else SamplingMaskRows()
                     req = _FakeReq(f"r{i}", array("q"), sampling_mask_rows=rows)
-                    req.sampling_logprobs_mode = mode
+                    req.return_sampling_mask = bool(support)
                     reqs.append(req)
-                expected = [([], []) for _ in modes]
-                received = [([], []) for _ in modes]
+                expected = [([], [], []) for _ in captures_support]
+                received = [([], [], []) for _ in captures_support]
                 for step in range(12):
                     width = (1, 7, 64)[step % 3]
                     lengths = torch.randint(
-                        1, width + 1, (len(mask_reqs),), generator=generator
+                        1, width + 1, (len(captured_reqs),), generator=generator
                     )
                     token_ids = torch.randint(
-                        0, 1 << 20, (len(mask_reqs), width), generator=generator
+                        0, 1 << 20, (len(captured_reqs), width), generator=generator
                     ).int()
-                    selected = torch.randn(len(mask_reqs), generator=generator)
+                    selected = torch.randn(len(captured_reqs), generator=generator)
                     support = torch.randn(len(support_reqs), width, generator=generator)
                     output = LogitsProcessorOutput(
                         next_token_logits=None,
@@ -1073,40 +1078,39 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                             selected_logprobs=selected,
                             support_logprobs=support,
                             statuses=torch.full(
-                                (len(mask_reqs),), SamplingMaskStatus.OK
+                                (len(captured_reqs),), SamplingMaskStatus.OK
                             ),
                         ),
                     )
                     SchedulerBatchResultProcessor.materialize_sampling_mask_output(
                         reqs, output
                     )
-                    for row, i in enumerate(mask_reqs):
+                    for row, i in enumerate(captured_reqs):
                         processor.add_sampling_mask_return_values(i, reqs[i], output)
-                        length = int(lengths[row])
-                        expected[i][0].append(token_ids[row, :length].tolist())
-                        if modes[i] == "support":
+                        expected[i][0].append(float(selected[row]))
+                        if captures_support[i]:
+                            length = int(lengths[row])
                             support_row = support_reqs.index(i)
-                            expected[i][1].append(
+                            expected[i][1].append(token_ids[row, :length].tolist())
+                            expected[i][2].append(
                                 support[support_row, :length].tolist()
                             )
                         else:
-                            expected[i][1].append(float(selected[row]))
+                            expected[i][1].append([])
+                            expected[i][2].append([])
                     if step in (0, 1, 5, 6, 11):
-                        accumulator = _accumulator(return_sampling_mask=True)
+                        accumulator = _accumulator(captures_sampling=True)
                         for req in reqs:
                             accumulator.accept(req=req)
                         chunks = round_trip(
                             accumulator.to_payload(dp_rank=0, is_idle_batch=False)
                         ).output_token_sampling_mask
                         for i, chunk in enumerate(chunks):
-                            if modes[i] is None:
+                            if captures_support[i] is None:
                                 self.assertIsNone(chunk)
                                 continue
-                            masks, logprobs = chunk.to_lists(
-                                support_logprobs=modes[i] == "support"
-                            )
-                            received[i][0].extend(masks)
-                            received[i][1].extend(logprobs)
+                            for kept, values in zip(received[i], _chunk_lists(chunk)):
+                                kept.extend(values)
                 self.assertEqual(received, expected)
 
 

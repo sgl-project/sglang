@@ -307,7 +307,7 @@ def _checkpoints_after_releases(*, lease):
     cache.components[ComponentType.MAMBA].checkpoints_level = 3
     reqs = [_running_req(cache, 100 * (i + 1)) for i in range(4)]
     for req in reqs[:2]:
-        req.return_sampling_mask = True
+        req.captures_sampling = True
     slots = allocator.state_slots
     pages = []
     while (taken := allocator.alloc(4)) is not None:

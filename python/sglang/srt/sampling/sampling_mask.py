@@ -1,25 +1,32 @@
-"""Host-side transport of output-token sampling masks."""
+"""Host-side transport of captured output-token sampling rows."""
 
 import pickle
 import sys
 from array import array
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import msgspec
 import numpy as np
 
 
+def returns_sampling_output(request) -> bool:
+    """Whether a request asked for sampling logprobs or for the sampling mask."""
+    return bool(request.return_sampling_logprobs) or bool(request.return_sampling_mask)
+
+
 class SamplingMaskChunk(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
-    """One request's sampling masks in one output batch, one row per output token."""
+    """One request's captured sampling rows in one output batch, one row per output token."""
 
-    # int32 [num_rows]
+    # float32 [num_rows], the sampled token's logprob
+    selected_logprobs: np.ndarray
+    # int32 [num_rows], 0 for a request that did not ask for the mask
     lengths: np.ndarray
     # int32 [sum(lengths)], row after row
     token_ids: np.ndarray
-    # float32 [sum(lengths)] in support mode, [num_rows] in selected mode
-    logprobs: np.ndarray
+    # float32 [sum(lengths)], aligned with token_ids
+    support_logprobs: np.ndarray
 
     def __reduce_ex__(self, protocol: int):
         # Read-only buffers unpickle as bytes, which np.frombuffer wraps without the
@@ -30,32 +37,36 @@ class SamplingMaskChunk(
             _chunk_from_buffers,
             tuple(
                 pickle.PickleBuffer(memoryview(values).toreadonly())
-                for values in (self.lengths, self.token_ids, self.logprobs)
+                for values in (
+                    self.selected_logprobs,
+                    self.lengths,
+                    self.token_ids,
+                    self.support_logprobs,
+                )
             ),
         )
 
-    def to_lists(
-        self, support_logprobs: bool
-    ) -> Tuple[List[List[int]], List[Union[float, List[float]]]]:
-        masks: List[List[int]] = []
-        values: List[Union[float, List[float]]] = (
-            [] if support_logprobs else self.logprobs.tolist()
-        )
+    def support_rows(self) -> Tuple[List[List[int]], List[List[float]]]:
+        """Each row's support token IDs and their logprobs."""
+        token_ids: List[List[int]] = []
+        logprobs: List[List[float]] = []
         start = 0
         for length in self.lengths.tolist():
             end = start + length
-            masks.append(self.token_ids[start:end].tolist())
-            if support_logprobs:
-                values.append(self.logprobs[start:end].tolist())
+            token_ids.append(self.token_ids[start:end].tolist())
+            logprobs.append(self.support_logprobs[start:end].tolist())
             start = end
-        return masks, values
+        return token_ids, logprobs
 
 
-def _chunk_from_buffers(lengths, token_ids, logprobs) -> SamplingMaskChunk:
+def _chunk_from_buffers(
+    selected_logprobs, lengths, token_ids, support_logprobs
+) -> SamplingMaskChunk:
     return SamplingMaskChunk(
+        selected_logprobs=np.frombuffer(selected_logprobs, dtype=np.float32),
         lengths=np.frombuffer(lengths, dtype=np.int32),
         token_ids=np.frombuffer(token_ids, dtype=np.int32),
-        logprobs=np.frombuffer(logprobs, dtype=np.float32),
+        support_logprobs=np.frombuffer(support_logprobs, dtype=np.float32),
     )
 
 
@@ -99,32 +110,41 @@ class _GrowableArray(msgspec.Struct):
 class SamplingMaskRows(msgspec.Struct):
     """One request's SamplingMaskChunk rows, queued until they are streamed."""
 
+    _selected_logprobs: array = msgspec.field(default_factory=lambda: array("f"))
     _lengths: array = msgspec.field(default_factory=lambda: array("i"))
     _token_ids: _GrowableArray = msgspec.field(
         default_factory=lambda: _GrowableArray(np.empty(0, dtype=np.int32))
     )
-    _logprobs: _GrowableArray = msgspec.field(
+    _support_logprobs: _GrowableArray = msgspec.field(
         default_factory=lambda: _GrowableArray(np.empty(0, dtype=np.float32))
     )
 
-    def append(self, token_ids: np.ndarray, logprobs: np.ndarray) -> None:
-        """Queue one token's int32 support and float32 logprobs."""
+    def append(
+        self,
+        selected_logprob: float,
+        token_ids: np.ndarray,
+        support_logprobs: np.ndarray,
+    ) -> None:
+        """Queue one token's sampled logprob, int32 support, and float32 support logprobs."""
+        self._selected_logprobs.append(selected_logprob)
         self._lengths.append(len(token_ids))
         self._token_ids.extend(token_ids)
-        self._logprobs.extend(logprobs)
+        self._support_logprobs.extend(support_logprobs)
 
     def view(self) -> SamplingMaskChunk:
-        """View the queued token IDs and logprobs without copying them."""
+        """View the queued support IDs and logprobs without copying them."""
         return SamplingMaskChunk(
+            selected_logprobs=np.array(self._selected_logprobs, dtype=np.float32),
             lengths=np.array(self._lengths, dtype=np.int32),
             token_ids=self._token_ids.view(),
-            logprobs=self._logprobs.view(),
+            support_logprobs=self._support_logprobs.view(),
         )
 
     def take(self) -> SamplingMaskChunk:
         """Hand off the queued rows without copying them, leaving the queue empty."""
         chunk = self.view()
+        del self._selected_logprobs[:]
         del self._lengths[:]
         self._token_ids.reset()
-        self._logprobs.reset()
+        self._support_logprobs.reset()
         return chunk

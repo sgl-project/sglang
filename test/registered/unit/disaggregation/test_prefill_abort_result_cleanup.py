@@ -46,7 +46,7 @@ class _Req(FakeReq):
         self.get_mm_token_counts = Mock()
         self.release_mm_inputs_on_abort = Mock()
         self.return_logprob = False
-        self.return_sampling_mask = False
+        self.captures_sampling = False
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))

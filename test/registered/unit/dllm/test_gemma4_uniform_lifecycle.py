@@ -503,6 +503,14 @@ class TestGemma4RequestValidation(unittest.TestCase):
             self.assertIn(field, error)
         self.assertIn("sampling is governed by the renoise schedule", error)
 
+    def test_every_algorithm_rejects_sampling_outputs(self):
+        """A diffusion step never runs the sampler, so no algorithm can return
+        sampling logprobs or masks; accepting them would return empty fields."""
+        for flag in ("return_sampling_logprobs", "return_sampling_mask"):
+            with self.subTest(flag=flag):
+                error = self._validate(algorithm="LowConfidence", **{flag: True})
+                self.assertIn(flag, error)
+
     def test_validation_is_gemma4_renoise_specific(self):
         self.assertIsNone(
             self._validate(SamplingParams(top_p=0.9), algorithm="LowConfidence")
