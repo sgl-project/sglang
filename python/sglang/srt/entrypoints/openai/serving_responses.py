@@ -690,6 +690,34 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return response
 
             if request.stream:
+                # Kick-start the inner generator so tokenizer validation (e.g.
+                # the context-length check in _validate_one_request) runs
+                # before the HTTP 200 / SSE stream starts (#48557).
+                # _generate_with_builtin_tools is an async generator, so its
+                # body — and therefore generate_request's validation — does
+                # not run until the first __anext__; without this the
+                # ValueError only surfaces inside the stream as an HTTP 200 +
+                # response.failed(server_error) event. Mirrors the
+                # chat/completions path (_handle_streaming_request). Background
+                # (non-stream) requests must NOT be kick-started: they return
+                # "queued" immediately and generate in a background task.
+                try:
+                    first_result = await result_generator.__anext__()
+                except ValueError as e:
+                    return self.create_error_response(str(e))
+
+                inner_result_generator = result_generator
+
+                async def prepend_first_result():
+                    # Bind the inner generator explicitly: rebinding the outer
+                    # `result_generator` below would otherwise be picked up by
+                    # this closure and make it iterate itself.
+                    yield first_result
+                    async for result in inner_result_generator:
+                        yield result
+
+                result_generator = prepend_first_result()
+
                 if self.use_harmony:
                     return self.responses_stream_generator(
                         request,
