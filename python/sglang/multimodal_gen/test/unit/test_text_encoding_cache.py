@@ -665,7 +665,7 @@ def test_custom_stage_cache_miss_prepares_offloaded_encoder(
 
     encoder.forward = encode
     stage._crop_start = 0
-    stage._build_prompt_inputs = lambda prompt: BatchEncoding(
+    stage._build_prompt_inputs = lambda prompt, images=None: BatchEncoding(
         {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}
     )
     manager = executor.component_residency_manager
