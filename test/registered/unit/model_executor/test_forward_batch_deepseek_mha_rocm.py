@@ -37,7 +37,7 @@ _CASES = [
 ]
 
 
-def _prepare(prefix_lens, capacity):
+def _prepare(*, prefix_lens, capacity):
     bs = len(prefix_lens)
     fb = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
@@ -61,7 +61,7 @@ def _prepare(prefix_lens, capacity):
     runner_ids.pack_read_stream = pack
     pool = create_autospec(MLATokenToKVPool, instance=True)
     pool.start_layer, pool.layer_num = 0, 1
-    pool.layer_router = PlainPoolRouter(pool, "full")
+    pool.layer_router = PlainPoolRouter(pool=pool, name="full")
     backend = SimpleNamespace(
         runner_ids=runner_ids,
         token_to_kv_pool=pool,
@@ -76,7 +76,7 @@ def _prepare(prefix_lens, capacity):
 
 
 class TestPackedPrefixChunkLayout(CustomTestCase):
-    def _assert_valid_layout(self, prefix_lens, capacity, starts, seq_lens):
+    def _assert_valid_layout(self, *, prefix_lens, capacity, starts, seq_lens):
         self.assertEqual(starts.shape, seq_lens.shape)
         self.assertEqual(starts.shape[1], len(prefix_lens))
         self.assertEqual(starts.dtype, torch.int32)
@@ -107,7 +107,12 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
                     ),
                     prefix_chunk_len=capacity,
                 )
-                self._assert_valid_layout(prefix_lens, capacity, starts, seq_lens)
+                self._assert_valid_layout(
+                    prefix_lens=prefix_lens,
+                    capacity=capacity,
+                    starts=starts,
+                    seq_lens=seq_lens,
+                )
 
     def test_only_hip_packs_long_and_short_prefixes_together(self):
         # Request-major chunks give each request capacity // batch_size keys,
@@ -115,18 +120,21 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         prefix_lens, capacity = [350000, 15000, 7495, 0], 65536
 
         with mock.patch.object(mix, "_is_hip", False):
-            fb = _prepare(prefix_lens, capacity)
+            fb = _prepare(prefix_lens=prefix_lens, capacity=capacity)
         self.assertEqual(fb.num_prefix_chunks, 22)
         self.assertEqual(fb.prefix_chunk_len, capacity // len(prefix_lens))
         expected_starts = [[i * fb.prefix_chunk_len] * 4 for i in range(22)]
         self.assertEqual(fb.prefix_chunk_starts.tolist(), expected_starts)
 
         with mock.patch.object(mix, "_is_hip", True):
-            fb = _prepare(prefix_lens, capacity)
+            fb = _prepare(prefix_lens=prefix_lens, capacity=capacity)
         self.assertEqual(fb.num_prefix_chunks, 6)
         self.assertEqual(fb.prefix_chunk_len, capacity)
         self._assert_valid_layout(
-            prefix_lens, capacity, fb.prefix_chunk_starts, fb.prefix_chunk_seq_lens
+            prefix_lens=prefix_lens,
+            capacity=capacity,
+            starts=fb.prefix_chunk_starts,
+            seq_lens=fb.prefix_chunk_seq_lens,
         )
         self.assertTrue(torch.equal(fb.prefix_chunk_starts_cpu, fb.prefix_chunk_starts))
         self.assertTrue(
@@ -142,7 +150,7 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         # rows, which keep aiter off its fp8 PS prefill.
         prefix_lens, capacity = [64, 64, 64], 48
         with mock.patch.object(mix, "_is_hip", True):
-            fb = _prepare(prefix_lens, capacity)
+            fb = _prepare(prefix_lens=prefix_lens, capacity=capacity)
         self.assertEqual(fb.num_prefix_chunks, 4)
         self.assertEqual(fb.prefix_chunk_len, capacity // len(prefix_lens))
         self.assertFalse(any(fb.prefix_chunk_has_zero_kv))
