@@ -23,7 +23,7 @@ from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=150, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=150, suite="extra-test-1-gpu-xpu")
 
 CHUNK_SIZE = 64
 SEQ_LENS = (1, 63, 64, 65, 130)
