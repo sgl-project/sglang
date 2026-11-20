@@ -122,6 +122,12 @@ impl DrainState {
         }
     }
 
+    /// Resolve once the drain has begun.
+    pub(crate) async fn began(&self) {
+        self.wait_until(|state| state.is_draining().then_some(()))
+            .await;
+    }
+
     /// Resolve once the drain has ended, and how.
     pub(crate) async fn ended(&self) -> DrainEnd {
         self.wait_until(Self::end).await

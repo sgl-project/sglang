@@ -76,6 +76,7 @@ sha2 = "0.10"
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
+tonic-health = { workspace = true }
 tower = { workspace = true }
 tokio-stream = { workspace = true }
 # Request bodies tagged `x-body-compressed: zstd`

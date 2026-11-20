@@ -575,7 +575,10 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 cfg.server_args.clone(),
                 hicache_manager.clone(),
             );
-            (listener, service)
+            let node_peers = listener.local_addr().ok().and_then(|addr| {
+                api_server::grpc::health::node_peers(&cfg.server_args.deployment_info, addr)
+            });
+            (listener, service, node_peers)
         });
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
@@ -602,10 +605,16 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         hicache_manager,
                         tokenizer.clone(),
                     );
-                    if let Some((listener, service)) = grpc_server {
+                    if let Some((listener, service, node_peers)) = grpc_server {
                         tokio::join!(
                             http,
-                            api_server::grpc::app::serve(listener, service, core, shutdown_rx)
+                            api_server::grpc::app::serve(
+                                listener,
+                                service,
+                                node_peers,
+                                core,
+                                shutdown_rx
+                            )
                         );
                     } else {
                         http.await;

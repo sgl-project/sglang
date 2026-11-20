@@ -315,6 +315,11 @@ impl CoreHandle {
         self.inner.drain.is_draining()
     }
 
+    /// Resolve once a drain has begun (see [`CoreHandle::begin_drain`]).
+    pub(crate) async fn drain_began(&self) {
+        self.inner.drain.began().await;
+    }
+
     /// Count a request this listener relayed to another DP rank's listener
     /// until the guard drops: the drain waits for it, and `/abort_request`
     /// here reaches the other ranks meanwhile (see [`CoreHandle::abort_peers`]).
