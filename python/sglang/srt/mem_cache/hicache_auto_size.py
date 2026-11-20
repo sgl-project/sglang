@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import device_capacity_tokens
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -112,6 +113,17 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
+def _mamba_host_row_bytes(params: CacheInitParams) -> int:
+    # MambaPoolHost pads its slot count by one row of target and packed draft layers.
+    if not params.req_to_token_pool.holds_state_slots:
+        return 0
+    pools = (
+        params.token_to_kv_pool_allocator.state.pool,
+        *params.mtp_draft_mamba_pools,
+    )
+    return sum(_leaf_bytes(pool) // device_capacity_tokens(pool) for pool in pools)
+
+
 @contextmanager
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
@@ -143,7 +155,8 @@ def auto_size_hicache(
         )
         * fraction
     )
-    ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
+    usable = budget * (1 - _ALLOCATION_SLACK_FRACTION) - _mamba_host_row_bytes(params)
+    ratio = min(requested, usable / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
     if torch.distributed.is_initialized():

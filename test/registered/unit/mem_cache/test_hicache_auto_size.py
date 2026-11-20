@@ -215,6 +215,61 @@ class TestHiCacheAutoSize(CustomTestCase):
             1024 + target.size * host.size_per_token,
         )
 
+    def test_default_ratio_leaves_room_for_the_mamba_host_padding_row(self):
+        """The Mamba host pool pads by one slot; the default ratio must leave room
+        for it, or startup fails on a tight budget."""
+        target = MambaPool(
+            size=8,
+            spec_state_size=8,
+            cache_params=InklingConvCacheParams(
+                shape=InklingConvStateShape(conv=[(25, 1)], temporal=(100, 1, 1)),
+                layers=[0],
+                dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+            ),
+            mamba_layer_ids=[0],
+            device="cpu",
+        )
+        kv = _leaf(
+            Mock(
+                spec=MHATokenToKVPool,
+                host_capacity_bytes=None,
+                get_kv_size_bytes=Mock(return_value=(50, 50)),
+            )
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=True),
+            token_to_kv_pool_allocator=Mock(
+                get_kvcache=Mock(return_value=kv),
+                storage=None,
+                state=SimpleNamespace(pool=target),
+            ),
+            page_size=1,
+        )
+        rank_budget = 8650
+        host_free = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + int(rank_budget / 0.8) + 1
+        with (
+            get_context().override_server_args(enable_hierarchical_cache=True),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(base, "available_host_memory_bytes", return_value=host_free),
+            sizing.auto_size_hicache(params=params, draft_plan=None, enabled=True),
+        ):
+            ratio = get_memory().hicache_ratio
+            self.assertLess(ratio, 2.0)
+            host = MambaPoolHost(
+                buffer_info=target.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=ratio,
+                host_size=0,
+                device_capacity=target.size,
+                pin_memory=False,
+                layout="page_first",
+            )
+            self.addCleanup(host.destroy)
+            self.assertEqual(host.size, int(8 * ratio) + 1)
+            self.assertLessEqual(
+                host.size * host.size_per_token + int(100 * ratio), rank_budget
+            )
+
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the
         per-rank budget, pools book one snapshot, and an explicit ratio opts out."""
