@@ -11,6 +11,8 @@ silently reroute them.
 import unittest
 from types import SimpleNamespace
 
+from transformers import Qwen2VLImageProcessor, Qwen3VLVideoProcessor
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -21,7 +23,10 @@ from sglang.srt.managers.multimodal_processor import (  # noqa: E402
     import_processors,
 )
 from sglang.srt.runtime_context import publish
-from sglang.srt.rust_server.multimodal import rust_mm_family_for  # noqa: E402
+from sglang.srt.rust_server.multimodal import (  # noqa: E402
+    RustMmProcessor,
+    rust_mm_family_for,
+)
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=16, suite="base-a-test-cpu")
@@ -60,6 +65,30 @@ class TestRustMmGate(CustomTestCase):
         # SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE contract).
         impostor = type("QwenVLImageProcessor", (), {})
         self.assertIsNone(rust_mm_family_for(impostor, "qwen2_5_vl"))
+
+    def test_qwen3_vl_defaults_launch_with_video(self):
+        """Qwen3-VL with HF's default processors and no `--mm-process-config`
+        must keep video on; the gate otherwise drops to image-only with only a
+        warning when it cannot read the video settings."""
+        publish(ServerArgs(model_path="dummy", model_impl="sglang"), role="tokenizer")
+        host = RustMmProcessor.__new__(RustMmProcessor)
+        host.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3VLForConditionalGeneration"],
+                model_type="qwen3_vl",
+                image_token_id=1,
+                video_token_id=2,
+                vision_start_token_id=3,
+                vision_end_token_id=4,
+            )
+        )
+        host._processor = SimpleNamespace(
+            image_processor=Qwen2VLImageProcessor(patch_size=16),
+            video_processor=Qwen3VLVideoProcessor(),
+        )
+        spec = host.resolve_spec()
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.video)
 
 
 if __name__ == "__main__":
