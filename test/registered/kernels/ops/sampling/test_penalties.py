@@ -8,6 +8,7 @@ the accumulated tables. Results must be bitwise equal.
 import dataclasses
 import itertools
 import random
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -296,3 +297,7 @@ def test_kernels_reject_tables_of_other_shapes():
         frequency.cumulate_padded_output_tokens(
             tokens, torch.ones(bs + 1, dtype=torch.int32, device=device)
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
