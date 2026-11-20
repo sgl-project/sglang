@@ -1282,6 +1282,12 @@ class Req(ReqDllmMixin):
         if not tail_str:
             return False
 
+        # A split multi-byte character decodes to trailing U+FFFD; also match the
+        # text before it, so the split does not release a held stop-string prefix.
+        tails = (tail_str,)
+        if tail_str.endswith("\ufffd"):
+            tails += (tail_str.rstrip("\ufffd"),)
+
         for stop_str in self.sampling_params.stop_strs:
             if not stop_str:
                 continue
@@ -1291,10 +1297,11 @@ class Req(ReqDllmMixin):
 
             # Check if tail_str suffix matches stop_str prefix
             # Only check if stop_str is not empty, it's for stream output
-            min_len = min(len(tail_str), len(stop_str))
-            for i in range(1, min_len + 1):
-                if tail_str[-i:] == stop_str[:i]:
-                    return True
+            for tail in tails:
+                min_len = min(len(tail), len(stop_str))
+                for i in range(1, min_len + 1):
+                    if tail[-i:] == stop_str[:i]:
+                        return True
 
         return False
 
