@@ -119,14 +119,20 @@ class DisaggCluster:
         # The head binds its result sockets at fixed offsets from its frontend.
         first_work_offset = max(ServerArgs.DISAGG_RESULT_PORT_OFFSETS.values()) + 1
         api_offset = first_work_offset + len(self.gpu_layout)
+        # give every process its own rendezvous port after the service endpoints
+        last_offset = api_offset + 1 + len(self.gpu_layout)
         for _ in range(64):
             base = get_free_port_below_ephemeral()
-            if all(is_port_available(base + i) for i in range(api_offset + 1)):
+            if all(is_port_available(base + i) for i in range(last_offset + 1)):
                 self.base_port = base
                 self.api_port = base + api_offset
                 self._role_ports = {
                     role: base + i
                     for i, role in enumerate(self.gpu_layout, start=first_work_offset)
+                }
+                self._master_ports = {
+                    role: self.api_port + i
+                    for i, role in enumerate(("server", *self.gpu_layout), start=1)
                 }
                 return
         raise RuntimeError(f"No free port block for {self.name}")
@@ -136,9 +142,7 @@ class DisaggCluster:
     def __enter__(self) -> DisaggCluster:
         for attempt in range(3):
             try:
-                # Workers send their transfer registration once, at startup.
-                head = self._launch_server_head()
-                self._launch_roles(head)
+                self._launch_servers()
                 self._warmup()
                 return self
             except Exception as e:
@@ -171,6 +175,11 @@ class DisaggCluster:
         self._fhs.append(fh)
         return proc
 
+    def _launch_servers(self) -> None:
+        # workers send their transfer registration once, at startup
+        head = self._launch_server_head()
+        self._launch_roles(head)
+
     def _launch_roles(self, head: subprocess.Popen) -> None:
         for role in self.gpu_layout:
             port = self._role_ports[role]
@@ -196,7 +205,7 @@ class DisaggCluster:
                 "--base-gpu-id",
                 str(gpus[0]),
                 "--master-port",
-                str(find_free_port(HOST)),
+                str(self._master_ports[role]),
                 "--log-level",
                 "info",
                 *self.extra_role_args.get(role, []),
@@ -230,7 +239,7 @@ class DisaggCluster:
             "server",
             "--strict-ports",
             "--master-port",
-            str(find_free_port(HOST)),
+            str(self._master_ports["server"]),
             "--scheduler-port",
             str(self.base_port),
             "--port",
