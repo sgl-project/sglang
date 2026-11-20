@@ -184,7 +184,7 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
-        gemm_afp4wfp4_k_tail_safe(x, w, x_scales, w_scales, y)
+        gemm_afp4wfp4_k_tail_safe(x=x, w=w, x_scales=x_scales, w_scales=w_scales, y=y)
 
     def _aiter_gemm_afp4wfp4_fake(
         x: torch.Tensor,

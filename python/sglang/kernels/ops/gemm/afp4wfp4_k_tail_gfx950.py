@@ -34,7 +34,7 @@ def k_tail_in_unfilled_stage(block_k: int, k: int, num_stages: int) -> bool:
 def k_tail_safe_tiling(
     block_k: int, k: int, num_stages: int
 ) -> Optional[tuple[int, int]]:
-    """Widest BLOCK_SIZE_K, then most num_stages, that keep the K tail out of an unfilled LDS stage."""
+    """Halve BLOCK_SIZE_K at the given num_stages; lower num_stages only at the minimum block."""
     # gemm_afp4wfp4 shrinks a block wider than K to K's next power of two, then raises it to the minimum.
     block_k = max(min(block_k, 1 << (k - 1).bit_length()), _MIN_BLOCK_K)
     while k_tail_in_unfilled_stage(block_k=block_k, k=k, num_stages=num_stages):
