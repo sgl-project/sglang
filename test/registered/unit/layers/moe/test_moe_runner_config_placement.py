@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.dwdp import dwdp_manager, replicate_routed_experts
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass
@@ -93,6 +94,44 @@ def test_the_kernel_gets_the_bound_placement(monkeypatch) -> None:
 
     # The layer kept its TP shard and now owns every expert.
     assert _kernel_placement(monkeypatch, layer.moe_runner_config) == (2, 1, 1, 0)
+
+
+def test_replicated_experts_are_complete_and_not_prefetched(monkeypatch) -> None:
+    """DWDP feeds MoE DP-local tokens and sums nothing after the experts, so a
+    MoE layer outside the target's prefetch (the MTP draft's) must hold every
+    routed expert: each expert-sharded tensor, quant scales included, in global
+    expert order and in the memory layout its kernel reads, and without waiting
+    on the target's prefetch slots."""
+    layer = _layer(monkeypatch)  # EP rank 1 of 2: local experts 2 and 3
+    names_and_shapes = (
+        ("w13_weight", (16, 4)),
+        ("w2_weight", (4, 8)),
+        ("w13_weight_scale_inv", (3, 4)),
+    )
+    for name, shape in names_and_shapes:
+        # Every element of an expert's slice holds that expert's global id.
+        local = torch.tensor([2.0, 3.0]).view(2, 1, 1).expand(2, *shape).clone()
+        if name == "w13_weight_scale_inv":
+            # Stored mn-major, as DeepGEMM keeps its scales: (E, 4, 3) in memory.
+            local = local.transpose(1, 2).contiguous().transpose(1, 2)
+        layer.register_parameter(name, torch.nn.Parameter(local, requires_grad=False))
+
+    def all_gather_single(output, input, group):
+        # The peer, EP rank 0, holds experts 0 and 1.
+        output.copy_(torch.cat([input - 2, input]))
+
+    monkeypatch.setattr(dwdp_manager, "all_gather_single", all_gather_single)
+    with get_parallel().override(
+        moe_ep_group=SimpleNamespace(world_size=2, device_group=None)
+    ):
+        replicate_routed_experts(torch.nn.ModuleDict({"experts": layer}))
+
+    for name, shape in names_and_shapes:
+        expected = torch.arange(4.0).view(4, 1, 1).expand(4, *shape)
+        assert torch.equal(getattr(layer, name), expected), name
+    assert layer.w13_weight_scale_inv.stride() == (12, 1, 3)
+    assert _placement(layer) == (2, 1, 1, 0)
+    assert not layer._dwdp_bound
 
 
 def _kernel_placement(monkeypatch, runner_config):
