@@ -103,8 +103,9 @@ def _hy4_ihc_pre_stage1(
 @triton.jit
 def _ihc_dot_partials(
     x_bf16,
-    fn3_ptr,
+    fn_ptr,
     k_offs,
+    k_mask,
     base,
     t_mask,
     K_TOTAL: tl.constexpr,
@@ -113,12 +114,18 @@ def _ihc_dot_partials(
     BLOCK_T: tl.constexpr,
 ):
     """The 2 * HC_MULT hc_fn dot products of a [BLOCK_T, BLOCK_K] bf16 tile on
-    tensor cores: hc_fn is pre-split into three bf16 terms ([3, K, 16], see
-    `_split_hc_fn`), each product is exact in fp32."""
+    tensor cores: the fp32 hc_fn tile is split into three bf16 terms whose sum
+    is hc_fn to ~fp32 precision, so each product is exact in fp32."""
     n = tl.arange(0, 16)
+    rest = tl.load(
+        fn_ptr + n[None, :] * K_TOTAL + k_offs[:, None],
+        mask=k_mask[:, None] & (n < 2 * HC_MULT)[None, :],
+        other=0.0,
+    )
     acc = tl.zeros((BLOCK_T, 16), dtype=tl.float32)
     for i in tl.static_range(3):
-        w = tl.load(fn3_ptr + i * K_TOTAL * 16 + k_offs[:, None] * 16 + n[None, :])
+        w = rest.to(tl.bfloat16)
+        rest = rest - w.to(tl.float32)
         acc = tl.dot(x_bf16, w, acc)
     col = tl.where(n < HC_MULT, 1 + n, 1 + HC_POW2 + n - HC_MULT)
     tl.store(
@@ -141,7 +148,6 @@ def _hy4_ihc_pre_stage1_tokens(
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
     PART_STRIDE: tl.constexpr,
-    fn3_ptr=None,
     USE_DOT: tl.constexpr = False,
 ):
     """Stage 1 for many tokens: BLOCK_T tokens share each hc_fn tile instead of
@@ -162,7 +168,16 @@ def _hy4_ihc_pre_stage1_tokens(
     tl.store(base, tl.sum(x_tile * x_tile, axis=1), mask=t_mask)
     if USE_DOT:
         _ihc_dot_partials(
-            x_raw, fn3_ptr, k_offs, base, t_mask, K_TOTAL, HC_MULT, HC_POW2, BLOCK_T
+            x_raw,
+            fn_ptr,
+            k_offs,
+            k_mask,
+            base,
+            t_mask,
+            K_TOTAL,
+            HC_MULT,
+            HC_POW2,
+            BLOCK_T,
         )
         return
     for m in tl.static_range(HC_MULT):
@@ -569,7 +584,6 @@ def _hy4_ihc_post_stage1(
     PART_STRIDE: tl.constexpr,
     OUT_NORM: tl.constexpr,
     BLOCK_H: tl.constexpr,
-    fn3_ptr=None,
     USE_DOT: tl.constexpr = False,
 ):
     """Stage 1 with the previous block's iHC post folded in: builds the new
@@ -626,7 +640,16 @@ def _hy4_ihc_post_stage1(
     tl.store(base, tl.sum(x_tile * x_tile, axis=1), mask=t_mask)
     if USE_DOT:
         _ihc_dot_partials(
-            new_res, fn3_ptr, k_offs, base, t_mask, K_TOTAL, HC_MULT, HC_POW2, BLOCK_T
+            new_res,
+            fn_ptr,
+            k_offs,
+            k_mask,
+            base,
+            t_mask,
+            K_TOTAL,
+            HC_MULT,
+            HC_POW2,
+            BLOCK_T,
         )
         return
     for m in tl.static_range(HC_MULT):
@@ -713,24 +736,6 @@ _IHC_DOT_BLOCK_T = 128
 _IHC_DOT_BLOCK_K = 128
 # The post-fused stage 1 also holds the residual tile: smaller tiles.
 _IHC_DOT_POST_CONFIG = (64, 256, 8)  # (BLOCK_T, BLOCK_K, num_warps)
-_fn3_cache: dict = {}
-
-
-def _split_hc_fn(hc_fn: torch.Tensor) -> torch.Tensor:
-    """hc_fn [2 * HC, K] fp32 as three bf16 terms whose sum is hc_fn to ~fp32
-    precision, transposed and padded to [3, K, 16]."""
-    key = (hc_fn.data_ptr(), hc_fn.shape, hc_fn.device)
-    fn3 = _fn3_cache.get(key)
-    if fn3 is None:
-        rows, k = hc_fn.shape
-        fn3 = torch.zeros((3, k, 16), dtype=torch.bfloat16, device=hc_fn.device)
-        rest = hc_fn.float()
-        for i in range(3):
-            term = rest.to(torch.bfloat16)
-            fn3[i, :, :rows] = term.t()
-            rest = rest - term.float()
-        _fn3_cache[key] = fn3
-    return fn3
 
 
 def ihc_fuses_out_norm(num_tokens: int) -> bool:
@@ -762,6 +767,7 @@ def hy4_ihc_post_pre_norm(
     first; only for token counts where `ihc_fuses_out_norm` holds.
     """
     residual = residual.contiguous()
+    hc_fn = hc_fn.contiguous()
     T, hc_mult, hidden_size = residual.shape
     k_total = hc_mult * hidden_size
     assert hc_fn.dtype == torch.float32 and hc_fn.shape == (2 * hc_mult, k_total)
@@ -776,7 +782,6 @@ def hy4_ihc_post_pre_norm(
     use_dot = (
         T >= _IHC_DOT_MIN_T and 2 * hc_mult <= 16 and residual.dtype == torch.bfloat16
     )
-    fn3 = _split_hc_fn(hc_fn) if use_dot else None
     if use_dot:
         block_k = _IHC_DOT_POST_CONFIG[1] if output is not None else _IHC_DOT_BLOCK_K
     else:
@@ -822,7 +827,6 @@ def hy4_ihc_post_pre_norm(
             BLOCK_T=block_t,
             OUT_NORM=out_norm_weight is not None,
             BLOCK_H=triton.next_power_of_2(hidden_size),
-            fn3_ptr=fn3,
             USE_DOT=use_dot,
             num_warps=warps,
             **common,
@@ -838,7 +842,6 @@ def hy4_ihc_post_pre_norm(
                 T,
                 BLOCK_T=block_t,
                 num_warps=_IHC_TOKEN_WARPS,
-                fn3_ptr=fn3,
                 USE_DOT=use_dot,
                 **common,
             )

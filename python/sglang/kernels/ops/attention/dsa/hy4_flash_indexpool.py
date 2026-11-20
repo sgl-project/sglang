@@ -762,6 +762,7 @@ def indexpool_expand(
         return out
     ragged = ragged_offsets is not None
     k = picked.shape[1]
+    assert (k + 1) * 4 <= topk, f"{k} picked groups and the tail exceed topk {topk}"
     _expand_kernel[(rows,)](
         picked,
         values,
@@ -815,6 +816,7 @@ def _window_kernel(
 
 
 def window_indices(positions, pages, row_to_batch, ragged_offsets, window, topk):
+    assert window <= topk, f"window {window} exceeds topk {topk}"
     rows = positions.shape[0]
     out = torch.empty((rows, topk), dtype=torch.int32, device=positions.device)
     if rows == 0:

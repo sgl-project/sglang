@@ -160,11 +160,11 @@ def hy4_flash_engram_combine(
     """hidden + per-stream gate x normalized value; kv: [T, (HC + 1) * H] (keys
     then value), hidden: [T, HC, H], hashes: [T, n_hash] of this layer."""
     tokens, hc, hidden_size = hidden.shape
+    hidden = hidden.contiguous()
     out = torch.empty_like(hidden)
     if tokens == 0:
         return out
     kv = kv.contiguous()
-    hidden = hidden.contiguous()
     assert kv.shape == (tokens, (hc + 1) * hidden_size)
     assert hashes.stride(1) == 1
     _engram_combine_kernel[(tokens,)](
