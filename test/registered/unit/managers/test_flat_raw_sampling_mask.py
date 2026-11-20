@@ -180,6 +180,18 @@ class TestSamplingOutputMetaInfo(CustomTestCase):
                         fields["output_sampling_mask_logprobs"], [[], [], []]
                     )
 
+    def test_unfiltered_zero_output_request_has_no_sampling_logprob(self):
+        """A max_new_tokens=0 request batched with a generating one keeps the
+        logprob of the token sampled after its prompt. It emits no token, so its
+        sampling logprobs must be as empty as its mask rows."""
+        state = _make_state(filters_sampling=False)
+        state.output_token_logprobs_val.append(-1.5)
+
+        fields = _meta_info(state, [None], finished=True, num_output_tokens=0)
+
+        self.assertEqual(fields["output_token_sampling_logprobs"], [])
+        self.assertEqual(fields["output_sampling_mask_logprobs"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

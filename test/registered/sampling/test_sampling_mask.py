@@ -917,6 +917,10 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
                     {"max_new_tokens": 0, **sampling_params}
                 )
                 self.assertEqual(output["meta_info"]["completion_tokens"], 0)
+                self.assertEqual(output["output_ids"], [])
+                self.assertEqual(
+                    output["meta_info"]["output_token_sampling_logprobs"], []
+                )
 
 
 class TestSamplingMaskRlOnPolicy(SamplingMaskTestMixin, CustomTestCase):

@@ -605,7 +605,9 @@ def _add_sampling_output_to_meta_info(
         meta_info["output_token_sampling_logprobs"] = (
             state.output_token_sampling_logprobs
             if obj.filters_sampling
-            else state.output_token_logprobs_val
+            # A request that emits no token still has the logprob of the token
+            # sampled after its prompt, when its batch sampled.
+            else state.output_token_logprobs_val[:num_output_tokens]
         )
     if obj.return_flat_raw_sampling_mask:
         # Built once on the finished response; streaming is rejected.
