@@ -2960,6 +2960,36 @@ class TestHiCacheArgs(CustomTestCase):
                 expected_decode_backend,
             )
 
+    def test_host_memory_mode_default_on_shared_memory_gpu(self):
+        """On a GPU that shares memory with the host, an unset mode resolves
+        to buffer_only with a small staging buffer when a storage backend is
+        set; an explicit mode or size, no backend, or a discrete GPU keeps
+        the given or default sizing."""
+        file = {"hicache_storage_backend": "file"}
+        cases = [
+            # (integrated, overrides, expected mode, expected hicache_size)
+            (True, file, "buffer_only", 4),
+            (True, dict(file, hicache_size=8), "buffer_only", 8),
+            (True, {}, "cache", 0),
+            (True, dict(file, hicache_host_memory_mode="cache"), "cache", 0),
+            (False, file, "cache", 0),
+        ]
+        for integrated, overrides, expected, expected_size in cases:
+            with self.subTest(integrated=integrated, overrides=overrides):
+                with patch(
+                    "sglang.srt.arg_groups.hicache_hook._gpu_shares_host_memory",
+                    return_value=integrated,
+                ):
+                    args = self._make_args(enable_hierarchical_cache=True, **overrides)
+                self.assertEqual(
+                    resolution_result(args, "hicache_host_memory_mode"), expected
+                )
+                self.assertEqual(
+                    resolution_result(args, "hicache_ratio"),
+                    1.2 if expected == "buffer_only" else 2.0,
+                )
+                self.assertEqual(resolution_result(args, "hicache_size"), expected_size)
+
     def test_buffer_only_accepts_both_tree_cores(self):
         for backend in ("python", "rust"):
             args = self._make_args(

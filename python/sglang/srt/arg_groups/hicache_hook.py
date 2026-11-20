@@ -12,6 +12,8 @@ from sglang.srt.arg_groups.overrides import declare_resolution
 logger = logging.getLogger(__name__)
 
 UNIFIED_KEY_SCHEME_STORAGE_BACKENDS = ("file", "mooncake")
+# buffer_only staging size when the GPU shares memory with the host.
+_SHARED_MEMORY_STAGING_GB = 4
 
 
 def handle_hicache(server_args: Any):
@@ -84,6 +86,7 @@ def handle_hicache(server_args: Any):
     ):
         return
 
+    resolve_hicache_host_memory_mode(server_args)
     validate_hicache_host_memory_mode(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:
@@ -128,6 +131,7 @@ def handle_hicache_ratio_default(server_args: Any):
     An explicit --hicache-ratio or --hicache-size is honored as given, so it
     resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
+    resolve_hicache_host_memory_mode(server_args)
     cfg = resolving_view(server_args)
     fraction = cfg.hicache_host_memory_fraction
     if fraction is not None and not 0 < fraction <= 1:
@@ -141,6 +145,62 @@ def handle_hicache_ratio_default(server_args: Any):
         fields["hicache_host_memory_fraction"] = None
     if fields:
         declare_resolution(server_args, "_handle_hicache_ratio_default", **fields)
+
+
+def _gpu_shares_host_memory(server_args: Any) -> bool:
+    """True on an integrated GPU (GB10 / DGX Spark) whose device memory is host
+    memory. A Grace-coupled discrete GPU (GH200, GB200) reports False."""
+    cfg = resolving_view(server_args)
+    if cfg.device not in (None, "cuda"):
+        return False
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    return bool(torch.cuda.get_device_properties(0).is_integrated)
+
+
+def resolve_hicache_host_memory_mode(server_args: Any):
+    """Default --hicache-host-memory-mode when the user left it unset.
+
+    On a GPU that shares memory with the host, an L2 host tier is carved from
+    the same memory as the GPU KV pool, so with an L3 backend the host pool
+    should only stage transfers (buffer_only).
+    """
+    cfg = resolving_view(server_args)
+    if cfg.hicache_host_memory_mode is not None:
+        return
+    mode = "cache"
+    fields = {}
+    if cfg.enable_hierarchical_cache and _gpu_shares_host_memory(server_args):
+        if cfg.hicache_storage_backend is None:
+            logger.warning(
+                "HiCache on a GPU that shares memory with the host: the host "
+                "tier competes with the GPU KV pool instead of adding to it. "
+                "Consider --hicache-storage-backend."
+            )
+        elif cfg.disaggregation_mode != "decode" and cfg.dcp_size <= 1:
+            mode = "buffer_only"
+            if cfg.hicache_ratio is None and cfg.hicache_size <= 0:
+                # A ratio of the GPU pool would still carve tens of GB from
+                # the shared memory; a fixed staging buffer is enough.
+                fields["hicache_size"] = _SHARED_MEMORY_STAGING_GB
+            logger.info(
+                "HiCache on a GPU that shares memory with the host: defaulting "
+                "--hicache-host-memory-mode to buffer_only%s; pass "
+                "--hicache-host-memory-mode cache to keep a host tier.",
+                (
+                    f" with a {_SHARED_MEMORY_STAGING_GB} GB staging buffer"
+                    if "hicache_size" in fields
+                    else ""
+                ),
+            )
+    declare_resolution(
+        server_args,
+        "resolve_hicache_host_memory_mode",
+        hicache_host_memory_mode=mode,
+        **fields,
+    )
 
 
 def resolve_hicache_dcp_compatibility(server_args: Any):
