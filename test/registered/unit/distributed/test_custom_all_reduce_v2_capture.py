@@ -54,3 +54,7 @@ def test_disabled_capture_does_not_build_communicator():
         with comm.capture():
             pass
     obj.assert_not_called()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
