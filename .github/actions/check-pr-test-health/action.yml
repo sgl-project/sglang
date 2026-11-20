@@ -38,17 +38,39 @@ runs:
             return;
           }
 
+          // The installation quota is shared across jobs. A short wait at the
+          // published reset can recover a read without bypassing this check.
+          let waitedForQuota = false;
+          async function readWithQuotaReset(read) {
+            try {
+              return await read();
+            } catch (error) {
+              const headers = error.response?.headers;
+              const reset = Number(headers?.['x-ratelimit-reset']);
+              const waitMs = Math.max(0, reset * 1000 - Date.now()) + 1000;
+              if (waitedForQuota || ![403, 429].includes(error.status) ||
+                  headers?.['x-ratelimit-remaining'] !== '0' ||
+                  !Number.isSafeInteger(reset) || reset <= 0 || waitMs > 120_000) {
+                throw error;
+              }
+              waitedForQuota = true;
+              core.info(`[health-check] Installation quota exhausted. Retrying the read in ${Math.ceil(waitMs / 1000)}s.`);
+              await require('node:timers/promises').setTimeout(waitMs);
+              return read();
+            }
+          }
+
           // Check lint status from the separate Lint workflow (lint.yml).
           // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
           // checks.listForRef which queries by commit SHA across ALL workflows.
           const ref = context.payload.pull_request?.head?.sha || context.sha;
           core.info(`[health-check] Checking lint for ref=${ref}`);
-          const { data } = await github.rest.checks.listForRef({
+          const { data } = await readWithQuotaReset(() => github.rest.checks.listForRef({
             owner: context.repo.owner,
             repo: context.repo.repo,
             ref: ref,
             check_name: 'lint',
-          });
+          }));
           const lintRun = data.check_runs.find(
             cr => cr.app?.slug === 'github-actions'
           );
@@ -69,12 +91,12 @@ runs:
             return;
           }
 
-          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+          const jobs = await readWithQuotaReset(() => github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
             run_id: context.runId,
             per_page: 100,
-          });
+          }));
           core.info(`[health-check] Total jobs in run: ${jobs.length}`);
           const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
           core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
@@ -125,10 +147,15 @@ runs:
               return false;
             }
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
+            const testStepNames = ['Run diffusion suite', 'Run pre-suite commands', 'Run test'];
+            // a disconnected runner leaves its active test step in_progress on a failed job
+            const interruptedTestStep = !failedStep && (j.steps || []).some(s =>
+              testStepNames.includes(s.name) && s.status === 'in_progress' && s.conclusion === null
+            );
             if (
               independentTestJobPrefix && j.name.startsWith(independentTestJobPrefix) &&
               // pre-suite commands also run architecture-specific numerical tests
-              ['Run diffusion suite', 'Run pre-suite commands', 'Run test'].includes(failedStep?.name)
+              (testStepNames.includes(failedStep?.name) || interruptedTestStep)
             ) {
               core.info(`[health-check] Collecting independent test failure: ${j.name}`);
               return false;

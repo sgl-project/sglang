@@ -2,7 +2,9 @@
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use itertools::izip;
@@ -72,6 +74,23 @@ impl From<&ServerArgs> for GenerationPolicy {
     }
 }
 
+/// Whether Python reads `value` (one value, or one per prompt) as set: `set`
+/// holds for the value, or for the entry of one of a batch's `n` prompts
+/// (Python reads no entry past them). A list sent with a single prompt is set
+/// unless empty, as Python tests the list itself.
+fn is_set<T: OneOrManyItem>(
+    value: Option<OneOrMany<T>>,
+    batch: Option<usize>,
+    set: impl Fn(&T) -> bool,
+) -> bool {
+    match (value, batch) {
+        (None, _) => false,
+        (Some(OneOrMany::One(item)), _) => set(&item),
+        (Some(OneOrMany::Many(items)), Some(n)) => items.iter().take(n).any(set),
+        (Some(OneOrMany::Many(items)), None) => !items.is_empty(),
+    }
+}
+
 pub fn into_requests(
     req: api_v1::GenerateRequest,
     policy: &GenerationPolicy,
@@ -107,14 +126,26 @@ pub fn into_requests(
         kv_hints,
         extra_key,
         cache_salt,
+        session_id,
         session_params,
+        custom_logit_processor,
+        return_sampling_mask,
         ..
     } = req;
-    if session_params.is_some() {
+    // Python's `SessionParams(**obj.session_params)`: an object with these
+    // fields only, and never alongside the top-level `session_id`.
+    let session_params = session_params
+        .map(|text| SessionParams::parse(&text))
+        .transpose()
+        .map_err(Error::Validation)?;
+    if session_id.is_some() && session_params.is_some() {
         return Err(Error::Validation(
-            "session_params is not supported by the Rust server".into(),
+            "session_id and session_params cannot both be set.".into(),
         ));
     }
+    let in_session = session_params
+        .as_ref()
+        .is_some_and(|params| params.id.is_some());
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
     let input_ids = input_ids.and_then(wire::token_ids_or_list);
@@ -189,7 +220,9 @@ pub fn into_requests(
         // `n == 0` guard below never sees it — reject it here, as Python's
         // `_determine_batch_size` does.
         (None, Some(OneOrMany::One(x))) => {
-            if x.is_empty() {
+            // Inside a session the history may supply the whole prompt; the
+            // scheduler rejects a request still empty after reconstruction.
+            if x.is_empty() && !in_session {
                 return Err(Error::Validation("input_ids cannot be empty".into()));
             }
             (vec![None], vec![Some(x)], false)
@@ -209,6 +242,33 @@ pub fn into_requests(
         return Err(Error::Validation(
             "batch must contain at least one item".into(),
         ));
+    }
+    // Python acts on these, so dropping one would silently change the answer:
+    // a value Python reads as set is a 400, and one it reads as unset passes:
+    // `null`, `false`, an empty processor name, or a batch's list of those.
+    let batch = is_batch.then_some(n);
+    let unsupported = [
+        (
+            "custom_logit_processor",
+            is_set(
+                custom_logit_processor.and_then(wire::optional_string_or_list),
+                batch,
+                |name| name.as_deref().is_some_and(|name| !name.is_empty()),
+            ),
+        ),
+        (
+            "return_sampling_mask",
+            is_set(
+                return_sampling_mask.and_then(wire::bool_or_list),
+                batch,
+                |&on| on,
+            ),
+        ),
+    ];
+    if let Some((field, _)) = unsupported.iter().find(|(_, set)| *set) {
+        return Err(Error::Validation(format!(
+            "{field} is not supported by the Rust server"
+        )));
     }
 
     // A list is per-item; a single object broadcasts to every item.
@@ -258,16 +318,26 @@ pub fn into_requests(
     // detok table. `client_facing` strips it back off for `meta_info.id`, so the
     // client sees exactly what it sent. Minted rids (`Rid::default`) are already
     // unique and are left bare.
+    //
+    // A session turn is the exception: the scheduler keys the session's turns
+    // by rid, and a later turn names one through `session_params.rid`, so the
+    // client's rid must reach the scheduler as sent. A collision is then the
+    // client's to avoid, as it is under Python.
+    let client_rid = |r: &str| {
+        if in_session {
+            Rid::from(r.to_owned())
+        } else {
+            Rid::from_client(r)
+        }
+    };
     let rids: Vec<Rid> = match rid {
         None => (0..n).map(|_| Rid::default()).collect(),
-        Some(OneOrMany::One(r)) if !is_batch => vec![Rid::from_client(&r)],
+        Some(OneOrMany::One(r)) if !is_batch => vec![client_rid(&r)],
         Some(OneOrMany::One(r)) => {
             check_broadcast_budget(r.len(), n, "rid")?;
             // Uniquify AFTER the `_{i}` split, so the split index stays part of
             // the rid the client gets back.
-            (0..n)
-                .map(|i| Rid::from_client(&format!("{r}_{i}")))
-                .collect()
+            (0..n).map(|i| client_rid(&format!("{r}_{i}"))).collect()
         }
         Some(OneOrMany::Many(v)) => {
             if !is_batch || v.len() != n {
@@ -291,7 +361,7 @@ pub fn into_requests(
                     )));
                 }
             }
-            v.iter().map(|r| Rid::from_client(r)).collect()
+            v.iter().map(|r| client_rid(r)).collect()
         }
     };
 
@@ -441,7 +511,8 @@ pub fn into_requests(
                 // `Some` here means "these ids were requested", so an empty list
                 // collapses to None.
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
+                // A client that asks for the mask is refused above.
+                return_sampling_mask: false,
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
                 bootstrap_host,
@@ -454,12 +525,15 @@ pub fn into_requests(
                 extra_key,
                 cache_salt,
                 lora_id,
+                session_id: session_id.clone(),
+                session_params: session_params.clone(),
                 routing_key: routing_key.clone(),
                 priority,
                 require_reasoning: require_reasoning.unwrap_or(false),
                 kv_hints,
                 mm: pack_mm(image_data, video_data, audio_data),
                 mm_buffers: Vec::new(),
+                dispatch_finish_time: DispatchFinishTime::default(),
             }
         },
     )
@@ -665,6 +739,12 @@ pub struct GenerateRequest {
     /// accepts the preloaded adapter identifier; dynamic LoRA loading remains
     /// owned by the Python registry and is intentionally not implied here.
     pub lora_id: Option<String>,
+    /// Python's top-level `session_id`: a radix-native session
+    /// (`--enable-session-radix-cache`).
+    pub session_id: Option<String>,
+    /// Python's `session_params`: this turn's place in a session opened
+    /// with `/open_session`.
+    pub session_params: Option<SessionParams>,
     pub routing_key: Option<String>,
     pub priority: Option<i64>,
     pub require_reasoning: bool,
@@ -678,6 +758,91 @@ pub struct GenerateRequest {
     /// per-item metadata, already placed inline or in shm. Pushed to the scheduler channel
     /// with the request by [`take_buffers`](Self::take_buffers).
     pub mm_buffers: Vec<Buffer>,
+    /// When the request was handed to the scheduler, set by the stage that
+    /// pushes it.
+    pub dispatch_finish_time: DispatchFinishTime,
+}
+
+/// When a request was handed to the scheduler channel: Python's
+/// `APIServerReqTimeStats.api_server_dispatch_finish_time`, as wall time. A
+/// shared cell, so a [`crate::GenerateHook`] that saw the request before it
+/// moved on reads it later.
+///
+/// The stage that pushes the request stamps it just before the push, so the
+/// stamp is in place before any response to the request exists, and clears it
+/// when the push is refused.
+#[derive(Clone, Debug, Default)]
+pub struct DispatchFinishTime(Arc<AtomicU64>);
+
+impl DispatchFinishTime {
+    pub fn get(&self) -> Option<SystemTime> {
+        match self.0.load(Ordering::Acquire) {
+            0 => None,
+            nanos => Some(UNIX_EPOCH + Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// Stamp now, in nanoseconds since the epoch (0 means unstamped).
+    pub fn set_now(&self) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(1, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            })
+            .max(1);
+        self.0.store(nanos, Ordering::Release);
+    }
+
+    /// Unstamp a request whose push was refused: it was never dispatched.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+/// Python's `SessionParams`: where a turn sits in its session. Positional on
+/// the wire (`array_like=True`): `[id, rid, offset, replace,
+/// drop_previous_output]`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionParams {
+    /// The session to continue; `None` makes a stateless request.
+    pub id: Option<String>,
+    /// The turn (by its rid) to continue from.
+    pub rid: Option<String>,
+    /// Token-level insertion point into the accumulated context.
+    pub offset: Option<i64>,
+    /// Unsupported by the scheduler, which rejects a request setting it.
+    pub replace: Option<bool>,
+    /// Drop the previous turn's generated tokens from the context.
+    pub drop_previous_output: Option<bool>,
+}
+
+impl SessionParams {
+    /// Python's `SessionParams(**session_params)`: an object with these
+    /// fields; `null` is no session.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(serde_json::Value::Null) => Ok(Self::default()),
+            Ok(value @ serde_json::Value::Object(_)) => {
+                serde_json::from_value(value).map_err(|error| format!("session_params: {error}"))
+            }
+            Ok(_) => Err("session_params: Input should be a valid dictionary".into()),
+            Err(error) => Err(format!("session_params: {error}")),
+        }
+    }
+}
+
+impl serde::Serialize for SessionParams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(5)?;
+        tuple.serialize_element(&self.id)?;
+        tuple.serialize_element(&self.rid)?;
+        tuple.serialize_element(&self.offset)?;
+        tuple.serialize_element(&self.replace)?;
+        tuple.serialize_element(&self.drop_previous_output)?;
+        tuple.end()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -881,21 +1046,6 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 /// Reject `n` copies of one prompt (chat's `n` choices) before they are
 /// cloned: the batch cap, and the clone budget a broadcast is held to for its
 /// `ids` plus the list `fields` copied with them.
-/// Python's deprecated spelling (`GenerateReqInput.normalize_batch_and_arguments`):
-/// a set `data_parallel_rank` names the DP rank when `routed_dp_rank` does
-/// not, and is dropped either way.
-pub(crate) fn move_deprecated_dp_rank(fields: &mut serde_json::Map<String, serde_json::Value>) {
-    if let Some(rank) = fields
-        .remove("data_parallel_rank")
-        .filter(|rank| !rank.is_null())
-        && fields
-            .get("routed_dp_rank")
-            .is_none_or(serde_json::Value::is_null)
-    {
-        fields.insert("routed_dp_rank".into(), rank);
-    }
-}
-
 pub(crate) fn check_prompt_copies(
     ids: usize,
     fields: &[&serde_json::Value],
@@ -1232,16 +1382,22 @@ mod tests {
     /// declared and dropped by hand just to let `bench_serving` through.
     /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
     /// behavior; a typo being silently ignored is the same trade Python makes.
-    /// The exception is `session_params`: dropping it would silently change the
-    /// answer, so a non-null value is a 400 (as Python's is without that
-    /// session), and `null` passes.
+    /// `session_id` only names a radix-native session, which this server does
+    /// not run, so Python without `--enable-session-radix-cache` ignores it too.
+    /// The exceptions are the fields Python acts on, where dropping one would
+    /// silently change the answer: `custom_logit_processor` and
+    /// `return_sampling_mask` are a 400 when Python reads them as set, and
+    /// pass when it reads them as unset (`null`, `false`, `""`, or a batch's
+    /// list of those; a list sent with one prompt is set).
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
             r#""session_id": "s""#,
             r#""session_params": null"#,
-            r#""return_sampling_mask": true"#,
-            r#""custom_logit_processor": "cls""#,
+            r#""return_sampling_mask": false"#,
+            r#""return_sampling_mask": null"#,
+            r#""custom_logit_processor": null"#,
+            r#""custom_logit_processor": """#,
             r#""lora_path": null"#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
@@ -1255,10 +1411,80 @@ mod tests {
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
         }
-        let field = r#""session_params": {"id": "s"}"#;
-        let body = format!(r#"{{"text": "hi", {field}}}"#);
-        let err = requests(&body).unwrap_err().to_string();
-        assert!(err.contains("not supported"), "{field}: {err}");
+        // Python reads no entry past the batch's prompts.
+        let batch = r#""text": ["a", "b"], "return_sampling_mask": [false, false, true], "custom_logit_processor": [null, null, "cls"]"#;
+        assert_eq!(requests(&format!("{{{batch}}}")).unwrap().0.len(), 2);
+        for (field, body) in [
+            (
+                "custom_logit_processor",
+                r#""text": "hi", "custom_logit_processor": "cls""#,
+            ),
+            (
+                "custom_logit_processor",
+                r#""text": ["a", "b"], "custom_logit_processor": [null, "cls"]"#,
+            ),
+            (
+                "return_sampling_mask",
+                r#""text": "hi", "return_sampling_mask": true"#,
+            ),
+            (
+                "return_sampling_mask",
+                r#""text": ["a", "b"], "return_sampling_mask": [false, true]"#,
+            ),
+            (
+                "custom_logit_processor",
+                r#""text": "hi", "custom_logit_processor": [null]"#,
+            ),
+            (
+                "return_sampling_mask",
+                r#""text": "hi", "return_sampling_mask": [false]"#,
+            ),
+        ] {
+            let err = requests(&format!("{{{body}}}")).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("{field} is not supported by the Rust server"),
+                "{body}"
+            );
+        }
+    }
+
+    /// A session turn carries Python's `SessionParams`, keeps the client's
+    /// rid as sent (the scheduler keys the session's turns by it), may send
+    /// no input (the history supplies it), and never also sets the
+    /// top-level `session_id`; an unknown key or a non-object is a 400.
+    #[test]
+    fn session_params_are_parsed_and_keep_the_clients_rid() {
+        let body = r#"{"rid": "turn-2", "input_ids": [], "session_params": {"id": "s", "rid": "turn-1", "offset": -1, "drop_previous_output": true}}"#;
+        let (ps, _) = requests(body).unwrap();
+        assert_eq!(
+            ps[0].rid.as_str(),
+            "turn-2",
+            "no uniquifier inside a session"
+        );
+        assert_eq!(
+            ps[0].session_params,
+            Some(SessionParams {
+                id: Some("s".into()),
+                rid: Some("turn-1".into()),
+                offset: Some(-1),
+                replace: None,
+                drop_previous_output: Some(true),
+            })
+        );
+        assert_eq!(ps[0].input_ids.as_deref(), Some([].as_slice()));
+        let (ps, _) = requests(r#"{"text": "hi", "rid": "r", "session_id": "s"}"#).unwrap();
+        assert_eq!(ps[0].session_id.as_deref(), Some("s"));
+        assert_eq!(ps[0].rid.client_facing(), "r");
+        assert_ne!(ps[0].rid.as_str(), "r", "uniquified outside a session");
+        for body in [
+            r#"{"text": "hi", "session_id": "s", "session_params": {"id": "s"}}"#,
+            r#"{"text": "hi", "session_params": {"id": "s", "bogus": 1}}"#,
+            r#"{"text": "hi", "session_params": [1]}"#,
+            r#"{"input_ids": [], "session_params": {"rid": "t"}}"#,
+        ] {
+            assert!(requests(body).is_err(), "{body}");
+        }
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

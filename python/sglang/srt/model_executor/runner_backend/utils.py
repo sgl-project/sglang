@@ -54,8 +54,12 @@ def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
     # Captured metadata in unrelated backends (e.g. DeepSeek V4) does not mean
     # they capture KDA state reads and need this mechanism.
     backend = model_runner.attn_backend
+    memory = get_memory()
+    loads_layer_wise = (
+        memory.enable_hierarchical_cache or memory.enable_unified_cache_external_linker
+    )
     if not (
-        get_memory().enable_hierarchical_cache
+        loads_layer_wise
         and backend.use_captured_forward_metadata_for_breakable_cuda_graph
     ):
         return False
@@ -141,6 +145,23 @@ def resolve_prefill_backend(
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
+    enable_memory_saver = get_exec().features.enable_memory_saver
+
+    if model_runner.device == "npu":
+        if backend_name != Backend.BREAKABLE:
+            raise ValueError(
+                f"NPU prefill graph only supports 'breakable', got '{backend_name}'"
+            )
+        from sglang.srt.hardware_backend.npu.graph_runner.breakable_npu_graph_backend import (
+            BreakableNPUGraphBackend,
+        )
+
+        return BreakableNPUGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=enable_memory_saver,
+            debug_eager=get_exec().graph.debug_cuda_graph,
+        )
+
     if model_runner.device == "xpu" and backend_name == Backend.FULL:
         from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
             FullXPUGraphBackend,
@@ -155,7 +176,7 @@ def resolve_prefill_backend(
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_memory_saver=enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
             enable_hicache_event_capture=_needs_hicache_event_capture(
                 cuda_graph_runner.model_runner
@@ -164,7 +185,7 @@ def resolve_prefill_backend(
     if backend_name == Backend.FULL:
         return FullCudaGraphBackend(
             cuda_graph_runner,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_memory_saver=enable_memory_saver,
             reuse_output_buffer=True,
         )
     raise ValueError(f"Unsupported prefill graph backend: {backend_name}")

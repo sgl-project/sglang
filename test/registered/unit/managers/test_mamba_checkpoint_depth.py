@@ -278,18 +278,32 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         from sglang.srt.managers.schedule_batch import prefill_checkpoint_boundary
         from sglang.srt.managers.schedule_policy import SchedulePolicy
 
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         policy = object.__new__(SchedulePolicy)
         policy.policy = CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
+        policy.shortest_prefill_aging_factor = 0.0
         adder = self._adder(strict=True)
         prompt, prefix, chunks = 4096, 0, []
         while prefix < prompt:
             chunked = SimpleNamespace(
-                full_untruncated_fill_ids=[0] * prompt, prefix_len=prefix
+                full_untruncated_fill_ids=[0] * prompt,
+                prefix_len=prefix,
+                arrival_processed_tokens=0,
             )
             arrival = SimpleNamespace(
-                origin_input_ids=[0] * 32, output_ids=[], num_matched_prefix_tokens=0
+                origin_input_ids=[0] * 32,
+                output_ids=[],
+                num_matched_prefix_tokens=0,
+                cache_request_handle=None,
+                arrival_processed_tokens=0,
             )
-            limit = policy.shortest_prefill_chunk_limit(chunked, [arrival], 64, 16)
+            limit = policy.shortest_prefill_chunk_limit(
+                chunked, [arrival], 64, 16, processed_tokens=0
+            )
             self.assertEqual(limit, 32)
             remaining = prompt - prefix
             limit = adder.grid_continuation_limit(limit, remaining)
