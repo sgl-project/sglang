@@ -1,4 +1,5 @@
 import sys
+from collections import defaultdict
 from itertools import accumulate
 from types import MethodType, ModuleType, SimpleNamespace
 
@@ -1751,6 +1752,91 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
                     torch.testing.assert_close(
                         value, getattr(ref.indexer_metadata, key), rtol=0, atol=0
                     )
+
+
+def test_qsa_graph_metadata_replays_reuse_one_variant(monkeypatch):
+    """Replay passes the graph bucket as bs and its padding rows as num_padding;
+    all of them must reuse one compiled variant of each metadata kernel."""
+    from sglang.srt.layers.attention.qsa import graph_metadata
+
+    kernels = (
+        graph_metadata._qsa_graph_row_metadata_kernel,
+        graph_metadata._qsa_graph_layout_kernel,
+        graph_metadata._qsa_draft_graph_metadata_kernel,
+    )
+    for kernel in kernels:
+        monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    pages, ratio = 32, 4
+    pool = SimpleNamespace(qsa_compress_ratio=ratio, qsa_compressed_page_size=16)
+    table = torch.arange(34 * pages * 64, dtype=torch.int32, device="cuda")
+    table = table.reshape(34, -1)
+
+    def buffers(rows):
+        def i32(*shape):
+            return torch.zeros(shape, dtype=torch.int32, device="cuda")
+
+        indexer = SimpleNamespace(
+            graph_compressed_lengths=i32(rows),
+            graph_write_locs=i32(rows),
+            graph_compressed_page_table=i32(rows, pages),
+            decode_logical_positions=i32(rows),
+            pending_ring_slots=torch.zeros(rows, dtype=torch.int64, device="cuda"),
+            graph_ring_group_locs=i32(rows, ratio),
+            graph_prefix_lengths=i32(rows),
+            compress_ratio=ratio,
+        )
+        return SimpleNamespace(
+            sequence_lengths=i32(rows),
+            row_req_pool_indices=i32(rows),
+            indexer_metadata=indexer,
+        )
+
+    # bs and num_padding each cover 1, multiples of 16 and other values.
+    cases = ((1, 0), (16, 0), (16, 1), (17, 3), (32, 16), (24, 7))
+    for bs, num_padding in cases:
+        seq = torch.full((bs,), 300, dtype=torch.int64, device="cuda")
+        reqs = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
+        common = dict(
+            bs=bs,
+            seq_lens=seq,
+            req_pool_indices=reqs,
+            extend_len=0,
+            num_padding=num_padding,
+            req_to_token=table,
+            pool=pool,
+        )
+        decode = buffers(bs)
+        graph_metadata.launch_graph_metadata(
+            mode=0,
+            num_rows=bs,
+            extend_lens=None,
+            metadata=decode,
+            seq_offset=1,
+            **common,
+        )
+        graph_metadata.launch_graph_metadata(
+            mode=2,
+            num_rows=2 * bs,
+            extend_lens=torch.full((bs,), 2, dtype=torch.int32, device="cuda"),
+            metadata=buffers(2 * bs),
+            **common,
+        )
+        draft = buffers(bs)
+        graph_metadata.launch_draft_graph_metadata(
+            graph_metadata.prepare_draft_graph_metadata([draft], table, pool),
+            seq,
+            reqs,
+            bs,
+            num_padding,
+        )
+        for key, value in vars(draft.indexer_metadata).items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(value, getattr(decode.indexer_metadata, key))
+        assert torch.equal(draft.sequence_lengths, decode.sequence_lengths)
+    device = torch.cuda.current_device()
+    counts = [len(kernel.device_caches[device][0]) for kernel in kernels]
+    # The row-metadata kernel compiles once per MODE (0 and 2).
+    assert counts == [2, 1, 1]
 
 
 @pytest.mark.parametrize("strided", [False, True])
