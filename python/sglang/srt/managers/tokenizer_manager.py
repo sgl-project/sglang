@@ -204,9 +204,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import (
-    resolve_watermark_request,
-)
+from sglang.srt.sampling.watermarking.runtime import watermark_request_enabled
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -245,16 +243,7 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
-    watermark = sampling_params.watermark
-    features = get_exec().features
-    _, _, enabled = resolve_watermark_request(
-        watermark,
-        server_enabled=features.enable_watermark,
-        default_key=features.watermark_key,
-        default_context_window=features.watermark_context_window,
-        default_enabled=features.watermark_default_enabled,
-        enforce_all=features.watermark_enforce_all,
-    )
+    enabled = watermark_request_enabled(sampling_params)
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
 
@@ -1678,7 +1667,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not isinstance(token_ids_logprob, list):
             raise ValueError("token_ids_logprob must be a flat list of integers.")
-        vocab_size = self.model_config.vocab_size
+        vocab_size = self.model_config.token_id_vocab_size
         for token_id in token_ids_logprob:
             if not isinstance(token_id, int):
                 raise ValueError("token_ids_logprob must be a flat list of integers.")
@@ -1776,7 +1765,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.model_config.vocab_size)
+        sampling_params.verify(self.model_config.token_id_vocab_size)
         _validate_watermark_request(sampling_params)
 
         # Build return object
@@ -2479,9 +2468,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.sampling_params = (
+                        tokenized_obj.sampling_params.for_sample(sample_index)
+                    )
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)

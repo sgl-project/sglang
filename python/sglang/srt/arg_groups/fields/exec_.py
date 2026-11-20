@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
     reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -88,8 +89,15 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_watermark: A[
         bool,
-        "Enable Aaronson-Gumbel text watermarking.",
+        "Enable text watermarking with the algorithm --watermark-algorithm selects.",
     ] = False
+    watermark_algorithm: A[
+        str,
+        Arg(
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel).",
+            choices=WATERMARK_ALGORITHM_CHOICES,
+        ),
+    ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
