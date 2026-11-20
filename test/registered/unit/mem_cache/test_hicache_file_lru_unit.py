@@ -404,6 +404,65 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
         self.assertFalse(b.exists("victim"))
         self.assertTrue(b.exists("newk"))
 
+    def test_refuses_when_pending_write_consumes_free_space_headroom(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        b._evictor._fs_stats = lambda: (1024, 150)
+        suffixed_a = b._get_suffixed_key("a")
+
+        self.assertTrue(b._evictor.reserve(suffixed_a, 40, key="a"))
+        # 150 - (40 pending + 40 new) = 70 < 100 -> must refuse; 10 B still fits.
+        self.assertFalse(b.set("b", _t(40)))
+        self.assertFalse(b.exists("b"))
+        self.assertTrue(b.set("small", _t(10)))
+        self.assertTrue(b.exists("small"))
+        b._evictor.commit(suffixed_a)
+
+    def test_evicts_to_cover_pending_writes_and_new_write(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        suffixed_victim = b._get_suffixed_key("victim")
+        path = os.path.join(b.file_path, f"{suffixed_victim}.bin")
+        with open(path, "wb") as f:
+            f.write(b"v" * 40)
+        b._evictor._lru[suffixed_victim] = 40
+        b._evictor._total_bytes = 40
+
+        free = [150]
+        original_remove = os.remove
+
+        def tracked_remove(p):
+            if os.path.exists(p):
+                free[0] += os.path.getsize(p)
+            return original_remove(p)
+
+        suffixed_a = b._get_suffixed_key("a")
+        with (
+            mock.patch.object(
+                b._evictor, "_fs_stats", side_effect=lambda: (1024, free[0])
+            ),
+            mock.patch("os.remove", side_effect=tracked_remove),
+        ):
+            self.assertTrue(b._evictor.reserve(suffixed_a, 40, key="a"))
+            # 150 - (40 pending + 40 new) = 70 < 100 -> evict 40 B victim
+            # (free -> 190, 190 - 80 = 110 >= 100) while keeping "a" pending.
+            self.assertTrue(b.set("b", _t(40)))
+
+        self.assertFalse(b.exists("victim"))
+        self.assertIn(suffixed_a, b._evictor._pending_writes)
+        self.assertTrue(b.exists("b"))
+        b._evictor.commit(suffixed_a)
+
+    def test_aborted_pending_write_releases_free_space_reservation(self):
+        b = self.make_backend(max_size="0", min_free="100")
+        b._evictor._fs_stats = lambda: (1024, 150)
+        suffixed_a = b._get_suffixed_key("a")
+
+        self.assertTrue(b._evictor.reserve(suffixed_a, 40, key="a"))
+        self.assertFalse(b.set("b", _t(40)))
+
+        b._evictor.abort(suffixed_a)
+        self.assertTrue(b.set("b", _t(40)))
+        self.assertTrue(b.exists("b"))
+
 
 class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
     def test_pre_reservation_visible_during_write(self):
