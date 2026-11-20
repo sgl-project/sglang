@@ -75,8 +75,8 @@ def _jit_spec_module(
 
 
 # Mirrors the static_asserts in kvcacheio/hisparse_spec.cuh.
-SPEC_SWAP_MAX_STEPS = 8
-SPEC_SWAP_MAX_OCCURRENCES = 16384
+SPEC_SWAP_MAX_STEPS = 12
+SPEC_SWAP_MAX_OCCURRENCES = 32768
 
 
 def load_cache_to_device_buffer_spec_mla(
@@ -104,17 +104,19 @@ def load_cache_to_device_buffer_spec_mla(
     kernel, so shared-index layers can replay only the Host-to-GPU copies with
     ``copy_cache_planned_mla``.
 
-    ``device_locs`` enables resident KV passthrough and single-step draft calls
+    A single target-only tail step reuses the configured speculative workspace.
+    ``device_locs`` optionally enables resident KV passthrough for draft calls
     using the same hot/scratch state. ``host_binding`` supplies the runtime
     [host base address, row stride in bytes] for the shared HiCache host pool.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if not 2 <= num_steps <= SPEC_SWAP_MAX_STEPS and not (
-        num_steps == 1 and device_locs is not None
-    ):
+    if num_steps * num_top_k > SPEC_SWAP_MAX_OCCURRENCES:
         raise ValueError(
-            f"HiSparse speculative swap requires 2-{SPEC_SWAP_MAX_STEPS} steps, "
-            f"or one resident-device step; got {num_steps}."
+            "HiSparse speculative occurrence count exceeds its workspace limit."
+        )
+    if not 1 <= num_steps <= SPEC_SWAP_MAX_STEPS:
+        raise ValueError(
+            f"HiSparse speculative swap requires 1-{SPEC_SWAP_MAX_STEPS} steps; got {num_steps}."
         )
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size

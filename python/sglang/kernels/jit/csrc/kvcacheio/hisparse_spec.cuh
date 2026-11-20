@@ -1009,11 +1009,11 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView host_binding) {
   using namespace host;
 
-  static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 8, "HiSparse speculative swap requires 1-8 steps.");
+  static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 12, "HiSparse speculative swap requires 1-12 steps.");
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
-  static_assert(NUM_STEPS * NUM_TOP_K <= 16384, "HiSparse speculative swap supports at most 16384 occurrences.");
+  static_assert(NUM_STEPS * NUM_TOP_K <= 32768, "HiSparse speculative swap supports at most 32768 occurrences.");
   static_assert(
-      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 16384,
+      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 32768,
       "HiSparse speculative metadata must cover every occurrence and fit the compact hash index.");
 
   const auto* device_locs_ptr = PassThroughDeviceLocs ? static_cast<const int32_t*>(device_locs.data_ptr()) : nullptr;

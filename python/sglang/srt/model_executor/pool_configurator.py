@@ -149,6 +149,10 @@ def _charges_dflash_draft_kv_per_token(kvc: KVCacheConfigurator) -> bool:
         # DFLASH and DSPARK only build the draft on the final PP stage.
         and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
         and not get_spec().speculative_dflash_draft_kv_ring
+        and not (
+            kvc.spec_algorithm.is_dflash()
+            and (get_spec().speculative_draft_kv_layout != "shared" or False)
+        )
     )
 
 
@@ -337,6 +341,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
+        if (
+            not kvc.is_draft_worker
+            and kvc.spec_algorithm.is_dflash()
+            and (get_spec().speculative_draft_kv_layout != "shared" or False)
+        ):
+            from sglang.srt.speculative.dflash_independent_cache import (
+                independent_draft_reservation_bytes,
+            )
+
+            fixed_draft_bytes = independent_draft_reservation_bytes(kvc)
+            self._fixed_overhead_bytes += fixed_draft_bytes
+            logger.info(
+                "Independent draft storage reservation: %.3f GiB/rank (includes inactive slots)",
+                fixed_draft_bytes / (1 << 30),
+            )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.

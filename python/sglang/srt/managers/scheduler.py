@@ -3085,7 +3085,14 @@ class Scheduler(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len
+                - input_len
+                - (
+                    0
+                    if self.spec_algorithm.is_dflash()
+                    and get_spec().speculative_draft_kv_layout != "shared"
+                    else 1
+                ),
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
@@ -4276,7 +4283,18 @@ class Scheduler(
         )
         batch.input_ids = None
 
-        if not batch.spec_algorithm.is_none():
+        if batch.spec_algorithm.is_dflash():
+            # HiSparse's host-copy staging crosses the same prefill/decode
+            # boundary as PD: restore DFLASH's bonus and committed lengths,
+            # rather than fabricating EAGLE's hidden/top-k relay state.
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_disagg_draft_input,
+            )
+
+            batch.spec_info = build_dflash_disagg_draft_input(
+                batch, last_tokens, self.future_map
+            )
+        elif not batch.spec_algorithm.is_none():
             batch.spec_info = self.future_map.make_staged_spec_input(
                 batch.req_pool_indices
             )

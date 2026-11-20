@@ -624,6 +624,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
+        self._independent_cache = None
+        self._independent_kv_mode = get_spec().speculative_draft_kv_layout
+        if (
+            self._independent_kv_mode != "shared"
+            and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "Independent DFlash KV currently requires --disable-cuda-graph"
+            )
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -837,7 +846,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
-        self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
+        self._use_fused_kv_materialize = (
+            is_cuda() or is_hip() or is_xpu()
+        ) and self._independent_kv_mode == "shared"
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -868,6 +879,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._use_aux_graph = (
             is_cuda()
+            and self._independent_kv_mode == "shared"
             and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and self.lilicorr is None
             and envs.SGLANG_OPT_DFLASH_AUX_GRAPH.get()
@@ -1110,6 +1122,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         token_to_kv_pool_allocator=None,
     ):
         if not self._hosts_draft:
+            return
+        if self._independent_kv_mode != "shared":
+            from sglang.srt.speculative.dflash_independent_cache import (
+                allocate_independent_draft_cache,
+            )
+
+            with draft_tp_context(self.draft_parallel_layout):
+                self._independent_cache = allocate_independent_draft_cache(
+                    self, req_to_token_pool, mixed=self._independent_kv_mode == "hybrid"
+                )
+            logger.info(
+                "Independent DFLASH %s storage: %s",
+                self._independent_kv_mode,
+                self._independent_cache.layout,
+            )
             return
         # Without draft windowing, the draft worker aliases the target
         # request->token mapping and allocation state. With draft windowing
@@ -1425,9 +1452,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH selector decode on the NVIDIA megakernel head (%s).",
-                "greedy and sampling requests"
-                if sampling
-                else "greedy; batches with sampling requests take the eager selector",
+                (
+                    "greedy and sampling requests"
+                    if sampling
+                    else "greedy; batches with sampling requests take the eager selector"
+                ),
             )
         return _MegakernelSelectorDraftSampler(
             head=head,
@@ -2503,6 +2532,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         extend_lens: Optional[torch.Tensor] = None,
         swa_cache_loc: Optional[torch.Tensor] = None,
         projected: bool = False,
+        swa_keep_mask: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -2689,9 +2719,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                             window_locs=layer_window_locs(
                                 self.draft_model_runner.token_to_kv_pool,
                                 attn.attn.layer_id,
-                                swa_cache_loc.view_as(cache_loc_2d)
-                                if swa_cache_loc is not None
-                                else None,
+                                (
+                                    swa_cache_loc.view_as(cache_loc_2d)
+                                    if swa_cache_loc is not None
+                                    else None
+                                ),
                             ),
                             physical=True,
                         ),
@@ -2727,6 +2759,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
                 ctx_swa_cache_loc=swa_cache_loc,
+                swa_keep_mask=swa_keep_mask,
             )
 
     def _append_target_hidden_decode(
@@ -2929,12 +2962,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
         ctx_swa_cache_loc: Optional[torch.Tensor] = None,
+        swa_keep_mask: Optional[torch.Tensor] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
+            layer_positions = ctx_positions
+            layer_cache_loc = ctx_cache_loc
+            layer_swa_loc = ctx_swa_cache_loc
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if swa_keep_mask is not None and attn.sliding_window_size >= 0:
+                layer_ctx_hidden = layer_ctx_hidden[swa_keep_mask]
+                layer_positions = ctx_positions[swa_keep_mask]
+                layer_cache_loc = ctx_cache_loc[swa_keep_mask]
+                layer_swa_loc = ctx_swa_cache_loc[swa_keep_mask]
             if isinstance(attn, DFlashMLAAttention):
                 attn.write_context_kv(
                     pool=self.draft_model_runner.token_to_kv_pool,
@@ -2952,7 +2994,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 k, v = attn.kv_proj_only(layer_ctx_hidden)
                 k = attn.apply_k_norm(k)
-                k = attn.apply_k_rope(ctx_positions, k)
+                k = attn.apply_k_rope(layer_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.layer_router.layer(
@@ -2960,11 +3002,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             ).store(
                 attn.attn,
                 KVWriteLoc(
-                    ctx_cache_loc,
+                    layer_cache_loc,
                     window_locs=layer_window_locs(
                         self.draft_model_runner.token_to_kv_pool,
                         attn.attn.layer_id,
-                        ctx_swa_cache_loc,
+                        layer_swa_loc,
                     ),
                     physical=True,
                 ),
@@ -3002,9 +3044,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                         window_locs=layer_window_locs(
                             token_to_kv_pool,
                             attn.layer_id,
-                            ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
-                            if ctx_swa_cache_loc is not None
-                            else None,
+                            (
+                                ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                                if ctx_swa_cache_loc is not None
+                                else None
+                            ),
                         ),
                         physical=True,
                     ),
@@ -3115,6 +3159,25 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
+
+    def _draft_block_embeds(
+        self, *, block_ids: torch.Tensor, embed_module, bs: int
+    ) -> Optional[torch.Tensor]:
+        """Block input embeds [bs * block, hidden]; None if the megakernel embeds."""
+        embed = self._megakernel_embed
+        if embed is not None and bs in embed.draft_embed_requests:
+            return None
+        if self._full_embed_gpu is not None:
+            # A borrowed embedding may use target-wide collectives, while
+            # other DP replicas are idle or looking up different token IDs.
+            noise_embedding = torch.nn.functional.embedding(
+                block_ids, self._full_embed_gpu
+            )
+        else:
+            noise_embedding = embed_module(block_ids)
+        if self._noise_embed_scale != 1.0:
+            noise_embedding = noise_embedding * self._noise_embed_scale
+        return noise_embedding.view(-1, noise_embedding.shape[-1])
 
     def _maybe_attach_megakernel_accept(self):
         accept = megakernel_draft_accept(self.draft_model)
@@ -3728,6 +3791,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             return batch_output
+        if self._independent_cache is not None:
+            from sglang.srt.speculative.dflash_tail import select_eager_phase
+
+            select_eager_phase(self, batch)
         self._validate_phase1_sampling_support(batch)
         if (
             batch.forward_mode.is_extend()
@@ -3801,7 +3868,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            if self.draft_kv_ring is not None:
+            swa_keep_mask = None
+            independent_swa_loc = None
+            if self._independent_cache is not None:
+                self._independent_cache.alloc_to_lengths(
+                    req_pool_indices_cpu=batch.req_pool_indices.cpu(),
+                    target_seq_lens_cpu=torch.tensor(
+                        [p + e for p, e in zip(batch.prefix_lens, batch.extend_lens)]
+                    ),
+                )
+                draft_cache_loc, independent_swa_loc, swa_keep_mask = (
+                    self._independent_cache.locations(
+                        batch.req_pool_indices, positions, ctx_lens
+                    )
+                )
+            elif self.draft_kv_ring is not None:
                 self.draft_kv_ring.record_floors(
                     batch.reqs,
                     batch.prefix_lens,
@@ -3820,14 +3901,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=draft_cache_loc,
                 swa_cache_loc=(
-                    None
-                    if self.draft_kv_ring is not None
+                    independent_swa_loc
+                    if self._independent_cache is not None
                     else self._draft_write_ids(
                         iteration_ids, IdSpaceKind.SLIDING_WINDOW
                     )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
+                swa_keep_mask=swa_keep_mask,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -3848,6 +3930,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH spec-v2 expected DFlashDraftInputV2 state on the running batch."
             )
+
+        if self._independent_cache is not None:
+            from sglang.srt.speculative.dflash_tail import (
+                forward_target_only_tail,
+                needs_target_only_tail,
+            )
+
+            if needs_target_only_tail(self, batch):
+                return forward_target_only_tail(
+                    self, batch, on_publish=on_publish, grammar_barrier=grammar_barrier
+                )
 
         if batch.forward_mode.is_idle():
             self._note_non_decode_step()
@@ -3874,14 +3967,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     # Matches the active ranks, which go eager when any DP rank is idle.
                     idle_verify_forward_batch.can_run_decode_cuda_graph = False
                     idle_can_run_cuda_graph = False
-                # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
-                # the idle rank replays the active ranks' graph with zero real rows.
-                self._target_worker.forward_batch_generation(
+                # On CUDA the idle rank keeps prepare_for_verify's graph
+                # decision: the bucket is max(original_global_num_tokens_cpu)
+                # on every rank, so it replays the active ranks' graph with
+                # zero real rows (raw_bs=0) and the same [bucket*w]*ndp
+                # DP-gather layout, like plain decode and EAGLE idle ranks.
+                idle_target_output = self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
                     skip_attn_backend_init=True if _is_npu else None,
                 )
+                idle_can_run_cuda_graph = idle_target_output.can_run_cuda_graph
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -3994,23 +4091,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        megakernel_embed = self._megakernel_embed
-        if megakernel_embed is not None and bs in megakernel_embed.draft_embed_requests:
-            # The megakernel embeds the block inside the draft forward.
-            input_embeds = None
-        else:
-            if self._full_embed_gpu is not None:
-                # A borrowed embedding may use target-wide collectives, while
-                # other DP replicas are idle or looking up different token IDs.
-                noise_embedding = torch.nn.functional.embedding(
-                    block_ids, self._full_embed_gpu
-                )
-            else:
-                noise_embedding = embed_module(block_ids)
-            if self._noise_embed_scale != 1.0:
-                noise_embedding = noise_embedding * self._noise_embed_scale
-            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
-
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
         # The iteration's window -- the draft block, the verify and the
@@ -4025,6 +4105,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             write_virtual=verify_out_cache_loc,
             read_extent=block_size,
+        )
+
+        ring_block_locs = None
+        input_embeds = self._draft_block_embeds(
+            block_ids=block_ids, embed_module=embed_module, bs=bs
         )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -4088,6 +4173,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             global_num_token_non_padded_cpu=bs * block_size,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
+        # Graph eligibility follows the target batch (the scheduler's DP vote),
+        # as for the DSpark draft; the draft keys its graph by local batch size.
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
         draft_translator = self.draft_model_runner.runner_ids
@@ -4101,6 +4189,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.use_compact_draft_cache
             else iteration_ids
         )
+        if self._independent_cache is not None:
+            self._independent_cache.alloc_to_lengths(
+                req_pool_indices_cpu=batch.req_pool_indices.cpu(),
+                target_seq_lens_cpu=seq_lens_cpu,
+            )
+            private_locs, _, _ = self._independent_cache.locations(
+                batch.req_pool_indices,
+                positions,
+                torch.full((bs,), block_size, dtype=torch.int32, device=device),
+            )
+            draft_plan = draft_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=prefix_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                write_virtual=private_locs,
+                read_extent=block_size,
+            )
         draft_plan.bind(forward_batch, draft_translator)
         ring_block_locs = None
         if self.draft_kv_ring is not None:
@@ -4113,7 +4218,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
             self._draft_feature = self._draft_confidence = None
-            # Consumed by the in-graph sample; must be staged before the replay.
             self._stage_draft_sampler(bs=bs, sampling_info=batch.sampling_info)
 
         self._join_aux()
@@ -4255,7 +4359,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs == 1
             and self._batched_small_copy
             and try_small_copy(
-                [draft_tokens[:, 0], draft_tokens[:, 1:]], [block_ids[:, 0], draft_next]
+                [draft_tokens[:, 0], draft_tokens[:, 1:]],
+                [block_ids[:, 0], draft_next],
             )
         ):
             draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -4539,7 +4644,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc = (
                 ring_block_locs
                 if ring_block_locs is not None
-                else self._draft_write_ids(iteration_ids)
+                else self._draft_write_ids(
+                    draft_plan if self._independent_cache is not None else iteration_ids
+                )
             )
             self._append_target_hidden_decode(
                 target_hidden=hidden.reshape(-1, hidden.shape[-1]),
@@ -4551,7 +4658,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     None
                     if ring_block_locs is not None
                     else self._draft_write_ids(
-                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                        (
+                            draft_plan
+                            if self._independent_cache is not None
+                            else iteration_ids
+                        ),
+                        IdSpaceKind.SLIDING_WINDOW,
                     )
                 ),
             )

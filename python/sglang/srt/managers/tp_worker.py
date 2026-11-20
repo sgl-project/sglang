@@ -567,10 +567,15 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            kv_capacity - 1,
+        independent_dflash = (
+            self.model_runner.spec_algorithm.is_dflash()
+            and get_spec().speculative_draft_kv_layout != "shared"
         )
+        # The independent adapter has a collective single-token tail, so it
+        # does not need to shorten the model's served position range. KV
+        # speculation/page headroom is a separate physical reservation.
+        guard = 0 if independent_dflash else 1
+        max_req_len = min(self.model_config.context_len - guard, kv_capacity - guard)
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
             max_req_input_len -= self.dllm_algorithm.block_size
@@ -719,9 +724,11 @@ class TpModelWorker(BaseTpWorker):
                     if not return_iteration_ids
                     # A folded forward also wrote the replay rows; the caller's
                     # plan covers the batch it scheduled.
-                    else forward_batch.iteration_ids
-                    if folded is None
-                    else self.model_runner.runner_ids.own_plan(batch)
+                    else (
+                        forward_batch.iteration_ids
+                        if folded is None
+                        else self.model_runner.runner_ids.own_plan(batch)
+                    )
                 ),
                 kv_weight_version_record=out.kv_weight_version_record,
             )

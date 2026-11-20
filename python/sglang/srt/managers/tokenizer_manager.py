@@ -255,8 +255,6 @@ def _validate_watermark_request(sampling_params: SamplingParams) -> None:
         default_enabled=features.watermark_default_enabled,
         enforce_all=features.watermark_enforce_all,
     )
-    if enabled and (sampling_params.beam_width or 1) > 1:
-        raise ValueError("beam search is not supported with watermarking")
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -1777,6 +1775,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_args.speculative_algorithm == "DFLASH"
+            and self.server_args.speculative_draft_kv_layout != "shared"
+            and sampling_params.top_k != 1
+            and (
+                sampling_params.max_new_tokens is None
+                or sampling_params.max_new_tokens > 1
+            )
+        ):
+            raise ValueError(
+                "Experimental independent DFlash currently requires greedy sampling (temperature=0 or top_k=1)"
+            )
         _validate_watermark_request(sampling_params)
 
         # Build return object
