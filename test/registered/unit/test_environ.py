@@ -11,8 +11,9 @@ from unittest.mock import patch
 
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -180,6 +181,66 @@ class TestEnvField(unittest.TestCase):
                     child = self.env_fields[name]
                     with child.override(None):
                         self.assertIsNone(child.get())
+
+
+# Renamed env vars that still accept their former name through a *WithAlias
+# descriptor: (new name, former name, former raw, former parsed, new raw, new
+# parsed). The former value is non-default so a read that ignores the alias
+# shows up. Add a row here when renaming a variable.
+RENAMED_ENV_ALIASES = [
+    (
+        "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ",
+        "SGLANG_ROCM_K3_FUSE_KDA_INPROJ",
+        "0",
+        False,
+        "1",
+        True,
+    ),
+    (
+        "SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
+        "SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS",
+        "64",
+        64,
+        "512",
+        512,
+    ),
+]
+
+
+class TestRenamedEnvAliases(CustomTestCase):
+    """A former env var name still reaches the renamed descriptor."""
+
+    def _get(self, name):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            value = getattr(envs, name).get()
+        return value, [w for w in caught if issubclass(w.category, FutureWarning)]
+
+    def test_former_name_applies_with_a_visible_warning(self):
+        for new_name, old_name, old_raw, old_value, _, _ in RENAMED_ENV_ALIASES:
+            # The former name has no descriptor, and patch.dict also drops the
+            # copy the alias fallback writes to the new name.
+            with self.subTest(new_name), patch.dict(os.environ):
+                self.assertEqual(vars(type(envs))[new_name].deprecated_name, old_name)
+                getattr(envs, new_name).clear()
+                os.environ[old_name] = old_raw
+                value, deprecations = self._get(new_name)
+                self.assertEqual(value, old_value)
+                self.assertEqual(len(deprecations), 1)
+                self.assertIn(old_name, str(deprecations[0].message))
+                self.assertIn(new_name, str(deprecations[0].message))
+
+    def test_new_name_wins_over_former_name(self):
+        for new_name, old_name, old_raw, _, new_raw, new_value in RENAMED_ENV_ALIASES:
+            with (
+                self.subTest(new_name),
+                patch.dict(os.environ),
+                getattr(envs, new_name).override(new_raw),
+            ):
+                os.environ[old_name] = old_raw
+                value, deprecations = self._get(new_name)
+                self.assertEqual(value, new_value)
+                self.assertEqual(deprecations, [])
 
 
 class TestDeprecatedEnvRegistry(unittest.TestCase):

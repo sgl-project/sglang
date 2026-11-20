@@ -240,6 +240,12 @@ def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
     return w.to(torch.bfloat16) * w_scale
 
 
+def rocm_absorb_bmm_runs_fp8(weight_dtype: torch.dtype) -> bool:
+    """Whether the absorb BMMs run this FP8 dtype on AITER's a8w8 BMM in every mode;
+    otherwise non-MXFP4 weights dequantize to BF16 (gfx942 FP8 only under capture)."""
+    return _use_aiter_gfx95 and weight_dtype == torch.float8_e4m3fn
+
+
 def rocm_absorb_q_bmm(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -265,7 +271,7 @@ def rocm_absorb_q_bmm(
             q_nope_out,
         )
     else:
-        if (_use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn) or (
+        if rocm_absorb_bmm_runs_fp8(attn.w_kc.dtype) or (
             is_capture_mode and attn.w_kc.dtype == torch.float8_e4m3fnuz
         ):
             # fp8 Triton kernel: always on gfx950,
@@ -330,7 +336,7 @@ def rocm_absorb_v_bmm(
         )
     else:
         _bmm_buf = None
-        if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
+        if rocm_absorb_bmm_runs_fp8(attn.w_kc.dtype):
             # As in the mxfp4 path above, write (batch, heads, dim) so the
             # post-GEMM flatten is a free view instead of a copy.
             _bmm_buf = torch.empty(

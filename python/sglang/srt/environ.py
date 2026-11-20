@@ -1226,8 +1226,17 @@ class Envs:
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
-    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
-    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ"
+    )
+    # Largest batch (tokens) that takes the merged in-proj GEMM for BF16 weights;
+    # Quark FP8 merges into fused_qkvg_proj itself, so every batch takes it.
+    SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvIntWithAlias(
+        256, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS"
+    )
+    # On gfx950 with AITER, opt in to lossy per-tensor FP8 MLA absorb;
+    # otherwise keep the BF16 dequant.
+    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 = EnvBool(False)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
