@@ -62,6 +62,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -633,7 +634,7 @@ def low_ratio_index_topk_hip_extend(
                 device=pos.device,
             )
         # counts, slot offsets and row counts per request, for the batched fill
-        identity_meta = torch.tensor(
+        identity_meta = async_h2d(
             [lc_per_req, starts, extend_lens_cpu], dtype=torch.int64, device=pos.device
         )
 
