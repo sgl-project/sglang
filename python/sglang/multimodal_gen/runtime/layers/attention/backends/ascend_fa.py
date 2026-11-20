@@ -265,10 +265,6 @@ class AscendFABackend(AttentionBackend):
         return AscendFAImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        return AscendFAMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return AscendFAMetadataBuilder
 

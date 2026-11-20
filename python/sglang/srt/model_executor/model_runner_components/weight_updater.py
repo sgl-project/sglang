@@ -236,6 +236,9 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # A half held by an earlier load (a failed one, say) must not pair
+            # with this load's other half.
+            _discard_pending_weight_halves(model)
             # Expert loaders may copy in parallel; restore before any thread writes.
             DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
@@ -341,16 +344,21 @@ class WeightUpdater:
         return bucket.reconstruct_tensors()
 
     def begin_weight_update(self: WeightUpdater) -> None:
+        model = self.get_model()
         DefaultModelLoader.restore_weights_before_loading(
-            self.get_model(), torch.device(self.device)
+            model, torch.device(self.device)
         )
+        # A load outside a session (startup, update from disk) may have left a
+        # half that would otherwise pair with this session's other half.
+        _discard_pending_weight_halves(model)
 
-    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> Optional[str]:
+        """Finish the session; return why the update is incomplete, or None."""
+        model = self.get_model()
         if run_post_load:
-            post_load_weights(self.get_model())
-        DefaultModelLoader.postprocess_weights(
-            self.get_model(), torch.device(self.device)
-        )
+            post_load_weights(model)
+        DefaultModelLoader.postprocess_weights(model, torch.device(self.device))
+        return _unpaired_weight_halves_error(model)
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
@@ -457,15 +465,46 @@ class WeightUpdater:
                 SGLangCheckpointEngineWorkerExtensionImpl,
             )
 
+            # An IPC update loads its buckets in several load_weights calls with
+            # no session around them: drop halves held from before, and log any
+            # left after.
+            _discard_pending_weight_halves(self.get_model())
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
+            error = _unpaired_weight_halves_error(self.get_model())
+            if error is not None:
+                logger.error(error)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+
+def _discard_pending_weight_halves(model: torch.nn.Module) -> List[str]:
+    """Loaders that fuse several checkpoint tensors into one param hold a half
+    until its pair arrives, possibly in a later load_weights call. A wrapper
+    model (a VLM, say) holds such a loader as a submodule."""
+    return [
+        name
+        for module in model.modules()
+        if hasattr(module, "discard_pending_weight_halves")
+        for name in module.discard_pending_weight_halves()
+    ]
+
+
+def _unpaired_weight_halves_error(model: torch.nn.Module) -> Optional[str]:
+    """Drop the halves still waiting for their pair; say which, if any."""
+    pending = _discard_pending_weight_halves(model)
+    if not pending:
+        return None
+    shown = ", ".join(pending[:8]) + (", ..." if len(pending) > 8 else "")
+    return (
+        f"The update sent only one half of {len(pending)} fused weights, "
+        f"so their params keep the old values: {shown}"
+    )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
