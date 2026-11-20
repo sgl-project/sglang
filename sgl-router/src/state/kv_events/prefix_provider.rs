@@ -252,14 +252,15 @@ impl RadixTreePrefixProvider {
                 // turn): every router prefers the same tied rank, by rendezvous
                 // hash. A preference only: rank load decides first, as nothing at
                 // rank level guards against a loaded rank the way the pressure
-                // guard does for workers.
+                // guard does for workers. Not counted as a tie-break: the
+                // selector may not follow it, and the request's worker-level
+                // lookup already counted the conversation once.
                 let by_rank: BTreeMap<String, u32> = depths
                     .iter()
                     .map(|&(rank, d)| (rank.to_string(), u32::try_from(d).unwrap_or(u32::MAX)))
                     .collect();
                 if let Some(winner) = rendezvous_winner(&by_rank, media.key) {
                     preferred = winner.parse().ok();
-                    self.tree.record_media_tiebreak();
                 }
             }
         }
@@ -804,7 +805,11 @@ mod tests {
                 let mut depths = placement.depths.clone();
                 depths.sort();
                 assert_eq!(depths, [(0, 4), (1, 4)], "no rank is boosted");
-                assert_eq!(provider.tree.media_tiebreaks(), 1);
+                assert_eq!(
+                    provider.tree.media_tiebreaks(),
+                    0,
+                    "a rank preference is not a tie-break: load may not follow it"
+                );
                 let preferred = placement.preferred.expect("a tied rank is preferred");
                 // Once a rank is remembered, it is the depth that decides.
                 provider.record_rank(&prompt, &ns, "http://a", 1);
