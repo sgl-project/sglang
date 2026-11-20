@@ -89,8 +89,10 @@ def _extract_param_value(text: str, start: int) -> Tuple[str, int]:
     return value, end_pos
 
 
-def _find_function_close(text: str, start: int = 0) -> int:
-    """Find </function> that is not inside a well-formed CDATA section."""
+def _find_function_close(
+    text: str, start: int, *, allow_broken_cdata: bool = True
+) -> int:
+    """Skip CDATA when locating the function boundary."""
     pos = start
     while True:
         idx = text.find(FUNCTION_CLOSE, pos)
@@ -103,12 +105,12 @@ def _find_function_close(text: str, start: int = 0) -> int:
 
         cdata_end = text.find(CDATA_END, cdata_start)
         if cdata_end == -1:
-            return idx
+            return idx if allow_broken_cdata else -1
 
         if cdata_end < idx:
             return idx
 
-        pos = idx + len(FUNCTION_CLOSE)
+        pos = cdata_end + len(CDATA_END)
 
 
 def _parse_function_block(
@@ -229,10 +231,11 @@ class MiniCPM5Detector(BaseFormatDetector):
             last_end = 0
             pos = 0
             while pos < len(text):
-                start = text.find(self.bot_token, pos)
-                if start == -1:
+                opening = _FUNC_OPEN_RE.search(text, pos)
+                if opening is None:
                     break
 
+                start = opening.start()
                 if start > last_end:
                     normal_parts.append(text[last_end:start])
 
@@ -271,48 +274,59 @@ class MiniCPM5Detector(BaseFormatDetector):
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         self._buffer += new_text
-        current_text = self._buffer
+        return self._drain_stream_buffer(tools, finished=False)
 
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            partial_len = self._ends_with_partial_token(self._buffer, self.bot_token)
-            if partial_len:
-                return StreamingParseResult()
-            normal_text = self._buffer
-            self._buffer = ""
-            if self.current_tool_id > 0:
-                normal_text = ""
-            return StreamingParseResult(normal_text=normal_text)
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        return self._drain_stream_buffer(tools, finished=True)
 
-        end = _find_function_close(current_text, start)
-        if end != -1:
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-            result = self.detect_and_parse(
-                current_text[: end + len(self.eot_token)], tools=tools
+    def _drain_stream_buffer(
+        self, tools: List[Tool], *, finished: bool
+    ) -> StreamingParseResult:
+        normal_parts = []
+        calls = []
+        while self._buffer:
+            text = self._buffer
+            opening = _FUNC_OPEN_RE.search(text)
+            if opening is None:
+                if not finished:
+                    start = text.find(self.bot_token)
+                    if start != -1:
+                        normal_parts.append(text[:start])
+                        self._buffer = text[start:]
+                        break
+                    if self._ends_with_partial_token(text, self.bot_token):
+                        break
+                self._buffer = ""
+                if self.current_tool_id <= 0:
+                    normal_parts.append(text)
+                break
+
+            start = opening.start()
+            close = _find_function_close(
+                text, opening.end(), allow_broken_cdata=finished
             )
-            if result.calls:
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": result.calls[0].name,
-                    "arguments": json.loads(result.calls[0].parameters),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
-                    0
-                ].parameters
-                result.calls[0].tool_index = self.current_tool_id
-                self.current_tool_id += 1
-            self._buffer = current_text[end + len(self.eot_token) :]
-            return result
+            if close == -1:
+                normal_parts.append(text[:start])
+                self._buffer = "" if finished else text[start:]
+                break
 
-        normal_text = current_text[:start]
-        self._buffer = current_text[start:]
-        return StreamingParseResult(normal_text=normal_text)
+            block_end = close + len(self.eot_token)
+            result = self.detect_and_parse(text[:block_end], tools)
+            self._buffer = text[block_end:]
+            if result.normal_text:
+                normal_parts.append(result.normal_text)
+            for call in result.calls:
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                call.tool_index = self.current_tool_id
+                self.prev_tool_call_arr.append(
+                    {"name": call.name, "arguments": json.loads(call.parameters)}
+                )
+                self.streamed_args_for_tool.append(call.parameters)
+                self.current_tool_id += 1
+                calls.append(call)
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def supports_structural_tag(self) -> bool:
         return False

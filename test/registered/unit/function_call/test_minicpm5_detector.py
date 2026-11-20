@@ -564,17 +564,76 @@ def test_streaming_partial_function_token_buffered():
     assert len(r2.calls) == 1
 
 
-def test_streaming_broken_cdata_uses_function_close():
+def test_streaming_broken_cdata_recovers_at_finish():
     detector = MiniCPM5Detector()
     tools = make_tools_exec()
     c1 = '<function name="exec"><param name="command"><![CDATA[ls 2>&1'
     c2 = "</function>"
-    r1 = detector.parse_streaming_increment(c1, tools)
-    assert len(r1.calls) == 0
-    r2 = detector.parse_streaming_increment(c2, tools)
-    assert len(r2.calls) == 1
-    args = json.loads(r2.calls[0].parameters)
-    assert "2>&1" in args["command"]
+    assert detector.parse_streaming_increment(c1, tools).calls == []
+    assert detector.parse_streaming_increment(c2, tools).calls == []
+    result = detector.finish(tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"command": "ls 2>&1"}
+
+
+def test_final_delta_drains_multiple_complete_calls():
+    """Both calls must arrive when generation ends with both in one delta."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    beijing = (
+        '<function name="get_weather"><param name="city">Beijing</param></function>'
+    )
+    shanghai = beijing.replace("Beijing", "Shanghai")
+    result = detector.parse_streaming_increment(beijing + shanghai, tools)
+    assert [call.tool_index for call in result.calls] == [0, 1]
+    assert [json.loads(call.parameters) for call in result.calls] == [
+        {"city": "Beijing"},
+        {"city": "Shanghai"},
+    ]
+    assert detector.finish(tools).calls == []
+
+
+def test_cdata_literal_function_close_does_not_emit_early():
+    """A literal closing tag may arrive before the CDATA terminator."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_exec()
+    c1 = '<function name="exec"><param name="command"><![CDATA[doc </function>'
+    c2 = " tail]]></param></function>"
+    assert detector.parse_streaming_increment(c1, tools).calls == []
+    result = detector.parse_streaming_increment(c2, tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {
+        "command": "doc </function> tail",
+    }
+
+
+def test_literal_function_marker_does_not_hide_later_call():
+    """The string <function> in prose is an invalid opener."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    prefix = "Use <function> to describe a tool call."
+    block = '<function name="get_weather"><param name="city">Beijing</param></function>'
+    non_stream = detector.detect_and_parse(prefix + block, tools)
+    assert len(non_stream.calls) == 1
+    assert non_stream.normal_text == prefix
+
+    first = detector.parse_streaming_increment(prefix, tools)
+    second = detector.parse_streaming_increment(block, tools)
+    assert first.normal_text + second.normal_text == prefix
+    assert [json.loads(call.parameters) for call in second.calls] == [
+        {"city": "Beijing"},
+    ]
+
+
+def test_finish_releases_partial_marker_in_plain_text():
+    """A plain text suffix held for a possible tool marker survives stream end."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    text = "Example: <func"
+    streamed = detector.parse_streaming_increment(text, tools)
+    finished = detector.finish(tools)
+    assert streamed.normal_text + finished.normal_text == text
+    assert streamed.calls + finished.calls == []
 
 
 if __name__ == "__main__":
