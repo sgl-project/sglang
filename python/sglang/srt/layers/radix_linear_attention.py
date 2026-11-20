@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kda_backend import KDAFusedVerify
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -78,6 +79,8 @@ class RadixLinearAttention(nn.Module):
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
+        # A model-owned fused KDA target verify, installed by the model once armed.
+        self.kda_fused_verify: Optional[KDAFusedVerify] = None
 
     def refresh_conv_weights(self, weight: torch.Tensor) -> None:
         """Rebuild the cached convolution view after replacing its parameter."""

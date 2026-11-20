@@ -2462,72 +2462,9 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            from sglang.kernels.ops.attention import (
-                kda_fused_decode_aiter_hip,
-                kda_fused_decode_gfx950,
-            )
+            from sglang.srt.models.kimi_k3_amd.kda import prepare_fused_kda_hip
 
-            layer = self.attn
-            # A re-run that fails to arm must not leave the previous f_b serving decode.
-            self._kda_hip_fused_decode_ready = False
-            layer._k3_hip_fused_decode_args = None
-            layer._k3_hip_fused_decode_backend = ""
-            layer._k3_hip_fused_decode_ops = None
-            w = layer.conv_weights
-            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
-            fused_ops = {
-                "aiter": kda_fused_decode_aiter_hip,
-                "gfx950": kda_fused_decode_gfx950,
-            }.get(backend)
-            state_dtype = self.config.mamba2_cache_params.dtype.temporal
-            backend_available = fused_ops is not None and fused_ops.available(
-                device=self.f_b_proj.weight.device, state_dtype=state_dtype
-            )
-            f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
-            if (
-                backend_available
-                and w is not None
-                and tuple(w.shape) == (3 * 12 * 128, 4)
-                and w.dtype == torch.float32
-                and f_b_weight is not None
-                and f_b_weight.shape == (12 * 128, 128)
-                and f_b_weight.dtype == torch.bfloat16
-                and layer.A_log is not None
-                and layer.A_log.numel() == 12
-                and layer.A_log.dtype == torch.float32
-                and layer.dt_bias is not None
-                and tuple(layer.dt_bias.shape) == (12 * 128,)
-                and layer.dt_bias.dtype == torch.float32
-                and layer.lower_bound is not None
-            ):
-                norm_weight = self.o_norm.weight.data.to(torch.bfloat16).contiguous()
-                f_b_weight = f_b_weight.view(12, 128, 128).contiguous()
-                a_log = layer.A_log.detach().reshape(-1).contiguous()
-                layer._k3_hip_fused_decode_args = (
-                    f_b_weight,
-                    norm_weight,
-                    float(self.o_norm.eps),
-                    a_log,
-                )
-                fused_ops.warmup(
-                    f_b_weight=f_b_weight,
-                    conv_weight=w,
-                    A_log=a_log,
-                    dt_bias=layer.dt_bias,
-                    lower_bound=float(layer.lower_bound),
-                    norm_weight=norm_weight,
-                    norm_eps=float(self.o_norm.eps),
-                    state_dtype=state_dtype,
-                )
-                layer._k3_hip_fused_decode_backend = backend
-                layer._k3_hip_fused_decode_ops = fused_ops
-                # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
-                # whose decode skips the fused kernel and needs f_b already applied.
-                mamba = get_exec().mamba
-                replayssm_ring = (
-                    mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
-                )
-                self._kda_hip_fused_decode_ready = not replayssm_ring
+            prepare_fused_kda_hip(self)
             return
         layer = self.attn
         w = layer.conv_weights
@@ -2681,8 +2618,9 @@ class KimiK3DeltaAttention(nn.Module):
         # gathered rank-major; the recurrence needs sequence order.
         gathered_rows = hidden_states.shape[0]
         hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
-        defer_f_b = (
-            self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
+        mode = forward_batch.forward_mode
+        defer_f_b = (self._kda_hip_fused_decode_ready and mode.is_decode()) or (
+            self.attn.kda_fused_verify is not None and mode.is_target_verify()
         )
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
@@ -2694,7 +2632,9 @@ class KimiK3DeltaAttention(nn.Module):
             )
 
         if not forward_batch.logical_forward_mode.is_decode():
-            forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
+            # A deferred f_b leaves f_a [tokens, head_dim] for the fused verify.
+            if not defer_f_b:
+                forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

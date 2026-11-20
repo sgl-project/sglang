@@ -1,5 +1,5 @@
 import importlib.util
-from typing import Optional, Tuple, Union
+from typing import Optional, Protocol, Tuple, Union
 
 import torch
 
@@ -53,6 +53,57 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_cache_chunk_size,
 )
+
+
+class KDAFusedVerify(Protocol):
+    """A model's fused kernel for one KDA layer's dense chain target verify.
+
+    Installed as ``RadixLinearAttention.kda_fused_verify`` under
+    ``--linear-attn-verify-backend aiter``. The model then hands ``a`` over as the
+    gate's unprojected input [1, tokens, K] for the hook to project.
+    """
+
+    def forward(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        intermediate_state_cache: Optional[torch.Tensor],
+        intermediate_conv_window_cache: torch.Tensor,
+        num_draft_tokens: int,
+        replay_ring: Optional[Tuple[torch.Tensor, ...]],
+        unsupported: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        """The verify output, or None to run the unfused chain.
+
+        ``unsupported`` names a batch property the backend knows the fused
+        kernel cannot handle (None if there is none).
+        """
+        ...
+
+    def unfused_gate(self, a: torch.Tensor) -> torch.Tensor:
+        """The projected gate [1, tokens, H, K] the unfused chain takes."""
+        ...
+
+
+# The kernel a model's KDAFusedVerify runs under --linear-attn-verify-backend aiter.
+_FUSED_VERIFY_HOOK_OP = "attention.kda_fused_verify_aiter_hip"
+
+
+def _kernel_runs_here(op: str) -> bool:
+    """Whether a registered implementation of ``op`` declares this device."""
+    from sglang.kernels import PlatformInfo, capabilities_satisfied, registry
+
+    platform = PlatformInfo.detect()
+    return any(
+        capabilities_satisfied(spec.capabilities, platform) for spec in registry.get(op)
+    )
 
 
 def _validate_flashinfer_kda_prefill(
@@ -183,6 +234,12 @@ class KDAKernelDispatcher:
                 self.verify_kernel = FlashInferKDAKernel()
         elif verify_backend.is_nv_cutedsl():
             self.verify_kernel = triton_kernel
+        elif verify_backend.is_aiter():
+            # A model's KDAFusedVerify hook runs the batches it covers; the rest
+            # take the Triton chain.
+            if not _kernel_runs_here(_FUSED_VERIFY_HOOK_OP):
+                raise ValueError("KDA aiter verify backend requires ROCm")
+            self.verify_kernel = triton_kernel
         elif verify_backend.is_custom():
             # Future custom KDA verify kernel plugs in here.
             raise NotImplementedError(
@@ -192,7 +249,8 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA verify backend: {verify_backend}. "
-                "KDA verify supports 'triton', 'helion', 'nv_cutedsl', or 'flashinfer'."
+                "KDA verify supports 'triton', 'helion', 'nv_cutedsl', 'aiter', or "
+                "'flashinfer'."
             )
 
         if prefill_backend.is_triton():
@@ -1357,6 +1415,33 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
+        if layer.kda_fused_verify is not None:
+            core_attn_out = layer.kda_fused_verify.forward(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                intermediate_state_indices=intermediate_state_indices,
+                intermediate_state_cache=intermediate_state_cache,
+                intermediate_conv_window_cache=intermediate_conv_window_cache,
+                num_draft_tokens=draft_token_num,
+                replay_ring=(
+                    (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+                    if replayssm_on
+                    else None
+                ),
+                unsupported=self._fused_verify_unsupported(
+                    ragged_layout=ragged_layout,
+                    retrieve_parent_token=retrieve_parent_token,
+                    replayssm_on=replayssm_on,
+                ),
+            )
+            if core_attn_out is not None:
+                return core_attn_out
+            a = layer.kda_fused_verify.unfused_gate(a)
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -1564,6 +1649,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _fused_verify_unsupported(
+        self,
+        *,
+        ragged_layout,
+        retrieve_parent_token: Optional[torch.Tensor],
+        replayssm_on: bool,
+    ) -> Optional[str]:
+        """A batch property a KDAFusedVerify hook cannot handle, or None."""
+        if ragged_layout is not None:
+            return "ragged verify layout"
+        if retrieve_parent_token is not None:
+            return "tree verify"
+        if (
+            replayssm_on
+            and self.state_pool is not None
+            and self.state_pool.replayssm_request_ring
+        ):
+            return "request-indexed ReplaySSM ring"
+        return None
 
     def _can_run_fused_chain_verify(
         self,
