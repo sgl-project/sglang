@@ -399,6 +399,13 @@ class MooncakeEPDispatcher(BaseDispatcher):
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
 
+    @property
+    def prebuild_pending(self) -> bool:
+        return EPBuffer.get_existing_buffer() is None
+
+    def prebuild(self) -> None:
+        self._low_latency_dispatcher._get_buffer()
+
     def _get_impl(self) -> _MooncakeEPDispatcherImpl:
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)

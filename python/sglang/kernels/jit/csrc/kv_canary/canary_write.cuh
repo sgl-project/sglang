@@ -26,7 +26,6 @@ struct WriteKernelParams {
   const int64_t* write_offsets;
   const int64_t* write_seed_slot_indices;
   const int32_t* write_num_valid_reqs;
-  int32_t write_req_capacity;
 
   // ForwardBatch passthroughs. out_cache_loc is caller-pre-translated for SWA groups; the kernel
   // treats it opaquely and skips entries with slot < 0.
@@ -311,7 +310,6 @@ inline void canary_write_step_cuda(
   p.write_offsets = static_cast<const int64_t*>(write_offsets.data_ptr());
   p.write_seed_slot_indices = static_cast<const int64_t*>(write_seed_slot_indices.data_ptr());
   p.write_num_valid_reqs = static_cast<const int32_t*>(write_num_valid_reqs.data_ptr());
-  p.write_req_capacity = write_req_capacity;
   p.input_ids = static_cast<const int64_t*>(input_ids.data_ptr());
   p.positions = static_cast<const int64_t*>(positions.data_ptr());
   p.out_cache_loc = static_cast<const int64_t*>(out_cache_loc.data_ptr());

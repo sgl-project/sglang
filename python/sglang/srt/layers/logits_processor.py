@@ -59,8 +59,12 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
@@ -247,8 +251,9 @@ class LogitsProcessorOutput:
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    # A per-row list, or one [#seq, k] tensor when every row has the same k.
+    next_token_top_logprobs_val: Optional[Union[List, torch.Tensor]] = None
+    next_token_top_logprobs_idx: Optional[Union[List, torch.Tensor]] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -368,7 +373,7 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -627,7 +632,7 @@ class LogitsProcessor(nn.Module):
 
         return (
             not (info.grammars and any(g is not None for g in info.grammars))
-            and not info.has_watermark_candidates
+            and info.watermark is None
             and sampling_allows_vocab_shards(
                 info,
                 return_logprob=forward_batch.return_logprob,
@@ -653,6 +658,19 @@ class LogitsProcessor(nn.Module):
                 and get_capture_logits_variant() == VERIFY_VOCAB_SHARDS
             )
         return self.verify_uses_vocab_shards(forward_batch)
+
+    @property
+    def logits_gatherer_pending(self) -> bool:
+        return self._logits_gatherer.prebuild_pending
+
+    def prebuild_logits_gatherer(self, *, shard_width: int, dtype: torch.dtype) -> bool:
+        """Build the TP logits all-gather state; True when built.
+        ``dtype`` is the lm_head output dtype unless _compute_lm_head forces one."""
+        if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
+            dtype = torch.float32
+        elif self.rl_on_policy_target is not None:
+            dtype = torch.bfloat16
+        return self._logits_gatherer.prebuild(hidden_size=shard_width, dtype=dtype)
 
     def forward(
         self,
@@ -1921,3 +1939,28 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def prebuild_logits_gatherers(model: nn.Module, *, dtype: torch.dtype) -> int:
+    """Returns how many LogitsProcessors got their state;
+    logits dtype is known only at forward, so ``dtype`` is the model (lm_head) dtype."""
+    processors = [
+        module
+        for module in model.modules()
+        if isinstance(module, LogitsProcessor) and module.logits_gatherer_pending
+    ]
+    heads = [module for module in model.modules() if isinstance(module, ParallelLMHead)]
+    if not heads:
+        # Tied word embeddings project through the input embedding.
+        heads = [
+            module
+            for module in model.modules()
+            if isinstance(module, VocabParallelEmbedding)
+        ]
+    if not processors or not heads:
+        return 0
+    shard_width = max(head.num_embeddings_per_partition for head in heads)
+    return sum(
+        processor.prebuild_logits_gatherer(shard_width=shard_width, dtype=dtype)
+        for processor in processors
+    )

@@ -36,11 +36,13 @@ from pathlib import Path
 import requests
 import torch
 
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     find_free_port,
     wait_for_server_health,
 )
+from sglang.srt.utils.network import get_free_port_below_ephemeral, is_port_available
 from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
 HOST = "127.0.0.1"
@@ -122,9 +124,28 @@ class DisaggCluster:
         self._alloc_ports()
 
     def _alloc_ports(self) -> None:
-        self.base_port = find_free_port(HOST)
-        self.api_port = find_free_port(HOST)
-        self._role_ports = {role: find_free_port(HOST) for role in self.gpu_layout}
+        # The head binds its result sockets at fixed offsets from its frontend.
+        first_work_offset = max(ServerArgs.DISAGG_RESULT_PORT_OFFSETS.values()) + 1
+        api_offset = first_work_offset + len(self.gpu_layout)
+        # give every process its own rendezvous port after the service endpoints
+        last_offset = api_offset + 1 + len(self.gpu_layout)
+        for _ in range(64):
+            base = get_free_port_below_ephemeral()
+            if all(is_port_available(base + i) for i in range(last_offset + 1)):
+                self.base_port = base
+                self.api_port = base + api_offset
+                self._role_ports = {
+                    role: base + i
+                    for i, role in enumerate(self.gpu_layout, start=first_work_offset)
+                }
+                self._master_ports = {
+                    role: self.api_port + i
+                    for i, role in enumerate(("server", *self.gpu_layout), start=1)
+                }
+                break
+        else:
+            raise RuntimeError(f"No free port block for {self.name}")
+
         if self.stage_groups:
             self.deployment_path = _LOG_DIR / f"disagg_{self.name}.json"
             deployment = {
@@ -147,8 +168,7 @@ class DisaggCluster:
     def __enter__(self) -> DisaggCluster:
         for attempt in range(3):
             try:
-                self._launch_roles()
-                self._launch_server_head()
+                self._launch_servers()
                 self._warmup()
                 return self
             except Exception as e:
@@ -158,9 +178,9 @@ class DisaggCluster:
                     flush=True,
                 )
                 self.stop()
-                self._alloc_ports()
                 if attempt == 2:
                     raise
+                self._alloc_ports()
         return self  # unreachable
 
     def __exit__(self, *exc) -> None:
@@ -181,7 +201,16 @@ class DisaggCluster:
         self._fhs.append(fh)
         return proc
 
-    def _launch_roles(self) -> None:
+    def _launch_servers(self) -> None:
+        if self.stage_groups:
+            self._launch_roles()
+            self._launch_server_head()
+            return
+        # preset workers send their transfer registration once, at startup
+        head = self._launch_server_head()
+        self._launch_roles(head)
+
+    def _launch_roles(self, head: subprocess.Popen | None = None) -> None:
         for role in self.gpu_layout:
             port = self._role_ports[role]
             gpus = self.gpu_layout[role]
@@ -191,6 +220,7 @@ class DisaggCluster:
             mode_args = [
                 "--disagg-role",
                 role,
+                "--strict-ports",
                 "--disagg-server-addr",
                 f"tcp://{HOST}:{self.base_port}",
             ]
@@ -216,7 +246,7 @@ class DisaggCluster:
                 "--base-gpu-id",
                 str(gpus[0]),
                 "--master-port",
-                str(find_free_port(HOST)),
+                str(self._master_ports[role]),
                 "--log-level",
                 "info",
                 *self.extra_role_args.get(role, []),
@@ -233,8 +263,17 @@ class DisaggCluster:
                     f"{role} failed to start for {self.name}. Log tail:\n"
                     f"{_tail_log(log)}"
                 )
+            if head is None:
+                continue
+            head_log = self._logs["server"]
+            registration = f"work_endpoint=tcp://{HOST}:{port} session="
+            if not _wait_for_log(head_log, registration, self.startup_timeout, head):
+                raise RuntimeError(
+                    f"Head did not receive {role} registration. Head log:\n"
+                    f"{_tail_log(head_log)}\nWorker log:\n{_tail_log(log)}"
+                )
 
-    def _launch_server_head(self) -> None:
+    def _launch_server_head(self) -> subprocess.Popen:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
         # Match the literal hostname advertised by the workers.
@@ -249,6 +288,9 @@ class DisaggCluster:
             "--model-path",
             self.model,
             *mode_args,
+            "--strict-ports",
+            "--master-port",
+            str(self._master_ports["server"]),
             "--scheduler-port",
             str(self.base_port),
             "--port",
@@ -264,18 +306,20 @@ class DisaggCluster:
         if not self.stage_groups:
             for role, port in self._role_ports.items():
                 cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
-        self._start_proc(cmd, log)
+        head = self._start_proc(cmd, log)
         try:
             wait_for_server_health(
                 f"http://{HOST}:{self.api_port}",
                 path="/v1/models",
                 timeout=self.startup_timeout,
+                process=head,
             )
         except Exception as e:
             raise RuntimeError(
                 f"server head failed to become healthy for {self.name}: {e}\n"
                 f"Server log tail:\n{_tail_log(log)}"
             ) from e
+        return head
 
     def _warmup(self) -> None:
         """Send a warmup request to establish RDMA connections."""
@@ -288,7 +332,7 @@ class DisaggCluster:
             ) from e
 
     def stop(self) -> None:
-        for proc in self._procs:
+        for proc in reversed(self._procs):
             terminate_and_kill_process_tree(proc)
         for fh in self._fhs:
             try:

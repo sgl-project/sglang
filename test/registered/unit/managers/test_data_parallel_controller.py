@@ -692,7 +692,6 @@ def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
     """
     receiver = SchedulerRequestReceiver(
         recv_from_tokenizer=None,
-        recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,

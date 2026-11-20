@@ -127,8 +127,8 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_npu:
-    from sgl_kernel_npu.moe.zero_experts_compute_identity import (
-        zero_experts_compute_identity_triton as zero_experts_compute_triton,
+    from sgl_kernel_npu.operators.moe import (
+        zero_experts_compute_identity as zero_experts_compute_triton,
     )
 else:
     from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
