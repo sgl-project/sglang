@@ -72,6 +72,8 @@ def resolve_dspine_head_topk(config, num_layers: int | None = None) -> int:
     k = values.pop()
     if k & (k - 1) or not 2 <= k <= 64:
         raise ValueError(f"DSPINE head_topk must be a power of two in [2, 64], got {k}")
+    if k > int(config.vocab_size):
+        raise ValueError("DSPINE head_topk cannot exceed the vocabulary size")
     return k
 
 
@@ -196,6 +198,8 @@ class DSpineCodeBridge(nn.Module):
         if name not in destinations or name == "packed_weight":
             raise ValueError(f"Unexpected DSPINE code-bridge weight: {name}")
         dest = destinations[name]
+        if name.endswith("_version") and (tensor.numel() != 1 or tensor.item() != 1):
+            raise ValueError(f"Unsupported DSPINE {name}")
         if tensor.is_floating_point() and not torch.isfinite(tensor).all().item():
             raise ValueError(f"Non-finite DSPINE code-bridge weight: {name}")
         if tuple(dest.shape) != tuple(tensor.shape):
@@ -446,6 +450,7 @@ def score_dspine_transitions(
     lm_head_weight: torch.Tensor,
     norm_eps: float,
     write_gram: torch.Tensor | None = None,
+    sender_weight: torch.Tensor | None = None,
     normalize: bool = True,
 ) -> torch.Tensor:
     """fp32 [B, T-1, K, K] transition logits of the redone last write.
@@ -471,8 +476,12 @@ def score_dspine_transitions(
     )
     sqrt_c = math.sqrt(codebook.shape[1])
     e = codebook[senders].float() * sqrt_c  # [B, S, K, C]
-    gate = torch.sigmoid(query.float()[:, :, None, :] + e @ pred_gate.T + gate_bias)
-    msg = gate * (e @ prev.T)  # [B, S, K, R]
+    if sender_weight is None:
+        sender_gate, sender_value = e @ pred_gate.T, e @ prev.T
+    else:
+        sender_gate, sender_value = F.linear(e, sender_weight).chunk(2, dim=-1)
+    gate = torch.sigmoid(query.float()[:, :, None, :] + sender_gate + gate_bias)
+    msg = gate * sender_value  # [B, S, K, R]
     x = raw.float()
     scale = rms.float()
     # R-space algebra: keep the [B, S, K, H] refined states implicit.

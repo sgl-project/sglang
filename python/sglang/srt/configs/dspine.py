@@ -78,7 +78,7 @@ def normalize_dspine_config(source: dict) -> dict:
                     "rank": rank,
                     "eps": source.get(
                         "bridge_eps",
-                        bridge.get("eps", config.get("rms_norm_eps", 1e-6)),
+                        source.get("transfer_space_eps", bridge.get("eps", 1e-6)),
                     ),
                 }
         if "selected_prefix_last_write_refine" not in cfg:
@@ -116,7 +116,7 @@ def normalize_dspine_config(source: dict) -> dict:
         if source.get("draft_vocab_size") is None:
             raise ValueError("DSPINE requires an explicit vocabulary size")
         config["vocab_size"] = source["draft_vocab_size"]
-    if source.get("draft_vocab_size", config["vocab_size"]) != config["vocab_size"]:
+    if source.get("draft_vocab_size") not in (None, config["vocab_size"]):
         raise ValueError("DSPINE does not support a reduced draft vocabulary")
     target_hidden = source.get("target_hidden_size")
     if target_hidden is not None and target_hidden != config["hidden_size"]:

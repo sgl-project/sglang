@@ -83,6 +83,7 @@ class DSpineSelector(CandidateSelector):
             lm_head_weight=model.lm_head.weight,
             norm_eps=model.norm.variance_epsilon,
             write_gram=model.write_gram_f32,
+            sender_weight=model.sender_weight_f32,
         )
 
 
@@ -117,10 +118,15 @@ class DSpineDraftModel(DFlashDraftModel):
         self.lm_head = None
         self.last_write_stash = None
         self._refinement_ready = False
-        # Never silently serve a partially loaded backbone.
+        self._invalidate_backbone()
+
+    @torch.no_grad()
+    def _invalidate_backbone(self):
+        # Check every full checkpoint load, including reloads. The target head
+        # is shared with the verifier and must never be invalidated here.
         for name, param in self.named_parameters():
-            if not name.startswith("selected_prefix_bridge."):
-                param.data.fill_(float("nan"))
+            if not name.startswith(("selected_prefix_bridge.", "lm_head.")):
+                param.fill_(float("nan"))
 
     @torch.no_grad()
     def prepare_refinement(self, lm_head):
@@ -157,6 +163,10 @@ class DSpineDraftModel(DFlashDraftModel):
         for name, tensor in (
             ("pred_gate_f32", bridge.predecessor_gate.weight),
             ("prev_f32", bridge.prev.weight),
+            (
+                "sender_weight_f32",
+                torch.cat((bridge.predecessor_gate.weight, bridge.prev.weight)).float(),
+            ),
             ("gate_bias_f32", bridge.gate.bias),
             ("write_f32", bridge.feature_write_weights[-1]),
             ("norm_f32", self.norm.weight),
@@ -236,10 +246,16 @@ class DSpineDraftModel(DFlashDraftModel):
         self._refinement_ready = False
         bridge = self.selected_prefix_bridge
         bridge.begin_load()
+        self.last_write_stash = None
+        self._invalidate_backbone()
 
         def backbone_weights():
             for name, tensor in weights:
                 short = name.removeprefix("model.")
+                if short.startswith("lm_head."):
+                    raise ValueError(
+                        "DSPINE checkpoints must not contain a target lm_head"
+                    )
                 if short.startswith("selected_prefix_bridge."):
                     bridge.load_weight(
                         short.removeprefix("selected_prefix_bridge."), tensor
@@ -248,7 +264,7 @@ class DSpineDraftModel(DFlashDraftModel):
                     "draft_block_causal_version",
                     "last_write_refine_version",
                 ):
-                    if int(tensor.item()) != 1:
+                    if tensor.numel() != 1 or tensor.item() != 1:
                         raise ValueError(
                             f"Unsupported DSPINE checkpoint version: {short}"
                         )

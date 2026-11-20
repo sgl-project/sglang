@@ -91,6 +91,46 @@ class TestDSpineConfig(unittest.TestCase):
         self.assertEqual(resolve_dspine_head_topk(SimpleNamespace(**normalized)), 4)
         self.assertNotIn("is_causal", source["transformer_layer_config"])
 
+    def test_speculators_transfer_space_epsilon_is_not_backbone_epsilon(self):
+        source = {
+            "speculators_model_type": "dspine",
+            "transformer_layer_config": {
+                "hidden_size": 8,
+                "num_hidden_layers": 3,
+                "vocab_size": 13,
+                "rms_norm_eps": 1e-5,
+            },
+            "block_size": 4,
+            "aux_hidden_state_layer_ids": [1, 5, 9],
+            "mask_token_id": 12,
+            "transfer_dim": 5,
+            "message_dim": 4,
+            "transition_top_k": 4,
+            "transfer_space_eps": 1e-7,
+        }
+        for explicit, expected in ((True, 1e-7), (False, 1e-6)):
+            with self.subTest(explicit=explicit):
+                config = copy.deepcopy(source)
+                if not explicit:
+                    del config["transfer_space_eps"]
+                result = normalize_dspine_config(config)
+                self.assertEqual(
+                    result["dflash_config"]["selected_prefix_code_bridge"],
+                    {"code_size": 5, "rank": 4, "eps": expected},
+                )
+
+    def test_refinement_width_cannot_exceed_vocabulary(self):
+        with self.assertRaisesRegex(ValueError, "vocabulary"):
+            resolve_dspine_head_topk(
+                bridge_config(dspine_top_k=16, selected_prefix_last_write_refine=None)
+            )
+
+    def test_null_draft_vocab_uses_full_vocabulary(self):
+        result = normalize_dspine_config(
+            vars(bridge_config()) | {"draft_vocab_size": None}
+        )
+        self.assertEqual(result["vocab_size"], 13)
+
     def test_unsupported_export_modes_rejected(self):
         for key, value in (
             ("is_causal", False),
@@ -257,6 +297,16 @@ class TestDSpineNumerics(unittest.TestCase):
         actual = score_dspine_transitions(
             candidates, raw, rms, query, anchors, **kwargs
         )
+        packed = score_dspine_transitions(
+            candidates,
+            raw,
+            rms,
+            query,
+            anchors,
+            sender_weight=torch.cat((kwargs["pred_gate"], kwargs["prev"])),
+            **kwargs,
+        )
+        torch.testing.assert_close(packed, actual, atol=1e-5, rtol=1e-5)
         reference = torch.empty(2, 3, 4, 4, dtype=torch.float64)
         for b in range(2):
             for step in range(3):
@@ -299,9 +349,12 @@ class TestDSpineNumerics(unittest.TestCase):
         ptr = bridge.packed_weight.data_ptr()
         bridge.prepare()
         self.assertEqual(ptr, bridge.packed_weight.data_ptr())
-        bridge.load_weight("terminal_disabled_version", torch.tensor(2))
-        with self.assertRaisesRegex(ValueError, "Unsupported"):
-            bridge.prepare()
+        for version in (torch.tensor(2), torch.tensor(1.5), torch.tensor([1, 1])):
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(ValueError, "Unsupported"),
+            ):
+                bridge.load_weight("terminal_disabled_version", version)
 
 
 if __name__ == "__main__":

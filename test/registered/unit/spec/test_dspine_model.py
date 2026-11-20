@@ -112,7 +112,14 @@ class TestDSpineModel(unittest.TestCase):
 
     def test_refinement_reload_keeps_graph_buffer_addresses(self):
         model = draft()
-        names = ("pred_gate_f32", "prev_f32", "write_f32", "norm_f32", "write_gram_f32")
+        names = (
+            "pred_gate_f32",
+            "prev_f32",
+            "write_f32",
+            "norm_f32",
+            "write_gram_f32",
+            "sender_weight_f32",
+        )
         pointers = {name: getattr(model, name).data_ptr() for name in names}
         previous = model.write_gram_f32.clone()
         model.selected_prefix_bridge.feature_write_weights.data.add_(0.1)
@@ -157,6 +164,53 @@ class TestDSpineModel(unittest.TestCase):
                     )
                 torch.testing.assert_close(probabilities[b, step], expected)
                 previous = index
+
+    def test_backbone_reload_invalidation_preserves_shared_target_head(self):
+        model = draft()
+        head = model.lm_head.weight.clone()
+        bridge = model.selected_prefix_bridge
+        weights = [
+            (f"selected_prefix_bridge.{name}", tensor.clone())
+            for name, tensor in bridge.state_dict().items()
+        ]
+        model.projector_type = None
+        # A complete bridge with no backbone must fail even after a valid load.
+        with self.assertRaisesRegex(ValueError, "Missing or non-finite"):
+            model.load_weights(weights)
+        torch.testing.assert_close(model.lm_head.weight, head, atol=0, rtol=0)
+        self.assertFalse(model._refinement_ready)
+        self.assertIsNone(model.last_write_stash)
+
+    def test_reload_cannot_overwrite_shared_target_head(self):
+        model = draft()
+        model.projector_type = None
+        head = model.lm_head.weight.clone()
+        with self.assertRaisesRegex(ValueError, "must not contain"):
+            model.load_weights([("model.lm_head.weight", torch.zeros_like(head))])
+        torch.testing.assert_close(model.lm_head.weight, head, atol=0, rtol=0)
+
+    def test_complete_reload_refreshes_refinement_and_preserves_head(self):
+        model = draft()
+        model.projector_type = None
+        weights = [
+            (name, tensor.clone())
+            for name, tensor in model.state_dict().items()
+            if not name.startswith("lm_head.")
+        ]
+        previous = model.sender_weight_f32.clone()
+        for name, tensor in weights:
+            if name == "selected_prefix_bridge.prev.weight":
+                tensor.add_(0.1)
+        head = model.lm_head.weight.clone()
+        model.load_weights(weights)
+        self.assertTrue(model._refinement_ready)
+        self.assertFalse(torch.equal(previous, model.sender_weight_f32))
+        torch.testing.assert_close(model.lm_head.weight, head, atol=0, rtol=0)
+        bridge = model.selected_prefix_bridge
+        torch.testing.assert_close(
+            model.sender_weight_f32,
+            torch.cat((bridge.predecessor_gate.weight, bridge.prev.weight)),
+        )
 
     def test_partial_blocks_are_rejected(self):
         model = draft()
