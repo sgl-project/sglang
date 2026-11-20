@@ -198,6 +198,7 @@ from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
     init_http_request_metrics,
 )
+from sglang.srt.observability.log_redaction import redact_exception
 from sglang.srt.observability.trace import (
     fastapi_telemetry_disabled_kwargs,
     process_tracing_init,
@@ -1014,7 +1015,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                         "retryable": False,
                     }
                 }
-                logger.error(f"[http_server] Error: {e}")
+                logger.error(f"[http_server] Error: {redact_exception(e)}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -1030,7 +1031,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return orjson_response(ret)
         except ValueError as e:
-            logger.error(f"[http_server] Error: {e}")
+            logger.error(f"[http_server] Error: {redact_exception(e)}")
             return _create_error_response(e)
 
 

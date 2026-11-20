@@ -167,6 +167,7 @@ POSITIONAL_FIELD_ORDER = (
     "log_requests_level",
     "log_requests_format",
     "log_requests_target",
+    "log_request_content_on_error",
     "uvicorn_access_log_exclude_prefixes",
     "crash_dump_folder",
     "enable_metrics",

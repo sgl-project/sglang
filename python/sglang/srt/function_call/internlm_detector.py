@@ -113,8 +113,7 @@ class InternlmDetector(BaseFormatDetector):
                         parameters = {}
 
                     logger.info(
-                        f"[InternLM Tool Call] Parsed tool call #{idx + 1}: name={name}, "
-                        f"parameters={json.dumps(parameters, ensure_ascii=False)}"
+                        f"[InternLM Tool Call] Parsed tool call #{idx + 1}: name={name}"
                     )
 
                     # Validate tool name

@@ -26,6 +26,7 @@ from sglang.srt.function_call.utils import (
     get_schema_properties,
     safe_literal_eval,
 )
+from sglang.srt.observability.log_redaction import redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def _convert_param_value(
             logger.warning(
                 "Parsed value '%s' of parameter '%s' is not an "
                 "integer in tool '%s', degenerating to string.",
-                param_value,
+                redact_text(param_value),
                 param_name,
                 func_name,
             )
@@ -88,7 +89,7 @@ def _convert_param_value(
             logger.warning(
                 "Parsed value '%s' of parameter '%s' is not a float "
                 "in tool '%s', degenerating to string.",
-                param_value,
+                redact_text(param_value),
                 param_name,
                 func_name,
             )
@@ -100,7 +101,7 @@ def _convert_param_value(
                 "Parsed value '%s' of parameter '%s' is not a boolean "
                 "(`true` or `false`) in tool '%s', degenerating to "
                 "false.",
-                param_value,
+                redact_text(param_value),
                 param_name,
                 func_name,
             )
@@ -119,7 +120,7 @@ def _convert_param_value(
                     "Parsed value '%s' of parameter '%s' cannot be "
                     "parsed with json.loads in tool '%s', will try "
                     "other methods to parse it.",
-                    param_value,
+                    redact_text(param_value),
                     param_name,
                     func_name,
                 )
@@ -130,7 +131,7 @@ def _convert_param_value(
                 "Parsed value '%s' of parameter '%s' cannot be "
                 "converted via Python `ast.literal_eval()` in tool "
                 "'%s', degenerating to string.",
-                param_value,
+                redact_text(param_value),
                 param_name,
                 func_name,
             )

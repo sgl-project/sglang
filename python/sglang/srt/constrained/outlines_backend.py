@@ -31,12 +31,12 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.json_schema_validation import (
     validate_outlines_json_schema,
 )
+from sglang.srt.observability.log_redaction import redact_content, redact_exception
 
 try:
     from outlines.fsm.json_schema import build_regex_from_schema
 except ImportError:
     from outlines_core.fsm.json_schema import build_regex_from_schema
-
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,10 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
-            logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
+            logger.error(
+                f"Hit invalid regex schema: regex={redact_content(regex)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
 
         return OutlinesGrammar(guide)
@@ -158,7 +161,10 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             json.decoder.JSONDecodeError,
             ValueError,
         ) as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            logger.error(
+                f"Hit invalid json_schema: key_string={redact_content(key_string)}, "
+                f"e={redact_exception(e)}"
+            )
             return InvalidGrammarObject(str(e))
         return self._compile_regex(regex)
 
