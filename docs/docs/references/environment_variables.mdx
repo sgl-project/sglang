@@ -163,6 +163,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_PD_DECODE_SEAT_AGE_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let a PD disaggregation decode server without pipeline parallelism keep the requests whose KV has landed in the order they arrived at the decode, instead of the order their KV landed, so a freed running slot goes to the landed request that arrived first. A retracted request keeps its place. Not applied with priority scheduling. This changes admission order only. When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let a PD disaggregation decode server with attention DP gather each scheduler pass's cross-DP sync rows through the scheduler's shared-memory exchange instead of a gloo gather and broadcast when its checks pass, giving the same rows. Needs `SGLANG_OPT_SCHEDULER_SHM_SYNC`, and `SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST` across two hosts. A group across more than two hosts, `--enable-pd-role-switch`, pipeline parallelism or `--sleep-on-idle` keeps the gloo gather; a gather on the device group (`--disable-overlap-schedule` or `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH`) is not affected. When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>

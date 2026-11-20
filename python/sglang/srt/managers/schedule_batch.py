@@ -665,6 +665,10 @@ class Req(ReqDllmMixin):
         # processed yet.
         self.inflight_steps = 0
 
+        # PD decode: the arrival number at this decode scheduler, kept through
+        # retraction (SGLANG_OPT_PD_DECODE_SEAT_AGE_ORDER).
+        self.decode_arrival_seq: Optional[int] = None
+
         # For retraction
         self.is_retracted = False
         # Indicates if the req has ever been retracted.

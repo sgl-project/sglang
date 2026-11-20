@@ -67,6 +67,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_seat_age import SeatAgeOrder, init_seat_age_order
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.shm_flag_reduce import init_decode_flag_reducer
@@ -479,6 +480,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    # The transfer queue's arrival order of the waiting queue, or None.
+    seat_age_order: Optional[SeatAgeOrder] = None
 
     def __init__(
         self,
@@ -567,6 +570,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.held_rebootstrap_reqs = IndexedReqList(
             ListKind.PD_HELD, abort=self._abort_held
         )
+        self.seat_age_order = transfer_queue.seat_age_order
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -1139,6 +1143,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
+        if self.seat_age_order is not None:
+            # Numbered on the first add only: a retracted request keeps its age.
+            self.seat_age_order.stamp(req)
         if is_retracted and retraction_needs_rebootstrap(
             self.token_to_kv_pool_allocator
         ):
@@ -1424,7 +1431,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
 
-        move(resumed_reqs, dst)
+        if self.seat_age_order is None:
+            move(resumed_reqs, dst)
+        else:
+            self.seat_age_order.join(dst, resumed_reqs)
 
         return resumed_reqs
 
@@ -3311,6 +3321,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
 
     enable_host_receive: bool = False
+    # SGLANG_OPT_PD_DECODE_SEAT_AGE_ORDER: the waiting queue's arrival order, or None.
+    seat_age_order: Optional[SeatAgeOrder] = None
 
     def __init__(
         self,
@@ -3355,6 +3367,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         init_decode_flag_reducer(
             self.gloo_group, enable_overlap=scheduler.enable_overlap
+        )
+        self.seat_age_order = init_seat_age_order(
+            pp_size=get_parallel().pp_size,
+            priority_scheduling=scheduler.enable_priority_scheduling,
         )
         # A page move that cannot avoid a row a receive writes waits, on the
         # host, until every rank's receive is done writing it.
@@ -3865,7 +3881,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.metadata_buffers.clear_slot(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
-        move(transferred_reqs, dst)
+        if self.seat_age_order is None:
+            move(transferred_reqs, dst)
+        else:
+            self.seat_age_order.join(dst, transferred_reqs)
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
         self.publish_pending_metadata(polls)

@@ -23,7 +23,11 @@ from unittest.mock import patch
 import msgspec
 
 from sglang.srt.arg_groups import overrides
-from sglang.srt.disaggregation import decode_freed_slots, pp_early_finish
+from sglang.srt.disaggregation import (
+    decode_freed_slots,
+    decode_seat_age,
+    pp_early_finish,
+)
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.environ import envs, nv_mega_runtime_switches
 from sglang.srt.layers import lm_head_all_to_all
@@ -276,6 +280,17 @@ def _freed_slots(shape: Shape) -> bool:
     )
 
 
+def _seat_age_order(shape: Shape) -> bool:
+    return (
+        shape.role == "decode"
+        and decode_seat_age.init_seat_age_order(
+            pp_size=get_parallel().pp_size,
+            priority_scheduling=shape.args.get("enable_priority_scheduling", False),
+        )
+        is not None
+    )
+
+
 def _pp_prefill_loop(shape: Shape) -> bool:
     return shape.role == "prefill" and get_parallel().pp_size > 1
 
@@ -369,6 +384,7 @@ def _tp_lm_head_fp32(shape: Shape) -> bool:
 RESOLVERS: Dict[str, Callable[[Shape], bool]] = {
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_DP_ROWS": _dp_rows,
     "SGLANG_OPT_PD_DECODE_ADMIT_FREED_SLOTS": _freed_slots,
+    "SGLANG_OPT_PD_DECODE_SEAT_AGE_ORDER": _seat_age_order,
     "SGLANG_OPT_PP_PREFILL_EARLY_FINISH": _pp_early_finish,
     "SGLANG_OPT_PP_EARLY_RELAY": _pp_early_relay,
     "SGLANG_OPT_PP_PROXY_RECV_AFTER_FORWARD": _pp_proxy_recv_after_forward,
@@ -449,7 +465,7 @@ def _children(*names: str) -> FrozenSet[str]:
 
 
 # Every PD decode loop with the overlap scheduler.
-_PD_DECODE = _children("PD_DECODE_ADMIT_FREED_SLOTS")
+_PD_DECODE = _children("PD_DECODE_ADMIT_FREED_SLOTS", "PD_DECODE_SEAT_AGE_ORDER")
 # A PD decode without attention DP.
 _PD_DECODE_TP = _children()
 _TWO_HOSTS = _children()
