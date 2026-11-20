@@ -203,8 +203,8 @@ def k3_kda_inproj_fp8_tail_rows(
 def k3_kda_inproj_fp8_f_b(
     *, f_a: torch.Tensor, f_b_weight: torch.Tensor
 ) -> torch.Tensor:
-    """f_b on f_a, a row slice of the merged Quark FP8 in-proj output: AITER's tuned
-    GEMM reads it in place on gfx95x, the tiny GEMM runs it elsewhere."""
+    """f_b on f_a, a row slice of the merged Quark FP8 in-proj output;
+    gfx95x reads it in place with AITER's tuned GEMM, other targets use the tiny GEMM."""
     if _is_gfx95:
         return kda_f_b_gemm_hip(f_a=f_a, f_b_weight=f_b_weight)
     from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm

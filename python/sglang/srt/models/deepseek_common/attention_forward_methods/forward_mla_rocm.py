@@ -241,9 +241,8 @@ def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
 
 
 def rocm_absorb_bmm_runs_fp8(weight_dtype: torch.dtype) -> bool:
-    """Whether rocm_absorb_{q,v}_bmm run an FP8 w_kc/w_vc of this dtype on
-    AITER's a8w8 BMM in every forward mode; otherwise a non-MXFP4 weight is
-    dequantized to BF16 (gfx942 FP8 only takes the a8w8 BMM under capture)."""
+    """Whether the absorb BMMs run this FP8 dtype on AITER's a8w8 BMM in every mode;
+    otherwise non-MXFP4 weights dequantize to BF16 (gfx942 FP8 only under capture)."""
     return _use_aiter_gfx95 and weight_dtype == torch.float8_e4m3fn
 
 

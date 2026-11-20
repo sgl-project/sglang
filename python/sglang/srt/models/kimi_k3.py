@@ -2274,8 +2274,8 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_side_tgv_m_ranges = m_ranges
 
     def _merge_kda_inproj_fp8(self) -> bool:
-        """Copy the Quark FP8 [f_a | b] rows into the tail that fused_qkvg_proj
-        reserved at init; False where no tail was reserved.
+        """Copy the Quark FP8 [f_a | b] rows into fused_qkvg_proj's reserved tail;
+        False where no tail was reserved.
 
         Leaves _bfa_w None. A re-run after weight processing keeps the merge,
         since the weights no longer have the checkpoint layout it reads."""
