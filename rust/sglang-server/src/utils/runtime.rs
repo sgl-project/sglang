@@ -413,6 +413,20 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?
     .map(Arc::new);
     let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    // Default: a real tokenizer decodes to text, with byte tables when they pass
+    // their startup check, which is slow too, so it also runs before the ports
+    // are bound. `None` (→ `Skip`, raw `output_ids`) only happens under
+    // `skip_tokenizer_init` — `load_tokenizer` rejects a non-skip server with no
+    // tokenizer.
+    let detokenizer_backend = match &dyn_tokenizer {
+        Some(t) => detokenizer::DetokenizerBackend::for_tokenizer(
+            t.clone(),
+            &cfg.server_args.tokenizer_path,
+            cfg.server_args.revision.as_deref(),
+            crate::tokenizer_manager::byte_tables::enabled(),
+        ),
+        None => detokenizer::DetokenizerBackend::Skip,
+    };
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -432,13 +446,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
-        // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
-        // `output_ids`) only happens under `skip_tokenizer_init` —
-        // `load_tokenizer` rejects a non-skip server with no tokenizer.
-        let backend = match &dyn_tokenizer {
-            Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
-            None => detokenizer::DetokenizerBackend::Skip,
-        };
+        let backend = detokenizer_backend;
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
