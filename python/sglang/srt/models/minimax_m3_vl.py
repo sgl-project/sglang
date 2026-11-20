@@ -277,8 +277,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]):
-        if not self.pp_group.is_last_rank:
-            return
+        # Unlike EAGLE3, every PP stage captures its share and relays it downstream.
         depth = len(self.model.layers)
         if not layer_ids or any(i < 0 or i >= depth for i in layer_ids):
             raise ValueError("DSpark capture IDs must select existing target layers")
@@ -286,6 +285,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.model.layers_to_capture = [i + 1 for i in layer_ids]
         for i, layer in enumerate(self.model.layers):
             layer._is_layer_to_capture = i in self.model.layers_to_capture
+
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        # Entry ids: a capture below start_layer was taken by an earlier stage.
+        return self.config.text_config.hidden_size * sum(
+            layer_id < self.model.start_layer
+            for layer_id in self.model.layers_to_capture
+        )
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]):
         if list(layer_ids) != sorted(set(layer_ids)):
