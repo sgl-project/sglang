@@ -1739,7 +1739,9 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "draft_ring",
                 "c128_state",
+                "request_row",
                 "minimax_index_k",
                 "minimax_dense_kv",
             ):
@@ -1941,7 +1943,9 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "draft_ring",
                 "c128_state",
+                "request_row",
                 "minimax_dense_kv",
             ):
                 raise RuntimeError(
@@ -1957,6 +1961,11 @@ class MoriKVManager(CommonKVManager):
             )
             src_state_indices = src_state_indices[:common_len]
             dst_state_indices = dst_state_indices[:common_len]
+        if state_type == "draft_ring":
+            # Row 0 marks a position one side's DCP rank does not own.
+            owned = (src_state_indices != 0) & (dst_state_indices != 0)
+            src_state_indices = src_state_indices[owned]
+            dst_state_indices = dst_state_indices[owned]
 
         # Group contiguous indices and issue per-tensor transfers
         grouped_plan = GroupedIndexPlan.from_groups(

@@ -178,6 +178,9 @@ class TestResolveMHADraftKVRing(CustomTestCase):
             "dp attention": _mha_args(attn_dp_size=2),
             "draft window": _mha_args(speculative_draft_window_size=512),
             "fa3": _mha_args(speculative_draft_attention_backend="fa3"),
+            "pd over mori": _mha_args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="mori"
+            ),
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():
