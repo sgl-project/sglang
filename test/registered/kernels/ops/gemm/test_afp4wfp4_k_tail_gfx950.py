@@ -81,6 +81,8 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
         cls.lds_fill = staticmethod(_make_lds_fill())
 
     def _assert_matches_reference(self):
+        # Importing the Quark scheme registers torch.ops.sglang.aiter_gemm_afp4wfp4 on HIP.
+        import sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4  # noqa: F401
         from sglang.kernels.ops.gemm.afp4wfp4_k_tail_gfx950 import (
             _aiter_get_config,
             gemm_afp4wfp4_k_tail_safe,
@@ -88,22 +90,40 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
         )
 
         for (k, m), (x_q, x_s, w_q, w_s, ref) in self.inputs.items():
-            with self.subTest(k=k, m=m):
-                aiter_config, _ = _aiter_get_config(m=m, n=N, k_packed=k // 2)
-                # Guard the premise: once AITER tunes this shape off the stale-LDS path, pick another.
-                self.assertTrue(
-                    k_tail_in_unfilled_stage(
-                        block_k=aiter_config["BLOCK_SIZE_K"],
-                        k=k,
-                        num_stages=aiter_config["num_stages"],
-                    )
+            aiter_config, _ = _aiter_get_config(m=m, n=N, k_packed=k // 2)
+            # Guard the premise: once AITER tunes this shape off the stale-LDS path, pick another.
+            self.assertTrue(
+                k_tail_in_unfilled_stage(
+                    block_k=aiter_config["BLOCK_SIZE_K"],
+                    k=k,
+                    num_stages=aiter_config["num_stages"],
                 )
-                y = torch.zeros((m, N), dtype=torch.bfloat16, device="cuda")
-                # 0xFF is a NaN E8M0 scale; a K-tail that reads stale LDS turns it into NaN.
-                self.lds_fill(0xFF)
-                gemm_afp4wfp4_k_tail_safe(x_q, w_q, x_s, w_s, y)
-                err = (y.float() - ref).abs().nan_to_num(float("inf"))
-                self.assertLessEqual(err.max().item(), 0.02 * ref.abs().max().item())
+            )
+            # The Quark op is the call site that regressed; the kernel entry is the unit under it.
+            entries = (
+                (
+                    "kernel",
+                    lambda y: gemm_afp4wfp4_k_tail_safe(
+                        x=x_q, w=w_q, x_scales=x_s, w_scales=w_s, y=y
+                    ),
+                ),
+                (
+                    "quark_op",
+                    lambda y: torch.ops.sglang.aiter_gemm_afp4wfp4(
+                        x_q, w_q, x_s, w_s, y
+                    ),
+                ),
+            )
+            for name, run in entries:
+                with self.subTest(k=k, m=m, entry=name):
+                    y = torch.zeros((m, N), dtype=torch.bfloat16, device="cuda")
+                    # 0xFF is a NaN E8M0 scale; a K-tail that reads stale LDS turns it into NaN.
+                    self.lds_fill(0xFF)
+                    run(y)
+                    err = (y.float() - ref).abs().nan_to_num(float("inf"))
+                    self.assertLessEqual(
+                        err.max().item(), 0.02 * ref.abs().max().item()
+                    )
 
     def test_matches_dequantized_reference(self):
         self._assert_matches_reference()
