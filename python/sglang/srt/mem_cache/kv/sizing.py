@@ -199,23 +199,22 @@ def _bs1_floor_terms(plan, context_len, floor_window, strategy):
     return tuple(terms)
 
 
-def _state_targets(plan, inp, chain, running, states, frozen, strategy):
+def _state_targets(inp, running, states, frozen, strategy, share_slots):
     units = {}
-    state_budget = int(chain * inp.state_share)
     for sub_pool in states:
         count = inp.state_slots
         if count is None:
             count = (
                 running * strategy.slots_per_request()
                 if not inp.radix_cache
-                else state_budget // sub_pool.spec.entry_bytes()
+                else share_slots[sub_pool.name]
             )
             if not inp.radix_cache and inp.max_running_requests is None:
                 # Without a radix cache state serves running requests only,
                 # but an estimated concurrency gets no more than the state
                 # share, as a cache's slots do: the rest of the arena is
                 # FULL's, not traded for more requests than FULL can hold.
-                count = min(count, state_budget // sub_pool.spec.entry_bytes())
+                count = min(count, share_slots[sub_pool.name])
         if frozen is not None:
             count = min(count, frozen.units(sub_pool.name))
         units[sub_pool.name] = count
@@ -266,6 +265,50 @@ def _token_targets(plan, inp, chain, running, states, windows, units, frozen):
     return full, window
 
 
+def _state_and_token_targets(
+    plan, inp, chain, running, states, windows, frozen, strategy
+):
+    share = int(chain * inp.state_share)
+    share_slots = {s.name: share // s.spec.entry_bytes() for s in states}
+
+    def solve(share_slots):
+        units = _state_targets(inp, running, states, frozen, strategy, share_slots)
+        full, window = _token_targets(
+            plan, inp, chain, running, states, windows, units, frozen
+        )
+        return units, full, window
+
+    full = solve(share_slots)[1]
+    # A fused draft keeps its host's slot count: the share prices slots at the host's
+    # width, and FULL pays for the wider slots only while it keeps this many tokens.
+    page = plan.page_size
+    floor = max(
+        # A stated or captured FULL target, else half of FULL (arbitrary).
+        (
+            full
+            if frozen is not None
+            or inp.max_total_tokens is not None
+            or inp.full_tokens is not None
+            else full // 2
+        ),
+        # The requests being solved for, and one longest request.
+        2 * running,
+        -(-(inp.context_len or 0) // page) * page,
+    )
+    for sub_pool in states:
+        # A band of draft state alone has no host state, and buys at its own width.
+        host_bytes = sub_pool.spec.host_entry_bytes() or sub_pool.spec.entry_bytes()
+        low, high = share_slots[sub_pool.name], share // host_bytes
+        while low < high:
+            mid = (low + high + 1) // 2
+            if solve({**share_slots, sub_pool.name: mid})[1] >= floor:
+                low = mid
+            else:
+                high = mid - 1
+        share_slots[sub_pool.name] = low
+    return solve(share_slots)
+
+
 def _targets_for_running(
     plan, inp, budget, running, strategy, states, windows, explicit_chain, frozen
 ):
@@ -283,9 +326,8 @@ def _targets_for_running(
             frozen.total_bytes,
             max(0, budget - frozen.fixed_bytes) // inp.alignment * inp.alignment,
         )
-    units = _state_targets(plan, inp, chain, running, states, frozen, strategy)
-    full, window = _token_targets(
-        plan, inp, chain, running, states, windows, units, frozen
+    units, full, window = _state_and_token_targets(
+        plan, inp, chain, running, states, windows, frozen, strategy
     )
     return chain, fixed, units, full, window
 
