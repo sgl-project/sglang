@@ -204,7 +204,8 @@ def rel_bias_partials(
     from sglang.srt.runtime_context import get_platform
     from sglang.srt.utils import get_device_core_count
 
-    if not get_platform().is_sm90:
+    # The SM100 kernel needs tcgen05, which SM90 and SM120 lack.
+    if not (get_platform().is_sm90 or get_platform().is_sm120):
         from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
             paged_rel_bias_decode,
         )
