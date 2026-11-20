@@ -190,6 +190,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.rem_dllm_tokens = 1024
         adder.can_run_list = []
         adder._state_slots_for_req = lambda req: 0
+        adder._request_rows_for_req = lambda req: 0
         adder._replay_len = lambda req, prefix_len: 0
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
@@ -223,8 +224,10 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder = object.__new__(PrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
-        adder._get_dllm_remain_tokens = lambda req=None: 64
+        adder._get_dllm_remain_tokens = lambda req=None, **_: 64
+        adder.memory_budget = SimpleNamespace(prices_by_demand=False)
         adder._state_slots_for_req = lambda req: 0
+        adder._request_rows_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
@@ -382,7 +385,9 @@ class TestGemma4RequestValidation(unittest.TestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_session_radix_cache = False
-        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
+        )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
         scheduler.tokenizer = None

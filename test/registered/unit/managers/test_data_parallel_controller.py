@@ -9,7 +9,8 @@ inject only the attrs the schedulers read (`workers`, `_active_workers`,
 `update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
 attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
 refresh-throttle tests inject `load_snapshot_reader` and `_last_refresh_time` on top of
-those.
+those. The abort-route test also sets `control_message_step` and builds the real
+dispatch table with `init_dispatcher`.
 """
 
 import threading
@@ -33,9 +34,17 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
-from sglang.srt.managers.io_struct import ActiveRanksOutput
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    ActiveRanksOutput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -199,6 +208,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.startup_time = {}
         scheduler.page_size = 64
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
@@ -244,8 +254,7 @@ class TestLocalKvEventSources(CustomTestCase):
         with (
             get_context().override_server_args(
                 tp_size=8,
-                dp_size=4,
-                enable_dp_attention=True,
+                attn_dp_size=4,
                 nnodes=2,
                 node_rank=1,
                 pp_size=1,
@@ -270,6 +279,25 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+
+
+class TestInitInfoReply(CustomTestCase):
+    @staticmethod
+    def _reply(*scheduler_infos):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
+        controller._record_scheduler_init_infos(list(scheduler_infos))
+        return controller.get_init_info()
+
+    def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
+        """The reply holds only the keys the controller names, so it must name this one."""
+        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        reporting = {**info, "router_l3_layout": "layout-a"}
+        self.assertEqual(
+            self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
+        )
+        self.assertNotIn("router_l3_layout", self._reply(info, info))
 
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
@@ -638,6 +666,116 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
         )
+
+
+_RECEIVER = "sglang.srt.managers.scheduler_components.request_receiver."
+
+
+def _dp_attention_leader(*, rank: int, local_control: bool) -> SimpleNamespace:
+    """Leader of DP group `rank` under --tp 2 --attn-dp-size 2."""
+    return SimpleNamespace(
+        attn_dp_enabled=True,
+        enable_dp_attention_local_control_broadcast=local_control,
+        attn_tp_rank=0,
+        attn_cp_rank=0,
+        attn_tp_size=1,
+        attn_cp_size=1,
+        tp_size=2,
+        tp_group=SimpleNamespace(rank=rank, ranks=[0, 1], cpu_group=object()),
+    )
+
+
+def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
+    """One lock-step iteration of both leaders; returns what each one applies.
+
+    Global rank 0 is the source of the tp_group control broadcast.
+    """
+    receiver = SchedulerRequestReceiver(
+        recv_from_tokenizer=None,
+        recv_skipper=None,
+        input_blocker=None,
+        mm_receiver=None,
+        server_args=SimpleNamespace(),
+        model_config=SimpleNamespace(is_multimodal=False),
+        max_recv_per_poll=-1,
+        request_retirer=None,
+        get_last_batch=lambda: None,
+        rust_server_mode=False,
+    )
+    sent_by_src = []
+
+    def broadcast_pyobj(data, rank, dist_group, src):
+        if rank == src:
+            sent_by_src.append(data)
+        return sent_by_src[-1]
+
+    applied = []
+    for rank, pulled in enumerate(pulled_by_rank):
+        with (
+            patch(
+                _RECEIVER + "get_parallel",
+                return_value=_dp_attention_leader(
+                    rank=rank, local_control=local_control
+                ),
+            ),
+            patch(
+                _RECEIVER + "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch(
+                _RECEIVER + "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda reqs: reqs,
+            ),
+            patch(_RECEIVER + "broadcast_pyobj", side_effect=broadcast_pyobj),
+        ):
+            applied.append(receiver._broadcast_reqs_across_ranks(list(pulled)))
+    return applied
+
+
+class TestDPAttentionAbortRoute(CustomTestCase):
+    def test_abort_is_applied_after_its_request_on_the_owner_rank(self):
+        """An accepted abort for a request on DP rank 1 must reach rank 1 after the
+        request, even when rank 1 drained its socket just before the request arrived."""
+        for local_control in (False, True):
+            with self.subTest(local_control=local_control):
+                ctl = _make_controller(num_dp_ranks=2)
+                ctl.control_message_step = 1 if local_control else 2  # tp_size
+                ctl.init_dispatcher()
+                gen = TokenizedGenerateReqInput(
+                    rid="victim",
+                    routed_dp_rank=1,
+                    input_text="",
+                    input_ids=[1],
+                    input_embeds=None,
+                    mm_inputs=None,
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(),
+                    return_logprob=False,
+                    logprob_start_len=0,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                )
+                abort = AbortReq(rid="victim")
+
+                ctl.round_robin_scheduler(gen)
+                ctl._request_dispatcher(abort)
+                sockets = [
+                    [c.args[0] for c in worker.send_pyobj.call_args_list]
+                    for worker in ctl.workers
+                ]
+                # Rank 1 polls before the controller forwards; rank 0 polls after.
+                first = _receive_round(
+                    pulled_by_rank=[sockets[0], []], local_control=local_control
+                )
+                second = _receive_round(
+                    pulled_by_rank=[[], sockets[1]], local_control=local_control
+                )
+
+                self.assertEqual(first[1] + second[1], [gen, abort])
+                self.assertEqual((first[0] + second[0]).count(abort), 1)
 
 
 if __name__ == "__main__":

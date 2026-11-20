@@ -19,6 +19,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -575,7 +576,6 @@ class LTX2ImageEncodingStage(PipelineStage):
     # generation -- the only signal that separates them.
     _DEFAULT_IMAGE_CRF = 33
     _LTX_2_5_IMAGE_CRF = 18
-    _GEMMA_4_MODEL_TYPES = ("gemma4_unified", "gemma4")
 
     @classmethod
     def _resolve_image_conditioning_crf(cls, server_args: ServerArgs) -> int:
@@ -985,9 +985,14 @@ class ImageVAEEncodingStage(PipelineStage):
                     video_condition = server_args.pipeline_config.preprocess_vae_encode(
                         video_condition, self.vae
                     )
-                    with temporary_module_dtype(
-                        self.vae, vae_dtype, enabled=should_cast_vae
-                    ) as vae:
+                    with (
+                        temporary_module_dtype(
+                            self.vae, vae_dtype, enabled=should_cast_vae
+                        ) as vae,
+                        use_gpu_conditioning_hash(
+                            enabled=num_frames == 1 and len(images) > 1
+                        ),
+                    ):
                         latent_dist: DiagonalGaussianDistribution = vae.encode(
                             video_condition
                         )
@@ -1109,13 +1114,11 @@ class ImageVAEEncodingStage(PipelineStage):
             if image.mode == "RGB":
                 return preprocess_image(image, device=get_local_torch_device())
             image = numpy_to_pt(pil_to_numpy(image))
+            return image if image.min() < 0 else normalize(image)
 
-        do_normalize = True
-        if image.min() < 0:
-            do_normalize = False
-        if do_normalize:
-            image = normalize(image)
-
+        # Tensors come from the pipeline config's preprocessing, already in
+        # [-1, 1]. Their range cannot be inferred from the values: a bright
+        # image has no negative pixel and would be normalized a second time.
         return image
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

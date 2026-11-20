@@ -1,12 +1,12 @@
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="base-a-test-npu")
+register_npu_ci(est_time=1, suite="extra-a-test-npu")
 
 # Initialize the quantization registry as in model-config loading.
 import sglang.srt.layers.quantization  # noqa: F401
@@ -102,12 +102,10 @@ class TestNPUSwigluMxfp8Quant(unittest.TestCase):
         group_list = torch.tensor([1, 1], dtype=torch.int64)
         hidden_states = torch.empty(2, 8)
 
-        with patch.object(
-            torch.ops.npu,
-            "swiglu_group_quant",
-            return_value=(output, scale, None),
-            create=True,
-        ) as kernel:
+        kernel = MagicMock(return_value=(output, scale, None))
+        activation_ops = ModuleType("sgl_kernel_npu.operators.activation")
+        activation_ops.swiglu_group_quant = kernel
+        with patch.dict("sys.modules", {activation_ops.__name__: activation_ops}):
             actual_output, actual_scale = activation._apply_activation(
                 hidden_states, group_list, group_list_type=1
             )

@@ -18,7 +18,7 @@ accept draws at the same generator state; with block-wise rejection they come fr
 worker's one RejectionNoise, whose device step counter a replay advances like an eager
 call. The DSPARK_ACCEPT_SAMPLE broadcast stays in
 the region (pynccl inside the graph), so TP ranks agree as in the eager path. With the
-deferred context-KV commit, the verify graph already joined this step's projection, so
+deferred draft KV store, the verify graph already joined this step's projection, so
 the region stages the stores from it.
 
 The caller routes only all-sampled steps without top-k / top-p, logit adjustments or

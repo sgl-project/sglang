@@ -70,9 +70,16 @@ Defined in `python/sglang/test/test_utils.py`:
 
 A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
 
-- **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
+- **`stage`** — the CI stage, with the kind when there is one (e.g. `base-b`, `base-b-kernel-unit`, `base-b-diffusion`, `base-c`).
 - **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
+
+Every hardware follows one shape, `<tier>[-<stage>]-[<kind>-]test-<runner>[-<hardware>][-<variant>]`:
+
+- **Tier** — `base` or `extra` per commit, then `nightly`, `weekly`, or NPU's `full`. NVIDIA and AMD have both `base` and `extra`; every other hardware only has `extra`, which runs on a PR with its `run-ci-<hardware>-extra` label.
+- **Stage letter** — only where jobs run in stage order (NVIDIA, AMD, NPU); suites one job runs as a single pool have none (`extra-test-cpu-intel`).
+- **Kind** — optional, what the suite holds (`kernel-unit`, `diffusion`, `diffusion-unit`, `disaggregation`). It always comes before `test`, never after; on CUDA it is part of `stage` (`stage="base-b-diffusion"` → `base-b-diffusion-test-1-gpu-large`).
+- **Hardware** — omitted for NVIDIA, otherwise a suffix after the runner (`base-b-test-1-gpu-small-amd-mi35x`, `extra-b-test-2-npu-a3`, `nightly-accuracy-test-8-gpu-amd-mi35x-kimi-k31-pro`).
 
 > CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
 
@@ -96,7 +103,7 @@ named `nightly-test-{runner_config}` — one suite per machine type, holding eve
 that runs nightly on it, with `auto_partition` splitting the work. There is no
 per-purpose split; kernel, eval, perf, and precision all share their machine's suite.
 
-> **Note**: A CUDA diffusion test registers on a `diffusion-*` runner_config (for example `stage="base-b", runner_config="diffusion-unit-1-gpu-h100"`), whose install adds the diffusion extra; those suites run in `pr-test-multimodal-gen.yml`. AMD diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`.
+> **Note**: A CUDA diffusion test carries the kind in its stage and uses a generic runner_config (for example `stage="base-b-diffusion-unit", runner_config="1-gpu-large"` → `base-b-diffusion-unit-test-1-gpu-large`). The `diffusion*` kinds map to the diffusion install in `kind_installs` of `scripts/ci/runner_configs.yml`; those suites run in `pr-test-multimodal-gen.yml`. AMD diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`.
 
 ### Choosing a Tier
 
@@ -328,8 +335,8 @@ register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-large")
 
 # Multi-backend test (only when testing backend-specific code paths)
 register_cuda_ci(est_time=80, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
-register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
+register_amd_ci(est_time=120, suite="base-a-test-1-gpu-small-amd")
+register_npu_ci(est_time=400, suite="nightly-test-8-npu-a3", nightly=True)
 
 # Temporarily disabled test
 register_cuda_ci(
@@ -355,9 +362,9 @@ They are ordinary registered tests; only their stage differs:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in test/registered/kernels/ops/<group>/
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 # Benchmarks in test/registered/kernels/benchmark/<group>/
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
