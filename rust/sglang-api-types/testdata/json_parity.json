@@ -373,7 +373,27 @@
           }
         }
       },
-      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null,\"dp_rank\":null}}"
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":9,\"finish_reason\":{\"type\":\"length\",\"length\":9,\"ignored_stop\":null},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null,\"dp_rank\":null}}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "finish length reports the ignored stop position",
+      "input": {
+        "text": "",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 1,
+          "completion_tokens": 64,
+          "finish_reason": {
+            "type": "length",
+            "length": 64,
+            "ignored_stop": {
+              "position": 2
+            }
+          }
+        }
+      },
+      "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":64,\"finish_reason\":{\"type\":\"length\",\"length\":64,\"ignored_stop\":{\"position\":2}},\"cached_tokens\":0,\"reasoning_tokens\":0,\"cached_tokens_details\":null,\"dp_rank\":null}}"
     },
     {
       "type": "GenerateResponse",

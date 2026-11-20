@@ -159,6 +159,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
                 matched_prefix_tokens,
                 pool_transfers,
                 assume_stored=False,
+                *,
+                storage_read_metadata=None,
             ):
                 self.prefetch_args = (
                     handle,
