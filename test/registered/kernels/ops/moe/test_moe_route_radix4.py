@@ -672,6 +672,11 @@ def test_fused_sort_aux_pins_the_addresses_it_matches_on():
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
         scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
     )
+    assert aux["topk_ids"] is ids and aux["topk_weights"] is w
+    assert aux["moe_buf"] is moe_buf
+    assert aux["topk_ids_ptr"] == ids.data_ptr()
+    assert aux["topk_weights_ptr"] == w.data_ptr()
+    assert aux["moe_buf_ptr"] == moe_buf.data_ptr()
     del w, ids, moe_buf
     later = [
         torch.empty((m, TOPK), dtype=torch.int32, device="cuda"),
@@ -728,10 +733,21 @@ def test_aiter_ignores_fused_sort_for_another_moe_call():
 # The K3 activation modes AITER's SiTUv2 MoE runs (aiter.fused_moe's
 # resolve_activation_dtype reads these at every call).
 _SITU_MODES = {
-    "a16w4": {},
-    "a8w4": {"AITER_SITUV2_A8W4": "1"},
-    "a4w4": {"AITER_SITUV2_A4W4": "1"},
+    "a16w4": {"AITER_SITUV2_A8W4": "0", "AITER_SITUV2_A4W4": "0"},
+    "a8w4": {"AITER_SITUV2_A8W4": "1", "AITER_SITUV2_A4W4": "0"},
+    "a4w4": {"AITER_SITUV2_A8W4": "0", "AITER_SITUV2_A4W4": "1"},
 }
+
+
+def _assert_activation_dtype(q_dtype_a, mode):
+    from aiter import dtypes
+
+    if mode == "a8w4":
+        assert q_dtype_a == dtypes.fp8
+    elif mode == "a4w4":
+        assert q_dtype_a == dtypes.fp4x2
+    else:
+        assert q_dtype_a not in (dtypes.fp8, dtypes.fp4x2)
 
 
 def _requires_route_sort_aiter():
@@ -816,6 +832,7 @@ def test_aiter_route_sort_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
     seen[0].apply_defaults()
     ours.apply_defaults()
     assert ours.arguments == seen[0].arguments
+    _assert_activation_dtype(ours.arguments["q_dtype_a"], mode)
 
 
 @pytest.mark.parametrize("mode", list(_SITU_MODES))
@@ -844,6 +861,7 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
             1, mode, "meta", num_experts=NUM_EXPERTS, model_dim=MODEL_DIM, inter_dim=384
         )
     )
+    _assert_activation_dtype(consumer.cfg_args(1)["q_dtype_a"], mode)
     config = TopKConfig(
         top_k=TOPK,
         use_grouped_topk=True,
