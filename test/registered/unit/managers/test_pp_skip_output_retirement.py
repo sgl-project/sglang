@@ -11,6 +11,8 @@ from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
@@ -145,11 +147,13 @@ class TestReceivedOutputRetirement(CustomTestCase):
         stage._pp_send_output_to_next_stage = lambda *args: []
         stage._pp_recv_dict_from_prev_stage = lambda: ({}, None)
         stage._pp_prep_batch_result = lambda batch, meta, outputs: SimpleNamespace(
-            logits_output=None
+            logits_output=None, next_token_ids=torch.tensor([7])
         )
         forward_done = object()
         meta = PPBatchMetadata(can_run_cuda_graph=False, forward_done=forward_done)
-        target = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        target = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, spec_algorithm=SpeculativeAlgorithm.NONE
+        )
         with (
             mock.patch.object(
                 scheduler_pp_mixin,
