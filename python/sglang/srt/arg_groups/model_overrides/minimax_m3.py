@@ -169,6 +169,9 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             or envs.SGLANG_M3_ALLOW_CUSTOM_AR.get()
         ):
             overrides["disable_custom_all_reduce"] = True
+        # one 128-token sparse block per page: the sparse kernels address it by one slot
+        if cfg.page_size is None:
+            overrides["page_size"] = 128
     elif get_platform().is_sm100:
         if is_attention_backend_not_set(cfg):
             if (
