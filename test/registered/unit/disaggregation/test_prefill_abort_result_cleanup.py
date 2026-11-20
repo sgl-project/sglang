@@ -259,7 +259,7 @@ class TestPrefillCompleteResult(CustomTestCase):
 
 
 class TestEarlySentLastChunkResult(CustomTestCase):
-    """SGLANG_PP_PD_PREFILL_EARLY_SEND: a PP stage already sent the last chunk when
+    """SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND: a PP stage already sent the last chunk when
     its forward ended; the result sends nothing and never waits for it."""
 
     def setUp(self):
