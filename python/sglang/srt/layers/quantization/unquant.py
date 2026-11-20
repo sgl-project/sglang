@@ -107,6 +107,7 @@ if _use_aiter:
 
     from sglang.srt.layers.quantization.unquant_hip import (
         a16w16_into,
+        decode_gemm,
         prefer_hipblaslt,
     )
 
@@ -1060,6 +1061,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
             and x.is_cuda
         ):
+            if bias is None and (out := decode_gemm(x, layer.weight)) is not None:
+                return out
             if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
                 return F.linear(x, layer.weight, bias)
             if (
