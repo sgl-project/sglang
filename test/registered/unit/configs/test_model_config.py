@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
 from transformers import (
     Cohere2Config,
     Gemma2Config,
@@ -220,6 +221,33 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertIs(config.hf_config, config.hf_text_config)
         self.assertEqual(config.hf_config.architectures, ["NemotronHForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
+
+    def test_auto_dtype_draft_runs_in_the_target_dtype(self):
+        """An EAGLE draft shares the target's embedding and hidden states, so
+        --dtype auto resolves it to the target's dtype, not its checkpoint's."""
+        with TemporaryDirectory() as target, TemporaryDirectory() as draft:
+            for checkpoint, architecture, torch_dtype in (
+                (target, "LlamaForCausalLM", torch.bfloat16),
+                (draft, "LlamaForCausalLMEagle", torch.float16),
+            ):
+                LlamaConfig(
+                    architectures=[architecture],
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_hidden_layers=1,
+                    vocab_size=128,
+                    torch_dtype=torch_dtype,
+                ).save_pretrained(checkpoint)
+            server_args = ServerArgs(
+                model_path=target,
+                speculative_algorithm="EAGLE",
+                speculative_draft_model_path=draft,
+            )
+            draft_config = ModelConfig.from_server_args(
+                server_args, model_path=draft, is_draft_model=True
+            )
+        self.assertEqual(draft_config.dtype, torch.bfloat16)
 
     def test_qwen4_exp_spec_hidden_size_keeps_hc_width(self):
         """Qwen4-Exp's MTP draft consumes the hc-flattened target stream,
