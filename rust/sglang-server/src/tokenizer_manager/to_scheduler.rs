@@ -7,6 +7,8 @@ use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{GenerateRequest, Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
+use crate::message::sampling::SamplingParams;
+use crate::message::types::OneOrMany;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
@@ -385,20 +387,23 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
-            RequestKind::Generate(g) => (
-                g.return_text_in_logprobs.unwrap_or(false),
-                g.sampling_params.no_stop_trim,
-                g.sampling_params.skip_special_tokens,
-            ),
-            RequestKind::Control(_)
-            | RequestKind::Detokenize { .. }
-            | RequestKind::Tokenize { .. } => (
-                false, /* decode_logprob_text */
-                false, /* no_stop_trim */
-                true,  /* skip_special_tokens */
-            ),
-        };
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens, has_stop_strs) =
+            match &req.kind {
+                RequestKind::Generate(g) => (
+                    g.return_text_in_logprobs.unwrap_or(false),
+                    g.sampling_params.no_stop_trim,
+                    g.sampling_params.skip_special_tokens,
+                    has_stop_strings(&g.sampling_params),
+                ),
+                RequestKind::Control(_)
+                | RequestKind::Detokenize { .. }
+                | RequestKind::Tokenize { .. } => (
+                    false, /* decode_logprob_text */
+                    false, /* no_stop_trim */
+                    true,  /* skip_special_tokens */
+                    false, /* has_stop_strs */
+                ),
+            };
         self.senders
             .detok_for(&req.rid)
             .send(DetokMsg::Register {
@@ -407,6 +412,7 @@ impl Intake {
                 decode_logprob_text,
                 no_stop_trim,
                 skip_special_tokens,
+                has_stop_strs,
             })
             .is_ok()
     }
@@ -597,6 +603,20 @@ impl Intake {
         // On success the scheduler owns the request (response arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
     }
+}
+
+/// Whether a request has stop strings or regexes, before or after `normalize`
+/// moves them from the API aliases into `stop_strs` / `stop_regex_strs`.
+fn has_stop_strings(p: &SamplingParams) -> bool {
+    let set = |v: &Option<OneOrMany<String>>| match v {
+        Some(OneOrMany::One(s)) => !s.is_empty(),
+        Some(OneOrMany::Many(v)) => v.iter().any(|s| !s.is_empty()),
+        None => false,
+    };
+    set(&p.stop)
+        || set(&p.stop_regex)
+        || p.stop_strs.iter().any(|s| !s.is_empty())
+        || p.stop_regex_strs.iter().any(|s| !s.is_empty())
 }
 
 #[cfg(test)]
