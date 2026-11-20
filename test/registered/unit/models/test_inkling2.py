@@ -502,7 +502,9 @@ def test_moe_layer_wires_placement_and_records_each_token_once(monkeypatch):
     monkeypatch.setattr(
         moe,
         "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(on_select_experts=recorded.append),
+        lambda: SimpleNamespace(
+            on_select_experts=lambda topk_ids: recorded.append(topk_ids)
+        ),
     )
     monkeypatch.setattr(moe, "_moe_num_token_non_padded", lambda: torch.tensor(13))
     monkeypatch.setattr(moe.Inkling2Experts, "prepare_routed_exchange", lambda _: None)
