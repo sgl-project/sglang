@@ -52,12 +52,19 @@ def get_model_config(
         and "config_groups" in config.quantization_config
     ):
         config_groups = config.quantization_config["config_groups"]
-        # Get group_size from the first group's weights config
         first_group = next(iter(config_groups.values()), {})
         weights_config = first_group.get("weights", {})
         group_size = weights_config.get("group_size")
-        block_shape = [0, group_size]
-        assert len(block_shape) == 2
+        strategy = weights_config.get("strategy")
+        if strategy in ("channel", "tensor"):
+            block_shape = None
+        elif strategy == "block":
+            block_shape = weights_config.get("block_structure")
+        else:
+            # Also handles grouped recipes without an explicit strategy.
+            block_shape = (
+                [0, group_size] if type(group_size) is int and group_size > 0 else None
+            )
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         text_config = config.get_text_config()
