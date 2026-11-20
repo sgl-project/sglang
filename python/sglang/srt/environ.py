@@ -863,6 +863,11 @@ class Envs:
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)
+    # PD decode (pp 1): landed requests take freed seats in decode-side arrival
+    # order instead of landing order (decode_seat_age.py).
+    SGLANG_OPT_PD_DECODE_SEAT_AGE_ORDER = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Distributed and model-parallel runtime

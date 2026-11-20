@@ -334,10 +334,19 @@ class _DecodeNode:
         return pq
 
     def arrive(self, rid, prompt_len, max_new_tokens, done_at):
+        req = self.request(rid, prompt_len, max_new_tokens)
+        receiver = _Receiver(self, self.next_room, done_at)
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+        receiver.decode_req = decode_req
+        decode_req.waiting_for_input = True
+        move([decode_req], self.scheduler.disagg_decode_prealloc_queue.queue)
+        return req
+
+    def request(self, rid, prompt_len, max_new_tokens):
         sampling_params = SamplingParams(max_new_tokens=max_new_tokens, temperature=0.0)
         sampling_params.normalize(None)
         self.next_room += 1
-        req = Req(
+        return Req(
             rid,
             "",
             array("q", [TOKEN] * prompt_len),
@@ -349,12 +358,6 @@ class _DecodeNode:
             disagg_mode=DisaggregationMode.DECODE,
             vocab_size=16,
         )
-        receiver = _Receiver(self, self.next_room, done_at)
-        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
-        receiver.decode_req = decode_req
-        decode_req.waiting_for_input = True
-        move([decode_req], self.scheduler.disagg_decode_prealloc_queue.queue)
-        return req
 
     def _admit_prebuilt(self):
         s = self.scheduler
