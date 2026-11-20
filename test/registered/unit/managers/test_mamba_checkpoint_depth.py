@@ -278,6 +278,10 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         from sglang.srt.managers.schedule_batch import prefill_checkpoint_boundary
         from sglang.srt.managers.schedule_policy import SchedulePolicy
 
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         policy = object.__new__(SchedulePolicy)
         policy.policy = CacheAwarePolicy.SHORTEST_PREFILL_FIRST
         policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)

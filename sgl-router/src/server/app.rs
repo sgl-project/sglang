@@ -218,8 +218,8 @@ pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize)
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
-        // The same probes under the engine's `/health` and sgl-model-gateway's
-        // `/liveness` and `/readiness`.
+        // Aliases of the probes above: the engine's `/health`, and the
+        // `/liveness` and `/readiness` paths deployments poll.
         .route("/health", get(crate::server::routes::health::healthz))
         .route("/liveness", get(crate::server::routes::health::healthz))
         .route("/readiness", get(crate::server::routes::health::readyz))
@@ -239,6 +239,12 @@ pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize)
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
+                .layer(DefaultBodyLimit::max(max_body_bytes))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/responses",
+            post(crate::server::routes::responses::responses)
                 .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )

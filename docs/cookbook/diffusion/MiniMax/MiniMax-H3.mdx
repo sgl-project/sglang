@@ -498,6 +498,21 @@ HCCL_BUFFSIZE=256 sglang serve \
   --component-residency text_encoder=layerwise-offload
 ```
 
+For optional MindIE-SD quantized attention on Ascend 950, follow the
+[installation and launch guide](/docs/sglang-diffusion/attention_backends#ascend-quantized-attention-with-mindie-sd)
+and use these attention options:
+
+```bash
+--attention-backend fa \
+--attention-backend-config '{"precision":"mxfp8","head_chunk_size":4}'
+```
+
+Attention precision is independent of linear-weight quantization. Keep
+`--quantization` unchanged when comparing attention backends. Use
+`'{"precision":"bf16"}'` for an explicit native floating-point baseline.
+Quantized attention applies to DiT self-attention; the refiner and text encoder
+do not inherit the DiT quantization settings.
+
 ## 4. Generate video and audio
 
 `num_inference_steps: N` executes **N denoising updates** over N+1 sigma
@@ -1701,11 +1716,11 @@ resident. The measured workload was one 5-second T2VA request at 1344×768,
 
 | NPU count | Topology | End-to-end latency |
 | ---: | --- | ---: |
-| 8 | TP2 + SP4 | **55.07 s** |
-| 4 | TP2 + SP2 | **103.57 s** |
+| 8 | TP2 + SP4 | **55.21 s** |
+| 4 | TP2 + SP2 | **96.48 s** |
 
 These are individual end-to-end measurements for each topology, not averages.
-The eight-NPU topology had 46.8% lower end-to-end latency than the four-NPU
+The eight-NPU topology had 42.8% lower end-to-end latency than the four-NPU
 topology.
 
 ### B300 precision and encoder placement
