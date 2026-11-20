@@ -103,6 +103,15 @@ class TestAiterWheelCache(CustomTestCase):
                 )
             self.assertFalse(root.exists())
 
+            directories_only = Path(directory) / "amd_aiter-2-py3-none-any.whl"
+            with zipfile.ZipFile(directories_only, "w") as archive:
+                for name in ("aiter/", "aiter_meta/csrc/", "aiter_meta/hsa/"):
+                    archive.writestr(name, "")
+                archive.writestr("aiter/__init__.py", "")
+            with self.assertRaises(ValueError):
+                cache.publish(wheel=directories_only, root=root, key="key")
+            self.assertFalse(root.exists())
+
     def test_jobs_that_run_from_the_aiter_checkout_skip_the_cache(self):
         """A cache hit deletes /sgl-workspace/aiter, so a job that runs from it must opt out."""
         checked = 0

@@ -80,9 +80,11 @@ def cache_key(*, commit, image, arch, namespace, inputs, abi):
 
 def validate_wheel(path):
     with zipfile.ZipFile(path) as archive:
-        names = archive.namelist()
+        names = [name for name in archive.namelist() if not name.endswith("/")]
         if archive.testzip() is not None:
             raise ValueError("Corrupt AITER wheel")
+        if "aiter/__init__.py" not in names:
+            raise ValueError("AITER wheel is missing aiter/__init__.py")
         for prefix in ("aiter/", "aiter_meta/csrc/", "aiter_meta/hsa/"):
             if not any(name.startswith(prefix) for name in names):
                 raise ValueError(f"AITER wheel is missing {prefix}")
