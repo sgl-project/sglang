@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import (
+from sglang.srt.multimodal.qwen_vl_media_processing import (
     ceil_by_factor,
     floor_by_factor,
     round_by_factor,
@@ -338,7 +338,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                     if result["pixel_values_videos"].numel() == 0:
                         del result["pixel_values_videos"]
 
-        if not self.use_cuda_ipc:
+        if not self._feature_transport.use_cuda_ipc:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result and isinstance(

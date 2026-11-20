@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
     GLM_IMAGE_RESOLUTION_ALIGNMENT,
     align_glm_image_resolution,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -425,7 +426,7 @@ class GlmImageAR(PipelineStage):
 
         Args:
             prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
-            condition_images: Optional list of condition images for i2i
+            image: Optional list of condition images for i2i
 
         Returns:
             Tuple of the D16 prior token IDs, optional source-image token IDs,
@@ -1092,73 +1093,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
 
-    def check_inputs(
-        self,
-        prompt,
-        height,
-        width,
-        callback_on_step_end_tensor_inputs,
-        prompt_embeds=None,
-    ):
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * self.transformer.config.patch_size)
-            != 0
-            or width is not None
-            and width % (self.transformer.config.patch_size) != 0
-        ):
-            logger.warning(
-                f"`height` and `width` have to be divisible by {self.vae_scale_factor * 2} but are {height} and {width}. Dimensions will be resized accordingly"
-            )
-
-        if callback_on_step_end_tensor_inputs is not None and not all(
-            k in self._callback_tensor_inputs
-            for k in callback_on_step_end_tensor_inputs
-        ):
-            raise ValueError(
-                f"`callback_on_step_end_tensor_inputs` has to be in {self._callback_tensor_inputs}, but found {[k for k in callback_on_step_end_tensor_inputs if k not in self._callback_tensor_inputs]}"
-            )
-
-        if prompt is not None and prompt_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `prompt`: {prompt} and `prompt_embeds`: {prompt_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
-        elif prompt is None and prompt_embeds is None:
-            raise ValueError(
-                "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
-            )
-        elif prompt is not None and (
-            not isinstance(prompt, str) and not isinstance(prompt, list)
-        ):
-            raise ValueError(
-                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
-            )
-
-    @property
-    def guidance_scale(self):
-        return self._guidance_scale
-
-    @property
-    def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1
-
-    @property
-    def num_timesteps(self):
-        return self._num_timesteps
-
-    @property
-    def attention_kwargs(self):
-        return self._attention_kwargs
-
-    @property
-    def current_timestep(self):
-        return self._current_timestep
-
-    @property
-    def interrupt(self):
-        return self._interrupt
-
     @torch.no_grad()
     def forward(
         self,
@@ -1166,7 +1100,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
 
-        guidance_scale = batch.guidance_scale
         prompt = batch.prompt
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
@@ -1207,10 +1140,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prompt_embeds = None
         do_classifier_free_guidance = True
         dtype = get_module_dtype(self.transformer, torch.bfloat16)
-
-        self._guidance_scale = guidance_scale
-        self._current_timestep = None
-        self._interrupt = False
 
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
@@ -1292,11 +1221,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                     condition_image, self.vae, device=device
                 )
                 condition_image = _repeat_to_batch(condition_image, batch_size)
-                condition_latent = retrieve_latents(
-                    self.vae.encode(condition_image),
-                    generator=generator,
-                    sample_mode="argmax",
-                )
+                with use_gpu_conditioning_hash(enabled=len(ar_condition_images) > 1):
+                    condition_latent = retrieve_latents(
+                        self.vae.encode(condition_image),
+                        generator=generator,
+                        sample_mode="argmax",
+                    )
                 condition_latent = (condition_latent - latents_mean) / latents_std
                 if condition_image_prior_token_id.dim() == 1:
                     condition_image_prior_token_id = (
@@ -1370,7 +1300,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         timesteps, num_inference_steps = retrieve_timesteps(
             scheduler, num_inference_steps, device, timesteps, sigmas, mu=mu
         )
-        self._num_timesteps = len(timesteps)
 
         # 7. Prepare for denoising loop
 

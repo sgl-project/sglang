@@ -222,6 +222,10 @@ def test_client_warmup_preserves_replica_routing_and_worker_health(
         "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_image",
         lambda *args, **kwargs: False,
     )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.server_warmup.should_include_warmup_audio",
+        lambda *args, **kwargs: False,
+    )
     warmup_req = dg.Req(prompt="warmup", is_warmup=True)
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.server_warmup.build_client_warmup_reqs",

@@ -27,6 +27,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -36,7 +37,12 @@ import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
 import torch
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import (
+    HfFileSystem,
+    hf_hub_download,
+    snapshot_download,
+    try_to_load_from_cache,
+)
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
@@ -44,6 +50,7 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
+    LoadFormat,
     LoadGroup,
 )
 from sglang.srt.configs.model_config import (
@@ -258,6 +265,151 @@ def _quark_draft_online_quant_config(
     return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
 
 
+def _read_safetensors_header_keys(path: str) -> Set[str]:
+    with open(path, "rb") as f:
+        header_len_bytes = f.read(8)
+        if len(header_len_bytes) < 8:
+            return set()
+        (header_len,) = struct.unpack("<Q", header_len_bytes)
+        if header_len <= 0 or header_len > 100 * 1024 * 1024:
+            return set()
+        header = json.loads(f.read(header_len))
+    return {k for k in header if k != "__metadata__"}
+
+
+def inspect_safetensors_tensor_names(
+    model_path: str,
+    revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    local_files_only: bool = False,
+    local_folder: Optional[str] = None,
+) -> Optional[Set[str]]:
+    """Return tensor names listed in a safetensors checkpoint without loading weights."""
+    if not model_path or model_path == "dummy":
+        return None
+
+    try:
+        candidate_dirs = []
+        if os.path.isdir(model_path):
+            candidate_dirs.append(model_path)
+        if (
+            local_folder
+            and os.path.isdir(local_folder)
+            and local_folder not in candidate_dirs
+        ):
+            candidate_dirs.append(local_folder)
+
+        for folder in candidate_dirs:
+            index_path = os.path.join(folder, "model.safetensors.index.json")
+            if not os.path.isfile(index_path):
+                index_files = sorted(
+                    glob.glob(os.path.join(folder, "*.safetensors.index.json"))
+                )
+                index_path = index_files[0] if index_files else ""
+            if index_path and os.path.isfile(index_path):
+                with open(index_path) as f:
+                    weight_map = json.load(f).get("weight_map") or {}
+                if weight_map:
+                    return set(weight_map.keys())
+
+        if os.path.isdir(model_path):
+            shards = sorted(Path(model_path).glob("*.safetensors"))
+            if shards:
+                tensor_names: Set[str] = set()
+                for shard in shards:
+                    tensor_names.update(_read_safetensors_header_keys(str(shard)))
+                return tensor_names or None
+            return None
+
+        cached_index = try_to_load_from_cache(
+            repo_id=model_path,
+            filename="model.safetensors.index.json",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        if isinstance(cached_index, str) and os.path.isfile(cached_index):
+            with open(cached_index) as f:
+                weight_map = json.load(f).get("weight_map") or {}
+            if weight_map:
+                return set(weight_map.keys())
+
+        cached_single = try_to_load_from_cache(
+            repo_id=model_path,
+            filename="model.safetensors",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        if isinstance(cached_single, str) and os.path.isfile(cached_single):
+            tensor_names = _read_safetensors_header_keys(cached_single)
+            if tensor_names:
+                return tensor_names
+
+        if local_files_only:
+            return None
+
+        try:
+            with get_lock(model_path, cache_dir):
+                index_file = hf_hub_download(
+                    repo_id=model_path,
+                    filename="model.safetensors.index.json",
+                    revision=revision,
+                    cache_dir=cache_dir,
+                )
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map") or {}
+            if weight_map:
+                return set(weight_map.keys())
+        except Exception:
+            pass
+
+        fs = HfFileSystem()
+        remote_path = f"{model_path}/model.safetensors"
+        open_kwargs = {"revision": revision} if revision is not None else {}
+        if fs.exists(remote_path, **open_kwargs):
+            with fs.open(remote_path, "rb", **open_kwargs) as f:
+                header_len_bytes = f.read(8)
+                if len(header_len_bytes) == 8:
+                    (header_len,) = struct.unpack("<Q", header_len_bytes)
+                    if 0 < header_len <= 100 * 1024 * 1024:
+                        header = json.loads(f.read(header_len))
+                        tensor_names = {k for k in header if k != "__metadata__"}
+                        return tensor_names or None
+    except Exception as e:
+        logger.debug(
+            "Failed to inspect safetensors tensor names for %s: %s",
+            model_path,
+            e,
+        )
+    return None
+
+
+def _maybe_attach_checkpoint_tensor_names(
+    quant_config: Optional[QuantizationConfig],
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    local_folder: Optional[str] = None,
+) -> None:
+    if (
+        quant_config is None
+        or not hasattr(quant_config, "set_checkpoint_tensor_names")
+        or not getattr(quant_config, "uses_checkpoint_tensor_manifest", True)
+    ):
+        return
+    local_files_only = (
+        huggingface_hub.constants.HF_HUB_OFFLINE
+        or load_config.load_format == LoadFormat.DUMMY
+    )
+    tensor_names = inspect_safetensors_tensor_names(
+        model_config.model_path,
+        revision=model_config.revision,
+        cache_dir=load_config.download_dir,
+        local_files_only=local_files_only,
+        local_folder=local_folder,
+    )
+    if tensor_names is not None:
+        quant_config.set_checkpoint_tensor_names(tensor_names)
+
+
 def _modelopt_quant_section(config: dict) -> dict:
     """Return ModelOpt quant settings from nested or flat ``hf_quant_config.json``.
 
@@ -317,9 +469,13 @@ def get_quant_config(
             )
             if draft_online is not None:
                 return draft_online
-            return _resolve_explicit_draft_quant_config(
+            quant_config = _resolve_explicit_draft_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
+            _maybe_attach_checkpoint_tensor_names(
+                quant_config, model_config, load_config
+            )
+            return quant_config
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -443,9 +599,13 @@ def get_quant_config(
                 return _resolve_explicit_draft_quant_config(
                     model_config, quant_cls.from_config(config)
                 )
-        return _resolve_explicit_draft_quant_config(
+        quant_config = _resolve_explicit_draft_quant_config(
             model_config, quant_cls.from_config(config)
         )
+        _maybe_attach_checkpoint_tensor_names(
+            quant_config, model_config, load_config, local_folder=hf_folder
+        )
+        return quant_config
 
 
 def _check_index_files_exist(
@@ -1389,12 +1549,18 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    max_inflight_bytes: Optional[int] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    ``max_inflight_bytes`` also caps the summed size of the files submitted
+    but not yet handed out; one file is always admitted, even above the cap.
+    Peak RAM is a small multiple of max(cap, largest shard): the shard being
+    yielded is not counted, and with ``disable_mmap`` a shard is held as
+    bytes and then as tensors (measured 2-3x with ``disable_mmap``).
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
@@ -1421,9 +1587,26 @@ def buffered_multi_thread_safetensors_weights_iterator(
         file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
-        # Seed the buffer.
-        for st_file in itertools.islice(file_iter, buffer_size):
-            pending.append((st_file, executor.submit(_load_file, st_file)))
+        next_file = next(file_iter, None)
+        inflight_bytes = 0
+
+        def fill_window():
+            nonlocal next_file, inflight_bytes
+            while next_file is not None and len(pending) < buffer_size:
+                size = os.path.getsize(next_file)
+                if (
+                    max_inflight_bytes is not None
+                    and pending
+                    and inflight_bytes + size > max_inflight_bytes
+                ):
+                    break
+                pending.append(
+                    (next_file, size, executor.submit(_load_file, next_file))
+                )
+                inflight_bytes += size
+                next_file = next(file_iter, None)
+
+        fill_window()
 
         with tqdm(
             total=len(hf_weights_files),
@@ -1433,14 +1616,13 @@ def buffered_multi_thread_safetensors_weights_iterator(
             position=tqdm._get_free_pos(),
         ) as pbar:
             while pending:
-                st_file, future = pending.popleft()
+                st_file, size, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
-                # Replenish: submit the next file to keep the buffer full.
-                next_file = next(file_iter, None)
-                if next_file is not None:
-                    pending.append((next_file, executor.submit(_load_file, next_file)))
+                # Replenish the window.
+                inflight_bytes -= size
+                fill_window()
 
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]
@@ -1720,11 +1902,22 @@ def composed_weight_loader(
 
 
 def runai_safetensors_weights_iterator(
-    hf_weights_files: List[str], is_distributed: bool = False, device: str = "cpu"
+    hf_weights_files: List[str],
+    is_distributed: bool = False,
+    device: str = "cpu",
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
 
+    # RunAI's distributed mode spans the whole world; a stage-local draft load
+    # must stream independently to avoid waiting for the other PP stages.
+    if load_group is None or (
+        load_group is not _DEFAULT_LOAD_GROUP
+        and torch.distributed.is_initialized()
+        and load_group.world_size != torch.distributed.get_world_size()
+    ):
+        is_distributed = False
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
