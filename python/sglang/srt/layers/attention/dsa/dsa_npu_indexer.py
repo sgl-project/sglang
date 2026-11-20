@@ -515,7 +515,30 @@ class DSANPUIndexerMixin:
                 pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
-        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
+        if getattr(pool, "layer_shard_enabled", False):
+            # The split pool caches the CP-gathered full-sequence index rows
+            # on non-owner ranks, skipping the get-time owner broadcast.
+            # Only safe when this write covers the whole read range (no
+            # cached prefix), same guard as the main-KV store path.
+            # cp_gathered_chunk covers the prefix-chunk patch-write: the
+            # gather above ran (full-chunk rows) but a prefix remains, so
+            # the write only completes a one-layer-ahead prefix broadcast.
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            no_prefix = prefix_lens is not None and all(n == 0 for n in prefix_lens)
+            gather_ran = (
+                is_prefill
+                and self.dsa_enable_prefill_cp
+                and forward_batch.attn_cp_metadata is not None
+            )
+            pool.set_index_k_buffer(
+                layer_id,
+                indexer_cache_loc,
+                k,
+                cp_gathered_full=(gather_ran and no_prefix),
+                cp_gathered_chunk=(gather_ran and not no_prefix),
+            )
+        else:
+            pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
