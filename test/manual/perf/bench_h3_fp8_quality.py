@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Real H3 quality switching: compare baseline and FP8-enabled deployments.
+
+Run once without --fp8, then with --fp8 and the same --output directory.
+Frames are compared before lossy file encoding; timings include quantization.
+Audio allows only FP32 roundoff (1e-7 absolute): the unquantized cold/warm
+B300 baseline itself differs by up to 2.8e-8. Non-FP8 video comparisons stay bit-exact.
+Requires a CUDA SM100+ GPU with room for the unquantized resident pipeline.
+"""
+
+import argparse
+import hashlib
+import json
+import subprocess
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from huggingface_hub import model_info
+from skimage.metrics import structural_similarity
+
+PROMPTS = (
+    "A quiet sunlit kitchen, detailed wooden furniture, slow camera pan, birdsong outside.",
+    "A cyclist rides through a busy rainy city street at night, reflections and traffic sounds.",
+    "Close-up of a person speaking beside a window, natural skin detail and soft daylight.",
+)
+
+
+def main():
+    # Spawned workers must initialize their platform before importing the runtime.
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--short-edge", type=int, default=768)
+    parser.add_argument("--prompt-count", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--audio-atol", type=float, default=1e-7)
+    parser.add_argument(
+        "--vae-attention", choices=("torch_sdpa", "torch_cudnn_sdpa"), default=None
+    )
+    parser.add_argument("--revision", default=None)
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    label = "fp8" if args.fp8 else "baseline"
+    revision = model_info("MiniMaxAI/MiniMax-H3", revision=args.revision).sha
+    report = {
+        "commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "gpu": torch.cuda.get_device_name(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "steps": args.steps,
+        "short_edge": args.short_edge,
+        "vae_attention": args.vae_attention,
+        "audio_atol": args.audio_atol,
+        "model_revision": revision,
+        "requests": [],
+    }
+    generator = DiffGenerator.from_pretrained(
+        model_path="MiniMaxAI/MiniMax-H3",
+        model_variant="fl2va",
+        revision=revision,
+        num_gpus=1,
+        performance_mode="speed",
+        enable_torch_compile=False,
+        warmup_mode="off",
+        component_quantizations={"video_vae": "fp8"} if args.fp8 else {},
+        component_attention_backends=(
+            {"video_vae": args.vae_attention} if args.vae_attention else {}
+        ),
+    )
+    try:
+        for index, prompt in enumerate(PROMPTS[: args.prompt_count]):
+            order = (
+                ("exact", "lossless", "high", "lossless", "high", "exact")
+                if args.fp8
+                else ("exact", "lossless", "exact", "lossless")
+            )
+            for iteration, quality in enumerate(order):
+                start = time.perf_counter()
+                result = generator.generate(
+                    {
+                        "prompt": prompt,
+                        "task": "t2va",
+                        "conditions": [],
+                        "target": {
+                            "short_edge": args.short_edge,
+                            "aspect_ratio": "16:9",
+                            "duration_seconds": 4.0,
+                        },
+                        "num_inference_steps": args.steps,
+                        "seed": 1101 + index,
+                        "quality": quality,
+                        "save_output": True,
+                        "output_path": str(args.output),
+                        "output_file_name": f"{label}-{index}-{iteration}.mp4",
+                        "perf_dump_path": str(
+                            args.output / f"metrics-{label}-{index}-{iteration}.json"
+                        ),
+                        "return_file_paths_only": False,
+                    }
+                )
+                elapsed = time.perf_counter() - start
+                if result is None:
+                    raise RuntimeError(f"generation failed: {index}/{quality}")
+                frames = np.stack(result.frames)
+                assert frames.dtype == np.uint8 and result.audio is not None
+                audio = result.audio.cpu().numpy()
+                audio_hash = hashlib.sha256(audio.tobytes()).hexdigest()
+                reference_path = args.output / f"reference-{index}-{quality}.npz"
+                if not args.fp8 and not reference_path.exists():
+                    np.savez(reference_path, frames=frames, audio=audio)
+                row = {
+                    "prompt": index,
+                    "quality": quality,
+                    "iteration": iteration,
+                    "frame_shape": list(frames.shape),
+                    "audio_sha256": audio_hash,
+                    "wall_s": elapsed,
+                    "peak_memory_mb": result.peak_memory_mb,
+                    "metrics": result.metrics,
+                }
+                del result
+                if quality == "high":
+                    reference_path = args.output / f"reference-{index}-lossless.npz"
+                with np.load(reference_path) as reference:
+                    expected = reference["frames"]
+                    assert frames.shape == expected.shape
+                    row["audio_max_abs"] = float(
+                        np.max(np.abs(audio - reference["audio"]))
+                    )
+                    row["frames_equal"] = np.array_equal(frames, expected)
+                    if row["audio_max_abs"] > args.audio_atol or (
+                        quality != "high" and not row["frames_equal"]
+                    ):
+                        np.savez(
+                            args.output / f"mismatch-{label}-{index}-{iteration}.npz",
+                            frames=frames,
+                            audio=audio,
+                        )
+                        print(json.dumps(row), flush=True)
+                    np.testing.assert_allclose(
+                        audio,
+                        reference["audio"],
+                        rtol=0,
+                        atol=args.audio_atol,
+                        equal_nan=False,
+                    )
+                    if quality != "high":
+                        np.testing.assert_array_equal(frames, expected)
+                    else:
+                        mse = ((frames.astype(np.float64) - expected) ** 2).mean(
+                            axis=(1, 2, 3)
+                        )
+                        row["worst_frame_psnr"] = float(
+                            np.min(10 * np.log10(255**2 / np.maximum(mse, 1e-12)))
+                        )
+                        row["worst_frame_ssim"] = min(
+                            structural_similarity(a, b, channel_axis=-1, data_range=255)
+                            for a, b in zip(frames, expected)
+                        )
+                        assert row["worst_frame_psnr"] >= 40
+                        assert row["worst_frame_ssim"] >= 0.98
+                report["requests"].append(row)
+                (args.output / f"{label}.json").write_text(json.dumps(report, indent=2))
+                print(json.dumps(row), flush=True)
+    finally:
+        generator.shutdown()
+
+
+if __name__ == "__main__":
+    main()
