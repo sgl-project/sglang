@@ -80,7 +80,7 @@ def _chunk_kda_ref(d, lower_bound):
     """Triton chunk_kda reference. chunk_kda mutates g/v and the state in place,
     so feed clones; returns (output, updated_state_slots)."""
     st = d["pool"].clone()
-    out, _ = chunk_kda(
+    out = chunk_kda(
         q=d["q"].clone(),
         k=d["k"].clone(),
         v=d["v"].clone(),
