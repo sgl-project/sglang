@@ -472,6 +472,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.use_flash_mla = (
             self.use_mla
+            and not self.use_dsa
             and not self.is_draft_worker
             and model_runner.spec_algorithm.is_dspark()
             and get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
@@ -523,8 +524,13 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (
-                self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
+            if self.dsa_dcp_target or (
+                self.use_fia
+                and not (
+                    self.use_quant_flash_attn
+                    or self.use_flash_mla
+                    or self.use_paged_mtp
+                )
             ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
@@ -1179,7 +1185,14 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.uniform_query_len = 1
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
+        if (
+            self.dsa_dcp_target
+            or self.use_flash_mla
+            or self.use_paged_mtp
+            or self.use_quant_flash_attn
+        ):
+            # DSA reads verify lengths including the candidates. Keep them
+            # separate from the runner's prefix lengths used by KDA and commit.
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens

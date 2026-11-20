@@ -177,6 +177,53 @@ def test_graph_metadata_preserves_prefix_and_stable_addresses(backend):
     assert metadata.seq_lens_cpu_list is None
 
 
+def test_dsa_dcp_verify_graph_preserves_prefix_lengths(backend):
+    backend.use_flash_mla = False
+    backend.use_dsa = backend.dsa_dcp_target = True
+    backend.is_draft_worker = False
+    backend.needs_cpu_seq_lens = True
+    backend.dcp_size = 2
+    backend.max_context_len = 512
+    batch = make_batch(ForwardMode.TARGET_VERIFY, [0, 0])
+    batch.spec_info.spec_input_type = mod.SpecInputType.DFLASH_VERIFY
+    batch.out_cache_loc = torch.zeros(16, dtype=torch.int64)
+    parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=2, attn_dcp_rank=0)
+    with patch.object(mod, "get_parallel", return_value=parallel):
+        backend.init_cuda_graph_state(2, 16)
+        backend.init_forward_metadata_out_graph(batch, in_capture=True)
+        metadata = backend.forward_metadata
+        seq_lens_ptr = metadata.seq_lens.data_ptr()
+        batch.seq_lens.copy_(torch.tensor([121, 249]))
+        batch.seq_lens_cpu = torch.tensor([129, 257])
+        batch.origin_out_cache_loc = torch.arange(16, dtype=torch.int64) + 256
+        backend.init_forward_metadata_out_graph(batch)
+
+    assert batch.seq_lens.tolist() == [121, 249]
+    assert metadata.seq_lens.data_ptr() == seq_lens_ptr
+    assert metadata.seq_lens.tolist() == [129, 257]
+    assert metadata.dcp_spec_seq_lens.tolist() == [
+        122,
+        123,
+        124,
+        125,
+        126,
+        127,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        128,
+        129,
+    ]
+    torch.testing.assert_close(
+        metadata.dcp_origin_out_cache_loc, batch.origin_out_cache_loc
+    )
+
+
 def test_target_verify_dispatches_to_flash_mla_and_zeroes_padding(backend):
     mode = ForwardMode.TARGET_VERIFY
     batch = make_batch(mode, [125, 0])
