@@ -471,6 +471,7 @@ class TestMergeKdaInprojFp8(CustomTestCase):
             _qkvgbfa_sizes=None,
             _bfa_f_b_w=None,
             _derived_weight_cache_error=None,
+            o_norm=SimpleNamespace(weight=torch.ones(8, dtype=torch.bfloat16)),
         )
         return attn
 
@@ -503,6 +504,34 @@ class TestMergeKdaInprojFp8(CustomTestCase):
 
         self.assertEqual(attn._qkvgbfa_sizes, [24, 8, 8, 3, 21])
         self.assertIsNone(attn._bfa_f_b_w)
+        fused = torch.randn(4, sum(attn._qkvgbfa_sizes))
+        gate = object()
+        received = []
+        attn.__dict__.update(
+            use_full_rank_gate=True,
+            fused_qkvg_proj=lambda x: (fused, None),
+            f_b_proj=lambda f_a: (received.append(f_a) or gate, None),
+        )
+
+        _, _, forget_gate, _ = KimiK3DeltaAttention.forward_qkvbfg_fused(
+            attn, torch.randn(4, 16)
+        )
+
+        self.assertIs(forget_gate, gate)
+        torch.testing.assert_close(received[0], fused[:, 32:40], rtol=0, atol=0)
+
+    def test_fp16_activations_run_f_b_on_its_projection(self):
+        """The cached f_b is BF16 and the BF16-only tiny GEMM rejects FP16 f_a, so
+        --dtype float16 must leave no cache and fall through to f_b_proj."""
+        attn = self._kda_attention()
+        attn.o_norm.weight = torch.ones(8, dtype=torch.float16)
+
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8(attn))
+        self.assertIsNone(attn._bfa_f_b_w)
+
+        bf16 = self._kda_attention()
+        self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_fp8(bf16))
+        self.assertEqual(bf16._bfa_f_b_w.dtype, torch.bfloat16)
 
     def test_rerun_keeps_the_merge(self):
         """A second post_load_weights must keep the FP8 merge, not fall back to the

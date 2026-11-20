@@ -2415,6 +2415,9 @@ class KimiK3DeltaAttention(nn.Module):
         # Rows were written in place, so the loader's process_weights_after_loading
         # prepares the projection's only copy; f_a_proj/b_proj keep small unused ones.
         self._qkvgbfa_sizes, self._bfa_f_b_w = merged
+        # The cached f_b is BF16; other activation dtypes (--dtype float16) run f_b_proj.
+        if self.o_norm.weight.dtype != torch.bfloat16:
+            self._bfa_f_b_w = None
         self._qkvgbfa_in_qkvg_proj = True
         self._derived_weight_cache_error = (
             "Online weight updates are not supported with the merged Quark FP8 "
