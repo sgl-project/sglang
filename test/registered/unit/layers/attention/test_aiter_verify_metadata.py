@@ -138,7 +138,7 @@ _CPRR_QUERY = dict(
 )
 
 
-def _cprr_kernel_heads(gathered_heads, q_len):
+def _cprr_kernel_heads(*, gathered_heads, q_len):
     return aiter_backend._asm_cprr_kernel_heads(
         gathered_heads=gathered_heads,
         supports=lambda heads: aiter_backend._asm_cprr_shape_verdict(
@@ -210,7 +210,9 @@ class TestAiterCprrKernelHeads(CustomTestCase):
         for native_shapes, expected in (({(96, 8), (128, 8)}, 96), ({(128, 8)}, 128)):
             support = _ShapeSupport(native_shapes)
             with patch.object(aiter_backend, "get_mla_decode_shape_support", support):
-                self.assertEqual(_cprr_kernel_heads(96, 8), expected)
+                self.assertEqual(
+                    _cprr_kernel_heads(gathered_heads=96, q_len=8), expected
+                )
             # The query describes the call the verify makes: fp8, LSE, round robin.
             self.assertLessEqual(
                 {
@@ -280,8 +282,8 @@ class TestAiterCprrKernelHeads(CustomTestCase):
         unknown = _ShapeSupport({(96, 6), (96, 8), (128, 6), (128, 8)}, supported=None)
         for query in (unknown, None):
             with patch.object(aiter_backend, "get_mla_decode_shape_support", query):
-                self.assertEqual(_cprr_kernel_heads(96, 6), 96)
-                self.assertEqual(_cprr_kernel_heads(96, 8), 128)
+                self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 96)
+                self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
 
     def test_unconfirmed_kernel_off_gfx950_is_not_native(self):
         # The copied table describes gfx950 kernels only.
@@ -289,14 +291,14 @@ class TestAiterCprrKernelHeads(CustomTestCase):
             {(96, 6), (96, 8), (128, 6), (128, 8)}, supported=None, arch="gfx1250"
         )
         with patch.object(aiter_backend, "get_mla_decode_shape_support", unknown):
-            self.assertEqual(_cprr_kernel_heads(96, 6), 0)
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 0)
 
     def test_table_never_overrides_a_fold(self):
         # The table says 96 heads are native at q_len 6, but aiter's planner folds
         # them: running 96 unpadded would fold on one side only.
         folds_96 = _ShapeSupport({(128, 6)}, supported=None)
         with patch.object(aiter_backend, "get_mla_decode_shape_support", folds_96):
-            self.assertEqual(_cprr_kernel_heads(96, 6), 128)
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 128)
 
     def test_unsupported_shape_stays_on_gluon_with_aiter_reason(self):
         reason = "asm no_kernel on gfx950: q=fp8 kv=fp8 heads=96 qlen=8"
