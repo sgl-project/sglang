@@ -15,7 +15,9 @@ from typing import Any, Iterable, Iterator, Optional
 import mlx.core as mx
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
@@ -94,6 +96,11 @@ class MlxAuxiliaryStatePool:
         self.device = device
         self.mamba_cache = None
         self.mem_usage = 0
+        # No speculative ReplaySSM cursors: `StateStorage.reset_request_rows`
+        # skips a pool whose cursors are None.
+        self.replayssm_spec_write_pos = None
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
         self._snapshots: dict[int, dict[int, _CacheSnapshot]] = {}
         self._alloc_iter: Optional[Iterator[torch.Tensor]] = None
         self.clear()
@@ -111,6 +118,10 @@ class MlxAuxiliaryStatePool:
 
     def schedulable_available_size(self) -> int:
         return self.available_size()
+
+    def slots_fit(self, count: int) -> bool:
+        """Whether ``count`` slots can be taken now."""
+        return self.schedulable_available_size() >= count
 
     def alloc_group_begin(self, num_reqs: int) -> None:
         self._alloc_iter = None
@@ -215,6 +226,19 @@ class MlxAuxiliaryStatePool:
         return self._index(index) in self._snapshots
 
 
+class MlxAuxiliaryStateStorage(StateStorage):
+    """The auxiliary-state slots, as the radix cache's state component reaches
+    them through the token allocator. The MLX table binds a request's slot when
+    it binds the row, and release keeps the MLX table's rules."""
+
+    def acquire(self, table, reqs, rows) -> None:
+        """Nothing left to bind: the MLX table's ``alloc`` gave each request
+        its auxiliary slot, or kept the one it holds, with its row."""
+
+    def release(self, table, req, mamba_ping_pong_track_buffer_to_keep=None):
+        table.free_mamba_cache(req, mamba_ping_pong_track_buffer_to_keep)
+
+
 class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
     """Req-to-token pool with MLX auxiliary-state slot bookkeeping. It never
     frees auxiliary slots: ``MlxAuxiliaryStateComponent`` owns their release."""
@@ -243,6 +267,14 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        self.state = MlxAuxiliaryStateStorage(
+            sub_pool="mamba",
+            pool=self.mamba_pool,
+            slots=self.mamba_pool,
+            layer_map={},
+            short_conv_pool=None,
+            ngram_pool=None,
+        )
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device
@@ -305,7 +337,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
 class MlxAuxiliaryStateComponent(MambaComponent):
     """Unified radix component for MLX native auxiliary-state snapshots."""
 
-    def __init__(self, cache, params):
+    def __init__(self, cache, params, slot):
         if params.enable_mamba_extra_buffer:
             raise NotImplementedError(
                 "MLX auxiliary-state radix cache does not support "
@@ -317,7 +349,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 "MlxAuxiliaryStateComponent requires MlxAuxiliaryStatePool, "
                 f"got {type(pool)}"
             )
-        TreeComponent.__init__(self, cache, params)
+        TreeComponent.__init__(self, cache, params, slot)
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
 
@@ -355,7 +387,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 source_value
             )
             if forked_value is None:
-                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                self.cache.evict_for_alloc(KVDemand(state_slots=1))
                 forked_value = (
                     self.cache.req_to_token_pool.auxiliary_state_pool.fork_from(
                         source_value

@@ -51,6 +51,8 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from sglang.kernels.arch import current_arch
+
 
 def _mark_batch_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
     # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
@@ -2193,18 +2195,6 @@ def _run_wide_vec(
 
 
 # ==============================================================================
-# PUBLIC API
-# ==============================================================================
-# Number of SMs on target GPU (detected dynamically)
-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
-
-# GPU architecture detected once at import time — avoids per-call
-# torch.cuda.get_device_capability() in the hot path.
-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
-_USE_PACKED_FMA = _GPU_MAJOR >= 10
-
-
-# ==============================================================================
 # MTP PUBLIC API
 # ==============================================================================
 _compiled_kernels_mtp: dict = {}
@@ -2223,7 +2213,7 @@ def _select_tile_v_for_mtp(B: int, HV: int, V: int, T: int = 1) -> int:
         num_v_tiles = V // tv
         grid_size = B * HV * num_v_tiles
         # Want at least 4 waves for good occupancy
-        if grid_size >= 4 * NUM_SMS:
+        if grid_size >= 4 * current_arch().num_sms:
             return tv
     return 32  # Minimum tile_v for maximum parallelism
 
@@ -2484,7 +2474,7 @@ def gated_delta_rule_mtp_wide_vec(
         effective_disable_final = disable_state_update
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = current_arch().is_sm_at_least(10)
     # Single-pool callers either pass output_state_indices=None (defaults to
     # initial_state_indices below) or pass the same tensor for both. In both
     # cases the kernel can elide write-side base-pointer arithmetic via the
@@ -3009,7 +2999,7 @@ def gated_delta_rule_mtp(
     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    use_packed_fma = _USE_PACKED_FMA
+    use_packed_fma = current_arch().is_sm_at_least(10)
     # Set same_pool=True when reads and writes alias (single-pool); the
     # kernel then DCEs write-side base-pointer arithmetic.
     same_pool = (

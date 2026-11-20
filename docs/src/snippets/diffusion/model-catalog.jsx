@@ -1,8 +1,15 @@
-// Keep explicit model IDs aligned with multimodal_gen/registry.py. The unit
-// test for this component reports registry entries missing from the catalog.
+// List real Hugging Face repo IDs that resolve through the multimodal_gen
+// registry (hf_model_paths or a model detector in configs/pipeline_configs/*,
+// see registry.py). They may differ from the literal hf_model_paths entries.
 export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
+    {
+      name: "MiniMax-H3-Image",
+      modelIds: ["MiniMaxAI/MiniMax-H3-Image"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3-Image",
+      note: "Six-step PDD text-to-image and image editing.",
+    },
     {
       name: "MOSS-Image",
       modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
@@ -73,7 +80,7 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "Krea-2",
-      modelIds: ["krea/Krea-2"],
+      modelIds: ["krea/Krea-2-Turbo", "krea/Krea-2-Raw"],
       cookbook: "/cookbook/diffusion/Krea/Krea-2",
     },
     {
@@ -91,9 +98,7 @@ export const DiffusionModelCatalog = ({ category }) => {
         "stabilityai/stable-diffusion-3-medium",
         "stabilityai/stable-diffusion-3-medium-diffusers",
         "stabilityai/stable-diffusion-3.5-medium",
-        "stabilityai/stable-diffusion-3.5-medium-diffusers",
         "stabilityai/stable-diffusion-3.5-large",
-        "stabilityai/stable-diffusion-3.5-large-diffusers",
       ],
     },
     {
@@ -143,6 +148,12 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "GLM-Image",
       modelIds: ["zai-org/GLM-Image"],
       note: "Resolved by the GLM-Image family detector.",
+    },
+    {
+      name: "HiDream-O1-Image",
+      modelIds: ["HiDream-ai/HiDream-O1-Image"],
+      cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
+      note: "Pixel-space unified transformer: no VAE, single monolithic role, sequence parallelism unsupported.",
     },
     {
       name: "Hunyuan3D 2",
@@ -248,6 +259,16 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
     },
     {
+      name: "FastH3 Omni",
+      modelIds: ["FastVideo/FastVideo-FastH3-Omni-8-Step-V1"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#fasth3-omni-ref2va-8-step-pdd",
+    },
+    {
+      name: "Pika H3 Flex",
+      modelIds: ["Pika-Labs/Pika-H3-Flex"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pika-h3-flex-six-step-adapters",
+    },
+    {
       name: "VDN-H3",
       modelIds: ["OpenVDN/vdn-minimax-h3"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
@@ -290,6 +311,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   ],
   world: [
     {
+      name: "HY-Nomas",
+      modelIds: ["tencent/Hy-Nomas"],
+      cookbook: "/cookbook/diffusion/HY-Nomas/HY-Nomas",
+    },
+    {
       name: "Cosmos 3",
       modelIds: [
         "nvidia/Cosmos3-Nano",
@@ -329,6 +355,14 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "FLUX 3 Action",
       modelIds: ["black-forest-labs/flux-3-action-droid"],
       cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
+    },
+    {
+      name: "Praxis-1",
+      modelIds: [
+        "runwayml/praxis-1-droid-lerobot",
+        "runwayml/praxis-1-yam-lerobot",
+      ],
+      cookbook: "/cookbook/vla/Runway/Praxis-1",
     },
     {
       name: "LingBotWorld",

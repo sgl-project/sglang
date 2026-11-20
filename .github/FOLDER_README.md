@@ -12,26 +12,23 @@ Recognized permission keys:
 
 | Key | Grants |
 | --- | --- |
-| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-<tier>-ci` |
-| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-full-ci`, `/run-<tier>-ci` |
+| `can_tag_run_ci_label` | `/tag-run-ci-label`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
+| `can_rerun_failed_ci` | `/rerun-failed-ci`, `/tag-and-rerun-ci`, `/run-ci <hardware...>`, `/run-extra-ci`, `/run-full-ci` |
 | `cooldown_interval_minutes` | rate limit in `pr-gate.yml`; `0` also grants `/rerun-test`, `/rerun-group`, `/run-cpu-ci` |
 
-`/run-ci`, `/run-base-ci`, and `/rerun-base-ci` with no argument are aliases of
-`/tag-and-rerun-ci`: labeling and retrying each use their existing permission
-checks. With one registered tier argument, they are aliases of `/run-<tier>-ci`
-and require both permissions. For example, `/run-ci extra` equals `/run-extra-ci`.
-Use `/run-ci nv` (or `/run-nv-ci`) for NVIDIA base and shared checks only.
-The `nv` entry has `label: null`, so it adds only `run-ci` and changes only the
-immediate rerun selection. Existing hardware labels are kept; future pushes follow the existing workflow gates.
-Legacy `/tag-and-rerun-ci <tier>` still retries broadly; its arguments add labels.
+Command syntax and the per-hardware tiers are documented in the
+[contribution guide](https://docs.sglang.io/docs/developer_guide/contribution_guide#how-to-trigger-ci-tests).
+`/run-ci`, `/run-extra-ci` and `/run-full-ci` with hardware arguments add
+labels and rerun runs, so they need both keys. The
+labeling commands and the no-argument `/run-ci` alias of `/tag-and-rerun-ci`
+check each key for the step it gates.
 
-`/run-extra-ci <hardware>` (also `/rerun-extra-ci <hardware>`) selects the
-`<hardware>-extra` tier only when it is registered. Otherwise, the existing
-ignored-suffix behavior is preserved. The registry contains `extra`, covering
-both NVIDIA and AMD extra workflows, `nv`, selecting NVIDIA base/shared checks,
-and `mlu`, selecting `pr-test-mlu.yml` with `run-ci-mlu`.
-The shared `extra` tier keeps `run-ci-extra`; separate hardware extra tiers are
-left for a follow-up. Other hardware-specific selections are not yet registered.
+Each opt-in workflow passes `require-label: run-ci-<tier>` to `pr-gate.yml` and
+is registered under that tier in `scripts/ci/opt_in_ci_tiers.json`;
+`scripts/lint/check_opt_in_ci_tiers.py` checks the two agree. Without the label,
+without `run-ci`, or on a draft PR, the gate passes with `opted-in=false` and
+the caller's test jobs skip. `pr-test-finish` then fails, so a PR cannot merge
+without running Base CI.
 
 `/rerun-test`, `/rerun-group` and `/run-cpu-ci` are gated on the commenter alone: either
 `cooldown_interval_minutes: 0`, or `write`/`admin` permission on the repo. Where

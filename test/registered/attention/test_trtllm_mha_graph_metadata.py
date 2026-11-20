@@ -20,11 +20,14 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
+    update_draft_step_seqlens,
     update_trtllm_mha_graph_metadata,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
@@ -34,9 +37,16 @@ DEVICE = "cuda"
 PAGE_SIZE = 128
 
 
+def _routed(pool):
+    """A stand-in pool whose layers its own plain router hands out."""
+    pool.start_layer, pool.layer_transfer_counter = 0, None
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 @pytest.fixture
 def make_xqa_backend(monkeypatch):
-    def parent_init(self, *args):
+    def parent_init(self, *args, **kwargs):
         self.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: SimpleNamespace(
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
@@ -46,7 +56,9 @@ def make_xqa_backend(monkeypatch):
     monkeypatch.setattr(
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
     )
-    monkeypatch.setattr(TRTLLMHAAttnBackend, "_resolve_swa_kv_pool", lambda *args: None)
+    monkeypatch.setattr(
+        trtllm_mha_backend, "resolve_window_kv_pool", lambda *args: None
+    )
     monkeypatch.setattr(trtllm_mha_backend, "DEFAULT_WORKSPACE_SIZE_MB", 1)
     monkeypatch.setattr(
         trtllm_mha_backend, "get_buffer", lambda name, factory: factory()
@@ -84,6 +96,7 @@ def make_xqa_backend(monkeypatch):
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
             is_draft_worker=False,
+            server_args=SimpleNamespace(enable_nvidia_megakernel=False),
         )
         return TRTLLMHAAttnBackend(runner)
 
@@ -114,7 +127,9 @@ def _run_decode_mode_extend(backend, monkeypatch, *, mode, width, decode):
     backend.forward_metadata = SimpleNamespace(
         is_ragged_verify=False, max_seq_len_q=width, cache_seqlens_int32=seq_lens
     )
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (None, None))
+    )
     backend._should_use_fused_fp8_path = lambda *a: False
     backend._reshape_paged_kv_cache = lambda *a: (None, None)
     backend._get_bmm_scales = lambda *a: (1.0, 1.0)
@@ -236,7 +251,9 @@ def test_fmha_v2_prefill_workspace_skips_xqa_semaphores(
         page_table=torch.arange(bs, dtype=torch.int32)[:, None],
     )
     kv = torch.zeros(bs * backend.page_size, heads, head_dim, dtype=torch.bfloat16)
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    backend.token_to_kv_pool = _routed(
+        SimpleNamespace(get_kv_buffer=lambda _: (kv, kv))
+    )
     monkeypatch.setattr(trtllm_mha_backend, "is_cp_active", lambda _: False)
     workspaces = {}
 
@@ -312,9 +329,9 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
     # V before K in one buffer: never the fused-halves layout fmha_v2 reads
     # without a copy, so the prefill takes the copy path.
     v, k = torch.randn(2, pool_pages * page_size, heads, head_dim).to(torch.bfloat16)
-    backend.token_to_kv_pool = SimpleNamespace(get_kv_buffer=lambda _: (k, v))
+    backend.token_to_kv_pool = _routed(SimpleNamespace(get_kv_buffer=lambda _: (k, v)))
 
-    backend.kv_index_translator = SimpleNamespace(
+    backend.runner_ids = SimpleNamespace(
         read_table=lambda plan, rows: SimpleNamespace(
             ids=page_table, is_translated=True
         ),
@@ -344,7 +361,7 @@ def test_fmha_v2_prefill_copies_only_the_batch_pages(
         extend_seq_lens_cpu=seq_lens.tolist(),
         extend_prefix_lens_cpu=[0, 0],
         req_pool_indices=torch.arange(2),
-        kv_loc_plan=None,
+        iteration_ids=None,
         _attn_output=None,
     )
     layer = SimpleNamespace(
@@ -492,7 +509,7 @@ def test_native_nvfp4_output_capacity_includes_unchunked_batch(
 
 
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
-    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
@@ -512,10 +529,12 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.draft_extend_metadata = {}
     # Passthrough source (static pool): every unified-arm branch stays off,
     # matching the real __init__'s parent binding.
-    backend.kv_index_translator = KVIndexTranslator(
+    backend.runner_ids = RunnerIds(
         req_to_token=backend.req_to_token,
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=PAGE_SIZE,
         device="cpu",
     )
@@ -562,6 +581,7 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64),
         out_cache_loc=torch.arange(2, dtype=torch.int64),
@@ -600,6 +620,7 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        ragged_verify_layout=None,
         spec_info=SimpleNamespace(
             num_tokens_per_req=4,
             num_accept_tokens=ExplodingAcceptTokens(),
@@ -622,8 +643,8 @@ def _translate_through_a_moving_page_map(backend):
     """Give the backend a translating pool whose virtual->physical page map the
     test rewrites before every replay, so a page-table column the refill missed
     still holds an earlier replay's page."""
-    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-    from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
     rows, width = backend.req_to_token.shape
     # Row r holds virtual pages r * width / PAGE_SIZE + 1, ...; page 0 is the sink.
@@ -631,21 +652,22 @@ def _translate_through_a_moving_page_map(backend):
         torch.arange(rows * width, dtype=torch.int32).view(rows, width) + PAGE_SIZE
     )
     v2p = torch.zeros(rows * width // PAGE_SIZE + 1, dtype=torch.int64)
-    translator = KVIndexTranslator.__new__(KVIndexTranslator)
-    translator.req_to_token = backend.req_to_token
-    translator.page_size = PAGE_SIZE
-    translator.device = "cpu"
-    translator.is_translating = True
-    translator.defer_read_translate = False
-    translator._capture_page_size = PAGE_SIZE
-    translator._full_v2p_table = v2p
-    translator._spaces = {
+    runner_ids = RunnerIds.__new__(RunnerIds)
+    runner_ids.req_to_token = backend.req_to_token
+    runner_ids.page_size = PAGE_SIZE
+    runner_ids.device = "cpu"
+    runner_ids.is_translating = True
+    runner_ids.defer_read_translate = False
+    runner_ids._capture_page_size = PAGE_SIZE
+    runner_ids._full_v2p_table = v2p
+    runner_ids._spaces = {
         IdSpaceKind.FULL: IdSpace(
             key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
         )
     }
-    translator._rows = torch.arange(rows, dtype=torch.int64)
-    backend.kv_index_translator = translator
+    runner_ids._role_sub_pools = {}
+    runner_ids._rows = torch.arange(rows, dtype=torch.int64)
+    backend.runner_ids = runner_ids
     return v2p
 
 
@@ -653,20 +675,24 @@ def _move_every_page(v2p, replay):
     v2p[1:] = torch.arange(1, v2p.numel()) + 1000 * replay
 
 
-def _assert_reads_only_current_pages(backend, v2p, bs=2):
+def _assert_reads_only_current_pages(backend, v2p, bs=2, page_table=None):
     metadata = backend.forward_metadata
+    if page_table is None:
+        page_table = metadata.page_table
     for row, length in enumerate(metadata.cache_seqlens_int32[:bs].tolist()):
         pages = -(-length // PAGE_SIZE)
         first_tokens = backend.req_to_token[row, : pages * PAGE_SIZE : PAGE_SIZE]
         expected = v2p[first_tokens.long() // PAGE_SIZE].to(torch.int32)
-        stale = (metadata.page_table[row, :pages] != expected).nonzero().flatten()
+        stale = (page_table[row, :pages] != expected).nonzero().flatten()
         assert stale.numel() == 0, (
             f"row {row} reads {length} tokens ({pages} pages), but page-table "
             f"columns {stale.tolist()} hold another replay's pages"
         )
 
 
-def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
+def _graph_batch(
+    seq_lens, forward_mode, spec_info, tokens_per_req, ragged_verify_layout=None
+):
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     bs = seq_lens.numel()
     return SimpleNamespace(
@@ -676,6 +702,7 @@ def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
         seq_lens_cpu=seq_lens.clone(),
         forward_mode=forward_mode,
         spec_info=spec_info,
+        ragged_verify_layout=ragged_verify_layout,
         positions=torch.arange(bs * tokens_per_req, dtype=torch.int64),
         # The window it writes; the reads under test do not depend on its ids.
         out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
@@ -702,14 +729,14 @@ def _replay_and_check_every_read(
     )
     v2p = _translate_through_a_moving_page_map(backend)
     capture = batch([1, 1])
-    bind_plan(backend.kv_index_translator, capture)
+    bind_plan(backend.runner_ids, capture)
     backend.init_forward_metadata_out_graph(capture, in_capture=True)
     backend.init_forward_metadata_in_graph(capture)
     # Rows grow across page boundaries and trade lengths between replays.
     for n, seq_lens in enumerate(replays, start=1):
         _move_every_page(v2p, n)
         replay = batch(seq_lens)
-        bind_plan(backend.kv_index_translator, replay)
+        bind_plan(backend.runner_ids, replay)
         backend.init_forward_metadata_out_graph(replay)
         backend.init_forward_metadata_in_graph(replay)
         _assert_reads_only_current_pages(backend, v2p)
@@ -726,8 +753,97 @@ def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
         monkeypatch,
         _make_backend_for_hook_test(),
         batch,
-        lambda translator, fb: translator.bind_own_plan(fb),
+        lambda runner_ids, fb: runner_ids.bind_own_plan(fb),
     )
+
+
+def _ring_backend(monkeypatch):
+    from sglang.srt.speculative.dflash_draft_ring import (
+        DFlashDraftKVRing,
+        draft_kv_ring_paged_rows_per_req,
+    )
+
+    def recorded_kernel(**kwargs):
+        assert kwargs["page_table"] is None and kwargs["skip_page_table"]
+        bs = kwargs["bs"]
+        kwargs["cache_seqlens"][:bs].copy_(
+            kwargs["seq_lens"][:bs] + kwargs["seqlen_offset"]
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", recorded_kernel
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=8)
+    backend.expand_encoder_only_verify = True
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=32)
+    ring = DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_paged_rows_per_req(
+            window_left=255, block_size=8, page_size=PAGE_SIZE
+        ),
+        dcp_size=1,
+        req_to_token_rows=4,
+        device="cpu",
+        window_left=255,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
+        page_size=PAGE_SIZE,
+    )
+    ring.min_pos.copy_(torch.tensor([0, 300, 5, 0], dtype=torch.int32))
+    backend.set_draft_kv_ring(ring)
+    return backend, ring
+
+
+def _assert_reads_the_ring(backend, ring, req_pool_indices, seq_lens, block):
+    metadata = backend.forward_metadata
+    bs = len(seq_lens)
+    floors = ring.min_pos[req_pool_indices].tolist()
+    expected_lens = [n - f + block for n, f in zip(seq_lens, floors)]
+    assert metadata.cache_seqlens_int32[:bs].tolist() == expected_lens
+    cols = torch.arange(backend.max_num_pages) % ring.pages_per_req
+    for row, req in enumerate(req_pool_indices.tolist()):
+        expected = (1 + req * ring.pages_per_req + cols).to(torch.int32)
+        assert torch.equal(metadata.page_table[row], expected)
+    rows = bs * block
+    assert torch.equal(
+        metadata.encoder_page_table[:rows],
+        metadata.page_table[:bs].repeat_interleave(block, dim=0),
+    )
+    assert metadata.encoder_cache_seqlens[:rows].tolist() == [
+        n for n in expected_lens for _ in range(block)
+    ]
+
+
+def test_draft_kv_ring_graph_verify_reads_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    capture = _graph_batch([1, 1], ForwardMode.TARGET_VERIFY, None, 8)
+    backend.init_forward_metadata_out_graph(capture, in_capture=True)
+    backend.init_forward_metadata_in_graph(capture)
+    for seq_lens, reqs in (([700, 310], [3, 1]), ([9, 900], [2, 0])):
+        replay = _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, None, 8)
+        replay.req_pool_indices = torch.tensor(reqs, dtype=torch.int64)
+        backend.init_forward_metadata_out_graph(replay)
+        backend.init_forward_metadata_in_graph(replay)
+        _assert_reads_the_ring(backend, ring, replay.req_pool_indices, seq_lens, 8)
+
+
+def test_draft_kv_ring_eager_verify_reads_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    seq_lens = [310, 700]
+    forward_batch = _eager_batch(seq_lens, ForwardMode.TARGET_VERIFY, tokens_per_req=8)
+    forward_batch.req_pool_indices = torch.tensor([1, 3], dtype=torch.int64)
+    backend.runner_ids.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    _assert_reads_the_ring(backend, ring, forward_batch.req_pool_indices, seq_lens, 8)
+
+
+def test_draft_kv_ring_other_modes_stay_inside_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    forward_batch = _eager_batch([1000, 20], ForwardMode.DECODE)
+    backend.runner_ids.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    table = backend.forward_metadata.page_table
+    assert backend.forward_metadata.cache_seqlens_int32.tolist() == [1000, 20]
+    assert int(table.max()) < 1 + 4 * ring.pages_per_req and int(table.min()) >= 1
 
 
 def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
@@ -740,6 +856,7 @@ def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
         seq_lens_cpu=seq_lens.clone(),
         forward_mode=forward_mode,
         spec_info=spec_info,
+        ragged_verify_layout=None,
         input_ids=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
         out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
         extend_seq_lens=seq_lens,
@@ -748,47 +865,56 @@ def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
     )
 
 
-def test_unified_eager_table_must_be_packed():
+@pytest.mark.parametrize("kind", [IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW])
+def test_unified_eager_packs_a_table_a_graph_reader_built(kind):
     """XQA and fmha_v2 index a page table as packed rows (row length = width,
-    strides ignored). A plan whose table an earlier captured reader had built in
-    its own wider buffer hands a graphs-off reader a strided view, which they
-    would misread for every row after the first."""
+    strides ignored). A captured reader that built the plan's table first built
+    it in place, as a view into its own wider buffer; a graphs-off reader of the
+    same plan gets that table packed, or it would misread every row after the
+    first."""
     backend = _make_backend_for_hook_test()
     v2p = _translate_through_a_moving_page_map(backend)
     _move_every_page(v2p, 1)
-    translator = backend.kv_index_translator
+    window_v2p = v2p + 5000
+    runner_ids = backend.runner_ids
+    runner_ids._spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
+        key=(IdSpaceKind.SLIDING_WINDOW, "test"), read_v2p=window_v2p
+    )
 
     forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    translator.bind_own_plan(forward_batch)
-    backend.init_forward_metadata(forward_batch)
-    assert backend.forward_metadata.page_table.is_contiguous()
-    _assert_reads_only_current_pages(backend, v2p)
-
-    forward_batch = _eager_batch([127, 300], ForwardMode.DECODE)
-    translator.bind_own_plan(forward_batch)
+    runner_ids.bind_own_plan(forward_batch)
     captured = torch.zeros((8, backend.max_num_pages), dtype=torch.int32)
-    translator.copy_page_table(forward_batch.kv_loc_plan, out=captured[:2])
-    with pytest.raises(AssertionError, match="packed rows"):
-        backend.init_forward_metadata(forward_batch)
+    runner_ids.copy_page_table(forward_batch.iteration_ids, out=captured[:2], kind=kind)
+    backend.init_forward_metadata(forward_batch)
+
+    metadata = backend.forward_metadata
+    for table, table_v2p in (
+        (metadata.page_table, v2p),
+        (metadata.swa_page_table, window_v2p),
+    ):
+        assert table.is_contiguous()
+        _assert_reads_only_current_pages(backend, table_v2p, page_table=table)
+    built = metadata.page_table if kind == IdSpaceKind.FULL else metadata.swa_page_table
+    assert torch.equal(built, captured[:2, : built.shape[1]])
 
 
-def _bind_iteration_plan(translator, forward_batch, window=4):
+def _bind_iteration_plan(runner_ids, forward_batch, window=4):
     """The plan a speculative worker builds once per iteration: its reads reach
     the whole draft window past the committed lengths."""
-    translator.plan(
+    runner_ids.plan(
         req_pool_indices=forward_batch.req_pool_indices,
         seq_lens=forward_batch.seq_lens,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
         write_virtual=forward_batch.out_cache_loc,
         read_extent=window,
-    ).bind(forward_batch, translator)
+    ).bind(forward_batch, runner_ids)
 
 
 @pytest.mark.parametrize(
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
         (ForwardMode.DRAFT_EXTEND_V2, SimpleNamespace(num_tokens_per_req=4), 0, 4),
     ],
     ids=["draft_decode", "target_verify", "draft_extend"],
@@ -827,17 +953,23 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
     backend.is_xqa_impl = False
     monkeypatch.setattr(backend, "_write_ragged_verify_graph_metadata", write_ragged)
-    spec_info = SimpleNamespace(ragged_verify_layout=object())
+    spec_info = SimpleNamespace()
 
     def batch(seq_lens):
-        return _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, 8)
+        return _graph_batch(
+            seq_lens,
+            ForwardMode.TARGET_VERIFY,
+            spec_info,
+            8,
+            ragged_verify_layout=object(),
+        )
 
     # 123 + 7 crosses a page boundary that 123 plus the uniform draft width does not.
     _replay_and_check_every_read(
         monkeypatch,
         backend,
         batch,
-        lambda translator, fb: _bind_iteration_plan(translator, fb, window=8),
+        lambda runner_ids, fb: _bind_iteration_plan(runner_ids, fb, window=8),
         replays=([5, 123], [300, 3]),
     )
 
@@ -846,7 +978,7 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
     ],
     ids=["draft_decode", "target_verify"],
 )
@@ -859,7 +991,7 @@ def test_unified_eager_spec_table_covers_every_page_read(
     _move_every_page(v2p, 1)
     # 127 committed tokens plus the drafts reach a page the prefix does not.
     forward_batch = _eager_batch([127, 3], forward_mode, spec_info, tokens_per_req)
-    _bind_iteration_plan(backend.kv_index_translator, forward_batch)
+    _bind_iteration_plan(backend.runner_ids, forward_batch)
     backend.init_forward_metadata(forward_batch)
     _assert_reads_only_current_pages(backend, v2p)
 
@@ -884,7 +1016,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
                 needs_cpu_seq_lens=False,
-                kv_index_translator=None,
+                runner_ids=None,
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
             )
 
@@ -896,7 +1028,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 kv_cache_dtype=torch.bfloat16,
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
-                kv_index_translator=None,
+                runner_ids=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
                 model_config=SimpleNamespace(context_len=2048),
             ),
@@ -936,6 +1068,7 @@ def test_metadata_update_records_inside_cuda_graph():
         req_pool_indices=torch.arange(2, dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([3, 4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.arange(2, dtype=torch.int64, device=DEVICE),
@@ -983,6 +1116,7 @@ def test_graph_read_done_event_fences_slot_mutation():
         req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),
@@ -1064,10 +1198,11 @@ def test_swa_cache_write_uses_metadata_slot_snapshot():
         raise AssertionError("cache writes must not read the live SWA mapping")
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
-    backend._swa_kv_pool = SimpleNamespace(
-        layers_mapping={1: (0, True)},
-        translate_loc_from_full_to_swa=translate_live_mapping,
+    swa_pool = SimpleNamespace(translate_loc_from_full_to_swa=translate_live_mapping)
+    swa_pool.layer_router = KVLayerRouter.from_layer_maps(
+        swa_pool, [(IdSpaceKind.SLIDING_WINDOW, None, {1: 0})]
     )
+    backend._swa_kv_pool = swa_pool
     backend.forward_metadata = SimpleNamespace(swa_out_cache_loc=snapshot)
     forward_batch = SimpleNamespace(out_cache_loc=torch.tensor([3], dtype=torch.int64))
 
@@ -1293,7 +1428,7 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
 def test_skip_page_table_updates_seqlens_only(pass_tables):
     """The unified-memory arm: skip_page_table=True must still rebuild the
     seqlen metadata in-graph but leave every page-table byte alone -- the bound
-    tables are capture-stable read tables the translator refreshes
+    tables are capture-stable read tables the `RunnerIds` refreshes
     out-of-graph, and an in-graph write would clobber them with virtual-derived
     pages. Covers both call shapes: page_table=None (what the backend passes)
     and a real sentinel-filled table (pins that the writes are compiled out,
@@ -1369,6 +1504,97 @@ def test_bs_zero_noop():
         max_seq_pages=0,
         page_size=PAGE_SIZE,
     )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 16, 128])
+def test_shared_draft_metadata_reads_what_each_step_writes(bs):
+    """A shared last-step table and one lengths launch reproduce every step's metadata."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    steps, pool_size, max_num_pages = 5, 160, 16
+    req_to_token, req_pool_indices, seq_lens, _, _ = _build_inputs(
+        bs, pool_size, max_num_pages, None, (max_num_pages - 2) * PAGE_SIZE, 4321 + bs
+    )
+    seq_lens[0] = PAGE_SIZE - 2  # the later steps cross into the next page
+    common = dict(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        bs=bs,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+    )
+    want = []
+    for step in range(steps):
+        lens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+        cu_lens = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+        update_trtllm_mha_graph_metadata(
+            cache_seqlens=lens,
+            cu_seqlens_k=cu_lens,
+            page_table=table,
+            seqlen_offset=step + 1,
+            **common,
+        )
+        want.append((lens, cu_lens, table))
+
+    lens = torch.zeros(steps, bs, dtype=torch.int32, device=DEVICE)
+    cu_lens = torch.zeros(steps, bs + 1, dtype=torch.int32, device=DEVICE)
+    table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+    update_trtllm_mha_graph_metadata(
+        cache_seqlens=lens[-1],
+        cu_seqlens_k=cu_lens[-1],
+        page_table=table,
+        seqlen_offset=steps,
+        **common,
+    )
+    update_draft_step_seqlens(
+        seq_lens=seq_lens,
+        cache_seqlens=lens,
+        cu_seqlens_k=cu_lens,
+        bs=bs,
+        steps=steps - 1,
+        first_offset=1,
+    )
+    torch.cuda.synchronize()
+    for step, (want_lens, want_cu, want_table) in enumerate(want):
+        assert torch.equal(lens[step], want_lens)
+        assert torch.equal(cu_lens[step], want_cu)
+        for row in range(bs):
+            live = -(-int(want_lens[row]) // PAGE_SIZE)
+            assert torch.equal(table[row, :live], want_table[row, :live])
+
+
+@pytest.mark.parametrize(
+    "runtime_optimization,steps,swa,translating,expected",
+    [
+        (False, 3, False, False, False),
+        (True, 1, False, False, False),
+        (True, 3, True, False, False),
+        (True, 3, False, True, False),
+        (True, 3, False, False, True),
+    ],
+)
+def test_shared_draft_metadata_policy_is_runtime_only_and_safe(
+    monkeypatch, runtime_optimization, steps, swa, translating, expected
+):
+    """The generic runtime switch, never plugin presence, owns metadata sharing."""
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnMultiStepDraftBackend,
+    )
+
+    backends = [
+        SimpleNamespace(
+            use_sliding_window_kv_pool=swa,
+            runner_ids=SimpleNamespace(is_translating=translating),
+        )
+        for _ in range(max(steps, 1))
+    ]
+    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(runtime_optimization):
+        assert (
+            TRTLLMHAAttnMultiStepDraftBackend._can_share_draft_metadata(backends, steps)
+            is expected
+        )
 
 
 if __name__ == "__main__":

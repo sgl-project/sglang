@@ -7,7 +7,7 @@ from typing import Any, Callable, Iterable, Protocol, Sequence, runtime_checkabl
 import numpy as np
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 
 LOCAL_PREPROCESSED_KEY = "encoder_local_preprocessed"
 

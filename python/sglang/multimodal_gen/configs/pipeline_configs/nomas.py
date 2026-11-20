@@ -10,10 +10,8 @@ from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
     QwenImageArchConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 # Preserve upstream whitespace: this text is part of the conditioning contract.
 NOMAS_SYSTEM_PROMPT = (

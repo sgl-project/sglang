@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.interns1pro import InternS1_1ImageProcessor
 
 

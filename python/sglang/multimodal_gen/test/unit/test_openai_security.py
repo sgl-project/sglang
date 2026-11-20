@@ -265,7 +265,7 @@ def test_video_upload_sanitizes_filename_and_preserves_metadata(tmp_path):
     filename = "../../../evil.png"
     upload = UploadFile(io.BytesIO(b"image"), filename=filename)
     saved = asyncio.run(
-        video_api._save_first_input_image([upload], "request", str(tmp_path))
+        utils.save_first_input_image([upload], "request", str(tmp_path))
     )
     assert Path(saved) == tmp_path / "request_evil.png"
     assert Path(saved).read_bytes() == b"image"
