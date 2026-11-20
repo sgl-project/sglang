@@ -14,15 +14,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
-def load_script(name, path):
-    spec = importlib.util.spec_from_file_location(name, REPO_ROOT / path)
+def load_script(*, name, path):
+    spec = importlib.util.spec_from_file_location(name=name, location=REPO_ROOT / path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-MODEL = load_script("amd_partition_model", "scripts/ci/amd/build_partition_model.py")
-AMD_SUITES = load_script("amd_suites", "scripts/ci/amd_suites.py")
+MODEL = load_script(
+    name="amd_partition_model", path="scripts/ci/amd/build_partition_model.py"
+)
+AMD_SUITES = load_script(name="amd_suites", path="scripts/ci/amd_suites.py")
 RUNNER = MODEL.runner_name("mi300")
 
 

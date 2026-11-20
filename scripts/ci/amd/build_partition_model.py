@@ -24,7 +24,7 @@ def parse_test_timings(log):
     timings = {}
     block = None
     for line in log.splitlines():
-        line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+        line = re.sub(pattern=r"\x1b\[[0-?]*[ -/]*[@-~]", repl="", string=line)
         if "TIMINGS BEGIN" in line:
             block = {}
             continue
