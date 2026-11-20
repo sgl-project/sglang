@@ -581,8 +581,9 @@ async fn register_one(
                 tracing::error!(
                     worker_url = %worker_url,
                     "worker manager: refused to register prefill worker: --decode-dispatch-limit \
-                     needs prefill engines with --optimistic-prefill-attempts above 0 or \
-                     --disaggregation-decode-allocation-policy prefill_complete",
+                     needs prefill engines with --optimistic-prefill-attempts above 0 or a \
+                     deferred --disaggregation-decode-allocation-policy (prefill_complete or \
+                     just_in_time)",
                 );
                 return;
             }

@@ -78,6 +78,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.tree_cache = Mock()
         self.request_retirer = release_only_retirer(self.tree_cache)
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        self.disagg_prefill_bootstrap_queue = SimpleNamespace(readiness_pacer=None)
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
         self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
@@ -220,12 +221,32 @@ class TestPrefillCompleteResult(CustomTestCase):
                 )
             )
 
-        req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
+        req.disagg_kv_sender.signal_decode_readiness.side_effect = ready
         move([req], scheduler.prefill_launched_reqs)
         scheduler.process_batch_result_disagg_prefill(batch, result)
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
         self.assertTrue(req.pending_bootstrap)
         scheduler.send_kv_chunk.assert_not_called()
+
+    def test_final_result_feeds_pacer_lead_and_still_signals_readiness(self):
+        """The pacer learns its schedule-to-result lead only here, and a request
+        it has not signaled yet must still reach decode."""
+        override = get_context().override_server_args(
+            disaggregation_decode_allocation_policy="just_in_time"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        scheduler = _Scheduler()
+        pacer = Mock()
+        scheduler.disagg_prefill_bootstrap_queue.readiness_pacer = pacer
+        req = _Req()
+        req.to_finish = None
+        req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
+        move([req], scheduler.prefill_launched_reqs)
+        with patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"):
+            scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        pacer.on_prefill_finished.assert_called_once_with(req)
+        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
 
     @patch(
         "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
@@ -239,7 +260,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
         release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
-        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        req.disagg_kv_sender.signal_decode_readiness.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
     def test_discarded_attempt_never_publishes_ready(self, force_retry):
@@ -252,7 +273,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])
         self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
-        req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
+        req.disagg_kv_sender.signal_decode_readiness.assert_not_called()
 
 
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
