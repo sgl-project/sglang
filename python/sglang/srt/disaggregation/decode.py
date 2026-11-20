@@ -395,12 +395,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
-        # In-transfer reqs never verify, so the spec scratch needs one row per
-        # verify-batch row. Eager warmup, MLP sync and CUDA graphs pad that batch
-        # past `size`, and some writers (Qwen4-Exp PLE side states, positional
-        # conv tapes) index the scratch by padded row without clamping it.
-        # ReplaySSM-spec rings (GDN, KDA's request ring) and PP-spec stable rows
-        # index by req_pool_idx, so they also keep the in-transfer slots.
+        # In-transfer reqs never verify, so the scratch only needs padded verify rows;
+        # ReplaySSM-spec rings and PP-spec stable rows index it by req_pool_idx.
         mamba_spec_state_size = (
             size if max_verify_batch_size is None else max_verify_batch_size
         )
