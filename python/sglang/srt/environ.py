@@ -2490,16 +2490,6 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
-    # Extends of at least this many tokens keep the residual token-sharded over TP
-    # (reduce-scatter + all-gather instead of all-reduce, norms on 1/TP rows); 0
-    # disables. Left unset, it applies only where it is validated (TP2, TP MoE) and
-    # stays off elsewhere; set explicitly, unsupported configs raise.
-    SGLANG_OPT_MINIMAX_M3_PREFILL_SP_MIN_TOKENS = EnvInt(4096)
-    # Under that SP layout at TP2, move the rows through symmetric memory instead of NCCL.
-    SGLANG_OPT_MINIMAX_M3_PREFILL_SP_SYMM_COMM = EnvBool(True)
-    # With those symmetric-memory moves, gather the attention input as MXFP8
-    # (fused add + norm + quantize on this rank's rows) instead of bf16.
-    SGLANG_OPT_MINIMAX_M3_PREFILL_SP_MXFP8_GATHER = EnvBool(True)
 
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Share one index top-k across every N sparse layers; 1 (default) disables

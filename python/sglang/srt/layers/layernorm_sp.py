@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device
 
@@ -66,11 +66,12 @@ SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
-# Enabled by SGLANG_OPT_MINIMAX_M3_PREFILL_SP_MIN_TOKENS, not --enable-layernorm-sp:
-# large extends only, with the TP-sharded MoE run on the gathered sequence.
+# Enabled where validated, not by --enable-layernorm-sp: extends of at least
+# MINIMAX_M3_SP_MIN_TOKENS only, with the TP-sharded MoE run on the gathered sequence.
 MINIMAX_M3_SP_ARCHITECTURES = frozenset(
     {"MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"}
 )
+MINIMAX_M3_SP_MIN_TOKENS = 4096
 
 
 def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
@@ -100,28 +101,22 @@ def initialize_layernorm_sp(*, model_config) -> None:
 
 
 def _minimax_m3_sp_min_tokens(architecture: Optional[str]) -> int:
-    """The SP threshold for an M3 model, or 0 for off. Unset, the default
-    threshold applies only to the validated TP2 setups (TP MoE, or MegaMoE
-    over the TP ranks); an explicit value
-    rejects configurations SP cannot serve instead of silently ignoring them."""
-    from sglang.srt.environ import envs
-
-    env = envs.SGLANG_OPT_MINIMAX_M3_PREFILL_SP_MIN_TOKENS
-    min_tokens = env.get()
-    if min_tokens <= 0 or architecture not in MINIMAX_M3_SP_ARCHITECTURES:
+    """The SP threshold for an M3 model, or 0 for off: on only for the validated
+    CUDA TP2 setups (TP MoE, or MegaMoE over the TP ranks)."""
+    if architecture not in MINIMAX_M3_SP_ARCHITECTURES:
         return 0
-    reason = _minimax_m3_sp_unsupported(min_tokens, explicit=env.is_set())
-    if reason is None:
-        return min_tokens
-    if env.is_set():
-        raise ValueError(f"SGLANG_OPT_MINIMAX_M3_PREFILL_SP_MIN_TOKENS: {reason}")
-    return 0
+    if _minimax_m3_sp_unsupported(MINIMAX_M3_SP_MIN_TOKENS) is not None:
+        return 0
+    return MINIMAX_M3_SP_MIN_TOKENS
 
 
-def _minimax_m3_sp_unsupported(min_tokens: int, *, explicit: bool) -> Optional[str]:
+def _minimax_m3_sp_unsupported(min_tokens: int) -> Optional[str]:
     from sglang.srt.layers.layer_boundary import FUSE_ALLREDUCE_MAX_BATCH_SIZE
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
+    # The push comm is CUDA symmetric memory, and the fallback gathers bf16 tensors.
+    if not is_cuda():
+        return "requires CUDA"
     parallel = get_parallel()
     # The published config, not get_moe_a2a_backend(): the MoE flags are
     # seeded after this runs and would read as the "none" default here.
@@ -143,9 +138,9 @@ def _minimax_m3_sp_unsupported(min_tokens: int, *, explicit: bool) -> Optional[s
             "backend other than MegaMoE over the TP ranks"
         )
     # Above two ranks the reduce-scatter sums in a different order than the
-    # all-reduce, so the default stays on the setup measured bitwise-identical.
-    if not explicit and parallel.tp_size != 2:
-        return "the default applies to TP2 only"
+    # all-reduce; TP2 is the setup measured bitwise-identical.
+    if parallel.tp_size != 2:
+        return "requires TP2"
     # A breakable graph captures the whole forward, logits included, so each
     # bucket decides SP once from its padded size; other captured backends do not.
     backend = get_exec().graph.cuda_graph_config.prefill.backend
@@ -509,21 +504,16 @@ def take_partial_sink(like: torch.Tensor) -> Optional[torch.Tensor]:
 def _init_push_comm(*, hidden: int, min_tokens: int) -> None:
     """Allocate the TP2 symmetric-memory comm at startup, before the KV pool is
     sized, at the largest prefill the server admits; skipped when that is below
-    the SP threshold or the toggle is off."""
+    the SP threshold."""
     from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
         recommended_max_tokens,
     )
-    from sglang.srt.environ import envs
 
     tp_group = get_parallel().tp_group
     max_tokens = ceil_align(
         recommended_max_tokens(include_prefill=True, floor=_max_prefill_bucket()), 2
     )
-    if (
-        tp_group.world_size != 2
-        or max_tokens < min_tokens
-        or not envs.SGLANG_OPT_MINIMAX_M3_PREFILL_SP_SYMM_COMM.get()
-    ):
+    if tp_group.world_size != 2 or max_tokens < min_tokens:
         return
     get_resources().layernorm_sp_push_comm = _PushComm(
         group=tp_group,
@@ -531,8 +521,7 @@ def _init_push_comm(*, hidden: int, min_tokens: int) -> None:
         hidden=hidden,
         dtype=torch.bfloat16,
         device=torch.device("cuda", torch.cuda.current_device()),
-        gather_mxfp8=hidden % 128 == 0
-        and envs.SGLANG_OPT_MINIMAX_M3_PREFILL_SP_MXFP8_GATHER.get(),
+        gather_mxfp8=hidden % 128 == 0,
     )
 
 
