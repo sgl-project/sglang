@@ -558,6 +558,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         disagg_prefill_transfer_queue=IndexedReqList(ListKind.PD_SENDING),
         prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         checkpoint_disagg_prefill=Mock(),
+        _early_sent_transfer_running=Mock(return_value=False),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
