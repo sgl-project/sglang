@@ -47,6 +47,8 @@ def supported_hardware() -> bool:
 @cache_once
 def build() -> Module:
     """Compile and load the kernel, raising if the toolchain cannot."""
+    if not supported_hardware():
+        raise RuntimeError("moe_route_radix4 targets gfx942/gfx950 (wave64, GFX9 DPP)")
     return load_jit(
         "moe_route_radix4",
         cuda_files=["moe/route_radix4_hip.cuh"],
@@ -188,7 +190,7 @@ def route_radix4_with_sort(
     long as it is registered. A given moe_buf ([M, D] packed bf16, D a
     multiple of 8) is zeroed in the same launch, and aux records it. Rows at or
     past num_token_non_padded come out as expert 0 with weight 0, which is what
-    select_experts masks CUDA-graph padding rows to on HIP.
+    select_experts masks CUDA-graph padding rows to on HIP. M is 1 to 1024.
     """
     M = scores.shape[0]
     device = scores.device

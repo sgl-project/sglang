@@ -524,8 +524,10 @@ def test_fused_sort_matches_route_and_layout(m, block_m):
 # (12, 7) sorts in the last CTA. Past 64 tokens every padding row sends all 16
 # routes to expert 0, which the tail's one-route-per-token ranking cannot see, so
 # they are placed separately: none, one, a whole tail chunk, and all but one.
+# A negative count is every row padded.
 @pytest.mark.parametrize(
-    "m, n_real", [(12, 7), (80, 80), (80, 79), (80, 61), (300, 1), (300, 0)]
+    "m, n_real",
+    [(12, 7), (80, 80), (80, 79), (80, 61), (300, 1), (300, 0), (80, -1000), (300, -1)],
 )
 def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
     """select_experts masks CUDA-graph padding rows to expert 0 and weight 0 in
@@ -537,8 +539,8 @@ def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
     non_padded = torch.tensor(n_real, dtype=torch.int32, device="cuda")
 
     ref_w, ref_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
-    ref_ids[n_real:] = 0
-    ref_w[n_real:] = 0.0
+    ref_ids[max(n_real, 0) :] = 0
+    ref_w[max(n_real, 0) :] = 0.0
     w, ids, aux = moe_route_radix4.route_radix4_with_sort(
         scores,
         bias,
@@ -722,6 +724,16 @@ def test_fused_sort_rejects_a_moe_buf_it_cannot_zero():
         )
 
 
+def test_fused_sort_rejects_an_empty_batch():
+    """An empty batch would leave num_valid_ids unset, so it has to fail."""
+    scores = torch.empty((0, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(Exception):
+        moe_route_radix4.route_radix4_with_sort(
+            scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+        )
+
+
 def test_fused_sort_aux_pins_the_addresses_it_matches_on():
     """AITER pairs a registered sort with fused_moe by the topk and output
     addresses, so while aux lives no other tensor may be handed those addresses;
@@ -740,6 +752,11 @@ def test_fused_sort_aux_pins_the_addresses_it_matches_on():
         block_m=BM,
         moe_buf=moe_buf,
     )
+    assert aux["topk_ids"] is ids and aux["topk_weights"] is w
+    assert aux["moe_buf"] is moe_buf
+    assert aux["topk_ids_ptr"] == ids.data_ptr()
+    assert aux["topk_weights_ptr"] == w.data_ptr()
+    assert aux["moe_buf_ptr"] == moe_buf.data_ptr()
     del w, ids, moe_buf
     later = [
         torch.empty((m, TOPK), dtype=torch.int32, device="cuda"),
@@ -813,10 +830,21 @@ def test_aiter_ignores_fused_sort_for_another_moe_call():
 # The K3 activation modes AITER's SiTUv2 MoE runs (aiter.fused_moe's
 # resolve_activation_dtype reads these at every call).
 _SITU_MODES = {
-    "a16w4": {},
-    "a8w4": {"AITER_SITUV2_A8W4": "1"},
-    "a4w4": {"AITER_SITUV2_A4W4": "1"},
+    "a16w4": {"AITER_SITUV2_A8W4": "0", "AITER_SITUV2_A4W4": "0"},
+    "a8w4": {"AITER_SITUV2_A8W4": "1", "AITER_SITUV2_A4W4": "0"},
+    "a4w4": {"AITER_SITUV2_A8W4": "0", "AITER_SITUV2_A4W4": "1"},
 }
+
+
+def _assert_activation_dtype(q_dtype_a, mode):
+    from aiter import dtypes
+
+    if mode == "a8w4":
+        assert q_dtype_a == dtypes.fp8
+    elif mode == "a4w4":
+        assert q_dtype_a == dtypes.fp4x2
+    else:
+        assert q_dtype_a not in (dtypes.fp8, dtypes.fp4x2)
 
 
 def _requires_route_sort_aiter():
@@ -901,6 +929,7 @@ def test_aiter_route_sort_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
     seen[0].apply_defaults()
     ours.apply_defaults()
     assert ours.arguments == seen[0].arguments
+    _assert_activation_dtype(ours.arguments["q_dtype_a"], mode)
 
 
 @pytest.mark.parametrize("mode", list(_SITU_MODES))
@@ -939,6 +968,7 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
             1, mode, "meta", num_experts=NUM_EXPERTS, model_dim=MODEL_DIM, inter_dim=384
         )
     )
+    _assert_activation_dtype(consumer.cfg_args(1)["q_dtype_a"], mode)
     config = TopKConfig(
         top_k=TOPK,
         use_grouped_topk=True,

@@ -565,8 +565,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     __syncthreads();
     if (tid == 0) {
       const int ticket = atomicAdd(tail_arrival, 1);
-      // Only the last tail_ctas arrivals wait, and only for CTAs that have already
-      // taken a ticket, so waiting cannot keep any CTA of the grid from running.
+      // Only the last tail_ctas arrivals wait, for the fewer than tail_ctas CTAs still to arrive, so the wait
+      // needs tail_ctas (<= 32) co-resident CTAs, far below any GPU partition (see kRadix4MaxTailCtas).
       if (ticket >= first_helper && ticket != M - 1)
         while (__hip_atomic_load(tail_arrival, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < M)
           __builtin_amdgcn_s_sleep(1);
@@ -777,8 +777,8 @@ struct RouteRadix4SortKernel {
     CHECK_HOST(S_.unwrap() % block_m == 0 && S_.unwrap() / block_m <= sorted_expert_ids.size(0))
         << "sorted rows must hold whole BM blocks, one expert id each";
 
+    CHECK_HOST(M_.unwrap() > 0) << "route_radix4_with_sort needs at least one token";
     const auto M = static_cast<uint32_t>(M_.unwrap());
-    if (M == 0) return;
     // The kernel writes these without bounds checks; sizes mirror _sorted_capacity.
     const int64_t routes = static_cast<int64_t>(M) * kRadix4TopK;
     const int64_t active = routes < kRadix4NumExperts ? routes : kRadix4NumExperts;
