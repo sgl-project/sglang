@@ -747,21 +747,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        binding = getattr(self.draft_runner, "ascend_binding", None)
-        chain = None
-        if binding is not None and not forward_batch.forward_mode.is_idle():
-            from sglang.kernels.plugin_kernels.npu.spec import DraftLoopIO
-
-            chain = binding.draft_loop(
-                DraftLoopIO(
-                    batch,
-                    forward_batch,
-                    self.draft_attn_backend.attn_backends[0],
-                    self.hot_token_id,
-                )
-            )
         with canary_outside_ctx:
-            # Run draft
+            chain = self.draft_runtime.propose_chain(batch, forward_batch)
             if chain is not None:
                 parent_list = self._topk1_parents_prealloc[:1]
                 top_scores_index = self._topk1_score_indices_prealloc[:1]
@@ -1244,12 +1231,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         iteration_ids: Optional[IterationIds] = None,
     ):
         self.draft_runtime.note_draft_extend()
-        binding = getattr(self.draft_runner, "ascend_binding", None)
-        fused = (
-            binding is not None
-            and not batch.forward_mode.is_idle()
-            and binding.plan_extend(batch, batch_result, self.hot_token_id)
-        )
+        run_fused = self.draft_runtime.plan_fused_extend(batch, batch_result)
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:
@@ -1306,7 +1288,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
-                skip_native_metadata=fused,
+                skip_native_metadata=run_fused is not None,
                 iteration_ids=iteration_ids,
             )
 
@@ -1315,17 +1297,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.plan_stream
             )
 
-        if fused:
-            backend = self.draft_extend_attn_backend or self.draft_runner.attn_backend
-            with forward_context(
-                ForwardContext(attn_backend=backend), forward_batch=forward_batch
-            ):
-                binding.run_extend(
-                    batch,
-                    forward_batch,
-                    select_index,
-                    batch_result.next_draft_input,
-                )
+        if run_fused is not None:
+            run_fused(batch, forward_batch, select_index, batch_result.next_draft_input)
             return
 
         # Run draft extend batch in the main compute stream

@@ -14,24 +14,47 @@ class PreparationView:
 
 @dataclass(frozen=True)
 class DraftLoopIO:
-    batch: Any
     forward_batch: Any
-    attention_backend: Any
-    hot_token_id: Any
+    input_ids: Any
+    positions: Any
+    previous_hidden_states: Any
+    per_step_out_cache_loc: Any
 
 
-class NpuBinding(Protocol):
+@dataclass(frozen=True)
+class DraftExtendIO:
+    forward_batch: Any
+    select_index: Any
+
+
+@dataclass(frozen=True)
+class DraftExtendOutput:
+    token_ids: Any
+    first_hidden_states: Any
+
+
+class DraftExecutor(Protocol):
+    """One invocation per admitted phase. Graph outputs may be borrowed."""
+
+    def covers(self, phase: Literal["decode", "extend"], batch: Any) -> bool: ...
+    def execute_decode(self, io: DraftLoopIO) -> Any: ...
+    def execute_extend(self, io: DraftExtendIO) -> DraftExtendOutput: ...
+
+
+class NpuBinding(DraftExecutor, Protocol):
     role: str
     mode: str
+    pd_decode: bool
+
+    def hit(self, route: str) -> None: ...
 
     def build(self, model: Any) -> None: ...
     def target_supported(self, batch: Any, embeds: Any, proxy: Any) -> bool: ...
     def run_target(self, batch: Any) -> Any: ...
-    def draft_loop(self, io: DraftLoopIO) -> Any: ...
-    def plan_extend(self, batch: Any, result: Any, hot_token_id: Any) -> bool: ...
-    def run_extend(
-        self, batch: Any, forward_batch: Any, select: Any, next_input: Any
-    ) -> None: ...
+    def supports_decode(
+        self, batch: Any, forward_batch: Any, hot_token_id: Any
+    ) -> bool: ...
+    def supports_extend(self, batch: Any, result: Any, hot_token_id: Any) -> bool: ...
 
 
 @dataclass(frozen=True)
