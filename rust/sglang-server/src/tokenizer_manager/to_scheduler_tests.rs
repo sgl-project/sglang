@@ -1394,6 +1394,7 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
         req.state
     );
     if let RequestKind::Generate(g) = &mut req.kind {
+        g.mm = None;
         g.input_ids = Some(input_ids);
         g.mm_buffers = buffers;
     }
@@ -1565,6 +1566,85 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
         4,
         "expanded ids ride the input_ids buffer"
     );
+}
+
+/// A request that asks for its prompt ids finds the final (expanded) ids in
+/// its slot once pushed to the scheduler, or once back from the mm pool after
+/// an abort, which then reports them; none are left before, or for a request
+/// that did not ask.
+#[test]
+fn requested_prompt_ids_are_left_once_final() {
+    for (requested, aborted) in [(false, false), (true, false), (true, true)] {
+        let case = format!("requested={requested} aborted={aborted}");
+        let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+        let mut req = mm_pretokenized_req("mm-ids");
+        let slot = requested.then(crate::message::request::PromptTokenIdsSlot::default);
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.prompt_token_ids = slot.clone();
+        }
+        intake.drive(req);
+        let mut req = mm_rx.try_recv().expect("mm pool must receive the request");
+        assert!(
+            slot.as_ref().is_none_or(|slot| slot.get().is_none()),
+            "{case}"
+        );
+        if aborted {
+            intake.on_abort(AbortSource::Guard("mm-ids".to_string().into()));
+        }
+        encode_like_worker(&mut req, vec![5, 6, 7, 8], Vec::new());
+        intake.drive(req);
+
+        assert_eq!(consumer.drain(16).len(), usize::from(!aborted), "{case}");
+        if let Some(slot) = slot {
+            assert_eq!(
+                slot.get().map(|ids| &ids[..]),
+                Some(&[5, 6, 7, 8][..]),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A text prompt's ids from the tokenizer pool are final once intake has
+/// fitted them to the context: they are left as it pushes the request, or as
+/// it drops one aborted while in the pool, truncated under auto-truncation.
+#[test]
+fn tokenizer_pool_return_leaves_fitted_prompt_ids() {
+    for (aborted, truncating) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("aborted={aborted} truncating={truncating}");
+        let (mut intake, tok_rx, _mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(false);
+        if truncating {
+            intake.limits.context_len = 2;
+            intake.limits.allow_auto_truncate = true;
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        let slot = crate::message::request::PromptTokenIdsSlot::default();
+        intake.drive(Request {
+            rid: "text-ids".to_string().into(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: "text-ids".to_string().into(),
+                text: Some("hi".into()),
+                prompt_token_ids: Some(slot.clone()),
+                ..Default::default()
+            })),
+        });
+        let mut req = tok_rx.try_recv().expect("text goes to the tokenizer pool");
+        if aborted {
+            intake.on_abort(AbortSource::Guard("text-ids".to_string().into()));
+        }
+        // The pool fills the ids and advances the FSM, as `TokenizerWorker` does.
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![7, 1, 8]);
+        }
+        req.state.apply(Event::TokenizeDone).unwrap();
+        intake.drive(req);
+
+        assert_eq!(consumer.drain(16).len(), usize::from(!aborted), "{case}");
+        let expected: &[i64] = if truncating { &[7, 1] } else { &[7, 1, 8] };
+        assert_eq!(slot.get().map(|ids| &ids[..]), Some(expected), "{case}");
+    }
 }
 
 /// A multimodal *text* prompt visits the tokenizer pool first

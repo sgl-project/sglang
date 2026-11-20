@@ -3,7 +3,7 @@
 
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -27,8 +27,7 @@ use super::frontend_state::FrontendState;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
-    AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight,
-    RequestLog,
+    AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, RequestLog,
 };
 
 /// How long the listeners keep open connections after a drain's requests
@@ -186,24 +185,8 @@ pub(super) struct CoreInner {
     /// Relayed aborts in flight at once, across every abort (see
     /// [`CoreHandle::abort_peers`]).
     pub(super) peer_abort_permits: tokio::sync::Semaphore,
-    /// Requests this listener relayed to another DP rank's listener and has
-    /// not finished answering (see [`CoreHandle::track_relayed`]).
-    pub(super) relayed: AtomicUsize,
     /// The pause flag and the model-facts cache; see `frontend_state`.
     pub(super) frontend: FrontendState,
-}
-
-/// A request relayed to another DP rank's listener, counted until dropped
-/// (see [`CoreHandle::track_relayed`]).
-pub(crate) struct RelayedRequest {
-    core: CoreHandle,
-    _in_flight: InFlight,
-}
-
-impl Drop for RelayedRequest {
-    fn drop(&mut self) {
-        self.core.inner.relayed.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 impl CoreHandle {
@@ -237,7 +220,6 @@ impl CoreHandle {
                 drain: Arc::default(),
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
-                relayed: AtomicUsize::new(0),
                 frontend: FrontendState::new(&metadata),
                 metadata,
             }),
@@ -288,11 +270,6 @@ impl CoreHandle {
         self.inner.metrics.as_ref()
     }
 
-    /// The DP rank the local scheduler answers for.
-    pub(crate) fn dp_rank(&self) -> RankId {
-        self.inner.dp_rank
-    }
-
     /// Record successful completion of the startup warmup. The state is
     /// shared by every transport.
     pub(crate) fn mark_ready(&self) {
@@ -313,17 +290,6 @@ impl CoreHandle {
 
     pub(crate) fn is_draining(&self) -> bool {
         self.inner.drain.is_draining()
-    }
-
-    /// Count a request this listener relayed to another DP rank's listener
-    /// until the guard drops: the drain waits for it, and `/abort_request`
-    /// here reaches the other ranks meanwhile (see [`CoreHandle::abort_peers`]).
-    pub(crate) fn track_relayed(&self) -> RelayedRequest {
-        self.inner.relayed.fetch_add(1, Ordering::SeqCst);
-        RelayedRequest {
-            core: self.clone(),
-            _in_flight: self.inner.drain.track(),
-        }
     }
 
     /// Whether the drain was begun forced (see [`DrainState::is_forced`]).

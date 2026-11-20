@@ -2186,6 +2186,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            input_candidate_selectors=forward_batch.input_candidate_selectors,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
