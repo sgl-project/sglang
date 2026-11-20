@@ -3921,9 +3921,12 @@ class Scheduler(
         # at intake without being queued sends it in the call that built it.
         self.invariant_checker.expect_output(req)
         if (
-            bench_drafter_enabled()
-            and self.spec_algorithm.is_dflash_family()
+            self.spec_algorithm.is_dflash_family()
+            # One already refused at intake keeps its own error and status.
+            and not req.finished()
+            and req.to_finish is None
             and req.sampling_params.top_k != 1
+            and bench_drafter_enabled()
         ):
             self._reject_bad_request(req, GREEDY_REQUEST_ERROR)
             return

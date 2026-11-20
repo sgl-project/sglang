@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
 from sglang.srt.speculative.bench_drafter import (
     bench_drafter_temperature,
     require_greedy_requests,
@@ -654,16 +655,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _check_bench_drafter_temperature(self) -> None:
-        """Refuse SGLANG_BENCH_DRAFTER_TEMPERATURE outside the fixed-work benchmark.
-
-        Runs before anything reads ``self._greedy_draft``: the benchmark temperature
-        overrides SGLANG_DSPARK_USE_GREEDY_DRAFT."""
+        """SGLANG_BENCH_DRAFTER_TEMPERATURE overrides SGLANG_DSPARK_USE_GREEDY_DRAFT; runs
+        before anything reads ``self._greedy_draft``. The env-only preconditions
+        (simulated acceptance, static verify) are checked with the server args."""
         temperature = bench_drafter_temperature()
         if temperature <= 0.0:
             return
-        name = "SGLANG_BENCH_DRAFTER_TEMPERATURE"
-        if not 0 < self._simulate_acc_len < float("inf"):
-            raise ValueError(f"{name} requires a finite SGLANG_SIMULATE_ACC_LEN > 0.")
         if self._greedy_draft:
             # The benchmark asks for sampled drafts; an argmax draft would undo it.
             self._greedy_draft = False
@@ -671,15 +668,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 logger.warning(
                     "%s overrides SGLANG_DSPARK_USE_GREEDY_DRAFT: draft rows sample "
                     "at the benchmark temperature instead of taking the argmax.",
-                    name,
+                    BENCH_DRAFTER_ENV,
                 )
-        if self._verify_planner.mode_value != "static":
-            raise ValueError(f"{name} requires SGLANG_RAGGED_VERIFY_MODE=static.")
-        if self._acceptance_estimator is not None:
-            raise ValueError(
-                f"{name} does not support the online acceptance estimator, which "
-                "scores the draft step logits."
-            )
         if self._target_tp_rank == 0:
             logger.warning(
                 "BENCHMARK: DSpark drafts sample at temperature %s; acceptance is "

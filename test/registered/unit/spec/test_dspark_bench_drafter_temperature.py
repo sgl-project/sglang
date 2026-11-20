@@ -158,23 +158,10 @@ class TestWorkerGuard(_BenchTemperature):
         self._check(worker, "0")
         self.assertTrue(worker._greedy_draft)
 
-    def test_requires_positive_finite_simulated_acceptance_length(self):
-        for length in (-1, 0, float("-inf"), float("inf"), float("nan")):
-            with self.subTest(length=length):
-                with self.assertRaisesRegex(ValueError, "SGLANG_SIMULATE_ACC_LEN"):
-                    self._check(_worker(_simulate_acc_len=length))
-
-    def test_rejects_unsupported_configs(self):
-        cases = {
-            "SGLANG_RAGGED_VERIFY_MODE": _worker(
-                _verify_planner=SimpleNamespace(mode_value="compact")
-            ),
-            "online acceptance estimator": _worker(_acceptance_estimator=object()),
-        }
-        for reason, worker in cases.items():
-            with self.subTest(reason=reason):
-                with self.assertRaisesRegex(ValueError, reason):
-                    self._check(worker)
+    def test_env_preconditions_are_checked_with_the_server_args(self):
+        # Simulated acceptance and static verify are refused before weights load
+        # (test_bench_drafter_temperature.py), so the worker check accepts them.
+        self._check(_worker(_simulate_acc_len=-1))
 
 
 if __name__ == "__main__":

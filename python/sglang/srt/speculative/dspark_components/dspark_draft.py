@@ -21,7 +21,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
+from sglang.srt.speculative.bench_drafter import (
+    bench_drafter_enabled,
+    bench_drafter_temperature,
+    bench_noise_key,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -381,8 +385,12 @@ class DraftBlockProposer:
         self._tp_sync = tp_sync
         self._greedy_draft = greedy_draft
         self._sharded_accept = sharded_accept
+        noise_key = draft_noise_key(random_seed)
+        if bench_drafter_enabled():
+            # Every row draws at the benchmark temperature: keep DP groups apart.
+            noise_key = bench_noise_key(noise_key)
         self._noise = DraftNoise(
-            key=draft_noise_key(random_seed),
+            key=noise_key,
             offset=torch.zeros(
                 1, dtype=torch.int64, device=self.draft_model_runner.device
             ),

@@ -70,7 +70,36 @@ def _handle_pd_request(mode, req):
     return abort, scheduler._add_request_to_queue, make_req
 
 
+def _bench_req(params, to_finish=None):
+    return SimpleNamespace(
+        sampling_params=params, to_finish=to_finish, finished=lambda: False
+    )
+
+
 class TestBenchDrafterRequestAdmission(CustomTestCase):
+    def test_other_servers_never_read_the_variable(self):
+        # A malformed value must not reach a server without a DFLASH-family drafter.
+        self.addCleanup(bench_drafter_temperature.cache_clear)
+        for algorithm in (SpeculativeAlgorithm.NONE, SpeculativeAlgorithm.EAGLE):
+            with self.subTest(algorithm=algorithm):
+                scheduler = MagicMock(spec_algorithm=algorithm)
+                scheduler._set_or_validate_priority.return_value = False
+                req = _bench_req(SamplingParams(temperature=0.7))
+                with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override(-1):
+                    bench_drafter_temperature.cache_clear()
+                    Scheduler._add_request_to_queue(scheduler, req)
+                scheduler._reject_bad_request.assert_not_called()
+
+    def test_a_request_refused_at_intake_keeps_its_error(self):
+        self.addCleanup(bench_drafter_temperature.cache_clear)
+        scheduler = MagicMock(spec_algorithm=SpeculativeAlgorithm.DFLASH)
+        scheduler._set_or_validate_priority.return_value = False
+        req = _bench_req(SamplingParams(temperature=0.7), to_finish=object())
+        with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override(1000):
+            bench_drafter_temperature.cache_clear()
+            Scheduler._add_request_to_queue(scheduler, req)
+        scheduler._reject_bad_request.assert_not_called()
+
     def test_sampling_request_is_rejected_before_batching(self):
         self.addCleanup(bench_drafter_temperature.cache_clear)
         for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
@@ -85,7 +114,7 @@ class TestBenchDrafterRequestAdmission(CustomTestCase):
                 ):
                     scheduler = MagicMock(spec_algorithm=algorithm)
                     scheduler._set_or_validate_priority.return_value = False
-                    req = SimpleNamespace(sampling_params=params)
+                    req = _bench_req(params)
                     with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override(temperature):
                         bench_drafter_temperature.cache_clear()
                         Scheduler._add_request_to_queue(scheduler, req)
