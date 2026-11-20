@@ -3,7 +3,6 @@ import random
 import unittest
 
 import requests
-
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
 from sglang.test.kl_multiturn_utils import (
@@ -47,7 +46,9 @@ class TestGLM52MXFP4DCP4MTPHiCache(DsaMtpServerBase, UnifiedRadixTreeTestMixin):
         make_mamba_prefill_assert(chunk_size=WIDENED_PAGE)
     )
     decode_cache_assert = staticmethod(
-        make_mamba_decode_assert(track_interval=WIDENED_PAGE)
+        make_mamba_decode_assert(
+            track_interval=WIDENED_PAGE, max_checkpoint_lag=WIDENED_PAGE
+        )
     )
     extra_server_args = DCP_ARGS + [
         "--enable-hierarchical-cache",
