@@ -721,11 +721,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
+        # A rank-local eager fallback can deadlock draft MoE collectives
+        # across attention-DP ranks.
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
+            and not get_parallel().enable_dp_attention
         ):
             can_run_decode_cuda_graph = False
         self.draft_runtime.begin_draft_round(
