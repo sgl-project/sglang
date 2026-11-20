@@ -40,8 +40,8 @@ RUN apt-get update \
 # The source is bind-mounted, not copied: each job installs its own checkout, so
 # baking one in would only go stale. The build has no GPU, so GDRCopy is forced
 # and a libcuda stub lets verify_imports load deep_ep.
-# Group 0 gets owner rights so a job running as a non-root UID in group 0 can
-# update the environment; done in the same step to avoid a second copy of it.
+# The job user owns the environment, and group 0 gets the same rights for a
+# runner that picks another UID; done in the same step to avoid a second copy.
 RUN --mount=type=bind,source=.,target=/sgl-src,rw \
     mkdir -p /tmp/cuda-stub \
     && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stub/libcuda.so.1 \
@@ -51,6 +51,11 @@ RUN --mount=type=bind,source=.,target=/sgl-src,rw \
     && : > /opt/sglang-ci-py3.12/env.sh \
     && rm -rf /tmp/cuda-stub "${XDG_CACHE_HOME}/uv" /root/.cache "${SGLANG_CACHE_DIR}" \
     && mkdir -p "${SGLANG_CACHE_DIR}" \
-    && chgrp -R 0 /opt/sglang-ci /opt/sglang-ci-py3.12 \
+    && chown -R 1001:0 /opt/sglang-ci /opt/sglang-ci-py3.12 \
     && chmod -R g=u /opt/sglang-ci /opt/sglang-ci-py3.12 \
     && chmod g+w /opt
+
+# UID 1001 is ARC's default runner UID and owns the runners' model cache. Its
+# primary group is 0, not its own, so it also keeps group 0's rights.
+RUN useradd --uid 1001 --gid 0 --create-home --shell /bin/bash runner
+USER 1001
