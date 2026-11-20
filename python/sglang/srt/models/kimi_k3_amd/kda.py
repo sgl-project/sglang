@@ -125,12 +125,21 @@ def build_fused_verify_hip(
     layer: RadixLinearAttention,
     use_full_rank_gate: bool,
     state_dtype: torch.dtype,
+    activation_dtype: torch.dtype,
 ) -> Optional[KimiK3HipFusedVerify]:
     """The AITER fused KDA verify hook over the fused decode's static inputs
     (``layer._k3_hip_fused_decode_args``), warmed for this server's draft-token
     count; None when the kernel cannot cover this layer or server."""
     # Only the full-rank gate projection can hand f_a over unprojected.
     if not use_full_rank_gate:
+        return None
+    # The kernel and the hook's unfused f_b GEMM take BF16 f_a; a Quark FP8 f_b arms its
+    # BF16 copy under any activation dtype (--dtype float16).
+    if activation_dtype != torch.bfloat16:
+        print_warning_once(
+            "Kimi-K3 fused KDA verify stays off: it takes BF16 activations, "
+            f"the model runs {activation_dtype}; verify runs the Triton chain"
+        )
         return None
     if (get_spec().speculative_eagle_topk or 1) > 1:
         print_warning_once(
@@ -267,4 +276,5 @@ def prepare_fused_kda_hip(attention: KimiK3DeltaAttention) -> None:
                 layer=layer,
                 use_full_rank_gate=attention.use_full_rank_gate,
                 state_dtype=state_dtype,
+                activation_dtype=attention.o_norm.weight.dtype,
             )

@@ -182,7 +182,7 @@ def _armable_hip_attention() -> SimpleNamespace:
         f_b_proj=SimpleNamespace(weight=f_b_weight),
         use_full_rank_gate=True,
         _fused_decode_f_b_weight=lambda: f_b_weight,
-        o_norm=SimpleNamespace(weight=torch.ones(dim), eps=1e-5),
+        o_norm=SimpleNamespace(weight=torch.ones(dim, dtype=torch.bfloat16), eps=1e-5),
         config=SimpleNamespace(
             mamba2_cache_params=SimpleNamespace(
                 dtype=SimpleNamespace(temporal=torch.bfloat16)
@@ -233,12 +233,14 @@ class TestHipFusedDecodeArming(CustomTestCase):
     def test_fused_verify_arms_only_for_supported_verify_layouts(self):
         """The fused verify covers chain verify with a slot-indexed ring only. Tree
         speculative decoding and the host-only request ring must not probe, arm or
-        warm it; an armed layer installs a hook for the warmed draft-token count."""
+        warm it; neither does a non-BF16 activation dtype. An armed layer installs a
+        hook for the warmed draft-token count."""
         decode_args = (torch.empty(12, 128, 128), None, 1e-5, None)
-        for topk, host_only, armed in (
-            (4, False, False),
-            (1, True, False),
-            (1, False, True),
+        for topk, host_only, dtype, armed in (
+            (4, False, torch.bfloat16, False),
+            (1, True, torch.bfloat16, False),
+            (1, False, torch.float16, False),
+            (1, False, torch.bfloat16, True),
         ):
             layer = SimpleNamespace(
                 conv_weights=None,
@@ -248,7 +250,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 kda_fused_verify=None,
             )
             with (
-                self.subTest(topk=topk, host_only=host_only),
+                self.subTest(topk=topk, host_only=host_only, dtype=dtype),
                 get_context().override_server_args(
                     speculative_num_draft_tokens=5,
                     speculative_eagle_topk=topk,
@@ -263,7 +265,10 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 mock.patch.object(kimi_k3_kda_hip, "print_warning_once") as warn,
             ):
                 hook = build_fused_verify_hip(
-                    layer=layer, use_full_rank_gate=True, state_dtype=torch.bfloat16
+                    layer=layer,
+                    use_full_rank_gate=True,
+                    state_dtype=torch.bfloat16,
+                    activation_dtype=dtype,
                 )
                 self.assertEqual(available.called, armed)
                 self.assertEqual(warmup.called, armed)
@@ -360,6 +365,32 @@ class TestHipFusedDecodeArming(CustomTestCase):
                     verify_warmup.call_args.kwargs["replay_ring"],
                     get_exec().mamba.enable_linear_replayssm_spec,
                 )
+
+    def test_fp16_activations_leave_the_fused_verify_unarmed(self):
+        """The kernel takes BF16 f_a, but a Quark FP8 f_b arms its BF16 copy under
+        any activation dtype; --dtype float16 must keep verify on the Triton chain."""
+        attention = _armable_hip_attention()
+        attention.o_norm.weight = torch.ones(128, dtype=torch.float16)
+        with (
+            get_context().override_server_args(
+                speculative_num_draft_tokens=5,
+                speculative_eagle_topk=1,
+                linear_attn_verify_backend="aiter",
+            ),
+            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            mock.patch.object(
+                kda_fused_decode_aiter_hip, "available", return_value=True
+            ),
+            mock.patch.object(kda_fused_decode_aiter_hip, "warmup"),
+            mock.patch.object(
+                kda_fused_verify_aiter_hip, "available", return_value=True
+            ),
+            mock.patch.object(kda_fused_verify_aiter_hip, "warmup"),
+            mock.patch.object(kimi_k3_kda_hip, "print_warning_once"),
+        ):
+            prepare_fused_kda_hip(attention)
+
+        self.assertIsNone(attention.attn.kda_fused_verify)
 
     def test_block_fp8_f_b_arms_from_the_merged_bf16_copy(self):
         """A block-FP8 f_b_proj holds FP8 with no Quark scheme; the fused decode must
