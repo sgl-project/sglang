@@ -41,7 +41,11 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
-from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS, load_image
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    load_image,
+    smart_to_rgb,
+)
 from sglang.srt.multimodal.modality import Modality
 
 
@@ -156,14 +160,22 @@ class MediaArtifactCacheMixin:
             return torch.from_numpy(data)
         if isinstance(data, Image.Image):
             data.load()
-            return data
+            return self._ensure_rgb_image(data)
         try:
             image, _ = load_image(data, self.gpu_image_decode)
             if isinstance(image, Image.Image):
                 image.load()
         except CLIENT_MEDIA_EXCEPTIONS as e:
             raise ValueError(f"Could not load image: {e}") from e
-        return image
+        return self._ensure_rgb_image(image)
+
+    def _ensure_rgb_image(self, image: Any) -> Any:
+        """Match the default legacy loader RGB conversion before processing."""
+        if not isinstance(image, Image.Image) or image.mode == "RGB":
+            return image
+        if getattr(self, "smart_rgb_conversion", False):
+            return smart_to_rgb(image)
+        return image.convert("RGB")
 
     def snapshot_media_source(self, source: Any, modality: Modality) -> MediaSnapshot:
         """Capture immutable media content before decode and preprocessing.

@@ -106,6 +106,38 @@ class TestMediaArtifactProcessor(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Could not decode image"):
             snapshot_media(lazy_image)
 
+    def test_default_decoder_normalizes_non_rgb_like_the_legacy_loader(self):
+        """#44748/#26751: cache misses preserve the legacy RGB contract."""
+        from sglang.srt.multimodal.media_io import smart_to_rgb
+
+        processor = MediaArtifactCacheMixin()
+        processor.gpu_image_decode = False
+        for smart in (False, True):
+            processor.smart_rgb_conversion = smart
+            for mode in ("L", "LA", "RGBA", "P", "RGB"):
+                image = Image.new("RGBA", (8, 8), (80, 160, 240, 0)).convert(mode)
+                buf = io.BytesIO()
+                image.save(buf, format="JPEG" if mode in ("L", "RGB") else "PNG")
+                for source in (image, buf.getvalue()):
+                    with self.subTest(smart=smart, mode=mode, direct=source is image):
+                        snapshot = snapshot_media(source)
+                        digest = snapshot.content_digest
+                        actual = processor.decode_media_snapshot(
+                            snapshot, Modality.IMAGE
+                        )
+                        decoded = (
+                            image if source is image else Image.open(io.BytesIO(source))
+                        )
+                        expected = (
+                            smart_to_rgb(decoded) if smart else decoded.convert("RGB")
+                        )
+                        self.assertEqual(actual.mode, "RGB")
+                        self.assertEqual(actual.tobytes(), expected.tobytes())
+                        self.assertEqual(snapshot.content_digest, digest)
+                        self.assertEqual(image.mode, mode)
+                        if mode == "RGB" and source is image:
+                            self.assertIs(actual, snapshot.data)
+
     def test_unknown_model_option_is_part_of_artifact_identity(self):
         processor = _Processor()
         digest = snapshot_media(b"image").content_digest
