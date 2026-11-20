@@ -116,7 +116,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
             f"{label}: expected cached_tokens >= {minimum}, got {cached_tokens}",
         )
         details = meta_info.get("cached_tokens_details") or {}
-        remote_tokens = int(details.get("host", 0))
+        remote_tokens = int(details.get("storage", 0))
         self._direct_remote_tokens += remote_tokens
         if remote_tokens:
             print(f"{label}: Direct load-back confirmed for {remote_tokens} tokens")

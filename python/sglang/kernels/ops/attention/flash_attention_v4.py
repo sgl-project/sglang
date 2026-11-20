@@ -219,6 +219,7 @@ def flash_attn_varlen_func(
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
+    rel_bias_presheared: bool = False,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -273,6 +274,8 @@ def flash_attn_varlen_func(
     rel_bias_kwargs = {}
     if rel_bias is not None:
         rel_bias_kwargs["rel_bias"] = rel_bias
+        if rel_bias_presheared:
+            rel_bias_kwargs["rel_bias_presheared"] = True
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
     # The kernel writes into out, except where it pads MLA heads: its output
@@ -357,6 +360,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     mask_mod: Optional[Callable] = None,
     out: Optional[torch.Tensor] = None,
+    rel_bias_presheared: bool = False,
     **_: object,
 ):
     if k is not None or v is not None:
@@ -398,6 +402,7 @@ def flash_attn_with_kvcache(
         sfk=sfk,
         sfv=sfv,
         rel_bias=rel_bias,
+        rel_bias_presheared=rel_bias_presheared,
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
         out=out,

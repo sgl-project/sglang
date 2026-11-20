@@ -15,6 +15,7 @@
 
 import logging
 import os
+import sys
 
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import is_hip
@@ -56,3 +57,27 @@ def maybe_pre_warm_aiter_chip_info() -> None:
             logger.info("Pre-warmed aiter GPU_ARCHS=%s", gfx)
     except Exception as e:
         logger.warning("Failed to pre-warm aiter chip info: %s", e)
+
+
+def pin_aiter_hip_runtime() -> None:
+    """Bind AITER's HIP runtime handle before a NIXL agent installs UCX's hooks."""
+    # Workaround: once UCX's memory hooks wrap dlopen, AITER's load_hip_runtime()
+    # misses torch's HIP runtime by soname and loads a second one, whose LLVM aborts
+    # the process. It caches its first result, so bind it before the agent exists;
+    # drop once AITER's _loaded_hip_runtime() finds the runtime by its mapped path.
+    if not is_hip() or "aiter" not in sys.modules:
+        return
+    try:
+        import aiter.jit.utils.hip_runtime  # noqa: F401
+    except ImportError:
+        return
+    try:
+        import aiter.jit.utils.chip_info  # noqa: F401
+    except ImportError:
+        pass
+    # chip_info imports the same file as top-level `hip_runtime`, a second module
+    # with its own cache, so bind both copies.
+    for name in ("aiter.jit.utils.hip_runtime", "hip_runtime"):
+        module = sys.modules.get(name)
+        if module is not None:
+            module.load_hip_runtime()

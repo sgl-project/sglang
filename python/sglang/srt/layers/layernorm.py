@@ -190,7 +190,7 @@ if _is_npu:
     import torch_npu
 
     try:
-        from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
+        from sgl_kernel_npu.operators.norm import gemma_rmsnorm as npu_gemma_rms_norm
     except ImportError:
         # sgl-kernel-npu wheels built before the target-specific Gemma provider
         # landed expose only the torch_npu operator, which is exactly what that
@@ -294,7 +294,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
 ):
     """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
 
-    The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
+    The single-kernel quantized backend dispatch is ROCm + aiter on gfx942 and gfx95.
     Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
     the existing tuple handoff behavior.
 

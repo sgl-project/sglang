@@ -18,9 +18,16 @@ class TestXPUCanaryPipelineParallel(CanaryE2EBase):
 
     model_mode = "mha"
     kv_canary_mode = CanaryMode.LOG
-    # --disable-cuda-graph is mandatory, not tuning: install_canary refuses a captured decode
+    # --disable-decode-cuda-graph --disable-prefill-cuda-graph is mandatory, not tuning: install_canary refuses a captured decode
     # on a device that routes to the torch reference (host work and D2H, so replay checks nothing).
-    extra_server_args = ("--device", "xpu", "--disable-cuda-graph", "--pp", "2")
+    extra_server_args = (
+        "--device",
+        "xpu",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
+        "--pp",
+        "2",
+    )
     # The torch reference folds the chain slot-by-slot on the host, so the workload is much
     # smaller than the CUDA-tuned defaults on the shared base.
     default_parallel_n = 2
