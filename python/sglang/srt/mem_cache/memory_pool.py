@@ -2280,6 +2280,8 @@ def _set_mha_kv_buffer_prefix_valid(
 
 
 class MHATokenToKVPool(KVCache, MHAKVView):
+    _kv_fused: Optional[List[torch.Tensor]] = None  # per-layer [2, rows, ...] K/V
+
     def __init__(
         self,
         size: int,
@@ -2750,6 +2752,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                         ]
                         self.k_buffer = [buf[0, :rows] for buf in fused]
                         self.v_buffer = [buf[1, :rows] for buf in fused]
+                        self._kv_fused, self._kv_rows = fused, rows
                     else:
                         self.k_buffer = [_zeros(k_shape) for _ in range(self.layer_num)]
                         self.v_buffer = [_zeros(v_shape) for _ in range(self.layer_num)]
@@ -2803,6 +2806,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         """Map owner tensors (in ``_build_kv_buffer_descs`` order) to k/v_buffer."""
         self.k_buffer = tensors[: self.layer_num]
         self.v_buffer = tensors[self.layer_num :]
+        self._kv_fused = None
 
     def _alloc_post_capture_buffers(self):
         dev = torch.device(self.device)
@@ -3149,11 +3153,16 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             )
             return
 
+        k_cache, v_cache = self.k_buffer[layer_idx], self.v_buffer[layer_idx]
+        if self._kv_fused is not None and torch.compiler.is_compiling():
+            # Slice here: two pre-made views of one tensor make Inductor clone it.
+            fused = self._kv_fused[layer_idx]
+            k_cache, v_cache = fused[0, : self._kv_rows], fused[1, : self._kv_rows]
         _set_kv_buffer_impl(
             cache_k,
             cache_v,
-            self.k_buffer[layer_idx],
-            self.v_buffer[layer_idx],
+            k_cache,
+            v_cache,
             loc,
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,

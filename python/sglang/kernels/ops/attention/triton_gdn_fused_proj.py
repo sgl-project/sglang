@@ -7,6 +7,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import _gdn_gating_values
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
@@ -540,6 +541,36 @@ def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
     return True, "eligible"
 
 
+def _fused_qkvzba_causal_conv1d_update_contiguous_fake(
+    mixed_qkvz: torch.Tensor,
+    mixed_ba: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state_indices: torch.Tensor,
+    *,
+    qkv_dim: int,
+    v_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    activation: str | None,
+    pad_slot_id: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch = mixed_qkvz.shape[0]
+    b = mixed_ba.new_empty((batch, num_v_heads))
+    return (
+        mixed_qkvz.new_empty((batch, qkv_dim)),
+        mixed_qkvz.new_empty((batch, num_v_heads, head_v_dim)),
+        b,
+        torch.empty_like(b),
+    )
+
+
+# Custom op: torch.compile then mutates conv_state in place, no pool clone.
+@register_custom_op(
+    mutates_args=["conv_state"],
+    fake_impl=_fused_qkvzba_causal_conv1d_update_contiguous_fake,
+)
 def fused_qkvzba_causal_conv1d_update_contiguous(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
