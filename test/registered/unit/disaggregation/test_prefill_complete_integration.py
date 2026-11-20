@@ -544,7 +544,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(buffers.output_token_sampling_mask_len[0, 0].item(), 2)
         self.assertEqual(buffers.output_token_sampling_mask_idx[0, :2].tolist(), [4, 5])
         self.assertEqual(
-            buffers.output_token_sampling_mask_logprobs[0, :2].tolist(), [-0.5, -1.0]
+            buffers.output_sampling_mask_logprobs[0, :2].tolist(), [-0.5, -1.0]
         )
         self.assertEqual(buffers.output_token_sampling_logprobs[0, 0].item(), -0.5)
 

@@ -3060,7 +3060,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 else:
                     self.assertIsNone(buffers.output_token_sampling_mask_len)
                     self.assertIsNone(buffers.output_token_sampling_mask_idx)
-                    self.assertIsNone(buffers.output_token_sampling_mask_logprobs)
+                    self.assertIsNone(buffers.output_sampling_mask_logprobs)
                     self.assertIsNone(buffers.output_token_sampling_logprobs)
                     self.assertEqual(buffers.get_buf(0)[6:10], (None,) * 4)
         disabled_ptrs, _, disabled_sizes = schemas[0]

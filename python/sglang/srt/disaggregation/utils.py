@@ -713,7 +713,7 @@ class MetadataBuffers:
                 )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
-            self.output_token_sampling_mask_logprobs = None
+            self.output_sampling_mask_logprobs = None
             self.output_token_sampling_logprobs = None
             if self.enable_sampling_mask:
                 self.output_token_sampling_mask_len = torch.zeros(
@@ -723,7 +723,7 @@ class MetadataBuffers:
                     (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
                 )
                 # Index-aligned with output_token_sampling_mask_idx.
-                self.output_token_sampling_mask_logprobs = torch.zeros(
+                self.output_sampling_mask_logprobs = torch.zeros(
                     (size, max_sampling_mask_tokens),
                     dtype=torch.float32,
                     device=device,
@@ -800,7 +800,7 @@ class MetadataBuffers:
             self.output_customized_info_len,
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
-            self.output_token_sampling_mask_logprobs,
+            self.output_sampling_mask_logprobs,
             self.output_token_sampling_logprobs,
             self.output_topk_p,
             self.output_topk_index,
@@ -841,7 +841,7 @@ class MetadataBuffers:
                 else None
             ),
             (
-                self.output_token_sampling_mask_logprobs[idx].clone()
+                self.output_sampling_mask_logprobs[idx].clone()
                 if self.enable_sampling_mask
                 else None
             ),
@@ -977,7 +977,7 @@ class MetadataBuffers:
             self.output_token_sampling_mask_idx[
                 req.metadata_buffer_index, :mask_len
             ].copy_(torch.from_numpy(chunk.token_ids))
-            self.output_token_sampling_mask_logprobs[
+            self.output_sampling_mask_logprobs[
                 req.metadata_buffer_index, :mask_len
             ].copy_(torch.from_numpy(chunk.support_logprobs))
             (sampling_logprob,) = chunk.selected_logprobs.tolist()

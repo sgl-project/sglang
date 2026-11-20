@@ -3418,7 +3418,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_top_logprobs_idx,
             output_token_sampling_mask_len,
             output_token_sampling_mask_idx,
-            output_token_sampling_mask_logprobs,
+            output_sampling_mask_logprobs,
             output_token_sampling_logprobs,
             output_topk_p,
             output_topk_index,
@@ -3517,9 +3517,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy()
                 )
                 sampling_mask_logprobs = (
-                    output_token_sampling_mask_logprobs[:sampling_mask_len]
-                    .cpu()
-                    .numpy()
+                    output_sampling_mask_logprobs[:sampling_mask_len].cpu().numpy()
                 )
             self.scheduler.batch_result_processor.commit_handoff_token(
                 req,
