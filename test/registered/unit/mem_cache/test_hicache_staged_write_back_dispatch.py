@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.common import _CUDA_HOST_REGISTERED_RANGES_ATTR
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -703,6 +704,18 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             self.assertTrue(
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
+        # One pinned range: adjacent host pages may leave as one copy.
+        self.assertTrue(staged.call_args.kwargs["merge_host_runs"])
+
+        # A pool registered in two ranges keeps one copy per page.
+        setattr(host.kv_buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [(0, 8), (8, 8)])
+        with mock.patch(
+            f"{MHA_POOL_HOST_MODULE}.jit_transfer_hicache_all_layer_staged_lf_pf"
+        ) as staged:
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend="kernel"
+            )
+        self.assertFalse(staged.call_args.kwargs["merge_host_runs"])
 
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
         """FIA views and packed drafts must restore without querying their owners."""

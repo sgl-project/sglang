@@ -438,7 +438,16 @@ def transfer_hicache_all_layer_staged_lf_pf(
     element_size: int | None = None,
     unroll: int | None = None,
     block_quota: int | None = None,
+    merge_host_runs: bool = False,
 ) -> None:
+    """Write device pages to a page_first host buffer through device staging.
+
+    The staged pages reach the host with one copy per page. A page of a few
+    kilobytes costs more to issue than to copy, so ``merge_host_runs`` sends
+    host pages that are adjacent in ``dst_indices`` as one copy. Pass it only
+    when the host buffer is one pinned range: a copy must not span two
+    registrations.
+    """
     element_dim = staging_k[0, 0].numel()
     element_size = element_size or (element_dim * staging_k.element_size())
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
@@ -469,6 +478,7 @@ def transfer_hicache_all_layer_staged_lf_pf(
             k_ptr_src,
             v_ptr_src,
             page_size,
+            merge_host_runs,
         )
 
 
@@ -484,7 +494,9 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
     element_size: int | None = None,
     unroll: int | None = None,
     block_quota: int | None = None,
+    merge_host_runs: bool = False,
 ) -> None:
+    """Single-tensor form of ``transfer_hicache_all_layer_staged_lf_pf``."""
     element_dim = staging[0, 0].numel()
     element_size = element_size or (element_dim * staging.element_size())
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
@@ -510,6 +522,7 @@ def transfer_hicache_all_layer_mla_staged_lf_pf(
             src_page_indices[page_begin : page_begin + chunk_pages],
             ptr_src,
             page_size,
+            merge_host_runs,
         )
 
 

@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
     get_allocator_from_storage,
+    host_buffer_is_one_pinned_range,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -654,6 +655,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_k=self.k_buffer,
                         dst_v=self.v_buffer,
                         page_size=self.page_size,
+                        merge_host_runs=host_buffer_is_one_pinned_range(self.kv_buffer),
                     )
                 elif self.can_use_jit and not self.device_rows_packed:
                     # The per-layer host views of page_first rows sit

@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    host_buffer_is_one_pinned_range,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -1077,6 +1078,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         staging=self.staging_buffer,
                         dst=self.kv_buffer,
                         page_size=self.page_size,
+                        merge_host_runs=host_buffer_is_one_pinned_range(self.kv_buffer),
                     )
                 elif self.can_use_jit and not self.device_rows_packed:
                     # The per-layer host views of page_first rows sit

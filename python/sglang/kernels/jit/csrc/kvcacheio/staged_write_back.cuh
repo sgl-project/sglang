@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hicache.cuh"
+#include "page_runs.h"
 #include "relayout.cuh"
 #include <dlfcn.h>
 #include <limits>
@@ -79,6 +80,7 @@ inline void copy_page_first_pages_fallback(
     const int64_t* dst_indices_ptr,
     int64_t num_pages,
     int64_t page_size,
+    bool merge_host_runs,
     cudaStream_t stream) {
   using namespace host;
 
@@ -93,13 +95,17 @@ inline void copy_page_first_pages_fallback(
     const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
     const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
     RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
-    for (const auto page_offset : irange(num_pages)) {
-      const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
-                            static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
-      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
-                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
-    }
+    // A small page makes a copy cost more to issue than to run, so adjacent
+    // host pages go out as one copy.
+    for_each_host_page_run(
+        dst_indices_ptr, num_pages, page_size, merge_host_runs, [&](int64_t first_page, int64_t run_pages) {
+          const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
+                                static_cast<size_t>(first_page * page_size * src_stride0 * elem_size);
+          char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
+                          static_cast<size_t>(dst_indices_ptr[first_page * page_size] * dst_stride0 * elem_size);
+          RuntimeDeviceCheck(cudaMemcpyAsync(
+              dst_ptr, src_ptr, static_cast<size_t>(run_pages) * src_page_bytes, cudaMemcpyDeviceToHost, stream));
+        });
   }
 }
 
@@ -260,7 +266,8 @@ struct HiCacheStagedWriteBackKernel {
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView k_ptr_src,
       const tvm::ffi::TensorView v_ptr_src,
-      const int64_t page_size) {
+      const int64_t page_size,
+      const bool merge_host_runs) {
     using namespace host;
 
     auto T = SymbolicSize{"num_tokens"};
@@ -337,7 +344,8 @@ struct HiCacheStagedWriteBackKernel {
     if constexpr (kIsMLA) {
       if (!try_copy_page_first_pages_batch(
               {staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, device.device_id, stream)) {
-        copy_page_first_pages_fallback({staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, stream);
+        copy_page_first_pages_fallback(
+            {staging_k}, {k_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, merge_host_runs, stream);
       }
     } else {
       if (!try_copy_page_first_pages_batch(
@@ -349,7 +357,13 @@ struct HiCacheStagedWriteBackKernel {
               device.device_id,
               stream)) {
         copy_page_first_pages_fallback(
-            {staging_k, staging_v}, {k_cache_dst, v_cache_dst}, dst_indices_ptr, P.unwrap(), page_size, stream);
+            {staging_k, staging_v},
+            {k_cache_dst, v_cache_dst},
+            dst_indices_ptr,
+            P.unwrap(),
+            page_size,
+            merge_host_runs,
+            stream);
       }
     }
   }
@@ -364,7 +378,8 @@ struct HiCacheStagedWriteBackKernel {
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView k_ptr_src,
       const tvm::ffi::TensorView v_ptr_src,
-      const int64_t page_size) {
+      const int64_t page_size,
+      const bool merge_host_runs) {
     run_staged_impl<false>(
         k_cache_dst,
         v_cache_dst,
@@ -374,7 +389,8 @@ struct HiCacheStagedWriteBackKernel {
         page_indices_src,
         k_ptr_src,
         v_ptr_src,
-        page_size);
+        page_size,
+        merge_host_runs);
   }
 
   static void run_all_mla_lf_pf_staged(
@@ -383,9 +399,19 @@ struct HiCacheStagedWriteBackKernel {
       const tvm::ffi::TensorView staging,
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView ptr_src,
-      const int64_t page_size) {
+      const int64_t page_size,
+      const bool merge_host_runs) {
     run_staged_impl<true>(
-        cache_dst, cache_dst, dst_indices_cpu, staging, staging, page_indices_src, ptr_src, ptr_src, page_size);
+        cache_dst,
+        cache_dst,
+        dst_indices_cpu,
+        staging,
+        staging,
+        page_indices_src,
+        ptr_src,
+        ptr_src,
+        page_size,
+        merge_host_runs);
   }
 };
 
@@ -452,7 +478,7 @@ struct HiCachePageUnifiedWriteBackKernel {
     const auto stream = LaunchKernel::resolve_device(dev);
     // The flattened tensors have one row per page (a single latent cache for MLA).
     if (!try_copy_page_first_pages_batch({staging}, {dst}, dst_ids, P.unwrap(), 1, dev.device_id, stream)) {
-      copy_page_first_pages_fallback({staging}, {dst}, dst_ids, P.unwrap(), 1, stream);
+      copy_page_first_pages_fallback({staging}, {dst}, dst_ids, P.unwrap(), 1, false, stream);
     }
   }
 };

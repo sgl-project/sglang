@@ -134,7 +134,22 @@ def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
         )
 
 
-def _run_mha(element_dim: int, page_count: int) -> None:
+def _host_pages(page_count: int, order: str) -> torch.Tensor:
+    """Host pages 1..page_count in an order that shapes the host copies.
+
+    ``descending`` has no two adjacent pages, ``ascending`` is one run, and
+    ``runs`` is the second half followed by the first with one page set apart.
+    """
+    ascending = torch.arange(1, page_count + 1, dtype=torch.int64)
+    if order == "ascending":
+        return ascending
+    if order == "runs":
+        first, second = ascending.tensor_split(2)
+        return torch.cat([second, first[:1], first[1:].flip(0)])
+    return ascending.flip(0)
+
+
+def _run_mha(element_dim: int, page_count: int, host_order: str = "descending") -> None:
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
@@ -171,7 +186,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         _fill_with_offset(device_pool.v_buffer[layer_id], layer_id + 100)
 
     device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
-    host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    host_pages = _host_pages(page_count, host_order)
     device_indices = _token_indices_for_pages(device_pages)
     # host_indices stay on the CPU: this is the case the staged JIT kernel must
     # accept (kDLCPU / kDLGPUHost destination indices).
@@ -228,7 +243,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         )
 
 
-def _run_mla(element_dim: int, page_count: int) -> None:
+def _run_mla(element_dim: int, page_count: int, host_order: str = "descending") -> None:
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
@@ -255,7 +270,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
         _fill_with_offset(device_pool.kv_buffer[layer_id], layer_id)
 
     device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
-    host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    host_pages = _host_pages(page_count, host_order)
     device_indices = _token_indices_for_pages(device_pages)
     host_indices = _token_indices_for_pages(host_pages, device="cpu")
     assert not host_indices.is_cuda
@@ -306,6 +321,19 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+# Adjacent host pages leave the staging buffer as one copy. On CUDA these pages
+# are below the batch-copy threshold at both page sizes, so the merged path runs.
+@pytest.mark.parametrize("host_order", ["ascending", "runs"])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_count", [1, 64, 65, 129])
+def test_page_first_staged_write_back_merges_adjacent_host_pages(
+    monkeypatch: pytest.MonkeyPatch, host_order: str, page_size: int, page_count: int
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "PAGE_SIZE", page_size)
+    _run_mha(128, page_count, host_order)
+    _run_mla(576, page_count, host_order)
 
 
 @pytest.mark.skipif(not is_hip(), reason="PAGE_SIZE is already 16 on CUDA.")
