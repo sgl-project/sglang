@@ -6776,9 +6776,12 @@ class Scheduler(
         entries = getattr(self, "_cancellation_retirements", None)
         if entries is None:
             entries = self._cancellation_retirements = {}
+        target_rid = (
+            recv_req.rid if recv_req.target_rid is None else recv_req.target_rid
+        )
         if (entry := entries.get(recv_req.cancellation_id)) is not None:
             if (entry.rid, entry.request_instance_id) != (
-                recv_req.rid,
+                target_rid,
                 recv_req.request_instance_id,
             ):
                 self._reply_cancellation_retirement(
@@ -6803,7 +6806,7 @@ class Scheduler(
             self._reply_cancellation_retirement(recv_req, "unknown", "receipt_capacity")
             return
         entry = _CancellationRetirement(
-            rid=recv_req.rid,
+            rid=target_rid,
             request_instance_id=recv_req.request_instance_id,
             expires_at=time.monotonic() + CANCELLATION_RETIREMENT_TTL_S,
             replies={recv_req.http_worker_ipc: recv_req},
@@ -6831,7 +6834,7 @@ class Scheduler(
         matches = [
             req
             for req in candidates
-            if req.rid == recv_req.rid
+            if req.rid == target_rid
             and req.request_instance_id == recv_req.request_instance_id
             and recv_req.request_instance_id
         ]

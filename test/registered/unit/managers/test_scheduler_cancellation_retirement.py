@@ -6,6 +6,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,6 +25,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     CancellationRetirementOutput,
     CancellationRetirementReq,
+    msgpack_decode,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
@@ -297,6 +299,48 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertEqual(self.outputs[-1][0].status, "unknown")
         self.assertFalse(req.finished())
         self.assertTrue(req.kv.holds_kv)
+
+    def test_retirement_ipc_separates_control_rid_from_target_rid(self):
+        """Native control callers route receipts on a new RID, not the generation RID."""
+        scheduler = self._scheduler()
+        target = self._req(scheduler, "internal-rid", "internal-rid")
+        neighbor = self._req(scheduler, "corr", "corr")
+        move([target, neighbor], scheduler.waiting_queue)
+
+        # The native Rust caller in #50042 sends this six-element tagged array.
+        def send(correlation_rid):
+            control = msgpack_decode(
+                msgspec.msgpack.encode(
+                    [
+                        "CancellationRetirementReq",
+                        correlation_rid,
+                        None,
+                        "rust-op",
+                        "internal-rid",
+                        "internal-rid",
+                    ]
+                )
+            )
+            scheduler.handle_cancellation_retirement(control)
+
+        send("corr")
+        send("retry-corr")
+        self.assertEqual(
+            [(out.rid, out.status) for out, _ in self.outputs],
+            [("corr", "retired"), ("retry-corr", "retired")],
+        )
+        self.assertTrue(target.kv.is_kv_released)
+        self.assertTrue(neighbor.kv.holds_kv)
+
+        # The former five-element layout must still target its original RID.
+        legacy = msgpack_decode(
+            msgspec.msgpack.encode(
+                ["CancellationRetirementReq", "corr", None, "legacy-op", "corr"]
+            )
+        )
+        scheduler.handle_cancellation_retirement(legacy)
+        self.assertEqual(self.outputs[-1][0].status, "retired")
+        self.assertTrue(neighbor.kv.is_kv_released)
 
     def test_unsupported_topology_and_grammar_queue_leave_request_untouched(self):
         scheduler = self._scheduler()

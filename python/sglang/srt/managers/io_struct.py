@@ -2552,6 +2552,9 @@ class AbortReq(BaseReq, kw_only=True):
 class CancellationRetirementReq(BaseReq, kw_only=True):
     cancellation_id: str
     request_instance_id: str
+    # Append-only IPC field: native callers route replies on a separate rid.
+    # HTTP callers leave this unset and use rid as the generation target.
+    target_rid: Optional[str] = None
 
 
 class CancellationRetirementOutput(BaseReq, kw_only=True):
