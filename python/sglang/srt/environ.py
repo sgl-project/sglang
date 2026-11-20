@@ -487,6 +487,7 @@ class Envs:
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_FORWARD = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -722,6 +723,8 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
+    SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -2054,6 +2057,7 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_DISABLE_THP = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
@@ -2306,6 +2310,22 @@ class Envs:
     # directive is always emitted.
     SGLANG_INKLING_DEFAULT_REASONING_EFFORT = EnvStr("0.9")
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
+    # MTP verify attention up to 64 tokens through the split-KV relative-bias
+    # decode kernel, all draft tokens of a sequence in one launch; changes the
+    # softmax reduction order.
+    SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL = EnvBool(False)
+    # Decode and MTP verify attention all-reduce through the push all-reduce
+    # (rank-order FP32 sum) instead of the multimem one-shot.
+    SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE = EnvBool(True)
+    # EP MoE combine sums each rank's own top-k rows per token, then all-reduces
+    # the FP32 token sums.
+    SGLANG_OPT_INKLING2_EP_PARTIAL_COMBINE = EnvBool(True)
+    # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
+    # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
+    SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
+    # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
+    # for the tokens this rank dispatches.
+    SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)

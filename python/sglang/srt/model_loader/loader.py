@@ -204,29 +204,6 @@ def _get_quantization_config(
             }
         )
 
-    if _is_npu:
-        packed_modules_mapping.update(
-            {
-                "visual": {
-                    "qkv_proj": ["qkv"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                },
-                "vision_model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "proj": ["out_proj"],
-                },
-                "model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                    "fused_qkv_a_proj_with_mqa": [
-                        "q_a_proj",
-                        "kv_a_proj_with_mqa",
-                    ],
-                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
-                },
-            }
-        )
-
     if model_config.quantization is not None:
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping, remap_prefix
@@ -407,6 +384,14 @@ def _validate_default_loader_extra_config(
         return
 
     allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format in (
+        LoadFormat.AUTO,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.MISTRAL,
+        LoadFormat.FLASH_RL,
+    ):
+        # Only the buffered multithreaded safetensors iterator honors it.
+        allowed_keys.add("max_inflight_bytes")
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(
@@ -416,6 +401,16 @@ def _validate_default_loader_extra_config(
                 "enable_gds in --model-loader-extra-config must be a boolean"
             )
 
+    max_inflight_bytes = extra_config.get("max_inflight_bytes")
+    if max_inflight_bytes is not None and (
+        not isinstance(max_inflight_bytes, int)
+        or isinstance(max_inflight_bytes, bool)
+        or max_inflight_bytes <= 0
+    ):
+        raise ValueError(
+            "max_inflight_bytes in --model-loader-extra-config must be a "
+            "positive integer"
+        )
     unexpected_keys = set(extra_config.keys()) - allowed_keys
     if unexpected_keys:
         raise ValueError(
@@ -756,8 +751,14 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    max_inflight_bytes=extra_config.get("max_inflight_bytes"),
                 )
             else:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to the multithreaded loader "
+                        "only; ignored because it is not in use."
+                    )
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,
@@ -768,6 +769,11 @@ class DefaultModelLoader(BaseModelLoader):
 
         else:
             if use_multithread:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to safetensors checkpoints "
+                        "only; ignored for .bin weights."
+                    )
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
