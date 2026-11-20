@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+from sglang.srt.managers.scheduler_components.request_list import (
+    PD_KINDS,
+    ListKind,
+    assert_empty,
+)
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -75,6 +80,14 @@ def handle_pd_role_switch(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
         )
+    # is_fully_idle skips them so a weight update can flush during a retract
+    # pause, but the teardown would drop them unanswered.
+    if scheduler.request_lists().get(ListKind.PD_HELD):
+        return _fail(
+            "a retract pause holds requests; resume generation and drain them "
+            "before switching",
+            safe_to_restore=True,
+        )
 
     required_graph_gb = recv_req.decode_cuda_graph_memory_gb
     # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
@@ -128,6 +141,7 @@ def handle_pd_role_switch(
         # is no in-place rollback.
         try:
             teardown_disaggregation(scheduler)
+            scheduler.gc_freezer.on_cache_reset()
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
             scheduler.init_disaggregation()
             scheduler._sync_disaggregation_mode_to_subcomponents()
@@ -239,6 +253,7 @@ def _current_kv_manager(scheduler: Scheduler):
 def teardown_disaggregation(scheduler: Scheduler) -> None:
     """Release the current role's disaggregation structures (queues, metadata
     buffers, KV transfer manager) so the other role can be rebuilt."""
+    assert_empty(scheduler.request_lists(), PD_KINDS)
     mode = scheduler.disaggregation_mode
     if mode == DisaggregationMode.PREFILL:
         q = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
@@ -247,7 +262,6 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
             if km is not None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue.clear()
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import logging
 import os
 import tempfile
 from types import SimpleNamespace
@@ -205,6 +206,44 @@ def test_attention_single_sample_matches_direct_attention(monkeypatch):
     qkv = x.unflatten(2, (num_heads, head_dim))
     expected = _sdpa(qkv, qkv, qkv).flatten(2)
     torch.testing.assert_close(out, expected)
+
+
+def test_failed_norm_modulate_kernel_is_reported_and_not_retried(monkeypatch, caplog):
+    """A failing fused RMSNorm+modulate kernel is reported once and the site
+    then stays on the reference chain instead of relaunching the kernel on
+    every call."""
+    module = dits_lingbot_video_moe
+    launches = []
+
+    def failing_kernel(*args):
+        launches.append(args)
+        raise RuntimeError("kernel build failed")
+
+    # restores the process-wide latch after the test
+    monkeypatch.setattr(module, "_norm_modulate_fusion_failed", False, raising=False)
+    monkeypatch.setattr(
+        module, "can_use_rmsnorm_scale_shift_per_token", lambda *args: True
+    )
+    monkeypatch.setattr(module, "rmsnorm_scale_shift_per_token", failing_kernel)
+    site = torch.nn.Module()
+    module.LINGBOT_VIDEO_GATED_RESIDUAL.mark(site)
+    assert module.LINGBOT_VIDEO_GATED_RESIDUAL.mount(site)
+    torch.manual_seed(0)
+    norm = module.LingBotVideoRMSNorm(8)
+    x, scale, shift = torch.randn(3, 2, 4, 8)
+    reference = norm(x) * (1.0 + scale) + shift
+
+    with caplog.at_level(logging.WARNING, logger=module.logger.name):
+        for _ in range(2):
+            out = module._lingbot_norm_modulate(
+                site, norm, x, scale, shift, torch.float32
+            )
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+    assert len(launches) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert "kernel build failed" in warnings[0]
 
 
 class _FakeBatchEncoding(dict):

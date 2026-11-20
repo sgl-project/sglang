@@ -1,5 +1,5 @@
 """RoutedExpertsCapturer: DeepEP-family backend recognition, capture width,
-and the output-rank host cache."""
+the output-rank host cache, and rows relayed between pipeline stages."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,8 +7,10 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.batch_overlap.operations import _StageExecutor
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
@@ -29,6 +31,7 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
         )
         cap.device_cache = SimpleNamespace(buffer=buf)
         cap.topk_size = self.K
+        cap.stage_start_layer, cap.stage_end_layer = 0, self.L
         return cap, buf
 
     def _slice(self, cap, n_local):
@@ -87,6 +90,7 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
         )
         cap.device_topk_size = self.TOPK_SIZE + 1
         cap.gather_buffer = torch.empty((8, self.TOPK_SIZE + 1), dtype=torch.int32)
+        cap.stage_start_layer, cap.stage_end_layer = 0, 2
         return cap
 
     def _capture(self, cap, ids, backend):
@@ -115,6 +119,94 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
                 self.assertTrue(
                     torch.equal(cap.device_cache.buffer[:4, 1, : self.TOPK_SIZE], ids)
                 )
+
+    def test_tbo_children_write_their_parent_rows(self):
+        """Children must not overwrite each other, even when padded to a common length."""
+        cap = self._capturer()
+        for token_range, value in (((0, 1), 1), ((1, 4), 2)):
+            ids = torch.full((3, self.TOPK_SIZE), value, dtype=torch.int32)
+            with forward_context(
+                ForwardContext(attn_backend=None, tbo_parent_token_range=token_range)
+            ):
+                self._capture(cap, ids, "deepep")
+        self.assertEqual(cap.device_cache.buffer[:4, 1, 0].tolist(), [1, 2, 2, 2])
+
+    def _read_non_ep_dp_tbo(self, rank, parent_sizes, split):
+        """Capture both gathered children on ``rank`` and read back its parent rows."""
+        cap = self._capturer()
+        cap.device_cache.buffer.fill_(-7)
+        cap.topk_size = self.TOPK_SIZE
+        ranges = [
+            [(0, split[r]), (split[r], size)] for r, size in enumerate(parent_sizes)
+        ]
+        padded = [max(e - s for s, e in rank_ranges) for rank_ranges in ranges]
+        offset = sum(parent_sizes[:rank])
+        with (
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.object(re_mod, "get_dp_global_num_tokens", return_value=padded),
+            mock.patch.object(re_mod, "dp_slot_in", return_value=rank),
+            mock.patch("sglang.srt.layers.dp_attention.dp_slot_in", return_value=rank),
+        ):
+            for child in range(2):
+                gathered = []
+                for r, rank_ranges in enumerate(ranges):
+                    s, e = rank_ranges[child]
+                    gathered += [100 * (r + 1) + i for i in range(s, e)]
+                    gathered += [-1] * (padded[r] - (e - s))
+                ids = torch.tensor(gathered, dtype=torch.int32)
+                ids = ids.unsqueeze(1).expand(-1, self.TOPK_SIZE + 1)
+                with forward_context(
+                    ForwardContext(
+                        attn_backend=None,
+                        tbo_parent_token_range=ranges[rank][child],
+                        tbo_parent_dp_offset=offset,
+                    )
+                ):
+                    cap.capture(layer_id=1, topk_indices=ids)
+            batch = SimpleNamespace(
+                global_num_tokens_cpu=parent_sizes,
+                out_cache_loc=torch.empty(parent_sizes[rank]),
+            )
+            return cap._get_local_slice(batch, False, None)[:, 1, 0].tolist()
+
+    def test_non_ep_dp_tbo_reads_each_ranks_rows(self):
+        """Gathered children must land where each DP rank's readback looks."""
+        for parent_sizes, split in (
+            ([4, 4], [2, 2]),
+            ([2, 6], [1, 3]),
+            ([6, 2], [4, 1]),
+            ([0, 4], [0, 2]),
+            ([3, 1], [3, 0]),
+        ):
+            for rank, size in enumerate(parent_sizes):
+                with self.subTest(parent_sizes=parent_sizes, rank=rank):
+                    self.assertEqual(
+                        self._read_non_ep_dp_tbo(rank, parent_sizes, split),
+                        [100 * (rank + 1) + i for i in range(size)],
+                    )
+
+    def test_stage_executor_exposes_parent_rows(self):
+        """A child's ForwardContext must carry the rows capture writes."""
+        batch = SimpleNamespace(
+            moe_num_token_non_padded=None,
+            tbo_parent_token_range=(2, 5),
+            tbo_parent_dp_offset=6,
+            global_dp_buffer_len=None,
+            tbo_padded_len=3,
+            global_num_tokens_cpu=None,
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+        )
+        executor = _StageExecutor(
+            "test",
+            [],
+            {"forward_batch": batch},
+            child_ctx=ForwardContext(attn_backend=None),
+        )
+        self.assertEqual(executor._child_ctx.tbo_parent_token_range, (2, 5))
+        self.assertEqual(executor._child_ctx.tbo_parent_dp_offset, 6)
 
     def test_other_widths_are_rejected(self):
         """Only the routed-only width may be padded; any other width is a caller bug."""
@@ -147,6 +239,8 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
                 model_config=SimpleNamespace(),
                 num_tokens=8,
                 max_running_requests=2,
+                stage_start_layer=0,
+                stage_end_layer=1,
                 device="cpu",
             )
         self.assertEqual(seen["num_fused_shared_experts"], 1)
@@ -158,14 +252,25 @@ class TestOutputRankHostCache(CustomTestCase):
     NUM_TOKENS = 16
     OUT_CACHE_LOC = torch.tensor([3, 7, 1, 12, 5])
 
-    def _capturer(self, attn_tp_rank, backend="none"):
+    def _capturer(
+        self,
+        attn_tp_rank,
+        backend="none",
+        pp_rank=0,
+        pp_size=1,
+        stage_start_layer=0,
+        stage_end_layer=None,
+    ):
+        if stage_end_layer is None:
+            stage_end_layer = self.NUM_LAYERS
         hf_text_config = SimpleNamespace(
             num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=self.K
         )
         with (
             get_parallel().override(
                 num_dp_ranks=1,
-                pp_rank=0,
+                pp_rank=pp_rank,
+                pp_size=pp_size,
                 attn_tp_rank=attn_tp_rank,
                 attn_tp_size=2,
                 attn_cp_rank=0,
@@ -189,17 +294,19 @@ class TestOutputRankHostCache(CustomTestCase):
                 num_tokens=self.NUM_TOKENS,
                 max_running_requests=4,
                 num_fused_shared_experts=0,
+                stage_start_layer=stage_start_layer,
+                stage_end_layer=stage_end_layer,
                 device="cpu",
             )
 
-    def _run_forward(self, cap, topk):
+    def _run_forward(self, cap, topk, layer_ids=None):
         with (
             mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=False),
             mock.patch.object(
                 re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
             ),
         ):
-            for layer_id in range(self.NUM_LAYERS):
+            for layer_id in layer_ids or range(self.NUM_LAYERS):
                 cap.capture(layer_id=layer_id, topk_indices=topk[:, layer_id])
             return cap.on_forward_end(
                 SimpleNamespace(
@@ -263,6 +370,36 @@ class TestOutputRankHostCache(CustomTestCase):
                     topk_indices=torch.zeros((3, self.K), dtype=torch.int32),
                 )
         self.assertEqual(gathered_shapes, [(6, self.K)] * self.NUM_LAYERS)
+
+    def test_pipeline_stages_relay_rows_instead_of_writing_the_host_cache(self):
+        """Under pipeline parallelism a stage holds only its own layers, so the
+        output rank must not store its partial rows, and every stage rank,
+        including ranks without a host cache, must hand its layers' rows to
+        the relay, which rebuilds the full rows stage by stage."""
+        topk = torch.randint(
+            1,
+            64,
+            (len(self.OUT_CACHE_LOC), self.NUM_LAYERS, self.K),
+            dtype=torch.int32,
+        )
+        first_stage = self._capturer(
+            attn_tp_rank=0, pp_rank=0, pp_size=2, stage_end_layer=1
+        )
+        later_stage = self._capturer(
+            attn_tp_rank=0, pp_rank=1, pp_size=2, stage_start_layer=1
+        )
+        relayed = None
+        for cap, layer_ids in ((first_stage, [0]), (later_stage, [1, 2])):
+            with self.subTest(stage_start_layer=layer_ids[0]):
+                out = self._run_forward(cap, topk, layer_ids=layer_ids)
+                self.assertTrue(torch.equal(out.topk, topk[:, layer_ids]))
+                self.assertTrue(torch.equal(out.out_cache_loc, self.OUT_CACHE_LOC))
+                relayed = re_mod.merge_pipeline_stage_rows(
+                    relayed=relayed, local=out.topk, stage_start_layer=layer_ids[0]
+                )
+        self.assertTrue(torch.equal(relayed, topk))
+        self.assertFalse(later_stage.has_host_cache)
+        self.assertEqual(int(first_stage.host_cache.buffer.count_nonzero()), 0)
 
 
 if __name__ == "__main__":

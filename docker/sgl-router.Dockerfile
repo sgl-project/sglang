@@ -18,10 +18,10 @@
 #
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
-# Run:
-#   docker run --rm -p 8090:8090 \
-#       -v $(pwd)/docker/sgl-router.sample.yaml:/etc/sgl-router/sgl-router.yaml \
-#       sgl-router:dev --config /etc/sgl-router/sgl-router.yaml
+# Run (the router is configured by CLI flags only):
+#   docker run --rm -p 30000:30000 sgl-router:dev \
+#       --host 0.0.0.0 --port 30000 --model-id qwen3 \
+#       --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000
 #
 # Image budget: < 100 MB stripped (M6 acceptance). Verify with
 #   `docker image inspect sgl-router:dev --format '{{.Size}}'`.
@@ -117,9 +117,7 @@ FROM ${RUNTIME_BASE_IMAGE} AS runtime
 
 COPY --from=builder /work/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
 
-# Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
-ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml
-EXPOSE 8090
+EXPOSE 30000
 
 # distroless `nonroot` runs as uid 65532. The router doesn't need root.
 # Numeric so a RUNTIME_BASE_IMAGE without a `nonroot` passwd entry still works.

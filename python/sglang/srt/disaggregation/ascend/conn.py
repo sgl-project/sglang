@@ -26,9 +26,8 @@ class AscendStateType(str, enum.Enum):
     """DSV4-on-NPU PD components without a cross-hardware equivalent."""
 
     DSV4_C128 = "dsv4_c128"
-    # C4 compress-state rows (attention + indexer) addressed within each
-    # req_pool_idx bank on Ascend 950 (CYCLE cache_mode).  Separate from StateType.SWA
-    # because each peer maps logical positions into its own local ring.
+    # Ascend 950 C4 state (attention + indexer) transfers row by row because
+    # the prefill and decode peers may use different SWA-page ring sizes.
     DSV4_C4_STATE = "dsv4_c4_state"
 
 
@@ -169,10 +168,17 @@ class AscendKVManager(MooncakeKVManager):
         return layout
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
     ) -> List[int]:
         if not self._uses_page_interleaved_dcp():
-            return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
+            return super().prepare_dcp_token_item_lens(
+                dst_page_item_lens,
+                dst_dcp_size,
+                draft_rows_collapsed=draft_rows_collapsed,
+            )
         if not self.is_hybrid_mla_backend or StateType.DSA in self.kv_args.state_types:
             self._get_dcp_remote_decode_layout()
         page_size = self.kv_args.page_size
@@ -228,7 +234,7 @@ class AscendKVManager(MooncakeKVManager):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
-            # On Ascend 950 (CYCLE cache_mode), StateType.SWA only contains SWA KV
+            # On Ascend 950, StateType.SWA only contains SWA KV
             # buffers (C4 compress state is registered separately as
             # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
             # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
@@ -320,7 +326,13 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
+        # Layer-split prefill reports owned-only entries while
+        # a non-split decode peer registers every layer; the entry-count
+        # mismatch routes into the group-aware dst remap below, same slicing
+        # as the PP path.
+        if self.pp_size > 1 or (
+            self.is_mla_backend and len(self.kv_args.kv_data_ptrs) != len(dst_kv_ptrs)
+        ):
             if self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
@@ -433,6 +445,8 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        draft_rows_collapsed: bool = False,
+        dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
     ) -> int:
         if not self._uses_page_interleaved_dcp():
             return super().send_kvcache_dcp(
@@ -452,6 +466,8 @@ class AscendKVManager(MooncakeKVManager):
                 dst_kv_item_lens=dst_kv_item_lens,
                 dst_tp_rank=dst_tp_rank,
                 dst_attn_tp_size=dst_attn_tp_size,
+                draft_rows_collapsed=draft_rows_collapsed,
+                dsa_index_k=dsa_index_k,
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs

@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=239, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=260, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=260, suite="base-b-test-1-gpu-small-amd")
 
 SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
@@ -42,6 +42,7 @@ class TestSRTEndpoint(CustomTestCase):
     # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
     env = {}
     expect_startup_observability = True
+    custom_logit_processor_args = ("--enable-custom-logit-processor",)
 
     @classmethod
     def setUpClass(cls):
@@ -56,7 +57,7 @@ class TestSRTEndpoint(CustomTestCase):
             # rows still cover the non-chunked path).
             env={**cls.env, **SERVER_ENV, "SGLANG_LOGPROB_CHUNK_SIZE": "64"},
             other_args=(
-                "--enable-custom-logit-processor",
+                *cls.custom_logit_processor_args,
                 "--mem-fraction-static",
                 "0.7",
                 "--cuda-graph-max-bs-decode",
@@ -108,6 +109,22 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
+
+    def test_stream_declares_utf8(self):
+        # Without a charset, `requests` decodes a text/event-stream as Latin-1.
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                "stream": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers["content-type"], "text/event-stream; charset=utf-8"
+        )
+        self.assertEqual(response.encoding, "utf-8")
 
     def test_logprob(self):
         self.run_decode(
@@ -320,6 +337,59 @@ class TestSRTEndpoint(CustomTestCase):
         # The consecutive-id prompt guarantees every 37th position is probed.
         self.assertGreater(checked, 4)
 
+    def test_token_ids_logprob_rows(self):
+        """Each scored position reports its own ids across a prefill chunk
+        boundary, with the values token_ids_logprob gives for the same ids."""
+        server_info = requests.get(self.base_url + "/server_info").json()
+        # -1 (chunking off) leaves one extend; the rows still run the path.
+        chunk = max(server_info["chunked_prefill_size"], 400)
+        rng = random.Random(0)
+        input_ids = [rng.randrange(1000, 20000) for _ in range(chunk + 200)]
+        logprob_start_len = chunk - 200
+        pool = rng.sample(range(1000, 30000), 200)
+        rows = []
+        for position in range(logprob_start_len + 1, len(input_ids)):
+            # The actual token first: its score is also in input_token_logprobs.
+            row = [input_ids[position]]
+            row += [t for t in rng.sample(pool, 5) if t != input_ids[position]]
+            rows.append(row)
+        rows[3] = []
+
+        def score(**ask):
+            requests.post(self.base_url + "/flush_cache")
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "input_ids": input_ids,
+                    "sampling_params": {"max_new_tokens": 0},
+                    "return_logprob": True,
+                    "logprob_start_len": logprob_start_len,
+                    **ask,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["meta_info"]
+
+        meta = score(token_ids_logprob_rows=rows)
+        reported = meta["input_token_ids_logprobs"]
+        self.assertEqual(len(reported), len(rows) + 1)
+        self.assertIsNone(reported[0])
+        for i, row in enumerate(rows):
+            if not row:
+                self.assertFalse(reported[i + 1])
+                continue
+            self.assertEqual([item[1] for item in reported[i + 1]], row)
+            self.assertAlmostEqual(
+                reported[i + 1][0][0], meta["input_token_logprobs"][i + 1][0], places=5
+            )
+
+        union = sorted({t for row in rows for t in row})
+        flat = score(token_ids_logprob=union)["input_token_ids_logprobs"]
+        for i, row in enumerate(rows):
+            at = {item[1]: item[0] for item in flat[i + 1]}
+            for value, requested, *_ in reported[i + 1] or []:
+                self.assertAlmostEqual(value, at[requested], places=3)
+
     def test_logprob_grammar(self):
         prompts = "Question: Is Paris the Capital of France? Answer:"
         allowed_tokens = [" Yes", " No"]
@@ -499,6 +569,7 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertIsInstance(memory_usage["kvcache"], float)
         self.assertEqual(memory_usage["token_capacity"], max_total_num_tokens)
         self.assertIsNone(memory_usage["token_capacity_swa"])
+        self.assertEqual(memory_usage["token_capacity_window"], {})
         self.assertIsInstance(memory_usage["startup_available"], float)
         self.assertGreater(memory_usage["startup_available"], 0)
         self.assertTrue(graph_phases.issubset(memory_usage["graph"]))
@@ -809,6 +880,8 @@ class TestTokenizeDetokenize(CustomTestCase):
 class TestRustServerEndpoint(TestSRTEndpoint):
     env = {"SGLANG_RUST_SERVER": "1"}
     expect_startup_observability = False
+    # Refused at startup in Rust-server mode; its tests are skipped below.
+    custom_logit_processor_args = ()
 
     _RUST_TODO = "not implemented by the embedded Rust server yet"
 
@@ -822,6 +895,10 @@ class TestRustServerEndpoint(TestSRTEndpoint):
 
     @unittest.skip(f"/flush_cache endpoint + cached_tokens meta {_RUST_TODO}")
     def test_cache_tokens(self):
+        pass
+
+    @unittest.skip(f"token_ids_logprob_rows request field {_RUST_TODO}")
+    def test_token_ids_logprob_rows(self):
         pass
 
     def test_greedy_token_equals_top1(self):

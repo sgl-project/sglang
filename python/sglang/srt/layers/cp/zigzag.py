@@ -425,10 +425,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         meta = forward_batch.attn_cp_metadata
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
+        queries = q if isinstance(q, tuple) else (q,)
 
         if attention_backend == CPAttentionBackendKind.FLASHINFER:
+            assert not isinstance(q, tuple)
             result = attn_fn(q[:logical_tokens])
         elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+            assert not isinstance(q, tuple)
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,
@@ -438,8 +441,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 use_zigzag_page_table=True,
             )
         else:
-            q_prev = q[: meta.total_q_prev_tokens]
-            q_next = q[meta.total_q_prev_tokens : logical_tokens]
+            # MLA passes separate query components to avoid concatenating them just
+            # to split the token dimension. Slice every component identically.
+            q_prev = tuple(t[: meta.total_q_prev_tokens] for t in queries)
+            q_next = tuple(
+                t[meta.total_q_prev_tokens : logical_tokens] for t in queries
+            )
+            if not isinstance(q, tuple):
+                q_prev, q_next = q_prev[0], q_next[0]
             result_prev = attn_fn(
                 q_prev,
                 meta.cu_seqlens_q_prev_tensor,
@@ -454,7 +463,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
-        pad_size = q.shape[0] - logical_tokens
+        pad_size = queries[0].shape[0] - logical_tokens
         assert pad_size >= 0
         if pad_size > 0:
             result = torch.cat(
@@ -468,15 +477,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
-        if swa_loc is not None:
-            swa_loc = swa_loc[: cache_loc.shape[0]]
         k_dim = k.shape[-1]
         v_dim = v.shape[-1]
         kv_cache = torch.cat([k, v], dim=-1).contiguous()
@@ -487,7 +489,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         value_cache_full = value_cache_full.contiguous()
         get_kv_layers().layer(layer.layer_id).store(
             layer,
-            KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
+            KVWriteLoc.for_layer(forward_batch, layer, window_locs=window_locs),
             key_cache_full,
             value_cache_full,
             layer.k_scale,
