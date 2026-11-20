@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 class RustMmVideoSampling(msgspec.Struct, frozen=True, kw_only=True):
-    """``qwen_vl.py``'s frame sampling and pre-resize inputs, read at launch
-    because ``VIDEO_TOTAL_PIXELS`` comes from the environment. Mirrors
-    ``sglang_processor::VideoSampling``."""
+    """``qwen_vl_media_processing.py``'s frame sampling and pre-resize inputs,
+    read at launch because ``VIDEO_TOTAL_PIXELS`` comes from the environment.
+    Mirrors ``sglang_processor::VideoSampling``."""
 
     config: Dict[str, float]
     fps: float
@@ -206,18 +206,18 @@ def _video_processor_mismatch(video_processor: Any) -> Optional[str]:
 def _video_spec(
     hf_config: Any, video_processor: Any, config: Dict[str, float]
 ) -> RustMmVideoSpec:
-    from sglang.srt.multimodal.processors import qwen_vl
+    from sglang.srt.multimodal import qwen_vl_media_processing as media
 
     sampling = RustMmVideoSampling(
         config={key: float(value) for key, value in config.items()},
-        fps=float(qwen_vl.FPS),
-        min_frames=float(qwen_vl.FPS_MIN_FRAMES),
-        max_frames=float(qwen_vl.FPS_MAX_FRAMES),
-        frame_factor=float(qwen_vl.FRAME_FACTOR),
-        factor=float(qwen_vl.IMAGE_FACTOR),
-        min_pixels=float(qwen_vl.VIDEO_MIN_PIXELS),
-        max_pixels=float(qwen_vl.VIDEO_MAX_PIXELS),
-        total_pixels=float(qwen_vl.VIDEO_TOTAL_PIXELS),
+        fps=float(media.FPS),
+        min_frames=float(media.FPS_MIN_FRAMES),
+        max_frames=float(media.FPS_MAX_FRAMES),
+        frame_factor=float(media.FRAME_FACTOR),
+        factor=float(media.IMAGE_FACTOR),
+        min_pixels=float(media.VIDEO_MIN_PIXELS),
+        max_pixels=float(media.VIDEO_MAX_PIXELS),
+        total_pixels=float(media.VIDEO_TOTAL_PIXELS),
     )
     return RustMmVideoSpec(
         video_token_id=hf_config.video_token_id,
