@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import logging
+from functools import partial
 from typing import Optional
 
 import msgspec
@@ -37,7 +39,11 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.managers.overlap_utils import (
     FutureRelayBuffers,
     offer_future_relay_buffers,
@@ -69,11 +75,12 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
     simulated_acc_len_generator,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -156,6 +163,8 @@ def candidate_request_length_bound(
 
 class TargetVerifyExecutor:
     _rejection_noise = None
+    _accept_split_group = None
+    deferred_logits_processor: Optional[LogitsProcessor] = None
 
     def __init__(
         self,
@@ -171,6 +180,7 @@ class TargetVerifyExecutor:
         simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
         rejection_noise: Optional[RejectionNoise] = None,
+        accept_split_group=None,
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
@@ -195,6 +205,18 @@ class TargetVerifyExecutor:
             else None
         )
         self._simulated_bonus_seed: Optional[int] = None
+        self._accept_split_group = accept_split_group
+        # With no in-graph epilogue reading them, target verify leaves the logits
+        # as vocab shards and the split accept exchanges only the rows it reads.
+        if self._accept_split_group is not None and verify_epilogue is None:
+            processors = [
+                module
+                for module in target_worker.model_runner.model.modules()
+                if isinstance(module, LogitsProcessor)
+            ]
+            if len(processors) == 1:
+                processors[0].defer_verify_layout = True
+                self.deferred_logits_processor = processors[0]
 
     def accept_and_finalize(
         self,
@@ -221,7 +243,22 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
-        correct_len, bonus, cap_trim_lens = accept_draft_tokens(
+        sync_site = _accept_sync_site(sampling_info, simulate_bonus_sampling_info)
+        accept_fn = (
+            partial(
+                accept_draft_tokens_tp_split,
+                group=self._accept_split_group,
+                target_logits_are_shards=self.is_deferred_layout(target_logits),
+            )
+            if self.splits_accept(
+                bs=bs,
+                sampling_info=sampling_info,
+                draft_block=draft_block,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+            else accept_draft_tokens
+        )
+        correct_len, bonus, cap_trim_lens = accept_fn(
             candidates=verify_ids_2d,
             target_logits=target_logits,
             draft_block=draft_block,
@@ -229,17 +266,9 @@ class TargetVerifyExecutor:
             draft_input=draft_input,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
-            cutoff_layout=layout,
+            cutoff_verify_lens=None if layout is None else layout.verify_lens,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
-        )
-        greedy_bonus = simulate_bonus_sampling_info is None and (
-            sampling_info is None or sampling_info.is_all_greedy
-        )
-        sync_site = (
-            SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if greedy_bonus
-            else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         return build_accept_outs(
             correct_len=correct_len,
@@ -256,6 +285,33 @@ class TargetVerifyExecutor:
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             simulated_bonus_seed=self._simulated_bonus_seed,
         )
+
+    def splits_accept(
+        self,
+        *,
+        bs: int,
+        sampling_info,
+        draft_block: DraftBlockResult,
+        simulate_bonus_sampling_info=None,
+    ) -> bool:
+        """Whether the eager accept shares the requests over the TP2 group:
+        rank 0's result is broadcast under the sync site anyway."""
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        return (
+            self._accept_split_group is not None
+            and bs >= 2
+            and self._tp_sync.enabled(
+                _accept_sync_site(sampling_info, simulate_bonus_sampling_info)
+            )
+            # The draft-vocab-sharded accept gathers across the group.
+            and draft_block.vocab_shard is None
+            # Block-wise rejection draws are keyed by the row within the call.
+            and (all_greedy or self._rejection_noise is None)
+        )
+
+    def is_deferred_layout(self, logits: Optional[torch.Tensor]) -> bool:
+        processor = self.deferred_logits_processor
+        return processor is not None and processor.is_deferred_layout(logits)
 
     def begin_simulated_step(self) -> None:
         """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length and bonus seed,
@@ -367,7 +423,21 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
-        if sampling_info is not None:
+        logits_output = result.logits_output
+        # The adjustments write the laid-out logits in place.
+        deferred = self.is_deferred_layout(logits_output.next_token_logits)
+        if (
+            deferred
+            and sampling_info is not None
+            and not verify_logits_adjustments_are_noop(sampling_info)
+        ):
+            logits_output.next_token_logits = (
+                self.deferred_logits_processor.finish_deferred_layout(
+                    logits_output.next_token_logits
+                )
+            )
+            deferred = False
+        if sampling_info is not None and not deferred:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -541,6 +611,12 @@ class TargetVerifyExecutor:
             iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
+        if self.is_deferred_layout(logits_output.next_token_logits):
+            logits_output.next_token_logits = (
+                self.deferred_logits_processor.finish_deferred_layout(
+                    logits_output.next_token_logits
+                )
+            )
 
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits
@@ -1176,6 +1252,25 @@ class DsparkVerifyEpilogue:
             )
 
 
+def accept_split_group():
+    """The TP2 group the eager verify accept splits its requests over, or None."""
+    if _is_hip or _is_npu:
+        return None
+    group = get_dp_tp_group()
+    return group if group.world_size == 2 else None
+
+
+def _accept_sync_site(sampling_info, simulate_bonus_sampling_info) -> SpecTpSyncSite:
+    greedy_bonus = simulate_bonus_sampling_info is None and (
+        sampling_info is None or sampling_info.is_all_greedy
+    )
+    return (
+        SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
+        if greedy_bonus
+        else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+    )
+
+
 def build_accept_outs(
     *,
     correct_len: torch.Tensor,
@@ -1374,6 +1469,99 @@ def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Ten
     return draft_probs
 
 
+def _exchange_vocab_shards(
+    group, shard: torch.Tensor, *, bs: int, rows_per_request: int
+) -> torch.Tensor:
+    """Float32 [rows, vocab] logits of this rank's half of the requests, from
+    each TP2 rank's vocab shard [bs * rows_per_request, vocab / 2]: every rank
+    sends the peer's rows of its shard."""
+    rank = group.rank_in_group
+    half_rows = (bs + 1) // 2 * rows_per_request
+    own = shard[:half_rows] if rank == 0 else shard[half_rows:]
+    for_peer = shard[half_rows:] if rank == 0 else shard[:half_rows]
+    if for_peer.shape[0] < half_rows:
+        for_peer = torch.nn.functional.pad(
+            for_peer, (0, 0, 0, half_rows - for_peer.shape[0])
+        )
+    width = shard.shape[1]
+    gathered = shard.new_empty((2, half_rows, width))
+    group.all_gather_into_tensor(gathered.view(-1, width), for_peer.contiguous())
+    logits = torch.empty(
+        (own.shape[0], 2 * width), dtype=torch.float32, device=shard.device
+    )
+    logits[:, rank * width : (rank + 1) * width] = own
+    logits[:, (1 - rank) * width : (2 - rank) * width] = gathered[1 - rank][
+        : own.shape[0]
+    ]
+    return logits
+
+
+def accept_draft_tokens_tp_split(
+    *,
+    group,
+    candidates: torch.Tensor,
+    target_logits: torch.Tensor,
+    draft_block: DraftBlockResult,
+    sampling_info,
+    verify_num_draft_tokens: int,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
+    target_logits_are_shards: bool = False,
+    **accept_kwargs,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """accept_draft_tokens with the requests split over a TP2 group: each rank
+    accepts its half, then the per-request results are all-gathered."""
+    bs = candidates.shape[0]
+    half = (bs + 1) // 2
+    rows = slice(0, half) if group.rank_in_group == 0 else slice(half, bs)
+    num_rows = rows.stop - rows.start
+    if sampling_info is not None:
+        sampling_info = copy.copy(sampling_info)
+        sampling_info.temperatures = sampling_info.temperatures[rows]
+        sampling_info.top_ps = sampling_info.top_ps[rows]
+        sampling_info.top_ks = sampling_info.top_ks[rows]
+        sampling_info.min_ps = sampling_info.min_ps[rows]
+    corrected_logits = draft_block.corrected_logits
+    if target_logits_are_shards:
+        target_logits = _exchange_vocab_shards(
+            group, target_logits, bs=bs, rows_per_request=verify_num_draft_tokens
+        )
+    else:
+        target_logits = target_logits[
+            rows.start * verify_num_draft_tokens : rows.stop * verify_num_draft_tokens
+        ]
+    results = accept_draft_tokens(
+        candidates=candidates[rows],
+        target_logits=target_logits,
+        draft_block=msgspec.structs.replace(
+            draft_block,
+            draft_tokens=draft_block.draft_tokens[rows],
+            corrected_logits=(
+                None if corrected_logits is None else corrected_logits[rows]
+            ),
+            greedy_mask=draft_block.greedy_mask[rows],
+            temperatures=draft_block.temperatures[rows],
+        ),
+        sampling_info=sampling_info,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        cutoff_verify_lens=(
+            None if cutoff_verify_lens is None else cutoff_verify_lens[rows]
+        ),
+        **accept_kwargs,
+    )
+    # [3, half] per rank: correct_len, bonus, cap_trim_lens; rank 1 pads an odd batch.
+    local = torch.zeros((3, half), dtype=torch.int64, device=candidates.device)
+    for i, result in enumerate(results):
+        local[i, :num_rows] = result.view(-1)
+    gathered = torch.empty((2, 3, half), dtype=torch.int64, device=candidates.device)
+    group.all_gather_into_tensor(gathered.view(-1), local.view(-1))
+    return tuple(
+        torch.cat([gathered[0, i], gathered[1, i, : bs - half]])
+        .to(result.dtype)
+        .view(bs, *result.shape[1:])
+        for i, result in enumerate(results)
+    )
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -1383,12 +1571,11 @@ def accept_draft_tokens(
     draft_input: DFlashDraftInputV2,
     gamma: int,
     verify_num_draft_tokens: int,
-    cutoff_layout: Optional[RaggedVerifyLayout] = None,
+    cutoff_verify_lens: Optional[torch.Tensor] = None,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
-    cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
     if all_greedy:
         return AcceptGreedy.execute(

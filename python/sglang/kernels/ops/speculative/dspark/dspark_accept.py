@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
+    _dflash_top_p_renorm_prob,
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
@@ -167,12 +168,20 @@ def _accept_sampling_core(
         else:
             cap_trim_lens = torch.zeros_like(correct_len)
         return correct_len, cap_trim_lens, accept_index, predicts
-    if plain:
+    if not sampling_info.need_top_k_sampling:
         target_probs = SoftmaxTemp.execute(
             logits=target_logits,
             temperatures=sampling_info.temperatures,
             rows_per_request=verify_num_draft_tokens,
-        ).view(bs, verify_num_draft_tokens, -1)
+        )
+        if sampling_info.need_top_p_sampling:
+            target_probs = _dflash_top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_num_draft_tokens, dim=0
+                ),
+            )
+        target_probs = target_probs.view(bs, verify_num_draft_tokens, -1)
     else:
         target_probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits,
@@ -342,7 +351,9 @@ class SoftmaxTemp:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        if _flashinfer_softmax is not None:
+        # FlashInfer takes float32 only; measured on B300 at 224 x 200k bf16 rows,
+        # cast + FlashInfer is 224 us and the Triton kernel reading bf16 is 191 us.
+        if _flashinfer_softmax is not None and kwargs["logits"].dtype == torch.float32:
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 

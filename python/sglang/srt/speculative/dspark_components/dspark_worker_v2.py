@@ -80,6 +80,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    accept_split_group,
     draft_folds_static_commit,
     target_model_type,
     verify_logits_adjustments_are_noop,
@@ -541,6 +542,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
             rejection_noise=self._rejection_noise,
+            accept_split_group=accept_split_group(),
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -1201,6 +1203,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        # Deferred layout: only the split accept reads the gathered shards.
+        shards_only = self._verify_executor.is_deferred_layout(
+            logits_output.next_token_logits
+        )
+        if shards_only and not (
+            self._verify_executor.splits_accept(
+                bs=bs, sampling_info=sampling_info, draft_block=draft_block
+            )
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and simulate_bonus_sampling_info is None
+            and (
+                sampling_info is None
+                or sampling_info.sampling_mask_batch_indices is None
+            )
+            # These read the full logits after the accept.
+            and self._simulate_acc_len <= 0
+            and self.target_worker.model_runner.watermark_state is None
+            and not self._observers.reads_target_logits
+        ):
+            logits_output.next_token_logits = (
+                self._verify_executor.deferred_logits_processor.finish_deferred_layout(
+                    logits_output.next_token_logits
+                )
+            )
+            shards_only = False
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -1265,6 +1293,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        if shards_only:
+            logits_output.next_token_logits = None
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,

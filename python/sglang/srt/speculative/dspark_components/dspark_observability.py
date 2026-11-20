@@ -20,6 +20,7 @@ from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
+    block_accept_estimate_enabled,
     create_block_accept_estimate_recorder,
 )
 from sglang.srt.speculative.dspark_components.dspark_sts import StsDataRecorder
@@ -815,6 +816,16 @@ class DsparkStepObservers:
         )
 
     # --- per-step observation --------------------------------------------
+
+    @property
+    def reads_target_logits(self) -> bool:
+        """Whether observe_verify_step reads the full-vocabulary target logits
+        on any TP rank; the same on every rank, so all of them take one layout."""
+        return (
+            bool(self._sts_collect_path)
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+            or block_accept_estimate_enabled()
+        )
 
     def observe_verify_step(
         self,
