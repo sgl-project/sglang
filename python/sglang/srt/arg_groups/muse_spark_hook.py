@@ -98,6 +98,22 @@ def _apply_muse_spark_launch_defaults(server_args: Any) -> None:
             defaults["mem_fraction_static"] = 0.8
         elif platform.is_sm90:
             defaults["mem_fraction_static"] = 0.85
+    if (
+        platform.is_sm90
+        and quantization == "modelopt_fp4"
+        and cfg.attention_backend is None
+        and cfg.prefill_attention_backend is None
+        and cfg.decode_attention_backend is None
+        and cfg.attn_cp_size == 1
+        and not cfg.enable_deterministic_inference
+        and cfg.speculative_eagle_topk in (None, 1)
+        and cfg.page_size in (None, 16, 32, 64, 128)
+    ):
+        # On Hopper, fmha_v2 prefill and XQA decode/verify over the FP8 KV cache
+        # (page size 64) serve Muse faster than FA3 at page size 1. Prefill CP,
+        # deterministic inference, topk > 1 drafts and an explicit page size
+        # trtllm_mha would replace keep the generic default.
+        defaults["attention_backend"] = "trtllm_mha"
     if cfg.enable_megamoe_for_layernorm_sp is None:
         defaults["enable_megamoe_for_layernorm_sp"] = (
             platform.is_sm100
