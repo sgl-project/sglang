@@ -149,6 +149,8 @@ still use the existing image APIs; encoding is not exposed as a standalone API.
 - `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
+  The default image/video filename is independent of the prompt and input media name.
+  Set `--output-file-name` when a downstream tool needs a predictable filename.
 
 For frame interpolation and upscaling, see [Post-Processing](/docs/sglang-diffusion/api/post_processing).
 
