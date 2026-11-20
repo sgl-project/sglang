@@ -17,8 +17,9 @@ import torch
 from torch.multiprocessing import reductions
 
 from sglang.srt.utils.common import torch_release
-from sglang.srt.utils.device import is_musa, is_npu
+from sglang.srt.utils.device import is_mlu, is_musa, is_npu
 
+_is_mlu = is_mlu()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
@@ -42,7 +43,12 @@ SGLANG_TP_RANK = None
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
 
-    if not _is_npu:
+    if _is_mlu:
+        from multiprocessing.reduction import ForkingPickler
+
+        ForkingPickler.register(torch.Tensor, _reduce_mlu_tensor)
+        ForkingPickler.register(torch.nn.Parameter, _reduce_mlu_tensor)
+    elif not _is_npu:
         if hasattr(reductions, "_reduce_tensor_original"):
             return
         reductions._reduce_tensor_original = reductions.reduce_tensor
@@ -81,6 +87,35 @@ def _reduce_tensor_modified(*args, **kwargs):
 def _rebuild_cuda_tensor_modified(*args):
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
     return reductions._rebuild_cuda_tensor_original(*args)
+
+
+def _reduce_mlu_tensor(tensor):
+    from torch_mlu.mlu.reductions import _reduce_tensor, rebuild_mlu_tensor
+
+    rebuild, args = _reduce_tensor(tensor)
+    if rebuild is not rebuild_mlu_tensor:
+        return rebuild, args
+    args = _modify_tuple(
+        args,
+        _REDUCE_TENSOR_ARG_DEVICE_INDEX,
+        lambda device: str(torch.mlu.get_device_properties(device).uuid),
+    )
+    return _rebuild_mlu_tensor_modified, args
+
+
+def _rebuild_mlu_tensor_modified(*args):
+    from torch_mlu.mlu.reductions import rebuild_mlu_tensor
+
+    # The same physical card may have different local indices in each process.
+    args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _mlu_device_from_uuid)
+    return rebuild_mlu_tensor(*args)
+
+
+def _mlu_device_from_uuid(device_uuid: str) -> int:
+    for device in range(torch.mlu.device_count()):
+        if str(torch.mlu.get_device_properties(device).uuid) == device_uuid:
+            return device
+    raise RuntimeError(f"MLU IPC device {device_uuid!r} is not visible to this process")
 
 
 def _device_to_uuid(device: int) -> str:
