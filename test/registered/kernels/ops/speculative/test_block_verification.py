@@ -2,10 +2,12 @@ import itertools
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.kernels.ops.speculative import reject_sampling
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
     speculative_sampling_classic_kernel,
@@ -223,6 +225,24 @@ def test_vocab_split_matches_classic_bitwise(slots, vocab, batch):
     assert (lengths[kind == 4] == slots - 1).all()
     assert (lengths[(kind == 3) | (kind == 5)] == 0).all()
     assert (predicts[indices[kind == 3, 0]] == vocab - 1).all()
+
+
+@pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
+@pytest.mark.parametrize("batch, split", [(127, True), (128, False)])
+def test_block_accept_takes_the_classic_kernel_from_128_requests(batch, split):
+    vocab, slots = 4096, 5
+    target = torch.full((batch, slots, vocab), 1 / vocab, device=DEVICE)
+    draft = torch.full((batch, slots - 1, vocab), 1 / vocab, device=DEVICE)
+    candidates = torch.zeros((batch, slots), dtype=torch.long, device=DEVICE)
+    coins = torch.rand((batch, slots), device=DEVICE)
+    final_coins = torch.rand((batch,), device=DEVICE)
+    with patch.object(
+        reject_sampling,
+        "_chain_speculative_sampling_block_split",
+        wraps=reject_sampling._chain_speculative_sampling_block_split,
+    ) as block_split:
+        _verify(target, draft, candidates, coins, final_coins)
+    assert block_split.called == split
 
 
 def test_accepts_longer_prefix_after_rejection():

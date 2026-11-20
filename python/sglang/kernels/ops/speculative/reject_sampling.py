@@ -1151,7 +1151,14 @@ def chain_speculative_sampling_triton(
 
     # The split path keeps partial sums in fp32 scratch, which is the classic kernel's
     # accumulation type, and so its result bit for bit, only for fp32 p and q.
-    if block_verification and target_probs.dtype == draft_probs.dtype == torch.float32:
+    # From 128 requests the split path stops paying off; measured
+    # split/classic kernel time at batch 128 on GB300, cold L2, vocab 129280-163840,
+    # was 0.82-1.65 at 5 slots and 1.39-3.47 at 9 slots (random to all-accept coins).
+    if (
+        block_verification
+        and target_probs.dtype == draft_probs.dtype == torch.float32
+        and batch_size < 128
+    ):
         _chain_speculative_sampling_block_split(
             predicts,
             accept_index,
