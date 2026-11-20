@@ -21,9 +21,8 @@ logger = logging.getLogger(__name__)
 class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Resolved parameters of the Rust MM pipeline for one model,
     consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
-    :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
-    (:meth:`rust_json`) and the drain adapter
-    (:meth:`RustMmProcessor.wrap_encoded`)."""
+    :meth:`RustServer._build_mm_spec`) and the drain adapter
+    (:meth:`RustMmProcessor.wrap_encoded`); :meth:`rust_json` is its JSON form."""
 
     family: str
     feature_shm: bool
@@ -49,16 +48,14 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         return 3 * self.temporal_patch_size * self.patch_size * self.patch_size
 
     def rust_json(self) -> str:
-        """The subset `sglang_mm::registry::pipeline_from_spec` parses — the
-        JSON form the ``_multimodal`` parity API takes; the server itself is
-        handed the typed ``MmSpec`` instead."""
+        """The fields that go to Rust, as JSON; the server itself is handed the
+        typed ``MmSpec`` instead."""
         fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
-    """The Python half of one Rust MM family (an arm of
-    `sglang_mm::registry::pipeline_from_spec`): which models it serves.
+    """The Python half of one Rust MM family: which models it serves.
     Supporting a new model family = one entry in :data:`RUST_MM_FAMILIES`
     plus its Rust arm — the launch gate is data-driven."""
 

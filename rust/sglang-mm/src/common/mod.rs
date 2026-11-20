@@ -2,7 +2,6 @@ pub mod fetch;
 pub mod par;
 pub mod resize;
 pub mod token_layout;
-pub mod transforms;
 
 #[cfg(feature = "parallel")]
 use std::sync::OnceLock;
@@ -163,22 +162,6 @@ mod python {
         Ok(PyBytes::new(py, &data))
     }
 
-    #[pyfunction]
-    pub fn base64_decode<'py>(
-        py: Python<'py>,
-        encoded: &str,
-    ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-        use base64::Engine;
-        let decoded = py
-            .detach(|| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded)
-                    .map_err(|e| format!("base64 decode error: {e}"))
-            })
-            .map_err(PyValueError::new_err)?;
-        Ok(pyo3::types::PyBytes::new(py, &decoded))
-    }
-
     pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         let m = PyModule::new(parent.py(), "common")?;
         m.add_function(wrap_pyfunction!(resize_rgb, &m)?)?;
@@ -186,7 +169,6 @@ mod python {
         m.add_function(wrap_pyfunction!(image_decode_rgb, &m)?)?;
         m.add_function(wrap_pyfunction!(content_hash, &m)?)?;
         m.add_function(wrap_pyfunction!(fetch_bytes, &m)?)?;
-        m.add_function(wrap_pyfunction!(base64_decode, &m)?)?;
         parent.add_submodule(&m)?;
         Ok(())
     }

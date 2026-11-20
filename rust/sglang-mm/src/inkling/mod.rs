@@ -1,6 +1,5 @@
 use std::sync::OnceLock;
 
-use crate::common;
 use crate::common::par;
 use half::bf16;
 
@@ -80,37 +79,11 @@ fn patchify_into(arr: &[u8], h: usize, w: usize, ps: usize, out: &mut [u16]) {
     par::for_chunks_mut(out, row_elems, |index, chunk| body((index, chunk)));
 }
 
-fn patchify_alloc(arr: &[u8], h: usize, w: usize, ps: usize) -> Vec<u16> {
+pub fn patchify_alloc(arr: &[u8], h: usize, w: usize, ps: usize) -> Vec<u16> {
     let (nph, npw) = grid(h, w, ps);
     let mut out = vec![0u16; nph * npw * ps * ps * 3];
     patchify_into(arr, h, w, ps, &mut out);
     out
-}
-
-/// Struct implementing ImageProcessorSpec for Inkling.
-pub struct InklingProcessor;
-
-impl crate::registry::ImageProcessorSpec for InklingProcessor {
-    fn name(&self) -> &'static str {
-        "inkling"
-    }
-
-    fn preprocess_batch(
-        &self,
-        datas: &[Vec<u8>],
-        patch_size: usize,
-        rescale_frac: Option<f64>,
-        rescale_cap: Option<i64>,
-    ) -> Result<Vec<(usize, usize, Vec<u16>, u64)>, String> {
-        if patch_size == 0 {
-            return Err("patch_size must be greater than zero".into());
-        }
-        par::try_map(datas, |data| {
-            let hash = common::content_hash_u64(data);
-            let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-            Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
-        })
-    }
 }
 
 // --- Python bindings (feature-gated: absent from the pure-Rust rlib) ---

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use sglang_mm::pipeline::{Tensor, TensorData};
+use sglang_mm::tensor::{Tensor, TensorData};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]

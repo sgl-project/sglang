@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use sglang_mm::pipeline::{Tensor, TensorData};
+use sglang_mm::tensor::{Tensor, TensorData};
 use sglang_processor::MmOutput;
 use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 

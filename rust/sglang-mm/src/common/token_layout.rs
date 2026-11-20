@@ -1,11 +1,34 @@
 //! Token-layout mechanics for the server MM pipeline.
 //!
-//! Families describe their prompt geometry as a [`TokenLayout`] value
-//! (`pipeline.rs`); [`apply_layout`] applies it mechanically. Expanding the
+//! Families describe their prompt geometry as a [`TokenLayout`] value;
+//! [`apply_layout`] applies it mechanically. Expanding the
 //! already-tokenized prompt means non-media tokens can never drift from a
 //! retokenize (the `SGLANG_MM_AVOID_RETOKENIZE` idea, unconditional here).
 
-use crate::pipeline::{Segment, TokenLayout, TokenPattern};
+/// The tokens one media item occupies in the expanded prompt.
+pub enum TokenPattern {
+    /// N copies of one placeholder id (qwen-style).
+    Repeat { id: i64, n: usize },
+    /// An explicit id sequence — tile markers, row separators, wrapper
+    /// tokens (minicpm/internvl-style structured expansions).
+    Explicit(Vec<i64>),
+}
+
+/// One span of the expanded prompt.
+pub enum Segment {
+    /// Copy `src` (a range into the original ids) verbatim.
+    Text(std::ops::Range<usize>),
+    /// Media item `item`'s token span.
+    Media { item: usize, pattern: TokenPattern },
+}
+
+/// Prompt geometry as data: the family *describes* the expansion, the driver
+/// *applies* it (`common::token_layout::apply_layout`) — deriving final input ids
+/// and per-item offsets, and validating that every item is placed exactly
+/// once.
+pub struct TokenLayout {
+    pub segments: Vec<Segment>,
+}
 
 /// The expanded prompt plus, per media item (indexed as in the layout), the
 /// inclusive `(start, end)` token range it occupies — the Python

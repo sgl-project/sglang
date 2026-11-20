@@ -33,7 +33,7 @@ pub fn resolve_media_work(
     input_ids: TokenIds,
     mm: MmData,
 ) -> Result<ResolvedMediaWork, MediaError> {
-    resolve_media_work_with_budget(input_ids, mm, sglang_mm::driver::MAX_REQUEST_BYTES)
+    resolve_media_work_with_budget(input_ids, mm, sglang_mm::common::fetch::MAX_REQUEST_BYTES)
 }
 
 fn resolve_media_work_with_budget(

@@ -9,8 +9,8 @@
 
 #![cfg(not(feature = "parallel"))]
 
-use sglang_mm_core::driver::{ImageSource, MmInput, process};
-use sglang_mm_core::registry::pipeline_from_spec;
+use sglang_mm_core::common::decode_rgb;
+use sglang_mm_core::qwen_vl::QwenVlProcessor;
 
 const SPEC: &str = r#"{"family":"qwen_vl","image_token_id":1,"patch_size":14,
     "merge_size":2,"temporal_patch_size":2,"min_pixels":3136,
@@ -36,21 +36,15 @@ fn png(w: u32, h: u32) -> Vec<u8> {
 #[test]
 fn processing_a_request_spawns_no_worker_threads() {
     let before = thread_names().len();
-    let family = pipeline_from_spec(SPEC).unwrap();
+    let processor = QwenVlProcessor::from_spec_json(SPEC).unwrap();
 
-    // Two images, so the per-item fan-out seam is exercised, not bypassed.
-    let out = process(
-        family.as_ref(),
-        MmInput {
-            input_ids: vec![7, 1, 8, 1, 9],
-            images: vec![
-                ImageSource::Bytes(png(112, 112)),
-                ImageSource::Bytes(png(84, 140)),
-            ],
-        },
-    )
-    .expect("request should succeed");
-    assert_eq!(out.items.len(), 2);
+    for encoded in [png(112, 112), png(84, 140)] {
+        let (rgb, height, width) = decode_rgb(&encoded).expect("decode should succeed");
+        let (pixel_values, grid) = processor
+            .process_image(&rgb, height, width)
+            .expect("request should succeed");
+        assert_eq!(pixel_values.len() % processor.tokens_per_image(&grid), 0);
+    }
 
     let after = thread_names();
     let spawned: Vec<&String> = after.iter().filter(|t| t.starts_with("sgl-mm")).collect();
