@@ -29,7 +29,7 @@ import logging
 from array import array
 from collections import deque
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
@@ -39,12 +39,12 @@ from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRAC
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
-    EvictParams,
     InitLoadBackParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
     StagedPrefetchPlan,
@@ -66,6 +67,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupState,
     NodeId,
 )
+from sglang.srt.utils.device import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -168,6 +170,15 @@ class _OngoingBufferLoadBack(msgspec.Struct):
     load_contexts: list[BufferLoadBackContext]
 
 
+class _OwnershipCheck(msgspec.Struct):
+    """A load-back's slot-ownership comparison, run on the device and read
+    at the load-back's ack."""
+
+    mismatch: torch.Tensor
+    copied: torch.cuda.Event
+    violation: str
+
+
 class _AnchorLock(msgspec.Struct):
     """Pins a staged prefetch's FULL device anchor until consumption."""
 
@@ -181,7 +192,7 @@ def validate_buffer_only_stack(
     swa_component: Optional[SWAComponent],
     storage_prefetch_threshold: int = 256,
     *,
-    auxiliary_swa_component: Optional[SWAComponent] = None,
+    further_window_components: Sequence[SWAComponent] = (),
 ) -> None:
     """Post-assembly buffer-mode fences.
 
@@ -209,7 +220,7 @@ def validate_buffer_only_stack(
                 f"source={spec.indices_from_pool}, source_slots={source_size}."
             )
     window_pools = []
-    for component in (swa_component, auxiliary_swa_component):
+    for component in (swa_component, *further_window_components):
         if component is None:
             continue
         pool = component._swa_kv_pool_host
@@ -283,11 +294,12 @@ class BufferModePipeline:
         write_backlog_cap: int,
         max_context_len: int = 0,
         *,
-        auxiliary_swa_component: Optional[SWAComponent] = None,
+        further_window_components: Sequence[SWAComponent] = (),
     ):
         self._cache = cache
         self._swa_component = swa_component
-        self._auxiliary_swa_component = auxiliary_swa_component
+        # Window slots beyond the tree's first, each with its own host pool.
+        self._further_window_components = tuple(further_window_components)
         self._swa_tail_only = envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.get()
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
@@ -345,6 +357,8 @@ class BufferModePipeline:
         ] = {}
         self.staged_prefetches: dict[CacheRequestHandle, _StagedPrefetch] = {}
         self.ongoing_buffer_load_back: dict[int, _OngoingBufferLoadBack] = {}
+        # Device-side ownership checks of in-flight load-backs, by ack id.
+        self._ownership_checks: dict[int, _OwnershipCheck] = {}
         # FIFO intents (one per pool of a node) awaiting a D2H slot, and the
         # pools in flight per node (admission to storage ack).
         self.pending_write_queue: deque[_UnifiedBackupIntent] = deque()
@@ -368,7 +382,7 @@ class BufferModePipeline:
     def _swa_components(self):
         return (
             component
-            for component in (self._swa_component, self._auxiliary_swa_component)
+            for component in (self._swa_component, *self._further_window_components)
             if component is not None
         )
 
@@ -615,7 +629,7 @@ class BufferModePipeline:
     @staticmethod
     def _pool_order(pool: PoolName) -> tuple[bool, str]:
         # KV first, then a fixed order: every rank must admit identically.
-        return (pool != PoolName.KV, pool.value)
+        return (pool != PoolName.KV, str(pool))
 
     def _write_intents(
         self, snapshot: BufferBackupSnapshot
@@ -683,8 +697,7 @@ class BufferModePipeline:
             self._queued_span_refs[span] = refs - 1
 
     def begin_insert_walk(self) -> None:
-        """Admit each node once per insert walk: the trigger chains every
-        unbacked ancestor, so a depth-d path is presented d(d+1)/2 times."""
+        """Admit each node once per insert walk, even if the walk's backups repeat it."""
         self._walk_admitted = set()
 
     def end_insert_walk(self) -> None:
@@ -788,14 +801,14 @@ class BufferModePipeline:
         (prepare_prefetch allocates its window here and a failed alloc
         forfeits the whole prefetch), plus a 10% burst absorber mirroring
         live_cap."""
-        window_pages = 0
-        if pool_name == PoolName.SWA and self._swa_component is not None:
-            window_pages = self._swa_component.full_window_pages
-        elif (
-            pool_name == PoolName.AUXILIARY_SWA
-            and self._auxiliary_swa_component is not None
-        ):
-            window_pages = self._auxiliary_swa_component.full_window_pages
+        window_pages = next(
+            (
+                component.full_window_pages
+                for component in self._swa_components()
+                if component.pool_name == pool_name
+            ),
+            0,
+        )
         return max(window_pages * host_pool.page_size, host_pool.size // 10)
 
     def _validate_backup_intent(
@@ -1093,11 +1106,18 @@ class BufferModePipeline:
         # One ack id per write: a node may have several pools in flight.
         self._backup_ack_seq += 1
         ack_id = -(1 << 40) - self._backup_ack_seq
+        shard_kwargs = {}
+        if self._kv_shard_host_pool() is not None:
+            # Logical-page KV sharding: staging slots take the node's page owners.
+            shard_kwargs["start_owner"] = cache.tree_core.rotation_phase_of(
+                snapshot.node_id
+            )
         host_indices = cc.write(
             device_value,
             node_id=ack_id,
             extra_pools=transfers or None,
             flush=False,
+            **shard_kwargs,
         )
         if host_indices is None:
             self._backup_ack_seq -= 1
@@ -1161,7 +1181,7 @@ class BufferModePipeline:
             list(entry.keys_by_pool[PoolName.KV]) if intent.pool == PoolName.KV else []
         )
         prefix_keys = snapshot.prefix_keys
-        if intent.pool in (PoolName.SWA, PoolName.AUXILIARY_SWA):
+        if intent.pool in {c.pool_name for c in self._swa_components()}:
             keys = entry.keys_by_pool[intent.pool]
             skipped_pages = len(snapshot.hash_values) - len(keys)
             if skipped_pages > 0:
@@ -1208,17 +1228,23 @@ class BufferModePipeline:
             )
         return list(merged.values())
 
-    def finish_storage_write_ack(self, operation_id: int) -> None:
+    def finish_storage_write_ack(
+        self, operation_id: int, written_pages: Optional[int] = None
+    ) -> None:
         """Storage ack (rank-synced drain): free the staging and feed each
-        written pool's beliefs unconditionally, keeping admission
-        TP-deterministic under per-rank backend failures."""
+        carried pool's beliefs with the written prefix. ``written_pages`` is
+        the rank-agreed written prefix of the operation's KV chain (None: a
+        write with no KV evidence, every key counts); feeding the same prefix
+        on every rank keeps admission TP-deterministic under per-rank backend
+        failures. The in-flight marks are dropped for the whole span, so an
+        un-backed tail reads as absent until a later write-through covers it."""
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
             return
         beliefs = self._cache.storage_existence_cache
         for pool, keys in entry.keys_by_pool.items():
             pool_beliefs = beliefs.pool(pool)
-            pool_beliefs.add(keys)
+            pool_beliefs.add(keys if written_pages is None else keys[:written_pages])
             pool_beliefs.untrack_inflight(keys)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units
@@ -1303,7 +1329,40 @@ class BufferModePipeline:
             allow_partial=False,
             min_tokens=cache.prefetch_threshold,
             evict_host=cache.evict_host,
+            start_owner=self._prefetch_start_owner(operation.handle),
         )
+
+    def _kv_shard_host_pool(self) -> Optional[PageInterleaveHostPool]:
+        host_pool = self._cache.cache_controller.mem_pool_host.anchor_entry.host_pool
+        return host_pool if isinstance(host_pool, PageInterleaveHostPool) else None
+
+    def _prefetch_start_owner(self, request: CacheRequestHandle) -> Optional[int]:
+        """Logical-page KV sharding: the owner class of the bounce's first page.
+        It continues the owner rotation of the device prefix the fetch extends
+        (UnifiedTreeNode.rotation_base); a new chain starts on the least-full
+        host class."""
+        host_pool = self._kv_shard_host_pool()
+        if host_pool is None:
+            return None
+        tree_core = self._cache.tree_core
+        prefix_tokens = self._prefetch_prefix_ctx[request][0]
+        matched_len, node_id, _ = tree_core.match_full_device_prefix(
+            self.prefetch_prefix_key(request)
+        )
+        base = tree_core.rotation_base_of(node_id) if matched_len else None
+        if base is None:
+            base = host_pool.least_full_class()
+        return base + len(prefix_tokens) // self._cache.page_size
+
+    def _staged_rotation_base(self, f: _StagedPrefetch) -> Optional[int]:
+        """Logical-page KV sharding: the chain rotation base the staged slots'
+        owners imply for the fetched span."""
+        host_pool = self._kv_shard_host_pool()
+        if host_pool is None or f.host_indices is None or not len(f.host_indices):
+            return None
+        first_owner = int(host_pool.placement.owner_of(f.host_indices[:1]))
+        first_page = f.matched_len // self._cache.page_size
+        return (first_owner - first_page) % host_pool.shard_size
 
     def _defer_prefetch_for_host_capacity(
         self, request: CacheRequestHandle, tokens: int
@@ -1475,6 +1534,10 @@ class BufferModePipeline:
     def has_staged(self, request: CacheRequestHandle) -> bool:
         return request in self.staged_prefetches
 
+    def staged_prefix_end(self, request: CacheRequestHandle) -> int:
+        f = self.staged_prefetches.get(request)
+        return 0 if f is None else f.matched_len + f.num_tokens
+
     def prepare_staged_prefetch(self, req: Req) -> bool:
         """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None
@@ -1495,7 +1558,7 @@ class BufferModePipeline:
             is_bigram=self._cache.tree_core.is_eagle,
             cache_salt=f.cache_salt,
         )
-        matched_len, node_id, _ = self._cache.tree_core.match_full_device_prefix(key)
+        matched_len, node_id = self._match_full_device_anchor(key)
         if matched_len < f.matched_len:
             logger.warning(
                 "HiCache staged prefetch deferred req=%s reason=shrunk "
@@ -1507,13 +1570,43 @@ class BufferModePipeline:
             )
             self._refetch_staged(f)
             return False
+        head_end = self._window_head_end(f)
+        if joint_len < head_end:
+            # Only the joint match vouches that the head is still resident: the
+            # hold pins FULL, not SWA.
+            logger.warning(
+                "HiCache staged prefetch deferred req=%s reason=window_head "
+                "joint=%d head_end=%d",
+                req.rid,
+                joint_len,
+                head_end,
+            )
+            self._refetch_staged(f)
+            return False
+        rotation_base = self._staged_rotation_base(f)
+        if (
+            rotation_base is not None
+            and matched_len > 0
+            and self._cache.tree_core.rotation_base_of(node_id) != rotation_base
+        ):
+            # Logical-page KV sharding: the device prefix is now a chain whose
+            # page owners the staged slots do not continue.
+            logger.warning(
+                "HiCache staged prefetch deferred req=%s reason=rotation "
+                "matched=%d tokens=%d",
+                req.rid,
+                matched_len,
+                f.num_tokens,
+            )
+            self._refetch_staged(f)
+            return False
         self._set_request_device_prefix(req, key, matched_len, node_id)
         plan = self._build_staged_prefetch_plan(f, key, matched_len)
         if plan is None:
             self._resolve_device_covered(req)
             return True
+        # Each window's host hit is read off the plan (`window_host_hit_lengths`).
         req.host_hit_length = plan.full_tokens
-        req.swa_host_hit_length = plan.window_tokens(ComponentType.SWA)
         req.mamba_host_hit_length = plan.mamba_slots
         # The device alone serves only this pass's joint match; the rest of the
         # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
@@ -1522,6 +1615,37 @@ class BufferModePipeline:
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = plan
         return True
+
+    def _match_full_device_anchor(self, key: RadixKey) -> tuple[int, NodeId]:
+        """The FULL-only device match of a staged key, with a node ending exactly
+        at it. Admission locks the SWA window ending at that node, and the plan
+        keeps the window's resident rows before the match end; when the match
+        ends inside a longer node, split it there as a joint match would, so the
+        reclaim and allocation that run before publication cannot strip them."""
+        tree_core = self._cache.tree_core
+        matched_len, node_id, node_end = tree_core.match_full_device_prefix(key)
+        if node_end > matched_len:
+            prefix = key[:matched_len]
+            self._cache.match_prefix(MatchPrefixParams(key=prefix))
+            matched_len, node_id, node_end = tree_core.match_full_device_prefix(prefix)
+            assert node_end == matched_len == len(prefix), (
+                f"FULL device anchor not split at {len(prefix)}: "
+                f"matched={matched_len} node_end={node_end}"
+            )
+        return matched_len, node_id
+
+    def _window_head_end(self, f: _StagedPrefetch) -> int:
+        span_end = f.matched_len + f.num_tokens
+        head_end = 0
+        for component in self._swa_components():
+            staged_tokens = sum(
+                len(t.host_indices)
+                for t in f.aux_xfers
+                if t.name == component.pool_name and t.host_indices is not None
+            )
+            if 0 < staged_tokens < component.full_window_pages * self._cache.page_size:
+                head_end = max(head_end, span_end - staged_tokens)
+        return head_end
 
     def _set_request_device_prefix(
         self, req: Req, key: RadixKey, matched_len: int, node_id: NodeId
@@ -1573,12 +1697,20 @@ class BufferModePipeline:
             # The device already covers every pool's remaining demand.
             return None
         return StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, windows, mamba_slots
+            f.operation_id,
+            key,
+            matched_len,
+            full_tokens,
+            windows,
+            mamba_slots,
+            window_sub_pools={
+                ct: self._cache.window_sub_pool_of_slot(ct) for ct in windows
+            },
         )
 
     def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
+        req.matched_window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason="device_covered")
@@ -1754,13 +1886,8 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (
-            req.host_hit_length,
-            req.swa_host_hit_length,
-            req.mamba_host_hit_length,
-        ) == (
+        assert (req.host_hit_length, req.mamba_host_hit_length) == (
             plan.full_tokens,
-            plan.window_tokens(ComponentType.SWA),
             plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 
@@ -1852,9 +1979,15 @@ class BufferModePipeline:
                         cache._apply_cache_action(action)
                 offset += end - start
             component.restore_buffer_mapping(torch.cat(full_parts), window_dev)
+        cache.name_loaded_window_rows_by_owner(state.load_transfers)
 
+        shard_kwargs = {}
+        rotation_base = self._staged_rotation_base(f)
+        if rotation_base is not None:
+            # Logical-page KV sharding: the loaded prefix keeps its slots' owners.
+            shard_kwargs["rotation_base"] = rotation_base
         insert_result = self._insert_loaded_prefix(
-            state, req, plan, prefix_indices=prefix_indices
+            state, req, plan, prefix_indices=prefix_indices, **shard_kwargs
         )
         self.ongoing_buffer_load_back[load_back_id] = state
         match = cache.match_prefix(MatchPrefixParams(key=key))
@@ -1862,40 +1995,65 @@ class BufferModePipeline:
             splice_base:span_end
         ]
         self.release_anchor_lock(request)
-        owned = match.device_prefix_len >= span_end and torch.equal(
-            canonical, device_indices
+        violation = (
+            "HiCache buffer load-back ownership violation "
+            f"req={f.request.rid}: "
+            f"insert prefix_len={insert_result.prefix_len} "
+            f"expected={splice_base}, matched={match.device_prefix_len} "
+            f"span_end={span_end} splice_base={splice_base}; "
+            f"the load-back's H2D may target freed slots"
         )
-        if not owned:
-            # Fail-stop: the insert freed or replaced slots the in-flight H2D
-            # still targets; continuing risks silent KV corruption.
-            raise RuntimeError(
-                "HiCache buffer load-back ownership violation "
-                f"req={f.request.rid}: "
-                f"insert prefix_len={insert_result.prefix_len} "
-                f"expected={splice_base}, matched={match.device_prefix_len} "
-                f"span_end={span_end} splice_base={splice_base}; "
-                f"in-flight H2D targets freed slots"
-            )
+        # Fail-stop before any H2D runs unless the insert appended the whole span.
+        if (
+            insert_result.prefix_len != splice_base
+            or match.device_prefix_len < span_end
+            or len(canonical) != len(device_indices)
+        ):
+            raise RuntimeError(violation)
+        self._check_ownership(load_back_id, canonical, device_indices, violation)
         return len(canonical), match.last_device_node
+
+    def _check_ownership(
+        self,
+        load_back_id: int,
+        canonical: torch.Tensor,
+        device_indices: torch.Tensor,
+        violation: str,
+    ) -> None:
+        """Compare the published rows with the H2D destinations, on CUDA with
+        pinned memory without waiting: the load-back's ack reads the result."""
+        if not device_indices.is_cuda:
+            if not torch.equal(canonical, device_indices):
+                raise RuntimeError(violation)
+            return
+        mismatch = async_d2h((canonical != device_indices).any())
+        copied = torch.cuda.Event()
+        # The H2D waits on start_loading's start_event, recorded later on this stream.
+        copied.record()
+        self._ownership_checks[load_back_id] = _OwnershipCheck(
+            mismatch, copied, violation
+        )
+
+    def _verify_ownership(self, load_back_id: int) -> None:
+        check = self._ownership_checks.pop(load_back_id, None)
+        if check is None:
+            return
+        check.copied.synchronize()
+        if check.mismatch.item():
+            raise RuntimeError(check.violation)
 
     def _ensure_full_capacity(self, load_tokens: int) -> bool:
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
         cache = self._cache
-        if cache.supports_swa():
-            avail = cache.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = cache.token_to_kv_pool_allocator.available_size()
-        if avail < load_tokens:
-            needed = load_tokens - avail
-            cache.evict_for_alloc(EvictParams(num_tokens=needed))
+        allocator = cache.token_to_kv_pool_allocator
+
+        def available() -> int:
             if cache.supports_swa():
-                avail = cache.token_to_kv_pool_allocator.full_available_size()
-            else:
-                avail = cache.token_to_kv_pool_allocator.available_size()
-            if avail < load_tokens:
-                return False
-        return True
+                return allocator.full_available_size()
+            return allocator.available_size()
+
+        return owner_rows_ready(cache, allocator, load_tokens, available)
 
     def _allocate_and_queue_load_back(
         self,
@@ -1952,6 +2110,7 @@ class BufferModePipeline:
         plan: StagedPrefetchPlan,
         *,
         prefix_indices: torch.Tensor,
+        rotation_base: Optional[int] = None,
     ) -> InsertResult:
         # Publish via a plain insert under the admission lock choreography;
         # the caller's request lock then pins the span (load_back pattern).
@@ -1968,6 +2127,7 @@ class BufferModePipeline:
                 component_evicted_seqlens={
                     ct: window.start for ct, window in plan.windows.items()
                 },
+                rotation_base=rotation_base,
                 **insert_fields,
             )
         )
@@ -1985,6 +2145,7 @@ class BufferModePipeline:
         f = self.ongoing_buffer_load_back.pop(ack_id, None)
         if f is None:
             return False
+        self._verify_ownership(ack_id)
         cache = self._cache
         cc = cache.cache_controller
 

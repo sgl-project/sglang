@@ -22,7 +22,7 @@ from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -120,13 +120,19 @@ class _DCPMetadataTests:
         heads, v_head_dim, n = 4, 512, 3 * NUM_DRAFT_TOKENS
         backend = object.__new__(self.backend_cls)
         backend.data_type = backend.q_data_type = torch.bfloat16
+        backend._megakernel = False
 
         def real_path(*args, **kwargs):
             raise _RealVerifyPath
 
         backend.token_to_kv_pool = _routed(SimpleNamespace(set_mla_kv_buffer=real_path))
         backend._run_decode_kernel = real_path
-        layer = SimpleNamespace(layer_id=0, tp_q_head_num=heads, v_head_dim=v_head_dim)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            v_head_dim=v_head_dim,
+            sliding_window_size=-1,
+        )
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
             out_cache_loc=None,

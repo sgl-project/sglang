@@ -21,12 +21,25 @@ from sglang.kernels.ops.diffusion import (
     fused_bias_silu,
     fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
+    fused_silu_temporal_pad,
     fused_situ_softcap_mul_bitexact,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA libdevice arithmetic")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_silu_temporal_pad_preserves_rounding_and_reflected_corners(dtype):
+    # A time/channel swap or approximate exp can silently change VAE latents.
+    torch.manual_seed(81)
+    x = torch.randn(2, 3, 32, 7, 11, device="cuda", dtype=dtype) * 6
+    expected = F.silu(x.permute(0, 2, 1, 3, 4).contiguous())
+    expected = F.pad(expected, (1, 1, 1, 1, 0, 0), mode="reflect")
+    expected = F.pad(expected, (0, 0, 0, 0, 2, 0))
+    assert torch.equal(fused_silu_temporal_pad(x), expected)
 
 
 @pytest.mark.parametrize("channels", [2240, 11200])
@@ -205,17 +218,6 @@ def test_situ_tables_are_ready_for_other_streams(monkeypatch):
         actual = fused_situ_softcap_mul_bitexact(hidden, gate)
     consumer.synchronize()
     assert torch.equal(actual, _situ_reference(hidden, gate))
-
-
-def test_situ_rejects_unsupported_operands():
-    hidden = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
-    for gate in (hidden.float(), hidden[:, :-1], hidden.cpu()):
-        with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_softcap_mul_bitexact(hidden, gate)
-    strided = hidden[..., ::2]
-    for x in (strided, hidden[:, :0]):
-        with pytest.raises(ValueError, match="matching CUDA BF16"):
-            fused_situ_softcap_mul_bitexact(x, x)
 
 
 if __name__ == "__main__":

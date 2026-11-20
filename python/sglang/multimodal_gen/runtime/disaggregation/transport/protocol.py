@@ -26,7 +26,6 @@ class TransferMsgType:
 
     # Registration
     REGISTER = "transfer_register"
-    REGISTER_ACK = "transfer_register_ack"
 
 
 @dataclass

@@ -8,8 +8,8 @@ from torch import nn
 
 from sglang.kernels.ops.embeddings.engram_hash import MODE_EXTEND
 from sglang.srt.layers.engram import EngramHasher
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
     NgramEmbeddingManager,
 )

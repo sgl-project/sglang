@@ -38,6 +38,8 @@ def _manager(
 ) -> NixlKVManager:
     manager = NixlKVManager.__new__(NixlKVManager)
     manager.customized_info_enabled = False
+    manager.exchange_aux_item_lens = False
+    manager.enable_kv_packing = False
     manager.enable_deferred_decode_kv_release = enabled
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
@@ -179,6 +181,7 @@ class TestNixlAbortNotification(
             agent_name = f"decode-{i}"
             manager.prep_handles[agent_name] = f"dst-prep-{i}"
             manager.decode_kv_args_table[agent_name] = SimpleNamespace(
+                unified_layout_error=None,
                 decode_tp_size=1,
                 requires_dcp_relayout=False,
                 kv_xfer_segments=None,

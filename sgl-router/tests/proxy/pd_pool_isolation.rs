@@ -43,6 +43,7 @@ fn config() -> Config {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,
@@ -51,6 +52,7 @@ fn config() -> Config {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            decode_dp_rank_policy: None,
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),

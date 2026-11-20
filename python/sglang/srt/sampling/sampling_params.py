@@ -13,12 +13,15 @@
 # ==============================================================================
 """Sampling parameters for text generation."""
 
+import copy
 import logging
 import math
-from typing import Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
+from sglang.srt.environ import envs
+from sglang.srt.sampling.stop_regex import validate_stop_regex
 from sglang.srt.sampling.watermarking.core import (
     WatermarkRequestConfig,
     normalize_watermark_request,
@@ -41,6 +44,12 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+# 2**64 / golden ratio: a request's samples get seeds far from each other and from
+# the small seeds clients pick by hand.
+_SAMPLE_SEED_STRIDE = 0x9E3779B97F4A7C15
+# The float32 bias is divided by a temperature of at least _SAMPLING_EPS; larger
+# values overflow to inf and NaN the softmax.
+LOGIT_BIAS_ABS_MAX = 1e30
 MAX_STOP_COUNT = 32
 MAX_STOP_REGEX_LEN = 256
 MAX_STOP_REGEX_COUNT = 32
@@ -135,6 +144,15 @@ def set_request_reasoning_in_grammar(sampling_params: Dict, enabled: bool) -> No
     custom_params = dict(sampling_params.get("custom_params") or {})
     custom_params[REQUEST_REASONING_IN_GRAMMAR_KEY] = True
     sampling_params["custom_params"] = custom_params
+
+
+def validate_n(n: Any) -> int:
+    # A negative limit disables the cap, matching the Rust server.
+    max_n = envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.get()
+    if type(n) is not int or n < 1 or 0 <= max_n < n:
+        bound = f"in [1, {max_n}]" if max_n >= 0 else ">= 1"
+        raise ValueError(f"n must be an integer {bound}, got {n!r}.")
+    return n
 
 
 class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
@@ -250,6 +268,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        validate_n(self.n)
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
@@ -293,11 +312,23 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"{self.min_new_tokens}."
                 )
         if self.logit_bias is not None:
-            for token_id in self.logit_bias:
+            for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
+                    )
+                if type(bias) not in (int, float):
+                    finite = False
+                else:
+                    try:
+                        finite = math.isfinite(bias) and abs(bias) <= LOGIT_BIAS_ABS_MAX
+                    except OverflowError:  # int beyond float64
+                        finite = False
+                if not finite:
+                    raise ValueError(
+                        "logit_bias values must be finite numbers with magnitude <= 1e30, "
+                        f"got {bias!r} for token {token_id}."
                     )
         if self.sampling_seed is not None:
             if not isinstance(self.sampling_seed, int):
@@ -372,8 +403,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"stop_regex is {stop_regex_len} bytes, over the "
                         f"{MAX_STOP_REGEX_LEN}-byte limit"
                     )
+                parsed_stop_regex = validate_stop_regex(stop_regex)
                 stop_regex_max_len = max(
-                    stop_regex_max_len, get_max_seq_length(stop_regex)
+                    stop_regex_max_len, _max_length_from_subpattern(parsed_stop_regex)
                 )
 
             self.stop_regex_max_len = stop_regex_max_len
@@ -387,6 +419,22 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
+
+    def for_sample(self, sample_index: int) -> "SamplingParams":
+        """These params for sample `sample_index` of the request's n samples.
+
+        Sample 0 keeps the request's seed, so n=1 is unchanged; the others get seeds
+        of their own, or n samples sharing a seed and prompt would be n copies. The
+        Rust server's `SamplingParams::for_sample` derives the same seeds.
+        """
+        if self.sampling_seed is None or sample_index == 0:
+            return self
+        seed = (self.sampling_seed + sample_index * _SAMPLE_SEED_STRIDE) % (1 << 64)
+        if seed >= 1 << 63:
+            seed -= 1 << 64
+        params = copy.copy(self)
+        params.sampling_seed = seed
+        return params
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need

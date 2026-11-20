@@ -56,6 +56,8 @@ def _commit_reference(history, tokens, slots, commit, live_rows, gate):
 
 def _epilogue_for_accept(*, fused, bs, stride, history):
     epi = dspark_verify.DsparkVerifyEpilogue.__new__(dspark_verify.DsparkVerifyEpilogue)
+    epi._draft_folds_static_commit_cache = False
+    epi._folds_static_commit_cache = None
     z = lambda *shape, dtype: torch.zeros(*shape, dtype=dtype)
     epi.stride, epi.gamma, epi.max_bs = stride, stride - 1, bs
     epi.verify_lens_buf = torch.full((bs,), stride, dtype=torch.int64)
@@ -70,7 +72,7 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
     epi.gated_commit_lens_buf = z(bs, dtype=torch.int32)
     epi.block_accept_lens_buf = torch.full((bs,), -1, dtype=torch.int32)
     epi.simulated_correct_len = None
-    epi.simulate_fold = epi._fused_argmax = False
+    epi.simulate_fold = False
     epi._fused_accept_tail = fused
     epi._accept_tail_bs = (1, 0)
     epi._accept_tail_logged = set()

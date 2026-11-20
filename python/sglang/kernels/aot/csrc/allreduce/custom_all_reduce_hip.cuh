@@ -381,7 +381,9 @@ DINLINE P* get_tmp_buf(volatile Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
-template <typename T, int ngpus>
+// kFixedOrder: stage 1 sums the ranks in order 0..ngpus-1 like cross_device_reduce_1stage, so both
+// kernels give the same bits at every size; otherwise each owner starts the sum at its own rank.
+template <typename T, int ngpus, bool kFixedOrder = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
     RankData* _dp,
     RankSignals sg,
@@ -405,7 +407,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    ptrs[i] = (const P*)_dp->ptrs[kFixedOrder ? i : target];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];

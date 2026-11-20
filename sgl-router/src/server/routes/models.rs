@@ -48,6 +48,7 @@ mod tests {
     async fn lists_configured_model() {
         let mut ctx = crate::server::app_context::AppContext::stub();
         ctx.config.model = crate::config::ModelConfig {
+            aliases: Vec::new(),
             id: "qwen3".into(),
             tokenizer_path: Some("x".into()),
             disable_input_ids_forwarding: false,
@@ -56,6 +57,7 @@ mod tests {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            decode_dp_rank_policy: None,
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),

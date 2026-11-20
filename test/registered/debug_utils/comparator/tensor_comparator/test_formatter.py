@@ -1,19 +1,6 @@
 import sys
-from pathlib import Path
-
-_TEST_ROOT: Path = Path(__file__).resolve().parents[4]
-if str(_TEST_ROOT) not in sys.path:
-    sys.path.insert(0, str(_TEST_ROOT))
 
 import pytest
-from registered.debug_utils.comparator.testing_helpers import (
-    assert_rich_tags_balanced,
-)
-from registered.debug_utils.comparator.testing_helpers import make_diff as _make_diff
-from registered.debug_utils.comparator.testing_helpers import make_stats as _make_stats
-from registered.debug_utils.comparator.testing_helpers import (
-    make_tensor_info as _make_tensor_info,
-)
 
 from sglang.srt.debug_utils.comparator.aligner.axis_aligner import AxisAlignerPlan
 from sglang.srt.debug_utils.comparator.aligner.entrypoint.traced_types import (
@@ -62,6 +49,12 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.comparator_test_utils import (
+    assert_rich_tags_balanced,
+)
+from sglang.test.comparator_test_utils import make_diff as _make_diff
+from sglang.test.comparator_test_utils import make_stats as _make_stats
+from sglang.test.comparator_test_utils import make_tensor_info as _make_tensor_info
 
 register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
 

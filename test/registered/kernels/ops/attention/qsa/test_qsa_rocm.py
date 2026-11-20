@@ -1,6 +1,6 @@
 """ROCm coverage for the QSA packed-varlen decode fallback.
 
-On HIP there is neither flash_attn (FA2) nor flash-attn-4, so
+On HIP there is neither flash_attn (FA2) nor the FA4 CuTe kernels, so
 ``_resolve_flash_attn_varlen_func`` resolves to aiter's FA2-compatible varlen
 kernel. The first two tests are device-independent (fake modules); the last one
 runs the real aiter kernel against a torch reference and only executes on ROCm.
@@ -17,7 +17,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=60, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def _fake_aiter(varlen_func):

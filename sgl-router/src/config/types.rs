@@ -169,6 +169,13 @@ pub enum DpRankPolicy {
     /// The worker's ranks in turn.
     #[value(name = "round_robin")]
     RoundRobin,
+    /// The rank expected to hold the fewest KV tokens by the engine's
+    /// `--load-publish-endpoint` feed: tokens in use plus queued, with every
+    /// request the rank holds charged a typical request's KV. Ties,
+    /// and a worker without a fresh reading for every rank, fall back to
+    /// `least_in_flight`.
+    #[value(name = "least_tokens")]
+    LeastTokens,
 }
 
 /// Role served by a static bucket.
@@ -381,6 +388,9 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
+    /// Extra `model` values rewritten to `id` in the forwarded body (`--model-alias`);
+    /// only `id` is advertised.
+    pub aliases: Vec<String>,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
     pub tokenizer_path: Option<String>,
@@ -394,8 +404,12 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
-    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it.
+    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it;
+    /// in PD mode, the prefill rank.
     pub dp_rank_policy: DpRankPolicy,
+    /// Rank choice under `dp_aware` for the PD decode rank, which no routing key
+    /// or cached prefix ever decides; `None` follows `dp_rank_policy`.
+    pub decode_dp_rank_policy: Option<DpRankPolicy>,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
@@ -419,6 +433,37 @@ pub struct ModelConfig {
     pub sampling_overrides: SamplingOverrides,
     /// Worker `--default-chat-template-kwargs`, applied when rendering.
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
+}
+
+impl ModelConfig {
+    /// The PD decode rank policy: `--decode-dp-rank-policy`, else `--dp-rank-policy`.
+    pub fn decode_dp_rank_policy(&self) -> DpRankPolicy {
+        self.decode_dp_rank_policy.unwrap_or(self.dp_rank_policy)
+    }
+}
+
+impl ModelConfig {
+    /// Canonicalize an alias, preserving an optional LoRA suffix. Match whole
+    /// names before suffixes, then the longest name, so URI colons and aliases
+    /// that extend another alias are not mistaken for adapter separators.
+    pub fn canonical_alias(&self, model: &str) -> Option<String> {
+        if model == self.id {
+            return None;
+        }
+        if self.aliases.iter().any(|alias| alias == model) {
+            return Some(self.id.clone());
+        }
+        let (name, adapter) = std::iter::once(&self.id)
+            .chain(&self.aliases)
+            .filter_map(|name| {
+                model
+                    .strip_prefix(name.as_str())?
+                    .strip_prefix(':')
+                    .map(|adapter| (name, adapter))
+            })
+            .max_by_key(|(name, _)| name.len())?;
+        (name != &self.id).then(|| format!("{}:{adapter}", self.id))
+    }
 }
 
 /// External KV Indexer client settings.
@@ -559,8 +604,9 @@ pub const MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS: u64 = 30_000;
 /// Duration` can overflow and panic.
 pub const MAX_KV_BOOTSTRAP_TIMEOUT_MS: u64 = 3_600_000;
 
-/// Default request header for sticky routing.
-pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
+/// Default request header for sticky routing: the one the engine reads its
+/// routing key from.
+pub const DEFAULT_STICKY_HEADER: &str = sglang_processor::openai::ROUTING_KEY_HEADER;
 
 /// Default request header for session-aware routing.
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";

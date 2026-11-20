@@ -17,10 +17,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
@@ -65,7 +63,7 @@ class UnifiedRadixCacheFixtures:
         req.last_host_node = match.last_host_node
         req.best_match_node = match.best_match_node
         req.host_hit_length = match.host_hit_length
-        req.swa_host_hit_length = match.swa_host_hit_length
+        req.matched_window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.mamba_host_hit_length = match.mamba_host_hit_length
 
     def _make_seq(self, start: int, num_pages: int) -> list[int]:

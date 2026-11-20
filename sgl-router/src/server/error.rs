@@ -35,6 +35,8 @@ enum ErrorClass {
     NoTarget,
     /// 504 — the router gave up waiting (any timeout / deadline).
     Timeout,
+    /// 501 — the path names a feature this router does not provide yet.
+    NotImplemented,
     /// 500 — internal router fault.
     Internal,
 }
@@ -47,6 +49,7 @@ impl ErrorClass {
             ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            ErrorClass::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -183,6 +186,11 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
+    /// An endpoint of a feature this router does not provide yet
+    /// (`/v1/responses/{id}`, `/v1/loads`, ...); `path` is the request path.
+    #[error("{path} is not supported by sgl-router yet")]
+    UnsupportedEndpoint { path: String },
+
     /// A non-OK status from an engine's gRPC server, relayed to a gRPC client unchanged.
     #[error("upstream gRPC status: {0}")]
     UpstreamGrpc(tonic::Status),
@@ -214,6 +222,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
+            ApiError::UnsupportedEndpoint { .. } => ErrorClass::NotImplemented,
             ApiError::UpstreamGrpc(status) => grpc_error_class(status.code()),
             ApiError::Internal(_) => ErrorClass::Internal,
         }
@@ -246,6 +255,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
+            ApiError::UnsupportedEndpoint { .. } => "unsupported_endpoint",
             ApiError::UpstreamGrpc(_) => "upstream_grpc_status",
             ApiError::Internal(_) => "internal_error",
         }
@@ -273,6 +283,7 @@ impl ApiError {
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. }
+            | ApiError::UnsupportedEndpoint { .. }
             | ApiError::UpstreamGrpc(_)
             | ApiError::Internal(_) => None,
         }
@@ -303,10 +314,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.class().status();
         let code = self.error_code();
-        let typ = match status.as_u16() {
-            400..=499 => "invalid_request_error",
-            _ => "server_error",
-        };
+        let typ = crate::protocol::openai_error_type(status.as_u16());
         let message = self.client_message();
         let mut resp = (
             status,
@@ -341,6 +349,7 @@ impl ApiError {
             ErrorClass::NotFound => Code::NotFound,
             ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
             ErrorClass::Timeout => Code::DeadlineExceeded,
+            ErrorClass::NotImplemented => Code::Unimplemented,
             ErrorClass::Internal => Code::Internal,
         };
         router_grpc_status(code, self.error_code(), self.client_message())
@@ -422,7 +431,8 @@ impl ApiError {
             }
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
-            | ApiError::SamplingContract { .. } => self.to_string(),
+            | ApiError::SamplingContract { .. }
+            | ApiError::UnsupportedEndpoint { .. } => self.to_string(),
             ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
     }
@@ -802,6 +812,15 @@ mod tests {
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
                 "worker_misconfigured",
+                None,
+            ),
+            (
+                "unsupported endpoint",
+                ApiError::UnsupportedEndpoint {
+                    path: "/v1/loads".into(),
+                },
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported_endpoint",
                 None,
             ),
             (
