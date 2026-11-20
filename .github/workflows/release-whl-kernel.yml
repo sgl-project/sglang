@@ -18,7 +18,7 @@ on:
           - 'cu130'
           - 'rocm720'
           - 'rocm1000'
-          - 'musa43'
+          - 'musa52'
       tag_name:
         description: "Version number, must be in the form of vX.Y.Z (e.g. v0.4.0)"
         type: string
@@ -326,15 +326,15 @@ jobs:
           git commit -m "update whl index"
           git push
 
-  build-musa43:
+  build-musa52:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'musa43')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'musa52')
     runs-on: kernel-build-node-musa
     strategy:
       matrix:
-        python-version: ["3.10"]
-        musa-version: ["43"]
+        python-version: ["3.12"]
+        musa-version: ["52"]
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
       # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
@@ -390,8 +390,8 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-musa${{ matrix.musa-version }}
           path: python/sglang/kernels/aot/dist/*
 
-  release-musa43:
-    needs: build-musa43
+  release-musa52:
+    needs: build-musa52
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -430,7 +430,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --musa 43
+        run: python3 scripts/update_kernel_whl_index.py --musa 52
 
       - name: Push wheel index
         run: |
