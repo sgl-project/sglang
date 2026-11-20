@@ -50,6 +50,8 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     SchedulerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -192,6 +194,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
     obj.rid = rid
     obj.stream = False
     obj.return_logprob = False
+    obj.return_routed_experts = False
     obj.lora_path = None
     obj.log_metrics = False
     return ReqState(
@@ -527,6 +530,105 @@ class TestAbortOutputPayload(CustomTestCase):
                 out = state.out_list[0]
                 self.assertEqual(out["output_ids"], expected)
                 self.assertEqual(out["meta_info"]["completion_tokens"], 3)
+
+    def test_abort_with_routed_experts_returns_no_output(self):
+        """An abort echo has no routed-experts rows, so a request that asked
+        for them gets no output tokens and no output logprobs either."""
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_routed_experts_rid"
+        state = _make_req_state(rid)
+        state.obj.return_routed_experts = True
+        state.obj.return_logprob = True
+        state.obj.top_logprobs_num = 0
+        state.obj.token_ids_logprob = None
+        state.obj.return_text_in_logprobs = False
+        state.output_ids = [5, 6, 7]
+        state.output_token_logprobs_val = [-0.1, -0.2, -0.3]
+        state.output_token_logprobs_idx = [5, 6, 7]
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        out = state.out_list[0]
+        self.assertEqual(out["output_ids"], [])
+        self.assertEqual(out["text"], "")
+        meta = out["meta_info"]
+        self.assertEqual(meta["completion_tokens"], 0)
+        self.assertEqual(meta["routed_experts"], "")
+        self.assertEqual(meta["output_token_logprobs"], [])
+        self.assertEqual(meta["output_token_logprobs_length"], 0)
+
+    def test_abort_with_routed_experts_returns_no_flat_output_top_logprobs(self):
+        """With flat raw output top logprobs, the blanked echo describes 0 rows."""
+        for b64 in (False, True):
+            with self.subTest(b64=b64):
+                tm = _make_tokenizer_manager(self)
+                rid = f"abort_routed_experts_flat_rid_{b64}"
+                state = _make_req_state(rid)
+                state.obj.return_routed_experts = True
+                state.obj.return_logprob = True
+                state.obj.top_logprobs_num = 2
+                state.obj.token_ids_logprob = None
+                state.obj.return_text_in_logprobs = False
+                state.obj.return_flat_raw_top_logprobs = False
+                state.obj.return_flat_raw_output_top_logprobs = True
+                state.obj.return_flat_raw_top_logprobs_b64 = b64
+                state.output_ids = [5, 6, 7]
+                state.output_token_logprobs_val = [-0.1, -0.2, -0.3]
+                state.output_token_logprobs_idx = [5, 6, 7]
+                state.output_top_logprobs_val = [[-0.1, -2.0]] * 3
+                state.output_top_logprobs_idx = [[5, 9]] * 3
+                tm.rid_to_state[rid] = state
+
+                tm._handle_abort_req(_make_abort_req(rid))
+
+                meta = state.out_list[0]["meta_info"]
+                self.assertEqual(meta["completion_tokens"], 0)
+                self.assertEqual(meta["output_top_logprobs_shape"], [0, 2])
+                self.assertEqual(meta["output_top_logprobs_null_prefix"], 0)
+                suffix = "_flat_b64" if b64 else "_flat"
+                empty = "" if b64 else []
+                self.assertEqual(meta[f"output_top_logprobs_val{suffix}"], empty)
+                self.assertEqual(meta[f"output_top_logprobs_idx{suffix}"], empty)
+
+    def test_blanked_abort_echo_reports_weight_versions_of_no_tokens(self):
+        """The weight versions of a blanked echo describe the 0 returned tokens."""
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_routed_experts_versions_rid"
+        state = _make_req_state(rid)
+        state.obj.return_routed_experts = True
+        state.output_ids = [5, 6, 7]
+        tm.rid_to_state[rid] = state
+        abort = _make_abort_req(rid)
+        abort.weight_versions = [
+            WeightVersionSpan(version="v1", start=0, end=2),
+            WeightVersionSpan(version="v2", start=2, end=3),
+        ]
+
+        tm._handle_abort_req(abort)
+
+        meta = state.out_list[0]["meta_info"]
+        self.assertEqual(meta["completion_tokens"], 0)
+        self.assertEqual(
+            meta["weight_versions"], [{"version": "v1", "start": 0, "end": 0}]
+        )
+        self.assertEqual(meta["weight_version"], "v1")
+
+    def test_streaming_abort_with_routed_experts_keeps_tokens(self):
+        """A streaming client has already received the tokens; the final abort
+        chunk is not blanked."""
+        tm = _make_tokenizer_manager(self)
+        rid = "abort_routed_experts_stream_rid"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.obj.return_routed_experts = True
+        state.output_ids = [5, 6, 7]
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertEqual(state.out_list[0]["meta_info"]["completion_tokens"], 3)
+        self.assertNotIn("routed_experts", state.out_list[0]["meta_info"])
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
@@ -1637,7 +1739,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
                 input_ids=[1],
                 mm_inputs=None,
                 time_stats=tm.rid_to_state[req.rid].time_stats,
-                sampling_params=SimpleNamespace(max_new_tokens=4),
+                sampling_params=SamplingParams(max_new_tokens=4),
             )
         )
         sent = asyncio.Queue()
@@ -1835,6 +1937,73 @@ class TestChatDisconnectAbort(CustomTestCase):
             asyncio.run(drive())
 
         self.assertEqual(sent_chunks, [])
+        sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
+        self.assertEqual([m.rid for m in sent], [state.obj.rid])
+        self.assertTrue(state.abort_sent)
+
+    def _make_streaming_state(self, tm, rid):
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.obj.background = False
+        state.dispatched = True
+        tm.rid_to_state[rid] = state
+        return state
+
+    @staticmethod
+    async def _next_chunk(stream, state, i):
+        state.out_list.append({"text": f"token{i}", "meta_info": {}})
+        state.event.set()
+        return await anext(stream)
+
+    def test_stream_polls_disconnect_once_per_wait_timeout(self):
+        """A stream must not poll is_disconnected() for every output.
+
+        Each poll costs an event-loop pass; polling per output cut 8k/1k
+        concurrency-256 streaming throughput by 10-25%.
+        """
+        tm = _make_tokenizer_manager(self)
+        state = self._make_streaming_state(tm, "stream_poll_rid")
+        request = Mock()
+        request.is_disconnected = AsyncMock(return_value=False)
+
+        async def drive():
+            stream = tm._stream_one_response(
+                obj=state.obj, state=state, request=request
+            )
+            for i in range(8):
+                await self._next_chunk(stream, state, i)
+            await stream.aclose()
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 3600
+        ):
+            asyncio.run(drive())
+        request.is_disconnected.assert_awaited_once()
+
+    def test_stream_polls_again_once_wait_timeout_elapses(self):
+        """A stream that keeps producing outputs still aborts when a later
+        poll finds its client gone."""
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        tm.server_args.tokenizer_worker_num = 1
+        state = self._make_streaming_state(tm, "stream_repoll_rid")
+        request = Mock()
+        request.is_disconnected = AsyncMock(side_effect=[False, True])
+
+        async def drive():
+            stream = tm._stream_one_response(
+                obj=state.obj, state=state, request=request
+            )
+            await self._next_chunk(stream, state, 0)
+            await asyncio.sleep(0.01)
+            await self._next_chunk(stream, state, 1)
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager._REQUEST_STATE_WAIT_TIMEOUT", 0.001
+        ):
+            with self.assertRaisesRegex(ValueError, "type 3"):
+                asyncio.run(drive())
+        self.assertEqual(request.is_disconnected.await_count, 2)
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertEqual([m.rid for m in sent], [state.obj.rid])
         self.assertTrue(state.abort_sent)

@@ -11,13 +11,19 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.sampling import can_softmax_sample
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.sampling import softmax_sample as sampling_softmax_sample
 from sglang.kernels.ops.speculative.cache_locs import (
     fill_front_out_cache_loc_func,
     generate_draft_decode_window_kv_indices,
 )
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func,
+)
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    RecurrentCommitIO,
+    SupportsRecurrentCommit,
 )
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
@@ -29,6 +35,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import built_megakernel
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
@@ -51,7 +58,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -228,6 +235,18 @@ def renorm_draft_probs(
     return sampling_softmax(next_token_logits, temperatures=sampling_info.temperatures)
 
 
+def use_fused_draft_sample(vocab_size: int) -> bool:
+    """Whether `sample_draft_proposal(..., fused=True)` applies: opted in
+    (SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE), not deterministic inference (seeded draws),
+    Gumbel sampling on, and a device / vocabulary `softmax_sample` serves."""
+    return (
+        envs.SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE.get()
+        and not get_exec().deterministic.enable_deterministic_inference
+        and envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get()
+        and can_softmax_sample(vocab_size)
+    )
+
+
 def sample_draft_proposal(
     next_token_logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -236,6 +255,7 @@ def sample_draft_proposal(
     sampling_seed: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     draft_step: int = 0,
+    fused: bool = False,
 ):
     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
 
@@ -257,6 +277,9 @@ def sample_draft_proposal(
     (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
     which is what greedy means. Drop that renorm and this stops holding.
     """
+    if fused:
+        # One fused kernel; callers pass the `use_fused_draft_sample` decision.
+        return sampling_softmax_sample(next_token_logits, temperatures, top_ks=top_ks)
     probs = sampling_softmax(next_token_logits, temperatures=temperatures)
     topk_p, topk_index = fast_sample(
         probs,
@@ -279,6 +302,28 @@ def sample_draft_proposal(
         topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
         topk_p = probs.gather(1, topk_index)
     return probs, topk_p, topk_index
+
+
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Map reduced-vocabulary probabilities onto target token ids.
+
+    ``hot_token_id`` maps the draft head's columns to target vocabulary columns.
+    Columns outside the hot vocabulary have zero probability. The result is fp32,
+    and the caller owns it independently of later calls.
+    """
+    out = torch.zeros(
+        (*draft_probs.shape[:-1], target_vocab_size),
+        dtype=torch.float32,
+        device=draft_probs.device,
+    )
+    # hot_token_id must contain unique target IDs.
+    # index_copy_ accepts the 1-D vocabulary map directly.
+    out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
+    return out
 
 
 # Simulate acceptance length for benchmarking purposes
@@ -979,10 +1024,11 @@ def _draft_without_cp(tp_context):
 
 
 def spec_stage_span(name: str):
-    """Profiler span for a coarse speculative-decoding stage (``draft`` /
-    ``draft_extend`` / ``verify``).
+    """Profiler span for a coarse speculative-decoding draft stage (``draft`` /
+    ``draft_extend``). The target verify forward is covered by the ``step[VERIFY ...]``
+    span in ``ModelRunner.forward``.
     """
-    return profile_range(name)
+    return forward_nvtx_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
@@ -1105,6 +1151,9 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     inside forward isolation, so it must not mutate req/pool state.
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
+        return
+    if not batch.token_to_kv_pool_allocator.state.tracks_decode_state:
+        batch.mamba_track_indices = batch.mamba_track_mask = None
         return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
@@ -1231,6 +1280,39 @@ def commit_mamba_states_after_verify(
         )
     else:
         last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
+
+    built = built_megakernel(model_runner.model)
+    if isinstance(built, SupportsRecurrentCommit):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            commit_ple_states_after_verify,
+        )
+
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        working = state_slots.working[:bs]
+        track = None if batch.mamba_track_indices is None else state_slots.track[:bs]
+        io = RecurrentCommitIO(
+            state_slots=working,
+            track_slots=track,
+            request_rows=batch.req_pool_indices[:bs],
+            accept_lens=accept_lens,
+            last_step=last_correct_step_indices,
+            track_steps=mamba_steps_to_track,
+            draft_token_num=draft_token_num,
+            src_indices_raw=src_indices_raw,
+        )
+        if built.commit_recurrent_state(io):
+            commit_ple_states_after_verify(
+                model_runner.token_to_kv_pool.layer_router,
+                working,
+                last_correct_step_indices,
+                track,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            return
 
     replay_state_indices = replay_track_indices = None
     if mamba_pool is not None and (
@@ -1396,7 +1478,10 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    if (
+        get_exec().mamba.enable_mamba_extra_buffer_lazy
+        and batch.token_to_kv_pool_allocator.state.tracks_decode_state
+    ):
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),

@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
 )
 from sglang.srt.arg_groups.argparse_actions import LoRAPathAction
+from sglang.srt.arg_groups.choices import LORA_BACKEND_CHOICES
 from sglang.srt.lora.lora_registry import LoRARef
 
 SUPPORTED_LORA_TARGET_MODULES = [
@@ -101,7 +102,7 @@ class Lora(msgspec.Struct):
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=["triton", "csgmv", "ascend", "torch_native", "triton_v2"],
+            choices=LORA_BACKEND_CHOICES,
         ),
     ] = "csgmv"
     max_lora_chunk_size: A[

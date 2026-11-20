@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeStore,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -139,6 +140,8 @@ def _make_mooncake_store(binding):
     st.split_factor = 0
     st._use_group_semantics = False
     st.enable_storage_metrics = False
+    st.unified_suffixes = None
+    st.unified_chunk_spans = None
     return st
 
 
@@ -584,7 +587,7 @@ def _make_v2_store(binding, sizes=None):
     return st
 
 
-class TestMooncakeStoreReceiptValidation(unittest.TestCase):
+class TestMooncakeStoreReceiptValidation(CustomTestCase):
     """Fault injection on the zero-copy get receipt path.
 
     The hit flags these APIs return are what the HiCache controller consumes
@@ -652,6 +655,15 @@ class TestMooncakeStoreReceiptValidation(unittest.TestCase):
         self.assertEqual(
             store.batch_get_v1(["p0", "p1"], host_indices=object()), [True, False]
         )
+
+    def test_unified_v1_missing_receipt_cannot_truncate_page_groups(self):
+        """An incomplete receipt vector must never count a partial page as a hit."""
+        binding = _ReceiptBinding([[4096, 4096, 4096]])
+        store = _make_v1_store(binding)
+        store.unified_suffixes = ["k", "v"]
+
+        with self.assertRaises(ValueError):
+            store.batch_get_v1(["p0", "p1"], host_indices=object())
 
     def test_f3_retry_after_short_read_reaches_transfer_layer(self):
         # A short read must leave no positive mark that a retry could be

@@ -5,7 +5,8 @@
 One Triton program per query token: the heads are padded into a 16-row MMA tile
 rather than into the grid, the online softmax stays in registers, and ``V`` is
 read as ``kv[:, :d_v]``, so there are no partials and no merge pass.
-``dsa/triton_sparse_mla.py`` is the gfx950-only FP8 sibling of this bf16 module.
+``dsa/triton_sparse_mla.py`` is the ROCm sibling of this bf16 module; it takes FP8 and
+BF16 KV on gfx942 and gfx950.
 
 Interface matches ``sglang.kernels.ops.attention.flash_mla_interface.flash_mla_sparse_fwd``::
 

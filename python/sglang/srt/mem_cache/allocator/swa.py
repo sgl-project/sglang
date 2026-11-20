@@ -1,5 +1,5 @@
 import logging
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -151,6 +151,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        self.supports_fused_decode_write = (
+            type(self) is SWATokenToKVPoolAllocator
+            and not self._swa_req_ring
+            and self.full_attn_allocator.supports_fused_decode_write
+            and self.swa_attn_allocator.supports_fused_decode_write
+            and getattr(type(kvcache), "translate_loc_from_full_to_swa", None)
+            is SWAKVPool.translate_loc_from_full_to_swa
+        )
 
     @property
     def swa_req_ring(self) -> bool:
@@ -442,9 +453,18 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
+        last_loc: Optional[torch.Tensor],  # last_loc for full layers
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         assert self.page_size > 1
+        if req_to_token_write is not None:
+            return self.full_attn_allocator.alloc_decode(
+                seq_lens,
+                seq_lens_cpu,
+                None,
+                req_to_token_write=req_to_token_write,
+                swa=(self.swa_attn_allocator, self.full_to_swa_index_mapping),
+            )
         if self._swa_req_ring:
             # See alloc_extend: slot-addressed ring, so full-attention KV only.
             return self.full_attn_allocator.alloc_decode(
