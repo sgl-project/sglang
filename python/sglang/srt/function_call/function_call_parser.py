@@ -245,15 +245,24 @@ class FunctionCallParser:
         """
         if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
-        final_normal_text = ""
-        final_calls = []
-
         sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
+        final_normal_text = sp_result.normal_text
+        final_calls = list(sp_result.calls)
+        # A chunk can hold more than one step of work for the detector, such
+        # as a whole call or several calls (batched detokenization,
+        # stream_interval > 1, speculative decoding). Detectors handle one
+        # step per call, so keep stepping until one makes no progress.
+        while True:
+            buffer = self.detector._buffer
+            sp_result = self.detector.parse_streaming_increment("", self.tools)
+            if not (
+                sp_result.normal_text
+                or sp_result.calls
+                or self.detector._buffer != buffer
+            ):
+                break
+            final_normal_text += sp_result.normal_text
             final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
 
         return final_normal_text, final_calls
 
