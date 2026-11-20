@@ -33,7 +33,6 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = Backend.TC_PIECEWISE
-        runner.has_mha_companion_layers = False
         runner.prefer_eager_mixed_prefill = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]

@@ -30,6 +30,10 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    PrefillAttentionBreaks,
+    PrefillAttentionState,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -381,7 +385,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def _load_static_batch(self, *, mm_input_embeds=None, captured_attn_states=()):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
@@ -397,15 +401,14 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
         runner.backend = SimpleNamespace()
-        runner.has_mha_companion_layers = False
         runner._prefill_static_buffers = None
         runner.static_draft_hidden_states = None
         runner.capture_return_pooled_hidden_states = False
         runner._next_token_logits_buffer = lambda _rows: None
         runner._prefill_logits_buffer_rows = lambda _batch: 1
         runner._prepare_forward_metadata_for_replay = lambda *_args: None
+        runner._captured_attn_states = frozenset(captured_attn_states)
 
-        mm_input_embeds = torch.randn(3, 8)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=1,
@@ -429,8 +432,39 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner_ids.bind_own_plan(forward_batch)
 
         static_batch, _ = runner.load_batch(forward_batch)
+        return static_batch
 
+    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+        mm_input_embeds = torch.randn(3, 8)
+        static_batch = self._load_static_batch(mm_input_embeds=mm_input_embeds)
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+
+    def test_breakable_capture_detects_mha_companion_breaks(self):
+        """Prefix gating follows the layers that broke, not the fields they set."""
+        mla, mha = object(), object()
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.mha_companion_layers = [None, mha]
+        for broken_layers, expected in (({mla}, False), ({mla, mha}, True)):
+            runner._publish_attention_breaks(
+                PrefillAttentionBreaks(
+                    states={PrefillAttentionState()}, layers=broken_layers
+                )
+            )
+            self.assertIs(runner._captured_mha_companion, expected)
+            self.assertEqual(runner._breakable_attn_state, PrefillAttentionState())
+
+    def test_breakable_replay_restores_the_captured_attention_state(self):
+        """Replay sees exactly the captured state: none for MLA, MHA's for MHA."""
+        mha = PrefillAttentionState(
+            mha_one_shot=True, mha_return_lse=False, attn_attend_prefix_cache=False
+        )
+        for captured, expected in (
+            ((), PrefillAttentionState()),
+            ({PrefillAttentionState()}, PrefillAttentionState()),
+            ({mha}, mha),
+        ):
+            static_batch = self._load_static_batch(captured_attn_states=captured)
+            self.assertEqual(PrefillAttentionState.of(static_batch), expected)
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
@@ -636,7 +670,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_context_size = None
         runner.max_seq_len = None
         runner._capture_chunked_prefix = False
-        runner.has_mha_companion_layers = False
 
         batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -705,7 +738,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_seq_len = None
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.FULL
-        runner.has_mha_companion_layers = False
         runner._prefix_chunk_len = 2
         runner._prefix_capture_variants = (1, 2, 4)
 

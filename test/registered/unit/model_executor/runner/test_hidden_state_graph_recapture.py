@@ -67,7 +67,6 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
         runner.prefill_backend_name = Backend.BREAKABLE
-        runner.has_mha_companion_layers = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.capture_hidden_mode = capture_hidden_mode
