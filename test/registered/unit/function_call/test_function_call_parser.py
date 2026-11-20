@@ -16,6 +16,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
@@ -1565,21 +1566,11 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
-    def test_parse_streaming_two_complete_calls_in_one_increment(self):
-        """Two complete calls in one increment stream in order, the first one included."""
-        text = (
-            "<｜tool▁calls▁begin｜>"
-            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
-            '```json\n{"city": "Paris"}\n```<｜tool▁call▁end｜>'
-            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n"
-            '```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜>'
-            "<｜tool▁calls▁end｜>"
-        )
-
+    def _assert_two_buffered_calls_stream_in_order(self, detector, text):
         # Each step emits one name or one argument diff; step until one emits nothing.
-        calls = list(self.detector.parse_streaming_increment(text, self.tools).calls)
+        calls = list(detector.parse_streaming_increment(text, self.tools).calls)
         for _ in range(4):
-            step = self.detector.parse_streaming_increment("", self.tools).calls
+            step = detector.parse_streaming_increment("", self.tools).calls
             if not step:
                 break
             calls += step
@@ -1590,6 +1581,30 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(names, ["get_weather", "get_tourist_attractions"])
         self.assertEqual(args, [{"city": "Paris"}, {"city": "Tokyo"}])
         self.assertEqual(indices, [0, 0, 1, 1])
+
+    def test_parse_streaming_two_complete_calls_in_one_increment(self):
+        """Two complete calls in one increment stream in order, the first one included."""
+        self._assert_two_buffered_calls_stream_in_order(
+            self.detector,
+            "<｜tool▁calls▁begin｜>"
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            '```json\n{"city": "Paris"}\n```<｜tool▁call▁end｜>'
+            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n"
+            '```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜>'
+            "<｜tool▁calls▁end｜>",
+        )
+
+    def test_v31_parse_streaming_two_complete_calls_in_one_increment(self):
+        """The same for the V3.1 format, whose call has no type or code fence."""
+        self._assert_two_buffered_calls_stream_in_order(
+            DeepSeekV31Detector(),
+            "<｜tool▁calls▁begin｜>"
+            '<｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Paris"}'
+            "<｜tool▁call▁end｜>"
+            "<｜tool▁call▁begin｜>get_tourist_attractions<｜tool▁sep｜>"
+            '{"city": "Tokyo"}<｜tool▁call▁end｜>'
+            "<｜tool▁calls▁end｜>",
+        )
 
 
 class TestDeepSeekV32Detector(unittest.TestCase):
