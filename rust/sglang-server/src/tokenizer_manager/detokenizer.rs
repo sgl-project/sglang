@@ -85,15 +85,20 @@ pub enum DetokenizerBackend {
 
 impl DetokenizerBackend {
     /// Mint a per-request decoder, or `None` in skip mode (the shard passes the
-    /// token ids through untouched instead of decoding text).
-    fn new_decoder(&self, skip_special_tokens: bool) -> Option<Box<dyn StreamDecoder>> {
+    /// token ids through untouched instead of decoding text). `prompt_tail_ids`
+    /// seeds the stream with the prompt's trailing tokens so the first output
+    /// token keeps its leading space (see [`DetokMsg::SeedPromptTail`]); at
+    /// `Register` time a text prompt has no `input_ids` yet, so the seed
+    /// arrives later and re-mints the decoder — `&[]` here is only the
+    /// pre-seed placeholder.
+    fn new_decoder(
+        &self,
+        prompt_tail_ids: &[u32],
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn StreamDecoder>> {
         match self {
-            // NOTE: the stream is seeded with an empty prompt context, which is
-            // correct for the common case. Seeding with the prompt's trailing
-            // tokens (for perfect first-token spacing) would require Register to
-            // carry input_ids — deferred.
             DetokenizerBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
-                stream: t.decode_stream(&[], skip_special_tokens),
+                stream: t.decode_stream(prompt_tail_ids, skip_special_tokens),
             })),
             DetokenizerBackend::Skip => None,
         }
@@ -204,11 +209,28 @@ impl Runnable for DetokenizerWorker {
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
-                            decoder: self.backend.new_decoder(skip_special_tokens),
+                            decoder: self.backend.new_decoder(&[], skip_special_tokens),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
                     );
+                }
+                // Prompt-tail seed for the decoder (see `DetokMsg::SeedPromptTail`).
+                // Only before the first chunk: once streaming, the decoder has
+                // already emitted text and replacing it would rewrite it. An
+                // unknown rid (raced with an abort's Deregister) is a no-op.
+                DetokMsg::SeedPromptTail {
+                    rid,
+                    prompt_tail_ids,
+                    skip_special_tokens,
+                } => {
+                    if let Some(st) = table.get_mut(&rid)
+                        && matches!(st.fsm, RequestState::Queued)
+                    {
+                        st.decoder = self
+                            .backend
+                            .new_decoder(&prompt_tail_ids, skip_special_tokens);
+                    }
                 }
                 // One decode step's chunks for this shard, batched by from-scheduler.
                 DetokMsg::Chunks(evs) => {
@@ -711,7 +733,7 @@ mod tests {
                     sink: ResponseSink::Local(tx),
                     decode_logprob_text: false,
                     no_stop_trim,
-                    decoder: backend.new_decoder(skip_special_tokens),
+                    decoder: backend.new_decoder(&[], skip_special_tokens),
                     fsm: RequestState::Queued,
                 },
             );
@@ -757,5 +779,153 @@ mod tests {
         let out = final_chunk(false, fr, vec![1, 2, 3]);
         assert_eq!(out.token_ids, vec![1, 2, 3]);
         assert!(!out.stop_token_trimmed);
+    }
+
+    /// The checked-in Llama-2-style (SentencePiece) fixture tokenizer
+    /// (`testdata/sentencepiece_tokenizer/`): a WordLevel vocab over the exact
+    /// words these tests use, with the same `Strip(" ", 1, 0)` decoder tail as
+    /// the real Llama-2 tokenizer — so the regression test runs in CI with no
+    /// model download. Returns the tokenizer, the prompt's trailing ids, and
+    /// the output ids for " Paris. It is known for the Eiffel Tower.".
+    fn sentencepiece_fixture() -> (sglang_processor::DynamoTokenizer, Vec<u32>, Vec<i64>) {
+        use crate::message::detok::PROMPT_TAIL_LEN;
+        use sglang_processor::TextTokenizer;
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/sentencepiece_tokenizer"
+        );
+        let tok = sglang_processor::DynamoTokenizer::load(dir, None).unwrap();
+        let prompt_ids = tok.encode("The capital of France is", true).unwrap();
+        let tail: Vec<u32> = prompt_ids
+            .iter()
+            .rev()
+            .take(PROMPT_TAIL_LEN)
+            .rev()
+            .map(|&id| id as u32)
+            .collect();
+        let ids: Vec<i64> = tok
+            .encode(" Paris. It is known for the Eiffel Tower.", false)
+            .unwrap()
+            .iter()
+            .map(|&id| id as i64)
+            .collect();
+        (tok, tail, ids)
+    }
+
+    /// Regression test for sgl-project/sglang#51029: with `SGLANG_RUST_SERVER=1`
+    /// the generated text dropped the leading space of the first output token
+    /// for Llama-2-style (SentencePiece) tokenizers, whose decoder strips one
+    /// leading space. Seeding the decode stream with the prompt's trailing
+    /// tokens — as the Python frontend does — keeps it: prompt
+    /// "The capital of France is", output ids decode to
+    /// " Paris. It is known for the Eiffel Tower.".
+    #[test]
+    fn first_token_keeps_its_leading_space() {
+        use crate::message::finish_reason::{FinishKind, FinishReason};
+        use crate::utils::runtime::Runnable;
+        let (tok, tail, ids) = sentencepiece_fixture();
+        let backend = DetokenizerBackend::Dynamo(tok.tokenizer().clone());
+        let (msg_tx, msg_rx) = flume::unbounded::<DetokMsg>();
+        let (abort_tx, _abort_rx) = flume::unbounded::<AbortSource>();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<ResponseItem>(64);
+        msg_tx
+            .send(DetokMsg::Register {
+                rid: Rid::from("r"),
+                sink: ResponseSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                skip_special_tokens: true,
+            })
+            .unwrap();
+        // The prompt tail intake seeds once the prompt is tokenized.
+        msg_tx
+            .send(DetokMsg::SeedPromptTail {
+                rid: Rid::from("r"),
+                prompt_tail_ids: tail,
+                skip_special_tokens: true,
+            })
+            .unwrap();
+        for (i, &id) in ids.iter().enumerate() {
+            let finish = (i + 1 == ids.len()).then(|| {
+                FinishReason::from(FinishKind::Length {
+                    length: Some(ids.len() as u64),
+                })
+            });
+            msg_tx
+                .send(DetokMsg::Chunks(vec![ChunkEvent {
+                    rid: Rid::from("r"),
+                    token_ids: vec![id],
+                    finish_reason: finish,
+                    ..Default::default()
+                }]))
+                .unwrap();
+        }
+        drop(msg_tx);
+        DetokenizerWorker::new(0, msg_rx, backend, abort_tx).run();
+        let mut text = String::new();
+        while let Ok(ResponseItem::Frame(ev) | ResponseItem::Done(ev)) = sink_rx.try_recv() {
+            text.push_str(&ev.text);
+        }
+        assert_eq!(text, " Paris. It is known for the Eiffel Tower.");
+    }
+
+    /// A seed that arrives once the request is streaming is ignored: the first
+    /// token was already decoded without context, and replacing the decoder
+    /// mid-stream would rewrite text the client already saw.
+    #[test]
+    fn late_seed_is_ignored_once_streaming() {
+        use crate::message::finish_reason::{FinishKind, FinishReason};
+        use crate::utils::runtime::Runnable;
+        let (tok, tail, ids) = sentencepiece_fixture();
+        let backend = DetokenizerBackend::Dynamo(tok.tokenizer().clone());
+        let (msg_tx, msg_rx) = flume::unbounded::<DetokMsg>();
+        let (abort_tx, _abort_rx) = flume::unbounded::<AbortSource>();
+        let (sink_tx, mut sink_rx) = mpsc::channel::<ResponseItem>(64);
+        msg_tx
+            .send(DetokMsg::Register {
+                rid: Rid::from("r"),
+                sink: ResponseSink::Local(sink_tx),
+                decode_logprob_text: false,
+                no_stop_trim: false,
+                skip_special_tokens: true,
+            })
+            .unwrap();
+        // First chunk before any seed: the token decodes alone, space stripped.
+        msg_tx
+            .send(DetokMsg::Chunks(vec![ChunkEvent {
+                rid: Rid::from("r"),
+                token_ids: vec![ids[0]],
+                ..Default::default()
+            }]))
+            .unwrap();
+        msg_tx
+            .send(DetokMsg::SeedPromptTail {
+                rid: Rid::from("r"),
+                prompt_tail_ids: tail,
+                skip_special_tokens: true,
+            })
+            .unwrap();
+        for (i, &id) in ids.iter().enumerate().skip(1) {
+            let finish = (i + 1 == ids.len()).then(|| {
+                FinishReason::from(FinishKind::Length {
+                    length: Some(ids.len() as u64),
+                })
+            });
+            msg_tx
+                .send(DetokMsg::Chunks(vec![ChunkEvent {
+                    rid: Rid::from("r"),
+                    token_ids: vec![id],
+                    finish_reason: finish,
+                    ..Default::default()
+                }]))
+                .unwrap();
+        }
+        drop(msg_tx);
+        DetokenizerWorker::new(0, msg_rx, backend, abort_tx).run();
+        let mut text = String::new();
+        while let Ok(ResponseItem::Frame(ev) | ResponseItem::Done(ev)) = sink_rx.try_recv() {
+            text.push_str(&ev.text);
+        }
+        assert_eq!(text, "Paris. It is known for the Eiffel Tower.");
     }
 }

@@ -1,0 +1,64 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 12,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Metaspace",
+    "replacement": "▁",
+    "prepend_scheme": "always",
+    "split": true
+  },
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Replace",
+        "pattern": {
+          "String": "▁"
+        },
+        "content": " "
+      },
+      {
+        "type": "Fuse"
+      },
+      {
+        "type": "Strip",
+        "content": " ",
+        "start": 1,
+        "stop": 0
+      }
+    ]
+  },
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "▁The": 0,
+      "▁capital": 1,
+      "▁of": 2,
+      "▁France": 3,
+      "▁is": 4,
+      "▁Paris.": 5,
+      "▁It": 6,
+      "▁known": 7,
+      "▁for": 8,
+      "▁the": 9,
+      "▁Eiffel": 10,
+      "▁Tower.": 11,
+      "[UNK]": 12
+    },
+    "unk_token": "[UNK]"
+  }
+}
