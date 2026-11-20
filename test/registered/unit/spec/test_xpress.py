@@ -1,11 +1,13 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
 
-from sglang.srt.models.dflash import DFlashDraftModel, _radix_topk
+from sglang.srt.models import dflash
+from sglang.srt.models.dflash import _radix_topk
 from sglang.srt.models.xpress import Qwen3XPressModel, XPressRefinerHead
 from sglang.srt.speculative.dflash_worker_v2 import _validate_xpress_lm_head
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -77,6 +79,8 @@ def test_xpress_target_head_validation():
 def test_xpress_checkpoint_load_folds_mixer(monkeypatch):
     model = Qwen3XPressModel.__new__(Qwen3XPressModel)
     nn.Module.__init__(model)
+    model.layers = nn.ModuleList()
+    model.projector_type = None
     model.xpress_head = _head("cpu")
     head = model.xpress_head
     raw = torch.randn_like(head.mix_L)
@@ -92,25 +96,55 @@ def test_xpress_checkpoint_load_folds_mixer(monkeypatch):
         ("xpress_head.mix.L", raw),
     ]
 
-    def load_base_weights(self, mapped):
-        params = dict(self.named_parameters())
-        for name, weight in mapped:
-            params[name].data.copy_(weight)
-
-    monkeypatch.setattr(DFlashDraftModel, "load_weights", load_base_weights)
+    build_buffers = Mock(wraps=head.build_fused_buffers)
+    monkeypatch.setattr(head, "build_fused_buffers", build_buffers)
     model.load_weights(weights)
+    build_buffers.assert_called_once_with()
     torch.testing.assert_close(head.mix_L, raw.tril() + torch.eye(head.block_size))
     torch.testing.assert_close(head._fused_buf["mix_kjc"], head.mix_L.permute(1, 2, 0))
+    torch.testing.assert_close(
+        head._fused_buf["w2_t"], dict(weights)["xpress_head.w2.weight"].T
+    )
 
 
 def test_xpress_post_load_refreshes_fused_mixer():
     model = Qwen3XPressModel.__new__(Qwen3XPressModel)
     nn.Module.__init__(model)
+    model.layers = nn.ModuleList()
     model.xpress_head = _head("cpu")
     model.post_load_weights()
     old_mixer = model.xpress_head._fused_buf["mix_kjc"].clone()
     model.xpress_head.fold_from_raw_(torch.randn_like(model.xpress_head.mix_L))
     model.post_load_weights()
+    assert not torch.equal(model.xpress_head._fused_buf["mix_kjc"], old_mixer)
+
+
+def test_xpress_post_load_runs_parent_before_refiner(monkeypatch):
+    model = Qwen3XPressModel.__new__(Qwen3XPressModel)
+    nn.Module.__init__(model)
+    model.xpress_head = _head("cpu")
+    events = []
+
+    class FakeMLAAttention:
+        def absorb_kv_b_proj(self):
+            events.append("parent")
+
+    # Exercise the real parent hook without constructing a GPU attention layer.
+    monkeypatch.setattr(dflash, "DFlashMLAAttention", FakeMLAAttention)
+    model.layers = [SimpleNamespace(self_attn=FakeMLAAttention())]
+    build_fused_buffers = model.xpress_head.build_fused_buffers
+
+    def build_after_parent():
+        events.append("refiner")
+        build_fused_buffers()
+
+    monkeypatch.setattr(model.xpress_head, "build_fused_buffers", build_after_parent)
+    model.post_load_weights()
+    assert events == ["parent", "refiner"]
+    old_mixer = model.xpress_head._fused_buf["mix_kjc"].clone()
+    model.xpress_head.fold_from_raw_(torch.randn_like(model.xpress_head.mix_L))
+    model.post_load_weights()
+    assert events == ["parent", "refiner", "parent", "refiner"]
     assert not torch.equal(model.xpress_head._fused_buf["mix_kjc"], old_mixer)
 
 

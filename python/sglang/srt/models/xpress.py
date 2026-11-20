@@ -236,11 +236,12 @@ class Qwen3XPressModel(DFlashDraftModel):
             raise ValueError(
                 f"XPress checkpoint is missing mixer or head weights: {sorted(missing)}."
             )
-        super().load_weights(mapped)
+        # The base loader dispatches to post_load_weights after copying mapped weights.
         self.xpress_head.fold_from_raw_(raw_mix)
-        self.post_load_weights()
+        super().load_weights(mapped)
 
     def post_load_weights(self) -> None:
+        super().post_load_weights()
         # Some SGLang loaders copy an already-folded state directly into the
         # parameters instead of calling load_weights(). Their transposed mixer
         # and projection buffers must follow the newly loaded parameters.
