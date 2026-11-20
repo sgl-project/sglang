@@ -62,7 +62,7 @@ flowchart TB
 
 This is the answer to a common question: HiCache cannot pool the host memory of several machines into one larger L2. Growing `--hicache-ratio` or `--hicache-size` only makes each instance's own private L2 larger. Cross-instance reuse is the job of L3, so it needs `--hicache-storage-backend`.
 
-L3 is the tier that *can* be shared, but whether it actually is depends on the backend and how it is configured. The `file` backend writes to `/tmp/hicache` by default (`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` overrides it), which is node-local unless that path is a shared mount. Distributed backends such as `mooncake`, `hf3fs`, `nixl` and `aibrix` give cluster-wide scope, but only when every instance is pointed at the same namespace and configuration.
+L3 is the tier that *can* be shared, but whether it actually is depends on the backend and how it is configured. The `file` backend writes to `/tmp/hicache` by default (`--file-storage-path` or `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` overrides it), which is node-local unless that path is a shared mount. Distributed backends such as `mooncake`, `hf3fs`, `nixl` and `aibrix` give cluster-wide scope, but only when every instance is pointed at the same namespace and configuration.
 
 ### HiRadixTree: Metadata Organization in HiCache
 
