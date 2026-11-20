@@ -428,9 +428,12 @@ class Flux3ImageVAE(AutoEncoder):
     ``AutoEncoder.__init__``, keeping the module tree (and ``state_dict`` keys)
     identical so ``ae.safetensors`` loads without renaming.
 
-    When a decode-parallel group exists (world_size > 1, e.g. ``--vae-sp N``) the
-    decoder is height-sharded (see :func:`enable_spatial_parallel_decoder`); on a
-    single GPU this is a no-op. The encoder is never sharded.
+    With ``use_parallel_decode`` (``--vae-sp true``) and a decode-parallel group
+    (world_size > 1) the decoder is height-sharded (see
+    :func:`enable_spatial_parallel_decoder`). It is off by default: every
+    GroupNorm and the mid attention gather the full height, and on two ranks the
+    sharded decode is slower than the serial one up to 2560x2560. The encoder is
+    never sharded.
     """
 
     _aliases = ["AutoEncoder", "Flux3ImageVAE"]
@@ -459,7 +462,11 @@ class Flux3ImageVAE(AutoEncoder):
         self.config = config
         self.hf_config = hf_config or {}
         # Runs before weight load; SpatialParallelConv2d keeps the param names.
-        self._spatial_parallel = has_decode_parallel_world()
+        self._spatial_parallel = (
+            config is not None
+            and config.use_parallel_decode
+            and has_decode_parallel_world()
+        )
         self._sp_upsamples = (
             enable_spatial_parallel_decoder(self.decoder)
             if self._spatial_parallel
@@ -475,7 +482,7 @@ class Flux3ImageVAE(AutoEncoder):
 # --------------------------------------------------------------------------- #
 # Spatial-parallel (height-sharded) decode.
 #
-# When a decode-parallel group exists (world_size > 1, e.g. `--vae-sp N`) the
+# With `--vae-sp true` and a decode-parallel group (world_size > 1) the
 # decoder is sharded over image height: each rank owns a height slice and its
 # convs exchange halo rows (SpatialParallelConv2d), while the two *global* spatial
 # ops -- GroupNorm (needs full-height statistics) and the mid self-attention

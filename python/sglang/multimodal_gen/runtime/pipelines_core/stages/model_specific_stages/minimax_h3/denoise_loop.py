@@ -139,13 +139,14 @@ def _minimax_h3_renoise_target_rows_(
     ``x_next = (1 - sigma_next) * x0 + sigma_next * noise`` with fresh noise.
     The terminal ``sigma_next == 0`` returns ``x0`` and draws nothing.
     """
-    state.add_(velocity, alpha=sigma)
+    # Keep the release's separate FP32 multiply/add rounding.
+    state.copy_(state + sigma * velocity)
     if sigma_next == 0.0:
         return
     noise = torch.randn(
         state.shape, generator=generator, device=state.device, dtype=torch.float32
     )
-    state.mul_(1.0 - sigma_next).add_(noise, alpha=sigma_next)
+    state.mul_(1.0 - sigma_next).add_(sigma_next * noise)
 
 
 def _build_local_embedding_layout(
@@ -201,7 +202,7 @@ class MiniMaxH3DenoiseBranch:
     def __init__(
         self,
         *,
-        packed: dict[str, torch.Tensor],
+        packed: dict[str, Any],
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
@@ -328,6 +329,12 @@ class MiniMaxH3DenoiseBranch:
                 "cu_seqlens_q": cu.to(device),
                 "cu_seqlens_q_host": tuple(int(value) for value in cu.tolist()),
                 "max_seqlen_q": int(cu[1]),
+                # Host metadata describes the global sequence reconstructed
+                # by Ulysses, not this rank's token shard. Keep text length
+                # for layout provenance; MindIE's video_spans mode uses
+                # txt_len=0 and treats everything outside spans as dense.
+                "txt_len": text_len,
+                "video_spans": packed.get("video_spans"),
             },
             "refiner_packed_seq_params": {
                 "cu_seqlens_q": torch.tensor(
@@ -622,7 +629,7 @@ def minimax_h3_denoise_loop(
                     None if adaln_plan_slots is None else adaln_plan_slots[step]
                 ),
             )
-            if attn_metadata is not None:
+            if attn_metadata is not None and hasattr(attn_metadata, "current_timestep"):
                 attn_metadata.current_timestep = step
             if model_forward is None and attn_metadata is not None:
                 forward_cm: AbstractContextManager = set_forward_context(

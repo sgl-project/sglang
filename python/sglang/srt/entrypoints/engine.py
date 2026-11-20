@@ -49,7 +49,6 @@ from typing import (
 import msgspec
 import torch
 import uvloop
-import zmq
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
@@ -94,14 +93,11 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
-    RpcReqOutput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
-    sock_recv,
-    sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -142,8 +138,13 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    redact_server_args_secrets,
+    reject_removed_kwargs,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -162,7 +163,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_free_port,
-    get_zmq_socket,
     is_port_available,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -311,6 +311,7 @@ class Engine(EngineScoreMixin, EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
+            reject_removed_kwargs(self.server_args_class, kwargs)
             server_args = self.server_args_class(**kwargs)
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
@@ -387,15 +388,6 @@ class Engine(EngineScoreMixin, EngineBase):
             )
             self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
-        # Initialize ZMQ sockets
-        context = zmq.Context(2)
-        if get_parallel().node_rank == 0:
-            self.send_to_rpc = get_zmq_socket(
-                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-            )
-        else:
-            self.send_to_rpc = None
-
         # Enable tracing
         if get_observability().enable_trace:
             process_tracing_init(
@@ -419,19 +411,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def _resolve_routed_dp_rank(
         self,
         routed_dp_rank: Optional[int],
-        data_parallel_rank: Optional[int],
     ) -> Optional[int]:
-        if data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-            if routed_dp_rank is None:
-                routed_dp_rank = data_parallel_rank
-
         if routed_dp_rank is not None:
             num_dp_ranks = get_parallel().num_dp_ranks
             if num_dp_ranks <= 1 and routed_dp_rank == 0:
@@ -493,8 +473,6 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
-        # Deprecated: use routed_dp_rank instead
-        data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -507,9 +485,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        routed_dp_rank = self._resolve_routed_dp_rank(
-            routed_dp_rank, data_parallel_rank
-        )
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
             text=prompt,
@@ -608,8 +584,6 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
-        # Deprecated: use routed_dp_rank instead
-        data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -622,9 +596,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        routed_dp_rank = self._resolve_routed_dp_rank(
-            routed_dp_rank, data_parallel_rank
-        )
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
             text=prompt,
@@ -1263,6 +1235,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # the validation stage writes through late resolution, which refuses a
         # record that is already published.
         try:
+            _check_rust_server_warmups()
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
@@ -1331,7 +1304,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
                 raise
 
-            if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            if not envs.SGLANG_BLOCK_NONZERO_RANK_CHILDREN.get():
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
                     None,
@@ -1531,7 +1504,6 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_infos=[scheduler_info], all_child_pids=[]
         )
         self._weight_cache_daemon_procs = []
-        self.send_to_rpc = None
         self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
             server_args, port_args, scheduler_info
         )
@@ -1565,11 +1537,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 and self.tokenizer_manager._subprocess_watchdog is not None
             ):
                 self.tokenizer_manager._subprocess_watchdog.stop()
-
-            send_to_rpc = getattr(self, "send_to_rpc", None)
-            if send_to_rpc is not None:
-                send_to_rpc.close(linger=0)
-                self.send_to_rpc = None
 
             # Gracefully stop weight cache daemons *before* the blanket
             # kill_process_tree below, so their SIGTERM handlers can unlink the
@@ -1955,10 +1922,10 @@ class Engine(EngineScoreMixin, EngineBase):
 
     def collective_rpc(self, method: str, **kwargs):
         obj = RpcReqInput(method=method, parameters=kwargs)
-        sock_send(self.send_to_rpc, obj)
-        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
-        assert isinstance(recv_req, RpcReqOutput)
-        assert recv_req.success, recv_req.message
+        result = self.loop.run_until_complete(
+            self.tokenizer_manager.collective_rpc(obj)
+        )
+        assert result.success, result.message
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
@@ -1978,27 +1945,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
-    # The KV-shard gather registers its scratch as an NCCL symmetric
-    # window, which requires cuMem-backed NCCL memory. The pool keeps torch
-    # memory under the memory saver or a custom mem pool. Multi-node
-    # deployments keep NCCL's setting (MNNVL fabrics default it on above).
-    kv_shard_symmetric_scratch = (
-        cfg.enable_kv_cache_sharding
-        and cfg.nnodes == 1
-        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
-        and not cfg.enable_memory_saver
-        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
-    )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
-        if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
-            logger.info(
-                "Setting NCCL_CUMEM_ENABLE=1 for every NCCL communicator so the "
-                "KV-shard prefix gather can use a symmetric window. Set "
-                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 to keep it off."
-            )
-        os.environ["NCCL_CUMEM_ENABLE"] = str(
-            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
-        )
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(cfg.enable_symm_mem))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
@@ -2047,7 +1995,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.3",
+                "0.7.4",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -2055,7 +2003,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.9",
+                "0.4.11",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
@@ -2169,6 +2117,21 @@ def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _check_rust_server_warmups() -> None:
+    """In Rust mode, refuse a ``--warmups`` it cannot run before any scheduler
+    loads weights. The listener-hosting schedulers run the warmups, but this
+    process has the registry Python mode reads: an entry point may register a
+    warmup only in this launcher process, which a spawned scheduler would not
+    know and would skip as unknown."""
+    if envs.SGLANG_RUST_SERVER.get():
+        from sglang.srt.rust_server.warmups import (
+            check_rust_server_warmups,
+            rust_server_warmup_names,
+        )
+
+        check_rust_server_warmups(rust_server_warmup_names(get_serving().warmups))
 
 
 def _rank_hosts_rust_listener(pp_rank: int, tp_rank: int) -> bool:

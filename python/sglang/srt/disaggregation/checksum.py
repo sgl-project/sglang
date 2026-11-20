@@ -5,7 +5,7 @@ from typing import List, Optional, Sequence, Union
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import is_health_check_request
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
@@ -24,8 +24,7 @@ def _flatten_ints(values: NestedInts) -> list[int]:
 
 
 def is_health_check_req(req: Req) -> bool:
-    rid = req.rid
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    return is_health_check_request(req.rid)
 
 
 def _to_page_indices_gpu(idx: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -44,6 +43,11 @@ def page_indices_for_request(
     kv_indices = scheduler.req_to_token_pool.req_to_token[
         req.kv.req_pool_idx, start_idx:end_idx
     ]
+    # req_to_token contains virtual IDs with unified memory. Digest the same
+    # physical pages as the transfer, including after arena compaction.
+    kv_indices = scheduler.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+        kv_indices
+    )
     return _to_page_indices_gpu(kv_indices, page_size)
 
 
@@ -94,10 +98,15 @@ def _state_indices(
     router = pool.layer_router
     # A pool wrapping one token KV view keeps its other layers' state per request.
     if router.wrapped_view() is not None:
+        state_ids = scheduler.token_to_kv_pool_allocator.state_ids(
+            scheduler.req_to_token_pool.state_sub_pool
+        )
         return (
-            scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
-                req.kv.req_pool_idx
-            ]
+            state_ids.ids(
+                scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.kv.req_pool_idx
+                ]
+            )
             .to(torch.int64)
             .contiguous()
             .reshape(-1)
@@ -149,6 +158,24 @@ class KvChecksumComputer:
         ]
         assert len(self._state_data_ptrs) == len(self._state_item_lens)
         assert self._kv_data_ptrs or self._state_data_ptrs
+
+    @classmethod
+    def for_kv_args(cls, kv_args, device: torch.device) -> KvChecksumComputer:
+        """Leaves out a DFLASH draft KV ring's two entries (rows and floor): they
+        are addressed per position, not by the request's state slots."""
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        keep = list(range(len(kv_args.state_types)))
+        if StateType.DRAFT_RING in kv_args.state_types:
+            ring = kv_args.state_types.index(StateType.DRAFT_RING)
+            keep = [i for i in keep if i not in (ring, ring + 1)]
+        return cls(
+            device=device,
+            kv_data_ptrs=kv_args.kv_data_ptrs,
+            kv_item_lens=kv_args.kv_item_lens,
+            state_data_ptrs=[kv_args.state_data_ptrs[i] for i in keep],
+            state_item_lens=[kv_args.state_item_lens[i] for i in keep],
+        )
 
     def compute(
         self,

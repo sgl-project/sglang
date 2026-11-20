@@ -64,7 +64,7 @@ class PerChannelRMSNorm(nn.Module):
     def __init__(self, channel_dim: int = 1, eps: float = 1e-8) -> None:
         """
         Args:
-            dim: Dimension along which to compute the RMS (typically channels).
+            channel_dim: Dimension along which to compute the RMS (typically channels).
             eps: Small constant added for numerical stability.
         """
         super().__init__()
@@ -77,9 +77,11 @@ class PerChannelRMSNorm(nn.Module):
         """
         Apply RMS normalization along the configured dimension.
         """
-        channel_dim = channel_dim or self.channel_dim
-        # Compute mean of squared values along `dim`, keep dimensions for broadcasting.
-        mean_sq = torch.mean(x**2, dim=self.channel_dim, keepdim=True)
+        if channel_dim is None:
+            channel_dim = self.channel_dim
+        # Compute mean of squared values along `channel_dim`, keep dimensions for
+        # broadcasting. The override has to reach the reduction, not just the local.
+        mean_sq = torch.mean(x**2, dim=channel_dim, keepdim=True)
         # Normalize by the root-mean-square (RMS).
         rms = torch.sqrt(mean_sq + self.eps)
         return x / rms

@@ -20,7 +20,10 @@ realizes the selected reservation before a host transfer pins device rows.
 """
 
 from contextlib import nullcontext
+from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Sequence, Tuple
+
+import msgspec
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -93,6 +96,9 @@ class PrefillBudget:
     # the slot count. State capability is independent of this conversion.
     state_slot_cost = 0
     has_state_slots = False
+    # Request rows the admitted requests bind (`ChainPrefillBudget`); none here.
+    has_request_rows = False
+    pending_request_rows = 0
     requires_final_shape_check = False
     # Admission prices the whole request and selects the chunk limit it fits
     # at (`check_prefill`); every admission path runs and commits that limit.
@@ -127,6 +133,7 @@ class PrefillBudget:
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        request_rows: int = 0,
     ) -> bool:
         """Prepare pools whose admission depends on movable shared space."""
         return True
@@ -169,8 +176,16 @@ class PrefillBudget:
     def request_held_state_slots(self, req) -> int:
         return 0
 
+    def request_rows(self, req) -> int:
+        return 0
+
     def state_slots_exhausted(self) -> bool:
         return False
+
+    def admits_more(self) -> bool:
+        """Whether the pass may admit another request: capacity remains
+        (`has_capacity`) and a state slot is left (`state_slots_exhausted`)."""
+        return self.has_capacity() and not self.state_slots_exhausted()
 
     def state_slots_fit(self, state_slots: int) -> bool:
         return True
@@ -185,6 +200,7 @@ class PrefillBudget:
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_align: int | None = None,
         host_hit_tokens: int = 0,
         held_state_slots: int = 0,
@@ -206,6 +222,7 @@ class PrefillBudget:
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
+        request_rows: int = 0,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
@@ -247,8 +264,8 @@ class PrefillBudget:
             chunk_limit,
             available_tokens,
         )
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        # Park the continuation rather than take running decodes' headroom.
+        return available if available > 0 else None
 
     def fit_chunk(
         self,
@@ -258,6 +275,7 @@ class PrefillBudget:
         max_new_tokens: int,
         chunk_limit: int,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_align: int | None = None,
     ) -> int | None:
         return chunk_limit
@@ -269,6 +287,7 @@ class PrefillBudget:
         *,
         extra_tokens: int = 0,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
         unfinished_input_len: int = 0,
@@ -382,6 +401,7 @@ class SWAPrefillBudget(PrefillBudget):
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_align: int | None = None,
         host_hit_tokens: int = 0,
         held_state_slots: int = 0,
@@ -464,6 +484,7 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
+        request_rows: int = 0,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
@@ -494,6 +515,7 @@ class SWAPrefillBudget(PrefillBudget):
         *,
         extra_tokens: int = 0,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
         unfinished_input_len: int = 0,
@@ -532,6 +554,10 @@ class ChainPrefillBudget(PrefillBudget):
     requires_final_shape_check = True
     admits_whole_requests = True
     prices_by_demand = True
+    # While one decision asks several questions of memory that does not change
+    # between them (`_one_memory_state`), and the evictable credit it read.
+    _one_state = False
+    _held_evictable: Optional[Dict[str, int]] = None
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
@@ -539,6 +565,9 @@ class ChainPrefillBudget(PrefillBudget):
         )
         self.has_state_slots = allocator.mamba_allocator is not None
         self.pending_state_slots = 0
+        # Rows the admitted requests bind, each a unit of every request sub-pool.
+        self.has_request_rows = bool(allocator.request_allocators)
+        self.pending_request_rows = 0
         # (sub-pool, retained window) per window sub-pool.
         self.windows = tuple(
             (name, tree_cache.window_retain_size(name))
@@ -557,6 +586,10 @@ class ChainPrefillBudget(PrefillBudget):
         # The rows this pass's forward writes, without the commitments and
         # decode that come later (`current_offset` is the token sub-pool's).
         self.window_current_offsets = dict(self.window_offsets)
+        # Request demands built in this pass, by `request_demand`'s arguments.
+        self._demands: Dict[tuple, KVDemand] = {}
+        # The allocator's answers in this pass, by question and memory state.
+        self._answers: Dict[tuple, bool] = {}
 
     def _available_and_evictable(self):
         # Sub-pools share bytes, so no token count says whether a demand fits;
@@ -575,27 +608,53 @@ class ChainPrefillBudget(PrefillBudget):
         chunk_limit=None,
         host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots=0,
+        request_rows=0,
         extra_tokens=0,
         cached_tokens=0,
     ) -> KVDemand:
         """What one request still needs over this pool's windows, built for
-        ``purpose`` as every site builds it (`demand.demand_inputs`)."""
-        return demand_inputs(
+        ``purpose`` as every site builds it (`demand.demand_inputs`).
+
+        A pass asks one request's demand at several checks (admission, its
+        shape check, the chunk-limit searches of a request that waits); each
+        distinct demand is built once per budget, which lives for one pass.
+        A demand depends only on these arguments and the pool parameters fixed
+        at construction, and its window map is read-only, so it is shared."""
+        key = (
             purpose,
             extend_input_len,
             max_new_tokens,
-            windows=dict(self.windows),
-            page_size=self.page_size,
-            chunk_limit=chunk_limit,
-            prefill_retire_lag=self.retirement.prefill_retire_lag,
-            decode_retire_lag=self.retirement.decode_retire_lag,
-            eviction_interval=self.retirement.eviction_interval,
-            checkpoint_interval=self.checkpoint_interval,
-            state_slots=state_slots,
-            cached_tokens=cached_tokens,
-            host_hit_lengths=host_hit_lengths,
-            extra_tokens=extra_tokens,
-        ).demand()
+            chunk_limit,
+            tuple(sorted(host_hit_lengths.items())) if host_hit_lengths else (),
+            state_slots,
+            request_rows if self.has_request_rows else 0,
+            extra_tokens,
+            cached_tokens,
+        )
+        demand = self._demands.get(key)
+        if demand is None:
+            demand = demand_inputs(
+                purpose,
+                extend_input_len,
+                max_new_tokens,
+                windows=dict(self.windows),
+                page_size=self.page_size,
+                chunk_limit=chunk_limit,
+                prefill_retire_lag=self.retirement.prefill_retire_lag,
+                decode_retire_lag=self.retirement.decode_retire_lag,
+                eviction_interval=self.retirement.eviction_interval,
+                checkpoint_interval=self.checkpoint_interval,
+                state_slots=state_slots,
+                request_rows=request_rows if self.has_request_rows else 0,
+                cached_tokens=cached_tokens,
+                host_hit_lengths=host_hit_lengths,
+                extra_tokens=extra_tokens,
+            ).demand()
+            demand = msgspec.structs.replace(
+                demand, window_tokens=MappingProxyType(demand.window_tokens)
+            )
+            self._demands[key] = demand
+        return demand
 
     def window_tokens(
         self,
@@ -631,6 +690,10 @@ class ChainPrefillBudget(PrefillBudget):
 
         return kv_storage_of(None, self.allocator).held_state_slots(req)
 
+    def request_rows(self, req) -> int:
+        """Request rows ``req`` binds when admitted: one unless it holds one."""
+        return int(self.has_request_rows and req.kv.req_pool_idx is None)
+
     def _others_hold_memory(self, req) -> bool:
         """Whether anything but ``req`` holds memory it gives back when it ends;
         asked of memory, since the running batch misses PD sends and microbatches."""
@@ -641,7 +704,11 @@ class ChainPrefillBudget(PrefillBudget):
     def _waiting_frees_memory(self) -> bool:
         """Whether memory comes back to a request that waits: admitted work, a
         forward or host copy in flight, or a row other work holds (not a parked row)."""
-        if self.total_offset > 0 or self.pending_state_slots > 0:
+        if (
+            self.total_offset > 0
+            or self.pending_state_slots > 0
+            or self.pending_request_rows > 0
+        ):
             return True
         steps = getattr(self.allocator, "forward_steps", None)
         if steps is not None and steps.in_flight():
@@ -664,6 +731,7 @@ class ChainPrefillBudget(PrefillBudget):
         full_tokens,
         window_tokens,
         state_slots=0,
+        request_rows=0,
         *,
         empty_pool=False,
         now=False,
@@ -671,15 +739,17 @@ class ChainPrefillBudget(PrefillBudget):
         """Whether the pending work plus this demand is admitted (the demand alone
         with ``empty_pool``); with ``now``, pending is only this pass's forward rows."""
         if empty_pool:
-            full_pending, window_pending, state_pending = 0, None, 0
+            full_pending, window_pending, state_pending, rows_pending = 0, None, 0, 0
         elif now:
             full_pending = self.current_offset
             window_pending = self.window_current_offsets
             state_pending = self.pending_state_slots
+            rows_pending = self.pending_request_rows
         else:
             full_pending = self.total_offset
             window_pending = self.window_offsets
             state_pending = self.pending_state_slots
+            rows_pending = self.pending_request_rows
         demand = KVDemand(
             full_tokens + full_pending,
             {
@@ -688,16 +758,57 @@ class ChainPrefillBudget(PrefillBudget):
                 for name, _ in self.windows
             },
             state_slots + state_pending,
+            request_rows + rows_pending,
         )
 
-        evictable = None
-        if not empty_pool:
-            evictable = evictable_by_sub_pool(self.tree_cache, self.allocator)
-        return self.allocator.admits(demand, evictable=evictable, empty_pool=empty_pool)
+        evictable = None if empty_pool else self._evictable()
+        # The allocator's answer depends only on the question and its pricing
+        # key (`ChainAllocator.pricing_key`), so it is priced once per memory state.
+        key = (
+            demand.full_tokens,
+            tuple(demand.window_tokens.values()),
+            demand.state_slots,
+            demand.request_rows,
+            # None for the empty pool.
+            None if evictable is None else tuple(evictable.items()),
+            self.allocator.pricing_key(),
+        )
+        fits = self._answers.get(key)
+        if fits is None:
+            fits = self.allocator.admits(
+                demand, evictable=evictable, empty_pool=empty_pool
+            )
+            self._answers[key] = fits
+        return fits
+
+    def _evictable(self) -> Dict[str, int]:
+        if not self._one_state:
+            return evictable_by_sub_pool(self.tree_cache, self.allocator)
+        if self._held_evictable is None:
+            self._held_evictable = evictable_by_sub_pool(
+                self.tree_cache, self.allocator
+            )
+        return self._held_evictable
+
+    def _one_memory_state(self, decide, *args, **kwargs):
+        """``decide(*args, **kwargs)``, whose questions all see one memory
+        state: the evictable credit is read once for them."""
+        if self._one_state:
+            return decide(*args, **kwargs)
+        self._one_state = True
+        try:
+            return decide(*args, **kwargs)
+        finally:
+            self._one_state = False
+            self._held_evictable = None
 
     def _admits(self, demand: KVDemand, **kwargs) -> bool:
         return self._fits(
-            demand.full_tokens, demand.window_tokens, demand.state_slots, **kwargs
+            demand.full_tokens,
+            demand.window_tokens,
+            demand.state_slots,
+            demand.request_rows,
+            **kwargs,
         )
 
     @property
@@ -751,6 +862,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: Optional[int],
         state_slots: int,
+        request_rows: int = 0,
         cached_tokens: int,
     ) -> bool:
         """The static rule's staged finish as one demand: the worst stage's token rows
@@ -766,10 +878,15 @@ class ChainPrefillBudget(PrefillBudget):
             max_new_tokens,
             chunk_limit=chunk_limit,
             state_slots=state_slots,
+            request_rows=request_rows,
             cached_tokens=cached_tokens,
         )
         return self._fits(
-            paged_input + peak, request.window_tokens, request.state_slots, now=True
+            paged_input + peak,
+            request.window_tokens,
+            request.state_slots,
+            request.request_rows,
+            now=True,
         )
 
     def has_capacity(self) -> bool:
@@ -783,7 +900,13 @@ class ChainPrefillBudget(PrefillBudget):
     def state_slots_exhausted(self) -> bool:
         return not self.state_slots_fit(1)
 
-    def check_prefill(
+    def admits_more(self) -> bool:
+        return self._one_memory_state(super().admits_more)
+
+    def check_prefill(self, **request) -> tuple[bool, int | None]:
+        return self._one_memory_state(self._check_prefill, **request)
+
+    def _check_prefill(
         self,
         *,
         extend_input_len: int,
@@ -793,6 +916,7 @@ class ChainPrefillBudget(PrefillBudget):
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_align: int | None = None,
         host_hit_tokens: int = 0,
         held_state_slots: int = 0,
@@ -832,6 +956,7 @@ class ChainPrefillBudget(PrefillBudget):
                 chunk_limit=limit,
                 host_hit_lengths=host_hits,
                 state_slots=state_slots,
+                request_rows=request_rows,
                 extra_tokens=extra_tokens,
                 cached_tokens=cached_tokens,
             )
@@ -843,6 +968,7 @@ class ChainPrefillBudget(PrefillBudget):
                 max_new_tokens,
                 chunk_limit=limit,
                 state_slots=state_slots + held_state_slots,
+                request_rows=request_rows,
                 extra_tokens=extra_tokens - host_rows,
             )
 
@@ -874,6 +1000,7 @@ class ChainPrefillBudget(PrefillBudget):
             chunk_limit=chunk_limit,
             host_hit_lengths=host_hits,
             state_slots=state_slots,
+            request_rows=request_rows,
             extra_tokens=extra_tokens,
             granule=granule,
         )
@@ -899,6 +1026,7 @@ class ChainPrefillBudget(PrefillBudget):
         chunk_limit,
         host_hit_lengths,
         state_slots,
+        request_rows=0,
         extra_tokens=0,
         empty_pool=False,
         now=False,
@@ -912,6 +1040,7 @@ class ChainPrefillBudget(PrefillBudget):
                 chunk_limit=chunk_limit,
                 host_hit_lengths=host_hit_lengths,
                 state_slots=state_slots,
+                request_rows=request_rows,
                 extra_tokens=extra_tokens,
             ),
             empty_pool=empty_pool,
@@ -925,6 +1054,7 @@ class ChainPrefillBudget(PrefillBudget):
         chunk_limit,
         host_hit_lengths,
         state_slots,
+        request_rows=0,
         extra_tokens=0,
         now=False,
         granule=None,
@@ -939,6 +1069,7 @@ class ChainPrefillBudget(PrefillBudget):
                 chunk_limit=chunk_limit,
                 host_hit_lengths=host_hit_lengths,
                 state_slots=state_slots,
+                request_rows=request_rows,
                 extra_tokens=extra_tokens,
                 now=now,
             ),
@@ -949,7 +1080,10 @@ class ChainPrefillBudget(PrefillBudget):
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         return chunk_limit if chunk_limit > 0 else None
 
-    def fit_chunk(
+    def fit_chunk(self, req, **chunk) -> int | None:
+        return self._one_memory_state(self._fit_chunk, req, **chunk)
+
+    def _fit_chunk(
         self,
         req,
         *,
@@ -957,6 +1091,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_align: int | None = None,
     ) -> int | None:
         """The next chunk of the admitted chunked request ``req``: it needs only
@@ -967,6 +1102,7 @@ class ChainPrefillBudget(PrefillBudget):
             chunk_limit=chunk_limit,
             host_hit_lengths=None,
             state_slots=state_slots,
+            request_rows=request_rows,
             now=True,
         )
         if self._chunk_fits(candidate, 0, **fits):
@@ -988,6 +1124,7 @@ class ChainPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
+        request_rows: int = 0,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
@@ -1005,6 +1142,7 @@ class ChainPrefillBudget(PrefillBudget):
                 ),
                 host_hit_lengths=dict(window_host_hit_lengths or {}),
                 state_slots=state_slots,
+                request_rows=request_rows,
                 extra_tokens=paged_input
                 - self.ceil_paged_tokens(extend_input_len)
                 - self.page_size,
@@ -1019,6 +1157,7 @@ class ChainPrefillBudget(PrefillBudget):
         *,
         extra_tokens: int = 0,
         state_slots: int = 0,
+        request_rows: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
         unfinished_input_len: int = 0,
@@ -1047,6 +1186,7 @@ class ChainPrefillBudget(PrefillBudget):
         self.total_offset += committed.full_tokens
         self.current_offset += now.full_tokens
         self.pending_state_slots += state_slots
+        self.pending_request_rows += request_rows if self.has_request_rows else 0
         for name, _ in self.windows:
             self.window_offsets[name] += committed.window_tokens[name]
             self.window_current_offsets[name] += now.window_tokens[name]
@@ -1060,6 +1200,7 @@ class ChainPrefillBudget(PrefillBudget):
         chunk_limit: int | None,
         window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        request_rows: int = 0,
     ):
         # H2D pins the restored rows. Realize the selected budget while the
         # chain can still be compacted, including pending prefill/decode demand.
@@ -1078,6 +1219,7 @@ class ChainPrefillBudget(PrefillBudget):
             full_tokens,
             windows,
             state_slots + self.pending_state_slots if self.has_state_slots else 0,
+            request_rows + self.pending_request_rows if self.has_request_rows else 0,
         )
 
     def prepare_load_back(self, **kwargs) -> bool:

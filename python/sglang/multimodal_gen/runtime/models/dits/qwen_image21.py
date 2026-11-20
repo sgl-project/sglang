@@ -17,7 +17,7 @@ from sglang.kernels.ops.diffusion import (
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
-    rmsnorm_preserve_reduction,
+    residual_gate_add_sum2,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
+    staged_partials,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
@@ -85,7 +88,6 @@ _KV_PROJECT_INTO_FUSION = BitExactFusionGate(
 _QKV_PACK_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 packed Q/K/V projection written into the packed QKV buffer"
 )
-_QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
 
@@ -154,16 +156,6 @@ def apply_rope(x, rope):
             logger=logger,
         )
     return _eager_rope(x, rope)
-
-
-def apply_qk_norm(x, norm):
-    if _is_cuda and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
-        return _QK_NORM_FUSION.run(
-            lambda: rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon),
-            lambda: norm(x),
-            logger=logger,
-        )
-    return norm(x)
 
 
 def apply_qk_norm_rope(x, norm, rope):
@@ -257,6 +249,22 @@ def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
 def cat_outputs(outputs, dim=0):
     # torch.cat on a one-element list degrades to a full copy of the tensor.
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=dim)
+
+
+def projected_residual_gate_add(layer, hidden, residual, gate):
+    """``residual_gate_add(residual, layer(hidden), gate)``. On a two-rank TP
+    group the row-parallel ``layer``'s all-reduce is folded into the gate
+    kernel, which reads both ranks' partial sums."""
+    if type(layer) is RowParallelLinear and residual.dtype is torch.bfloat16:
+        partials = staged_partials(layer, hidden, residual)
+        if partials is not None:
+            out = residual_gate_add_sum2(residual, *partials, gate)
+            if out is not None:
+                return out
+            # the kernel declined these operands: reduce the staged partials
+            update = (partials[0] + partials[1]).view_as(residual)
+            return residual_gate_add(residual, update, gate)
+    return residual_gate_add(residual, layer(hidden)[0], gate)
 
 
 def apply_modulation(x, norm, scale):
@@ -433,7 +441,9 @@ class QwenImage21FeedForward(nn.Module):
         self.pack_gate_up_weights()
         return module
 
-    def forward(self, x, use_packed_bf16=False):
+    def forward(self, x, use_packed_bf16=False, project_out=True):
+        # project_out=False returns ``out``'s input; the comfy_kitchen MLP never
+        # runs then, since it needs a TP group of one.
         # GEMM width can change rounding. Only use the measured target lengths;
         # exact/lossless and conditioning prefixes keep separate projections.
         if (
@@ -449,7 +459,7 @@ class QwenImage21FeedForward(nn.Module):
             weight = _stacked_rows(self.gate_layer.weight, self.proj.weight)
             if weight is not None:
                 hidden = fused_packed_silu_mul_bitexact(nn.functional.linear(x, weight))
-                return self.out(hidden)[0]
+                return self.out(hidden)[0] if project_out else hidden
         # Storage-identity checks cannot be traced; a compiled graph keeps the
         # separate projections.
         packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
@@ -466,7 +476,7 @@ class QwenImage21FeedForward(nn.Module):
             )
         else:
             hidden = nn.functional.silu(gate) * value
-        return self.out(hidden)[0]
+        return self.out(hidden)[0] if project_out else hidden
 
 
 class QwenImage21Attention(nn.Module):
@@ -842,7 +852,9 @@ class QwenImage21Attention(nn.Module):
                 )
         return out, prefix_output
 
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, project_out=True
+    ):
         # batch target projections while retaining each sample's unpadded prefix
         packed = self._project_qkv_packed(x, layouts, caches)
         qkv = None
@@ -873,7 +885,10 @@ class QwenImage21Attention(nn.Module):
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
-        return self.to_out[0](cat_outputs(outputs).flatten(2))[0], prefix_outputs
+        hidden = cat_outputs(outputs).flatten(2)
+        if not project_out:
+            return hidden, prefix_outputs
+        return self.to_out[0](hidden)[0], prefix_outputs
 
 
 class QwenImage21TransformerBlock(nn.Module):
@@ -915,6 +930,10 @@ class QwenImage21TransformerBlock(nn.Module):
             else None
             for state, cache in zip(prefix_states, caches, strict=True)
         ]
+        # two-rank TP: the block's row-parallel outputs skip their all-reduce
+        peer_partials = (
+            _is_cuda and get_tp_world_size() == 2 and not torch.compiler.is_compiling()
+        )
         attention, prefix_attentions = self.attn(
             apply_modulation(hidden_states, self.img_norm1, scale1),
             ropes,
@@ -922,16 +941,32 @@ class QwenImage21TransformerBlock(nn.Module):
             layouts,
             caches,
             prefix_pad,
+            project_out=not peer_partials,
         )
-        hidden_states = residual_gate_add(hidden_states, attention, gate1)
-        hidden_states = residual_gate_add(
-            hidden_states,
-            self.img_mlp(
-                apply_modulation(hidden_states, self.img_norm2, scale2),
-                use_packed_bf16=use_packed_bf16_mlp,
-            ),
-            gate2,
-        )
+        if peer_partials:
+            hidden_states = projected_residual_gate_add(
+                self.attn.to_out[0], attention, hidden_states, gate1
+            )
+            hidden_states = projected_residual_gate_add(
+                self.img_mlp.out,
+                self.img_mlp(
+                    apply_modulation(hidden_states, self.img_norm2, scale2),
+                    use_packed_bf16=use_packed_bf16_mlp,
+                    project_out=False,
+                ),
+                hidden_states,
+                gate2,
+            )
+        else:
+            hidden_states = residual_gate_add(hidden_states, attention, gate1)
+            hidden_states = residual_gate_add(
+                hidden_states,
+                self.img_mlp(
+                    apply_modulation(hidden_states, self.img_norm2, scale2),
+                    use_packed_bf16=use_packed_bf16_mlp,
+                ),
+                gate2,
+            )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation

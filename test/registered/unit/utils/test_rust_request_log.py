@@ -1,13 +1,16 @@
-"""The Rust server renders `--log-requests` lines from what Python hands it
-(`rust_server.config.request_log_settings`); the expected lines here come from
-Python's own `RequestLogger`, in both formats, and the Rust tests
-(rust/sglang-server/src/api_server/core/request_log/tests.rs) render the same
-cases from the same fixture."""
+"""The Rust tests (rust/sglang-server/src/api_server/core/request_log/tests.rs)
+render the cases below from rust/sglang-server/testdata/request_log.json: the
+settings Python hands the Rust server and the lines Python's `RequestLogger`
+logs. The fixture keeps only the fields in `_GENERATE_FIELDS` and
+`_OPENAI_REQUESTS`, so it pins the log format, not the request classes' fields;
+the Rust server gets the full field list from Python at runtime."""
 
+import dataclasses
 import datetime
 import json
 import os
 import re
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -41,6 +44,83 @@ RUST_REQUEST_LOG_FIXTURE = os.path.join(
     os.path.dirname(__file__),
     *[os.pardir] * 4,
     "rust/sglang-server/testdata/request_log.json",
+)
+
+# The `GenerateReqInput` fields the fixture keeps, in the order its lines print.
+_GENERATE_FIELDS = (
+    "rid",
+    "session_id",  # shared by a batch's items
+    "text",
+    "input_ids",
+    "input_embeds",  # a skip name
+    "image_data",
+    "video_data",
+    "audio_data",
+    "sampling_params",
+    "watermark",
+    "return_logprob",
+    "logprob_start_len",
+    "top_logprobs_num",
+    "token_ids_logprob",
+    "return_sampling_mask",
+    "return_text_in_logprobs",  # a `False` default
+    "stream",
+    "log_metrics",
+    "routed_experts_start_len",  # a `0` default
+    "modalities",  # set with a batch item's images
+    "lora_path",  # a skip name
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+    "routed_dp_rank",
+    "routing_key",  # neither per item nor shared: an item keeps the default
+    "priority",
+    "extra_key",
+    "custom_labels",
+    "cache_salt",
+)
+
+# Per OpenAI request: its model, its settings key, and its kept fields in order.
+_OPENAI_REQUESTS = {
+    "chat": (
+        ChatCompletionRequest,
+        "chat_completion_fields",
+        (
+            "routed_dp_rank",
+            "messages",
+            "model",
+            "frequency_penalty",
+            "logprobs",
+            "n",
+            "stop",
+            "stream",
+            "temperature",
+            "tools",
+            "tool_choice",
+            "skip_special_tokens",
+        ),
+    ),
+    "completion": (
+        CompletionRequest,
+        "completion_fields",
+        (
+            "routed_dp_rank",
+            "model",
+            "prompt",
+            "echo",
+            "logit_bias",
+            "max_tokens",
+            "n",
+            "stop",
+            "stream",
+            "temperature",
+            "top_k",
+        ),
+    ),
+}
+
+_ProjectedGenerateReqInput = dataclasses.make_dataclass(
+    GenerateReqInput.__name__, _GENERATE_FIELDS
 )
 
 _META_INFO = {
@@ -89,7 +169,7 @@ _CASES = [
             },
             "stream": True,
         },
-        "headers": {"x-smg-routing-key": "conv'1"},
+        "headers": {"x-sgl-routing-key": "conv'1"},
         "out": {"text": " world", "output_ids": [1, 2], "meta_info": _META_INFO},
     },
     {
@@ -109,8 +189,7 @@ _CASES = [
             "bootstrap_room": 12345678901234,
             "routing_key": "rk",
             "custom_labels": {"tenant": "a'b"},
-            # Deprecated: Python moves it to `routed_dp_rank`.
-            "data_parallel_rank": 1,
+            "routed_dp_rank": 1,
         },
         "headers": {},
         "out": {
@@ -157,10 +236,9 @@ _CASES = [
             # One room for the batch counts up per item.
             "bootstrap_host": "10.0.0.2",
             "bootstrap_room": 100,
-            # Deprecated: the batch's normalization moves it to `routed_dp_rank`.
-            "data_parallel_rank": 0,
+            "routed_dp_rank": 0,
         },
-        "headers": {"x-smg-routing-key": "k"},
+        "headers": {"x-sgl-routing-key": "k"},
         "out": {"text": "y", "output_ids": [3], "meta_info": {"id": "b1"}},
     },
     {
@@ -265,7 +343,7 @@ _CASES = [
             "text": "ab'" * 690 + "é" * 50,
             "sampling_params": {"stop_token_ids": list(range(2050))},
         },
-        "headers": {"x-smg-routing-key": "k"},
+        "headers": {"x-sgl-routing-key": "k"},
         "out": {
             "text": "x" * 2049,
             "output_ids": list(range(2050)),
@@ -287,12 +365,11 @@ _OPENAI_CASES = [
             "messages": [{"role": "user", "content": "hi 'there'"}],
             "temperature": 0.5,
             "stop": _TRICKY,
-            # Deprecated: the validator copies it to `routed_dp_rank`.
-            "data_parallel_rank": 1,
+            "routed_dp_rank": 1,
             # Not a field: dropped.
             "not_a_field": 1,
         },
-        "headers": {"x-smg-routing-key": "conv'1"},
+        "headers": {"x-sgl-routing-key": "conv'1"},
     },
     {
         # Level 2 cuts the long prompt list and, in the JSON format, the
@@ -383,10 +460,7 @@ class _FixedDatetime(datetime.datetime):
 
 
 def build_rust_request_log_fixture() -> dict:
-    """Every case at every level in both formats: the settings Python hands
-    the Rust server and the lines Python's `RequestLogger` logs. Regenerate
-    the fixture with `write_rust_request_log_fixture()` after changing either
-    side."""
+    """Every case at every level in both formats, on the kept fields only."""
     # The defaults, whatever this shell or an earlier test in the process sets.
     with (
         use_context(RuntimeContext(parallel=ParallelContext())),
@@ -421,13 +495,39 @@ def _logger(level: int, log_format: str, lines: list) -> RequestLogger:
     return logger
 
 
+def _kept_settings(level: int, log_format: str) -> dict:
+    settings = request_log_settings(level, GenerateReqInput, log_format)
+    defaults = dict(settings["fields"])
+    settings["fields"] = [(name, defaults[name]) for name in _GENERATE_FIELDS]
+    for key in ("batch_item_fields", "batch_shared_fields"):
+        names = set(settings[key])
+        settings[key] = [name for name in _GENERATE_FIELDS if name in names]
+    # The fixture holds these once, in `openai_fields`.
+    for _, key, _ in _OPENAI_REQUESTS.values():
+        del settings[key]
+    return settings
+
+
+def _project(obj: GenerateReqInput) -> _ProjectedGenerateReqInput:
+    projected = _ProjectedGenerateReqInput(
+        **{name: getattr(obj, name) for name in _GENERATE_FIELDS}
+    )
+    # Not a field, but the multimodal summary reads it.
+    projected.parallel_sample_num = getattr(obj, "parallel_sample_num", 1)
+    return projected
+
+
+def _project_openai(kind: str, body: dict) -> dict:
+    model, _, names = _OPENAI_REQUESTS[kind]
+    # What `log_openai_received_request` logs for a request model.
+    dump = model(**json.loads(json.dumps(body))).model_dump(exclude_none=True)
+    return {name: dump[name] for name in names if name in dump}
+
+
 def _build_rust_request_log_fixture() -> dict:
     fixture = {
         "levels": {
-            fmt: {
-                str(level): request_log_settings(level, GenerateReqInput, fmt)
-                for level in range(4)
-            }
+            fmt: {str(level): _kept_settings(level, fmt) for level in range(4)}
             for fmt in _FORMATS
         },
         "timestamp": _NOW.isoformat(),
@@ -435,15 +535,10 @@ def _build_rust_request_log_fixture() -> dict:
         "openai_cases": [],
         "openai_multimodal_cases": [],
     }
-    # The OpenAI models' fields, once rather than in every level's settings.
-    fixture["openai_fields"] = {
-        key: fixture["levels"]["text"]["2"][key]
-        for key in ("chat_completion_fields", "completion_fields")
-    }
-    for settings in fixture["levels"].values():
-        for level_settings in settings.values():
-            del level_settings["chat_completion_fields"]
-            del level_settings["completion_fields"]
+    fixture["openai_fields"] = {}
+    for model, key, names in _OPENAI_REQUESTS.values():
+        defaults = dict(rust_config._openai_model_fields(model))
+        fixture["openai_fields"][key] = [(name, defaults[name]) for name in names]
     for case in _CASES:
         expected = {fmt: {} for fmt in _FORMATS}
         for fmt in _FORMATS:
@@ -453,10 +548,12 @@ def _build_rust_request_log_fixture() -> dict:
                 obj = GenerateReqInput(**json.loads(json.dumps(case["body"])))
                 obj.normalize_batch_and_arguments()
                 request = _Request(case["headers"])
-                logger.log_received_request(obj, request=request)
+                logger.log_received_request(_project(obj), request=request)
                 item = case.get("batch_item")
                 logger.log_finished_request(
-                    obj if item is None else obj[item], case["out"], request=request
+                    _project(obj if item is None else obj[item]),
+                    case["out"],
+                    request=request,
                 )
                 receive, finish = lines
                 expected[fmt][str(level)] = {
@@ -464,17 +561,14 @@ def _build_rust_request_log_fixture() -> dict:
                     "finish": finish,
                 }
         fixture["cases"].append({**case, "expected": expected})
-    models = {"chat": ChatCompletionRequest, "completion": CompletionRequest}
     for case in _OPENAI_CASES:
         expected = {fmt: {} for fmt in _FORMATS}
         for fmt in _FORMATS:
             for level in (2, 3):
                 lines = []
-                request = models[case["request"]](
-                    **json.loads(json.dumps(case["body"]))
-                )
                 _logger(level, fmt, lines).log_openai_received_request(
-                    request, request=_Request(case["headers"])
+                    _project_openai(case["request"], case["body"]),
+                    request=_Request(case["headers"]),
                 )
                 (expected[fmt][str(level)],) = lines
         fixture["openai_cases"].append({**case, "expected": expected})
@@ -482,9 +576,8 @@ def _build_rust_request_log_fixture() -> dict:
         expected = {}
         for fmt in _FORMATS:
             lines = []
-            request = ChatCompletionRequest(**json.loads(json.dumps(case["body"])))
             _logger(2, fmt, lines).log_openai_received_request(
-                request, request=_Request({})
+                _project_openai("chat", case["body"]), request=_Request({})
             )
             (line,) = lines
             if fmt == "json":
@@ -516,18 +609,115 @@ def write_rust_request_log_fixture() -> None:
         f.write(text + "\n")
 
 
+_WRITE_FIXTURE = (
+    "python test/registered/unit/utils/test_rust_request_log.py --write-fixture"
+)
+
+
+def _first_difference(old, new, path: str = "fixture"):
+    """`(path, old value, new value)` where `new` first differs, or None."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        for key in [*old, *(key for key in new if key not in old)]:
+            at = f"{path}[{key!r}]"
+            if key not in old or key not in new:
+                return at, old.get(key, "<missing>"), new.get(key, "<missing>")
+            if found := _first_difference(old[key], new[key], at):
+                return found
+        return None
+    if isinstance(old, list) and isinstance(new, list):
+        for i, (a, b) in enumerate(zip(old, new)):
+            at = f"{path}[{i}]"
+            if isinstance(a, dict) and "name" in a:
+                at += f" ({a['name']})"
+            if found := _first_difference(a, b, at):
+                return found
+        if len(old) != len(new):
+            return f"len({path})", len(old), len(new)
+        return None
+    if type(old) is type(new) and old == new:
+        return None
+    return path, old, new
+
+
+def _excerpt(value, other) -> str:
+    """`value` around where it stops matching `other`."""
+    if isinstance(value, str) and isinstance(other, str):
+        at = len(os.path.commonprefix([value, other]))
+        return f"from character {at}: {value[max(at - 40, 0) : at + 80]!r}"
+    text = repr(value)
+    return text if len(text) <= 200 else text[:200] + "..."
+
+
 class TestRustRequestLogFixture(CustomTestCase):
     def test_fixture_matches_python(self):
         with open(RUST_REQUEST_LOG_FIXTURE, encoding="utf-8") as f:
             checked_in = json.load(f)
-        self.assertEqual(
-            checked_in,
-            # Through JSON, as the file holds it (tuples become lists).
-            json.loads(json.dumps(build_rust_request_log_fixture())),
-            "Python's request log changed: regenerate "
-            "rust/sglang-server/testdata/request_log.json (see "
-            "build_rust_request_log_fixture) and make the Rust renderer match",
+        # Through JSON, as the file holds it (tuples become lists).
+        built = json.loads(json.dumps(build_rust_request_log_fixture()))
+        difference = _first_difference(checked_in, built)
+        if difference is None:
+            return
+        path, old, new = difference
+        self.fail(
+            "Python's request log format changed, so the Rust server's must "
+            f"follow. rust/sglang-server/testdata/request_log.json differs at "
+            f"{path}:\n"
+            f"  checked in: {_excerpt(old, new)}\n"
+            f"  Python now: {_excerpt(new, old)}\n"
+            f"Regenerate it with `{_WRITE_FIXTURE}`, then make "
+            "rust/sglang-server/src/api_server/core/request_log.rs pass "
+            "`cargo test -p sglang-server request_log`. A field added to a "
+            "request class never needs this: the fixture keeps only the "
+            "fields named in this test."
         )
+
+    def test_kept_fields_exist(self):
+        fields = {field.name for field in dataclasses.fields(GenerateReqInput)}
+        self.assertEqual(
+            [name for name in _GENERATE_FIELDS if name not in fields],
+            [],
+            "_GENERATE_FIELDS names fields GenerateReqInput no longer has",
+        )
+        skip_names = {
+            name
+            for level in range(4)
+            for name in request_log_settings(level, GenerateReqInput)["skip_names"]
+        }
+        self.assertEqual(
+            sorted(skip_names - set(_GENERATE_FIELDS)),
+            [],
+            "skip names missing from _GENERATE_FIELDS",
+        )
+        for case in _CASES:
+            self.assertEqual(
+                [name for name in case["body"] if name not in _GENERATE_FIELDS],
+                [],
+                f"{case['name']} sets fields missing from _GENERATE_FIELDS",
+            )
+
+        openai_fields = {
+            kind: dict(rust_config._openai_model_fields(model))
+            for kind, (model, _, _) in _OPENAI_REQUESTS.items()
+        }
+        for kind, (model, _, names) in _OPENAI_REQUESTS.items():
+            self.assertEqual(
+                [name for name in names if name not in openai_fields[kind]],
+                [],
+                f"_OPENAI_REQUESTS names fields {model.__name__} no longer has",
+            )
+        cases = [(case["request"], case) for case in _OPENAI_CASES]
+        cases += [("chat", case) for case in _OPENAI_MULTIMODAL_CASES]
+        for kind, case in cases:
+            _, _, names = _OPENAI_REQUESTS[kind]
+            self.assertEqual(
+                [
+                    name
+                    for name in case["body"]
+                    if name in openai_fields[kind] and name not in names
+                ],
+                [],
+                f"{case['name']} sets fields missing from _OPENAI_REQUESTS",
+            )
 
     def test_settings_render_the_class_defaults(self):
         """The defaults Rust prints for absent fields are what Python prints
@@ -573,4 +763,7 @@ class TestRustRequestLogFixture(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if "--write-fixture" in sys.argv:
+        write_rust_request_log_fixture()
+    else:
+        unittest.main()

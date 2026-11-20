@@ -426,5 +426,13 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         np.testing.assert_array_equal(info.dst_device_kv_indices, device_pages)
 
 
+class TestHiSparseRetraction(CustomTestCase):
+    def test_retraction_rebootstraps_instead_of_host_backup(self):
+        from sglang.srt.mem_cache.common import retraction_needs_rebootstrap
+
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        self.assertTrue(retraction_needs_rebootstrap(allocator))
+
+
 if __name__ == "__main__":
     unittest.main()

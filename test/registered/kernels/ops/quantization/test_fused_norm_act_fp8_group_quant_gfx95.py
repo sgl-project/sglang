@@ -14,7 +14,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 M_VALUES = (1, 8, 32, 64, 256, 512)
 # Qwen3-14B and Qwen3-1.7B hidden / intermediate sizes, and their per-rank
@@ -119,7 +119,7 @@ class TestFusedNormActFp8GroupQuant(CustomTestCase):
                     )
 
     def test_silu_mul_fp8_group_quant(self):
-        from sglang.kernels.ops.quantization.silu_mul_fp8_group_quant import (
+        from sglang.kernels.ops.activation.silu_mul_fp8_group_quant import (
             silu_mul_fp8_group_quant,
         )
         from sglang.srt.layers.activation import SiluAndMul

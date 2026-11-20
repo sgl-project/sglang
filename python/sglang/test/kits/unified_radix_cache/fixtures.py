@@ -132,6 +132,7 @@ def build_fixture(
         model_path="dummy",
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
+        hybrid_cache_checkpoints_level=cfg.hybrid_cache_checkpoints_level,
     )
     # The dummy HF config cannot supply mamba_cache_chunk_size, so preset
     # FLA_CHUNK_SIZE.
@@ -168,7 +169,9 @@ def build_fixture(
             cache_params=mamba2_cache_params,
             mamba_layer_ids=cfg.non_full_layer_ids,
             enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=cfg.enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=3,
+            enable_overlap_schedule=cfg.enable_overlap_schedule,
         )
     else:
         req_to_token_pool = ReqToTokenPool(
