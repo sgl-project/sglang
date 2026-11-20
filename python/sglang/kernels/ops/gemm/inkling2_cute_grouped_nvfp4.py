@@ -32,6 +32,7 @@
 # and each token row's FP32 accumulator is stored to its own output row.
 
 import functools
+import os
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -874,7 +875,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         # (bN, bK, RestN, RestK, RestL)
         gSFB_nkl = cute.local_tile(
-            mSFB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            mSFB_nkl,
+            cute.slice_(self.mma_tiler_sfb, (0, None, None)),
+            (None, None, None),
         )
         # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(
@@ -1774,12 +1777,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         return tile_sched_params, grid
 
 
+# Experimental: generic callers retain the original tile unless the model
+# supplies a proven upper bound on the routed rows of every expert.
+TOKEN_TILE = int(os.environ.get("INKLING2_NVFP4_TOKEN_TILE", "128"))
+if TOKEN_TILE not in (32, 64, 128):
+    raise ValueError("INKLING2_NVFP4_TOKEN_TILE must be 32, 64, or 128")
+
+
 class _RoutedSwapGemm:
-    def __init__(self, experts: int, n: int, k: int, sm_version: str):
+    def __init__(
+        self, experts: int, n: int, k: int, sm_version: str, token_tile: int = 128
+    ):
+        if token_tile not in (32, 64, 128):
+            raise ValueError("token_tile must be 32, 64, or 128")
         self.experts, self.n, self.k = experts, n, k
         self.gemm = Sm100BlockScaledPersistentDenseGemmKernel(
             sf_vec_size=16,
-            mma_tiler_mn=(128, 128),
+            mma_tiler_mn=(128, token_tile),
             cluster_shape_mn=(1, 1),
             sm_version=sm_version,
         )
@@ -1834,7 +1848,7 @@ class _RoutedSwapGemm:
 
 
 @functools.cache
-def _compile(experts: int, n: int, k: int):
+def _compile(experts: int, n: int, k: int, token_tile: int = 128):
     major, minor = torch.cuda.get_device_capability()
     rows, scale_rows, out_rows = cute.sym_int64(), cute.sym_int64(), cute.sym_int64()
     blocks = cute.sym_int64()
@@ -1848,7 +1862,7 @@ def _compile(experts: int, n: int, k: int):
         )
 
     return cute.compile(
-        _RoutedSwapGemm(experts, n, k, f"sm_{major}{minor}"),
+        _RoutedSwapGemm(experts, n, k, f"sm_{major}{minor}", token_tile),
         fake(cutlass.Uint8, (experts, n, k // 2)),
         fake(cutlass.Uint8, (experts * ((n + 127) // 128 * 128) * (k // 16),)),
         fake(cutlass.Uint8, (rows, k // 2)),
@@ -1863,7 +1877,16 @@ def _compile(experts: int, n: int, k: int):
 
 
 def routed_swap_matmul(
-    values, x_scales, weight, scales, counts, offsets, schedule, out
+    values,
+    x_scales,
+    weight,
+    scales,
+    counts,
+    offsets,
+    schedule,
+    out,
+    *,
+    max_expert_rows=None,
 ):
     """out[r] = values[r] @ weight[e].T for the routed rows r of each local expert
     e (offsets[e] <= r < offsets[e] + counts[e]); values/x_scales are what the routed
@@ -1872,7 +1895,17 @@ def routed_swap_matmul(
     experts, n, packed = weight.shape
     k = packed * 2
     scale_rows = (values.shape[0] + 127 * experts + 127) // 128 * 128
-    _compile(experts, n, k)(
+    # The model's distinct top-k experts bound each expert's rows by its input
+    # token count. At <=8 rows each active expert has one 128-row schedule block;
+    # a smaller compute tile consumes the same first scale block. No GPU scalar
+    # reads are needed, including during CUDA graph capture. Larger/unknown
+    # groups retain the original schedule and compute tile.
+    token_tile = (
+        TOKEN_TILE
+        if max_expert_rows is not None and 0 < max_expert_rows <= min(TOKEN_TILE, 8)
+        else 128
+    )
+    _compile(experts, n, k, token_tile)(
         weight,
         scales.view(torch.uint8).view(-1),
         values,

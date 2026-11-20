@@ -4,7 +4,18 @@ from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matm
 from sglang.kernels.ops.moe.inkling2_moe import _sm_count, routed_quant_module
 
 
-def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quantize):
+def _routed_gemm(
+    device,
+    rows,
+    weight,
+    scales,
+    counts,
+    offsets,
+    schedule,
+    quantize,
+    *,
+    max_expert_rows=None,
+):
     """Grouped NVFP4 GEMM of rows that quantize(module, values, x_scales, amax,
     sm_count) writes, with the activation scales laid out as one 128-row scale
     block run per expert. Returns the FP32 accumulator and the per-row amax."""
@@ -17,11 +28,32 @@ def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quanti
     amax = torch.empty(rows, dtype=torch.float32, device=device)
     quantize(routed_quant_module(width), values, x_scales, amax, sm_count)
     out = torch.empty((rows, output_size), dtype=torch.float32, device=device)
-    routed_swap_matmul(values, x_scales, weight, scales, counts, offsets, schedule, out)
+    routed_swap_matmul(
+        values,
+        x_scales,
+        weight,
+        scales,
+        counts,
+        offsets,
+        schedule,
+        out,
+        max_expert_rows=max_expert_rows,
+    )
     return out, amax
 
 
-def routed_expert_matmul(x, dst2src, top_k, weight, scales, counts, offsets, schedule):
+def routed_expert_matmul(
+    x,
+    dst2src,
+    top_k,
+    weight,
+    scales,
+    counts,
+    offsets,
+    schedule,
+    *,
+    max_expert_rows=None,
+):
     """Grouped NVFP4 GEMM of the routed token rows of x (row r reads token
     dst2src[r] // top_k). Returns the unscaled FP32 accumulator and per-row amax;
     rows outside offsets[0]..offsets[-1] are left unset."""
@@ -30,7 +62,15 @@ def routed_expert_matmul(x, dst2src, top_k, weight, scales, counts, offsets, sch
         module.quantize(x, dst2src, values, x_scales, amax, offsets, top_k, sm_count)
 
     return _routed_gemm(
-        x.device, dst2src.numel(), weight, scales, counts, offsets, schedule, quantize
+        x.device,
+        dst2src.numel(),
+        weight,
+        scales,
+        counts,
+        offsets,
+        schedule,
+        quantize,
+        max_expert_rows=max_expert_rows,
     )
 
 
@@ -48,6 +88,8 @@ def routed_swiglu_expert_matmul(
     offsets,
     out_dtype,
     schedule,
+    *,
+    max_expert_rows=None,
 ):
     """Scale the previous GEMM's accumulator, apply capped swiglu, quantize, and
     run the next grouped NVFP4 GEMM, for rows in offsets[0]..offsets[-1]."""
@@ -79,4 +121,5 @@ def routed_swiglu_expert_matmul(
         offsets,
         schedule,
         quantize,
+        max_expert_rows=max_expert_rows,
     )
