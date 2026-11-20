@@ -131,9 +131,8 @@ def _decode_mamba_spec_state_size(*, size, pre_alloc_size, verify_rows, replayss
 def test_decode_mamba_spec_scratch_rows(
     size, pre_alloc_size, verify_rows, replayssm_spec, pp_spec_stable_rows, rows
 ):
-    """In-transfer requests never verify, so the spec scratch covers the padded
-    verify batch and skips the pre-allocated slots, unless verify indexes it by
-    req_pool_idx (ReplaySSM-spec, PP-spec rows)."""
+    """The spec scratch covers the padded verify batch, not in-transfer slots,
+    unless verify indexes it by req_pool_idx (ReplaySSM-spec, PP-spec rows)."""
     with envs.SGLANG_ENABLE_PP_SPEC.override(pp_spec_stable_rows):
         spec_rows = _decode_mamba_spec_state_size(
             size=size,
@@ -185,10 +184,8 @@ def _ple_decode_pool(*, size, pre_alloc_size, verify_rows, draft_tokens):
     "pre_alloc_size", [4, 0], ids=["default_extra_slots", "no_extra_slots"]
 )
 def test_decode_ple_verify_writes_fit_padded_batch(pre_alloc_size):
-    """TP8 / attention DP2 with 4 running requests: each worker holds 2, and eager
-    warmup pads verify to the attention TP width, 4 rows. The PLE short-conv tape
-    and the N-gram commit write those rows by position, so the decode pool must
-    hold them whether or not it reserves in-transfer slots."""
+    """PLE verify writes index the scratch by padded batch position;
+    the decode pool must hold those rows with or without in-transfer slots."""
     size, draft_tokens = 2, 4
     with (
         patch(

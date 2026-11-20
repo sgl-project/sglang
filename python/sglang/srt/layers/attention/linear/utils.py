@@ -135,9 +135,6 @@ def select_verify_intermediate_state_indices(
 
 
 def max_verify_batch_size(pool_size: int) -> int:
-    """The most rows a verify batch over `pool_size` requests can have once
-    eager warmup, MLP sync or a CUDA graph pads it (see
-    `build_verify_intermediate_state_indices`)."""
     from sglang.srt.layers.dp_attention import (
         get_cuda_graph_max_batch_size,
         get_eager_max_batch_size,
