@@ -1,9 +1,11 @@
 """The fused MLA value BMM + MXFP4 output quant is bit-identical to the split path."""
 
+import contextlib
 import unittest
 from unittest import mock
 
 import torch
+import triton
 
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -44,16 +46,32 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         )
         return fused_flatten_mxfp4_quant(bf16_output)
 
-    def _fused(self, x, w=None, w_scales=None):
+    @contextlib.contextmanager
+    def _fused_kernel_only(self):
+        """Fail the call if the op took its split fallback instead of launching the fused kernel."""
+        from sglang.kernels.ops.gemm import mla_value_bmm_mxfp4_hip
+
+        with mock.patch.object(
+            mla_value_bmm_mxfp4_hip,
+            "batched_gemm_afp4wfp4_pre_quant",
+            side_effect=AssertionError("fused op took the split fallback"),
+        ):
+            yield
+
+    def _fused(self, x, w=None, w_scales=None, allow_fallback=False):
         from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
             batched_gemm_a16wfp4_flatten_mxfp4_quant,
         )
 
-        return batched_gemm_a16wfp4_flatten_mxfp4_quant(
-            x,
-            self.weight_fp4 if w is None else w,
-            self.weight_scales if w_scales is None else w_scales,
+        guard = (
+            contextlib.nullcontext() if allow_fallback else self._fused_kernel_only()
         )
+        with guard:
+            return batched_gemm_a16wfp4_flatten_mxfp4_quant(
+                x=x,
+                w=self.weight_fp4 if w is None else w,
+                w_scales=self.weight_scales if w_scales is None else w_scales,
+            )
 
     def _assert_matches_split_path(
         self, x, actual_fp4, actual_scales, w=None, w_scales=None
@@ -68,19 +86,26 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         return torch.randn((HEADS, tokens, K), dtype=torch.bfloat16, device="cuda")
 
     def test_matches_split_path_per_token_count(self):
+        from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+            _get_config,
+        )
+
         from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
             can_fuse_mla_value_bmm_mxfp4_quant,
         )
 
-        # 17 leaves a partial M tile; 64 spans several.
-        for tokens in (1, 17, 64):
+        # 17 leaves a partial M tile; 129 spans several.
+        for tokens in (1, 17, 64, 129):
             with self.subTest(tokens=tokens):
                 x = self._x(tokens)
                 self.assertTrue(
                     can_fuse_mla_value_bmm_mxfp4_quant(
-                        x, self.weight_fp4, self.weight_scales
+                        x=x, w=self.weight_fp4, w_scales=self.weight_scales
                     )
                 )
+                if tokens == 129:
+                    config, _ = _get_config(129, N, K // 2)
+                    self.assertGreater(triton.cdiv(129, config["BLOCK_SIZE_M"]), 1)
                 self._assert_matches_split_path(x, *self._fused(x))
 
     def test_matches_split_path_on_mla_call_site_views(self):
@@ -94,14 +119,16 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         w_vc = self.weight_fp4.contiguous().transpose(1, 2)
         w_scale_v = self.weight_scales.contiguous().transpose(1, 2)
         w, w_scales = w_vc.transpose(-2, -1), w_scale_v.transpose(-2, -1)
-        for tokens in (1, 17, 64):
+        for tokens in (1, 17, 64, 129):
             with self.subTest(tokens=tokens):
                 attn_output = torch.randn(
                     (tokens, HEADS, K), dtype=torch.bfloat16, device="cuda"
                 )
                 x = attn_output.transpose(0, 1)
                 self.assertEqual(x.stride(), (K, HEADS * K, 1))
-                self.assertTrue(can_fuse_mla_value_bmm_mxfp4_quant(x, w, w_scales))
+                self.assertTrue(
+                    can_fuse_mla_value_bmm_mxfp4_quant(x=x, w=w, w_scales=w_scales)
+                )
                 self._assert_matches_split_path(
                     x, *self._fused(x, w, w_scales), w=w, w_scales=w_scales
                 )
@@ -115,9 +142,9 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         compiled = torch.compile(
             batched_gemm_a16wfp4_flatten_mxfp4_quant, fullgraph=True
         )
-        self._assert_matches_split_path(
-            x, *compiled(x, self.weight_fp4, self.weight_scales)
-        )
+        with self._fused_kernel_only():
+            fused = compiled(x=x, w=self.weight_fp4, w_scales=self.weight_scales)
+        self._assert_matches_split_path(x, *fused)
 
     def test_config_lookup_fallback_uses_split_path(self):
         from sglang.kernels.ops.gemm import mla_value_bmm_mxfp4_hip
@@ -126,7 +153,7 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         with mock.patch.object(
             mla_value_bmm_mxfp4_hip, "_get_fused_config", return_value=None
         ):
-            fallback = self._fused(x)
+            fallback = self._fused(x, allow_fallback=True)
         self._assert_matches_split_path(x, *fallback)
 
     def test_cuda_graph_replay(self):
