@@ -40,7 +40,7 @@ def _chunk(rows) -> SamplingMaskChunk:
     )
 
 
-def _make_state(**obj_kwargs) -> ReqState:
+def _make_state(filters_sampling: bool = True, **obj_kwargs) -> ReqState:
     obj = GenerateReqInput(
         text="hello",
         return_logprob=True,
@@ -55,6 +55,7 @@ def _make_state(**obj_kwargs) -> ReqState:
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
+        filters_sampling=filters_sampling,
     )
 
 
@@ -148,6 +149,26 @@ class TestSamplingOutputMetaInfo(CustomTestCase):
         self.assertEqual(fields["output_token_sampling_logprobs"], [])
         for key in _FLAT_KEYS:
             self.assertEqual(fields[key], [])
+
+    def test_unfiltered_request_omits_sampling_fields(self):
+        """An unfiltered request is not captured; its response must carry no sampling
+        field for either flag, nested or flat, rather than an empty one."""
+        keys = ("output_token_sampling_logprobs", "output_sampling_mask_logprobs")
+        for logprobs, mask, flat in (
+            (True, False, False),
+            (False, True, False),
+            (True, True, False),
+            (False, True, True),
+        ):
+            with self.subTest(logprobs=logprobs, mask=mask, flat=flat):
+                state = _make_state(
+                    filters_sampling=False, return_flat_raw_sampling_mask=flat
+                )
+                state.obj.return_sampling_logprobs = logprobs
+                state.obj.return_sampling_mask = mask
+                fields = _meta_info(state, [None, None], finished=True)
+                for key in (*keys, *_FLAT_KEYS):
+                    self.assertNotIn(key, fields)
 
 
 if __name__ == "__main__":

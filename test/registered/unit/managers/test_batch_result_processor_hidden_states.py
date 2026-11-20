@@ -208,7 +208,8 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
             reqs=[
-                SimpleNamespace(captures_sampling=x, return_sampling_mask=x)
+                # The middle request returns the mask without being captured.
+                SimpleNamespace(captures_sampling=x, return_sampling_mask=True)
                 for x in (True, False, True)
             ],
             output=output,

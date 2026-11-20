@@ -1,8 +1,14 @@
+import asyncio
+import copy
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    GenerateReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
@@ -196,6 +202,61 @@ class TestSamplingMaskValidation(CustomTestCase):
                 return_sampling_logprobs=True,
                 return_logprob=True,
             )
+
+    def _tokenize(self, sampling_params, **request_fields):
+        self.manager.model_config.vocab_size = 32
+        self.manager.preferred_sampling_params = None
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.tokenizer = None
+        self.manager.fake_bootstrap_room_counter = 0
+        req = GenerateReqInput(
+            input_ids=[1, 2, 3], sampling_params=sampling_params, **request_fields
+        )
+        req.normalize_batch_and_arguments()
+        self.manager.rid_to_state = {
+            req.rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+        }
+        return self.manager._create_tokenized_object(req, "", req.input_ids)
+
+    def test_dispatch_records_whether_sampling_is_filtered(self):
+        """The response omits the sampling fields of an unfiltered request. A
+        parallel-sampling copy gets a fresh state without being tokenized again, so
+        the value must reach the state at dispatch, on the single and the batched
+        path, and a request body cannot supply it."""
+        sent = []
+        self.manager.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock(return_value=[]),
+            cancel_for_dispatch=lambda items: None,
+        )
+        self.manager.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=lambda tokenized_objs: [],
+            cancel_for_dispatch=lambda proxies: None,
+        )
+        self.manager.canary_info_hook = None
+        self.manager.encoder_dispatch_ready = {}
+        self.manager.batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+        self.manager._dispatch_to_scheduler = sent.append
+
+        def fresh_state(tokenized):
+            state = ReqState([], False, asyncio.Event(), None, tokenized.time_stats)
+            self.manager.rid_to_state = {tokenized.rid: state}
+            return state
+
+        for sampling_params, filtered in (({"top_k": 10}, True), ({}, False)):
+            with self.subTest(sampling_params=sampling_params):
+                tokenized = self._tokenize(sampling_params, return_sampling_mask=True)
+                sample = copy.copy(tokenized)
+                sample.rid = f"{tokenized.rid}-sample"
+                state = fresh_state(sample)
+                asyncio.run(self.manager._send_one_request(sample))
+                self.assertIs(state.filters_sampling, filtered)
+
+                state = fresh_state(tokenized)
+                asyncio.run(self.manager._send_batch_request([tokenized]))
+                self.assertIs(state.filters_sampling, filtered)
+        self.assertEqual(len(sent), 4)
+        with self.assertRaises(TypeError):
+            GenerateReqInput(input_ids=[1], filters_sampling=True)
 
     def test_removed_sampling_logprobs_mode_is_rejected(self):
         for mode in ("selected", "support", [None, None]):

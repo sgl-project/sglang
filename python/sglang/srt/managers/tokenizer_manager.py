@@ -307,6 +307,9 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # SamplingParams.filters_sampling() of the dispatched request; an unfiltered
+    # request is not captured and its response omits the sampling fields.
+    filters_sampling: bool = False
     # Held at generate_request's pause gate; an abort_all leaves it to run
     # after the pause.
     waiting_at_pause_gate: bool = False
@@ -516,6 +519,9 @@ def _add_sampling_output_to_meta_info(
     finished: bool,
 ):
     """Add the sampling logprobs and mask rows a request asked for."""
+    # An unfiltered request is not captured (Req.captures_sampling): nothing to add.
+    if not state.filters_sampling:
+        return
     obj = state.obj
     if chunk is not None:
         if obj.return_sampling_logprobs:
@@ -2017,6 +2023,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
+            self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 hook.on_request_dispatched(
                     rid_to_state=self.rid_to_state, tokenized_obj=tokenized_obj
@@ -2101,6 +2108,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(tensor, CudaIpcTensorTransportProxy):
                         pool.cancel_proxy(tensor)
 
+    def _record_filters_sampling(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> None:
+        """Keep whether the request filters sampling for its response. Every state
+        that receives output was dispatched, a parallel-sampling copy included."""
+        state = self.rid_to_state.get(tokenized_obj.rid)
+        if state is not None:
+            state.filters_sampling = tokenized_obj.sampling_params.filters_sampling()
+
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
 
@@ -2135,6 +2152,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
+            for tokenized_obj in tokenized_objs:
+                self._record_filters_sampling(tokenized_obj)
             if (hook := self.canary_info_hook) is not None:
                 for tokenized_obj in tokenized_objs:
                     hook.on_request_dispatched(

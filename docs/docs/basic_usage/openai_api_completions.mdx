@@ -421,7 +421,16 @@ idx = np.frombuffer(
 - `return_sampling_logprobs: true` adds `output_token_sampling_logprobs` to `meta_info`: one float per output token.
 - `return_sampling_mask: true` adds `output_sampling_mask_logprobs`: one row per output token, each entry `[logprob, token_id]` for a token the sampler could have drawn. Unlike a `top_logprobs` entry it carries no text, whatever `return_text_in_logprobs` is.
 
-Either flag needs greedy sampling or a finite `top_k` within `--sampling-mask-max-tokens`.
+The fields are returned only for a request that filters sampling with top-k, top-p or min-p; greedy sampling counts as `top_k: 1`. Without a filter each token is sampled from `softmax(logits / temperature)` and the fields are omitted: read `output_token_sampling_logprobs` when present and the output token logprob (`logprobs: true`) otherwise.
+
+That fallback is not the logprob of the draw when the server changes what is sampled or what is reported:
+
+- `SGLANG_RETURN_ORIGINAL_LOGPROB=1` reports the logprob before temperature.
+- Watermarking reports the logprob before the watermark.
+- Speculative decoding may accept draft tokens without exact sampling: argmax verification, a relaxed acceptance threshold, or simulated acceptance.
+- `--rl-on-policy-target` reports a BF16 log-softmax, and a batch that also holds a filtered request is not drawn from it.
+
+With a filter, `return_sampling_mask` needs greedy sampling or a finite `top_k` within `--sampling-mask-max-tokens`; `return_sampling_logprobs` alone has no such limit.
 
 The native `/generate` API takes the same two flags.
 
