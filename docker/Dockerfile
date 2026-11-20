@@ -621,6 +621,18 @@ ARG USE_LATEST_SGLANG
 
 WORKDIR /sgl-workspace
 
+# torch 2.14 pins nvidia-cublas 13.1, which has no SM120 GEMM kernels; SM120 images can opt into
+# 13.4 (--build-arg SGL_CUBLAS_VERSION=13.4.3.11). After every install that resolves torch's
+# dependencies (they would pin 13.1 back), and before the source copy, so source changes keep it.
+ARG SGL_CUBLAS_VERSION=
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "${SGL_CUBLAS_VERSION}" ]; then \
+        if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
+            echo "SGL_CUBLAS_VERSION installs the CUDA 13 cuBLAS wheel, not for CUDA ${CUDA_VERSION}" && exit 1; \
+        fi; \
+        uv pip install --reinstall --no-deps "nvidia-cublas==${SGL_CUBLAS_VERSION}"; \
+    fi
+
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \

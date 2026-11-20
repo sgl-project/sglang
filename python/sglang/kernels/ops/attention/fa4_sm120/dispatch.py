@@ -48,10 +48,10 @@ def get_forward_arch(device) -> int | None:
     return arch if get_forward_host(arch) is not None else None
 
 
-def try_cached_paged_decode(*, arch: int, **kwargs):
-    """Try an architecture-owned paged-decode launch plan."""
+def try_cached_paged(*, arch: int, **kwargs):
+    """Try an architecture-owned paged decode or prefill launch plan."""
     host = get_forward_host(arch)
-    return None if host is None else host.try_paged_decode(arch=arch, **kwargs)
+    return None if host is None else host.try_paged(arch=arch, **kwargs)
 
 
 def try_cached_varlen(*, arch: int, **kwargs):
