@@ -200,9 +200,6 @@ class Parallel(msgspec.Struct):
         "the group's unique KV capacity. Prefill workers of PD "
         "disaggregation only.",
     ] = False
-    # Deprecated spelling of `attn_dp_size`: `--dp-size N --enable-dp-attention`
-    # resolves to `attn_dp_size = N`, `dp_size = 1`. TODO: remove after 2026-12-31.
-    enable_dp_attention: A[bool, Arg(no_cli=True, resolvable=True)] = False
     enable_dp_attention_local_control_broadcast: A[
         bool,
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
@@ -251,17 +248,41 @@ class Parallel(msgspec.Struct):
         bool,
         "Shard dense MLP weights across the attention TP group under DP attention.",
     ] = False
+    kda_dwdp_size: A[
+        Optional[int],
+        "DWDP for Kimi-K3 KDA projection and shared-expert weights on PD prefill "
+        "workers (--disaggregation-mode prefill) under attention DP: each group of "
+        "this many attention-DP ranks holding the same attention-TP slice keeps 1/N "
+        "of every KDA layer's [q,k,v,g] in-projection and o_proj (and of the shared "
+        "experts when they would be replicated), and gathers a layer's full weights "
+        "over NVLink just before it runs. Must divide the attention-DP size. Saves "
+        "~(1 - 1/N) of those weights per rank (about 53 GB for K3 at attention TP 1, "
+        "N=8) for one layer-weight gather per sharded layer per forward.",
+    ] = None
     enable_layernorm_sp: A[
         bool,
         "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; supports Qwen3 dense and Muse Spark ModelOpt NVFP4 with "
+        "Prefill only; supports Qwen3 dense, Kimi-K3 without attention DP or CP, "
+        "and Muse Spark ModelOpt NVFP4 with "
         "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
         "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
         "NVLink/NVSwitch.",
     ] = False
+    layernorm_sp_min_tokens: A[
+        int,
+        "With --enable-layernorm-sp, run a pass sequence-parallel only above this "
+        "token count; smaller passes take the replicated path. 0 (the default) "
+        "runs every extend sequence-parallel, as today. The SP collectives cost "
+        "the same per layer whatever the pass size, so small extends -- short "
+        "follow-up turns, small chunks, prefix-cache hits -- can be slower "
+        "sequence-parallel than replicated while large chunks are faster. The "
+        "crossover is deployment-specific: measure extend passes of a few sizes "
+        "on both paths. Must be a captured prefill CUDA graph bucket, or at or "
+        "above the largest one.",
+    ] = 0
     enable_megamoe_for_layernorm_sp: A[
         Optional[bool],
         Arg(
@@ -279,14 +300,17 @@ class Parallel(msgspec.Struct):
     ] = None
     disable_attn_tp_gather: A[
         bool,
-        "Disable scheduler-side attn_tp_gather (the upstream SP path "
-        "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
-        "buffer). Use for models that manage SP scatter/gather at the "
-        "model level (e.g., perform their own all_gather/reduce_scatter "
-        "inside attention) and do not consume the upstream gathered_buffer. "
-        "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
-        "which can cause kernel autotuners to select wrong-sized variants "
-        "at small batches.",
+        Arg(
+            help="Disable scheduler-side attn_tp_gather (the upstream SP path "
+            "that pads num_tokens to attn_tp_size and pre-allocates a gathered "
+            "buffer). Use for models that manage SP scatter/gather at the "
+            "model level (e.g., perform their own all_gather/reduce_scatter "
+            "inside attention) and do not consume the upstream gathered_buffer. "
+            "Without this, the cuda graph runner pads num_tokens to attn_tp_size, "
+            "which can cause kernel autotuners to select wrong-sized variants "
+            "at small batches.",
+            resolvable=True,
+        ),
     ] = False
     enable_p2p_check: A[
         bool,

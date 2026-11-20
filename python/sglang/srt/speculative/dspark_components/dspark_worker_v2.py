@@ -79,6 +79,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    draft_folds_static_commit,
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
@@ -262,7 +263,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model.logits_mup_width_multiplier = getattr(
             target_model_config.hf_text_config, "logits_mup_width_multiplier", None
         )
-        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
@@ -349,7 +349,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
                 "yet support cuda graph (idle DP groups cannot join the token-keyed "
-                "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
+                "compact graph). Re-run with --disable-decode-cuda-graph --disable-prefill-cuda-graph (eager is lossless), "
                 "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
                 "cuda graph under DP."
             )
@@ -423,12 +423,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             and torch.device(self.device).type == "cuda"
             else None
         )
-        static_epilogue_supported = (
-            target_is_dsv41
-            and self._verify_planner.mode_value == "static"
-            and self._draft_is_moe
+        static_mode = (
+            self._verify_planner.mode_value == "static"
             and not get_parallel().attn_dp_enabled
             and get_parallel().pp_size == 1
+        )
+        dsv41_static = static_mode and target_is_dsv41 and self._draft_is_moe
+        # The KV pools do not exist yet; alloc_memory_pool checks that the draft
+        # really folds once they do.
+        self._static_epilogue_needs_draft_fold = (
+            static_mode
+            and not dsv41_static
+            and getattr(self.draft_model, "folds_static_verify_commit", False)
+        )
+        static_epilogue_supported = (
+            dsv41_static or self._static_epilogue_needs_draft_fold
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
         # need the group's pynccl communicator
@@ -519,7 +528,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
-        self._verify_executor = TargetVerifyExecutor(
+        self._verify_executor = self._build_verify_executor(
             target_worker=self.target_worker,
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -547,6 +556,12 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _build_verify_executor(self, **kwargs):
+        return TargetVerifyExecutor(**kwargs)
+
+    def _on_prefill_target_hidden(self, batch, target_hidden):
+        pass
 
     def _build_acceptance_estimator(self) -> Optional[OnlineAcceptanceEstimator]:
         if (
@@ -624,6 +639,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if self._static_epilogue_needs_draft_fold and not draft_folds_static_commit(
+            draft_model=self.draft_model, kv_injector=self._kv_injector
+        ):
+            raise ValueError(
+                f"{type(self.draft_model).__name__} folds the static verify commit, "
+                "but its FULL KV slots are not the target's unremapped slots"
+            )
 
     def init_attention_backends(self):
         if not self._hosts_draft:
@@ -808,8 +830,13 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().attn_dp_enabled:
+                # Idle DP ranks still run the target to join its MoE collectives.
+                # On the last PP stage that forward consumes the previous stage's
+                # relay, so hand the received proxy through instead of dropping it.
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
@@ -872,6 +899,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 token_indices=logits_output.hidden_states_token_indices,
                 target_hidden_is_projected=target_hidden_is_projected,
             )
+        self._on_prefill_target_hidden(batch, logits_output.hidden_states)
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
@@ -1303,7 +1331,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens=accept.commit_lens,
         )
 
-        folded_commit = graph_accept and epilogue.folds_commit
+        folded_commit = graph_accept and (
+            epilogue.folds_commit if run_compact else epilogue.folds_static_commit
+        )
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
@@ -1484,9 +1514,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         assert get_spec().speculative_eagle_topk in (None, 1)
         attn_backend = self.target_worker.model_runner.attn_backend
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
-        mamba_steps_to_track = None
         mamba_track_indices = batch.mamba_track_indices
+        mamba_track_interval = 0
 
         if mamba_track_indices is not None:
             mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
@@ -1511,23 +1540,42 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ):
                     mamba_track_indices = None
 
-        if mamba_track_indices is not None:
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
+        if commit_lens.is_cuda:
+            from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                fused_commit_track_indices,
             )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+
+            last_correct_step_indices, mamba_steps_to_track = (
+                fused_commit_track_indices(
+                    None,
+                    commit_lens,
+                    seq_lens_pre_verify if mamba_track_indices is not None else None,
+                    self.verify_num_draft_tokens,
+                    mamba_track_interval,
+                )
             )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
+        else:
+            last_correct_step_indices = commit_lens.to(torch.int64) - 1
+            mamba_steps_to_track = None
+            if mamba_track_indices is not None:
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != seq_lens_post_verify // mamba_track_interval
+                )
+                tracking_point = (
+                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                )
+                can_track_mask = to_track_mask & (
+                    to_track_ith < commit_lens.to(to_track_ith.dtype)
+                )
+                mamba_steps_to_track = torch.where(
+                    can_track_mask,
+                    to_track_ith.to(torch.int64),
+                    torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                )
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,

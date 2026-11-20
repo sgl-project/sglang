@@ -60,7 +60,6 @@ def apply_simulator_defaults(raw_args: argparse.Namespace, argv: list[str]) -> N
     if not (
         _has_cli_option(argv, "--cuda-graph-backend-decode")
         or _has_cli_option(argv, "--cuda-graph-backend-prefill")
-        or _has_cli_option(argv, "--disable-cuda-graph")
     ):
         raw_args.disable_cuda_graph = True
 
