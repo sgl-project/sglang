@@ -165,8 +165,8 @@ _TEXT_ENCODER_KEY_PREFIXES = (
 
 
 def _safetensors_file_kind(source: WeightSource) -> str:
-    """ "lora", "text_encoder", "vae" or "transformer", from a Hub safetensors
-    file's header only; other formats are taken as transformers."""
+    """ "lora", "tensors", "text_encoder", "vae" or "transformer", from a Hub
+    safetensors file's header only; other formats are taken as transformers."""
     filename = source.filename
     assert source.repo_id is not None and filename is not None
     if not filename.lower().endswith(".safetensors"):
@@ -180,6 +180,10 @@ def _safetensors_file_kind(source: WeightSource) -> str:
     )
     if any(marker in key.lower() for key in keys for marker in _LORA_KEY_MARKERS):
         return "lora"
+    if keys and not any("." in key for key in keys):
+        # Module weights have dotted names. Bare names are standalone tensors:
+        # prompt embeddings, position tables, cached latents.
+        return "tensors"
     if any(key.startswith(_TEXT_ENCODER_KEY_PREFIXES) for key in keys):
         return "text_encoder"
     if any(key.startswith("encoder.") for key in keys) and any(
@@ -202,6 +206,11 @@ def resolve_hub_file_model(model_path: Any) -> HubFileModel | None:
         source.repo_id, source.revision, source.filename
     )
     kind = _safetensors_file_kind(source)
+    if kind == "tensors":
+        raise ValueError(
+            f"{model_path} holds standalone tensors (such as prompt embeddings), "
+            f"not transformer or LoRA weights. Serve the base model {base_model}."
+        )
     if kind in ("text_encoder", "vae"):
         raise ValueError(
             f"{model_path} holds {kind} weights, not a transformer or LoRA. Serve "
@@ -221,12 +230,15 @@ def resolve_hub_file_model(model_path: Any) -> HubFileModel | None:
     )
 
 
-def apply_hub_file_model_path(kwargs: dict[str, Any], explicit: set[str]) -> None:
+def apply_hub_file_model_path(kwargs: dict[str, Any], explicit: set[str]) -> str | None:
     """Rewrite server kwargs whose ``model_path`` is a Hub weight file into the
-    base model plus a transformer override or a LoRA."""
+    base model plus a transformer override or a LoRA.
+
+    Returns the equivalent explicit command to log, which the caller does once
+    ServerArgs has configured logging."""
     resolved = resolve_hub_file_model(kwargs.get("model_path"))
     if resolved is None:
-        return
+        return None
 
     if resolved.is_lora:
         if kwargs.get("lora_path"):
@@ -261,9 +273,7 @@ def apply_hub_file_model_path(kwargs: dict[str, Any], explicit: set[str]) -> Non
         explicit.add("served_model_name")
     kwargs["model_path"] = resolved.base_model
     explicit.add("model_path")
-    logger.info(
-        "Serving %s on its base model, as --model-path %s %s",
-        resolved.weight,
-        resolved.base_model,
-        flag,
+    return (
+        f"Serving {resolved.weight} on its base model, as "
+        f"--model-path {resolved.base_model} {flag}"
     )

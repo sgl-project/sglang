@@ -135,8 +135,12 @@ def test_transformer_file_becomes_weight_override(hub):
     weight = "Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors"
     kwargs, explicit = {"model_path": weight}, {"model_path"}
 
-    apply_hub_file_model_path(kwargs, explicit)
+    note = apply_hub_file_model_path(kwargs, explicit)
 
+    assert note == (
+        f"Serving {weight} on its base model, as --model-path {H3} "
+        f"--component-weights-paths.transformer {weight} --model-variant ref2va"
+    )
     assert kwargs == {
         "model_path": H3,
         "component_weights_paths": {"transformer": weight},
@@ -212,19 +216,20 @@ def test_conflicting_overrides_are_rejected(hub, extra, tensors):
             ["encoder.conv_in.weight", "decoder.conv_out.weight"],
             "vae",
         ),
+        ("embeddings/bullet_time.safetensors", ["qwen3vl_32b"], "standalone tensors"),
     ],
 )
-def test_component_files_fail_before_download(hub, filename, tensors, kind):
+def test_non_model_files_fail_before_download(hub, filename, tensors, kind):
     hub.cards["Comfy-Org/MiniMax-H3"] = H3
     weight = f"Comfy-Org/MiniMax-H3/{filename}"
     hub.tensors[weight] = tensors
-    with pytest.raises(ValueError, match=f"holds {kind} weights"):
+    with pytest.raises(ValueError, match=f"holds {kind}"):
         apply_hub_file_model_path({"model_path": weight}, set())
 
 
 def test_other_model_paths_are_untouched(hub):
     kwargs = {"model_path": H3, "model_variant": "fl2va"}
-    apply_hub_file_model_path(kwargs, set())
+    assert apply_hub_file_model_path(kwargs, set()) is None
     assert kwargs == {"model_path": H3, "model_variant": "fl2va"}
     assert hub.api is None
 
