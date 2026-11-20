@@ -856,8 +856,9 @@ RUN cd sglang \
 
 # gfx950: bundle TreeCore, which Kimi-K3.1's env defaults load on every rank so they cannot mix
 # Rust/Python implementations and diverge on HiCache reclaim. Build against the installed ROCm
-# torch; isolation would pull CUDA torch.
-RUN if [ "${GPU_ARCH%%-*}" = "gfx950" ]; then \
+# torch; isolation would pull CUDA torch. The Rust TreeCore needs PyTorch 2.11+, so the rocm720
+# flavor (torch 2.9.1) keeps the Python TreeCore.
+RUN if [ "${GPU_ARCH%%-*}" = "gfx950" ] && [ "${GPU_ARCH##*-}" != "rocm720" ]; then \
       cd sglang/python \
       && python -m pip --no-cache-dir install "setuptools-rust>=1.11" \
       && sed -i -E 's/^rust-extensions = \["multimodal"\]$/rust-extensions = ["multimodal", "rust_tree_core"]/' pyproject.toml \
