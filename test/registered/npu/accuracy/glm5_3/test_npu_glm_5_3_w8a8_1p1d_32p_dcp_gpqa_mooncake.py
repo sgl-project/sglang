@@ -195,10 +195,6 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     "--tokenizer-worker-num",
     16,
     "--disable-shared-experts-fusion",
-    # DP LM head keeps the logits all-gather inside the attention TP group and
-    # skips the multimem gatherer, which probes NVML on every multi-node TP
-    # group. The released NPU image predates the is_cuda() guard for that probe.
-    "--enable-dp-lm-head",
     "--dtype",
     "bfloat16",
     "--load-balance-method",
@@ -212,25 +208,14 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     "--speculative-num-draft-tokens",
     4,
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    32,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    1000,
 ]
 
 
 # DCP variant with L3 Mooncake store
-# 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4,
-# EPLB enabled on the decode side only (NPU EPLB requires PP=1)
+# 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP and EPLB on gpqa_diamond"""
+    """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
 
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
@@ -300,7 +285,7 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         super().setUpClass()
 
     def test_npu_glm_5_3_w8a8_1p1d_dcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with DCP and EPLB on gpqa_diamond"""
+        """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
         self.run_accuracy()
 
 
