@@ -15,7 +15,6 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.bench_drafter import (
     bench_drafter_enabled,
     override_draft_sampling,
-    require_greedy_requests,
 )
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
@@ -231,7 +230,6 @@ def propose_lilicorr_block(
         else torch.ones(bs, dtype=torch.bool, device=device)
     )
     if sampling_enabled and bench_drafter_enabled():
-        require_greedy_requests(sampling_info)
         override_draft_sampling(temperatures, greedy_mask)
     selected, q_rows = head.select_with_proposal(
         uniforms=torch.rand(bs, slots, dtype=torch.float32, device=device),
@@ -313,7 +311,9 @@ class LiLiCorrDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         if not self.sampling_enabled:
             return
-        if sampling_info is None:
+        if bench_drafter_enabled():
+            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
+        elif sampling_info is None:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
         else:
@@ -327,9 +327,6 @@ class LiLiCorrDraftSampler:
                     bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
                 )
             )
-        if bench_drafter_enabled():
-            require_greedy_requests(sampling_info)
-            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
 
     def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
         del input_ids

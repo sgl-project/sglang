@@ -87,10 +87,6 @@ class TestResolveDraftParams(_BenchTemperature):
         params = self._resolve(1000.0, None)
         self.assertTrue(torch.equal(params.step_temperatures, torch.full((3,), 1000.0)))
 
-    def test_override_rejects_sampling_requests(self):
-        with self.assertRaisesRegex(ValueError, "requires greedy requests"):
-            self._resolve(1000.0, MIXED)
-
 
 class TestParse(_BenchTemperature):
     def test_unset_is_zero(self):
@@ -102,7 +98,7 @@ class TestParse(_BenchTemperature):
             self.assertEqual(bench_drafter_temperature(), 1000.0)
 
     def test_out_of_range_values_raise(self):
-        for raw in ("-1", "inf", "nan"):
+        for raw in ("-1", "inf", "nan", "1e-50", "1e50"):
             with self.subTest(raw=raw):
                 with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override(raw):
                     bench_drafter_temperature.cache_clear()
@@ -119,7 +115,6 @@ class TestParse(_BenchTemperature):
 
 def _worker(**overrides):
     fields = dict(
-        _simulated_correct_len=torch.zeros(1, dtype=torch.int64),
         _simulate_acc_len=3.8,
         _greedy_draft=False,
         _verify_planner=SimpleNamespace(mode_value="static"),
@@ -136,8 +131,15 @@ class TestWorkerGuard(_BenchTemperature):
             bench_drafter_temperature.cache_clear()
             DSparkWorkerV2._check_bench_drafter_temperature(worker)
 
+    def test_sampling_request_rejected_before_simulated_greedy_can_mask_it(self):
+        worker = _worker(_hosts_draft=True, _simulate_acc_greedy=True)
+        batch = SimpleNamespace(sampling_info=MIXED)
+        with envs.SGLANG_BENCH_DRAFTER_TEMPERATURE.override("1000"):
+            with self.assertRaisesRegex(ValueError, "requires greedy requests"):
+                DSparkWorkerV2.forward_batch_generation(worker, batch)
+
     def test_off_accepts_anything(self):
-        self._check(_worker(_simulated_correct_len=None, _greedy_draft=True), "0")
+        self._check(_worker(_simulate_acc_len=-1, _greedy_draft=True), "0")
 
     def test_benchmark_config_passes(self):
         worker = _worker()
@@ -156,9 +158,14 @@ class TestWorkerGuard(_BenchTemperature):
         self._check(worker, "0")
         self.assertTrue(worker._greedy_draft)
 
+    def test_requires_positive_finite_simulated_acceptance_length(self):
+        for length in (-1, 0, float("-inf"), float("inf"), float("nan")):
+            with self.subTest(length=length):
+                with self.assertRaisesRegex(ValueError, "SGLANG_SIMULATE_ACC_LEN"):
+                    self._check(_worker(_simulate_acc_len=length))
+
     def test_rejects_unsupported_configs(self):
         cases = {
-            "SGLANG_SIMULATE_ACC_LEN": _worker(_simulated_correct_len=None),
             "SGLANG_RAGGED_VERIFY_MODE": _worker(
                 _verify_planner=SimpleNamespace(mode_value="compact")
             ),

@@ -29,7 +29,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
+from sglang.srt.speculative.bench_drafter import (
+    bench_drafter_temperature,
+    require_greedy_requests,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -659,11 +662,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         if temperature <= 0.0:
             return
         name = "SGLANG_BENCH_DRAFTER_TEMPERATURE"
-        if self._simulated_correct_len is None:
-            raise ValueError(
-                f"{name} requires SGLANG_SIMULATE_ACC_LEN > 0: real acceptance would "
-                "reject the drafts it samples."
-            )
+        if not 0 < self._simulate_acc_len < float("inf"):
+            raise ValueError(f"{name} requires a finite SGLANG_SIMULATE_ACC_LEN > 0.")
         if self._greedy_draft:
             # The benchmark asks for sampled drafts; an argmax draft would undo it.
             self._greedy_draft = False
@@ -812,6 +812,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
+        # Check the original request before simulated greedy decode can discard its
+        # sampling metadata or prefill can produce the first target token.
+        if bench_drafter_temperature() > 0.0:
+            require_greedy_requests(batch.sampling_info)
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,

@@ -218,6 +218,18 @@ def _unit_scale_on_hip(scale):
     return 1.0 if scale is None and is_hip() else scale
 
 
+def _bench_head_scores(logits, *, token_id_vocab_size, col_start, row_start, step):
+    scores = gumbel_draft_scores(
+        logits, col_start=col_start, row_start=row_start, step=step
+    )
+    # Some checkpoints store padding as original vocabulary rows. The target
+    # masks these logits too; a hot draft would frequently pick invalid IDs.
+    valid_cols = max(0, token_id_vocab_size - col_start)
+    if valid_cols < scores.shape[1]:
+        scores[:, valid_cols:].fill_(-torch.inf)
+    return scores
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -231,12 +243,25 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+        token_id_vocab_size=None,
     ):
         self.weight = weight
         self.block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
+        self.token_id_vocab_size = (
+            self.org_vocab_start + self.num_org
+            if token_id_vocab_size is None
+            else token_id_vocab_size
+        )
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
         max_tokens = int(max_bs) * (self.block_size - 1)
@@ -244,9 +269,12 @@ class _DflashDraftSampler:
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         # SGLANG_BENCH_DRAFTER_TEMPERATURE: Gumbel-max sampling replaces the argmax;
         # the in-graph step counter advances the noise on every replay.
-        self.bench_sampling = bench_drafter_enabled()
-        self.noise_step = torch.zeros((), dtype=torch.int64, device=device)
-        score_dtype = torch.float32 if self.bench_sampling else weight.dtype
+        self.noise_step = (
+            torch.zeros((), dtype=torch.int64, device=device)
+            if bench_drafter_enabled()
+            else None
+        )
+        score_dtype = torch.float32 if self.noise_step is not None else weight.dtype
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
@@ -278,9 +306,10 @@ class _DflashDraftSampler:
             hs = hs.to(self.weight.dtype)
         n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
-        if self.bench_sampling:
-            logits = gumbel_draft_scores(
+        if self.noise_step is not None:
+            logits = _bench_head_scores(
                 logits,
+                token_id_vocab_size=self.token_id_vocab_size,
                 col_start=self.org_vocab_start,
                 row_start=0,
                 step=self.noise_step,
@@ -444,7 +473,9 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
-        if sampling_info is None or not self.sampling_enabled:
+        if self.sampling_enabled and bench_drafter_enabled():
+            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
+        elif sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
         else:
@@ -458,9 +489,6 @@ class _SelectorDraftSampler:
                     bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
                 )
             )
-        if bench_drafter_enabled():
-            require_greedy_requests(sampling_info)
-            override_draft_sampling(self.temperatures[:bs], self.greedy_mask[:bs])
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -497,27 +525,29 @@ class _MegakernelSelectorDraftSampler:
     def __init__(self, *, head, out, candidate_out, q_out, sampling_enabled):
         self.out, self.candidate_out, self.q_out = out, candidate_out, q_out
         self.sampling_enabled = sampling_enabled
-        # Staging goes to the megakernel head's own buffers, not ones sized here.
-        self.max_bs = None
+        self.max_bs = max(head.draft_head_requests)
         self._head = head
         self._staged_greedy = False
+        self._bench_sampling = sampling_enabled and bench_drafter_enabled()
+        if self._bench_sampling:
+            self._bench_temperatures = torch.full(
+                (self.max_bs,),
+                bench_drafter_temperature(),
+                dtype=torch.float32,
+                device=q_out.device,
+            )
+            self._bench_greedy_mask = torch.zeros(
+                self.max_bs, dtype=torch.bool, device=q_out.device
+            )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         if not self.sampling_enabled:
             return
-        if bench_drafter_enabled():
-            require_greedy_requests(sampling_info)
-            device = self.q_out.device
+        if self._bench_sampling:
             self._head.stage_draft_head_sampling(
-                temperatures=torch.full(
-                    (bs,),
-                    bench_drafter_temperature(),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                greedy_mask=torch.zeros((bs,), dtype=torch.bool, device=device),
+                temperatures=self._bench_temperatures[:bs],
+                greedy_mask=self._bench_greedy_mask[:bs],
             )
-            self._staged_greedy = False
             return
         if _is_all_greedy(sampling_info):
             if not self._staged_greedy:
@@ -975,9 +1005,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if temperature <= 0.0:
             return
         name = BENCH_DRAFTER_ENV
-        if SIMULATE_ACC_LEN <= 0:
+        if not (0 < SIMULATE_ACC_LEN < math.inf):
             raise ValueError(
-                f"{name} requires SGLANG_SIMULATE_ACC_LEN > 0: real acceptance would "
+                f"{name} requires a finite SGLANG_SIMULATE_ACC_LEN > 0: real acceptance would "
                 "reject the drafts it samples."
             )
         if SIMULATE_ACC_TOKEN_MODE != "real-draft-token" and self._target_tp_rank == 0:
@@ -1489,7 +1519,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampler = self._draft_sampler
         if sampler is None:
             return
-        if sampler.max_bs is None or bs <= sampler.max_bs:
+        if bs <= sampler.max_bs:
             sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
 
     def _maybe_attach_megakernel_head(self, lm_head):
@@ -1691,7 +1721,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start = 0
         else:
             shard = lm_head.shard_indices
-            if int(shard.num_added_elements) != 0:
+            # All TP ranks must agree on capture, even a rank whose local
+            # slice of the added vocabulary consists entirely of padding.
+            if lm_head.num_added_embeddings:
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
@@ -1705,6 +1737,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
+            token_id_vocab_size=self.model_runner.model_config.token_id_vocab_size,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
@@ -2259,7 +2292,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
         if bench_drafter_enabled():
-            require_greedy_requests(sampling_info)
             override_draft_sampling(temperatures, greedy_mask)
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -2330,8 +2362,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         scores at the benchmark temperature; ``logits`` unchanged when it is off."""
         if not bench_drafter_enabled():
             return logits
-        return gumbel_draft_scores(
+        return _bench_head_scores(
             logits,
+            token_id_vocab_size=self.model_runner.model_config.token_id_vocab_size,
             col_start=col_start,
             row_start=row_start,
             step=self._bench_eager_noise_step + BENCH_EAGER_STEP_OFFSET,
@@ -2364,11 +2397,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
         num_org = int(getattr(lm_head, "org_vocab_size", 0)) or None
+        shard = getattr(lm_head, "shard_indices", None)
+        added = None
+        if bench_drafter_enabled() and shard is not None and shard.num_added_elements:
+            start_added = shard.num_org_elements_padded
+            added = slice(start_added, start_added + shard.num_added_elements)
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
             logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end], None)
-            if num_org is not None and logits.shape[-1] > num_org:
+            if added is not None:
+                # At TP1 these two slices, concatenated, are in global token-ID order.
+                logits = torch.cat((logits[:, :num_org], logits[:, added]), dim=-1)
+            elif num_org is not None and logits.shape[-1] > num_org:
                 logits = logits[:, :num_org]
             logits = self._bench_draft_scores(logits, col_start=0, row_start=start)
             out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
@@ -2390,21 +2431,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
-        try:
-            return self._sample_from_vocab_parallel_head(
-                hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
-            )
-        finally:
-            # One noise step per draft call, shared by every rank and chunk.
+        if bench_drafter_enabled():
+            # Every rank and chunk in this round samples with the same step.
             self._bench_eager_noise_step += 1
-
-    def _sample_from_vocab_parallel_head(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        lm_head,
-        chunk_size: int,
-    ) -> torch.Tensor:
         if not is_dense_head_weight(getattr(lm_head, "weight", None)):
             return self._greedy_sample_from_quantized_head(
                 hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
@@ -3807,6 +3836,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info = batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
             return
+        if bench_drafter_enabled():
+            require_greedy_requests(sampling_info)
 
         if self.selector is not None:
             if self._selector_sampling_enabled:

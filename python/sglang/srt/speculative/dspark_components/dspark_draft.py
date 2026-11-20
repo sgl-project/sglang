@@ -21,10 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.speculative.bench_drafter import (
-    bench_drafter_temperature,
-    require_greedy_requests,
-)
+from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -171,7 +168,6 @@ def resolve_draft_params(
         # Benchmark mode: only the draft step temperature changes. temperatures and
         # greedy_mask, which the verify reads, stay as resolved, so the target still
         # verifies greedily.
-        require_greedy_requests(sampling_info)
         step_temperatures.fill_(bench_temperature)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 

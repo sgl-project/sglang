@@ -19,10 +19,11 @@ from sglang.srt.speculative.bench_drafter import (
     override_draft_sampling,
 )
 from sglang.srt.speculative.lilicorr_utils import LiLiCorrDraftSampler
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 def _sampling_info(temperatures, top_ks):
@@ -86,6 +87,51 @@ class TestGumbelDraftScores(_Case):
         self.assertFalse(torch.equal(a, c))
         self.assertTrue(bool(torch.isfinite(a).all()))
 
+    def test_noise_endpoints_are_finite_and_respect_masked_tokens(self):
+        # Test both extremes of the 32-bit RNG. Rounding the upper uniform
+        # endpoint to 1 used to let a negligible (or masked) logit win.
+        words = torch.tensor([[0xFFFFFFFF, 0, 0]])
+        with (
+            _bench(1),
+            patch(
+                "sglang.kernels.ops.speculative.dspark.markov_sample._philox",
+                return_value=(words, None, None, None),
+            ),
+        ):
+            scores = self._scores(torch.tensor([[0.0, -1000.0, -torch.inf]]), 0)
+        self.assertTrue(torch.isfinite(scores[:, :2]).all())
+        self.assertEqual(scores[0, 2].item(), -torch.inf)
+        self.assertEqual(scores.argmax().item(), 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_cuda_graph_replay_matches_eager_vocab_shards(self):
+        cpu_logits = torch.arange(3 * 503).view(3, 503).to(torch.bfloat16)
+        logits = cpu_logits.cuda()
+        # Exercise both words of the counter and a non-aligned vocab shard.
+        initial = (1 << 32) + 7
+        step = torch.tensor(initial, device="cuda", dtype=torch.int64)
+
+        def scores(x, s, col=0):
+            return gumbel_draft_scores(x, step=s, col_start=col, row_start=13)
+
+        with _bench(1000):
+            scores(logits, step)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                full = scores(logits, step)
+                step.add_(1)
+
+            step.fill_(initial)
+            for s in range(initial, initial + 3):
+                graph.replay()
+                sharded = torch.cat(
+                    [scores(logits[:, :117], s), scores(logits[:, 117:], s, 117)],
+                    dim=1,
+                )
+                self.assertTrue(torch.equal(full, sharded))
+                torch.testing.assert_close(full.cpu(), scores(cpu_logits, s))
+                self.assertEqual(step.item(), s + 1)
+
     def test_eager_and_graph_streams_do_not_share_noise(self):
         logits = torch.zeros(4, 64)
         with _bench(1000):
@@ -106,22 +152,29 @@ class TestGumbelDraftScores(_Case):
         self.assertTrue(torch.equal(torch.cat(shards, dim=1), full))
 
     def test_high_temperature_is_near_uniform(self):
-        vocab, steps = 16, 4000
-        logits = torch.linspace(-8.0, 8.0, vocab).repeat(1, 1)
+        vocab, steps, rows = 16, 16, 256
+        logits = torch.linspace(-8.0, 8.0, vocab).expand(rows, -1)
         with _bench(1000):
             picks = torch.stack(
                 [self._scores(logits, s).argmax(-1) for s in range(steps)]
             ).view(-1)
         counts = torch.bincount(picks, minlength=vocab).float()
-        expected = steps / vocab
+        expected = steps * rows / vocab
         self.assertEqual(int((counts > 0).sum()), vocab)
         self.assertLess(float((counts - expected).abs().max()), 0.35 * expected)
 
+    def test_smallest_temperature_keeps_finite_logits_ordered(self):
+        logits = torch.tensor([[15.0, 25.0]])
+        with _bench(torch.finfo(torch.float32).tiny):
+            scores = self._scores(logits, 0)
+        self.assertTrue(torch.isfinite(scores).all())
+        self.assertEqual(scores.argmax().item(), 1)
+
     def test_low_temperature_follows_the_logits(self):
-        logits = torch.tensor([[0.0, 5.0, 1.0, -2.0]])
+        logits = torch.tensor([[0.0, 5.0, 1.0, -2.0]]).expand(200, -1)
         with _bench(0.01):
-            picks = {int(self._scores(logits, s).argmax()) for s in range(200)}
-        self.assertEqual(picks, {1})
+            picks = self._scores(logits, 0).argmax(-1)
+        self.assertTrue(torch.all(picks == 1))
 
 
 class TestOverride(_Case):
@@ -187,13 +240,11 @@ class TestPlainDflashGraphSampler(_Case):
         self.assertFalse(bool((draws == self.argmax).all()))
 
 
-def _eager_worker():
-    worker = SimpleNamespace(_bench_eager_noise_step=0)
-    worker._bench_draft_scores = lambda logits, **kw: (
-        dfw.DFlashWorkerV2._bench_draft_scores(worker, logits, **kw)
-    )
-    worker._sample_from_vocab_parallel_head = lambda **kw: (
-        dfw.DFlashWorkerV2._sample_from_vocab_parallel_head(worker, **kw)
+def _eager_worker(token_id_vocab_size=VOCAB):
+    worker = object.__new__(dfw.DFlashWorkerV2)
+    worker._bench_eager_noise_step = 0
+    worker.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(token_id_vocab_size=token_id_vocab_size)
     )
     return worker
 
@@ -214,8 +265,93 @@ class TestPlainDflashEagerHead(_Case):
             draws = torch.stack(
                 [self._sample(worker, hidden, weight) for _ in range(20)]
             )
-        self.assertEqual(worker._bench_eager_noise_step, 21)
+        self.assertEqual(worker._bench_eager_noise_step, 20)
         self.assertGreater(int(torch.unique(draws).numel()), VOCAB // 2)
+
+    def test_rank_with_only_padding_uses_eager_head_for_added_vocab(self):
+        head = SimpleNamespace(
+            weight=torch.ones(4, 3),
+            num_added_embeddings=1,
+            shard_indices=SimpleNamespace(num_added_elements=0),
+        )
+        worker = SimpleNamespace(
+            _target_tp_rank=1,
+            _target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=head))
+            ),
+            block_size=BLOCK,
+            selector=None,
+            lilicorr=None,
+            _is_domino=False,
+        )
+        with patch.object(
+            dfw, "get_parallel", return_value=SimpleNamespace(tp_group=Mock())
+        ):
+            self.assertIsNone(dfw.DFlashWorkerV2._maybe_build_draft_sampler(worker))
+
+    def test_chunked_added_vocab_matches_unpadded_head(self):
+        valid = 9
+        worker = _eager_worker(valid)
+        worker._draft_greedy_local_cap = 0
+        hidden = torch.ones(11, HIDDEN)
+        weight = torch.zeros((16, HIDDEN))
+        weight[4:8].fill_(1e5)  # padding between base and added embeddings
+        weight[13:].fill_(1e5)  # padding after the added embeddings
+        head = SimpleNamespace(
+            weight=weight,
+            shard_indices=SimpleNamespace(
+                num_org_elements=4,
+                num_org_elements_padded=8,
+                num_added_elements=5,
+                org_vocab_start_index=0,
+                added_vocab_start_index=4,
+            ),
+        )
+        with (
+            _bench(1000),
+            patch.object(
+                dfw,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=SimpleNamespace(world_size=1)),
+            ),
+        ):
+            actual = worker._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden, lm_head=head, chunk_size=2
+            )
+            quant_head = SimpleNamespace(
+                org_vocab_size=4,
+                shard_indices=head.shard_indices,
+                quant_method=SimpleNamespace(apply=lambda _, x, bias: x @ weight.T),
+            )
+            quantized = _eager_worker(valid)._greedy_sample_from_vocab_parallel_head(
+                hidden_states=hidden, lm_head=quant_head, chunk_size=2
+            )
+            expected = self._sample(
+                _eager_worker(valid), hidden, torch.cat((weight[:4], weight[8:13]))
+            )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(quantized, expected)
+        self.assertTrue(bool((actual >= 4).any()))
+
+    def test_benchmark_skips_padded_token_ids(self):
+        # Some checkpoints include padding within their declared LM-head vocabulary.
+        valid = 7
+        weight = torch.zeros(VOCAB, HIDDEN)
+        weight[valid:].fill_(1e5)
+        hidden = torch.ones(BLOCK, HIDDEN)
+        worker = _eager_worker(valid)
+        with _bench(1000):
+            sampler = dfw._DflashDraftSampler(
+                weight=weight,
+                block_size=BLOCK,
+                num_org=VOCAB,
+                org_vocab_start=0,
+                max_bs=1,
+                token_id_vocab_size=valid,
+            )
+            sampler(hidden)
+            self.assertTrue(bool((sampler.out < valid).all()))
+            self.assertTrue(bool((self._sample(worker, hidden, weight) < valid).all()))
 
 
 class TestSelectorAndLiLiCorrStaging(_Case):
@@ -242,20 +378,23 @@ class TestSelectorAndLiLiCorrStaging(_Case):
                 torch.equal(sampler.temperatures[:3], torch.full((3,), 1000.0))
             )
             self.assertFalse(bool(sampler.greedy_mask[:3].any()))
-            with self.assertRaisesRegex(ValueError, "requires greedy requests"):
-                sampler.stage_sampling_params(bs=3, sampling_info=MIXED)
 
     def test_megakernel_selector_stages_the_benchmark_temperature(self):
-        head = Mock()
-        sampler = dfw._MegakernelSelectorDraftSampler(
-            head=head,
-            out=None,
-            candidate_out=None,
-            q_out=torch.empty(1),
-            sampling_enabled=True,
-        )
+        head = Mock(draft_head_requests=(1, 4))
         with _bench(1000):
-            sampler.stage_sampling_params(bs=3, sampling_info=GREEDY)
+            sampler = dfw._MegakernelSelectorDraftSampler(
+                head=head,
+                out=None,
+                candidate_out=None,
+                q_out=torch.empty(1),
+                sampling_enabled=True,
+            )
+            worker = SimpleNamespace(_draft_sampler=sampler)
+            for bs in (3, 3, 5):  # repeat the shape, then exceed the head capacity
+                dfw.DFlashWorkerV2._stage_draft_sampler(
+                    worker, bs=bs, sampling_info=GREEDY
+                )
+        self.assertEqual(head.stage_draft_head_sampling.call_count, 2)
         staged = head.stage_draft_head_sampling.call_args.kwargs
         self.assertTrue(torch.equal(staged["temperatures"], torch.full((3,), 1000.0)))
         self.assertFalse(bool(staged["greedy_mask"].any()))
@@ -310,6 +449,24 @@ class TestDflashWorkerGuard(_Case):
         self._check(_dflash_worker(_target_tp_rank=0), mode="fixed")
         self._check(_dflash_worker(selector=object()))
         self._check(_dflash_worker(lilicorr=object(), _lilicorr_sampling_enabled=True))
+
+    def test_rejects_non_finite_acceptance_length(self):
+        for length in (float("nan"), float("inf")):
+            with self.subTest(length=length):
+                with self.assertRaisesRegex(ValueError, "SGLANG_SIMULATE_ACC_LEN"):
+                    self._check(_dflash_worker(), acc_len=length)
+
+    def test_plain_dflash_requires_greedy_requests(self):
+        worker = _dflash_worker()
+        with _bench(1000):
+            for sampling_info in (None, GREEDY):
+                dfw.DFlashWorkerV2._validate_phase1_sampling_support(
+                    worker, SimpleNamespace(sampling_info=sampling_info)
+                )
+            with self.assertRaisesRegex(ValueError, "requires greedy requests"):
+                dfw.DFlashWorkerV2._validate_phase1_sampling_support(
+                    worker, SimpleNamespace(sampling_info=MIXED)
+                )
 
     def test_rejects_unsupported_configs(self):
         cases = {
