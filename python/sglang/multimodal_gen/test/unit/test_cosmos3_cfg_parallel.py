@@ -151,7 +151,9 @@ def _make_batch(cond_len, uncond_len, control, sound):
 def _denoise(enable_cfg_parallel, cond_len, uncond_len, control, sound):
     batch = _make_batch(cond_len, uncond_len, control, sound)
     server_args = SimpleNamespace(
-        enable_cfg_parallel=enable_cfg_parallel, pipeline_config=None
+        enable_cfg_parallel=enable_cfg_parallel,
+        use_fsdp_inference=False,
+        pipeline_config=None,
     )
     out = _make_stage()._denoise_once(batch, server_args)
     return [out.latents] + ([out.audio_latents] if sound else [])

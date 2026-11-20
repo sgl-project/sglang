@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Tuple, Type
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.head_gate import indexer_head_gate
 from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
@@ -52,8 +53,7 @@ class Fp4Indexer(Indexer):
         self, q: torch.Tensor, weights_raw: torch.Tensor, positions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Reached from the merged no-RoPE K / head-gate GEMM only, whose gate is BF16.
-        weights = (weights_raw * self.n_heads**-0.5).float()
-        return q, weights.unsqueeze(-1) * self.softmax_scale
+        return q, indexer_head_gate(weights_raw, self.softmax_scale)
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate_fp32(self, x, q_scale):
