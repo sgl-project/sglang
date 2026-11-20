@@ -195,7 +195,20 @@ sglang serve \
   --speculative-num-draft-tokens 6
 ```
 
-On Hopper (SM90), DSA DCP selects Triton for prefill and decode with a BF16 KV cache. For a pooled-index model such as GLM-5.3-Flash, the index keys and unfinished pool stay replicated across ranks. Rank 0 broadcasts the selected token indices before each rank attends to its local KV rows.
+On Hopper (SM90), DSA DCP selects Triton for prefill and decode with a BF16 KV cache. For a pooled-index model such as GLM-5.3-Flash, the index keys and unfinished pool stay replicated across ranks. By default, rank 0 broadcasts the selected token indices before each rank attends to its local KV rows.
+
+#### Pooled index row sharding on Hopper
+
+Set `SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD=1` to distribute index scoring and top-k selection by request row during decode. This command enables row sharding on eight H200 GPUs.
+
+```bash
+SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD=1 sglang serve \
+  --model-path "$MODEL_PATH" --trust-remote-code \
+  --tp-size 8 --dcp-size 8 \
+  --dsa-prefill-backend triton --dsa-decode-backend triton
+```
+
+Each rank scores the full index history for its assigned rows. The ranks then gather their selected token indices, including tokens from the unfinished pool. The switch defaults to `0`. DCP1, DCP groups smaller than the attention TP group, and batches whose partition would leave a rank empty use the existing replicated path.
 
 ## References
 

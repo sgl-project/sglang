@@ -2338,6 +2338,8 @@ class Envs:
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
+    # Distribute pooled decode index rows when DCP spans the attention TP group.
+    SGLANG_OPT_DSA_KPOOL_DECODE_ROW_SHARD = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
