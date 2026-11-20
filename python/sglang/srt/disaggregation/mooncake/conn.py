@@ -2193,6 +2193,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         except ValueError as exc:
             logger.error(f"Dropped AUX_DATA for bootstrap_room {room}: {exc}")
+            # The row stays unwritten: fail the room, or a later Success commits it.
+            if self.request_status.get(room) not in (None, KVPoll.Success):
+                self.record_failure(room, f"AUX_DATA rejected: {exc}")
+                self.update_status(room, KVPoll.Failed)
             return
 
         logger.debug(

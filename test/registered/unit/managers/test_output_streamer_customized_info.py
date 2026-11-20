@@ -1113,6 +1113,28 @@ class TestOutputStreamerSamplingMasks(unittest.TestCase):
                                 kept.extend(values)
                 self.assertEqual(received, expected)
 
+    def test_a_token_trimmed_from_the_output_queues_no_sampling_row(self):
+        """Speculative decoding samples a first token even for max_new_tokens=0, and
+        finished_len then trims it: its sampling row must not reach the client."""
+        processor = SchedulerBatchResultProcessor(
+            **{f.name: None for f in dataclasses.fields(SchedulerBatchResultProcessor)}
+        )
+        output = SimpleNamespace(
+            next_token_sampling_logprobs=[0.0],
+            next_token_sampling_mask_idx=[np.array([5], dtype=np.int32)],
+            next_token_sampling_support_logprobs=[np.array([0.0], dtype=np.float32)],
+        )
+        for finished_len, num_rows in ((None, 1), (0, 0)):
+            with self.subTest(finished_len=finished_len):
+                req = _FakeReq(
+                    "r", array("q", [5]), sampling_mask_rows=SamplingMaskRows()
+                )
+                req.finished_len = finished_len
+                processor.add_sampling_mask_return_values(0, req, output)
+                chunk = req.sampling_mask_rows.take()
+                self.assertEqual(len(chunk.selected_logprobs), num_rows)
+                self.assertEqual(len(chunk.lengths), num_rows)
+
 
 class TestOutputStreamerDetokenizeHeader(unittest.TestCase):
     def setUp(self):
