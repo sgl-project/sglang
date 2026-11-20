@@ -61,6 +61,7 @@ from sglang.srt.layers.logprob_processor import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
@@ -82,7 +83,6 @@ from sglang.srt.utils.device import (
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
-    from sglang.srt.managers.req_types import TokenIdRows
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +369,7 @@ class LogitsMetadata:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[Optional[Union[List[int], "TokenIdRows"]]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None

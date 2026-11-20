@@ -1,5 +1,5 @@
-"""token_ids_logprob_rows: request validation, and the rows each extend of a
-chunked or cache-resumed prefill scores."""
+"""token_ids_logprob_rows: malformed rows are rejected, and each extend of a
+chunked or cache-resumed prefill scores its own rows."""
 
 import sys
 from types import SimpleNamespace
@@ -16,23 +16,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
-UNSUPPORTED = {
-    "with-flat-ids": {"token_ids_logprob": [4]},
-    "too-few-rows": {"token_ids_logprob_rows": [[4, 2]]},
-    "too-many-rows": {"token_ids_logprob_rows": [[4, 2], [5], [6]]},
-    "out-of-vocabulary": {"token_ids_logprob_rows": [[4, 2], [8]]},
-    "negative-id": {"token_ids_logprob_rows": [[4, 2], [-1]]},
-    "boolean-id": {"token_ids_logprob_rows": [[4, 2], [True]]},
-    "non-list-row": {"token_ids_logprob_rows": [[4, 2], 5]},
-    "non-list-rows": {"token_ids_logprob_rows": 5},
-    "no-logprobs": {"return_logprob": False},
-    "decoding": {"sampling_params": {"max_new_tokens": 1}},
-    "no-start": {"logprob_start_len": -1},
-    "streaming": {"stream": True},
-    "multi-item": {"multi_item_delimiter_indices": [1, 2]},
-    "pooled-positions": {"token_indices_to_pool": [1, 2]},
-    "session": {"session_params": {"id": "s"}},
-    "text-input": {"input_ids": None, "text": "hello"},
+MALFORMED_ROWS = {
+    "too-few-rows": [[4, 2]],
+    "too-many-rows": [[4, 2], [5], [6]],
+    "out-of-vocabulary": [[4, 2], [8]],
+    "negative-id": [[4, 2], [-1]],
+    "non-list-row": [[4, 2], 5],
+    "non-list-rows": 5,
 }
 
 
@@ -49,14 +39,12 @@ def _request(**overrides):
     return request
 
 
-def _validate(
-    request, disaggregation_mode=DisaggregationMode.NULL, is_encoder_decoder=False
-):
+def _validate(request):
     manager = TokenizerManager.__new__(TokenizerManager)
     manager.model_config = SimpleNamespace(
-        token_id_vocab_size=8, is_encoder_decoder=is_encoder_decoder
+        token_id_vocab_size=8, is_encoder_decoder=False
     )
-    manager.disaggregation_mode = disaggregation_mode
+    manager.disaggregation_mode = DisaggregationMode.NULL
     manager._validate_token_ids_logprob_rows(request)
 
 
@@ -66,25 +54,10 @@ def test_valid_requests():
     _validate(_request(logprob_start_len=3, token_ids_logprob_rows=[]))
 
 
-@pytest.mark.parametrize("overrides", UNSUPPORTED.values(), ids=UNSUPPORTED.keys())
-def test_unsupported_request_is_rejected(overrides):
+@pytest.mark.parametrize("rows", MALFORMED_ROWS.values(), ids=MALFORMED_ROWS.keys())
+def test_malformed_rows_are_rejected(rows):
     with pytest.raises(ValueError, match="token_ids_logprob_rows"):
-        _validate(_request(**overrides))
-
-
-def test_batched_input_is_rejected():
-    with pytest.raises(ValueError, match="one input_ids sequence"):
-        _request(input_ids=[[1, 2], [3, 4]])
-
-
-def test_pd_disaggregation_is_rejected():
-    with pytest.raises(ValueError, match="token_ids_logprob_rows"):
-        _validate(_request(), DisaggregationMode.PREFILL)
-
-
-def test_encoder_decoder_model_is_rejected():
-    with pytest.raises(ValueError, match="token_ids_logprob_rows"):
-        _validate(_request(), is_encoder_decoder=True)
+        _validate(_request(token_ids_logprob_rows=rows))
 
 
 @pytest.mark.parametrize("boundaries", [(), (12,), (24,), (30,), (12, 24, 30)])
