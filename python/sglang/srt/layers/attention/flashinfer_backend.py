@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import (
     IdSpace,
     IdSpaceKind,
@@ -75,7 +75,6 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -96,6 +95,7 @@ if is_flashinfer_available():
     from flashinfer.cascade import merge_state
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
+    from sglang.srt.layers.attention.flashinfer_mis_swa import MultiItemSWAWrapper
 
     # FlashInfer's MergeState CUDA kernel uses blockDim = (head_dim/vec_size, num_heads).
     # When num_heads is large (e.g. with DP attention where attention_tp_size=1), the
@@ -443,12 +443,34 @@ class FlashInferAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        # Some models (e.g. Cohere2) declare windows only on RadixAttention.
+        # They still need a window-aware plan: setting window_left only in
+        # forward selects a kernel compiled without the per-element SWA mask.
+        layer_windows = {
+            layer.sliding_window_size
+            for layer in model_runner.model.modules()
+            if isinstance(layer, RadixAttention) and layer.sliding_window_size >= 0
+        }
+        # FlashInfer also specializes soft-capping at plan time. Preserve the
+        # model's uniform soft-cap in both ordinary SWA and MIS plans, rather
+        # than enabling it only in the custom MIS variant at run time.
+        layer_caps = {
+            layer.logit_cap or 0.0
+            for layer in model_runner.model.modules()
+            if isinstance(layer, RadixAttention)
+        }
+        self.logits_soft_cap = (
+            next(iter(layer_caps)) if layer_windows and len(layer_caps) == 1 else 0.0
+        )
+        self.sliding_window_size = model_runner.sliding_window_size
+        if self.sliding_window_size is None and len(layer_windows) == 1:
+            self.sliding_window_size = next(iter(layer_windows))
         assert not (
-            model_runner.sliding_window_size is not None
+            self.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        if model_runner.sliding_window_size is not None:
+        if self.sliding_window_size is not None:
             self.num_wrappers = 2
             self.dispatch_reason = WrapperDispatch.SLIDING_WINDOW
         elif model_runner.model_config.is_encoder_decoder:
@@ -613,6 +635,19 @@ class FlashInferAttnBackend(AttentionBackend):
                     backend=self.decode_backend,
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
+            )
+
+        # Ordinary SWA and full-attention MIS retain their existing wrappers.
+        # Create the logical-window variant lazily, only for a SWA MIS batch.
+        self._mis_swa_wrappers = None
+        self._mis_swa_args = None
+        if self.enable_mis and layer_windows:
+            self._mis_swa_args = (
+                self.workspace_buffer,
+                model_runner.dtype,
+                self.flashinfer_kv_cache_dtype,
+                model_runner.model_config.head_dim,
+                model_runner.model_config.v_head_dim,
             )
 
         # Create indices updater
@@ -1208,6 +1243,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            prefill_wrappers = self.prefill_wrappers_paged
+            if multi_item_params.is_enabled() and self._mis_swa_args is not None:
+                # MIS currently disables radix cache and chunked prefill. A
+                # trimmed physical prefix cannot be interpreted by the logical
+                # mask without additional absolute-position metadata.
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    raise ValueError("SWA MIS requires an untrimmed, uncached prefill")
+                if self._mis_swa_wrappers is None:
+                    self._mis_swa_wrappers = list(self.prefill_wrappers_paged)
+                    self._mis_swa_wrappers[0] = MultiItemSWAWrapper(*self._mis_swa_args)
+                prefill_wrappers = self._mis_swa_wrappers
+                prefill_wrappers[0].multi_item_params = multi_item_params
+
             self._prepare_dequant_workspace_metadata_for_extend(
                 forward_batch, use_ragged
             )
@@ -1218,7 +1266,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.seq_lens_sum,
                 prefix_lens,
-                prefill_wrappers=self.prefill_wrappers_paged,
+                prefill_wrappers=prefill_wrappers,
                 use_ragged=use_ragged,
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
@@ -1230,7 +1278,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 plan=forward_batch.iteration_ids,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged,
+                prefill_wrappers,
                 use_ragged,
                 extend_no_prefix,
                 multi_item_params,
@@ -1570,6 +1618,9 @@ class FlashInferAttnBackend(AttentionBackend):
             and self.forward_metadata.multi_item_params.is_enabled()
         ):
             paged_window_left = -1
+        if isinstance(prefill_wrapper_paged, MultiItemSWAWrapper):
+            # This is a logical window; the variant keeps physical traversal unbounded.
+            paged_window_left = layer.sliding_window_size
 
         logits_soft_cap = layer.logit_cap
 
@@ -1802,7 +1853,8 @@ class FlashInferIndicesUpdaterDecode:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.sliding_window_size = model_runner.sliding_window_size
+        self.sliding_window_size = attn_backend.sliding_window_size
+        self.logits_soft_cap = attn_backend.logits_soft_cap
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -2058,6 +2110,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.head_dim,
                 1,
                 data_type=self.data_type,
+                logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -2081,6 +2134,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.head_dim,
                 1,
                 data_type=self.data_type,
+                logits_soft_cap=self.logits_soft_cap,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
@@ -2109,7 +2163,8 @@ class FlashInferIndicesUpdaterPrefill:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.sliding_window_size = model_runner.sliding_window_size
+        self.sliding_window_size = attn_backend.sliding_window_size
+        self.logits_soft_cap = attn_backend.logits_soft_cap
         self.attn_backend = attn_backend
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -2499,6 +2554,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                logits_soft_cap=self.logits_soft_cap,
                 # window.window_left is the paged pass's: -1 on this prefix read,
                 # which its custom mask keeps to the window.
                 window_left=window.window if window is not None else -1,
@@ -2514,7 +2570,18 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_enabled = (
             multi_item_params is not None and multi_item_params.is_enabled()
         )
-        if multi_item_enabled:
+        if isinstance(wrapper_paged, MultiItemSWAWrapper):
+            # variant_owns_mask evaluates item isolation and the logical window
+            # on every KV tile. Passing prefix_len_ptr to plan would instead
+            # select FlashInfer's physical-offset MIS mask mode.
+            assert multi_item_enabled and not use_ragged
+            assert custom_mask is None
+            use_custom_mask = None
+            prefix_len_ptr = None
+            token_pos_in_items_ptr = None
+            token_pos_in_items_len = 0
+            max_item_len_ptr = None
+        elif multi_item_enabled:
             # Multi-item scoring is active - use specialized parameters and disable generic custom_mask
             use_custom_mask = None
             prefix_len_ptr = multi_item_params.prefix_len_ptr
@@ -2598,6 +2665,9 @@ class FlashInferIndicesUpdaterPrefill:
             and window.window_left >= 0
         ):
             paged_plan_kwargs["window_left"] = window.window_left
+
+        if not uses_fast_prefill:
+            paged_plan_kwargs["logits_soft_cap"] = self.logits_soft_cap
 
         # A captured kernel keeps the tile size FlashInfer picked from this hint,
         # so every replay must pass the same hint, including fast_prefill_plan.
