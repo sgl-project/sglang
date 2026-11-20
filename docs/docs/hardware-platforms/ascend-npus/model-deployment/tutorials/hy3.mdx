@@ -85,6 +85,7 @@ For details, see
 </Note>
 
 {/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tag below to the stable release once it is published. */}
+
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 

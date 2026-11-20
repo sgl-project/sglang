@@ -696,7 +696,7 @@ def redact_server_args_secrets(values: dict[str, Any]) -> dict[str, Any]:
     secrets replaced. An unset credential stays None, so readers can still
     tell whether one is configured."""
     # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+    from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 
     return redact_watermark_secrets(
         {
@@ -810,7 +810,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
     # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
+    from sglang.srt.sampling.watermarking.redaction import redact_watermark_command_line
 
     server_args._launch_command = redact_watermark_command_line(
         redact_secret_cli_args(argv, parser), raw_args.watermark_config
