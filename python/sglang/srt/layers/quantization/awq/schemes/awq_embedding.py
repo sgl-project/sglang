@@ -19,10 +19,10 @@ class AWQEmbeddingScheme:
 
     def __init__(self, quant_config: AWQConfig | AWQMarlinConfig) -> None:
         settings = quant_config.embedding_quantization
-        if (settings["bits"], settings["layout"], settings["zero_point"]) != (
-            4,
-            "row_major",
-            True,
+        if (
+            settings["bits"] != 4
+            or settings["layout"] != "row_major"
+            or not settings["zero_point"]
         ):
             raise ValueError("AWQ embeddings require row_major INT4 with zero points")
         self.group_size = settings["group_size"]
@@ -36,22 +36,45 @@ class AWQEmbeddingScheme:
         weight_loader,
     ) -> None:
         self.params_dtype = params_dtype
-        num_rows = sum(output_partition_sizes)
+        output_size_per_partition = sum(output_partition_sizes)
         num_groups = input_size_per_partition // self.group_size
-        for name, width, dtype in (
-            ("qweight", input_size_per_partition // 8, torch.int32),
-            ("qzeros", num_groups // 8, torch.int32),
-            ("scales", num_groups, torch.float16),
-        ):
-            layer.register_parameter(
-                name,
-                ModelWeightParameter(
-                    data=torch.empty(num_rows, width, dtype=dtype),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=weight_loader,
-                ),
-            )
+
+        qweight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // 8,
+                dtype=torch.int32,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+
+        qzeros = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                num_groups // 8,
+                dtype=torch.int32,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+
+        scales = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                num_groups,
+                dtype=torch.float16,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("qzeros", qzeros)
+        layer.register_parameter("scales", scales)
         layer.register_buffer(
             "shifts", torch.arange(0, 32, 4, dtype=torch.int32), persistent=False
         )
