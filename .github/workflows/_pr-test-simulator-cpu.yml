@@ -94,6 +94,9 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_optional_aisimulate.py
           OMP_NUM_THREADS=2 python3 -m pytest -q tools/sglang-simulator/test/test_train_latency_model.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_cpu_bootstrap.py tools/sglang-simulator/test/test_cpu_optional_imports.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_cpu_pool_bounds.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_cpu_allocator_compat.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
