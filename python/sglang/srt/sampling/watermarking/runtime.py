@@ -1,12 +1,12 @@
 """Engine entry points into the configured watermark algorithm.
 
 The only place that decides which algorithm runs: each entry point dispatches on
-``--watermark-algorithm`` to that algorithm's adapter module.
+``--watermark-algorithm`` to that algorithm's adapter module, which implements
+``interface.WatermarkAdapter``.
 """
 
 from __future__ import annotations
 
-from types import ModuleType
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -18,11 +18,12 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.sampling.watermarking.interface import (
+        WatermarkAdapter,
         WatermarkEngine,
         WatermarkRows,
     )
 
-_ADAPTERS: dict[str, ModuleType] = {"gumbel": gumbel_adapter}
+_ADAPTERS: dict[str, WatermarkAdapter] = {"gumbel": gumbel_adapter}
 
 # Provider ABI v2 (`VerifySamplingView.watermark_*`) fields of a batch without
 # watermark rows.

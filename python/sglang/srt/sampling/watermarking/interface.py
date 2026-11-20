@@ -7,14 +7,16 @@ everything a particular algorithm does lives behind them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol, Sequence
 
+import torch
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 class WatermarkRows(Protocol):
@@ -59,7 +61,10 @@ class SampleStep:
     sampling_info: SamplingBatchInfo
     # The pre-watermark logits, iff the caller asked to keep them for logprobs.
     logprob_logits: Optional[Tensor]
-    # Set when the algorithm already sampled; the stock sampler is then skipped.
+    # Set when the algorithm already sampled. The stock sampler is then skipped
+    # whole: no logprobs, no sampling masks, no grammar or TP token all-reduce;
+    # these become the algorithm's job. commit() still runs on these tokens,
+    # so an algorithm must not also commit them inside apply().
     token_ids: Optional[Tensor] = None
 
 
@@ -88,12 +93,23 @@ class VerifyWatermark(Protocol):
     ) -> tuple[Tensor, Any]:
         """The logits to verify against and the sampling info to verify with.
 
+        Callers accept with the returned sampling info, not the one passed in.
+        The NV mega runtime path (SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION)
+        builds the provider's ``VerifySamplingView`` from the sampling info
+        before any apply (``make_post_verify_io``), and a provider forces
+        through the bound object's ABI v2 methods instead of apply, so an
+        algorithm that changes the sampling info must refuse that path in its
+        ``check_server_args``.
+
         ``custom_mask`` None means a chain draft: ``draft_tokens`` and
         ``positions`` are [batch, draft_token_num].
         """
         ...
 
-    def record(self, accept_index: Tensor, accept_lens: Tensor) -> None: ...
+    def record(self, accept_index: Optional[Tensor], accept_lens: Tensor) -> None:
+        """Record the accepted positions; ``accept_index`` None after a chain
+        apply, where each row accepts a prefix of its draft positions."""
+        ...
 
 
 class WatermarkEngine(Protocol):
@@ -108,8 +124,10 @@ class WatermarkEngine(Protocol):
         ...
 
     def bind_verify(
-        self, rows: WatermarkRows, *, full_mask: bool
-    ) -> VerifyWatermark: ...
+        self, rows: Optional[WatermarkRows], *, full_mask: bool
+    ) -> Optional[VerifyWatermark]:
+        """The verify's watermark, or None when the batch has no watermark rows."""
+        ...
 
     def append_accept_tokens(
         self,
@@ -118,3 +136,38 @@ class WatermarkEngine(Protocol):
         accept_tokens: Tensor,
         accept_lens: Tensor,
     ) -> None: ...
+
+
+class WatermarkAdapter(Protocol):
+    """An algorithm's adapter module, as ``runtime`` dispatches to it."""
+
+    def make_engine(
+        self,
+        features: Any,
+        *,
+        max_num_reqs: int,
+        max_contexts_per_req: int,
+        vocab_size: int,
+        device: str,
+    ) -> WatermarkEngine: ...
+
+    def build_rows(
+        self, requests: Sequence[Req], *, features: Any, device: torch.device | str
+    ) -> Optional[WatermarkRows]:
+        """The batch's rows, or None when no request is a candidate."""
+        ...
+
+    def request_enabled(
+        self, sampling_params: SamplingParams, *, features: Any
+    ) -> bool:
+        """Whether the request is watermarked; raises ValueError for an invalid
+        request. Runs for every request, watermarking on or off."""
+        ...
+
+    def check_server_args(self, cfg: Any) -> None:
+        """Server-argument checks; runs only with --enable-watermark."""
+        ...
+
+    def watermark_view_fields(self, rows: WatermarkRows) -> dict[str, Any]:
+        """The provider ABI v2 ``VerifySamplingView.watermark_*`` fields."""
+        ...

@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -1214,7 +1214,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        target_logits, watermark = self._force_watermark(
+        target_logits, sampling_info, watermark = self._force_watermark(
             batch=batch,
             logits_output=logits_output,
             verify_ids_2d=verify_ids_2d,
@@ -1274,14 +1274,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)
         if watermark is not None:
-            # A chain accepts a prefix of each row's verify positions.
-            batch_size, chain_length = accept.out_tokens.shape
-            accept_index = torch.arange(
-                batch_size * chain_length,
-                dtype=torch.int32,
-                device=accept.out_tokens.device,
-            ).view(batch_size, chain_length)
-            watermark.record(accept_index, accept.commit_lens)
+            watermark.record(None, accept.commit_lens)
             self.target_worker.model_runner.watermark.append_accept_tokens(
                 sampling_info.watermark,
                 batch.req_pool_indices,
@@ -1412,14 +1405,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_ids_2d: torch.Tensor,
         positions_2d: torch.Tensor,
         sampling_info,
-    ) -> tuple[torch.Tensor, Optional[VerifyWatermark]]:
+    ) -> tuple[torch.Tensor, Any, Optional[VerifyWatermark]]:
+        """The logits and sampling info to accept with, and the bound watermark."""
         target_logits = logits_output.next_token_logits
-        if sampling_info is None or sampling_info.watermark is None:
-            return target_logits, None
-        watermark = self.target_worker.model_runner.watermark.bind_verify(
-            sampling_info.watermark, full_mask=False
+        engine = self.target_worker.model_runner.watermark
+        watermark = (
+            engine.bind_verify(sampling_info.watermark, full_mask=False)
+            if engine is not None and sampling_info is not None
+            else None
         )
-        target_logits, _ = watermark.apply(
+        if watermark is None:
+            return target_logits, sampling_info, None
+        target_logits, sampling_info = watermark.apply(
             target_logits,
             sampling_info=sampling_info,
             req_pool_indices=batch.req_pool_indices,
@@ -1430,7 +1427,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             # compute_spec_logprobs reads logits_output after acceptance.
             keep_logits=batch.return_logprob,
         )
-        return target_logits, watermark
+        return target_logits, sampling_info, watermark
 
     def _sampling_graph_eligible(
         self,

@@ -222,7 +222,11 @@ class GumbelEngine:
             return None
         return GumbelSample(self.state, rows, forward_batch)
 
-    def bind_verify(self, rows: GumbelRows, *, full_mask: bool) -> GumbelVerify:
+    def bind_verify(
+        self, rows: Optional[GumbelRows], *, full_mask: bool
+    ) -> Optional[GumbelVerify]:
+        if rows is None:
+            return None
         return GumbelVerify(self.state, rows, full_mask)
 
     def append_accept_tokens(
@@ -399,8 +403,14 @@ class GumbelVerify:
         self._forced = (req_pool_indices, context_hashes, selected)
         return logits, sampling_info
 
-    def record(self, accept_index: torch.Tensor, accept_lens: torch.Tensor) -> None:
+    def record(
+        self, accept_index: Optional[torch.Tensor], accept_lens: torch.Tensor
+    ) -> None:
         req_pool_indices, context_hashes, selected = self._forced
+        if accept_index is None:
+            accept_index = torch.arange(
+                selected.numel(), dtype=torch.int32, device=selected.device
+            ).view(accept_lens.shape[0], -1)
         self.record_speculative(
             req_pool_indices, context_hashes, selected, accept_index, accept_lens
         )

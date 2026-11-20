@@ -482,7 +482,7 @@ class NGRAMWorker(BaseSpecWorker):
                 self.model_runner.watermark.bind_verify(
                     batch.sampling_info.watermark, full_mask=True
                 )
-                if batch.sampling_info.watermark is not None
+                if self.model_runner.watermark is not None
                 else None
             )
             if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():

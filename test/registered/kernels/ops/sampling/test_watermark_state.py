@@ -405,9 +405,7 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
     assert bonus.tolist() == [forced[1]]
 
     accept_lens = torch.tensor([2], dtype=torch.int32, device="cuda")
-    verify.record(
-        torch.arange(4, dtype=torch.int32, device="cuda").view(1, 4), accept_lens
-    )
+    verify.record(None, accept_lens)
     engine.append_accept_tokens(
         rows,
         req_pool_indices,

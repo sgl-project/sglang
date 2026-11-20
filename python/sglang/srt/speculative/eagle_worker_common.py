@@ -944,11 +944,12 @@ def run_eagle_verify(
         or target_worker.model_runner.attn_backend.verify_mask.mode
         == TreeMaskMode.FULL_MASK
     )
+    watermark_engine = target_worker.model_runner.watermark
     watermark = (
-        target_worker.model_runner.watermark.bind_verify(
+        watermark_engine.bind_verify(
             batch.sampling_info.watermark, full_mask=watermark_full_mask
         )
-        if batch.sampling_info.watermark is not None
+        if watermark_engine is not None
         else None
     )
     if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
