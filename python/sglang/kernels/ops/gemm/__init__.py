@@ -550,6 +550,13 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.int8_scaled_mm_via_int_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:int8_scaled_mm_via_int_mm",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.muse_spark_router_gemv",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
@@ -609,6 +616,14 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+register_kernel(
+    KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
+    )
+)
 register_kernel(
     KernelSpec(
         op="gemm.hopper_fp8_block_gemv",

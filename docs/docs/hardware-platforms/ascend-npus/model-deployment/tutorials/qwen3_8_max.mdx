@@ -24,11 +24,11 @@ source.
 | Feature                       | Example usage                                                                                 |
 |-------------------------------|-----------------------------------------------------------------------------------------------|
 | Tensor Parallelism            | `--tp-size 64`                                                                                |
-| DP Attention                  | `--dp-size 4 \`<br/>`--enable-dp-attention`                                                                            |
+| DP Attention                  | `--attn-dp-size 4`                                                                            |
 | Expert Parallelism            | `--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                                    |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 8192` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 16` |
+| NPU Graph                     | enabled by default; disable with `--disable-decode-cuda-graph --disable-prefill-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 16` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 
@@ -88,6 +88,7 @@ tag `cann9.1.0-a3-B105`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 {/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tag below to the stable release once it is published. */}
+
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
@@ -133,7 +134,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 Multi-node deployment distributes the model across multiple A3 Series nodes using tensor parallelism while keeping
 prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
 node can provide. The validated configuration deploys the W4A8 quantized checkpoint on 4 nodes with `--tp-size 64`
-(16 dies per node), DP attention (`--dp-size 4` + `--enable-dp-attention`), and DeepEP in `auto` mode.
+(16 dies per node), DP attention (`--attn-dp-size 4`), and DeepEP in `auto` mode.
 
 Modify the IP addresses of the four nodes, then run the same script on all four nodes. Each node determines its own
 rank by matching the local IP address against `IPS`.
@@ -208,7 +209,7 @@ do
             --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 64 \
-            --dp-size 4 --enable-dp-attention --enable-dp-lm-head \
+            --attn-dp-size 4 --enable-dp-lm-head \
             --mem-fraction-static 0.8 \
             --chunked-prefill-size 8192 \
             --cuda-graph-bs-decode 16 \

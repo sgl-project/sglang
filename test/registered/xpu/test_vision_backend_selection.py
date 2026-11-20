@@ -6,7 +6,7 @@ import pytest
 from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=300, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=300, suite="extra-test-1-gpu-xpu")
 
 
 @pytest.mark.parametrize(
