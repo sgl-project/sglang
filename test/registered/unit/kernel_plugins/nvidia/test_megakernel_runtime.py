@@ -342,8 +342,6 @@ class TestDFlashBinding(CustomTestCase):
         unknown_key = runtime(invariants={"draft_kv": 1})
         with self.assertRaisesRegex(RuntimeError, "guard key draft_kv"):
             self._bind(names, runtime=unknown_key)
-        with self.assertRaisesRegex(RuntimeError, "API 2; SGLang binds API 1"):
-            self._bind(names, runtime=runtime(api_version=2))
 
         def guard_differs_on_rank_1(value, group=None):
             return [value, "other"] if isinstance(value, list) else [value, value]

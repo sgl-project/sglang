@@ -16,10 +16,9 @@ three whole phases; everything else stays SGLang's:
 The class pulls worker state on demand, by name, through ``DFlashBinding.pull``:
 only the ``EXPORTS`` it lists in ``exports``. It lists in ``invariants`` the value
 it expects for each ``GUARD`` key it depends on (a frozenset accepts any of its
-members). ``bind_dflash_runtime`` checks both, and the API version, on every TP rank
-before it builds the runtime. A name or API SGLang does not have raises; a guard value
-the runtime does not serve declines it (one warning naming each key), and SGLang's
-stock round runs.
+members). ``bind_dflash_runtime`` checks both on every TP rank before it builds the
+runtime. A name SGLang does not have raises; a guard value the runtime does not
+serve declines it (one warning naming each key), and SGLang's stock round runs.
 """
 
 from __future__ import annotations
@@ -60,15 +59,12 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.utils import GenerationBatchResult
 
-# Bumped when an entry, an export's meaning or a guard key's meaning changes.
-DFLASH_RUNTIME_API = 1
 logger = logging.getLogger(__name__)
 
 
 class DFlashRuntime(Protocol):
     """What SGLang calls on a bound runtime (see the module docstring)."""
 
-    api_version: ClassVar[int]
     exports: ClassVar[frozenset[str]]
     invariants: ClassVar[Mapping[str, Any]]
 
@@ -214,16 +210,11 @@ def _accepts(expected: Any, actual: Any) -> bool:
 
 
 def check_dflash_runtime(cls: Any, worker: Any, path: str) -> list[str]:
-    """The guard values ``cls`` does not serve here, after raising on an API version,
-    export or guard key SGLang lacks. Collective: every TP rank must read the same
+    """The guard values ``cls`` does not serve here, after raising on an export or
+    guard key SGLang lacks. Collective: every TP rank must read the same
     values, so every rank declines alike."""
     if not isinstance(cls, type):
         raise TypeError(f"{FLAG}: {path} is not a class")
-    if cls.api_version != DFLASH_RUNTIME_API:
-        raise RuntimeError(
-            f"{FLAG}: {path} is DFLASH runtime API {cls.api_version}; "
-            f"SGLang binds API {DFLASH_RUNTIME_API}"
-        )
     unknown = sorted(set(cls.exports) - EXPORTS.keys())
     unknown += sorted(f"guard key {k}" for k in cls.invariants.keys() - GUARD.keys())
     if unknown:
