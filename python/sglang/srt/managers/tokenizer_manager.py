@@ -1922,9 +1922,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     def _reads_input_ids_late(self) -> bool:
-        logger = self.request_logger
         return (
-            (logger.log_requests and "input_ids" not in (logger.metadata[1] or ()))
+            self.request_logger.logs_field_on_finish("input_ids")
             or self.request_metrics_exporter_manager.exporter_enabled()
             or bool(self.dump_requests_folder)
             or bool(self.crash_dump_folder)

@@ -972,6 +972,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    # The streaming response holds `request` until the request finishes.
+    request.__dict__.pop("_json", None)
     return await serve_generate_request(obj, request)
 
 

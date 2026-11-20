@@ -993,7 +993,12 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
-    tm.request_logger = Mock(log_requests=False)
+    tm.request_logger = RequestLogger(
+        log_requests=False,
+        log_requests_level=2,
+        log_requests_format="text",
+        log_requests_target=None,
+    )
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
@@ -2042,6 +2047,33 @@ class TestReadsInputIdsLate(CustomTestCase):
                 self.assertEqual(
                     TokenizerManager._reads_input_ids_late(manager), expected
                 )
+
+    def test_generate_request_releases_prompt_after_dispatch(self):
+        for dump, released in (("", True), ("/tmp/dump", False)):
+            with self.subTest(dump=dump):
+                tm = _make_tm_for_generate(self)
+                tm.dump_requests_folder = dump
+                obj = GenerateReqInput(input_ids=[1, 2, 3], rid="r", sampling_params={})
+                tokenized = MagicMock(input_ids=[1, 2, 3], mm_inputs=None)
+                tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+                tm._send_one_request = AsyncMock()
+
+                async def wait_one_response(obj, request):
+                    state = tm.rid_to_state[obj.rid]
+                    yield {
+                        "input_ids": obj.input_ids,
+                        "released": state.prompt_released,
+                    }
+
+                tm._wait_one_response = wait_one_response
+
+                async def drive():
+                    return await tm.generate_request(obj).__anext__()
+
+                out = asyncio.run(drive())
+                tm._send_one_request.assert_awaited_once()
+                self.assertEqual(out["input_ids"] is None, released)
+                self.assertEqual(out["released"], released)
 
     def test_dumps_turned_on_later_skip_released_prompts(self):
         """Dumps enabled at runtime must not record a request whose prompt is gone."""
