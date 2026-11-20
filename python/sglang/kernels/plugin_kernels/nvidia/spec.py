@@ -533,7 +533,8 @@ class SupportsDFlashRuntime(Protocol):
 
     dflash_runtime is the "module:attribute" path of its runtime class, which SGLang
     imports only when every TP rank names the same and binds to the DFLASH worker
-    (sglang.srt.speculative.dflash_binding); "" keeps SGLang's round.
+    (sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding); "" keeps SGLang's
+    round.
     """
 
     dflash_runtime: str

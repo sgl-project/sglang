@@ -1,5 +1,6 @@
-"""The DFLASH worker's binding to a plugin's decode round.
+"""Host binding for the Kimi K3.1 megakernel's DFlash runtime.
 
+The DFLASH worker binds the Kimi K3.1 megakernel's DFlash runtime through this module.
 A megakernel target build that runs the DFLASH decode round itself names its runtime
 class by "module:attribute" (spec.SupportsDFlashRuntime). The worker hands the class
 three whole phases; everything else stays SGLang's:
@@ -16,7 +17,9 @@ The class pulls worker state on demand, by name, through ``DFlashBinding.pull``:
 only the ``EXPORTS`` it lists in ``exports``. It lists in ``invariants`` the value
 it expects for each ``GUARD`` key it depends on (a frozenset accepts any of its
 members). ``bind_dflash_runtime`` checks both, and the API version, on every TP rank
-before it builds the runtime, and raises naming each mismatch.
+before it builds the runtime. A name or API SGLang does not have raises; a guard value
+the runtime does not serve declines it (one warning naming each key), and SGLang's
+stock round runs.
 """
 
 from __future__ import annotations
@@ -210,9 +213,10 @@ def _accepts(expected: Any, actual: Any) -> bool:
     return actual in expected if isinstance(expected, frozenset) else actual == expected
 
 
-def check_dflash_runtime(cls: Any, worker: Any, path: str) -> None:
-    """Raise naming each export, guard key or value ``cls`` and SGLang disagree on;
-    collective (every TP rank must read the same guard values)."""
+def check_dflash_runtime(cls: Any, worker: Any, path: str) -> list[str]:
+    """The guard values ``cls`` does not serve here, after raising on an API version,
+    export or guard key SGLang lacks. Collective: every TP rank must read the same
+    values, so every rank declines alike."""
     if not isinstance(cls, type):
         raise TypeError(f"{FLAG}: {path} is not a class")
     if cls.api_version != DFLASH_RUNTIME_API:
@@ -226,20 +230,17 @@ def check_dflash_runtime(cls: Any, worker: Any, path: str) -> None:
         raise RuntimeError(f"{FLAG}: SGLang does not export {unknown} to {path}")
     actual = {key: GUARD[key][1](worker) for key in sorted(cls.invariants)}
     megakernel_agree(sorted(actual.items()), what="DFLASH runtime guard values")
-    mismatches = [
+    return [
         f"{key} is {actual[key]!r} ({GUARD[key][0]}), expected {expected!r}"
         for key, expected in sorted(cls.invariants.items())
         if not _accepts(expected, actual[key])
     ]
-    if mismatches:
-        raise RuntimeError(
-            f"{FLAG}: {path} does not run this DFLASH setup: " + "; ".join(mismatches)
-        )
 
 
 def bind_dflash_runtime(worker: Any, target_model: torch.nn.Module) -> Any:
     """The runtime the target's build names, checked and built on ``worker``, or None
-    for SGLang's round (flag off, no build, or a build naming none). Collective."""
+    for SGLang's round (flag off, no build, a build naming none, or a setup the runtime
+    does not serve). Collective."""
     if not megakernel_enabled():
         return None
     built = built_megakernel(target_model)
@@ -257,5 +258,14 @@ def bind_dflash_runtime(worker: Any, target_model: torch.nn.Module) -> Any:
     if path.count(":") != 1:
         raise ValueError(f"{FLAG}: {path!r} is not a 'module:attribute' path")
     cls = pkgutil.resolve_name(path)
-    check_dflash_runtime(cls, worker, path)
+    unserved = check_dflash_runtime(cls, worker, path)
+    if unserved:
+        if get_parallel().tp_rank == 0:
+            logger.warning(
+                "%s: %s does not serve this DFLASH setup (%s); DFlash phases run stock",
+                FLAG,
+                path,
+                "; ".join(unserved),
+            )
+        return None
     return cls(DFlashBinding(worker, cls.exports), built)

@@ -22,6 +22,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
+    bind_dflash_runtime,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
@@ -67,7 +70,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
-from sglang.srt.speculative.dflash_binding import bind_dflash_runtime
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_l2_prefetch import (
     DraftL2Prefetch,
@@ -515,7 +517,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     """
 
     _hosts_draft: bool = True
-    _runtime = None  # see dflash_binding.py
+    _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
     _aux_pending: bool = False
 
@@ -790,8 +792,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             and envs.SGLANG_OPT_DFLASH_AUX_GRAPH.get()
         )
         self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
-        # A plugin's decode round (dflash_binding.py), or None for the stock one; built
-        # before the KV pools are sized, so its allocations come out of the KV budget.
+        # A megakernel's decode round (kimi_k31_dflash_binding.py), or None for the stock
+        # one; built before the KV pools are sized, so its allocations come out of the KV
+        # budget.
         self._runtime = bind_dflash_runtime(self, target_model)
         # Side stream only where KV frees wait on it (overlap scheduler, no unified
         # memory or HiCache) and the stock round owns the draft KV writes.

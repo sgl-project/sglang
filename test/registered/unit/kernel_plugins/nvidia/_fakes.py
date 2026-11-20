@@ -118,7 +118,7 @@ def server_args(**kw):
 
 
 class FakeDFlashRuntime:
-    """A DFLASH runtime (speculative/dflash_binding.py) recording what it was built with."""
+    """A DFLASH runtime (kimi_k31_dflash_binding.py) recording what it was built with."""
 
     api_version = 1
     exports = frozenset({"block_size", "mask_token_id"})
