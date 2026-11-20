@@ -15,8 +15,9 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -62,6 +63,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -402,9 +404,17 @@ def _reserve_pp_pages(cache, req, hashes):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete", metrics=None):
+    def _fixture(
+        self,
+        *,
+        swa=False,
+        mamba=False,
+        policy="wait_complete",
+        metrics=None,
+        page_size=2,
+    ):
         cfg = CacheConfig(
-            page_size=1 if mamba else 2,
+            page_size=1 if mamba else page_size,
             components=(ComponentType.FULL,)
             + ((ComponentType.SWA,) if swa else ())
             + ((ComponentType.MAMBA,) if mamba else ()),
@@ -597,6 +607,85 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             assert _reserve_pp_pages(cache, req, ["a", "b"]) == 0
             evict.assert_not_called()
         assert req.cache_request_handle not in cache.linker.prefetches
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_layer_load_extends_an_existing_request_row(self):
+        cache, backend, req, allocator = self._fixture(swa=True, page_size=1)
+        cache.pp_size = 2
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        backend.lookup.side_effect = AssertionError(
+            "only the PP ticket queries storage"
+        )
+
+        def extend(end):
+            req.extend_end = end
+            count = end - req.prefix_len
+            seq_lens = torch.tensor([end])
+            batch = ScheduleBatch(
+                reqs=[req],
+                tree_cache=cache,
+                req_to_token_pool=cache.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                forward_mode=ForwardMode.EXTEND,
+                device="cpu",
+                prefix_lens=[req.prefix_len],
+                extend_lens=[count],
+                extend_num_tokens=count,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens,
+            )
+            with get_context().override_server_args(attention_backend="torch_native"):
+                slots, _, _ = alloc_for_extend(batch)
+            return slots
+
+        req.init_next_round_input(cache)
+        prefix = extend(2)
+        cache.checkpoint(req, up_to=2)
+        req.external_cache_hit_length = 4
+        req.init_next_round_input(cache)
+        row = req.kv.req_pool_idx
+        assert (req.prefix_len, req.host_hit_length) == (2, 2)
+        assert cache.linker.load_back(req) == (2, req.last_node)
+        assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (2, 2)
+        tail = cache.linker.private_load_indices[req.rid]
+
+        req.prefix_len = 4
+        suffix = extend(6)
+        assert req.kv.req_pool_idx == row
+        assert (req.kv.kv_allocated_len, req.kv.kv_committed_len) == (6, 6)
+        assert torch.equal(
+            cache.req_to_token_pool.req_to_token[row, :6],
+            torch.cat([prefix, tail, suffix]),
+        )
+        cache.linker.start_layer_wise_loading()
+        backend.queued_loads.clear()  # The backend has started writing this row.
+        cache.linker.release_request(req.cache_request_handle)
+        assert req.rid in cache.linker.private_load_indices
+        assert cache.linker.finish_loads() == []
+        cache.checkpoint(req, up_to=6)
+        assert self._match(cache, req).device_prefix_len == 6
+        self._assert_balanced(cache, allocator)
+
+    def test_pp_rejected_layer_load_retires_its_reservation(self):
+        cache, backend, req, allocator = self._fixture(swa=True)
+        cache.pp_size = 2
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        req.external_cache_hit_length = 4
+        req.init_next_round_input(cache)
+        hashes = cache.linker.hit_markers[req.rid].tail_hashes
+        assert _reserve_pp_pages(cache, req, hashes) == 2
+        backend.load = MagicMock(side_effect=OSError("queue failed"))
+        with patch.object(cache.linker, "pp_tickets", True):
+            assert cache.linker.load_back(req) == (4, req.last_node)
+        loaded = cache.linker.private_load_indices[req.rid]
+        cache.req_to_token_pool.alloc([req])
+        cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 4)), loaded)
+        req.kv.set_row_len(4)
+        assert cache.linker.finish_loads([req]) == [req.rid]
+        assert (
+            not cache.linker.private_load_indices and not cache.linker.rejected_pp_loads
+        )
+        cache.free_kv_row(req.kv, [(0, 4)])
         self._assert_balanced(cache, allocator)
 
     def test_prefetch_metrics_count_lookup_load_and_outcome(self):
@@ -966,13 +1055,6 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
     with pytest.raises(ValueError, match=component_type.name):
         UnifiedCacheLinkerWrapper(cache, backend)
 
-    assert not cache.tree_core.enable_external_cache_linker
-
-
-def test_pipeline_parallelism_rejects_layer_wise_mode():
-    cache = _cache_for_wrapper(pp_size=2)
-    with pytest.raises(ValueError, match="layer.wise.*PP=1"):
-        UnifiedCacheLinkerWrapper(cache, _FakeLinker())
     assert not cache.tree_core.enable_external_cache_linker
 
 

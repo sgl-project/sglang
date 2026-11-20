@@ -1412,10 +1412,26 @@ class _Request(SimpleNamespace):
 
 
 class TestCachedPrefixEarlySend(CustomTestCase):
+    def test_failed_layer_load_drops_intermediate_chunk_before_kv_send(self):
+        from sglang.srt.managers.req_types import FINISH_ABORT
+
+        batch = _batch(4)
+        req = batch.chunked_req = batch.reqs[0]
+        req.request_discard(FINISH_ABORT("layer load failed", 503))
+        scheduler = _Scheduler([batch], {}, {})
+        move([req], scheduler.chunked_reqs)
+        scheduler.process_batch_result_disagg_prefill(batch, _result())
+        self.assertIs(req.to_finish, req.discard_output_reason)
+        scheduler.send_kv_chunk.assert_not_called()
+
     def test_batch_that_starts_a_hicache_load_back_does_not_early_send(self):
         """A request can match pages whose HiCache load-back was submitted in the same
         build; early-sending them would read KV the H2D has not written yet (#44070)."""
-        for consumer_index, expect_send in ((-1, True), (0, False)):
+        for consumer_index, pp_linker_load, expect_send in (
+            (-1, False, True),
+            (0, False, False),
+            (-1, True, False),
+        ):
             scheduler = _EarlySendScheduler()
             req = _Request(
                 prefix_len=128,
@@ -1428,6 +1444,7 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                 reqs=[req],
                 add_inflight_step=Mock(),
                 hicache_consumer_index=consumer_index,
+                pp_linker_load=pp_linker_load,
                 extend_num_tokens=32,
                 forward_mode=SimpleNamespace(
                     is_prebuilt=lambda: False, is_extend=lambda: True

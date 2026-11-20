@@ -222,6 +222,7 @@ class TestDSparkPPOutput(CustomTestCase):
 
         payloads = []
         scheduler = SimpleNamespace(
+            _pp_linker_chunk_batch=None,
             _pp_spec_relay=False,
             pp_group=SimpleNamespace(is_first_rank=False),
             future_map=SimpleNamespace(
@@ -240,6 +241,7 @@ class TestDSparkPPOutput(CustomTestCase):
             scheduler,
             SimpleNamespace(
                 next_token_ids=tokens,
+                pp_failed_load_rids=(),
                 next_draft_input=make_next_draft_input(
                     bonus_tokens=tokens, new_seq_lens=batch.seq_lens
                 ),
