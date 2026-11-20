@@ -35,10 +35,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.modelslim.modelslim import (
     remap_dspark_weight_name_npu,
 )
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -404,8 +404,7 @@ class DSparkAttention(MqaAttentionBase):
             self.is_dsv41
             and _fused_wo_a_arch_supported()
             and self.wo_a.weight.dtype == torch.bfloat16
-            and self.wo_a.weight.shape
-            == (self.n_local_groups * self.o_lora_rank, 4096)
+            and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
         )
 
@@ -425,9 +424,7 @@ class DSparkAttention(MqaAttentionBase):
         value = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
         out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
         return (
-            mhc.AttnOutput(out)
-            if defer_all_reduce and self.attn_tp_size > 1
-            else out
+            mhc.AttnOutput(out) if defer_all_reduce and self.attn_tp_size > 1 else out
         )
 
     @staticmethod

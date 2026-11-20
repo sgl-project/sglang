@@ -4450,9 +4450,7 @@ class DeepseekV4Model(nn.Module):
                 if hoisted_engram_kv is not None:
                     _, kv, kv_ready = hoisted_engram_kv.pop(i)
                     torch.cuda.current_stream().wait_event(kv_ready)
-                    hidden_states = engram.gate(
-                        state.residual, kv, input_ids=input_ids
-                    )
+                    hidden_states = engram.gate(state.residual, kv, input_ids=input_ids)
                     del kv
                 else:
                     hidden_states = engram(
