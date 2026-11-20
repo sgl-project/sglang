@@ -269,7 +269,10 @@ class TestIpcKvGather(CustomTestCase):
         self.assertTrue(torch.equal(out[0], torch.cat([k, peer_k], dim=1)))
         self.assertTrue(torch.equal(out[1], torch.cat([v, peer_v], dim=1)))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+    @unittest.skipUnless(
+        torch.version.hip is not None and torch.cuda.is_available(),
+        "requires a ROCm GPU",
+    )
     def test_cuda_staging_is_uncached_and_exportable(self):
         """Staging must stay out of the caching allocator and export over HIP IPC."""
         mod._typestr(torch.float32, torch.device("cuda"))
