@@ -187,7 +187,7 @@ pub enum ApiError {
     },
 
     /// An endpoint of a feature this router does not provide yet
-    /// (`/v1/responses`, `/v1/loads`, ...); `path` is the request path.
+    /// (`/v1/responses/{id}`, `/v1/loads`, ...); `path` is the request path.
     #[error("{path} is not supported by sgl-router yet")]
     UnsupportedEndpoint { path: String },
 
@@ -314,10 +314,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.class().status();
         let code = self.error_code();
-        let typ = match status.as_u16() {
-            400..=499 => "invalid_request_error",
-            _ => "server_error",
-        };
+        let typ = crate::protocol::openai_error_type(status.as_u16());
         let message = self.client_message();
         let mut resp = (
             status,
@@ -820,7 +817,7 @@ mod tests {
             (
                 "unsupported endpoint",
                 ApiError::UnsupportedEndpoint {
-                    path: "/v1/responses".into(),
+                    path: "/v1/loads".into(),
                 },
                 StatusCode::NOT_IMPLEMENTED,
                 "unsupported_endpoint",

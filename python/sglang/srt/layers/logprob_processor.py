@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import itertools
 import logging
 from contextlib import nullcontext
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.runner_utils.pool import (
     borrow_graph_pool,
     graph_pool_borrow_largest_run,
@@ -200,6 +203,44 @@ def get_token_ids_logprobs(logprobs, token_ids_logprobs, no_copy_to_cpu=False):
     )
 
 
+def _top_logprobs(
+    logprobs: torch.Tensor,
+    max_k: int,
+    log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    precomputed_topk: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Normalized top-``max_k`` values and token ids of every row."""
+    if log_normalizer is not None:
+        row_max, row_log_sum = log_normalizer
+        if precomputed_topk is not None:
+            values_tensor, indices_tensor = precomputed_topk
+        else:
+            values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
+        values_tensor = (values_tensor.float() - row_max[:, None]) - row_log_sum[
+            :, None
+        ]
+    else:
+        values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
+    return values_tensor, indices_tensor
+
+
+def _chunk_rows(
+    pruned_lens: List[int], split_pruned_len: int, num_rows: int
+) -> Iterator[Tuple[int, int, int]]:
+    """Per sequence of a chunk of ``num_rows`` logprob rows: its rows [lo, hi)
+    of the chunk, and ``done``, how many of its rows earlier chunks hold.
+
+    Only the first sequence can have rows in earlier chunks, fewer than its
+    pruned length, and only the last can run past the chunk: its hi is the
+    chunk's end.
+    """
+    pt = 0
+    for n, pruned_len in enumerate(pruned_lens):
+        done = split_pruned_len if n == 0 else 0
+        lo, pt = pt, pt + pruned_len - done
+        yield lo, min(pt, num_rows), done
+
+
 def get_top_logprobs_chunk(
     logprobs: torch.Tensor,
     top_k_nums: List[int],
@@ -210,6 +251,7 @@ def get_top_logprobs_chunk(
     log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     precomputed_topk: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     copy_to_pinned_cpu: bool = False,
+    candidates: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> int:
     """Get top-k logprobs for each sequence in the chunk.
 
@@ -227,23 +269,19 @@ def get_top_logprobs_chunk(
             logsumexp+top-k kernel, sorted with lowest-index tie-breaking
         copy_to_pinned_cpu: Copy gathered results to pinned CPU spans;
             finalize_input_logprobs converts them to rows after the copy completes.
+        candidates: Final (values, token ids) of every row, at least
+            max(top_k_nums) wide, emitted in place of the top-k
 
     Returns:
         int: Number of remaining tokens to process in next chunk
     """
     # Empty chunks still walk the slice to emit placeholder entries.
-    max_k = max(top_k_nums)
-    if log_normalizer is not None:
-        row_max, row_log_sum = log_normalizer
-        if precomputed_topk is not None:
-            values_tensor, indices_tensor = precomputed_topk
-        else:
-            values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
-        values_tensor = (values_tensor.float() - row_max[:, None]) - row_log_sum[
-            :, None
-        ]
+    if candidates is not None:
+        values_tensor, indices_tensor = candidates
     else:
-        values_tensor, indices_tensor = logprobs.topk(max_k, dim=1)
+        values_tensor, indices_tensor = _top_logprobs(
+            logprobs, max(top_k_nums), log_normalizer, precomputed_topk
+        )
     if copy_to_pinned_cpu:
         values = async_d2h(values_tensor)
         indices = async_d2h(indices_tensor)
@@ -253,54 +291,89 @@ def get_top_logprobs_chunk(
         indices = indices_tensor.tolist()
         rows_avail = len(values)
 
-    pt = 0
     next_split_pruned_len = 0
-    for n, (k, pruned_len) in enumerate(zip(top_k_nums, pruned_lens)):
-        if n == 0:
-            # For the first sequence, adjust the pruned length
-            pruned_len -= split_pruned_len
-        else:
-            # After the first sequence, no split in the middle
-            split_pruned_len = 0
-
-        if pruned_len <= 0:
-            # if pruned length is less than or equal to 0,
-            # there is no top-k logprobs to process
+    chunk_rows = _chunk_rows(pruned_lens, split_pruned_len, rows_avail)
+    for k, pruned_len, (lo, hi, done) in zip(top_k_nums, pruned_lens, chunk_rows):
+        if pruned_len <= done:
+            # No logprob rows: there is no top-k logprobs to process
             top_logprobs_val.append([])
             top_logprobs_idx.append([])
             continue
 
         # Handle remaining tokens in next chunk if any
-        available_len = min(pruned_len, max(rows_avail - pt, 0))
-        if available_len < pruned_len:
-            next_split_pruned_len = split_pruned_len + available_len
+        if hi - lo < pruned_len - done:
+            next_split_pruned_len = done + hi - lo
 
         # Get the top-k logprobs
         if copy_to_pinned_cpu:
             # Keep one span per sequence to avoid per-row tensor slicing.
-            val = [values[pt : pt + available_len, :k]] if available_len else []
-            idx = [indices[pt : pt + available_len, :k]] if available_len else []
+            val = [values[lo:hi, :k]] if hi > lo else []
+            idx = [indices[lo:hi, :k]] if hi > lo else []
         else:
-            val = [values[pt + j][:k] for j in range(available_len)]
-            idx = [indices[pt + j][:k] for j in range(available_len)]
+            val = [row[:k] for row in values[lo:hi]]
+            idx = [row[:k] for row in indices[lo:hi]]
 
         # Append or extend based on whether the sequence was split across chunks
         # Split-sequence continuations extend; everyone else owns a fresh
         # (possibly empty) entry.
-        if split_pruned_len > 0:
+        if done > 0:
             top_logprobs_val[-1].extend(val)
             top_logprobs_idx[-1].extend(idx)
         else:
             top_logprobs_val.append(val)
             top_logprobs_idx.append(idx)
-
-        pt += pruned_len
     return next_split_pruned_len
+
+
+@dataclasses.dataclass(slots=True)
+class _RaggedRows:
+    """Rows of differing length, stored as their concatenation and each row's size."""
+
+    values: torch.Tensor
+    lengths: List[int]
+
+    def tolist(self) -> List[List[float]]:
+        # One host copy for all rows, then cut in Python.
+        flat = self.values.tolist()
+        ends = itertools.accumulate(self.lengths)
+        return [flat[end - length : end] for length, end in zip(self.lengths, ends)]
+
+
+def _gather_token_id_rows(
+    logprobs: torch.Tensor,
+    first_row: int,
+    token_id_rows: List[List[int]],
+    log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    copy_to_pinned_cpu: bool,
+) -> _RaggedRows:
+    """Gather each row's own token ids from ``logprobs`` with one host copy."""
+    device = logprobs.device
+    lengths = [len(row) for row in token_id_rows]
+    num_ids = sum(lengths)
+    index = torch.empty(
+        (2, num_ids), dtype=torch.long, pin_memory=is_pin_memory_available(device)
+    )
+    index[0] = torch.arange(first_row, first_row + len(lengths)).repeat_interleave(
+        torch.tensor(lengths, dtype=torch.long), output_size=num_ids
+    )
+    index[1] = torch.from_numpy(
+        np.fromiter(
+            itertools.chain.from_iterable(token_id_rows), dtype=np.int64, count=num_ids
+        )
+    )
+    rows, columns = index.to(device, non_blocking=True).unbind(0)
+    values = logprobs[rows, columns]
+    if log_normalizer is not None:
+        row_max, row_log_sum = log_normalizer
+        values = (values.float() - row_max[rows]) - row_log_sum[rows]
+    if copy_to_pinned_cpu:
+        values = async_d2h(values)
+    return _RaggedRows(values, lengths)
 
 
 def get_token_ids_logprobs_chunk(
     logprobs: torch.Tensor,
-    token_ids_logprobs: List[int],
+    token_ids_logprobs: List[Optional[Union[List[int], TokenIdRows]]],
     pruned_lens: List[int],
     token_ids_logprobs_val: List,
     token_ids_logprobs_idx: List,
@@ -314,7 +387,8 @@ def get_token_ids_logprobs_chunk(
         logprobs: Log probabilities tensor of shape [seq_len, vocab_size].
             With ``log_normalizer`` set, raw logits instead; gathered rows are
             normalized by subtraction.
-        token_ids_logprobs: List of token IDs for each sequence
+        token_ids_logprobs: For each sequence, the token IDs to report at every
+            row, or a TokenIdRows giving each row its own token IDs
         pruned_lens: List of pruned lengths for each sequence
         token_ids_logprobs_val: List to store token logprob values
         token_ids_logprobs_idx: List to store token indices
@@ -358,7 +432,18 @@ def get_token_ids_logprobs_chunk(
         # Get the token ids logprobs
         val = []
         idx = []
-        if token_ids is not None and available_len > 0:
+        if isinstance(token_ids, TokenIdRows):
+            wanted = token_ids.rows[split_pruned_len : split_pruned_len + available_len]
+            if wanted:
+                span = _gather_token_id_rows(
+                    logprobs, pt, wanted, log_normalizer, copy_to_pinned_cpu
+                )
+                if copy_to_pinned_cpu:
+                    val.append(span)
+                else:
+                    val.extend(span.tolist())
+                idx.extend(wanted)
+        elif token_ids is not None and available_len > 0:
             rows = logprobs[pt : pt + available_len, token_ids]
             if log_normalizer is not None:
                 rows = (
@@ -431,7 +516,16 @@ def compute_spec_logprobs(
         1, accepted_token_ids.long().view(-1, 1)
     ).view(bs, max_accept)
 
-    if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+    top_k = batch.top_logprobs_nums[0] if batch.top_logprobs_nums else 0
+    if top_k > 0 and all(x == top_k for x in batch.top_logprobs_nums):
+        # Every row asks for the same k: one [bs * max_accept, k] pair, so the
+        # result is copied to the host and converted to lists once per step
+        # instead of once per row.
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = gathered_logprobs.topk(top_k, dim=-1)
+    elif batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
         top_logprobs_nums_expanded = [
             num for num in batch.top_logprobs_nums for _ in range(max_accept)
         ]
@@ -583,6 +677,93 @@ class InputLogprobProcessor:
         # hold the whole chunk; do not change LoRA or logprob chunk boundaries.
         return fit_rows >= chunk_size
 
+    def select_input_candidates(
+        self,
+        selector: Any,
+        logits: torch.Tensor,
+        k: int,
+        first_position: int,
+        log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """The ``k`` candidates per row that a request's
+        ``ReqLogprob.input_candidate_selector`` chooses in place of the top-k.
+        Subclasses implement the selectors they serve and are installed through
+        ``LogitsProcessor.input_logprob_processor_cls``.
+
+        Args:
+            logits: [rows, vocab_size] consecutive rows of one request. Raw
+                logits when ``log_normalizer`` (per-row max, logsumexp - max)
+                is set, else log-probabilities.
+            first_position: Index in the request's input of the token the
+                first row predicts; row r predicts ``first_position + r``. It
+                does not depend on logprob chunks, prefill chunks or the batch.
+                A row can lie past the input (the one that predicts the first
+                output token); its result is dropped. Do not modify ``logits``.
+
+        Returns:
+            [rows, k] full-vocabulary log-probabilities, [rows, k] token ids,
+            and optional [rows, k] weights, carried as fp32.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} serves no input candidate selector; "
+            f"got {selector!r}"
+        )
+
+    def _select_chunk_candidates(
+        self,
+        logprobs: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+        chunk_slice: slice,
+        split_pruned_len: int,
+        plain_max_k: int,
+        log_normalizer: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        precomputed_topk: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The (values, token ids) of a chunk's rows, as wide as the largest
+        top_logprobs_num of the requests of ``chunk_slice``: the
+        top-``plain_max_k``, with the rows of each selector request replaced.
+        """
+        selectors = logits_metadata.input_candidate_selectors
+        top_k_nums = logits_metadata.top_logprobs_nums
+        values, indices = _top_logprobs(
+            logprobs, plain_max_k, log_normalizer, precomputed_topk
+        )
+        pad = max(top_k_nums[chunk_slice]) - values.shape[1]
+        # Selector rows are fp32; widening half-precision top-k values is exact.
+        values = values.to(torch.promote_types(values.dtype, torch.float32))
+        values = torch.nn.functional.pad(values, (0, pad))
+        indices = torch.nn.functional.pad(indices, (0, pad))
+        chunk_rows = _chunk_rows(
+            logits_metadata.extend_logprob_pruned_lens_cpu[chunk_slice],
+            split_pruned_len,
+            logprobs.shape[0],
+        )
+        for n, (lo, hi, done) in enumerate(chunk_rows, start=chunk_slice.start):
+            if selectors[n] is None or hi == lo:
+                continue
+            k = top_k_nums[n]
+            row_normalizer = None
+            if log_normalizer is not None:
+                row_normalizer = (log_normalizer[0][lo:hi], log_normalizer[1][lo:hi])
+            # A sequence's first logprob row sits at prefix + start and
+            # predicts the next input token.
+            first_position = (
+                logits_metadata.extend_prefix_lens_cpu[n]
+                + logits_metadata.extend_logprob_start_lens_cpu[n]
+                + done
+                + 1
+            )
+            row_values, row_indices, _ = self.select_input_candidates(
+                selectors[n],
+                logprobs[lo:hi],
+                k,
+                first_position,
+                row_normalizer,
+            )
+            values[lo:hi, :k] = row_values
+            indices[lo:hi, :k] = row_indices
+        return values, indices
+
     def _forward_by_chunk(
         self,
         pruned_states: torch.Tensor,
@@ -615,6 +796,15 @@ class InputLogprobProcessor:
         else:
             token_ids_logprobs_val = None
             token_ids_logprobs_idx = None
+
+        # Requests with an input candidate selector take no part in the top-k,
+        # so every other request computes what it would without them.
+        selectors = logits_metadata.input_candidate_selectors
+        plain_top_k_nums = logits_metadata.top_logprobs_nums
+        if selectors is not None:
+            plain_top_k_nums = [
+                0 if s is not None else k for k, s in zip(plain_top_k_nums, selectors)
+            ]
 
         # If a single sequence is split into multiple chunks, we need to keep track
         # of the pruned length of the sequences in the previous chunks.
@@ -712,7 +902,7 @@ class InputLogprobProcessor:
                     # is requested, the fused kernel produces the normalizer and
                     # the top-k in the same single read of the logits.
                     max_k = (
-                        max(logits_metadata.top_logprobs_nums[chunk_slice])
+                        max(plain_top_k_nums[chunk_slice])
                         if logits_metadata.extend_return_top_logprob
                         else 0
                     )
@@ -741,6 +931,17 @@ class InputLogprobProcessor:
                     pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
                         chunk_slice
                     ]
+                    chunk_candidates = None
+                    if selectors is not None:
+                        chunk_candidates = self._select_chunk_candidates(
+                            chunk_logprobs,
+                            logits_metadata,
+                            chunk_slice,
+                            split_len_topk,
+                            max(plain_top_k_nums[chunk_slice]),
+                            chunk_log_normalizer,
+                            chunk_precomputed_topk,
+                        )
                     split_len_topk = get_top_logprobs_chunk(
                         chunk_logprobs,
                         top_k_nums,
@@ -751,6 +952,7 @@ class InputLogprobProcessor:
                         log_normalizer=chunk_log_normalizer,
                         precomputed_topk=chunk_precomputed_topk,
                         copy_to_pinned_cpu=borrow_logprob_memory,
+                        candidates=chunk_candidates,
                     )
 
                 # Get the logprob of given token id
@@ -818,6 +1020,13 @@ class InputLogprobProcessor:
         )
 
 
+def _drop_token_id_rows(token_ids_logprobs: List) -> List[Optional[List[int]]]:
+    return [
+        None if isinstance(token_ids, TokenIdRows) else token_ids
+        for token_ids in token_ids_logprobs
+    ]
+
+
 class OutputLogprobProcessor:
     """Output (decode) logprob processing: logprobs -> topk / token-ids /
     sampled-token gather, returned as a LogprobResult for the caller to
@@ -849,7 +1058,7 @@ class OutputLogprobProcessor:
                 result.token_ids_logprobs_val,
                 result.token_ids_logprobs_idx,
             ) = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+                logprobs, _drop_token_id_rows(token_ids_logprobs), no_copy_to_cpu=True
             )
 
         result.token_logprobs = logprobs[
@@ -876,6 +1085,7 @@ class OutputLogprobProcessor:
             logger.warning("No logits available for logprob computation")
             return None
 
+        token_ids_logprobs = _drop_token_id_rows(token_ids_logprobs)
         # Check if any requests actually need logprobs computation
         needs_token_ids_logprobs = any(
             token_ids is not None and len(token_ids) > 0

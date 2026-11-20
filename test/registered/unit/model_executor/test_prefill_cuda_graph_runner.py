@@ -30,6 +30,9 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -112,6 +115,59 @@ class _FakeBatchRegistry:
 
     def get_slot(self, name):
         return self.slots[name]
+
+
+def _load_batch_runner(backend):
+    """A runner with the state load_batch reads, over one 4-token bucket."""
+    runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+    runner.capture_num_tokens = [4]
+    runner.max_context_size = None
+    runner.max_seq_len = None
+    runner._capture_chunked_prefix = False
+    runner.buffer_registry = _FakeBatchRegistry()
+    runner.model_runner = SimpleNamespace(
+        attn_tp_sequence_sharded=lambda _: False,
+        prepare_dummy_forward_batch=lambda batch: batch,
+        runner_ids=_static_pool_translator(),
+    )
+    runner.enable_cp_bcg_capture = False
+    runner._is_full_backend = False
+    runner.backend = backend
+    runner.has_mha_companion_layers = False
+    runner._prefill_static_buffers = None
+    runner.static_draft_hidden_states = None
+    runner.capture_return_pooled_hidden_states = False
+    runner._next_token_logits_buffer = lambda _rows: None
+    runner._prefill_logits_buffer_rows = lambda _batch: 1
+    runner._prepare_forward_metadata_for_replay = lambda *_args: None
+    return runner
+
+
+def _three_token_extend(runner, **fields):
+    """Three tokens of one request behind a 5-token prefix, bound to the
+    runner's ids."""
+    forward_batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=torch.arange(3, dtype=torch.int64),
+        req_pool_indices=torch.zeros(1, dtype=torch.int64),
+        seq_lens=torch.tensor([8], dtype=torch.int32),
+        out_cache_loc=torch.arange(3, dtype=torch.int64),
+        seq_lens_sum=8,
+        positions=torch.arange(5, 8, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([8], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3], dtype=torch.int32),
+        extend_prefix_lens=torch.full((1,), 5, dtype=torch.int32),
+        extend_start_loc=torch.zeros(1, dtype=torch.int32),
+        extend_seq_lens_cpu=[3],
+        extend_prefix_lens_cpu=[5],
+        mm_inputs=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        global_forward_mode=ForwardMode.EXTEND,
+        **fields,
+    )
+    runner.model_runner.runner_ids.bind_own_plan(forward_batch)
+    return forward_batch
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
@@ -382,55 +438,38 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
     def test_static_batch_preserves_consumed_multimodal_embeddings(self):
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.capture_num_tokens = [4]
-        runner.max_context_size = None
-        runner.max_seq_len = None
-        runner._capture_chunked_prefix = False
-        runner.buffer_registry = _FakeBatchRegistry()
-        runner_ids = _static_pool_translator()
-        runner.model_runner = SimpleNamespace(
-            attn_tp_sequence_sharded=lambda _: False,
-            prepare_dummy_forward_batch=lambda batch: batch,
-            runner_ids=runner_ids,
-        )
-        runner.enable_cp_bcg_capture = False
-        runner._is_full_backend = False
-        runner.backend = SimpleNamespace()
-        runner.has_mha_companion_layers = False
-        runner._prefill_static_buffers = None
-        runner.static_draft_hidden_states = None
-        runner.capture_return_pooled_hidden_states = False
-        runner._next_token_logits_buffer = lambda _rows: None
-        runner._prefill_logits_buffer_rows = lambda _batch: 1
-        runner._prepare_forward_metadata_for_replay = lambda *_args: None
-
+        runner = _load_batch_runner(SimpleNamespace())
         mm_input_embeds = torch.randn(3, 8)
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=1,
-            input_ids=torch.arange(3, dtype=torch.int64),
-            req_pool_indices=torch.zeros(1, dtype=torch.int64),
-            seq_lens=torch.tensor([3], dtype=torch.int32),
-            out_cache_loc=torch.arange(3, dtype=torch.int64),
-            seq_lens_sum=3,
-            positions=torch.arange(3, dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
-            extend_seq_lens=torch.tensor([3], dtype=torch.int32),
-            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
-            extend_start_loc=torch.zeros(1, dtype=torch.int32),
-            extend_seq_lens_cpu=[3],
-            extend_prefix_lens_cpu=[0],
-            mm_inputs=None,
-            mm_input_embeds=mm_input_embeds,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            global_forward_mode=ForwardMode.EXTEND,
-        )
-        runner_ids.bind_own_plan(forward_batch)
+        forward_batch = _three_token_extend(runner, mm_input_embeds=mm_input_embeds)
 
         static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+
+    def test_breakable_static_batch_carries_the_input_logprob_request(self):
+        """A Breakable replay runs the logits processor on the static batch,
+        which must ask it for what the raw batch asks."""
+        runner = _load_batch_runner(
+            BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        )
+        selectors = [object()]
+        forward_batch = _three_token_extend(
+            runner,
+            return_logprob=True,
+            extend_logprob_start_lens_cpu=[1],
+            top_logprobs_nums=[5],
+            input_candidate_selectors=selectors,
+            token_ids_logprobs=[[7]],
+        )
+
+        static_batch, _ = runner.load_batch(forward_batch)
+
+        self.assertTrue(static_batch.return_logprob)
+        self.assertEqual(static_batch.extend_prefix_lens_cpu, [5])
+        self.assertEqual(static_batch.extend_logprob_start_lens_cpu, [1])
+        self.assertEqual(static_batch.top_logprobs_nums, [5])
+        self.assertIs(static_batch.input_candidate_selectors, selectors)
+        self.assertEqual(static_batch.token_ids_logprobs, [[7]])
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
