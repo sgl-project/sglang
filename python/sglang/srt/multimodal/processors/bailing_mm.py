@@ -25,12 +25,12 @@ from sglang.srt.models.bailing_mm import (
     BailingMMNativeForConditionalGeneration,
 )
 from sglang.srt.models.bailing_mm_v3 import BailingMoeV3VLForConditionalGeneration
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import ImageData, VideoData
 
 DEFAULT_IMAGE_PATCH_TOKEN = "<|image_pad|>"
 DEFAULT_FRAME_PATCH_TOKEN = "<|video_pad|>"

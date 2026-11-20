@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.core import WatermarkState
+    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -100,10 +100,13 @@ def per_step_draft_out_cache_loc(
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # Contiguous so each step's row is a dense loc: the KV write and metadata
+    # kernels read locs by flat offset, ignoring strides.
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
+        .contiguous()
     )
 
 
@@ -127,11 +130,9 @@ def draft_step_writes(
         # A chain draft writes the leading columns of the verify window.
         assert topk == 1 and isinstance(cols, slice) and cols.step is None
         step_cols = slice(cols.start + step, cols.start + step + 1)
-    # Contiguous: a step's ids are strided across the window, and metadata
-    # kernels read their write ids by contiguous offsets.
     forward_batch.out_cache_loc = per_step_draft_out_cache_loc(
         loc, forward_batch.batch_size, topk, num_steps
-    )[step].contiguous()
+    )[step]
     forward_batch.iteration_cols = step_cols
     try:
         yield
@@ -401,6 +402,12 @@ def eagle_prepare_for_verify(
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
+        # Host upper bound of this batch's final KV lengths: bounds the
+        # backend's replay page-table copies in mirrorless mode without a D2H sync.
+        batch.max_seq_len_host = (
+            max((req.seqlen for req in batch.reqs), default=0)
+            + verify_input.draft_token_num
+        )
         batch.input_ids = verify_input.draft_token
         maybe_detect_oob(
             batch.input_ids,
@@ -741,8 +748,7 @@ def eagle_sample(
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
     *,
-    watermark_state: Optional[WatermarkState] = None,
-    watermark_full_mask: bool = True,
+    watermark: Optional[VerifyWatermark] = None,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
@@ -790,8 +796,7 @@ def eagle_sample(
         verify_input=verify_input,
         batch=batch,
         grammar_mask=grammar_mask,
-        watermark=watermark_state is not None
-        and sampling_info.has_watermark_candidates,
+        watermark=watermark is not None,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -830,45 +835,18 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
-    watermark_context_hashes = None
-    watermark_selected = None
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        if batch.return_logprob:
+    if watermark is not None:
+        next_token_logits, sampling_info = watermark.apply(
+            next_token_logits,
+            sampling_info=sampling_info,
+            req_pool_indices=batch.req_pool_indices,
+            draft_tokens=verify_input.draft_token,
+            positions=verify_input.positions,
+            draft_token_num=verify_input.draft_token_num,
+            custom_mask=verify_input.custom_mask,
             # compute_spec_logprobs reads logits_output after verify.
-            next_token_logits = next_token_logits.clone()
-        if next_token_logits.is_cuda:
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative_from_tree(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    draft_tokens=verify_input.draft_token,
-                    custom_mask=verify_input.custom_mask,
-                    positions=verify_input.positions,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                    full_mask=watermark_full_mask,
-                )
-            )
-        else:
-            contexts, context_lengths = watermark_state.speculative_contexts(
-                req_pool_indices=batch.req_pool_indices,
-                draft_tokens=verify_input.draft_token,
-                custom_mask=verify_input.custom_mask,
-                positions=verify_input.positions,
-                draft_token_num=verify_input.draft_token_num,
-                full_mask=watermark_full_mask,
-                context_windows=watermark_state.context_windows(sampling_info),
-            )
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    contexts=contexts,
-                    context_lengths=context_lengths,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                )
-            )
+            keep_logits=batch.return_logprob,
+        )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -916,8 +894,7 @@ def eagle_sample(
         simulated_acc_len=simulated_acc_len,
         simulate_acc_len=SIMULATE_ACC_LEN,
         simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-        watermark=watermark_state is not None
-        and sampling_info.has_watermark_candidates,
+        watermark=watermark is not None,
     )
     fused_verify = chain and (greedy or sparse or vocab_shard is not None)
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
@@ -962,7 +939,6 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=verify_input.tree_topk,
             )
 
         if _is_hip:
@@ -1006,7 +982,6 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=verify_input.tree_topk,
             )
     elif sparse:
         from sglang.srt.speculative.uno_utils import (
@@ -1043,7 +1018,6 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=verify_input.tree_topk,
             )
 
         tp_group = (
@@ -1227,14 +1201,8 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        watermark_state.record_speculative(
-            batch.req_pool_indices,
-            watermark_context_hashes,
-            watermark_selected,
-            accept_index,
-            accept_lens,
-        )
+    if watermark is not None:
+        watermark.record(accept_index, accept_lens)
     return predict, accept_lens, accept_index
 
 

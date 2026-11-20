@@ -26,20 +26,14 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 # ROCm uses the same imports: causal_conv1d.py falls back to the Triton kernels there.
 if is_cuda() or is_hip():
@@ -54,12 +48,7 @@ if is_cuda() or is_hip():
         causal_conv1d_update,
     )
 elif is_npu():
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu as causal_conv1d_fn,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_update_npu as causal_conv1d_update,
-    )
+    from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
 elif is_xpu():
     # XPU has no native causal_conv1d kernel yet; use the portable Triton
     # implementation for both the "native" and the "_triton" entry points so

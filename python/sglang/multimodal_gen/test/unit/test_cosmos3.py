@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     is_nano_checkpoint,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
+    CosmosDreamsConfig,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
@@ -38,6 +41,7 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_metadata,
     build_action_sampling_params,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -65,6 +69,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     sequence_shard_padding,
     shard_sequence,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -82,6 +87,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
@@ -167,12 +173,13 @@ class TestCosmos3RopePlacement(CustomTestCase):
                     self.assertNotIn("inv_freq", rotary_emb.state_dict())
 
 
-class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
+class TestCosmos3T1FusedQKNormRoPE(CustomTestCase):
     def _can_enable(
         self,
         *,
         is_blackwell=False,
         is_hopper=False,
+        is_sm121=False,
         hidden_act="silu",
         tp_size=1,
         sp_size=1,
@@ -182,6 +189,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
         return _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=is_blackwell,
             is_hopper=is_hopper,
+            is_sm121=is_sm121,
             hidden_act=hidden_act,
             tp_size=tp_size,
             sp_size=sp_size,
@@ -253,6 +261,24 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
 
     def test_compiled_path_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, is_compiled=True))
+
+    def test_sm121_single_gpu_nano_and_edge_enabled(self):
+        self.assertTrue(self._can_enable(is_sm121=True, hidden_size=4096))
+        self.assertTrue(
+            self._can_enable(is_sm121=True, hidden_act="relu2", hidden_size=2048)
+        )
+
+    def test_sm121_unmeasured_shapes_and_topologies_disabled(self):
+        for overrides in (
+            {"hidden_size": 5120},
+            {"hidden_size": 5120, "tp_size": 2},
+            {"hidden_act": "relu2", "hidden_size": 4096},
+            {"hidden_size": 4096, "tp_size": 2},
+            {"hidden_size": 4096, "sp_size": 2},
+            {"hidden_size": 4096, "is_compiled": True},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(self._can_enable(is_sm121=True, **overrides))
 
     def test_other_architecture_disabled(self):
         self.assertFalse(self._can_enable())
@@ -613,6 +639,80 @@ class TestCosmos3EdgeSamplingDefaults(unittest.TestCase):
         sp = Cosmos3SamplingParams(prompt="t", num_frames=81, width=1024, height=576)
         sp._resolve_variant_defaults(is_edge=True)
         self.assertEqual((sp.width, sp.height), (1024, 576))
+
+
+def _cosmos3_size_server_args(config=None):
+    server_args = _cosmos3_server_args(config)
+    server_args.backend = "sglang"
+    server_args.performance_mode = "manual"
+    server_args.enable_cfg_parallel = False
+    server_args.enable_breakable_cuda_graph = False
+    server_args.enable_torch_compile = False
+    server_args.enable_trace = False
+    server_args.attention_backend_config = {}
+    server_args.warmup_steps = 1
+    server_args.warmup_num_frames = None
+    return server_args
+
+
+def _build_cosmos3_sampling(server_args, data_type, fields):
+    with (
+        mock.patch.object(
+            openai_utils, "get_global_server_args", return_value=server_args
+        ),
+        mock.patch.object(
+            SamplingParams, "from_pretrained", return_value=Cosmos3SamplingParams()
+        ),
+    ):
+        return openai_utils.build_sampling_params(
+            "size", prompt="a cat", request_data_type=data_type, **fields
+        )
+
+
+class TestCosmos3RequestSizeAlignment(unittest.TestCase):
+    """Requested sizes reach the latent stage as multiples of 16."""
+
+    def _assert_latent_stage_accepts(self, sampling, server_args):
+        stage = Cosmos3LatentPreparationStage(vae=None, transformer=None)
+        result = stage.verify_input(Req(sampling_params=sampling), server_args)
+        self.assertTrue(result.is_valid(), result.get_failure_summary())
+
+    def test_http_size_aligns_to_the_latent_grid(self):
+        server_args = _cosmos3_size_server_args()
+        for data_type, fields, expected in (
+            (DataType.IMAGE, {"size": "1920x1080", "num_frames": 1}, (1920, 1072)),
+            (DataType.IMAGE, {"size": "854x480", "num_frames": 1}, (848, 480)),
+            (DataType.VIDEO, {"size": "1920x1080", "num_frames": 17}, (1920, 1072)),
+            (DataType.VIDEO, {"width": 854, "height": 480}, (848, 480)),
+            (DataType.IMAGE, {"size": "1280x720", "num_frames": 1}, (1280, 720)),
+            (DataType.VIDEO, {"size": "832x480", "num_frames": 17}, (832, 480)),
+            (DataType.VIDEO, {}, (1280, 720)),
+        ):
+            with self.subTest(data_type=data_type, fields=fields):
+                sampling = _build_cosmos3_sampling(server_args, data_type, fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+                self._assert_latent_stage_accepts(sampling, server_args)
+
+    def test_simulation_configs_keep_requested_size(self):
+        server_args = _cosmos3_size_server_args(CosmosDreamsConfig())
+        sampling = _build_cosmos3_sampling(
+            server_args, DataType.VIDEO, {"size": "854x480", "num_frames": 17}
+        )
+        self.assertEqual((sampling.width, sampling.height), (854, 480))
+
+    def test_warmup_resolution_aligns_to_the_latent_grid(self):
+        server_args = _cosmos3_size_server_args()
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Cosmos3SamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["1920x1080"],
+                warmup_input_path="warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(1920, 1072)])
 
 
 class TestCosmos3SamplingParamsDataType(unittest.TestCase):
@@ -1753,7 +1853,7 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertTrue(torch.allclose(out, torch.full((1,), 56.0)))
 
     def test_control_cfg_parallel_distribution(self):
-        """Round-robin branch distribution + all-reduce equals the serial blend."""
+        """Round-robin branches are all-gathered and combined in serial order."""
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         seen = {}
 
@@ -1771,7 +1871,7 @@ class TestCosmos3Transfer(unittest.TestCase):
 
             return fake_run
 
-        def run(rank, world):
+        def run(rank, world, lockstep):
             stage._run_transformer = make_run(rank)
             branches = stage._control_cfg_branches(
                 torch.zeros(1),
@@ -1792,32 +1892,66 @@ class TestCosmos3Transfer(unittest.TestCase):
                 fps=24.0,
                 cfg_rank=rank,
                 cfg_world_size=world,
+                cfg_lockstep=lockstep,
             )
 
         target = (
             "sglang.multimodal_gen.runtime.pipelines_core.stages."
-            "model_specific_stages.cosmos3.cfg_model_parallel_all_reduce"
+            "model_specific_stages.cosmos3.cfg_model_parallel_all_gather"
         )
-        # Stand in for the all-reduce with identity so each rank returns its own
-        # partial; summing them mimics the cross-rank reduction.
-        with mock.patch(target, side_effect=lambda x: x):
-            # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
-            # uncond), rank 1 runs only the control-dropped cond_nc.
-            r0 = run(0, 2)
-            r1 = run(1, 2)
-            self.assertEqual(seen[0], ["cond", "uncond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
+        values = {"cond": 20.0, "cond_nc": 10.0, "uncond": 2.0}
+        branch_order = ["cond", "cond_nc", "uncond"]
+        sent = []
 
-            seen.clear()
-            # 4 ranks for 3 branches: rank 3 is idle and contributes zeros.
-            parts = [run(r, 4) for r in range(4)]
-            self.assertEqual(seen[0], ["cond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertEqual(seen[2], ["uncond"])
-            self.assertEqual(seen[3], [])
-            self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
-            self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
+        def fake_gather(world):
+            # Return what every rank would send for the same slot, so each
+            # rank combines all branches as a real all-gather would let it.
+            def gather(pred, dim, separate_tensors):
+                sent.append(pred)
+                slot = len(sent) - 1
+                bids = [slot * world + r for r in range(world)]
+                return [
+                    (
+                        torch.full_like(pred, values[branch_order[bid]])
+                        if bid < len(branch_order)
+                        else torch.zeros_like(pred)
+                    )
+                    for bid in bids
+                ]
+
+            return gather
+
+        # FSDP across CFG ranks needs equal forwards per rank: a rank with no
+        # branch left pads with a discarded forward. Replicated weights skip it.
+        for lockstep, pad_r1, pad_r3 in (
+            (True, ["uncond"], ["cond"]),
+            (False, [], []),
+        ):
+            with self.subTest(lockstep=lockstep):
+                seen.clear()
+                # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
+                # uncond), rank 1 runs the control-dropped cond_nc.
+                for rank in range(2):
+                    sent.clear()
+                    with mock.patch(target, side_effect=fake_gather(2)):
+                        out = run(rank, 2, lockstep)
+                    self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+                self.assertEqual(seen[0], ["cond", "uncond"])
+                self.assertEqual(seen[1], ["cond_nc"] + pad_r1)
+                self.assertTrue(torch.equal(sent[1], torch.zeros(1)))
+
+                seen.clear()
+                # 4 ranks for 3 branches: rank 3 sends zeros.
+                for rank in range(4):
+                    sent.clear()
+                    with mock.patch(target, side_effect=fake_gather(4)):
+                        out = run(rank, 4, lockstep)
+                    self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+                self.assertEqual(seen[0], ["cond"])
+                self.assertEqual(seen[1], ["cond_nc"])
+                self.assertEqual(seen[2], ["uncond"])
+                self.assertEqual(seen[3], pad_r3)
+                self.assertTrue(torch.equal(sent[0], torch.zeros(1)))
 
     def test_single_hint_defaults_applied(self):
         sp = Cosmos3SamplingParams(
@@ -1882,6 +2016,136 @@ class TestCosmos3Transfer(unittest.TestCase):
             Cosmos3SamplingParams(
                 prompt="t", control_path="x.mp4", control_hint="bogus"
             )
+
+
+class TestCosmos3CfgParallelUndCache(unittest.TestCase):
+    """CFG ranks must miss the UND K/V cache in the same steps."""
+
+    _MODULE = (
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.cosmos3"
+    )
+    # 6 steps; a [400, 1000] window (the T2I default) covers steps 0-3.
+    _TIMESTEPS = [999.0, 800.0, 600.0, 400.0, 200.0, 50.0]
+
+    def _und_cache_misses(
+        self,
+        *,
+        cfg_rank,
+        guidance_interval,
+        cfg_world_size=2,
+        control_guidance=1.0,
+        use_fsdp_inference=True,
+    ):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        cache = set()
+        misses = []
+
+        def fake_run(*, latents, cache_key, current_timestep, **_):
+            if cache_key not in cache:
+                cache.add(cache_key)
+                misses.append(current_timestep)
+            return torch.zeros_like(latents)
+
+        stage.transformer = mock.Mock(reset_cache=mock.Mock(side_effect=cache.clear))
+        stage._run_transformer = fake_run
+        stage.scheduler = mock.Mock(step=lambda noise_pred, t, latents, **_: (latents,))
+        stage.progress_bar = lambda iterable, **_: iterable
+        stage.log_info = lambda *_: None
+        stage.check_cancelled = lambda _: None
+        stage._logged_parallel_config = True
+        stage._logged_cfg_split = True
+        stage._current_batch_is_warmup = False
+
+        text = torch.zeros(1, 4, dtype=torch.long)
+        batch = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(
+                guidance_interval=guidance_interval,
+                control_guidance=control_guidance,
+            ),
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": torch.ones_like(text),
+                "uncond_text_ids": text,
+                "uncond_text_mask": torch.ones_like(text),
+                "cond_text_seq_len": 4,
+                "uncond_text_seq_len": 4,
+                "video_shape": (1, 1, 1),
+                "control_latents": (
+                    [torch.zeros(1)] if control_guidance != 1.0 else None
+                ),
+            },
+            latents=torch.zeros(1, 1, 1, 1, 1),
+            audio_latents=None,
+            timesteps=torch.tensor(self._TIMESTEPS),
+            guidance_scale=4.0,
+            generator=None,
+            seed=None,
+            scheduler=None,
+            rollout=False,
+            profile=False,
+            is_warmup=False,
+        )
+        server_args = types.SimpleNamespace(
+            enable_cfg_parallel=True,
+            use_fsdp_inference=use_fsdp_inference,
+            pipeline_config=None,
+        )
+        patches = {
+            "get_classifier_free_guidance_rank": cfg_rank,
+            "get_classifier_free_guidance_world_size": cfg_world_size,
+            "get_sp_world_size": 1,
+            "rollout_step_kwargs": {},
+            "prepare_rollout_if_enabled": None,
+            "init_rollout_env_if_enabled": None,
+            "finalize_rollout_if_enabled": None,
+        }
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(
+                    mock.patch(f"{self._MODULE}.{name}", return_value=value)
+                )
+            stack.enter_context(
+                mock.patch(
+                    f"{self._MODULE}.cfg_model_parallel_all_gather",
+                    side_effect=lambda x, **_: [x] * cfg_world_size,
+                )
+            )
+            stage._denoise_once(batch, server_args)
+        return misses
+
+    def test_ranks_miss_und_cache_in_same_steps(self):
+        cases = {
+            # CFG on throughout (T2V/I2V): one UND pass per rank, no resets.
+            "always_on": (None, 2, 1.0, [0]),
+            # T2I default: CFG split ends at step 4, where every rank runs "cond".
+            # Rank 1 has only cached "uncond".
+            "window_ends": ((400.0, 1000.0), 2, 1.0, [0, 4]),
+            # CFG split starts at step 3, where rank 1 first needs "uncond".
+            "window_starts": ((0.0, 500.0), 2, 1.0, [0, 3]),
+            # Transfer on 3 CFG ranks: the control split stays on while the text
+            # window closes at step 4, dropping "uncond"; rank 2 then pads with "cond".
+            "control_text_window_ends": ((400.0, 1000.0), 3, 2.0, [0, 4]),
+        }
+        for name, (interval, world, control_g, expected) in cases.items():
+            with self.subTest(name):
+                per_rank = [
+                    self._und_cache_misses(
+                        cfg_rank=rank,
+                        guidance_interval=interval,
+                        cfg_world_size=world,
+                        control_guidance=control_g,
+                    )
+                    for rank in range(world)
+                ]
+                self.assertEqual(per_rank, [expected] * world)
+
+    def test_no_und_cache_reset_without_fsdp(self):
+        """Replicated weights keep CFG ranks in step, so no extra UND pass is paid."""
+        misses = self._und_cache_misses(
+            cfg_rank=0, guidance_interval=(400.0, 1000.0), use_fsdp_inference=False
+        )
+        self.assertEqual(misses, [0])
 
 
 class TestCosmos3DomainAwareLinear(unittest.TestCase):

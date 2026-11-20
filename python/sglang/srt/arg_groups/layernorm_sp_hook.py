@@ -25,18 +25,24 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--enable-megamoe-for-layernorm-sp requires --enable-layernorm-sp."
             )
+        if cfg.layernorm_sp_min_tokens:
+            raise ValueError(
+                "--layernorm-sp-min-tokens requires --enable-layernorm-sp."
+            )
         return
     architectures = model_config_of(server_args).hf_config.architectures
+    architecture = architectures[0] if architectures else None
     validate_layernorm_sp(
-        architecture=architectures[0] if architectures else None,
+        architecture=architecture,
         tp_size=cfg.tp_size,
         ep_size=cfg.ep_size,
+        pp_size=cfg.pp_size,
+        attn_cp_size=cfg.attn_cp_size,
         quantization=cfg.quantization,
         moe_a2a_backend=cfg.moe_a2a_backend,
         moe_runner_backend=cfg.moe_runner_backend,
         attn_dp_enabled=attn_dp_enabled_of(cfg),
         speculative_algorithm=cfg.speculative_algorithm,
-        pp_size=cfg.pp_size,
         enable_megamoe_for_layernorm_sp=use_megamoe,
     )
     if architectures and architectures[0] in ("MuseSparkForConditionalGeneration",):
@@ -84,6 +90,11 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
                         "a larger eager prefill could replace captured SP workspaces."
                     )
                 prefill_backend = Backend.BREAKABLE
+            validate_layernorm_sp_min_tokens(
+                min_tokens=cfg.layernorm_sp_min_tokens,
+                prefill_backend=prefill_backend,
+                prefill_bs=cfg.cuda_graph_config.prefill.bs,
+            )
             declare_resolution(
                 server_args,
                 "handle_layernorm_sp",
@@ -104,6 +115,37 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
                 "SGLANG_MOE_NVFP4_DISPATCH=0 so FlashInfer A2A transports "
                 "BF16 activations and sizes its workspace for the BF16 payload."
             )
+    validate_layernorm_sp_min_tokens(
+        min_tokens=cfg.layernorm_sp_min_tokens,
+        prefill_backend=cfg.cuda_graph_config.prefill.backend,
+        prefill_bs=cfg.cuda_graph_config.prefill.bs,
+    )
+
+
+def validate_layernorm_sp_min_tokens(
+    *, min_tokens: int, prefill_backend, prefill_bs
+) -> None:
+    """--layernorm-sp-min-tokens against the prefill CUDA graphs it will run under.
+
+    A captured prefill graph took the SP or the replicated path for its bucket
+    size, and replays a pass of fewer tokens padded up to that bucket, while the
+    exit gather outside the graph decides on the real count. With the threshold
+    a captured bucket, or at or above the largest one, a pass and its bucket
+    fall on the same side of it.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if min_tokens < 0:
+        raise ValueError(f"--layernorm-sp-min-tokens must be >= 0; got {min_tokens}.")
+    if min_tokens == 0 or prefill_backend == Backend.DISABLED:
+        return
+    buckets = sorted(int(b) for b in prefill_bs or ())
+    if buckets and min_tokens < buckets[-1] and min_tokens not in buckets:
+        raise ValueError(
+            f"--layernorm-sp-min-tokens {min_tokens} must be one of the captured "
+            f"prefill CUDA graph buckets {buckets}, or at or above the largest: a "
+            "replayed graph would otherwise take a path its exit gather does not."
+        )
 
 
 def validate_layernorm_sp(
@@ -114,6 +156,7 @@ def validate_layernorm_sp(
     speculative_algorithm: Optional[str],
     pp_size: int = 1,
     ep_size: int = 1,
+    attn_cp_size: int = 1,
     quantization: Optional[str] = None,
     moe_a2a_backend: str = "none",
     moe_runner_backend: str = "auto",
@@ -121,6 +164,7 @@ def validate_layernorm_sp(
 ) -> None:
     """Fail loud for unsupported / incompatible configs. Callers gate on the flag."""
     from sglang.srt.layers.layernorm_sp import (
+        KIMI_K3_SP_ARCHITECTURES,
         SP_SUPPORTED_ARCHITECTURES,
         is_muse_spark_architecture,
     )
@@ -136,6 +180,22 @@ def validate_layernorm_sp(
         raise ValueError(
             "--enable-layernorm-sp requires tp_size > 1: there is no sequence to "
             "shard across a single TP rank."
+        )
+    if architecture and architecture.startswith("Qwen4Exp"):
+        if ep_size != tp_size:
+            raise ValueError(
+                "--enable-layernorm-sp requires ep_size == tp_size for Qwen4Exp; "
+                f"got ep_size={ep_size}, tp_size={tp_size}."
+            )
+        if attn_cp_size != 1:
+            raise ValueError(
+                "--enable-layernorm-sp requires attn_cp_size == 1 for Qwen4Exp; "
+                f"got attn_cp_size={attn_cp_size}."
+            )
+    if architecture in KIMI_K3_SP_ARCHITECTURES and attn_cp_size != 1:
+        raise ValueError(
+            "--enable-layernorm-sp requires attn_cp_size == 1 for Kimi-K3; "
+            f"got attn_cp_size={attn_cp_size}."
         )
     if is_muse_spark_architecture(architecture):
         if (tp_size, ep_size) not in ((4, 4), (8, 8)):
@@ -154,15 +214,15 @@ def validate_layernorm_sp(
                 "--enable-megamoe-for-layernorm-sp."
             )
         if enable_megamoe_for_layernorm_sp:
-            if moe_a2a_backend not in ("none", "flashinfer"):
+            if moe_a2a_backend not in ("none", "flashinfer_nvlink_one_sided"):
                 raise ValueError(
-                    "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer; "
+                    "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer_nvlink_one_sided; "
                     "MegaMoE performs its own dispatch/combine and decode uses all-reduce."
                 )
-        elif moe_a2a_backend != "flashinfer":
+        elif moe_a2a_backend != "flashinfer_nvlink_one_sided":
             raise ValueError(
                 "Muse Spark --enable-layernorm-sp requires "
-                "--moe-a2a-backend flashinfer."
+                "--moe-a2a-backend flashinfer_nvlink_one_sided."
             )
         if moe_runner_backend != "flashinfer_trtllm":
             raise ValueError(
@@ -175,13 +235,18 @@ def validate_layernorm_sp(
             "SP shards the sequence across the full TP group, which under DP "
             "attention spans data-parallel groups holding different sequences."
         )
-    if speculative_algorithm is not None and not (
+    gathers_aux_hidden_states = (
         is_muse_spark_architecture(architecture) and speculative_algorithm == "DFLASH"
-    ):
+    ) or (
+        architecture in KIMI_K3_SP_ARCHITECTURES
+        and speculative_algorithm in ("DFLASH", "DSPARK")
+    )
+    if speculative_algorithm is not None and not gathers_aux_hidden_states:
         raise ValueError(
             "--enable-layernorm-sp supports speculative decoding only with "
-            "Muse Spark DFLASH: other models/algorithms do not gather the "
-            "sequence-sharded auxiliary hidden states."
+            "Muse Spark DFLASH and Kimi-K3 DFLASH / DSPARK: other "
+            "models/algorithms do not gather the sequence-sharded auxiliary "
+            "hidden states."
         )
     if pp_size > 1:
         raise ValueError(
