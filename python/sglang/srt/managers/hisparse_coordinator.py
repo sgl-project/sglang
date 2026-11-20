@@ -215,6 +215,11 @@ class HiSparseSpecSwapManager:
                 workspace_capacity - coordinator.device_buffer_size,
             ),
         )
+        # B12/topK2048 needs 24576 occurrences. Keep the physical scratch sized
+        # to actual occurrences while the hash/metadata use a 32768 bucket;
+        # a completely disjoint union must not fill the hash table to 100%.
+        if workspace_capacity > 16384:
+            workspace_capacity = 1 << (workspace_capacity - 1).bit_length()
         hash_size = 1 << max(1, (2 * coordinator.device_buffer_size - 1).bit_length())
         self._cache_index = torch.full(
             (layer_num, max_num_req_slots, 2, hash_size),
@@ -348,7 +353,15 @@ class HiSparseSpecSwapManager:
                 f"HiSparse spec needs {self.num_draft_tokens} verify slots, but the "
                 f"extra page has only {coordinator.page_size - 1} usable slots."
             )
-        expected_slots = req_pool_indices.numel() * self.num_draft_tokens
+        requests = req_pool_indices.numel()
+        active_width = (
+            verify_cache_locs.numel() // requests if requests else self.num_draft_tokens
+        )
+        if active_width not in (1, self.num_draft_tokens):
+            raise ValueError(
+                "HiSparse verify supports the configured block or a target-only tail step"
+            )
+        expected_slots = requests * active_width
         if verify_cache_locs.numel() != expected_slots:
             raise ValueError(
                 f"HiSparse verify slot mismatch: expected {expected_slots}, "
@@ -371,17 +384,15 @@ class HiSparseSpecSwapManager:
                 )
 
         extra_start = coordinator.device_buffer_size + 1
-        row_indices = torch.repeat_interleave(req_pool_indices, self.num_draft_tokens)
+        row_indices = torch.repeat_interleave(req_pool_indices, active_width)
         offsets = (
             torch.arange(
                 expected_slots, dtype=torch.int64, device=req_pool_indices.device
             )
-            % self.num_draft_tokens
+            % active_width
         )
         token_positions = (
-            torch.repeat_interleave(
-                start_positions.to(torch.int64), self.num_draft_tokens
-            )
+            torch.repeat_interleave(start_positions.to(torch.int64), active_width)
             + offsets
         )
         columns = extra_start + offsets
@@ -519,7 +530,7 @@ class HiSparseSpecSwapManager:
             raise RuntimeError("HiSparse spec swap is not initialized.")
         num_reqs = req_pool_indices.size(0)
         num_steps, num_top_k = top_k_result.shape[1:]
-        if num_steps != self.num_draft_tokens:
+        if num_steps not in (1, self.num_draft_tokens):
             raise ValueError(
                 f"HiSparse spec step mismatch: expected {self.num_draft_tokens}, "
                 f"got {num_steps}."
@@ -624,9 +635,11 @@ class HiSparseCoordinator:
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
                     ].buffer_info,
-                    device_capacity_tokens=self.mem_pool_device.size
-                    if self.mem_pool_device.host_capacity_tokens is None
-                    else self.mem_pool_device.host_capacity_tokens,
+                    device_capacity_tokens=(
+                        self.mem_pool_device.size
+                        if self.mem_pool_device.host_capacity_tokens is None
+                        else self.mem_pool_device.host_capacity_tokens
+                    ),
                     start_layer=self.mem_pool_device.start_layer,
                     end_layer=self.mem_pool_device.end_layer,
                     host_to_device_ratio=host_to_device_ratio,
@@ -638,9 +651,11 @@ class HiSparseCoordinator:
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
                     ].buffer_info,
-                    device_capacity_tokens=self.mem_pool_device.size
-                    if self.mem_pool_device.host_capacity_tokens is None
-                    else self.mem_pool_device.host_capacity_tokens,
+                    device_capacity_tokens=(
+                        self.mem_pool_device.size
+                        if self.mem_pool_device.host_capacity_tokens is None
+                        else self.mem_pool_device.host_capacity_tokens
+                    ),
                     start_layer=self.mem_pool_device.start_layer,
                     end_layer=self.mem_pool_device.end_layer,
                     target_layer_num=self.mem_pool_device.layer_num,
