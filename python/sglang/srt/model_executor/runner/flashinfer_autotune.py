@@ -30,6 +30,7 @@ from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_lora,
     get_model,
     get_parallel,
     get_platform,
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +323,56 @@ def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
     # and attaching the root a process already has is a no-op.
     with autotune_v2(mode="replay", cache_root=root):
         pass
+
+
+def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
+    """Whether this runner's decode capture must be served entirely by the store."""
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        FullCudaGraphBackend,
+    )
+
+    mr = runner.model_runner
+    # FlashInfer's strict replay is single-rank only, as is the managed store here.
+    return (
+        uses_flashinfer_managed_autotune_cache()
+        and isinstance(runner.backend, FullCudaGraphBackend)
+        and runner.capture_forward_mode == ForwardMode.DECODE
+        and not runner.enable_torch_compile
+        and not runner.enable_two_batch_overlap
+        and not get_lora().enable_lora
+        and not mr.is_draft_worker
+        and should_run_flashinfer_autotune(mr)
+    )
+
+
+@contextlib.contextmanager
+def flashinfer_capture_replay(
+    runner: DecodeCudaGraphRunner,
+    forward_fn: Callable[[], object],
+    post_warmup_hook: Optional[Callable[[], None]],
+):
+    """Tune what one decode shape looks up, then capture it under strict replay."""
+    if not uses_flashinfer_capture_replay(runner):
+        yield
+        return
+    from flashinfer import autotune_v2
+
+    # The process's own store, selected for these contexts only.
+    store = dict(
+        cache_root=flashinfer_managed_autotune_cache_root(),
+        cache_scope="context",
+        skip_ops=get_flashinfer_autotune_skip_ops(),
+    )
+    try:
+        # Profiles startup tuning never looked up are tuned and published here.
+        with autotune_v2(mode="tune", **store):
+            forward_fn()
+    finally:
+        if post_warmup_hook is not None:
+            post_warmup_hook()
+    # A lookup the fill did not make raises instead of capturing the default.
+    with autotune_v2(mode="replay", strict_replay=True, **store):
+        yield
 
 
 def _autotune_tactic_sync_group(
