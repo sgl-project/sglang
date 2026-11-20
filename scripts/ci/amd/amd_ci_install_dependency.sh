@@ -473,11 +473,13 @@ if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SK
                     NEED_REBUILD="false"
                 else
                     echo "[CI-AITER-CHECK] Cache install failed; rebuilding"
-                    docker exec "$CI_CONTAINER_NAME" rm -rf "$AITER_CACHE_ROOT/$AITER_CACHE_KEY"
+                    docker exec "$CI_CONTAINER_NAME" rm -rf "$AITER_CACHE_ROOT/$AITER_CACHE_KEY" \
+                        || { echo "[CI-AITER-CHECK] Cannot evict cache entry; rebuilding without cache"; AITER_CACHE_KEY=""; }
                 fi
             else
                 echo "[CI-AITER-CHECK] Cache miss: $AITER_CACHE_KEY"
-                docker exec "$CI_CONTAINER_NAME" rm -rf "$AITER_CACHE_ROOT/$AITER_CACHE_KEY"
+                docker exec "$CI_CONTAINER_NAME" rm -rf "$AITER_CACHE_ROOT/$AITER_CACHE_KEY" \
+                        || { echo "[CI-AITER-CHECK] Cannot evict cache entry; rebuilding without cache"; AITER_CACHE_KEY=""; }
             fi
         else
             echo "[CI-AITER-CHECK] Cache mount or lock unavailable; rebuilding without cache"
