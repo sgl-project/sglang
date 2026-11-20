@@ -59,7 +59,7 @@ pub struct ResponsesStream {
     calls: Vec<Call>,
     /// Emitted after the calls so it cannot split one.
     held: Vec<(Held, String)>,
-    /// The last delta went to `held`, not a call: a cut-off ends it.
+    /// The last non-blank delta went to `held`, not a call: a cut-off ends it.
     last_held: bool,
     next_index: usize,
     /// Finished items with their `output_index`.
@@ -159,7 +159,11 @@ impl ResponsesStream {
             Some((k, text)) if *k == kind => text.push_str(delta),
             _ => self.held.push((kind, delta.to_owned())),
         }
-        self.last_held = true;
+        // Blank text after a call (a parser's newline) is dropped on flush,
+        // so it does not make the held text the item generated last.
+        if !delta.trim().is_empty() {
+            self.last_held = true;
+        }
         true
     }
 
@@ -451,9 +455,7 @@ impl ResponsesStream {
         let finish = Finish::from_chat(Some(&reason));
         self.close_open(finish, out);
         // Only the item generated last can have been cut off.
-        let cut_is_held =
-            self.last_held && self.held.last().is_some_and(|(_, t)| !t.trim().is_empty());
-        let (calls_finish, held_finish) = if cut_is_held {
+        let (calls_finish, held_finish) = if self.last_held {
             (Finish::Completed, finish)
         } else {
             (finish, Finish::Completed)
@@ -1038,5 +1040,14 @@ mod tests {
             chunk(indexed(0, None, "1}"), Some("length")),
         ]);
         assert_eq!(statuses(&evs), ["completed", "incomplete"]);
+        // Blank text after the newest call merges into the earlier held text;
+        // the call is still the item generated last.
+        let evs = run(&[
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content": "between"}), None),
+            chunk(indexed(1, Some("g"), r#"{"y":"#), None),
+            chunk(json!({"content": "\n"}), Some("length")),
+        ]);
+        assert_eq!(statuses(&evs), ["completed", "incomplete", "completed"]);
     }
 }
