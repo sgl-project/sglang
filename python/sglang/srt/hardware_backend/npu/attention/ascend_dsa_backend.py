@@ -355,7 +355,9 @@ def _quantize_pooled_indexer_query_int8(
     from sgl_kernel_npu.operators.activation import dynamic_quant
 
     rotated = query @ hadamard
-    quantized, scale = dynamic_quant(rotated, dst_type=torch.int8)
+    quantized, scale = dynamic_quant(rotated.reshape(-1, 128), dst_type=torch.int8)
+    quantized = quantized.reshape(query.shape)
+    scale = scale.reshape(query.shape[:-1])
     # The padded all-0 rows get a scale of 0, replaced with 1
     scale = torch.where(scale > 0, scale, torch.ones_like(scale))
     return quantized, scale.to(torch.float16)
@@ -373,9 +375,12 @@ def _quantize_pooled_indexer_query_mxfp8(
     from sgl_kernel_npu.operators.activation import dynamic_mx_quant
 
     D = query.shape[-1]
-    quantized, scale = dynamic_mx_quant(query, dst_type=torch.float8_e4m3fn)
-    scale = scale.reshape(query.shape[:-1] + (D // 64, 2))  # E8M0
-    return quantized, scale
+    quantized, scale = dynamic_mx_quant(
+        query.reshape(-1, D), dst_type=torch.float8_e4m3fn, axis=-1
+    )
+    return quantized.view(query.shape), scale.reshape(
+        query.shape[:-1] + (D // 64, 2)
+    ).view(torch.float8_e8m0fnu)
 
 
 def _index_k_scale_cache(pool, layer_id: int):
