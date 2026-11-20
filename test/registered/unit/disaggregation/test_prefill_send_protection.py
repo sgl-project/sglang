@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -72,6 +72,21 @@ class _Sender:
         pages = np.asarray(page_indices).reshape(-1).tolist()
         self.in_flight.update(pages)
         self.sends.append(pages)
+
+
+class _WaitingSender(_Sender):
+    """Records the forward-wait event each send hands to the transfer worker."""
+
+    _early_send_wait_event = None
+
+    def __init__(self):
+        super().__init__()
+        self.waits = []
+
+    def send(self, page_indices, state_indices=None, num_kv_tokens=None):
+        super().send(page_indices, state_indices, num_kv_tokens)
+        self.waits.append(self._early_send_wait_event)
+        self._early_send_wait_event = None
 
 
 def _scheduler(cache, allocator, pool):
@@ -336,6 +351,43 @@ class TestPrefillSendProtection(CustomTestCase):
                 self.assertEqual(req.start_send_idx, expected)
                 pages = [p for send in sender.sends for p in send]
                 self.assertEqual(pages, list(range(start // 4, (expected + 3) // 4)))
+
+    def test_pp_intermediate_send_waits_for_enqueued_forwards(self):
+        # Under PP the scheduler may only have waited for the forward's shared
+        # reads, so an intermediate chunk's transfer must wait for its writes.
+        for pp_size, final, waits in [
+            (2, False, True),
+            (2, True, False),
+            (1, False, False),
+        ]:
+            with (
+                self.subTest(pp_size=pp_size, final=final),
+                get_context().override_server_args(
+                    page_size=4, chunked_prefill_size=8, pp_size=pp_size
+                ),
+            ):
+                req = Req("pp", None, array("q", range(31)), SamplingParams())
+                req.kv.req_pool_idx = 0
+                req.extend_end = 24
+                req.disagg_kv_sender = sender = _WaitingSender()
+                scheduler = _scheduler(
+                    SimpleNamespace(supports_prefix_sharing=lambda: False),
+                    SimpleNamespace(
+                        page_size=4,
+                        translate_kv_indices_for_transfer=lambda x: x,
+                        storage=SimpleNamespace(
+                            record_network_transfer=lambda *args, **kwargs: None
+                        ),
+                    ),
+                    SimpleNamespace(req_to_token=torch.arange(32).reshape(1, -1)),
+                )
+                scheduler.forward_stream = forward_stream = object()
+                event = Mock()
+                scheduler.device_module = SimpleNamespace(Event=lambda: event)
+                scheduler.send_kv_chunk(req, last_chunk=final)
+                self.assertEqual(sender.waits, [event if waits else None])
+                if waits:
+                    event.record.assert_called_once_with(forward_stream)
 
 
 if __name__ == "__main__":

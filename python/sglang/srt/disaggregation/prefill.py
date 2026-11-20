@@ -1745,10 +1745,15 @@ class SchedulerDisaggregationPrefillMixin:
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
         if self.enable_overlap:
-            ev = self.device_module.Event()
-            ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+            self._wait_enqueued_forwards_before_send(req.disagg_kv_sender)
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def _wait_enqueued_forwards_before_send(self: Scheduler, sender) -> None:
+        """Make the transfer worker wait for every forward enqueued so far before
+        it reads the source KV of the sender's next send."""
+        ev = self.device_module.Event()
+        ev.record(self.forward_stream)
+        sender._early_send_wait_event = ev
 
     def send_kv_chunk(
         self,
@@ -1817,6 +1822,11 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         sender = req.disagg_kv_sender
+        if not last_chunk and get_parallel().pp_size > 1:
+            # Under PP the schedule stream may wait only for the launched
+            # forward's shared reads (read-done), not for its KV writes, so the
+            # forward that computes this chunk can still be writing it.
+            self._wait_enqueued_forwards_before_send(sender)
         # The schedule stream may wait on the in-flight forward. A sender that takes
         # host-tensor indices waits on their copy's event itself. CP and shard
         # filtering read the indices on the scheduler before that wait, so those
