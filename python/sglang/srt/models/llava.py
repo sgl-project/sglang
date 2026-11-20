@@ -655,6 +655,11 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     """
 
     MULTIMODAL_PROJECTOR_TYPE = LlavaMultiModalProjector
+    # The language model's fused projections (Llama, Mistral, Qwen2, ...)
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     @property
     def dtype(self):
