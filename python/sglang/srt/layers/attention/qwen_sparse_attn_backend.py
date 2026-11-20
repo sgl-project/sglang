@@ -1378,17 +1378,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
             return
         state = self._mtp_shared_sparse_indices
-        row_to_req = metadata.get_token_to_batch_idx().long()
-        row_req_pool_indices = metadata.req_pool_indices[
-            row_to_req[: topk_indices.shape[0]]
-        ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
-        req_rows = row_req_pool_indices[anchor_rows]
+        num_rows = topk_indices.shape[0]
+        row_to_req = metadata.get_token_to_batch_idx()[:num_rows].long()
+        # Each request's last row by scatter-max: nonzero() would read its size back
+        # (a stream sync); requests with no rows write the trash row.
+        last_row = torch.full_like(metadata.req_pool_indices, -1, dtype=torch.long)
+        rows = torch.arange(row_to_req.numel(), device=row_to_req.device)
+        last_row.scatter_reduce_(0, row_to_req, rows, "amax")
+        anchor_rows = last_row.clamp(min=0)
+        req_rows = torch.where(
+            last_row >= 0, metadata.req_pool_indices.long(), state.trash_row
+        )
         captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
-        state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
+        state.capture(
+            topk_indices.index_select(0, anchor_rows), req_rows, captured_lens, layer_id
+        )
 
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:

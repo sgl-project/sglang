@@ -1177,6 +1177,48 @@ def test_qsa_extend_rows_take_the_host_lens_without_a_sync():
     assert torch.equal(short, want)
 
 
+def test_qsa_mtp_extend_capture_seeds_last_rows_without_a_sync():
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QSAMTPSharedSparseIndices,
+        QwenSparseAttnBackend,
+        _extend_token_to_batch_idx,
+    )
+
+    lens, pool_ids, layer_id = [4, 0, 7, 1], [5, 2, 9, 3], 3
+    rows = sum(lens)
+    topk = torch.arange(rows * 6, dtype=torch.int32, device="cuda").view(rows, 6)
+    seqlens = torch.arange(100, 100 + rows, dtype=torch.int32, device="cuda")
+    row_map = _extend_token_to_batch_idx(
+        torch.tensor(lens, device="cuda"), lens, len(lens), "cuda"
+    )
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        req_pool_indices=torch.tensor(pool_ids, device="cuda"),
+        get_token_to_batch_idx=lambda: row_map,
+        get_seqlens_expanded=lambda: seqlens,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_draft_extend_v2=lambda: False)
+    )
+    state = QSAMTPSharedSparseIndices(
+        layer_ids=[layer_id], num_requests=16, token_topk=6, tail_width=2, device="cuda"
+    )
+    backend = SimpleNamespace(_mtp_shared_sparse_indices=state)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        QwenSparseAttnBackend.capture_mtp_sparse_indices(
+            backend, topk, forward_batch, layer_id, metadata=metadata
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    # Each request with rows is seeded from its last row; the empty one is untouched.
+    for pool_id, last in ((5, 3), (9, 10), (3, 11)):
+        assert torch.equal(state.indices[0, pool_id, :6], topk[last])
+        assert state.captured_len[0, pool_id].item() == 100 + last
+    assert state.indices[0, 2].eq(0).all() and state.captured_len[0, 2].item() == 1
+
+
 def test_qsa_row_ranges_do_not_cross_sequences():
     sequence_lengths = torch.tensor([10, 7], dtype=torch.int32)
     query_positions = torch.tensor([8, 9, 4, 6], dtype=torch.int32)
