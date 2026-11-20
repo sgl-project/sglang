@@ -90,6 +90,8 @@ def test_attention_tp_scale_requires_moe_dense_tp_one():
         enable_eplb=False,
         pp_size=1,
         mooncake_ib_device=None,
+        enable_symm_mem=False,
+        elastic_ep_reuse_cuda_graph=False,
         ep_join_mode=None,
         ep_join_rank_offset=0,
         max_ep_size=8,
