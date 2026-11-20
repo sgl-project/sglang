@@ -383,6 +383,52 @@ async fn pump_applies_block_stored_to_tree() {
     assert!(m.holds(&id), "tree must hold the worker");
 }
 
+/// Regression: hybrid-SSM (Mamba/KDA) workers under EAGLE/MTP report an
+/// EAGLE-family `speculative_algorithm` but publish unigram blocks. Queries
+/// must hash in the published mode, or no request ever matches the rank that
+/// holds its prefix and cache-aware routing degrades to least-load.
+#[tokio::test]
+async fn pump_learns_unigram_hashing_from_events_despite_eagle_guess() {
+    use crate::state::kv_events::{CacheNamespace, RadixTreePrefixProvider};
+
+    let id = worker_id("http://w1", 3);
+    let h = spawn_pump(std::slice::from_ref(&id));
+    let (tree, tx, pump, oracle) = (h.tree, h.tx, h.pump, h.block_size_oracle);
+    // What discovery sets for a worker whose /server_info says EAGLE.
+    oracle.try_set(4).unwrap();
+    oracle.set_bigram(true);
+
+    let tokens: Vec<u32> = (100..112).collect();
+    let stored = CacheNamespace::NONE.block_hashes(&tokens, 4, false);
+    assert_ne!(CacheNamespace::NONE.block_hashes(&tokens, 4, true), stored);
+    tx.send(WorkerEvent::Batch {
+        worker: id.clone(),
+        seq: 1,
+        batch: batch(vec![KvCacheEvent::BlockStored(BlockStored {
+            parent_block_hash: None,
+            block_hashes: stored,
+            token_ids: tokens.clone(),
+            block_size: 4,
+            lora_id: None,
+            lora_name: None,
+            cache_salt: None,
+            is_bigram: false,
+            medium: None,
+        })]),
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    pump.await.unwrap();
+
+    assert!(!oracle.is_bigram(), "the published unigram mode must win");
+    let provider = RadixTreePrefixProvider::new(tree, oracle);
+    assert_eq!(
+        provider.rank_depths(&tokens, CacheNamespace::NONE, "http://w1"),
+        vec![(3, 3)]
+    );
+}
+
 /// The pump must carry each event's `medium` into the tree. The engine's
 /// write-back sequence for a backed-up block is a host-tagged store
 /// followed by a device-tagged removal; applied tier-blind, the removal

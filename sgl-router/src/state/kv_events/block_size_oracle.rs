@@ -21,7 +21,7 @@
 //! through `KvEventIndex::add_worker`; that refactor can land later
 //! without changing the oracle's public surface.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use super::CacheNamespace;
@@ -45,10 +45,22 @@ const BIGRAM_BIGRAM: u8 = 2;
 /// established first-wins with a loud warning on disagreement, mirroring
 /// `try_set` — a heterogeneous EAGLE/non-EAGLE cluster would otherwise let the
 /// last registrant silently flip the global hashing mode.
+///
+/// The bigram flag has two sources. [`Self::set_bigram`] records a *guess*
+/// from the worker's `/server_info` `speculative_algorithm`;
+/// [`Self::observe_bigram`] records the mode the worker's `BlockStored`
+/// events actually use, which wins. The guess can be wrong: the engine turns
+/// bigram keys off for hybrid-SSM models (Mamba/KDA layers) even under
+/// EAGLE/MTP, so a guessed-bigram query would never match their unigram
+/// hashes.
 #[derive(Debug, Default)]
 pub struct BlockSizeOracle {
     value: AtomicU32,
     bigram: AtomicU8,
+    observed_bigram: AtomicU8,
+    /// `observe_bigram` runs once per event batch, so a conflicting worker would
+    /// otherwise repeat its warning on every batch.
+    observed_conflict_warned: AtomicBool,
 }
 
 /// Returned by [`BlockSizeOracle::try_set`] when the candidate disagrees
@@ -108,11 +120,64 @@ impl BlockSizeOracle {
         }
     }
 
+    /// Record the hashing mode a worker's published `BlockStored` events
+    /// actually use. It overrides the [`Self::set_bigram`] guess. First-wins
+    /// across workers, like the guess, with a warning on disagreement.
+    pub fn observe_bigram(&self, is_bigram: bool) {
+        let candidate = if is_bigram {
+            BIGRAM_BIGRAM
+        } else {
+            BIGRAM_UNIGRAM
+        };
+        match self.observed_bigram.compare_exchange(
+            BIGRAM_UNKNOWN,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                let guess = self.bigram.load(Ordering::Relaxed);
+                if guess != BIGRAM_UNKNOWN && guess != candidate {
+                    tracing::info!(
+                        guessed_bigram = guess == BIGRAM_BIGRAM,
+                        observed_bigram = is_bigram,
+                        "kv-events: published BlockStored events use a different hashing \
+                         mode than speculative_algorithm implied; using the observed mode \
+                         (expected for hybrid-SSM models under EAGLE/MTP)",
+                    );
+                }
+            }
+            Err(existing) if existing == candidate => {}
+            Err(existing) => {
+                if !self.observed_conflict_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        established_bigram = existing == BIGRAM_BIGRAM,
+                        worker_bigram = is_bigram,
+                        "kv-events: a worker publishes BlockStored events in a different \
+                         hashing mode (bigram/unigram) than the established cluster value; \
+                         keeping the first. Cache-aware routing will never match for the \
+                         minority workers. (Logged once.)",
+                    );
+                }
+            }
+        }
+    }
+
+    /// The effective mode: observed if any worker's events have reported one,
+    /// otherwise the guess.
+    fn bigram_mode(&self) -> u8 {
+        match self.observed_bigram.load(Ordering::Relaxed) {
+            BIGRAM_UNKNOWN => self.bigram.load(Ordering::Relaxed),
+            observed => observed,
+        }
+    }
+
     /// Whether query hashing should use the bigram variant
     /// ([`super::hash::compute_block_hashes_bigram`]). Defaults to `false`
-    /// until a worker reports an EAGLE-family `speculative_algorithm`.
+    /// until a worker reports an EAGLE-family `speculative_algorithm` or
+    /// publishes bigram `BlockStored` events.
     pub fn is_bigram(&self) -> bool {
-        self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
+        self.bigram_mode() == BIGRAM_BIGRAM
     }
 
     /// The prompt's block hashes as workers publish them; `None` until the
@@ -128,7 +193,7 @@ impl BlockSizeOracle {
     /// bigram fleet as unigram.
     pub fn hash_config(&self) -> Option<(u32, bool)> {
         let size = self.get()?;
-        match self.bigram.load(Ordering::Relaxed) {
+        match self.bigram_mode() {
             BIGRAM_UNKNOWN => None,
             mode => Some((size, mode == BIGRAM_BIGRAM)),
         }
@@ -231,6 +296,36 @@ mod tests {
             oracle.is_bigram(),
             "a disagreeing worker must not flip the established mode"
         );
+    }
+
+    /// Hybrid-SSM workers report an EAGLE-family algorithm but publish unigram
+    /// blocks; the published mode must win, or no query ever matches.
+    #[test]
+    fn observed_mode_overrides_the_guess() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(128).unwrap();
+        oracle.set_bigram(true);
+        assert_eq!(oracle.hash_config(), Some((128, true)));
+        oracle.observe_bigram(false);
+        assert!(!oracle.is_bigram());
+        assert_eq!(oracle.hash_config(), Some((128, false)));
+        // A later guess cannot undo an observation.
+        oracle.set_bigram(true);
+        assert!(!oracle.is_bigram());
+    }
+
+    #[test]
+    fn observed_mode_alone_completes_hash_config_and_is_first_wins() {
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(64).unwrap();
+        assert_eq!(oracle.hash_config(), None);
+        oracle.observe_bigram(true);
+        assert_eq!(oracle.hash_config(), Some((64, true)));
+        assert!(!oracle.observed_conflict_warned.load(Ordering::Relaxed));
+        oracle.observe_bigram(false); // conflicting worker; first wins
+        oracle.observe_bigram(false); // repeats each batch; warned only once
+        assert!(oracle.is_bigram());
+        assert!(oracle.observed_conflict_warned.load(Ordering::Relaxed));
     }
 
     #[test]

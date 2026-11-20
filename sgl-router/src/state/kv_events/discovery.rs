@@ -207,6 +207,11 @@ struct ServerInfoResponse {
 /// blocks over token bigrams. Recognizes the engine's `is_eagle()` set
 /// (`EAGLE`, `EAGLE3`, `FROZEN_KV_MTP`, case-insensitive).
 ///
+/// This is only the initial guess. Hybrid-SSM models (Mamba/KDA layers) keep
+/// unigram keys even under EAGLE/MTP, so the index overrides it with the mode
+/// observed in the worker's `BlockStored` events
+/// ([`super::BlockSizeOracle::observe_bigram`]).
+///
 /// An *unrecognized* value that looks EAGLE-family (contains `EAGLE` or `MTP`)
 /// is logged loudly and treated as non-bigram — it most likely means a new
 /// EAGLE variant the router doesn't know yet, which would otherwise silently

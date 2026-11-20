@@ -72,6 +72,8 @@ pub struct BlockStored {
     pub lora_id: Option<i64>,
     pub lora_name: Option<String>,
     pub cache_salt: Option<String>,
+    /// Whether `token_ids` arrived as `[t_i, t_{i+1}]` pairs, i.e. the worker's
+    /// block-hash mode; the index uses it to pick the query hasher.
     pub is_bigram: bool,
     /// Storage tier (`"GPU"`, `"CPU_PINNED"`, `"DISK"`, `"EXTERNAL"`).
     /// Optional in the Python schema (`= None` default), so it may be
@@ -748,6 +750,7 @@ mod tests {
                 assert_eq!(b.parent_block_hash, None);
                 assert_eq!(b.block_size, 2);
                 assert_eq!(b.token_ids, vec![10, 20, 20, 30]);
+                assert!(b.is_bigram);
             }
             other => panic!("expected BlockStored, got {other:?}"),
         }
@@ -774,6 +777,7 @@ mod tests {
                 assert_eq!(b.block_hashes, vec![1234567890123_i64, -987654321_i64]);
                 assert_eq!(b.parent_block_hash, Some(42));
                 assert_eq!(b.token_ids, vec![10, 20, 30, 40]);
+                assert!(!b.is_bigram);
                 assert_eq!(b.block_size, 4);
                 assert_eq!(b.lora_id, Some(7));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));

@@ -38,6 +38,8 @@ pub(super) struct PumpHarness {
     pub(super) ctrl_tx: mpsc::Sender<PumpControl>,
     /// Obligations the pump handed back, e.g. a gap-driven retry.
     pub(super) bootstrap_rx: mpsc::Receiver<ObligationBatch>,
+    /// The pump feeds it each batch's observed block-hash mode.
+    pub(super) block_size_oracle: Arc<BlockSizeOracle>,
 }
 
 /// Build a tree + cursors + live-set wired through `pump_loop` with
@@ -64,6 +66,7 @@ pub(super) fn spawn_pump_with_bootstrap(
     // Real queue so a gap-driven re-queue is observable rather than dropped.
     let (bootstrap_tx, bootstrap_rx) = mpsc::channel(16);
     let tally = Arc::new(EventTally::new());
+    let block_size_oracle = BlockSizeOracle::new();
     let pump = tokio::spawn(pump_loop(
         PumpDeps {
             tally: Arc::clone(&tally),
@@ -78,6 +81,7 @@ pub(super) fn spawn_pump_with_bootstrap(
             peers: Arc::new(PeerRegistry::new()),
             snapshot_http: reqwest::Client::new(),
             bootstrap_tx: bootstrap_tx.clone(),
+            block_size_oracle: Arc::clone(&block_size_oracle),
             ctrl_tx: ctrl_tx.downgrade(),
         },
         cancel.clone(),
@@ -95,6 +99,7 @@ pub(super) fn spawn_pump_with_bootstrap(
         pump,
         ctrl_tx,
         bootstrap_rx,
+        block_size_oracle,
     }
 }
 
