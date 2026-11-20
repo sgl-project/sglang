@@ -450,10 +450,8 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
 
 class TestMlaDcpDecodeRoute(CustomTestCase):
-    """The asm DCP decode casts the gathered query to fp8 and passes the KV cache's
-    fp8 scale. Over a bf16 cache there is no scale, aiter rejected the call ("fp8 Q
-    requires q_scale and kv_scale"), and a DCP server with the default KV dtype
-    failed at startup. Such caches decode on Gluon."""
+    """The asm DCP decode needs the fp8 KV cache's scale; any other KV dtype must
+    route DCP decode to Gluon, not asm."""
 
     def _selected(self, **overrides):
         from sglang.srt.layers.attention.aiter_backend import _mla_dcp_asm_selected
@@ -489,10 +487,8 @@ def _mla_gluon_with_lse(q_nope, q_pe, kv_c, o, *args, return_lse=False, **kwargs
 
 
 class TestMlaGluonDcpUnsupportedReason(CustomTestCase):
-    """mla_gluon asserts gfx950, head dims 512 and 64, and in its bh16 regimes (<= 96
-    heads, not 64) a bf16 query over a bf16 or e4m3fn cache; its bh64 regime (64, 128
-    heads) needs batch % 64. DCP also needs it to return the lse. A DCP route to Gluon
-    outside these must fail at startup, not at decode."""
+    """Every shape outside mla_gluon's asserts (or without return_lse) must yield a reason,
+    so a DCP route to Gluon fails at startup, not at decode."""
 
     def _reason(self, *, gluon_fn=_mla_gluon_with_lse, gfx950=True, **overrides):
         kwargs = dict(
@@ -563,10 +559,8 @@ _BACKEND = "sglang.srt.layers.attention.aiter_backend"
 
 
 class TestMlaDcpGluonStartupCheck(CustomTestCase):
-    """A DCP server over a non-fp8 KV cache asked for the asm decode, which cannot read
-    it, and crashed at the first decode. It now decodes on Gluon, and building the
-    backend fails where Gluon cannot run it either. Other routes to Gluon (an fp8
-    cache whose verify the asm cp kernel does not cover) keep starting as before."""
+    """DCP over a non-fp8 KV cache must fail at backend build when Gluon cannot run it;
+    fp8-cache routes to Gluon (e.g. a Gluon verify) must still start."""
 
     def _build(self, *, kv_cache_dtype, verify_backend="asm", dcp_size=8):
         # Kimi K3 at TP8 DCP8 (96 gathered heads, 4 draft tokens), on a Gluon that
