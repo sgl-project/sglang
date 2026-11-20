@@ -2514,6 +2514,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_token_logprobs=output.input_token_logprobs,
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,
+            input_top_logprobs_weights=output.input_top_logprobs_weights,
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
             input_logprobs_copy_done=output.input_logprobs_copy_done,
