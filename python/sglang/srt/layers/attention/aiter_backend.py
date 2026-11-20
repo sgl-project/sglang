@@ -246,7 +246,6 @@ def _mla_dcp_asm_selected(
     decode_backend: str,
     kv_cache_dtype: torch.dtype,
 ) -> bool:
-    """Whether DCP decode runs on aiter's asm MLA kernel."""
     # The kernel is a8w8: it reads the KV cache with its fp8 scale; any other cache decodes on Gluon.
     return (
         use_mla
@@ -1342,7 +1341,6 @@ class AiterAttnBackend(AttentionBackend):
     def _check_mla_dcp_gluon(
         self, *, gathered_num_head: int, kv_lora_rank: int, qk_rope_head_dim: int
     ) -> None:
-        """Fail at startup if a DCP decode moved off asm by its KV dtype cannot run on Gluon."""
         # Only this route; other routes to Gluon are left to mla_gluon's own asserts.
         reason = mla_gluon_dcp_unsupported_reason(
             gathered_num_head=gathered_num_head,

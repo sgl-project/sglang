@@ -516,7 +516,7 @@ def _hip_arch(gcn_arch_name):
 
 
 def _mla_gluon_with_lse(q_nope, q_pe, kv_c, o, *args, return_lse=False, **kwargs):
-    """An aiter mla_gluon that can return the lse."""
+    pass
 
 
 class TestMlaGluonDcpUnsupportedReason(CustomTestCase):
