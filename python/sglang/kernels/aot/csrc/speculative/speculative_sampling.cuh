@@ -39,7 +39,6 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
     DType* uniform_samples,
     DType* uniform_samples_for_final_sampling,
     DType* target_probs,
-    DType* draft_probs,
     uint32_t batch_size,
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
@@ -51,7 +50,10 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
-  const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+  // Sampling scratch, then one slot per draft token for the ids the kernel rejects
+  // at the last accepted node.
+  const uint32_t smem_size =
+      sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>) + num_draft_tokens * sizeof(IdType);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
@@ -66,7 +68,6 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
       &uniform_samples,
       &uniform_samples_for_final_sampling,
       &target_probs,
-      &draft_probs,
       &batch_size,
       &num_speculative_tokens,
       &num_draft_tokens,

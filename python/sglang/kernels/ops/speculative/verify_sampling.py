@@ -3,17 +3,44 @@
 A name is ``None`` where the platform has no kernel for it.
 """
 
+import torch
+
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_musa, is_npu
+
+
+def _with_zero_draft_probs(kernel):
+    """Adapt a kernel that still takes ``draft_probs`` to the CUDA/MUSA signature.
+
+    The CUDA and MUSA kernels mask the tokens rejected at the last accepted node
+    themselves. The NPU kernel and the ROCm Triton port still take a zeroed
+    ``draft_probs`` scratch buffer, so it is allocated here for those kernels only.
+    """
+
+    def tree_speculative_sampling_target_only(*, target_probs, **kwargs):
+        kernel(
+            target_probs=target_probs,
+            draft_probs=torch.zeros_like(target_probs),
+            **kwargs,
+        )
+
+    return tree_speculative_sampling_target_only
+
 
 if is_npu():
     try:
         from sgl_kernel_npu.sample import (
             chain_speculative_sampling_triton,
-            tree_speculative_sampling_target_only,
+        )
+        from sgl_kernel_npu.sample import (
+            tree_speculative_sampling_target_only as _npu_tree_sampling,
         )
     except ImportError:
         chain_speculative_sampling_triton = None
         tree_speculative_sampling_target_only = None
+    else:
+        tree_speculative_sampling_target_only = _with_zero_draft_probs(
+            _npu_tree_sampling
+        )
 else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
@@ -24,12 +51,13 @@ else:
             tree_speculative_sampling_target_only,
         )
     elif is_hip() and is_gfx95_supported():
-        # Triton port of the CUDA kernel above, same operands and results.
+        # Triton port of the CUDA kernel above, with the same results. It still
+        # takes a draft_probs buffer, so it gets the zeroed one.
         from sglang.kernels.ops.speculative.target_only_sampling import (
             tree_speculative_sampling_target_only_triton,
         )
 
-        tree_speculative_sampling_target_only = (
+        tree_speculative_sampling_target_only = _with_zero_draft_probs(
             tree_speculative_sampling_target_only_triton
         )
     elif is_musa():

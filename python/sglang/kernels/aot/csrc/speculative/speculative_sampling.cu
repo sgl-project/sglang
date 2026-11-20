@@ -39,7 +39,6 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples,
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
-    at::Tensor draft_probs,
     double threshold_single,
     double threshold_acc,
     bool deterministic = true) {
@@ -67,7 +66,6 @@ void tree_speculative_sampling_target_only(
   CHECK_DIM(2, retrive_next_sibling);
   CHECK_DIM(2, uniform_samples);
   CHECK_DIM(3, target_probs);
-  CHECK_DIM(3, draft_probs);
   unsigned int batch_size = uniform_samples.size(0);
   unsigned int num_spec_step = accept_index.size(1);
   unsigned int num_draft_tokens = candidates.size(1);
@@ -115,9 +113,6 @@ void tree_speculative_sampling_target_only(
   if (target_probs.scalar_type() != at::kFloat) {
     throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
   }
-  if (draft_probs.scalar_type() != at::kFloat) {
-    throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
-  }
   CHECK_GE(threshold_single, 0);
   CHECK_GE(1, threshold_single);
   CHECK_GE(threshold_acc, 0);
@@ -135,7 +130,6 @@ void tree_speculative_sampling_target_only(
       static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<float*>(uniform_samples_for_final_sampling.data_ptr()),
       static_cast<float*>(target_probs.data_ptr()),
-      static_cast<float*>(draft_probs.data_ptr()),
       batch_size,
       num_spec_step,
       num_draft_tokens,
