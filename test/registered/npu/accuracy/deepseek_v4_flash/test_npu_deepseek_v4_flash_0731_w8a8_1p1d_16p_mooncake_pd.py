@@ -6,8 +6,6 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    assert_metrics,
-    run_bench_serving,
 )
 from sglang.test.ascend.test_ascend_utils import (
     append_ld_library_path,

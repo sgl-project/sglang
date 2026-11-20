@@ -12,7 +12,6 @@ from typing import Iterable, Optional, Union
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.server_fixtures.disaggregation_fixture import (
     SGL_ROUTER_REQUEST_TIMEOUT_SECS,
     find_sgl_router_binary,

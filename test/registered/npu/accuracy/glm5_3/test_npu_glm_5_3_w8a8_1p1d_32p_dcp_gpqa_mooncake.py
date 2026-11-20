@@ -148,16 +148,6 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--hicache-storage-backend",
     "mooncake",
     "--enable-cache-report",
-    # EPLB
-    "--enable-eplb",
-    "--expert-distribution-recorder-mode",
-    "stat",
-    "--ep-num-redundant-experts",
-    16,
-    "--eplb-rebalance-num-iterations",
-    100000,
-    "--expert-distribution-recorder-buffer-size",
-    50,
 ]
 
 GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
@@ -230,9 +220,10 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
     1000,
 ]
 
-# DCP variant with EPLB and L3 Mooncake store
+
+# DCP variant with L3 Mooncake store
 # 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4,
-# EPLB enabled on both P and D with GLM-5.3-w8a8
+# EPLB enabled on the decode side only (NPU EPLB requires PP=1)
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP and EPLB on gpqa_diamond"""

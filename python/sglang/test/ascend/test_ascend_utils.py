@@ -1004,7 +1004,7 @@ def start_memcache_meta_service(
 
 HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
 
-# Default port of the Mooncake master service. 
+# Default port of the Mooncake master service.
 MOONCAKE_MASTER_PORT = 50051
 
 
