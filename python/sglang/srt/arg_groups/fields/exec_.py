@@ -27,6 +27,7 @@ from sglang.srt.arg_groups.choices import (
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
+    WATERMARK_ALGORITHM_CHOICES,
     reject_removed_choice,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -88,13 +89,23 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_watermark: A[
         bool,
-        "Enable Aaronson-Gumbel text watermarking.",
+        "Enable text watermarking with the algorithm --watermark-algorithm selects.",
     ] = False
+    watermark_algorithm: A[
+        str,
+        Arg(
+            help="The text watermarking algorithm: gumbel (Aaronson-Gumbel) or "
+            "synthid (SynthID Text).",
+            choices=WATERMARK_ALGORITHM_CHOICES,
+        ),
+    ] = "gumbel"
     watermark_config: A[
         Optional[str],
         "Watermark settings as a JSON file path or an inline JSON object with "
-        "optional key, key_b, context_window, mixing_probability, max_probability, "
-        "default_enabled, and enforce_all fields.",
+        "optional default_enabled and enforce_all fields; gumbel reads key, key_b, "
+        "context_window, mixing_probability, and max_probability; synthid reads "
+        "keys, ngram_len, num_candidates, context_history_size, and "
+        "skip_first_ngram_calls.",
     ] = None
     watermark_key: A[
         Optional[str],
@@ -124,6 +135,26 @@ class ExecFeatures(msgspec.Struct):
         bool,
         Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
+    watermark_keys: A[
+        Optional[List[int]],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_ngram_len: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_num_candidates: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_history_size: A[
+        Optional[int],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_skip_first_ngram_calls: A[
+        Optional[bool],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
@@ -485,6 +516,12 @@ class ExecKernel(msgspec.Struct):
     enable_fp4_indexer: A[
         bool,
         "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
+    ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
+        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
+        "prefill kernel over the DCP-gathered keys in prefill.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],

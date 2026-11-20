@@ -21,7 +21,7 @@ from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.runtime_context import get_context, get_exec
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.redaction import (
     WATERMARK_CONTAINER_FIELD_NAMES,
     WATERMARK_SECRET_FIELD_NAMES,
     redact_watermark_secrets,
