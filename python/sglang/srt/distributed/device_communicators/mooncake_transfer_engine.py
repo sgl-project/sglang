@@ -359,6 +359,27 @@ def get_mooncake_transfer_engine() -> Optional[KVTransferEngine]:
     return _mooncake_transfer_engine
 
 
+def _hicache_mooncake_store_uses_rdma() -> bool:
+    """MooncakeStore reuses the shared engine only with protocol "rdma"; for any
+    other protocol it builds its own, so creating the shared one is wasted."""
+    try:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            load_mooncake_store_config,
+        )
+
+        extra_config = HybridCacheController.parse_storage_backend_extra_config(
+            get_memory().hicache_storage_backend_extra_config
+        )[0]
+        return load_mooncake_store_config(extra_config).protocol == "rdma"
+    except Exception as e:
+        # Keep the shared engine; the store reports a bad config when it starts.
+        logger.debug("Could not resolve the HiCache Mooncake protocol: %s", e)
+        return True
+
+
 def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
@@ -375,6 +396,7 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
             get_memory().enable_hierarchical_cache
             and get_memory().hicache_storage_backend == "mooncake"
             and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+            and _hicache_mooncake_store_uses_rdma()
         )
         or (
             get_disagg().encoder_only

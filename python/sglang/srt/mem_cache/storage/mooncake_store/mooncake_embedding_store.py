@@ -20,6 +20,14 @@ class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
         MooncakeDistributedStore = self._import_mooncake_store()
         self.store = MooncakeDistributedStore()
         self.config = self._load_config(storage_config)
+        if self.config.enable_egm_store_pool:
+            # The positional setup() below mounts an ordinary host segment, which
+            # NVLink peers on other nodes cannot read.
+            raise ValueError(
+                "enable_egm_store_pool is supported only by the HiCache Mooncake "
+                "store. Unset MOONCAKE_ENABLE_EGM_STORE_POOL (or the key in the "
+                "Mooncake config file) for the multimodal embedding cache."
+            )
         setup_kwargs = {}
         if self.config.tenant_id != DEFAULT_TENANT_ID:
             setup_kwargs["tenant_id"] = self.config.tenant_id
