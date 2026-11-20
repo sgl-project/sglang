@@ -1059,7 +1059,7 @@ class Inkling2MoE(nn.Module):
         if record_mode == "per_token" and parallel.moe_ep_size > 1:
             raise ValueError(
                 "Inkling2 under expert parallelism records expert counts with "
-                "--expert-distribution-recorder-mode stat, stat_approx or per_pass."
+                "--expert-distribution-recorder-mode stat or per_pass."
             )
         self.record_experts = record_mode is not None
         self.gate = Inkling2Gate(config, placement=placement)

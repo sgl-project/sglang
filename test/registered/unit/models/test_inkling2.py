@@ -553,7 +553,7 @@ def test_moe_layer_wires_placement_and_records_each_token_once(monkeypatch):
     real = (torch.arange(tokens) < 13).long()
     assert torch.equal(seen["replicated"], real) and torch.equal(seen["local"], real)
     mode[0] = "per_token"
-    with pytest.raises(ValueError, match="stat, stat_approx or per_pass"):
+    with pytest.raises(ValueError, match="stat or per_pass"):
         build(0)
 
 
