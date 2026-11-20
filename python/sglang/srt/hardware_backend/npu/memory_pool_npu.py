@@ -1240,9 +1240,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_kv_layer_ids(self):
+        layer_ids = list(range(self.start_layer, self.start_layer + self.layer_num))
+        if self.use_combined_kv_buffer:
+            return layer_ids
         return (
-            list(range(self.start_layer, self.start_layer + self.layer_num))
-            * (1 if self.use_combined_kv_buffer or self.dsa_kv_cache_store_fp8 else 2)
+            layer_ids * (1 if self.dsa_kv_cache_store_fp8 else 2)
             + self.get_state_layer_ids()
         )
 

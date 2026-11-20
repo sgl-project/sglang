@@ -291,7 +291,13 @@ def _static_storage(pool) -> StaticKVStorage:
 
 
 def _npu_mla_pool(
-    start_layer, layer_num, *, fp8=False, combined=False, indexer_layer_ids=()
+    start_layer,
+    layer_num,
+    *,
+    fp8=False,
+    combined=False,
+    indexer_layer_ids=(),
+    indexer_scale=False,
 ):
     # CPU tensors exercise the real registration methods without NPU allocation.
     pool = NPUMLATokenToKVPool.__new__(NPUMLATokenToKVPool)
@@ -311,7 +317,9 @@ def _npu_mla_pool(
     pool.v_buffer = buffers(layers, 1)
     pool.kv_buffer = buffers(layers, 2)
     pool.index_k_buffer = buffers(indexer_layer_ids, 3)
-    pool.index_k_scale_buffer = buffers(indexer_layer_ids, 4) if fp8 else None
+    pool.index_k_scale_buffer = (
+        buffers(indexer_layer_ids, 4) if fp8 or indexer_scale else None
+    )
     return pool
 
 
@@ -342,6 +350,20 @@ class TestNpuMlaLayerMetadata(CustomTestCase):
                 layers + index_layers * 2,
             ),
             ({"combined": True}, ("kv_buffer",), layers),
+            (
+                {"combined": True, "indexer_layer_ids": index_layers},
+                ("kv_buffer",),
+                layers,
+            ),
+            (
+                {
+                    "combined": True,
+                    "indexer_layer_ids": index_layers,
+                    "indexer_scale": True,
+                },
+                ("kv_buffer",),
+                layers,
+            ),
         ]
         for options, groups, expected_ids in cases:
             with self.subTest(options=options):
