@@ -1210,8 +1210,8 @@ class Envs:
     # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
     # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStr("auto")
-    # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
-    # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
+    # Deprecated: use --fp4-gemm-backend aiter|triton. Honored with a
+    # DeprecationWarning only while --fp4-gemm-backend is auto (see fp4_utils).
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra

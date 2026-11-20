@@ -2,11 +2,10 @@
 
 import logging
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -20,6 +19,7 @@ from sglang.srt.layers.quantization.dequantization import (
     dequantize_fp8,
     dequantize_nvfp4,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
@@ -38,11 +38,6 @@ _ASM_FP4_SCALE_COL_MULTIPLE = 8
 # N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
 # TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
 _ASM_FP4_UNSAFE_MAX_N = 128
-
-# Keep this path opt-in while the AITER ASM integration is validated across the
-# Quark model matrix. Unlike the Triton fallback, it consumes AITER's
-# a4w4_blockscale_tuned_gemm CSVs.
-_use_aiter_asm_fp4_gemm = _is_hip and envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.get()
 
 
 def _asm_fp4_scale_swizzle_supported(weight_scale: torch.Tensor) -> bool:
@@ -90,18 +85,9 @@ def _shuffle_asm_fp4_act_scale(x_scales: torch.Tensor) -> torch.Tensor:
 
 
 def _asm_fp4_prequantized_input(
-    x: tuple[torch.Tensor, ...],
+    x_q: torch.Tensor, x_scales: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Adapt an already-quantized ``(x_fp4, x_scales)`` activation for gemm_a4w4."""
-    # The 3- and 5-tuples request Triton-only fused epilogues (atomic pre-quant,
-    # split + cat); weights are already preshuffled, so there is no fallback.
-    if len(x) != 2:
-        raise NotImplementedError(
-            "AITER ASM FP4 GEMM only supports the (x_fp4, x_scales) tuple input; "
-            f"got a {len(x)}-tuple. Disable SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM "
-            "for models that use this projection."
-        )
-    x_q, x_scales = x
     # Only B is preshuffled (bpreshuffle=True), so the packed FP4 activation is
     # consumed as-is. The scales come from the Triton fused-quant kernels in
     # row-major (M, K/32) order, which gemm_a4w4 cannot read directly.
@@ -394,6 +380,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+        # AITER's gemm_a4w4 (with the a4w4_blockscale_tuned_gemm CSVs) is opt-in
+        # via --fp4-gemm-backend aiter; auto keeps the Triton GEMM on ROCm.
+        self.use_aiter_fp4_gemm = _is_hip and get_fp4_gemm_runner_backend().is_aiter()
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
@@ -423,7 +412,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return
 
         layer.use_aiter_asm_fp4_gemm = False
-        if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
+        if not self.use_aiter_fp4_gemm:
             return
 
         if not _asm_fp4_scale_swizzle_supported(layer.weight_scale.data):
@@ -875,26 +864,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return torch.nn.functional.linear(x, layer.weight, bias)
 
         if getattr(layer, "use_aiter_asm_fp4_gemm", False):
-            output_shape = None
-            if isinstance(x, tuple):
-                x_q, x_scales = _asm_fp4_prequantized_input(x)
-            else:
-                if x.dim() == 3:
-                    output_shape = [*x.shape[:-1], layer.weight.shape[0]]
-                    x = x.view(-1, x.shape[-1])
-                x_q, x_scales = per_1x32_f4_quant(x)
-
-            output_dtype_ref = torch.empty(0, dtype=self.out_dtype, device=x_q.device)
-            y = gemm_a4w4(
-                x_q,
-                layer.weight,
-                x_scales,
-                layer.weight_scale,
-                output_dtype_ref,
-            )
-            if bias is not None:
-                y = y + bias
-            return y.view(*output_shape) if output_shape is not None else y
+            return self._apply_aiter_asm_fp4_gemm(layer, x, bias)
 
         # Bias will be added after the GEMM if provided
         three_d = False
@@ -971,6 +941,57 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return y.view(*output_shape)
         else:
             return y
+
+    def _apply_aiter_asm_fp4_gemm(
+        self,
+        layer: torch.nn.Module,
+        x: Union[torch.Tensor, tuple],
+        bias: Optional[torch.Tensor],
+    ):
+        # gemm_a4w4 has no fused epilogues, so it takes every tuple input that
+        # the Triton path accepts and runs the epilogue unfused: the 3-tuple's
+        # preallocated output buffer is not needed, and the 5-tuple's split + cat
+        # runs after the GEMM. This keeps the backend choice independent of the
+        # model code that calls the layer.
+        x_scales = None
+        split_cat = None
+        if isinstance(x, tuple):
+            if len(x) == 5:
+                x, k_pe, s1, s2, _ = x
+                split_cat = (k_pe, s1, s2)
+            elif len(x) == 3:
+                x, x_scales, _ = x
+            else:
+                x, x_scales = x
+
+        output_shape = None
+        if x_scales is not None:
+            x_q, x_scales = _asm_fp4_prequantized_input(x, x_scales)
+        else:
+            if x.dim() == 3:
+                output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+                x = x.view(-1, x.shape[-1])
+            x_q, x_scales = per_1x32_f4_quant(x)
+
+        output_dtype_ref = torch.empty(0, dtype=self.out_dtype, device=x_q.device)
+        y = gemm_a4w4(
+            x_q,
+            layer.weight,
+            x_scales,
+            layer.weight_scale,
+            output_dtype_ref,
+        )
+        if bias is not None:
+            y = y + bias
+        if split_cat is not None:
+            # Same result as the Triton path's fused_gemm_afp4wfp4_split_cat, whose
+            # wrapper returns k_pe's dtype: k = cat(y[..., :S1], k_pe), v = y[..., S1:].
+            k_pe, s1, s2 = split_cat
+            y = y.view(-1, k_pe.shape[1], s1 + s2).to(k_pe.dtype)
+            k = torch.cat([y[..., :s1], k_pe], dim=-1)
+            v = y[..., s1:].contiguous()
+            return k, v
+        return y.view(*output_shape) if output_shape is not None else y
 
 
 class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
