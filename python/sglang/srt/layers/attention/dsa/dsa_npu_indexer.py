@@ -121,7 +121,13 @@ class _IndexerQueryShard(NamedTuple):
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
         plan = get_dsa_token_shard_plan(forward_batch)
-        local = plan is not None
+        # MTP seed export selects the last query of each request using global
+        # row indices. Keep those rows available even when attention is sharded.
+        spec_info = forward_batch.spec_info
+        capture_seed = (
+            spec_info is not None and spec_info.dsa_seed_topk_capture is not None
+        )
+        local = plan is not None and not capture_seed
         if local and (plan.rows != self.rows or plan.local_start != self.start):
             # Same arithmetic, but the two sites read their inputs separately;
             # if those ever drift, the gather stays correct where this would not.
