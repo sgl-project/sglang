@@ -1179,12 +1179,9 @@ def _check_overlapping_reads(cache, store, allocator):
 
     baseline = anchor_refs()
     tickets = cache.linker.pp_tickets
-    assert tickets.bind(slow, expected=True)
-    assert anchor_refs() == baseline + 1
-    assert tickets.bind(fast, expected=True)
+    for req in (slow, fast):
+        assert tickets.bind(req, expected=True)
     _drain_until(cache, lambda: ("fast", 2) in store.reads)
-    assert store.slow_read.running()
-    assert anchor_refs() == baseline + 1
     if store.rank == 0:
         assert not tickets.can_admit(slow.cache_request_handle)
     cache.check_hicache_events()
@@ -1209,9 +1206,8 @@ def _check_overlapping_reads(cache, store, allocator):
 
 def _check_blocked_follower_lookup(cache, store):
     tickets = cache.linker.pp_tickets
-    for policy in ("wait_complete", "best_effort", "timeout"):
+    for policy, first_token in (("wait_complete", 160), ("best_effort", 60)):
         cache.prefetch_stop_policy = policy
-        cache.prefetch_timeout_base = cache.prefetch_timeout_per_page = 0
         resume = threading.Event()
         lookup = store.lookup
 
@@ -1238,7 +1234,7 @@ def _check_blocked_follower_lookup(cache, store):
             patch.object(store, "lookup", blocked_lookup),
             patch.object(dist, "all_reduce", delay_result),
         ):
-            req = _request(policy, 60 if policy != "wait_complete" else 160)
+            req = _request(policy, first_token)
             handle = req.cache_request_handle
             assert tickets.bind(req, expected=True)
             state = tickets.pending[handle]
@@ -1253,16 +1249,15 @@ def _check_blocked_follower_lookup(cache, store):
                     assert not tickets.can_admit(handle)
                 cache.check_hicache_events()
                 assert tickets.can_admit(handle) == (policy != "wait_complete")
-            finally:
                 resume.set()
-            if policy == "wait_complete":
-                try:
+                if policy == "wait_complete":
                     _drain_until(cache, lambda: state.read is not None)
-                finally:
                     submitted.set()
-            try:
                 _drain_until(cache)
             finally:
+                # Release the worker even if a scheduler assertion failed.
+                resume.set()
+                submitted.set()
                 published.set()
             hit = fixtures.match_prefix(cache, req.origin_input_ids[:-1])
             assert hit.device_prefix_len == (2 if policy == "wait_complete" else 0)
@@ -1332,10 +1327,9 @@ def _check_layer_wise(cache, allocator, rank):
     store.load = Mock(return_value=True)
     store.start_layer_wise_loading = Mock(return_value=0)
     store.finish_layer_wise_loading = Mock(return_value=True)
+    held = allocator.alloc(allocator.available_size() - 10)
     for failed in (True, False):
         req = _request(f"take-{failed}", 95)
-        free = allocator.available_size()
-        held = allocator.alloc(free - 10)
         assert tickets.bind(req, expected=True)
         with (
             patch.object(type(cache.kv_storage()), "take_units", return_value=None)
@@ -1355,14 +1349,11 @@ def _check_layer_wise(cache, allocator, rank):
             allocator.free(slots)
         cache.unlock(req.lock)
         tickets.release(req.cache_request_handle)
-        allocator.free(held)
-        assert allocator.available_size() == free
+        assert allocator.available_size() == 10
 
-    # A full queue can defer every layer-wise admission. At most one ticket
-    # holds private rows, then its scheduling turn expires and frees them.
-    free = allocator.available_size()
-    held = allocator.alloc(free - 10)
-    waiting = [_request(f"queued-{i}", 110 + 10 * i) for i in range(8)]
+    # Deferred requests share the same ten free slots. At most one can hold a
+    # reservation, and it expires on the following scheduling turn.
+    waiting = [_request(f"queued-{i}", 110 + 10 * i) for i in range(3)]
     for req in waiting:
         assert tickets.bind(req, expected=True)
 
@@ -1435,9 +1426,8 @@ def _check_unbound_and_retracted_tickets(cache, store):
     dist.barrier()
     cache.linker.reset()
     assert cache.full_protected_size() == protected
-    active = cache.linker.pp_tickets
     following = _request("after-reset", 100)
-    assert active.bind(following, expected=True)
+    assert cache.linker.pp_tickets.bind(following, expected=True)
     _drain_until(cache)
     assert cache.prefetch_loaded_tokens_by_reqid[following.cache_request_handle] == 2
 

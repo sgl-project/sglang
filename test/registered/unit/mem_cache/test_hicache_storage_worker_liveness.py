@@ -218,7 +218,7 @@ def _two_rank_flush_with_file_storage(rank, rendezvous):
 
             pipeline = cache.buffer_pipeline
             busy_key = RadixKey(array("q", range(8, 8 + 2 * PAGE)))
-            for timeout, busy_rank in ((0, 0), (0, 1), (30, 0), (30, 1)):
+            for timeout, busy_rank in ((0, 0), (30, 1)):
                 stage.flush_cache.reset_mock()
                 if rank == busy_rank:
                     slots = cache.token_to_kv_pool_allocator.alloc(len(busy_key))

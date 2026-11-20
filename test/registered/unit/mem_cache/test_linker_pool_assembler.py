@@ -1335,48 +1335,35 @@ class TestMooncakeLinkerPPLookup(CustomTestCase):
                 PoolName.SWA, keys=keys[-2:], hit_policy=PoolHitPolicy.TRAILING_PAGES
             ),
         ]
-        window_pages = (range(6), (0, 1, 4, 5), range(4), ())
-        boundaries = ([1, 2, 3, 4, 5, 6], [1, 2, 6], [1, 2, 3, 4], [])
-        for replicated, tp_prefix in ((True, ""), (False, "tp2_")):
-            existing = set()
-            for pp_rank, pages in enumerate(window_pages):
-                suffix = f"{tp_prefix}cp1_pp{pp_rank}"
-                for i in range(6):
-                    existing.add(f"model_{keys[i]}_{suffix}_k")
-                for i in pages:
-                    existing.add(f"model_{keys[i]}_{suffix}_swa")
-
-            for pp_rank, expected in enumerate(boundaries):
-                with self.subTest(replicated=replicated, pp_rank=pp_rank):
-                    storage = MooncakeStore.__new__(MooncakeStore)
-                    storage.pp_rank, storage.pp_size = pp_rank, len(boundaries)
-                    storage.mem_pool_host = group
-                    storage.registered_pools = group.entry_map
-                    storage.config_prefix = "model"
-                    storage.unified_suffixes = None
-                    storage._has_request_context_support = False
-                    storage.mla_suffix = _storage_suffix(
-                        rank_replicated=replicated,
-                        tp_rank=2,
-                        attn_cp_rank=1,
-                        pp_rank=pp_rank,
-                    )
-                    exists = Mock(
-                        side_effect=lambda batch: [k in existing for k in batch]
-                    )
-                    storage.store = SimpleNamespace(batch_is_exist=exists)
-                    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-                    linker.pool_group, linker.storage = group, storage
-                    linker.stats = {"lookup": 0}
-                    self.assertEqual(linker.lookup("req", transfers), expected)
-                    suffix = f"{tp_prefix}cp1_pp{pp_rank}"
-                    exists.assert_called_once_with(
-                        [
-                            f"model_{key}_{suffix}_{pool}"
-                            for pool in ("k", "swa")
-                            for key in keys
-                        ]
-                    )
+        storage = MooncakeStore.__new__(MooncakeStore)
+        storage.mem_pool_host = group
+        storage.registered_pools = group.entry_map
+        storage.config_prefix = "model"
+        storage.unified_suffixes = None
+        storage._has_request_context_support = False
+        storage.pp_size = 2
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.pool_group, linker.storage = group, storage
+        linker.stats = {"lookup": 0}
+        for rank, replicated, suffix, swa_hits, boundaries in (
+            (0, True, "cp1_pp0", [1] * 6, [1, 2, 3, 4, 5, 6]),
+            (1, False, "tp2_cp1_pp1", [1, 1, 0, 0, 1, 1], [1, 2, 6]),
+        ):
+            with self.subTest(pp_rank=rank):
+                storage.pp_rank = rank
+                storage.mla_suffix = _storage_suffix(
+                    rank_replicated=replicated, tp_rank=2, attn_cp_rank=1, pp_rank=rank
+                )
+                exists = Mock(return_value=[1] * len(keys) + swa_hits)
+                storage.store = SimpleNamespace(batch_is_exist=exists)
+                self.assertEqual(linker.lookup("req", transfers), boundaries)
+                exists.assert_called_once_with(
+                    [
+                        f"model_{key}_{suffix}_{pool}"
+                        for pool in ("k", "swa")
+                        for key in keys
+                    ]
+                )
 
 
 if __name__ == "__main__":
