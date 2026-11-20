@@ -144,8 +144,8 @@ def _supports_cache(kv_cache: torch.Tensor) -> bool:
 def _check_fp8_q_out(
     fp8_q: torch.Tensor, *, q_nope: torch.Tensor, head_dim: int
 ) -> None:
-    """The backend's FP8 query buffer must be [tokens, >= q heads, head_dim] in
-    e4m3fn with stride 1 over head_dim; anything else is a backend bug."""
+    """The backend's FP8 query buffer must be a contiguous [tokens, >= q heads,
+    head_dim] e4m3fn tensor on the query device; anything else is a backend bug."""
     tokens, heads = q_nope.shape[:2]
     if not (
         fp8_q.dtype == torch.float8_e4m3fn
@@ -153,12 +153,14 @@ def _check_fp8_q_out(
         and fp8_q.shape[0] == tokens
         and fp8_q.shape[1] >= heads
         and fp8_q.shape[2] == head_dim
-        and fp8_q.stride(2) == 1
+        and fp8_q.is_contiguous()
+        and fp8_q.device == q_nope.device
     ):
         raise ValueError(
             f"mla_fp8_q_out must be a [{tokens}, >={heads}, {head_dim}] "
-            f"float8_e4m3fn buffer, got {tuple(fp8_q.shape)} {fp8_q.dtype} "
-            f"stride {fp8_q.stride()}"
+            f"contiguous float8_e4m3fn buffer on {q_nope.device}, got "
+            f"{tuple(fp8_q.shape)} {fp8_q.dtype} stride {fp8_q.stride()} "
+            f"on {fp8_q.device}"
         )
 
 
