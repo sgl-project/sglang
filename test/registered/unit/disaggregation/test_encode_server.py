@@ -6,12 +6,15 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import grpc
 import numpy as np
 import torch
 
 import sglang.srt.disaggregation.encoder.server as encoder_server
+from sglang.encoder.v1 import encoder_pb2
 from sglang.srt.disaggregation.encoder import http_server
 from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
+from sglang.srt.disaggregation.encoder.grpc_server import SGLangEncoderServer
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
@@ -145,6 +148,23 @@ class TestEncodeRequestInputEdges(CustomTestCase):
             with self.assertRaises(RuntimeError) as raised:
                 preprocessor._load_single_item(payload, Modality.AUDIO)
         self.assertLess(len(str(raised.exception)), 1000)
+
+
+class TestGrpcSend(CustomTestCase):
+    def test_send_without_a_staged_embedding_reports_an_error(self):
+        servicer = SGLangEncoderServer.__new__(SGLangEncoderServer)
+        servicer.encoder = SimpleNamespace(
+            send=AsyncMock(return_value=False), release_request=AsyncMock()
+        )
+        context = Mock()
+        request = encoder_pb2.SendRequest(
+            req_id="r", prefill_host="h", embedding_port=1
+        )
+
+        asyncio.run(servicer.Send(request, context))
+
+        context.set_code.assert_called_once_with(grpc.StatusCode.INTERNAL)
+        servicer.encoder.release_request.assert_not_called()
 
 
 class TestEncoderCacheIdentity(CustomTestCase):
