@@ -615,9 +615,6 @@ def test_fused_static_epilogue_plan_at_the_checkpoint_scale_extremes(monkeypatch
     )
     original_scales = layer.w2_weight_scale.clone()
     monkeypatch.setattr(MoeLoraRunner, "_admit", lambda *_: "nvfp4")
-    monkeypatch.setattr(
-        "sglang.srt.lora.moe.runner.resolve_vendor", lambda *_: "cutedsl"
-    )
     with (
         get_context().override_server_args(),
         get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL),

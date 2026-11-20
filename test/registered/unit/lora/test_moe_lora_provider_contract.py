@@ -16,6 +16,21 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
+class TestBf16ActivationAdmission(CustomTestCase):
+    def test_quantized_layers_refuse_other_activation_dtypes(self):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+        from sglang.srt.lora.moe.families import family_of_layer
+
+        layer = SimpleNamespace(
+            quant_method=object.__new__(ModelOptNvFp4FusedMoEMethod),
+            params_dtype=torch.float16,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "BF16 activations"):
+            family_of_layer(layer)
+
+
 class TestMxfp4PreparedQuantInfo(CustomTestCase):
     def test_loader_padded_hidden_width_is_rejected(self):
         from sglang.srt.lora.moe.quant_info import MoeLoraMxfp4MarlinQuantInfo
@@ -55,6 +70,213 @@ class TestMxfp8Admission(CustomTestCase):
         )
         with self.assertRaisesRegex(NotImplementedError, "hidden_size % 128"):
             MoeLoraMxfp8QuantInfo.from_layer(layer)
+
+
+class TestFp8MarlinFamilyBinding(CustomTestCase):
+    @staticmethod
+    def _fp8_method(backend, **config):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+        from sglang.srt.runtime_context import get_flags
+
+        with get_flags().moe.override(runner_backend=backend):
+            return Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True, **config))
+
+    def test_fp8_method_binds_marlin_tiles_under_lora_marlin(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe.families import family_of_layer
+
+        tiles = torch.zeros((2, 16, 1024), dtype=torch.int32)
+        for config, family in (
+            (dict(weight_block_size=[128, 128]), "fp8"),
+            (dict(use_mxfp8=True), "mxfp8"),
+        ):
+            with self.subTest(family):
+                method = self._fp8_method(MoeRunnerBackend.LORA_MARLIN, **config)
+                layer = SimpleNamespace(
+                    quant_method=method, params_dtype=torch.bfloat16, w13_weight=tiles
+                )
+                self.assertEqual(family_of_layer(layer), family)
+        method = self._fp8_method(MoeRunnerBackend.MARLIN, weight_block_size=[128, 128])
+        layer = SimpleNamespace(
+            quant_method=method, params_dtype=torch.bfloat16, w13_weight=tiles
+        )
+        with self.assertRaisesRegex(NotImplementedError, "float8_e4m3fn"):
+            family_of_layer(layer)
+
+    def test_mxfp4_experts_in_mxfp8_config(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe.families import family_of_layer
+
+        method = self._fp8_method(
+            MoeRunnerBackend.LORA_CUTEDSL, use_mxfp8=True, is_fp4_experts=True
+        )
+        layer = SimpleNamespace(quant_method=method, params_dtype=torch.bfloat16)
+        self.assertEqual(family_of_layer(layer), "mxfp4")
+
+    def test_fp8_exclusion_and_per_tensor_layer_admission(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+        from sglang.srt.lora.moe.families import family_of_layer
+
+        weights = torch.empty(0, dtype=torch.bfloat16)
+        excluded = SimpleNamespace(
+            quant_method=object.__new__(UnquantizedFusedMoEMethod),
+            w13_weight=weights,
+            w2_weight=weights,
+        )
+        self.assertEqual(family_of_layer(excluded), "bf16")
+
+        per_tensor = SimpleNamespace(
+            quant_method=self._fp8_method(MoeRunnerBackend.LORA_TRITON),
+            params_dtype=torch.bfloat16,
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError, "per-tensor layers are unsupported"
+        ):
+            family_of_layer(per_tensor)
+
+
+class TestMxfp4ScaleStorage(CustomTestCase):
+    def test_lora_backends_store_e8m0_scales(self):
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+        from sglang.srt.runtime_context import get_flags
+
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            is_fp4_experts=True,
+        )
+        for backend, dtype in (
+            (MoeRunnerBackend.LORA_CUTEDSL, torch.float8_e8m0fnu),
+            (MoeRunnerBackend.AUTO, torch.float32),
+        ):
+            layer = torch.nn.Module()
+            layer.moe_tp_size = 1
+            layer.moe_runner_config = SimpleNamespace(is_gated=True)
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(runner_backend=backend),
+            ):
+                Fp8MoEMethod(config).create_weights(layer, 2, 256, 128, torch.bfloat16)
+                self.assertEqual(layer.w13_weight_scale_inv.dtype, dtype)
+                self.assertEqual(layer.w2_weight_scale_inv.dtype, dtype)
+
+
+class TestCompressedTensorsFp8Admission(CustomTestCase):
+    _BLOCK = dict(strategy="block", block_structure=[128, 128])
+    _GROUP_ACT = dict(strategy="group", group_size=128, dynamic=True)
+    _CHANNEL = dict(strategy="channel")
+    _TOKEN_ACT = dict(strategy="token", dynamic=True)
+
+    @staticmethod
+    def _layer(weights, activations):
+        from compressed_tensors.quantization import QuantizationArgs
+
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+            CompressedTensorsW8A8Fp8MoE,
+        )
+
+        scheme = CompressedTensorsW8A8Fp8MoE(
+            QuantizationArgs(num_bits=8, type="float", **weights),
+            QuantizationArgs(num_bits=8, type="float", **activations),
+        )
+        layer = torch.nn.Module()
+        layer.quant_method = object.__new__(CompressedTensorsFusedMoEMethod)
+        layer.scheme = scheme
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        layer.moe_tp_size = 1
+        layer.params_dtype = torch.bfloat16
+        layer.num_local_experts = 2
+        scheme.create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size_per_partition=128,
+            params_dtype=torch.bfloat16,
+        )
+        return layer
+
+    def test_scale_layouts_bind_to_their_families(self):
+        from sglang.srt.lora.moe import quant_info as qi
+        from sglang.srt.lora.moe.families import family_of_layer
+
+        cases = (
+            (self._BLOCK, self._GROUP_ACT, "fp8", qi.MoeLoraFp8QuantInfo, (2, 2, 1)),
+            (
+                self._CHANNEL,
+                self._TOKEN_ACT,
+                "fp8_channel",
+                qi.MoeLoraFp8ChannelQuantInfo,
+                (2, 256, 1),
+            ),
+            (
+                {"strategy": "tensor"},
+                {"strategy": "tensor", "dynamic": True},
+                "fp8_tensor",
+                qi.MoeLoraFp8TensorQuantInfo,
+                (2,),
+            ),
+        )
+        for weights, activations, family, info_cls, down_shape in cases:
+            with self.subTest(family=family):
+                layer = self._layer(weights, activations)
+                self.assertEqual(family_of_layer(layer), family)
+                if family == "fp8_tensor":
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        layer.w13_weight_scale.max(dim=1).values, requires_grad=False
+                    )
+                info = info_cls.from_layer(layer)
+                self.assertIs(info.w2_scale, layer.w2_weight_scale)
+                self.assertEqual(tuple(info.w2_scale.shape), down_shape)
+
+    def test_other_layouts_and_schemes_are_refused(self):
+        from sglang.srt.lora.moe.families import family_of_layer
+        from sglang.srt.lora.moe.quant_info import MoeLoraFp8QuantInfo
+
+        layer = self._layer(
+            dict(strategy="block", block_structure=[64, 64]), self._GROUP_ACT
+        )
+        with self.assertRaisesRegex(NotImplementedError, r"\[128, 128\]"):
+            MoeLoraFp8QuantInfo.from_layer(layer)
+        layer.scheme = object()
+        with self.assertRaisesRegex(NotImplementedError, "FP8 scheme only"):
+            family_of_layer(layer)
+
+
+class TestVendorResolution(CustomTestCase):
+    def test_vendor_resolution_keeps_the_weight_layout(self):
+        from sglang.srt.lora.moe.families import resolve_vendor
+
+        self.assertEqual(resolve_vendor("bf16", "marlin"), "cutedsl")
+        self.assertEqual(resolve_vendor("fp8_tensor", "cutedsl"), "triton")
+        self.assertEqual(resolve_vendor("mxfp8", "triton"), "cutedsl")
+        with self.assertRaisesRegex(NotImplementedError, "lora_triton"):
+            resolve_vendor("nvfp4", "triton")
+
+    def test_lora_runners_never_fold_routed_scaling(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            _fuses_routed_scaling_factor_in_topk,
+        )
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            Mxfp4MarlinMoEMethod,
+        )
+
+        # The method folds for its fused runner; the LoRA finalize owns it.
+        method = object.__new__(Mxfp4MarlinMoEMethod)
+        self.assertTrue(
+            _fuses_routed_scaling_factor_in_topk(method, MoeRunnerBackend.MARLIN)
+        )
+        for backend in (
+            MoeRunnerBackend.LORA_MARLIN,
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_TRITON,
+        ):
+            self.assertFalse(_fuses_routed_scaling_factor_in_topk(method, backend))
 
 
 class TestProviderGeometry(CustomTestCase):
@@ -103,6 +325,7 @@ class TestDerivedBaseWeights(CustomTestCase):
 
         cases = (
             ("nvfp4", "cutedsl", True),
+            ("fp8", "marlin", True),
             ("fp8", "cutedsl", False),
             ("bf16", "triton", False),
         )

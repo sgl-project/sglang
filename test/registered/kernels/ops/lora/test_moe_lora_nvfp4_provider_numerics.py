@@ -233,7 +233,7 @@ def test_fp4_marlin_shared_outer_decode_plan_matches_reference(
         torch.cuda.get_device_capability(device)[0]
     )
     if family == "nvfp4" and architecture != "sm100":
-        pytest.skip("the NVFP4 case covers the SM100 shared decode row")
+        pytest.skip("the NVFP4 case covers the sm100 decode.shared.marlin row")
     g = torch.Generator(device="cpu").manual_seed(23)
 
     def rand(*shape, scale=0.05):
@@ -254,10 +254,7 @@ def test_fp4_marlin_shared_outer_decode_plan_matches_reference(
         quant_family=family,
         vendor="marlin",
     )[Phase.DECODE]
-    rows = {
-        "sm90": "decode.shared",
-        "sm100": "decode.shared.nvfp4" if family == "nvfp4" else "decode.shared.marlin",
-    }
+    rows = {"sm90": "decode.shared", "sm100": "decode.shared.marlin"}
     assert selected.name == rows[architecture]
     provider = select_provider_cls(selected.base_gemm_rows, family, "marlin")(
         quant_info

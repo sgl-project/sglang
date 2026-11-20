@@ -365,13 +365,6 @@ class MoeLoraNvFp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
 
     @classmethod
     def from_layer(cls, base_layer: FusedMoE) -> MoeLoraNvFp4MarlinQuantInfo:
-        if base_layer.params_dtype != torch.bfloat16:
-            raise NotImplementedError("NVFP4 MoE LoRA requires BF16 activations.")
-        for name in ("w13_weight", "w2_weight"):
-            if getattr(base_layer, name).dtype != torch.int32:
-                raise ValueError(
-                    f"NVFP4 MoE LoRA requires already-prepared Marlin {name}."
-                )
         return cls(
             w13_global_scale=base_layer.w13_weight_scale_2,
             w2_global_scale=base_layer.w2_weight_scale_2,
@@ -393,3 +386,16 @@ class MoeLoraMxfp4MarlinQuantInfo(MoeLoraMarlinQuantInfo):
                 f"{quant_info.hidden_size} (padded to {padded_hidden})"
             )
         return quant_info
+
+
+class MoeLoraFp8MarlinQuantInfo(MoeLoraMarlinQuantInfo):
+    """E4M3 Marlin tiles with exponent-compensated BF16 scales per K group."""
+
+    group_size: int  # 32 or 128 along K, the same for both stages
+
+    @classmethod
+    def from_layer(cls, base_layer: FusedMoE) -> MoeLoraFp8MarlinQuantInfo:
+        # prepare_moe_fp8_layer_for_marlin: one group size for both stages, widths kept.
+        fields = cls._prepared_fields(base_layer)
+        group_size = fields["hidden_size"] // fields["w13_scales"].shape[1]
+        return cls(group_size=group_size, **fields)
