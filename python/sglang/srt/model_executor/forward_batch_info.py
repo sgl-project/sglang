@@ -151,8 +151,8 @@ _HOST_INTS_PER_LAUNCH = 256
 
 
 def _host_ints_to_device(values: List[int], dtype: torch.dtype, device) -> torch.Tensor:
-    """A 1-D ``dtype`` CUDA tensor holding ``values``, written by kernels that take
-    the values as arguments instead of a pinned host-to-device copy.
+    """A 1-D ``dtype`` CUDA tensor holding ``values``,
+    written by kernels that take the values as arguments instead of a pinned copy.
 
     The kernel writes a buffer padded to a power of two (or to whole launches past
     one launch), so a varying length compiles a bounded set of kernels; the
