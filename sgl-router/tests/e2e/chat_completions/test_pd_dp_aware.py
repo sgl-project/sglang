@@ -224,7 +224,11 @@ def _cold_cache(topo: Topology) -> None:
     is pinned to that rank ahead of load, so a spread test must start cold
     whatever ran before it.
     """
-    resp = httpx.post(f"{topo.router.base_url}/flush_cache", timeout=30.0)
+    # ``timeout`` makes a busy engine wait for idle instead of refusing (400 ->
+    # router 502), so a request still in flight from an earlier test is fine.
+    resp = httpx.post(
+        f"{topo.router.base_url}/flush_cache", params={"timeout": 30}, timeout=60.0
+    )
     assert resp.status_code == 200, resp.text
     deadline = time.time() + 30.0
     while _prefill_tree_blocks(topo.router.base_url, topo.prefill.url) > 0:
