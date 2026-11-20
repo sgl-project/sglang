@@ -204,7 +204,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DISABLE_OVERLAP_AFTER_PREFILL`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process all prefill results before scheduling the next step, for TTFT. On gfx942, a complete eager BF16 DeepSeek-V2-Lite generation prefill of 1–2048 tokens for one request with no cached prefix already processes its result early after an idle scheduler iteration. This automatic path excludes MLP synchronization and speculative decoding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process all prefill results before scheduling the next batch to reduce time to first token. On gfx942, the scheduler also does this by default for a complete eager prefill of 1–4096 tokens after an idle iteration when the batch contains one request with no cached prefix and the generation model uses unquantized BF16. This automatic path excludes MLP synchronization and speculative decoding.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
     </tr>
     <tr>

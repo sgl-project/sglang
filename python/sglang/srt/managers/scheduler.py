@@ -2330,8 +2330,8 @@ class Scheduler(
             if last_batch_is_extend:
                 return True
 
-        # BF16 DeepSeek-V2-Lite on gfx942 has a host-bound first eager prefill.
-        # Limit the default to the validated model and singleton cache-miss shapes.
+        # On gfx942, launching the next eager prefill can delay the first result.
+        # Limit the automatic path to complete singleton cache misses.
         # Idle state is rank-local under MLP synchronization, so it must not
         # select a collective scheduling boundary there.
         if (
@@ -2342,18 +2342,13 @@ class Scheduler(
             and last_batch.contains_last_prefill_chunk
             and last_batch.prefix_lens == [0]
             and last_batch.extend_num_tokens is not None
-            and 0 < last_batch.extend_num_tokens <= 2048
+            and 0 < last_batch.extend_num_tokens <= 4096
             and last_batch.spec_algorithm == SpeculativeAlgorithm.NONE
             and is_gfx942_supported()
             and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
             and self.is_generation
             and self.model_config.dtype == torch.bfloat16
             and self.model_config.quantization is None
-            and self.model_config.hf_config.model_type == "deepseek_v2"
-            and self.model_config.hf_config.hidden_size == 2048
-            and self.model_config.hf_config.num_hidden_layers == 27
-            and self.model_config.hf_config.n_routed_experts == 64
-            and self.model_config.hf_config.num_experts_per_tok == 6
         ):
             return True
 

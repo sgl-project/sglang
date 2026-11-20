@@ -44,27 +44,8 @@ def _batch(
     )
 
 
-def _model_config(
-    *,
-    model_type="deepseek_v2",
-    hidden_size=2048,
-    layers=27,
-    experts=64,
-    topk=6,
-    dtype=torch.bfloat16,
-    quantization=None,
-):
-    return SimpleNamespace(
-        dtype=dtype,
-        quantization=quantization,
-        hf_config=SimpleNamespace(
-            model_type=model_type,
-            hidden_size=hidden_size,
-            num_hidden_layers=layers,
-            n_routed_experts=experts,
-            num_experts_per_tok=topk,
-        ),
-    )
+def _model_config(*, dtype=torch.bfloat16, quantization=None):
+    return SimpleNamespace(dtype=dtype, quantization=quantization)
 
 
 @contextmanager
@@ -343,9 +324,10 @@ class TestIdlePrefillResultOrder(CustomTestCase):
             (128, True),
             (512, True),
             (2048, True),
+            (2049, True),
+            (4096, True),
             (0, False),
-            (2049, False),
-            (4096, False),
+            (4097, False),
             (None, False),
         ):
             with self.subTest(tokens=tokens):
@@ -374,13 +356,8 @@ class TestIdlePrefillResultOrder(CustomTestCase):
         )
         self.assertLess(trace.index(("launch", "B")), trace.index(("process", "A")))
 
-    def test_unvalidated_model_shapes_and_dtypes_keep_overlap(self):
+    def test_quantized_and_non_bf16_models_keep_overlap(self):
         for kwargs in (
-            {"model_type": "qwen3"},
-            {"hidden_size": 5120},
-            {"layers": 60},
-            {"experts": 160},
-            {"topk": 8},
             {"quantization": "fp8"},
             {"dtype": torch.float16},
             {"dtype": torch.float32},
