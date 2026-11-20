@@ -6,7 +6,6 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
-from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -740,7 +739,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             List[bool]
         ] = None,  # True leaves a zero-row compressed tail
         is_draft_worker: bool = False,
-        indexer_quant_mode: Optional[int] = None,
+        indexer_dtype: Optional[torch.dtype] = None,
         use_combined_kv_buffer: bool = False,
         # Accepted to stay compatible with the generic hybrid DSA pool
         # contract; all three are inert on NPU (no Kimi-K3.1 fp8 scales /
@@ -752,7 +751,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
-        if index_kpool > 1 and indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+        if index_kpool > 1 and (indexer_dtype or dtype) == torch.int8:
             raise ValueError("INT8 indexer KV cache is not supported with NPU KPool.")
         self.kv_scale_ue8m0 = kv_scale_ue8m0
         self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
@@ -803,12 +802,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for i in self.indexer_layer_ids
         )
         requested_kv_cache_dim = kv_cache_dim
-        self.dsa_kv_cache_store_fp8 = (
+        self.dsa_kv_cache_store_c8 = (
             index_head_dim is not None
-            and dtype == torch.float8_e4m3fn
+            and dtype in (torch.float8_e4m3fn, torch.int8)
             and requested_kv_cache_dim is not None
         )
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
             assert requested_kv_cache_dim == (
                 kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
@@ -820,32 +819,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         else:
             self.rope_dtype = self.store_dtype
         self.kv_cache_dim = (
-            requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+            requested_kv_cache_dim if self.dsa_kv_cache_store_c8 else kv_lora_rank
         )
-        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+        self.kr_cache_dim = 0 if self.dsa_kv_cache_store_c8 else qk_rope_head_dim
 
         # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache
-        if (
-            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-            and get_memory().enable_hierarchical_cache
-        ):
+        if indexer_dtype == torch.int8 and get_memory().enable_hierarchical_cache:
             raise ValueError(
                 "--indexer-kv-cache-dtype=int8 is not supported with "
                 "--enable-hierarchical-cache"
             )
-        self.indexer_kv_store_int8 = (
-            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-            and not self.dsa_kv_cache_store_fp8
-            and index_head_dim is not None
+        self.index_k_dtype = dtype if indexer_dtype is None else indexer_dtype
+        self.index_k_store_dtype = (
+            self.store_dtype if indexer_dtype is None else indexer_dtype
         )
-        if self.indexer_kv_store_int8:
-            self.index_k_store_dtype = torch.int8
-            self.index_k_scale_dtype = torch.float16
-        else:
-            self.index_k_store_dtype = self.store_dtype
-            self.index_k_scale_dtype = (
-                torch.float32 if self.dsa_kv_cache_store_fp8 else None
-            )
+        self.index_k_scale_dtype = {
+            torch.int8: torch.float16,
+            torch.float8_e4m3fn: torch.float32,
+        }.get(self.index_k_store_dtype)
         logger.info(
             f"Indexer K Cache type {self.index_k_store_dtype} scale type {self.index_k_scale_dtype}"
         )
@@ -956,7 +947,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     dtype=(
                         torch.bfloat16
-                        if self.dsa_kv_cache_store_fp8
+                        if self.dsa_kv_cache_store_c8
                         else self.rope_dtype
                     ),
                     device=self.device,
@@ -977,7 +968,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     device=self.device,
                 )
                 if (
-                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
+                    self.index_k_scale_dtype is not None
                 ) and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
@@ -1009,6 +1000,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_score[idx],
         )
 
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        # Shared pool adapters use this legacy name for the packed C8 layout.
+        return self.dsa_kv_cache_store_c8
+
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 
@@ -1038,7 +1034,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 for buffer in (self.k_buffer, self.index_k_buffer)
                 if buffer is not None
             ),
-            packed_fp8=self.dsa_kv_cache_store_fp8,
+            packed_fp8=self.dsa_kv_cache_store_c8,
         )
 
     def _mla_native_buffers(self):
@@ -1185,9 +1181,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
-        if self.store_dtype != self.dtype:
+        if self.index_k_store_dtype != self.index_k_dtype:
             return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.dtype
+                self.index_k_dtype
             )
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
@@ -1224,7 +1220,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.use_combined_kv_buffer:
             return [(buffer, global_kv) for buffer in self.kv_buffer]
         entries = [(buffer, global_kv) for buffer in self.k_buffer]
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+        if not getattr(self, "dsa_kv_cache_store_c8", False):
             entries += [(buffer, global_kv) for buffer in self.v_buffer]
         if self.index_head_dim is not None:
             entries += [(buffer, True) for buffer in self.index_k_buffer]
@@ -1263,13 +1259,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             2 if self.index_k_scale_buffer is not None else 1
         )
 
-    def _pack_dsa_fp8_kv_cache(self, cache_k, cache_v):
+    def _pack_dsa_c8_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)
-        quantized, scale = torch_npu.npu_dynamic_quant(
-            latent.reshape(-1, 128), dst_type=self.dtype
-        )
+        if self.dtype == torch.int8:
+            quantized, scale = torch_npu.npu_dynamic_block_quant(
+                latent.reshape(-1, 1, self.kv_lora_rank),
+                dst_type=self.dtype,
+                row_block_size=1,
+                col_block_size=128,
+            )
+        else:
+            quantized, scale = torch_npu.npu_dynamic_quant(
+                latent.reshape(-1, 128), dst_type=self.dtype
+            )
         rows = latent.shape[0]
-        # Opaque record: latent FP8 | rope BF16 bytes | per-tile FP32 scales.
+        # Opaque C8 record: latent INT8/FP8 | rope BF16 bytes | per-tile FP32 scales.
         packed = torch.cat(
             (
                 quantized.reshape(rows, self.kv_lora_rank).view(torch.uint8),
@@ -1296,12 +1300,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
+            packed = self._pack_dsa_c8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[self._kv_local_offset(layer_id)].view(
                     -1, 1, self.kv_cache_dim
@@ -1405,16 +1409,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
 
-        if self.indexer_kv_store_int8:
+        if self.index_k_scale_dtype is not None:
             assert index_k.dtype == self.index_k_store_dtype, (
                 f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
             )
         else:
-            if index_k.dtype != self.dtype:
-                index_k = index_k.to(self.dtype)
+            if index_k.dtype != self.index_k_dtype:
+                index_k = index_k.to(self.index_k_dtype)
 
-            if self.store_dtype != self.dtype:
-                index_k = index_k.view(self.store_dtype)
+        if self.index_k_store_dtype != self.index_k_dtype:
+            index_k = index_k.view(self.index_k_store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
@@ -1461,7 +1465,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
             if self.index_k_scale_buffer is not None:
                 buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             # Retraction copies opaque records; byte views also avoid FP8
             # advanced-indexing restrictions, without decoding/requantizing.
             buffers = [

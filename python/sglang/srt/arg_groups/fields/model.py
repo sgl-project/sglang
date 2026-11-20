@@ -207,7 +207,8 @@ class Model(msgspec.Struct):
                 'Data type for kv cache storage. "auto" will use model data type. '
                 '"bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and '
                 '"fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported '
-                'by the FA4 backend. "nvfp4" selects '
+                'by the FA4 backend. "int8" selects C8 KV cache for DSA models '
+                'on Ascend A3. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
                 "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
@@ -222,13 +223,13 @@ class Model(msgspec.Struct):
         Optional[str],
         Arg(
             help=(
-                "Quantization recipe for the DSA lightning-indexer KV cache "
-                "(Ascend NPU only). None disables the quantized indexer cache "
-                'and keeps the default indexer behavior. "int8" stores the '
-                "indexer keys in INT8 with FP16 scales to speed up the "
-                "lightning indexer."
+                "Storage dtype for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). Defaults to the main KV cache dtype. "
+                '"bf16" or "bfloat16" keeps indexer keys unquantized; '
+                '"int8" stores them in INT8 with FP16 scales, independently '
+                "of the main KV cache dtype."
             ),
-            choices=["int8"],
+            choices=["bf16", "bfloat16", "int8"],
         ),
     ] = None
     qsa_indexer_dtype: A[

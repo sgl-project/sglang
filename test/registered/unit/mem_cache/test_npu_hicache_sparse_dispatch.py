@@ -171,7 +171,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
             k=Buffer((3, 8, 128, 1, 512)),
             v=Buffer((3, 8, 128, 1, 64)),
             index_k=Buffer((2, 8, 128, 1, 128)),
-            index_scales=Buffer((2, 8, 128, 1)),
+            index_scales=Buffer((2, 8, 128, 1), SimpleNamespace(itemsize=4)),
             index_layer_indices=(0, 2),
             index_width=128,
             k_width=512,

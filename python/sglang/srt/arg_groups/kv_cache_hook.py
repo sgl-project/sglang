@@ -361,13 +361,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
 
 def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
-    """Check the DSA lightning-indexer INT8 cache recipe.
-
-    npu_quant_lightning_indexer is a CANN op, so an explicitly requested
-    indexer recipe only makes sense on Ascend NPU and on a model that
-    actually has a DSA lightning indexer. The recipe itself is resolved
-    against the resolved KV cache dtype later, at pool-build time.
-    """
+    """Check explicit DSA lightning-indexer cache dtypes on Ascend NPU."""
     cfg = resolving_view(server_args)
 
     if cfg.indexer_kv_cache_dtype is None:
@@ -377,13 +371,13 @@ def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
         raise ValueError(
             f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
             "supported with --enable-hierarchical-cache. Disable hierarchical "
-            "cache or use the default BF16 indexer cache."
+            "cache or leave --indexer-kv-cache-dtype unset."
         )
 
     if not get_platform().is_npu:
         raise RuntimeError(
             "--indexer-kv-cache-dtype is only supported on Ascend NPU "
-            "(npu_quant_lightning_indexer is a CANN op)."
+            "(the lightning indexer uses CANN operators)."
         )
 
     if getattr(model_config_of(server_args), "index_head_dim", None) is None:

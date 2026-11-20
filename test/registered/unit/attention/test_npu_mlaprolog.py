@@ -81,7 +81,7 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
         self.kr_cache = torch.zeros(1, 4, 1, 2, dtype=torch.bfloat16)
         self.pool = SimpleNamespace(
             index_head_dim=4,
-            dsa_kv_cache_store_fp8=False,
+            dsa_kv_cache_store_c8=False,
             get_kv_buffer=lambda _: (self.k_cache, self.kr_cache),
         )
         self.disagg = SimpleNamespace(disaggregation_mode="decode")

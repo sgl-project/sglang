@@ -22,16 +22,7 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fnuz: "fp8_e4m3",
     torch.float8_e5m2: "fp8_e5m2",
     torch.bfloat16: "bf16",
-}
-
-# Quantization recipes of the NPU DSA quantized indexer cache. Unlike the
-# quant_lightning_indexer (v2) FP8/MXFP8/FP4 quant modes, the INT8 recipe
-# runs the v1 npu_quant_lightning_indexer op, where the quantization is
-# implied by the INT8 key dtype (its quant_mode args stay 0).
-QUANT_MODE_TOKEN_INT8 = 0
-
-_INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
-    "int8": QUANT_MODE_TOKEN_INT8,
+    torch.int8: "int8",
 }
 
 
@@ -72,6 +63,10 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = fp8_dtype
         else:
             kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "int8":
+        if not current_platform.is_npu():
+            raise ValueError("--kv-cache-dtype int8 is only supported on Ascend NPUs.")
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
@@ -117,31 +112,19 @@ def configure_kv_cache_dtype(
     return kv_cache_dtype_str, kv_cache_dtype
 
 
-def resolve_indexer_quant_mode(
+def resolve_indexer_kv_cache_dtype(
     indexer_kv_cache_dtype: Optional[str],
-    main_kv_cache_dtype: torch.dtype,
-) -> Optional[int]:
-    """Map --indexer-kv-cache-dtype to a quantized-indexer recipe for the
-    NPU DSA indexer cache.
-
-    None leaves the quantized indexer at its default: an FP8 main KV cache
-    keeps the existing FP8 indexer (the DSA FP8 packed store), any other
-    main dtype leaves the quantized indexer disabled (the DSA indexer then
-    runs the legacy bf16 npu_lightning_indexer path). The INT8 recipe only
-    exists on top of a non-FP8 main KV cache; the FP8 main cache already
-    stores the indexer cache quantized.
-    """
+) -> Optional[torch.dtype]:
+    """None follows the main KV pool; an explicit dtype overrides only Indexer KV."""
     if indexer_kv_cache_dtype is None:
         return None
-    quant_mode = _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE.get(indexer_kv_cache_dtype)
-    if quant_mode is None:
+    dtype = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "int8": torch.int8,
+    }.get(indexer_kv_cache_dtype)
+    if dtype is None:
         raise ValueError(
             f"Unsupported indexer_kv_cache_dtype: {indexer_kv_cache_dtype}."
         )
-    if main_kv_cache_dtype == torch.float8_e4m3fn:
-        raise ValueError(
-            f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires a "
-            "non-FP8 main KV cache (--kv-cache-dtype auto or bf16), "
-            f"got {main_kv_cache_dtype}."
-        )
-    return quant_mode
+    return dtype
