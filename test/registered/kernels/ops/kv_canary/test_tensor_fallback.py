@@ -36,7 +36,7 @@ from sglang.kernels.ops.kv_canary.write_ref import (
 )
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="extra-test-1-gpu-xpu")
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="the tensor fallback runs on XPU only"
