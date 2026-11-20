@@ -1775,6 +1775,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        _validate_watermark_request(sampling_params)
         if (
             isinstance(obj, GenerateReqInput)
             and self.server_args.speculative_algorithm == "DFLASH"
@@ -1788,7 +1789,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 "Experimental independent DFlash currently requires greedy sampling (temperature=0 or top_k=1)"
             )
-        _validate_watermark_request(sampling_params)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
