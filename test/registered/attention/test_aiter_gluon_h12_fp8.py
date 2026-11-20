@@ -450,8 +450,8 @@ class TestMlaDcpAsmDecode(CustomTestCase):
 
 
 class TestMlaDcpDecodeRoute(CustomTestCase):
-    """The asm DCP decode needs the fp8 KV cache's scale; any other KV dtype must
-    route DCP decode to Gluon, not asm."""
+    """The asm DCP decode needs the fp8 KV cache's scale;
+    any other KV dtype must route DCP decode to Gluon, not asm."""
 
     def _selected(self, **overrides):
         from sglang.srt.layers.attention.aiter_backend import _mla_dcp_asm_selected
