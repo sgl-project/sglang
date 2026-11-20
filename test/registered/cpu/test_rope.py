@@ -9,6 +9,7 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
+    Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_cpu,
@@ -261,6 +262,44 @@ class TestROPE(CustomTestCase):
                     num_q_heads,
                     num_kv_heads,
                 )
+
+    def test_phi3_longrope(self):
+        torch.manual_seed(1234)
+        head_size, rotary_dim = 128, 96
+        num_q_heads, num_kv_heads = 24, 8
+        orig_max, max_pos = 4096, 131072
+        rope = Phi3LongRoPEScaledRotaryEmbedding(
+            head_size,
+            rotary_dim,
+            max_pos,
+            orig_max,
+            10000,
+            True,
+            torch.bfloat16,
+            [1.0 + 0.1 * i for i in range(rotary_dim // 2)],
+            [2.0 + 0.1 * i for i in range(rotary_dim // 2)],
+        )
+        for positions in [
+            torch.arange(64),
+            torch.arange(orig_max - 32, orig_max + 32),
+        ]:
+            n = positions.numel()
+            qkv = torch.randn(
+                n, (num_q_heads + 2 * num_kv_heads) * head_size, dtype=torch.bfloat16
+            )
+            q, k, _ = qkv.split(
+                [
+                    num_q_heads * head_size,
+                    num_kv_heads * head_size,
+                    num_kv_heads * head_size,
+                ],
+                dim=-1,
+            )
+            # float32 inputs take the native path, bf16 inputs take the CPU kernel
+            q_ref, k_ref = rope(positions, q.float(), k.float())
+            q_out, k_out = rope(positions, q.clone(), k.clone())
+            torch.testing.assert_close(q_out.float(), q_ref, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(k_out.float(), k_ref, atol=2e-2, rtol=2e-2)
 
     def test_apply_rotary_pos_emb(self):
         torch.manual_seed(1234)

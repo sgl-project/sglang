@@ -135,10 +135,19 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        k = self.original_max_position_embeddings
+        if _is_cpu_amx_available and query.dtype == self.long_short_cos_sin_cache.dtype:
+            # The whole batch switches to the long cache once any position exceeds k.
+            idx = positions + (positions > k).any().long() * k
+            if offsets is not None:
+                idx = idx + offsets
+            return rotary_embedding_cpu(
+                idx, query, key, self.head_size, self.long_short_cos_sin_cache, True
+            )
+
         query = query.unflatten(1, (-1, self.head_size))
         key = key.unflatten(1, (-1, self.head_size))
 
-        k = self.original_max_position_embeddings
         long_prompt_offset = (
             torch.any(positions > k).float() * torch.full_like(positions, k)
         ).long()

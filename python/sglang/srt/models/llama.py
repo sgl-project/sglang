@@ -578,6 +578,7 @@ class LlamaForCausalLM(nn.Module):
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
+            self.lm_head.is_tied_lm_head = True
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
