@@ -61,9 +61,13 @@ def handle_mps_backends(server_args: Any):
 
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
-        declare_resolution(
-            server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=16
-        )
+        raw = getattr(server_args, "_raw_input", None) or {}
+        if raw.get("triton_attention_num_kv_splits") is None:
+            declare_resolution(
+                server_args,
+                "_handle_amd_specifics",
+                triton_attention_num_kv_splits=16,
+            )
         # Above this the HIP runtime registers a pageable H2D source with the
         # GPU rather than staging it, and the MMU notifier on that registration
         # evicts our KFD queues once per tensor while weights load. In KB.
