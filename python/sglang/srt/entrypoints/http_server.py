@@ -72,10 +72,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
+from pydantic import SkipValidation, ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
+from sglang.srt.configs.nemotron_decision import is_nemotron_decision
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -132,7 +133,11 @@ from sglang.srt.entrypoints.server_utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
-from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
+from sglang.srt.entrypoints.systemone.protocol import (
+    NemotronDecisionRequest,
+    NemotronDecisionsRequest,
+    SystemOneRequest,
+)
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.uvicorn_worker_spawn import (
     skip_main_reimport_in_spawned_workers,
@@ -2072,10 +2077,18 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 
 
 @app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
-async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
+async def v1_decisions_request(
+    request: SkipValidation[DecisionRequest], raw_request: Request
+):
     """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
-    return await raw_request.app.state.openai_serving_decisions.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.openai_serving_decisions
+    request_type = (
+        DecisionRequest
+        if serving.question_encoder is None
+        else NemotronDecisionsRequest
+    )
+    return await serving.handle_request(
+        _validate_decision_body(request, request_type), raw_request
     )
 
 
@@ -2193,12 +2206,33 @@ async def anthropic_v1_count_tokens(
     )
 
 
+def _validate_decision_body(body, request_type):
+    # Choose the checkpoint schema before validation, without an OpenAPI union.
+    try:
+        return request_type.model_validate(body)
+    except ValidationError as error:
+        raise RequestValidationError(
+            errors=[
+                {**item, "loc": ("body", *item["loc"])}
+                for item in error.errors(include_url=False)
+            ]
+        ) from error
+
+
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
-async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
+async def systemone_decisions(
+    request: SkipValidation[SystemOneRequest], raw_request: Request
+):
     """System One compatible decisions, answered by candidate scoring without generation."""
-    return await raw_request.app.state.systemone_serving.handle_request(
-        request, raw_request
+    serving = raw_request.app.state.systemone_serving
+    request_type = (
+        SystemOneRequest
+        if serving.question_encoder is None
+        else NemotronDecisionRequest
+    )
+    return await serving.handle_request(
+        _validate_decision_body(request, request_type), raw_request
     )
 
 
@@ -2437,6 +2471,8 @@ def _execute_server_warmup(server_args: ServerArgs):
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
+    if is_nemotron_decision(_global_state.tokenizer_manager.model_config.hf_config):
+        max_new_tokens = 1
     json_data = {
         "sampling_params": {
             "temperature": 0,

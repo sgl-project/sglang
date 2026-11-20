@@ -26,6 +26,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
+from sglang.srt.entrypoints.systemone.nemotron_decide import create_decision_encoder
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -33,9 +34,7 @@ from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-    from sglang.srt.multimodal.processors.base_processor import (
-        MultimodalSpecialTokens,
-    )
+    from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +85,16 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self.joint_head_config = self.tokenizer_manager.model_config.joint_head_config
         self.pointer_head = self.tokenizer_manager.model_config.pointer_head
         tokenizer = self.tokenizer_manager.tokenizer
+        self.question_encoder = create_decision_encoder(
+            self.tokenizer_manager.model_config,
+            tokenizer,
+            self.tokenizer_manager.context_len,
+        )
+        self.prompt_format_version = (
+            PROMPT_FORMAT_VERSION
+            if self.question_encoder is None
+            else self.question_encoder.prompt_format_version
+        )
         # Other tokenizers skip the shortcut in _encode_labels and check the full prompt.
         self.added_tokens = (
             {i: token for token, i in tokenizer.get_added_vocab().items()}
@@ -146,10 +155,10 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 "return_prompt_token_ids cannot replay image inputs through /v1/score"
             )
         version = request.prompt_format_version
-        if version is not None and version != PROMPT_FORMAT_VERSION:
+        if version is not None and version != self.prompt_format_version:
             return (
                 f"prompt_format_version {version} is not served, this server "
-                f"uses version {PROMPT_FORMAT_VERSION}"
+                f"uses version {self.prompt_format_version}"
             )
         return self._validate_reasoning(request.chat_template_kwargs)
 
@@ -214,6 +223,8 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self, chat_template_kwargs: Dict[str, Any]
     ) -> Optional[str]:
         """The answer position must follow the reasoning block, not sit inside it."""
+        if self.question_encoder is not None:
+            return None
         config = self.template_manager.reasoning_config
         if config is not None and config.always_on:
             return (
@@ -229,7 +240,9 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return None
 
     def _chat_template_kwargs(self, request_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Reasoning off, then the server defaults, then the request kwargs."""
+        """Use the trained encoder's defaults, or turn reasoning off for generic reads."""
+        if self.question_encoder is not None:
+            return {**self.default_chat_template_kwargs, **request_kwargs}
         kwargs = {}
         if self.reasoning_toggle is not None:
             kwargs[self.reasoning_toggle] = False
@@ -248,6 +261,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
     def _encoded_questions(self, request: DecisionRequest) -> Iterator[EncodedQuestion]:
         """Prompt and label ids for each question, in request order."""
+        if self.question_encoder is not None:
+            yield from self.question_encoder.encode_decisions(
+                request, self._chat_template_kwargs(request.chat_template_kwargs)
+            )
+            return
         text = render_text(request.input)
         chat_template_kwargs = self._chat_template_kwargs(request.chat_template_kwargs)
         for question in request.questions:
@@ -419,17 +437,26 @@ class OpenAIServingDecisions(OpenAIServingBase):
         request: DecisionRequest,
         raw_request: Request,
     ) -> ORJSONResponse:
+        # Checkpoint temperatures vary by question type, so calibrate after scoring.
         prompts, label_token_ids, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
-            temperature=request.temperature,
+            temperature=request.temperature if self.question_encoder is None else 1.0,
         )
         answers = {}
         for i, question in enumerate(request.questions):
+            probabilities = result.scores[i]
+            if self.question_encoder is not None:
+                probabilities = self.question_encoder.calibrate(
+                    "noul" if question.type == "yes_no" else question.type,
+                    probabilities,
+                    result.token_logprobs[i],
+                    temperature=request.temperature,
+                )
             answer = _build_answer(
                 question=question,
                 view=_decision_view(question),
-                probabilities=result.scores[i],
+                probabilities=probabilities,
                 token_logprobs=result.token_logprobs[i],
             )
             if request.return_prompt_token_ids:
@@ -438,7 +465,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
             answers[question.id] = answer
         response = DecisionResponse(
             model=request.model,
-            prompt_format_version=PROMPT_FORMAT_VERSION,
+            prompt_format_version=self.prompt_format_version,
             answers=answers,
             usage=UsageInfo(
                 prompt_tokens=result.prompt_tokens,

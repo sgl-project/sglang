@@ -37,6 +37,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+from sglang.srt.configs.nemotron_decision import is_nemotron_decision
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -210,10 +211,17 @@ def handle_model_specific_adjustments(server_args: Any):
             )
 
     decision_config = model_config.decision_config
+    nemotron_decision = is_nemotron_decision(hf_config)
+    if nemotron_decision:
+        from sglang.srt.arg_groups.model_overrides.nemotron_decision import (
+            apply_nemotron_decision_prefill_defaults,
+        )
+
+        apply_nemotron_decision_prefill_defaults(server_args, model_config)
     if (
         decision_config is not None
         and decision_config.get("attention_mode") == NONCAUSAL_FULL_ATTENTION
-    ):
+    ) or nemotron_decision:
         # A cached prefix or a prefill chunk would attend to only part of its prompt.
         logger.info(
             "Radix cache and chunked prefill are disabled for a decision "
@@ -224,6 +232,16 @@ def handle_model_specific_adjustments(server_args: Any):
             "_handle_model_specific_adjustments",
             disable_radix_cache=True,
             chunked_prefill_size=-1,
+        )
+
+    if nemotron_decision:
+        # Decision requests finish in prefill and never enter decode.
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
         )
 
     _hybrid_spec = get_linear_attn_spec(hf_config)
