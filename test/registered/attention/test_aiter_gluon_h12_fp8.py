@@ -15,6 +15,7 @@ from sglang.kernels.arch._hip import HipArch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_mla_gluon as mod
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -617,32 +618,23 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
         cfg.kv_lora_rank = 512
         cfg.qk_rope_head_dim = 64
         cfg.context_len = 4096
-        spec = mock.Mock(
-            speculative_num_draft_tokens=4,
-            speculative_num_steps=3,
-            speculative_algorithm="EAGLE",
-            speculative_attention_mode="decode",
-        )
         with (
             envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override(verify_backend),
-            mock.patch(f"{_BACKEND}.get_schedule", return_value=mock.Mock(page_size=1)),
-            mock.patch(f"{_BACKEND}.get_spec", return_value=spec),
-            mock.patch(
-                f"{_BACKEND}.get_parallel",
-                return_value=mock.Mock(attn_tp_size=8, attn_dcp_size=dcp_size),
+            get_context().override_server_args(
+                page_size=1,
+                speculative_algorithm="EAGLE",
+                speculative_num_draft_tokens=4,
+                speculative_num_steps=3,
+                speculative_attention_mode="decode",
+            ),
+            get_parallel().override(
+                tp_size=8, attn_tp_size=8, moe_tp_size=8, attn_dcp_size=dcp_size
             ),
             mock.patch(f"{_BACKEND}.resolve_window_kv_pool", return_value=None),
             mock.patch(f"{_BACKEND}.resolve_window_id_space", return_value=None),
             mock.patch(f"{_BACKEND}._kv_cache_is_vectorized_5d", return_value=False),
             mock.patch(f"{_BACKEND}._require_untranslated_storage"),
-            mock.patch(f"{_BACKEND}.is_dp_attention_enabled", return_value=False),
-            mock.patch(
-                f"{_BACKEND}.get_exec",
-                return_value=mock.Mock(
-                    deterministic=mock.Mock(enable_deterministic_inference=False)
-                ),
-            ),
             # __init__ rewrites these module globals; restore them afterwards.
             mock.patch(f"{_BACKEND}._use_mla_ps_kernel", True),
             mock.patch(f"{_BACKEND}.fast_mode", False),
