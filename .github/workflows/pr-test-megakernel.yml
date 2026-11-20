@@ -111,6 +111,10 @@ jobs:
       - name: Install sgl-nvidia-mega
         run: python3 -m pip install --no-deps -e ./sgl-nvidia-mega
 
+      - name: Check native Kimi hybrid binding before model loading
+        if: contains(format(' {0} ', matrix.models), ' kimi_k3 ')
+        run: python3 -m pytest -v test/registered/unit/kernel_plugins/nvidia/test_megakernel_hybrid_verify.py
+
       - name: Run end-to-end tests
         timeout-minutes: 180
         working-directory: sgl-nvidia-mega
