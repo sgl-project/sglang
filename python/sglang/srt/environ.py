@@ -1400,9 +1400,9 @@ class Envs:
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     SGLANG_TRTLLM_MLA_WORKSPACE_MB = EnvInt(_k31_gb_best(256, 150))
-    # Upper bound on rows per finalized SiTU MXFP4 launch. Larger batches are
-    # split into sequential launches; 0 keeps one-shot launches.
-    # Deferred-finalize calls always use one launch.
+    # Cap rows per ordinary finalized SiTU MXFP4 StandardTopK routed launch.
+    # Non-positive values keep one-shot launches. Prepared routing, router-logit
+    # dispatch, specialized CUDA decode, and deferred finalize are unchanged.
     SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH = EnvInt(0)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
