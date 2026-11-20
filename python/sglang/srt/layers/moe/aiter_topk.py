@@ -53,7 +53,12 @@ def _allocate_shared_columns(
 
 
 def _shared_columns(
-    config: "TopKConfig", *, routed_k: int, num_experts: int, device: torch.device
+    config: "TopKConfig",
+    *,
+    routed_k: int,
+    num_experts: int,
+    num_tokens: int,
+    device: torch.device,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """The config's persistent buffers, or None when creating them now would
     land inside a graph capture."""
@@ -64,7 +69,8 @@ def _shared_columns(
     cached = config.aiter_shared_columns
     if cached is None:
         # Allocation must not land inside a graph capture; warmup normally allocates first.
-        if torch.cuda.is_current_stream_capturing():
+        # A batch taller than the buffer keeps the append path without allocating.
+        if torch.cuda.is_current_stream_capturing() or num_tokens > _buffer_height():
             return None
         weights, ids = _allocate_shared_columns(
             routed_k=routed_k,
@@ -170,7 +176,11 @@ def try_select_experts(
     ):
         return None
     buffers = _shared_columns(
-        config, routed_k=routed_k, num_experts=num_experts, device=router_logits.device
+        config,
+        routed_k=routed_k,
+        num_experts=num_experts,
+        num_tokens=token,
+        device=router_logits.device,
     )
     if buffers is None or token > buffers[0].shape[0]:
         return None

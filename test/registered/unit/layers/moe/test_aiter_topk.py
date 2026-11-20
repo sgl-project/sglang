@@ -487,6 +487,10 @@ class TestAiterSharedColumnsContract(CustomTestCase):
 
         with get_schedule().override(chunked_prefill_size=2048, max_prefill_tokens=0):
             config = self._config()
+            self.assertIsNone(self._fuse(config, num_tokens=8193))
+            self.assertIsNone(config.aiter_shared_columns)
+            self.assertIsNotNone(self._fuse(config, num_tokens=1))
+            config = self._config()
             self.assertIsNotNone(self._fuse(config, num_tokens=8192))
             self.assertIsNone(self._fuse(config, num_tokens=8193))
 
