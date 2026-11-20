@@ -24440,6 +24440,11 @@ impl ::serde::Serialize for GetServerInfoResponse {
             "supports_staged_video",
             &self.supports_staged_video,
         )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "native_model_type",
+            &self.native_model_type,
+        )?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -24474,6 +24479,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_instance_id = None;
                 let mut f_accepts_encoder_handoff = None;
                 let mut f_supports_staged_video = None;
+                let mut f_native_model_type = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -24615,6 +24621,15 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             }
                             f_supports_staged_video = Some(map.next_value::<bool>()?);
                         }
+                        "native_model_type" => {
+                            if f_native_model_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "native_model_type",
+                                ));
+                            }
+                            f_native_model_type =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -24640,6 +24655,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     instance_id: f_instance_id.unwrap_or_default(),
                     accepts_encoder_handoff: f_accepts_encoder_handoff.unwrap_or_default(),
                     supports_staged_video: f_supports_staged_video.unwrap_or_default(),
+                    native_model_type: f_native_model_type.unwrap_or_default(),
                 })
             }
         }

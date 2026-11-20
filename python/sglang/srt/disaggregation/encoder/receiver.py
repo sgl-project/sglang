@@ -1314,6 +1314,17 @@ class WaitingZmqRequest(WaitingMMRequestBase):
         return True
 
 
+async def _release_staged_transfer(handoff, rid):
+    try:
+        await handoff.release(envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get())
+    except Exception as exc:
+        logger.warning(
+            "Early release of staged media for rid=%s failed; encoder lease will expire: %s",
+            rid,
+            exc,
+        )
+
+
 class WaitingStagedImage(WaitingZmqRequest):
     """One private PULL socket. The native part and local scheduler rid differ."""
 
@@ -1333,6 +1344,11 @@ class WaitingStagedImage(WaitingZmqRequest):
 
     def _embedding_shape(self):
         handoff = self.recv_req.encoder_handoff
+        if handoff.version == 3:
+            return (
+                sum(item.embedding_rows for item in (*handoff.images, *handoff.videos)),
+                handoff.embedding_width,
+            )
         merge = self.mm_processor.spatial_merge_size
         rows = sum(
             layout.t * (layout.h // merge) * (layout.w // merge)
@@ -1368,7 +1384,7 @@ class WaitingStagedImage(WaitingZmqRequest):
                 and _cat_grid([recv_obj.grid_dim]).tolist() != handoff.grids()
             ):
                 raise ValueError("received image grid differs from staged descriptor")
-            if handoff.version == 2 and (
+            if handoff.version >= 2 and (
                 tuple(recv_obj.shape) != self._embedding_shape()
                 or recv_obj.dtype not in (torch.float16, torch.bfloat16, torch.float32)
             ):
@@ -1383,44 +1399,59 @@ class WaitingStagedImage(WaitingZmqRequest):
         # The processor's spans run in prompt order, possibly interleaving both.
         handoff = self.recv_req.encoder_handoff
         (packed,) = recv_embedding.values()
-        merge = self.mm_processor.spatial_merge_size
-        image_rows = sum(v.t * (v.h // merge) * (v.w // merge) for v in handoff.images)
+        if handoff.version == 3:
+            image_rows = sum(item.embedding_rows for item in handoff.images)
+        else:
+            merge = self.mm_processor.spatial_merge_size
+            image_rows = sum(
+                v.t * (v.h // merge) * (v.w // merge) for v in handoff.images
+            )
         offsets = {Modality.IMAGE: 0, Modality.VIDEO: image_rows}
         mm = self.staged_layout
         for item in mm.mm_items:
-            ((start, end),) = item.offsets
             cursor = offsets[item.modality]
-            offsets[item.modality] = cursor + end - start + 1
+            offsets[item.modality] = cursor + sum(
+                end - start + 1 for start, end in item.offsets
+            )
             item.precomputed_embeddings = packed[cursor : offsets[item.modality]]
         if (
             offsets[Modality.IMAGE] != image_rows
             or offsets[Modality.VIDEO] != packed.shape[0]
         ):
             raise ValueError("staged media rows differ from rebuilt prompt")
-        handoff.bind_identities(mm.mm_items, self.recv_req.encoder_routing_hashes)
-        attach_mm_routing_labels(mm.mm_items, self.recv_req.mm_routing_labels)
         self._bind_pool_slot_to_mm_inputs(mm)
+        self._publish_layout()
+
+    def _publish_layout(self):
+        mm = self.staged_layout
+        self.recv_req.encoder_handoff.bind_identities(
+            mm.mm_items, self.recv_req.encoder_routing_hashes
+        )
+        attach_mm_routing_labels(mm.mm_items, self.recv_req.mm_routing_labels)
         self.recv_req.mm_inputs = mm
         self.recv_req.input_ids = array("q", mm.input_ids)
         self.status = WaitingMMRequestStatus.SUCCESS
-
-    async def _release_transfer(self):
-        try:
-            await self.recv_req.encoder_handoff.release(
-                envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
-            )
-        except Exception as exc:
-            logger.warning(
-                "Early release of staged media for rid=%s failed; encoder lease will expire: %s",
-                self.rid,
-                exc,
-            )
 
     def release_resources(self):
         super().release_resources()
         if not getattr(self, "_release_submitted", False) and self.registration_runner:
             self._release_submitted = True
-            self.registration_runner.submit(self._release_transfer())
+            self.registration_runner.submit(
+                _release_staged_transfer(self.recv_req.encoder_handoff, self.rid)
+            )
+
+
+class WaitingStagedTpPeer(WaitingStagedImage):
+    """A non-owner TP rank waits for the leader's one completed transfer."""
+
+    needs_recv_socket = False
+
+    def send_encode_request(self):
+        self._publish_layout()
+
+    def release_resources(self):
+        # Only the leader owns the lease and any registered receive buffer.
+        WaitingMMRequestBase.release_resources(self)
 
 
 class WaitingStagedNixlImage(WaitingStagedImage):
@@ -2100,6 +2131,7 @@ class MMReceiverBase(ABC):
         if (
             scheduler is not None
             and self.encoder_transfer_backend == "nixl"
+            and self.tp_rank == 0
             and get_disagg().disaggregation_mode != "decode"
         ):
             from sglang.srt.disaggregation.encoder.nixl import NixlReceiver
@@ -2554,27 +2586,29 @@ class MMReceiverBase(ABC):
                 error_code = HTTPStatus.INTERNAL_SERVER_ERROR
                 try:
                     if handoff is not None:
+                        if (
+                            handoff.version == 3
+                            and handoff.embedding_width
+                            != self.scheduler.model_config.hidden_size
+                        ):
+                            raise ValueError(
+                                "staged embedding width differs from the language model"
+                            )
                         mm = handoff.build_layout(
                             self.mm_processor,
                             recv_req.input_ids,
                             self.scheduler.max_req_input_len,
                         )
-                        if get_disagg().disaggregation_mode == "decode":
-                            handoff.bind_identities(
-                                mm.mm_items, recv_req.encoder_routing_hashes
-                            )
-                            recv_req.mm_inputs = mm
-                            recv_req.input_ids = array("q", mm.input_ids)
-                            new_recv_reqs.append(recv_req)
-                            continue
-                        cls = WaitingStagedImage
                         transport_kwargs = {**extra_kwargs, "staged_layout": mm}
-                        if self.encoder_transfer_backend == "nixl":
+                        if get_disagg().disaggregation_mode == "decode" or (
+                            self.tp_size > 1 and self.tp_rank != 0
+                        ):
+                            cls = WaitingStagedTpPeer
+                        elif self.encoder_transfer_backend == "nixl":
                             cls = WaitingStagedNixlImage
-                            transport_kwargs = {
-                                **transport_kwargs,
-                                "nixl_receiver": self.nixl_receiver,
-                            }
+                            transport_kwargs["nixl_receiver"] = self.nixl_receiver
+                        else:
+                            cls = WaitingStagedImage
                     elif self.encoder_transfer_backend == "nixl":
                         raise ValueError(
                             "NIXL embedding receive requires a staged media handoff"
@@ -2601,13 +2635,13 @@ class MMReceiverBase(ABC):
                     self.waiting_by_rid[waiting_req.rid] = waiting_req
                     waiting_req.send_encode_request()
                 except Exception as error:
-                    local_error = f"{type(error).__name__}: {error}"
                     if (
                         handoff is not None
                         and waiting_req is None
                         and isinstance(error, ValueError)
                     ):
                         error_code = HTTPStatus.BAD_REQUEST
+                    local_error = (f"{type(error).__name__}: {error}", error_code)
                     logger.exception(
                         "Failed to start multimodal receive for rid=%s", recv_req.rid
                     )
@@ -2624,8 +2658,11 @@ class MMReceiverBase(ABC):
                 ]
                 if failed_ranks:
                     details = "; ".join(
-                        f"rank {rank}: {rank_errors[rank]}" for rank in failed_ranks
+                        f"rank {rank}: {rank_errors[rank][0]}" for rank in failed_ranks
                     )
+                    # All ranks return the same failure, including when only a
+                    # follower rejected the request or failed to bind a resource.
+                    error_code = rank_errors[failed_ranks[0]][1]
                     error_msg = f"Failed to start multimodal receive ({details})"
                     logger.error(error_msg)
                     if waiting_req is not None:
@@ -2645,6 +2682,16 @@ class MMReceiverBase(ABC):
                                 waiting_req.rid,
                             )
                         self.waiting_by_rid.pop(waiting_req.rid, None)
+                    elif (
+                        handoff is not None
+                        and (self.tp_size == 1 or self.tp_rank == 0)
+                        and self.registration_runner is not None
+                        and get_disagg().disaggregation_mode != "decode"
+                    ):
+                        # Admission may fail before a waiting object owns the lease.
+                        self.registration_runner.submit(
+                            _release_staged_transfer(handoff, recv_req.rid)
+                        )
                     abort_reqs.append(
                         (
                             self.create_req(recv_req),
@@ -2654,6 +2701,10 @@ class MMReceiverBase(ABC):
                     )
                     continue
 
+                if handoff is not None and get_disagg().disaggregation_mode == "decode":
+                    self.waiting_by_rid.pop(waiting_req.rid)
+                    new_recv_reqs.append(recv_req)
+                    continue
                 self.waiting_list.append(waiting_req)
             else:
                 new_recv_reqs.append(recv_req)
@@ -2689,6 +2740,22 @@ class MMReceiverBase(ABC):
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
             if status_value == WaitingMMRequestStatus.SUCCESS:
+                if self.tp_size > 1 and isinstance(waiting_req, WaitingStagedImage):
+                    # Exactly one rank consumes the encoder lease. Everyone has
+                    # already validated the same native layout. Broadcast only
+                    # its tensors on the matching CPU/GPU process group.
+                    items = waiting_req.recv_req.mm_inputs.mm_items
+                    embeddings = self.tp_group.broadcast_tensor_dict(
+                        {
+                            str(i): item.precomputed_embeddings
+                            for i, item in enumerate(items)
+                        }
+                        if self.tp_rank == 0
+                        else None
+                    )
+                    if self.tp_rank != 0:
+                        for index, item in enumerate(items):
+                            item.precomputed_embeddings = embeddings[str(index)]
                 new_recv_reqs.append(waiting_req.recv_req)
             elif status_value == WaitingMMRequestStatus.FAIL:
                 self._sync_fail_info_across_tp(waiting_req)

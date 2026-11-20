@@ -248,13 +248,22 @@ class TestStagedNativeTransfer(CustomTestCase):
         *,
         video_processor=True,
         video_decoder=True,
+        send_sockets=(),
     ):
         from sglang.srt.disaggregation.encoder import grpc_server
 
         grids = [[1, 2, 2], [1, 4, 2]]
+        if model_type == "kimi_vl":
+            grids = [[2, 2], [4, 2]]
+        elif model_type in {"inkling2", "muse_spark"}:
+            grids = [[1, 1, 1], [1, 2, 1]]
         tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         enc = MMEncoder.__new__(MMEncoder)
         enc.model_type = model_type
+        enc.model = SimpleNamespace(
+            visual=Mock(),
+            _encoder_processor=SimpleNamespace(temporal_compression_ratio=1),
+        )
         enc.transfer_backend = backend
         enc.use_mooncake = enc.mm_global_cache_enabled = False
         enc.rank = 0
@@ -264,6 +273,11 @@ class TestStagedNativeTransfer(CustomTestCase):
         enc.encode_dispatch_lock = asyncio.Lock()
         enc.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
         enc.preprocessor.model_type = enc.model_type
+        enc.preprocessor.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
+            )
+        )
         enc.preprocessor._supported_modalities = {Modality.IMAGE}
         if video_processor:
             enc.preprocessor._supported_modalities.add(Modality.VIDEO)
@@ -280,11 +294,29 @@ class TestStagedNativeTransfer(CustomTestCase):
 
         async def prepare(requests, modality, **kwargs):
             item_grids, counts, aux = grids, [1, 2], {}
+            if model_type in {"kimi_k3", "kimi_k31"} and modality == Modality.IMAGE:
+                aux["original_image_sizes"] = [[32, 48], [80, 27]]
             if modality == Modality.VIDEO:
                 item_grids, counts = [[2, 2, 2], [3, 2, 2]], [2, 3]
-                if model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                if model_type == "muse_spark":
+                    item_grids = [[2, 1, 1], [3, 1, 1]]
+                if model_type in {
+                    "qwen3_vl",
+                    "qwen3_vl_moe",
+                    "qwen3_5",
+                    "qwen3_5_moe",
+                    "intern_s2_preview",
+                    "glm4v",
+                    "glm4v_moe",
+                    "glm5_next",
+                    "muse_spark",
+                }:
                     aux["video_timestamps"] = [[0.0, 0.5], [0.0, 0.6, 1.2]]
-                elif model_type == "qwen2_5_vl":
+                elif model_type == "mimo_v2":
+                    aux["video_timestamps"] = [0.0, 0.5, 0.0, 0.6, 1.2]
+                elif model_type == "minimax_m3_vl":
+                    aux["video_timestamps"] = [[0.0, 0.5], None]
+                elif model_type in {"qwen2_5_vl", "qwen3_omni_moe"}:
                     aux["second_per_grid_ts"] = torch.tensor([0.5, 0.75])
             ctx = SimpleNamespace(
                 req_id=requests[0]["req_id"],
@@ -315,7 +347,9 @@ class TestStagedNativeTransfer(CustomTestCase):
             patch.object(
                 grpc_server,
                 "get_parallel",
-                return_value=SimpleNamespace(tp_size=1, num_dp_ranks=1),
+                return_value=SimpleNamespace(
+                    tp_size=1 + len(send_sockets), num_dp_ranks=1, pp_size=1, nnodes=1
+                ),
             ),
             patch.object(
                 grpc_server,
@@ -333,7 +367,7 @@ class TestStagedNativeTransfer(CustomTestCase):
             ThreadPoolExecutor(4) as enc.executor,
             zmq.asyncio.Context() as receivers,
         ):
-            svc = grpc_server.SGLangEncoderServer(enc, [], Mock())
+            svc = grpc_server.SGLangEncoderServer(enc, send_sockets, Mock())
 
             yield svc, enc, receivers, grids, tensor
 
@@ -517,7 +551,13 @@ class TestStagedNativeTransfer(CustomTestCase):
                     self.assertEqual(
                         (layout.t, layout.h, layout.w), (tensor.shape[0], 2, 2)
                     )
-                    if model.startswith("qwen3"):
+                    if model in {
+                        "qwen3_vl",
+                        "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
+                        "intern_s2_preview",
+                    }:
                         self.assertEqual(
                             list(layout.timestamps), [[0.0, 0.5], [0.0, 0.6, 1.2]][i]
                         )
@@ -535,9 +575,10 @@ class TestStagedNativeTransfer(CustomTestCase):
                         ],
                     )
                     self.assertEqual(
-                        layout.HasField("second_per_grid_ts"), model == "qwen2_5_vl"
+                        layout.HasField("second_per_grid_ts"),
+                        model in {"qwen2_5_vl", "qwen3_omni_moe"},
                     )
-                    if model == "qwen2_5_vl":
+                    if model in {"qwen2_5_vl", "qwen3_omni_moe"}:
                         self.assertEqual(layout.second_per_grid_ts, [0.5, 0.75][i])
                 state = enc.req_states[transfer.part_id]
                 if backend == "nixl":
@@ -569,11 +610,241 @@ class TestStagedNativeTransfer(CustomTestCase):
                         self.assertEqual(data, expected.numpy().tobytes())
                 self.assert_retired(svc, enc, [state])
 
-        for model in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"):
+        for model in (
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "intern_s2_preview",
+            "qwen3_omni_moe",
+        ):
             for backend in ("nixl", "zmq_to_scheduler"):
                 for images in ([], ["i1", "i2"]):
                     with self.subTest(model=model, backend=backend, mixed=bool(images)):
                         asyncio.run(run(backend, model, images))
+
+    def test_staged_native_model_layout(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder.native_handoff import (
+            NATIVE_IMAGE_MODEL_TYPES,
+            NATIVE_VIDEO_MODEL_TYPES,
+        )
+
+        async def run(model, backend):
+            with self.native_encoder(backend, model) as (svc, enc, _, _, _):
+                info = await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), Mock())
+                self.assertEqual(info.native_model_type, model)
+                self.assertEqual(
+                    info.supports_staged_video, model in NATIVE_VIDEO_MODEL_TYPES
+                )
+                videos = ["video1", "video2"] if info.supports_staged_video else []
+                transfer = (
+                    await svc.Stage(
+                        pb.StageRequest(
+                            request_id="native",
+                            mm_items=["image1", "image2"],
+                            video_urls=videos,
+                        ),
+                        Mock(),
+                    )
+                ).transfer
+                self.assertEqual(transfer.version, 3)
+                self.assertEqual(transfer.native_model_type, model)
+                self.assertEqual(transfer.embedding_width, 4)
+                self.assertEqual([x.embedding_rows for x in transfer.images], [1, 2])
+                self.assertEqual([x.t for x in transfer.images], [1, 1])
+                sizes = (
+                    [[32, 48], [80, 27]]
+                    if model in {"kimi_k3", "kimi_k31"}
+                    else [[], []]
+                )
+                self.assertEqual(
+                    [list(x.original_size) for x in transfer.images], sizes
+                )
+                if videos:
+                    self.assertEqual(
+                        [x.embedding_rows for x in transfer.videos], [2, 3]
+                    )
+                    self.assertEqual(
+                        [len(x.identities) for x in transfer.videos],
+                        [2, 3] if model == "mimo_v2" else [1, 1],
+                    )
+                    expected_times = [
+                        [0.0, 0.5],
+                        [] if model == "minimax_m3_vl" else [0.0, 0.6, 1.2],
+                    ]
+                    self.assertEqual(
+                        [list(x.timestamps) for x in transfer.videos], expected_times
+                    )
+                else:
+                    context = AsyncMock()
+                    context.abort.side_effect = RuntimeError(
+                        "staged video is unavailable"
+                    )
+                    with self.assertRaisesRegex(
+                        RuntimeError, "staged video is unavailable"
+                    ):
+                        await svc.Stage(
+                            pb.StageRequest(request_id="video", video_urls=["v"]),
+                            context,
+                        )
+                await svc.Release(
+                    pb.ReleaseRequest(transfer_id=transfer.transfer_id), Mock()
+                )
+                self.assertEqual(enc.req_states, {})
+
+        for model in sorted(NATIVE_IMAGE_MODEL_TYPES):
+            for backend in ("nixl", "zmq_to_scheduler"):
+                with self.subTest(model=model, backend=backend):
+                    asyncio.run(run(model, backend))
+
+    def test_tp_stage_drains_cancelled_dispatch_before_next_modality(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder import grpc_server
+
+        async def run():
+            started, resume = asyncio.Event(), asyncio.Event()
+            calls = {1: [], 2: [], 0: []}
+            with self.native_encoder(send_sockets=[1, 2]) as (svc, enc, *_):
+
+                async def send(rank, wrapped):
+                    request = unwrap_from_pickle(wrapped)
+                    follower = Mock()
+
+                    async def record(part, modality):
+                        calls[rank].append((part["req_id"], modality))
+
+                    follower.encode_staged_on_tp_ranks = record
+                    await encoder_server._handle_encoder_worker_request(
+                        follower, request
+                    )
+                    if rank == 1 and len(calls[rank]) == 1:
+                        started.set()
+                        await resume.wait()
+
+                async def local(part, modality):
+                    calls[0].append((part["req_id"], modality))
+                    (result,) = await enc.batch_encode([part], modality)
+                    return result
+
+                enc.encode_staged_on_tp_ranks = local
+                with patch.object(grpc_server, "async_sock_send", send):
+                    first = asyncio.create_task(
+                        svc.Stage(
+                            pb.StageRequest(request_id="cancel", mm_items=["a", "b"]),
+                            Mock(),
+                        )
+                    )
+                    await asyncio.wait_for(started.wait(), 2)
+                    first.cancel()
+                    next_stage = asyncio.create_task(
+                        svc.Stage(
+                            pb.StageRequest(
+                                request_id="mixed",
+                                mm_items=["a", "b"],
+                                video_urls=["c", "d"],
+                            ),
+                            Mock(),
+                        )
+                    )
+                    await asyncio.sleep(0)
+                    self.assertTrue(enc.encode_dispatch_lock.locked())
+                    self.assertFalse(first.done())
+                    self.assertFalse(calls[0] or calls[2])
+                    resume.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await first
+                    transfer = (await asyncio.wait_for(next_stage, 2)).transfer
+                    self.assertEqual(calls[0], calls[1])
+                    self.assertEqual(calls[0], calls[2])
+                    self.assertEqual(
+                        [x[1] for x in calls[0]],
+                        [Modality.IMAGE, Modality.IMAGE, Modality.VIDEO],
+                    )
+                    self.assertEqual(set(enc.req_states), {transfer.part_id})
+                    await svc.Release(
+                        pb.ReleaseRequest(transfer_id=transfer.transfer_id), Mock()
+                    )
+
+        asyncio.run(run())
+
+    def test_tp_follower_error_prevents_publication(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+        from sglang.srt.disaggregation.encoder import grpc_server
+
+        async def run():
+            with self.native_encoder(send_sockets=[1]) as (svc, enc, *_):
+                group = object()
+                parallel = SimpleNamespace(tp_group=SimpleNamespace(cpu_group=group))
+                context = AsyncMock()
+                context.abort.side_effect = RuntimeError("tensor-parallel failure")
+
+                def follower_status(status, *, op, group):
+                    self.assertEqual(status.item(), 0)
+                    self.assertIs(group, parallel.tp_group.cpu_group)
+                    status.fill_(400)
+
+                with (
+                    patch.object(grpc_server, "async_sock_send", AsyncMock()),
+                    patch.object(encoder_server, "get_parallel", return_value=parallel),
+                    patch.object(torch.distributed, "all_reduce", follower_status),
+                    self.assertRaisesRegex(RuntimeError, "tensor-parallel failure"),
+                ):
+                    await svc.Stage(
+                        pb.StageRequest(request_id="failed", mm_items=["a", "b"]),
+                        context,
+                    )
+                self.assertEqual(
+                    context.abort.await_args.args[0],
+                    grpc_server.grpc.StatusCode.INVALID_ARGUMENT,
+                )
+                self.assertFalse(svc._leases or enc.req_states or svc._active)
+
+        asyncio.run(run())
+
+    def test_failed_tp_dispatch_fences_the_group(self):
+        from sglang.srt.disaggregation.encoder import grpc_server
+
+        async def run():
+            with self.native_encoder(send_sockets=[1, 2]) as (svc, enc, *_):
+                enc.encode_staged_on_tp_ranks = AsyncMock()
+                svc._on_dispatch_failure = Mock()
+                send = AsyncMock(side_effect=[None, RuntimeError("broken IPC")])
+                with patch.object(grpc_server, "async_sock_send", send):
+                    with self.assertRaisesRegex(RuntimeError, "broken IPC"):
+                        await svc._dispatch_staged({}, Modality.VIDEO)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "dispatch is unavailable"
+                    ):
+                        await svc._dispatch_encode({})
+                self.assertEqual(send.await_count, 2)
+                svc._on_dispatch_failure.assert_called_once()
+                enc.encode_staged_on_tp_ranks.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_mimo_rejects_video_with_linked_audio(self):
+        with self.native_encoder(model_type="mimo_v2") as (svc, *_):
+            self.assertRaisesRegex(
+                ValueError,
+                "without an audio track",
+                svc._video_layouts,
+                SimpleNamespace(video_audio_feature_lens=torch.tensor([8])),
+            )
+
+    def test_unrecognized_model_does_not_advertise_staging(self):
+        from sglang.encoder.v1 import encoder_pb2 as pb
+
+        async def run():
+            with self.native_encoder(model_type="unregistered_model") as (svc, *_):
+                context = AsyncMock()
+                context.abort.side_effect = RuntimeError("model lacks staged adapter")
+                with self.assertRaisesRegex(RuntimeError, "model lacks staged adapter"):
+                    await svc.GetEncoderInfo(pb.GetEncoderInfoRequest(), context)
+
+        asyncio.run(run())
 
     def test_failed_or_cancelled_mixed_stage_retires_both_native_parts(self):
         from sglang.encoder.v1 import encoder_pb2 as pb
@@ -1018,6 +1289,32 @@ class TestEncoderPreprocessorOffEventLoop(CustomTestCase):
             return result
 
         return asyncio.run(run())
+
+    def test_glm_video_timestamps_match_native_prompt(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor.model_type = "glm4v"
+        preprocessor._flatten_and_load_videos = AsyncMock(
+            return_value=(
+                [object()] * 3,
+                {
+                    "video_metadata": [
+                        {"fps": 10, "frames_indices": [0, 1, 4, 5, 8]},
+                        {"fps": 8, "frames_indices": [2, 3]},
+                        {"fps": None, "frames_indices": []},
+                    ]
+                },
+            )
+        )
+        preprocessor.video_processor = Mock(
+            return_value={
+                "video_grid_thw": torch.tensor([[2, 2, 2], [3, 2, 2], [1, 2, 2]])
+            }
+        )
+        with preprocessor.preproc_executor, preprocessor.io_executor:
+            output = asyncio.run(
+                preprocessor._process_video_items(["a", "b", "c"], None)
+            )
+        self.assertEqual(output["video_timestamps"], [[0.0, 0.4], [0.25] * 3, [0.0]])
 
     def test_video_hook_runs_off_the_event_loop(self):
         preprocessor = self._make_preprocessor()

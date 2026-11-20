@@ -275,12 +275,18 @@ class KimiGridMMDataMixin:
                 "The number of image placeholders does not match img_grid_thw entries."
             )
 
-        image_embeddings = embeddings[Modality.IMAGE]
+        image_embeddings = (
+            embeddings[Modality.IMAGE] if embeddings is not None else None
+        )
         mm_items = []
         consumed = 0
         for (start, end), grid in zip(offsets, img_grid_thw):
             num_tokens = end - start + 1
-            embedding_slice = image_embeddings[consumed : consumed + num_tokens]
+            embedding_slice = (
+                image_embeddings[consumed : consumed + num_tokens]
+                if image_embeddings is not None
+                else None
+            )
             consumed += num_tokens
             mm_items.append(
                 MultimodalDataItem(
@@ -291,7 +297,7 @@ class KimiGridMMDataMixin:
                 )
             )
 
-        if self.uses_wide_image_identity:
+        if embeddings is not None and self.uses_wide_image_identity:
             self.assign_kimi_image_identities(mm_items, None)
 
         return MultimodalProcessorOutput(

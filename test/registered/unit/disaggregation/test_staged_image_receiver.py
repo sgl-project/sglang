@@ -68,8 +68,8 @@ def request(rid):
 
 def bridge(external=True):
     rust = RustServer(Mock(), http_port=0)
-    rust._external_image_token_id = 8 if external else None
-    rust._external_video_token_id = 10 if external else None
+    if external:
+        rust.bind_external_encoder_processor(processor())
     rust._encoder_dispatcher = Mock()
     return rust
 
@@ -196,6 +196,33 @@ class TestStagedImageReceiver(unittest.TestCase):
                 text, {"input_ids": array("q", [8]), "epd.handoff": b"{}"}
             )
 
+    def test_external_ingress_uses_each_processors_raw_markers(self):
+        rust = bridge()
+        glm = SimpleNamespace(
+            IM_TOKEN_ID=10,
+            VIDEO_TOKEN_ID=11,
+            mm_tokens=SimpleNamespace(image_token_id=10, video_token_id=10),
+        )
+        rust.bind_external_encoder_processor(glm)
+        self.assertEqual(rust._external_media_markers.counts([10, 11, 11]), (1, 2))
+        glm.accepts_staged_expanded_spans = True
+        rust.bind_external_encoder_processor(glm)
+        self.assertEqual(rust._external_media_markers.counts([10, 10]), (None, None))
+        kimi = SimpleNamespace(mm_tokens=SimpleNamespace(image_token_id=163605))
+        rust.bind_external_encoder_processor(kimi)
+        self.assertEqual(rust._external_media_markers.counts([163605]), (1, 0))
+        muse = SimpleNamespace(
+            patch_id=30,
+            video_id=31,
+            image_placeholder_ids=[7, 8],
+            video_placeholder_ids=[7, 9],
+        )
+        rust.bind_external_encoder_processor(muse)
+        for prompt in ([7, 8], [42, 7, 9], [30], [31]):
+            with self.assertRaises(NoEncoderError):
+                rust._attach_buffers(request("raw"), {"input_ids": array("q", prompt)})
+        rust._attach_buffers(request("text"), {"input_ids": array("q", [7, 42, 9])})
+
     def test_video_only_limits_timing_and_cache_identity(self):
         rid = "09" * 16
         meta = {
@@ -260,6 +287,11 @@ class TestStagedImageReceiver(unittest.TestCase):
             torch.equal(layouts[0].mrope_positions, layouts[1].mrope_positions)
         )
 
+        q.model_type = "qwen3_omni_moe"
+        q.audio_start_token_id, q.hf_config.audio_token_id = 11, 12
+        q.hf_config.position_id_per_seconds = 4
+        omni_clip = handoff.build_layout(q, prompt, 100)
+        self.assertEqual([i.modality for i in omni_clip.mm_items], [Modality.VIDEO])
         q.model_type = "qwen3_vl"
         with self.assertRaisesRegex(ValueError, "metadata differs"):
             handoff.build_layout(q, prompt, 100)
@@ -269,8 +301,15 @@ class TestStagedImageReceiver(unittest.TestCase):
             second_per_grid_ts=None,
         )
         handoff = EncoderHandoff.parse(timed_video, 0, 1)
-        q.model_type = "qwen3_5"
-        with self.assertRaisesRegex(ValueError, "unsupported for qwen3_5"):
+        for model_type in ("qwen3_5", "qwen3_5_moe", "intern_s2_preview"):
+            with self.subTest(model_type=model_type):
+                q.model_type = model_type
+                mm = handoff.build_layout(q, prompt, 100)
+                self.assertEqual(
+                    [i.modality for i in mm.mm_items], [Modality.VIDEO] * 2
+                )
+        q.model_type = "unsupported_vl"
+        with self.assertRaisesRegex(ValueError, "unsupported for unsupported_vl"):
             handoff.build_layout(q, prompt, 100)
         q.model_type = "qwen3_vl"
         # The two embedding rows fit; the per-frame timestamp and marker tokens do not.
@@ -291,6 +330,7 @@ class TestStagedImageReceiver(unittest.TestCase):
         )
         rx = scheduler(None)
         rx.scheduler.max_req_input_len = 8
+        rx.registration_runner = None  # Synchronous admission-only fixture.
         rx.create_req = lambda req: req
         admitted, errors = rx.process_waiting_requests([obj])
         self.assertFalse(admitted)

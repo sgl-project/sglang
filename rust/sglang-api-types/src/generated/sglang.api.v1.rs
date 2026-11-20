@@ -3922,6 +3922,9 @@ pub struct GetServerInfoResponse {
     /// Accepts version-2 encoder handoffs containing video layouts.
     #[prost(bool, tag = "18")]
     pub supports_staged_video: bool,
+    /// Native model type accepted by this listener's version-3 handoff.
+    #[prost(string, tag = "19")]
+    pub native_model_type: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

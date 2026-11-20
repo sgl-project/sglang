@@ -44,6 +44,8 @@ message GetEncoderInfoResponse {
   // Source policy applied by the native encoder when fetching remote URLs.
   // A sidecar that fetches bytes on its behalf must honor these bounds.
   StagedMediaPolicy staged_media_policy = 5;
+  // Present when this encoder emits the model-specific v3 handoff.
+  string native_model_type = 6;
 }
 
 message StagedMediaPolicy {
@@ -63,11 +65,12 @@ message ImageLayout {
   uint32 h = 2;
   uint32 w = 3;
   string identity = 4; // native full EPD cache key, lowercase hex
+  uint32 embedding_rows = 5; // v3: exact rows in the packed output
+  repeated uint32 original_size = 6; // v3: [width, height] when required by the processor
 }
 
-// Video grids are reported by the encoder after sampling. Qwen3-VL returns
-// one identity and timestamp per temporal group, Qwen2/2.5-VL one identity
-// per video. Qwen2.5-VL also uses seconds per temporal grid for M-RoPE.
+// Grids reflect sampling on the encoder. Each identity covers the embedding
+// for one native language-processor item, which can be a clip or a frame group.
 message VideoLayout {
   uint32 t = 1;
   uint32 h = 2;
@@ -75,6 +78,7 @@ message VideoLayout {
   repeated string identities = 4;
   repeated double timestamps = 5;
   optional double second_per_grid_ts = 6;
+  uint32 embedding_rows = 7; // v3: exact rows in the packed output
 }
 
 message StagedImageTransfer {
@@ -86,9 +90,13 @@ message StagedImageTransfer {
   uint32 num_parts = 6;
   uint32 image_count = 7;
   repeated ImageLayout images = 8;
-  // Version 2 packs image embedding rows first, followed by video rows.
+  // Versions 2 and 3 pack image embedding rows first, followed by video rows.
   // Within each modality, item order matches that of the original prompt.
   repeated VideoLayout videos = 9;
+  // Version 3 binds the layout to a native model processor. Grids use THW
+  // order; a native two-dimensional HW grid is represented with t = 1.
+  string native_model_type = 10;
+  uint32 embedding_width = 11;
 }
 
 message StageResponse { StagedImageTransfer transfer = 1; }

@@ -1785,6 +1785,14 @@ class Scheduler(
                 scheduler=self,
             )
 
+            if (
+                self.rust_server is not None
+                and envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get()
+            ):
+                self.rust_server.bind_external_encoder_processor(
+                    self.mm_receiver.mm_processor
+                )
+
     def _gpu_work_on_forward_stream(self) -> bool:
         # Muse Spark's monokernel launches need every one of their workgroups resident
         # at once (they wait on each other); a kernel on another stream that takes a CU

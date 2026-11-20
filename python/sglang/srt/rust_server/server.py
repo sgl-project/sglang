@@ -262,8 +262,7 @@ class RustServer:
         # --language-only: ready events since the last drain; errors for the next one.
         self._encoder_dispatcher: Optional[MMReceiverBase] = None
         self._encoder_bootstrap_server = None
-        self._external_image_token_id = None
-        self._external_video_token_id = None
+        self._external_media_markers = None
         self._external_media_limits = {}
         self._encoder_dispatch_ready: List[threading.Event] = []
         self._encoder_dispatch_errors: deque[EncoderDispatchErrorReq] = deque()
@@ -549,12 +548,6 @@ class RustServer:
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
-            instance._external_image_token_id = (
-                scheduler.model_config.hf_config.image_token_id
-            )
-            instance._external_video_token_id = (
-                scheduler.model_config.hf_config.video_token_id
-            )
             instance._external_media_limits = get_mm().limit_mm_data_per_request or {}
         elif get_disagg().language_only:
             instance._start_encoder_dispatch()
@@ -637,6 +630,16 @@ class RustServer:
                 "Unset SGLANG_RUST_SERVER to serve it."
             )
         model_config = scheduler.model_config
+        if envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.get():
+            from sglang.srt.disaggregation.encoder.native_handoff import (
+                NATIVE_IMAGE_MODEL_TYPES,
+                STAGED_VIDEO_MODEL_TYPES,
+            )
+
+            model_type = model_config.hf_config.model_type
+            if model_type not in STAGED_VIDEO_MODEL_TYPES | NATIVE_IMAGE_MODEL_TYPES:
+                raise RuntimeError(f"No staged encoder layout for {model_type!r}")
+            return
         if model_config.is_multimodal and rust_mm_family_of(model_config) is None:
             supported = sorted(
                 set(chain.from_iterable(f.model_types for f in RUST_MM_FAMILIES))
@@ -647,6 +650,12 @@ class RustServer:
                 f"model_type={model_config.hf_config.model_type!r}. "
                 "Unset SGLANG_RUST_SERVER to serve this model."
             )
+
+    def bind_external_encoder_processor(self, processor):
+        """Use the same raw prompt markers as the receiver that expands them."""
+        from sglang.srt.disaggregation.encoder.handoff import StagedPromptMarkers
+
+        self._external_media_markers = StagedPromptMarkers.from_processor(processor)
 
     def _start_encoder_dispatch(self) -> None:
         from sglang.srt.disaggregation.encoder.receiver import (
@@ -1079,17 +1088,17 @@ class RustServer:
         # pushing embeddings nobody waits for.
         media = buffers.get("epd.media")
         handoff = buffers.get("epd.handoff")
+        markers = self._external_media_markers
         if handoff is not None:
             from sglang.srt.disaggregation.encoder.handoff import EncoderHandoff
 
-            if self._external_image_token_id is None:
+            if markers is None:
                 raise ValueError(
                     "encoder_handoff requires SGLANG_EXTERNAL_ENCODER_HANDOFF=1"
                 )
             obj.encoder_handoff = EncoderHandoff.parse(
                 memoryview(handoff),
-                obj.input_ids.count(self._external_image_token_id),
-                obj.input_ids.count(self._external_video_token_id),
+                *markers.counts(obj.input_ids),
             )
             for modality, count in (
                 ("image", obj.encoder_handoff.image_count),
@@ -1104,13 +1113,9 @@ class RustServer:
             if hashes is not None:
                 obj.encoder_routing_hashes = msgspec.msgpack.decode(memoryview(hashes))
             obj.need_wait_for_mm_inputs = True
-        elif self._external_image_token_id is not None:
+        elif markers is not None:
             if media is not None or (
-                ids is not None
-                and (
-                    self._external_image_token_id in obj.input_ids
-                    or self._external_video_token_id in obj.input_ids
-                )
+                ids is not None and markers.contains_media(obj.input_ids)
             ):
                 raise NoEncoderError("A media prompt requires a staged encoder_handoff")
         elif media is not None:

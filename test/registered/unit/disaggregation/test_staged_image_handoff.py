@@ -60,7 +60,11 @@ class TestStagedImageHandoff(unittest.TestCase):
             handoff.validate_layout(3, 10, 128)
 
     def test_caller_hash_does_not_replace_content_identity(self):
+        from sglang.srt.multimodal.modality import Modality
+
         class Item:
+            modality = Modality.IMAGE
+
             def __init__(self, embedding, key):
                 self.precomputed_embeddings = embedding
                 self.cache_key = key

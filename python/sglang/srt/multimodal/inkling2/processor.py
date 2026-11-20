@@ -137,7 +137,9 @@ class Inkling2MultimodalProcessor(BaseMultimodalProcessor):
             raise ValueError(
                 f"Image placeholder count {count} does not match encoded image count {len(grids)}"
             )
-        image_embeddings = embeddings.get(Modality.IMAGE)
+        image_embeddings = (
+            embeddings.get(Modality.IMAGE) if embeddings is not None else None
+        )
         items = []
         output = []
         row = 0
@@ -153,7 +155,11 @@ class Inkling2MultimodalProcessor(BaseMultimodalProcessor):
                 MultimodalDataItem(
                     modality=Modality.IMAGE,
                     offsets=[(start, len(output) - 1)],
-                    precomputed_embeddings=image_embeddings[row : row + num_tokens],
+                    precomputed_embeddings=(
+                        image_embeddings[row : row + num_tokens]
+                        if embeddings is not None
+                        else None
+                    ),
                     model_specific_data={"vision_grid_thw": grid},
                 )
             )

@@ -199,12 +199,11 @@ def validate_rust_server_unsupported_args(server_args: Any) -> None:
         if (
             not envs.SGLANG_RUST_SERVER.get()
             or not cfg.language_only
-            or cfg.tp_size != 1
             or cfg.pp_size != 1
         ):
             raise ValueError(
                 "SGLANG_EXTERNAL_ENCODER_HANDOFF=1 requires SGLANG_RUST_SERVER=1, "
-                "--language-only and TP=PP=1"
+                "--language-only and PP=1"
             )
     if not envs.SGLANG_RUST_SERVER.get():
         return

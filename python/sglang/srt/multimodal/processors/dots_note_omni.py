@@ -219,6 +219,32 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         )
         super().__init__(hf_config, server_args, processor, transport_mode, **kwargs)
 
+    def get_staged_media_layout(self, prompt, img_grid_thw):
+        """Expand each image pad inside the tokenized Dots image delimiters."""
+        token_id = self.mm_token_ids["im_token_id"]
+        if prompt.count(token_id) != len(img_grid_thw):
+            raise ValueError("Dots image placeholders differ from the encoder layout")
+        ids = []
+        items = []
+        for token in prompt:
+            if token != token_id:
+                ids.append(token)
+                continue
+            grid = img_grid_thw[len(items)]
+            count = int(grid.prod()) // self.image_preprocessor.merge_size**2
+            start = len(ids)
+            ids.extend([token_id] * count)
+            items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(start, len(ids) - 1)],
+                    model_specific_data={"image_grid_thw": grid.reshape(1, 3)},
+                )
+            )
+        return MultimodalProcessorOutput(
+            input_ids=ids, mm_items=items, **self.mm_token_ids
+        )
+
     @staticmethod
     def _token_id(processor, token: str) -> int:
         token_ids = processor.encode(token, add_special_tokens=False)

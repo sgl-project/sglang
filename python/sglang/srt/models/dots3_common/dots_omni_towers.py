@@ -212,6 +212,11 @@ class DotsNoteOmniImagePreprocessor:
     def _get_image_token_str(self, token_count: int):
         return "<|img|>" + "<|imgpad|>" * token_count + "<|endofimg|>"
 
+    def __call__(self, *, images, **kwargs):
+        """Return the native Dots patch tensors for the standalone encoder."""
+        pixels, grids, _ = self.process_images(images)
+        return {"pixel_values": torch.cat(pixels), "image_grid_thw": torch.cat(grids)}
+
     def process_images(self, images: Iterable, details=None):
         images = list(images)
         details = details or ["auto"] * len(images)

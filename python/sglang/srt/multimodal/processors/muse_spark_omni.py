@@ -1049,6 +1049,8 @@ class MuseSpark1xOmniMultimodalProcessor(
             )
             ids = self._expand_mm_placeholders(ids, images, videos, audios)
             output = self._build_output(ids, images, videos, audios, transport=False)
+        if embeddings is None:
+            return output
         consumed = {}
         for item in output.mm_items:
             start = consumed.get(item.modality, 0)

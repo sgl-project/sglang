@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS
@@ -15,9 +15,7 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.utils import print_warning_once
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -583,6 +581,80 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         if modality == Modality.VIDEO:
             return [offset for offset in all_offsets if is_video_offset(offset)]
         return [offset for offset in all_offsets if not is_video_offset(offset)]
+
+    def get_staged_media_layout(
+        self, prompt, img_grid_thw=None, video_grid_thw=None, video_timestamps=()
+    ):
+        """Rebuild the HF frame blocks and native GLM position IDs from E metadata."""
+        images = iter(() if img_grid_thw is None else img_grid_thw)
+        videos = iter(
+            zip(() if video_grid_thw is None else video_grid_thw, video_timestamps)
+        )
+        ids = []
+        items = []
+        for token in prompt:
+            start = len(ids)
+            if token == self.IM_TOKEN_ID:
+                grid = next(images, None)
+                if grid is None:
+                    raise ValueError("GLM image placeholder exceeds encoder layout")
+                rows = int(grid.prod()) // self._processor.image_processor.merge_size**2
+                ids.extend([token] * rows)
+                offsets = [(start, len(ids) - 1)]
+                modality = Modality.IMAGE
+            elif token == self.VIDEO_TOKEN_ID:
+                video = next(videos, None)
+                if video is None:
+                    raise ValueError("GLM video placeholder exceeds encoder layout")
+                grid, timestamps = video
+                per_frame = (
+                    int(grid[1] * grid[2])
+                    // self._processor.video_processor.merge_size**2
+                )
+                frame_text = "".join(
+                    self._processor.replace_frame_token_id(
+                        time, num_image_tokens=per_frame
+                    )
+                    for time in timestamps
+                )
+                frame_ids = self._tokenizer.encode(frame_text, add_special_tokens=False)
+                offsets = [
+                    (start + begin, start + end)
+                    for begin, end in self.get_mm_items_offset(
+                        torch.tensor(frame_ids), self.IM_TOKEN_ID
+                    )
+                ]
+                ids.extend(frame_ids)
+                modality = Modality.VIDEO
+            else:
+                ids.append(token)
+                continue
+            items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    offsets=offsets,
+                    model_specific_data={
+                        f"{modality.name.lower()}_grid_thw": grid.reshape(1, 3)
+                    },
+                )
+            )
+        if next(images, None) is not None or next(videos, None) is not None:
+            raise ValueError("GLM encoder layout exceeds prompt placeholders")
+        positions, delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=torch.tensor([ids]),
+            hf_config=self.hf_config,
+            image_grid_thw=img_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=None,
+        )
+        return MultimodalProcessorOutput(
+            input_ids=ids,
+            mm_items=items,
+            im_token_id=self.IM_TOKEN_ID,
+            video_token_id=self.IM_TOKEN_ID,
+            mrope_positions=positions.squeeze(1),
+            mrope_position_delta=delta,
+        )
 
     def compute_mrope_positions(self, input_ids, mm_items):
         image_grid_thw = None

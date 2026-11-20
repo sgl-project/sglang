@@ -64,8 +64,8 @@ class StagedImageService:
         ):
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Staged media require Qwen-VL, zmq_to_scheduler or nixl, TP=DP=1 "
-                "and positive staging limits",
+                "Staged media require a compatible processor, zmq_to_scheduler or nixl, "
+                "a single-node TP group with PP=DP=1 and positive staging limits",
             )
 
     async def GetEncoderInfo(self, request, context):
@@ -118,6 +118,18 @@ class StagedImageService:
                 images=image_layouts,
                 videos=video_layouts,
             )
+            if self._info.native_model_type:
+                shape = self._describe(part_id).shape
+                rows = sum(
+                    item.embedding_rows for item in (*image_layouts, *video_layouts)
+                )
+                if len(shape) != 2 or shape[0] != rows or shape[1] <= 0:
+                    raise RuntimeError(
+                        "Native staged layout does not match its embedding"
+                    )
+                transfer.version = 3
+                transfer.native_model_type = self._info.native_model_type
+                transfer.embedding_width = shape[1]
             response = pb.StageResponse(transfer=transfer)
             expiry = loop.call_later(self._ttl, self._expire, transfer_id)
             self._leases[transfer_id] = _Lease(transfer, expiry)
@@ -192,7 +204,7 @@ class StagedImageService:
 
     async def Describe(self, request, context):
         lease = await self._lookup(request.transfer, context)
-        if self._describe is None:
+        if self._write is None:
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION, "NIXL is not enabled"
             )

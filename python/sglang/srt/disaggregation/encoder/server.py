@@ -556,7 +556,7 @@ def _build_mm_aux_data(mm_inputs, model_type=None):
         attr: _normalize_aux_value(mm_inputs.get(attr))
         for attr in video_meta_attrs_for(model_type)
     }
-    if model_type == "kimi_k3":
+    if model_type in {"kimi_k3", "kimi_k31"}:
         aux["original_image_sizes"] = _normalize_aux_value(
             mm_inputs.get("original_image_sizes")
         )
@@ -1109,7 +1109,7 @@ class MMEncoder:
             return selected
 
         split_kimi_k3_images = (
-            self.model_type == "kimi_k3" and modality == Modality.IMAGE
+            self.model_type in {"kimi_k3", "kimi_k31"} and modality == Modality.IMAGE
         )
 
         if modality == Modality.AUDIO:
@@ -2350,6 +2350,24 @@ class MMEncoder:
         )
         return results[0]
 
+    async def encode_staged_on_tp_ranks(self, request, modality):
+        """Agree on the result before rank zero publishes a staged transfer."""
+        (result,) = await self.batch_encode([request], modality)
+        # A follower can report a post-forward failure even when rank zero
+        # produced an embedding. Every rank completes this CPU collective
+        # before it consumes the next request.
+        code = int(result[4] or 0)
+        status = torch.tensor([code], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            status,
+            op=torch.distributed.ReduceOp.MAX,
+            group=get_parallel().tp_group.cpu_group,
+        )
+        group_code = status.item()
+        if group_code and group_code != code:
+            return 0, 0, 0, "A tensor-parallel encoder rank failed", group_code
+        return result
+
     async def encode_request(self, req: dict, modality: Modality):
         """Adapt a request dictionary to the single-request encode interface."""
         return await self.encode(
@@ -2562,6 +2580,11 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
             encoder.profiler.start(request)
         else:
             encoder.profiler.stop()
+    elif isinstance(request, dict) and request.get("type") == "staged_encode":
+        part = request["request"]
+        await encoder.encode_staged_on_tp_ranks(
+            part, Modality.from_str(part["modality"])
+        )
     elif isinstance(request, dict) and request.get("type") == "batch_encode":
         await encoder.batch_encode(
             request["requests"],

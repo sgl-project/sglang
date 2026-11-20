@@ -177,12 +177,22 @@ class TestServerInfoTransportParity(CustomTestCase):
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
         )
         with envs.SGLANG_EXTERNAL_ENCODER_HANDOFF.override(True):
-            for name, supported in (("qwen3_vl", True), ("qwen3_5", False)):
+            for name, supported in (
+                ("qwen3_vl", True),
+                ("qwen3_5", True),
+                ("kimi_k3", False),
+                ("glm4v", True),
+                ("qwen3", False),
+            ):
                 with self.subTest(model=name):
                     scheduler.model_config.hf_config.model_type = name
                     info = json.loads(rust_config._launch_server_info(scheduler))
                     self.assertTrue(info["accepts_encoder_handoff"])
                     self.assertEqual(info["supports_staged_video"], supported)
+                    self.assertEqual(
+                        info.get("native_model_type"),
+                        name if name in {"kimi_k3", "glm4v"} else None,
+                    )
 
     def test_rust_launch_info_redacts_the_api_keys(self):
         # Only the API key (or nothing) guards /server_info, so reporting the
