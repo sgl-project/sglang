@@ -116,9 +116,9 @@ class DotsToolDetector(BaseFormatDetector):
 
         ref = schema.get("$ref")
         if isinstance(ref, str) and ref.startswith("#/$defs/"):
-            return self._resolve_param_type(
-                defs.get(ref.rsplit("/", 1)[-1]), defs, depth + 1
-            )
+            # Decode JSON Pointer escapes in order: ~01 represents literal ~1.
+            name = ref[len("#/$defs/") :].replace("~1", "/").replace("~0", "~")
+            return self._resolve_param_type(defs.get(name), defs, depth + 1)
 
         for keyword in ("anyOf", "oneOf", "allOf"):
             alternatives = schema.get(keyword)
