@@ -248,8 +248,8 @@ class TestAiterDcpVerifyGraphReplay(CustomTestCase):
 
 
 class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
-    """With SGLANG_AITER_MLA_PERSIST=0 the module modes are off, so the fp8-Q ASM
-    opt-in's verify metadata must be planned with the modes its launch passes."""
+    """With SGLANG_AITER_MLA_PERSIST=0 the module modes are off, so the opt-in's verify
+    metadata must be planned with the modes its launch passes."""
 
     def _planned_modes(self, use_mla_auto_kv_splits):
         recorded = {}
@@ -274,9 +274,6 @@ class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
         backend.init_cuda_graph_state(
             max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _DRAFT_TOKENS
         )
-        parallel = SimpleNamespace(
-            dcp_enabled=False, dcp_size=1, dcp_rank=0, attn_dcp_rank=0, attn_dcp_size=1
-        )
         with (
             patch.object(
                 aiter_backend, "create_flashinfer_kv_indices_triton", _NoopKernel()
@@ -284,7 +281,6 @@ class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
             patch.object(aiter_backend, "_use_mla_ps_kernel", False),
             patch.object(aiter_backend, "fast_mode", False),
             patch.object(aiter_backend, "intra_batch_mode", False),
-            patch.object(aiter_backend, "get_parallel", lambda: parallel),
         ):
             backend._apply_cuda_graph_metadata(
                 bs=_BATCH_SIZE,
@@ -304,6 +300,28 @@ class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
                 recorded, launch_modes = self._planned_modes(auto_kv_splits)
                 self.assertEqual(launch_modes, modes)
                 self.assertEqual(recorded, {"buffer": modes, "plan": modes})
+
+    def test_eager_verify_rejects_a_window_other_than_the_selected_one(self):
+        backend = _dcp_verify_backend(asm_cprr=False)
+        backend.use_mla_fp8_q_asm = True
+        backend.num_draft_tokens = 8
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=_BATCH_SIZE,
+            spec_info=SimpleNamespace(draft_token_num=4),
+            seq_lens_cpu=_DCP_SEQ_LENS,
+            out_cache_loc=None,
+        )
+        with (
+            patch.object(
+                aiter_backend,
+                "reset_verify_attn_plan_cache",
+                lambda: None,
+                create=True,
+            ),
+            self.assertRaisesRegex(AssertionError, "8-token verify window, got 4"),
+        ):
+            backend.init_forward_metadata(forward_batch)
 
 
 class _MHAPool:

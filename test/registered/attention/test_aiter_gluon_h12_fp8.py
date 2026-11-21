@@ -649,8 +649,8 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertFalse(other_arch._use_mla_decode_persist_metadata())
 
     def test_persist_auto_splits_still_set_the_module_modes(self):
-        """Under PERSIST=1 with auto KV splits, draft extend reads the module modes with a
-        split cap of -1, so the opt-in must not keep them on the non-auto schedule."""
+        """Under PERSIST=1 with auto KV splits, draft extend reads the module modes,
+        with a split cap of -1; the opt-in must not keep them on the non-auto schedule."""
         from sglang.srt.layers.attention import aiter_backend
 
         with (
@@ -666,6 +666,26 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertTrue(eligible.use_mla_fp8_q_asm)
             self.assertEqual(eligible.max_split_per_batch, -1)
             self.assertTrue(aiter_backend.fast_mode)
+            self.assertFalse(aiter_backend.intra_batch_mode)
+            self.assertEqual(eligible._mla_decode_metadata_modes(), (True, False))
+
+    def test_persist_off_auto_splits_leave_the_module_modes_alone(self):
+        from sglang.srt.layers.attention import aiter_backend
+
+        with (
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm_fp8q"),
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.override(True),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
+            mock.patch.object(aiter_backend, "fast_mode", False),
+            mock.patch.object(aiter_backend, "intra_batch_mode", False),
+        ):
+            eligible = self._build(num_draft_tokens=8)
+
+            self.assertTrue(eligible.use_mla_fp8_q_asm)
+            self.assertEqual(eligible.max_split_per_batch, -1)
+            # Draft extend reads these under PERSIST=0, so they stay off.
+            self.assertFalse(aiter_backend.fast_mode)
             self.assertFalse(aiter_backend.intra_batch_mode)
             self.assertEqual(eligible._mla_decode_metadata_modes(), (True, False))
 
@@ -747,8 +767,8 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
         return be._mla_decode_fwd_with_head_pad.call_args.kwargs
 
     def test_opt_in_launches_with_the_planned_schedule(self):
-        """Under PERSIST=0 the module modes are off, but the opt-in plans with the
-        PERSIST=1 schedule; the launch must take the same fast and intra-batch modes."""
+        """Under PERSIST=0 the module modes are off, but the opt-in plans with
+        the PERSIST=1 schedule; the launch must take the same modes."""
         for verify in (False, True):
             for auto_kv_splits, planned in (
                 (False, (False, True)),
@@ -779,7 +799,7 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
 
     def test_default_route_launch_is_unchanged(self):
         """With the opt-in off, PERSIST=1 decode and verify launch with the module
-        intra_batch_mode, no fast_mode, and verify keeps the planned split cap."""
+        intra_batch_mode and no fast_mode; verify keeps the planned split cap."""
         for auto_kv_splits in (False, True):
             for verify, num_kv_splits in (
                 (False, None if auto_kv_splits else 32),
@@ -865,8 +885,8 @@ class TestFp8QAsmQueryCast(CustomTestCase):
                 quant.assert_called_once()
 
     def test_default_wide_window_keeps_plain_cast(self):
-        """With the opt-in off, a >4-token window keeps the plain fp8 cast at a fresh
-        unit scale, as before the opt-in; the quant kernel is not called."""
+        """With the opt-in off, a >4-token window keeps the plain fp8 cast, at a fresh
+        unit scale as before the opt-in; the quant kernel is not called."""
         q, q_in, scale, _, be, quant = self._run_decode(enabled=False, qlen=8)
         quant.assert_not_called()
         self.assertTrue(

@@ -1477,11 +1477,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _use_mla_decode_persist_metadata(self) -> bool:
-        """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
-
-        Matches ``_mla_ps_kernel_enabled() and dcp_world_size <= 1`` when ASM
-        is off. DCP ASM needs the same buffers with fast_mode scheduling.
-        """
+        # DCP ASM needs the same buffers as PS decode, scheduled with fast_mode.
         return (self._mla_ps_kernel_enabled() and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
