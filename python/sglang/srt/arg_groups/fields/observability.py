@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.arg_utils import (
     Arg,
     json_list_type,
 )
+from sglang.srt.environ import envs
 
 
 class Observability(msgspec.Struct):
@@ -78,6 +79,13 @@ class Observability(msgspec.Struct):
         bool,
         "Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0.",
     ] = False
+    prometheus_metric_style: A[
+        str,
+        Arg(
+            help="Style for Prometheus metric names: 'colon' (legacy: sglang:...) or 'underscore' (standard: sglang_...). Defaults to 'colon' (or SGLANG_PROMETHEUS_METRIC_STYLE env var).",
+            choices=["colon", "underscore"],
+        ),
+    ] = msgspec.field(default_factory=envs.SGLANG_PROMETHEUS_METRIC_STYLE.get)
     load_snapshot_publish_interval: A[
         int,
         "Publish load snapshot to shared memory every N decode iterations. Prefill and idle always publish immediately.",

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import os
 import time
@@ -43,7 +44,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 if TYPE_CHECKING:
     from prometheus_client import Gauge
@@ -318,6 +318,29 @@ def resolve_collector_class(role: str, default_cls: type) -> type:
     return stat_loggers.get(role, default_cls)
 
 
+def _resolve_metric_style(server_args=None) -> str:
+    from sglang.srt.environ import envs
+
+    if get_context().is_config_namespace_published("observability"):
+        return get_observability().prometheus_metric_style
+    return (
+        getattr(server_args, "prometheus_metric_style", None)
+        or envs.SGLANG_PROMETHEUS_METRIC_STYLE.get()
+    )
+
+
+def format_metric_name(name: str, style: Optional[str] = None) -> str:
+    """Format a Prometheus metric name according to the configured metric style.
+
+    Translates 'sglang:...' prefix to 'sglang_...' when style is 'underscore'.
+    """
+    if style is None:
+        style = _resolve_metric_style()
+    if style == "underscore" and isinstance(name, str) and name.startswith("sglang:"):
+        return "sglang_" + name[len("sglang:") :]
+    return name
+
+
 class _StatLoggerDIMixin:
     """Shared DI override hooks for all *MetricsCollector classes.
 
@@ -330,6 +353,56 @@ class _StatLoggerDIMixin:
     _gauge_cls = None
     _histogram_cls = None
     _summary_cls = None
+
+    @classmethod
+    def _wrap_metric_factory(cls, factory, use_underscore: bool):
+        if not use_underscore or factory is None:
+            return factory
+
+        @functools.wraps(factory)
+        def _wrapped(*args, **kwargs):
+            if (
+                "name" in kwargs
+                and isinstance(kwargs["name"], str)
+                and kwargs["name"].startswith("sglang:")
+            ):
+                kwargs = dict(kwargs, name="sglang_" + kwargs["name"][len("sglang:") :])
+            elif args and isinstance(args[0], str) and args[0].startswith("sglang:"):
+                args = ("sglang_" + args[0][len("sglang:") :],) + args[1:]
+            return factory(*args, **kwargs)
+
+        return _wrapped
+
+    def _resolve_metric_classes(
+        self, server_args=None, include_gauge_histogram: bool = False
+    ):
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
+        from prometheus_client import Histogram as _PromHistogram
+        from prometheus_client import Summary as _PromSummary
+
+        from sglang.srt.utils.gauge_histogram import (
+            GaugeHistogram as _PromGaugeHistogram,
+        )
+
+        use_underscore = _resolve_metric_style(server_args) == "underscore"
+
+        Counter = self._wrap_metric_factory(
+            self._counter_cls or _PromCounter, use_underscore
+        )
+        Gauge = self._wrap_metric_factory(self._gauge_cls or _PromGauge, use_underscore)
+        Histogram = self._wrap_metric_factory(
+            self._histogram_cls or _PromHistogram, use_underscore
+        )
+        Summary = self._wrap_metric_factory(
+            self._summary_cls or _PromSummary, use_underscore
+        )
+        if include_gauge_histogram:
+            GaugeHistogram = self._wrap_metric_factory(
+                _PromGaugeHistogram, use_underscore
+            )
+            return Counter, Gauge, Histogram, Summary, GaugeHistogram
+        return Counter, Gauge, Histogram, Summary
 
 
 @dataclass(kw_only=True, frozen=True, slots=True)
@@ -351,15 +424,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_streaming_session: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter as _PromCounter
-        from prometheus_client import Gauge as _PromGauge
-        from prometheus_client import Histogram as _PromHistogram
-        from prometheus_client import Summary as _PromSummary
-
-        Counter = self._counter_cls or _PromCounter
-        Gauge = self._gauge_cls or _PromGauge
-        Histogram = self._histogram_cls or _PromHistogram
-        Summary = self._summary_cls or _PromSummary
+        Counter, Gauge, Histogram, Summary, GaugeHistogram = (
+            self._resolve_metric_classes(server_args, include_gauge_histogram=True)
+        )
 
         self.labels = labels
         self.enable_lora = enable_lora
@@ -1908,13 +1975,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         bucket_e2e_request_latency: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter as _PromCounter
-        from prometheus_client import Gauge as _PromGauge
-        from prometheus_client import Histogram as _PromHistogram
-
-        Counter = self._counter_cls or _PromCounter
-        Gauge = self._gauge_cls or _PromGauge
-        Histogram = self._histogram_cls or _PromHistogram
+        Counter, Gauge, Histogram, Summary = self._resolve_metric_classes(server_args)
 
         self.labels = labels or {}
 
@@ -2277,14 +2338,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         labels: Dict[str, str],
+        server_args: Optional[ServerArgs] = None,
     ):
-        from prometheus_client import Counter as _PromCounter
-        from prometheus_client import Gauge as _PromGauge
-        from prometheus_client import Histogram as _PromHistogram
-
-        Counter = self._counter_cls or _PromCounter
-        Gauge = self._gauge_cls or _PromGauge
-        Histogram = self._histogram_cls or _PromHistogram
+        Counter, Gauge, Histogram, Summary = self._resolve_metric_classes(server_args)
 
         self.labels = labels
 
@@ -2496,10 +2552,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):
-    def __init__(self, ep_size: int) -> None:
-        from prometheus_client import Histogram as _PromHistogram
-
-        Histogram = self._histogram_cls or _PromHistogram
+    def __init__(self, ep_size: int, server_args: Optional[ServerArgs] = None) -> None:
+        Counter, Gauge, Histogram, Summary = self._resolve_metric_classes(server_args)
 
         ep_size_buckets = [i for i in range(ep_size)]
         self.eplb_gpu_physical_count = Histogram(
@@ -2533,13 +2587,10 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
         labels: Dict[str, str],
+        server_args: Optional[ServerArgs] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter as _PromCounter
-        from prometheus_client import Histogram as _PromHistogram
-
-        Counter = self._counter_cls or _PromCounter
-        Histogram = self._histogram_cls or _PromHistogram
+        Counter, Gauge, Histogram, Summary = self._resolve_metric_classes(server_args)
 
         self.labels = labels
 
@@ -2874,15 +2925,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 class EncoderMetricsCollector(_StatLoggerDIMixin):
     """Metrics collector for the EPD encoder server (--encoder-only)."""
 
-    def __init__(self, labels: Dict[str, str]) -> None:
+    def __init__(
+        self, labels: Dict[str, str], server_args: Optional[ServerArgs] = None
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter as _PromCounter
-        from prometheus_client import Gauge as _PromGauge
-        from prometheus_client import Histogram as _PromHistogram
-
-        Counter = self._counter_cls or _PromCounter
-        Gauge = self._gauge_cls or _PromGauge
-        Histogram = self._histogram_cls or _PromHistogram
+        Counter, Gauge, Histogram, Summary = self._resolve_metric_classes(server_args)
 
         self.labels = labels
 
