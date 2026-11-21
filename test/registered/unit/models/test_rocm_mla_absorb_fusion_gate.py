@@ -180,8 +180,8 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 self.assertEqual(tuple(fused[1].shape), (2, 1, 576))
 
     def test_non_unit_kv_scale_keeps_the_split_chain(self):
-        """The split chain's AITER cache write casts without the KV scale,
-        while the fused kernels divide by it; their bytes differ unless it is 1."""
+        """The split chain's AITER write skips the KV scale and its Triton decode write
+        divides by it; the unscaled fused launch agrees with both only at 1."""
         for k_scale_float in (None, 1.0):
             with self.subTest(k_scale_float=k_scale_float):
                 self.assertIsNotNone(
