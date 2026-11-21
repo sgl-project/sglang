@@ -1011,7 +1011,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        not q.is_cuda  # pipelining is CUDA-only; torch.cuda calls fail on XPU
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
@@ -1319,15 +1320,14 @@ class MiniMaxH3Attention(nn.Module):
         # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
         # are torch nn.RMSNorm, so the fused kernel is called directly.
         self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
-            )
+            current_platform.is_cuda() or current_platform.is_xpu()
+        ) and can_use_fused_inplace_qknorm_rope(
+            arch.attention_head_dim,
+            rope_dim,
+            True,
+            _BF16_DTYPE,
+            cache_dtype=_BF16_DTYPE,
+            round_norm_before_rope=True,
         )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
