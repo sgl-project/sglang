@@ -25,6 +25,7 @@ def _swa_scatter_kernel(
     final_pos_ptr,  # [T] int
     unified_ptr,  # [pages, D] bf16
     n_rows,
+    kv_row_stride,
     ring_stride,  # SWA ring per-slot stride
     win: tl.constexpr,
     D: tl.constexpr,
@@ -43,7 +44,7 @@ def _swa_scatter_kernel(
     loc = s * ring_stride + (pos % ring_stride)
     offs = tl.arange(0, BLOCK_D)
     mask = offs < D
-    vals = tl.load(kv_ptr + row * D + offs, mask=mask, other=0.0)
+    vals = tl.load(kv_ptr + row * kv_row_stride + offs, mask=mask, other=0.0)
     tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
 
 
@@ -80,7 +81,7 @@ def store_swa_into_unified(
 
     has_final = final_pos is not None
     fp_arg = final_pos if has_final else positions
-    assert kv.is_contiguous() and kv.dtype == unified_kv.dtype
+    assert kv.stride(1) == 1 and kv.dtype == unified_kv.dtype
     assert state_slot.is_contiguous() and positions.is_contiguous()
     assert fp_arg.is_contiguous()
     two_pool = kv_rope is not None
@@ -111,6 +112,7 @@ def store_swa_into_unified(
             fp_arg,
             dst,
             n_rows,
+            src.stride(0),
             ring_stride,
             win=win,
             D=D,

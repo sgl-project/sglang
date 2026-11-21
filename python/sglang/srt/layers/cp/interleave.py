@@ -52,6 +52,20 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_gfx1250_supported
+
+# Stage CP gather inputs without a zero fill and cache the gather index.
+# TODO: try gfx950/gfx942.
+_FAST_CP_GATHER = is_gfx1250_supported()
+
+
+def _rows_for_gather(x: torch.Tensor, n: int, n_valid: int) -> torch.Tensor:
+    # Rows past n_valid are never selected after the gather, so they need no fill.
+    if x.shape[0] >= n and x.is_contiguous():
+        return x[:n]
+    out = x.new_empty((n, *x.shape[1:]))
+    out[:n_valid] = x[:n_valid]
+    return out
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -78,6 +92,8 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     per_rank_logical_token: Optional[List[int]] = None
     # Tail row -> packed all-gather slot; local tail metadata rows include padding.
     gather_index: Optional[torch.Tensor] = None
+    # Read only by the CP all-gather; the reorders keep their own index path.
+    cp_gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
     # Only sequence-dependent graph segments use this capacity. Eager cache
@@ -317,7 +333,9 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         # Equal shards already have the collective shape. Avoid a zero fill
         # and D2D staging copy before launching the attention KV collective.
-        if local_logical_len == physical_rank_len and x.is_contiguous():
+        if _FAST_CP_GATHER:
+            padded_x = _rows_for_gather(x, physical_rank_len, local_logical_len)
+        elif local_logical_len == physical_rank_len and x.is_contiguous():
             padded_x = x[:physical_rank_len]
         else:
             padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
@@ -348,10 +366,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
                 .reshape(total_tokens, *x.shape[1:])
             )
 
+        if metadata.cp_gather_index is not None:
+            return gathered.index_select(0, metadata.cp_gather_index)
         flat_indices = torch.arange(total_tokens, device=x.device)
         gather_indices = (
             flat_indices % self.cp_size
         ) * physical_rank_len + flat_indices // self.cp_size
+        if _FAST_CP_GATHER:
+            metadata.cp_gather_index = gather_indices
         return gathered.index_select(0, gather_indices)
 
     def get_supported_attention_backend(self):
