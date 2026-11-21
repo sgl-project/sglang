@@ -28,7 +28,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, idle_penalty_store
+from sglang.test.scheduler_test_utils import FakeReq, idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -362,7 +362,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
-        scheduler.penalty_store = idle_penalty_store()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
 
         with patch("sglang.srt.managers.utils.get_serving"):

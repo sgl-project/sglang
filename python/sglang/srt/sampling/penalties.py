@@ -1,6 +1,6 @@
 """Penalty history in per-request rows, found through a slot -> row table.
 
-`PenaltyStore` is one per scheduler: `admit` gives a penalized request a row
+`PenaltyStatusPool` is one per scheduler: `admit` gives a penalized request a row
 on `req.penalty_row` and (re)sets it to the history of its `output_ids`
 each time the request enters an extend step; the scheduler's request exit
 (`RequestRetirer`) gives the row back with `free`. A retraction keeps the row:
@@ -65,7 +65,7 @@ def uses_penalty(sampling_params) -> bool:
     return any(_penalty_kinds(sampling_params))
 
 
-class PenaltyStore:
+class PenaltyStatusPool:
     def __init__(self, vocab_size: int, num_slots: int, device):
         self.vocab_size = vocab_size
         self.device = device
@@ -224,10 +224,10 @@ class PenaltyStore:
 class StepPenalties:
     """The penalized requests of one step: their slots and penalty params."""
 
-    store: PenaltyStore
+    pool: PenaltyStatusPool
     batch_size: int
     # [n] indices into the step's batch of the penalized requests, and their
-    # slots; their rows are read from the store's table at sampling.
+    # slots; their rows are read from the pool's table at sampling.
     batch_indices: torch.Tensor
     slots: torch.Tensor
     # [n, 1] per penalized request, None when none of them uses that penalty.
@@ -240,7 +240,7 @@ class StepPenalties:
 
     @classmethod
     def build(
-        cls, reqs: Sequence, req_pool_indices: torch.Tensor, store: PenaltyStore
+        cls, reqs: Sequence, req_pool_indices: torch.Tensor, pool: PenaltyStatusPool
     ) -> Optional[StepPenalties]:
         """req_pool_indices: the step's slots on the device, in request order."""
         batch_indices = [i for i, r in enumerate(reqs) if r.uses_penalty]
@@ -250,10 +250,10 @@ class StepPenalties:
             if reqs[i].penalty_row is None:
                 raise RuntimeError(
                     f"request {reqs[i].rid} uses sampling penalties but holds no "
-                    "penalty row; PenaltyStore.admit was not called"
+                    "penalty row; PenaltyStatusPool.admit was not called"
                 )
 
-        device = store.device
+        device = pool.device
         batch_indices_device = async_h2d(
             batch_indices, dtype=torch.int64, device=device
         )
@@ -274,14 +274,14 @@ class StepPenalties:
         stop_token_ids = None
         if uses_min_new_tokens:
             stop_sets = [
-                _stop_token_ids(reqs[i], store.vocab_size) for i in batch_indices
+                _stop_token_ids(reqs[i], pool.vocab_size) for i in batch_indices
             ]
             width = max(1, max(len(s) for s in stop_sets))
-            padded = [s + [store.vocab_size] * (width - len(s)) for s in stop_sets]
+            padded = [s + [pool.vocab_size] * (width - len(s)) for s in stop_sets]
             stop_token_ids = async_h2d(padded, dtype=torch.int64, device=device)
 
         return cls(
-            store=store,
+            pool=pool,
             batch_size=len(reqs),
             batch_indices=batch_indices_device,
             slots=slots,
@@ -302,9 +302,9 @@ class StepPenalties:
 
     def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Return (additive, scaling) [batch_size, vocab] penalties, each None if unused."""
-        rows = self.store.rows(self.slots)
-        counts = self.store.gather_counts(rows)
-        vocab_size = self.store.vocab_size
+        rows = self.pool.rows(self.slots)
+        counts = self.pool.gather_counts(rows)
+        vocab_size = self.pool.vocab_size
         device = counts.device
         # The tokens each row has output, for presence and repetition.
         present = (
@@ -327,7 +327,7 @@ class StepPenalties:
             if self.presence is not None:
                 additive.addcmul_(present, self.presence, value=-1)
             if self.min_new_tokens is not None:
-                lens = self.store.gather_lens(rows)
+                lens = self.pool.gather_lens(rows)
                 stop_penalties = torch.zeros(
                     (counts.shape[0], vocab_size + 1),
                     dtype=torch.float32,
@@ -372,7 +372,7 @@ class StepPenalties:
             token_ids = token_ids[self.batch_indices]
             if accept_mask is not None:
                 accept_mask = accept_mask[self.batch_indices]
-        self.store.accumulate(self.store.rows(self.slots), token_ids, accept_mask)
+        self.pool.accumulate(self.pool.rows(self.slots), token_ids, accept_mask)
 
 
 def _stop_token_ids(req, vocab_size: int) -> List[int]:

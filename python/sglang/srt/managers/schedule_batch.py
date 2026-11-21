@@ -569,9 +569,9 @@ class Req(ReqDllmMixin):
             }
         self.sampling_params = sampling_params
         # Whether the params use a sampling penalty; set at each admission
-        # (PenaltyStore.admit), after which the params do not change.
+        # (PenaltyStatusPool.admit), after which the params do not change.
         self.uses_penalty = False
-        # Penalty history row in the scheduler's PenaltyStore, from the request's
+        # Penalty history row in the scheduler's PenaltyStatusPool, from the request's
         # first admission until its exit (RequestRetirer); a retraction keeps it.
         self.penalty_row: Optional[int] = None
         self.custom_logit_processor = custom_logit_processor

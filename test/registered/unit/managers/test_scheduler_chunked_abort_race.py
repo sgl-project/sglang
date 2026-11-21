@@ -38,7 +38,7 @@ from sglang.srt.managers.scheduler_components.request_list import move  # noqa: 
 from sglang.test.scheduler_test_utils import (  # noqa: E402
     FakeReq,
     empty_request_lists,
-    idle_penalty_store,
+    idle_penalty_status_pool,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -92,7 +92,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.hisparse_coordinator = None
     sched.uocr_runtime = None
     sched.ipc_channels = Mock()
-    sched.penalty_store = idle_penalty_store()
+    sched.penalty_status_pool = idle_penalty_status_pool()
     sched.init_request_retirer()
     return sched
 

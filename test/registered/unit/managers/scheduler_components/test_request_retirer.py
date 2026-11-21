@@ -152,7 +152,7 @@ class TestPenaltyRowExit(CustomTestCase):
         req.penalty_row = None
         req.sampling_params = SamplingParams(presence_penalty=1.0)
         req.output_ids = []
-        retirer.penalty_store.admit(req)
+        retirer.penalty_status_pool.admit(req)
         return retirer, req
 
     def test_release_frees_the_row(self):
@@ -160,7 +160,7 @@ class TestPenaltyRowExit(CustomTestCase):
         with patch.object(request_retirer, "release_kv_cache"):
             retirer.release(req, checkpoint=False)
         self.assertIsNone(req.penalty_row)
-        self.assertEqual(retirer.penalty_store.num_rows, 0)
+        self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
 
     def test_abort_retracted_frees_the_row_after_the_kv_record_left(self):
         # A retracted streaming turn hands its KV record to the session slot;
@@ -170,7 +170,7 @@ class TestPenaltyRowExit(CustomTestCase):
         with patch.object(request_retirer, "make_abort_req"):
             retirer.abort_retracted(req, reason=FINISH_ABORT())
         self.assertIsNone(req.penalty_row)
-        self.assertEqual(retirer.penalty_store.num_rows, 0)
+        self.assertEqual(retirer.penalty_status_pool.num_rows, 0)
 
 
 class TestTakeOutWithoutRelease(CustomTestCase):

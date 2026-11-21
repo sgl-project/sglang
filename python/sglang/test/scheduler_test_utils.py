@@ -17,7 +17,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
-from sglang.srt.sampling.penalties import PenaltyStore
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -36,9 +36,9 @@ class FakeReq(SimpleNamespace):
     send_via = None
 
 
-def idle_penalty_store() -> PenaltyStore:
-    """A `PenaltyStore` for a scheduler whose requests use no penalty."""
-    return PenaltyStore(vocab_size=1, num_slots=1, device="cpu")
+def idle_penalty_status_pool() -> PenaltyStatusPool:
+    """A `PenaltyStatusPool` for a scheduler whose requests use no penalty."""
+    return PenaltyStatusPool(vocab_size=1, num_slots=1, device="cpu")
 
 
 def release_only_retirer(
@@ -52,7 +52,7 @@ def release_only_retirer(
         or SimpleNamespace(retire_group=lambda req: None),
         hisparse_coordinator=hisparse_coordinator,
         uocr_runtime=None,
-        penalty_store=idle_penalty_store(),
+        penalty_status_pool=idle_penalty_status_pool(),
         send_abort_output=None,
         stream_output=None,
     )

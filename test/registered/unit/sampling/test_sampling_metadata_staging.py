@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.sampling.penalties import PenaltyStore, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -57,12 +57,12 @@ class _H2DCopies(TorchDispatchMode):
 
 
 def _step_penalties(reqs, device):
-    store = PenaltyStore(VOCAB_SIZE, len(reqs) + 1, device)
+    pool = PenaltyStatusPool(VOCAB_SIZE, len(reqs) + 1, device)
     for slot, req in enumerate(reqs, start=1):
         req.kv.req_pool_idx = slot
-        store.admit(req)
+        pool.admit(req)
     slots = torch.arange(1, len(reqs) + 1, device=device)
-    return StepPenalties.build(reqs, slots, store)
+    return StepPenalties.build(reqs, slots, pool)
 
 
 class _SamplingMetadataTestBase(CustomTestCase):

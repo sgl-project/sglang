@@ -26,5 +26,5 @@ objects staying frozen (the prerequisite for the per-step immutable ScheduleBatc
 refactor); derived values like `seq_lens_sum` only recompute safely when fields
 are rebound.
 
-Out of scope (mutation intended): the penalty history (`PenaltyStore`), CUDA
+Out of scope (mutation intended): the penalty history (`PenaltyStatusPool`), CUDA
 graph static buffers, `ForwardBatch` fields, attention-backend metadata.

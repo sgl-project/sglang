@@ -47,7 +47,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_disagg
-from sglang.srt.sampling.penalties import PenaltyStore
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -183,7 +183,7 @@ class _DecodeNode:
             last_batch=None,
             tree_cache=self.tree_cache,
             req_to_token_pool=self.req_to_token_pool,
-            penalty_store=PenaltyStore(
+            penalty_status_pool=PenaltyStatusPool(
                 vocab_size=16,
                 num_slots=self.req_to_token_pool.req_to_token.shape[0],
                 device="cpu",
@@ -219,7 +219,7 @@ class _DecodeNode:
             beam_coordinator=SimpleNamespace(retire_group=lambda req: None),
             hisparse_coordinator=None,
             uocr_runtime=None,
-            penalty_store=s.penalty_store,
+            penalty_status_pool=s.penalty_status_pool,
             send_abort_output=lambda abort_req, req: None,
             stream_output=lambda *a, **k: None,
         )

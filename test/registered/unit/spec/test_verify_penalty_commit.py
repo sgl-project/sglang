@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.sampling.penalties import PenaltyStore, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_utils import commit_block_accept_tokens_to_penalties
@@ -28,7 +28,7 @@ def _req(slot, **sampling_params):
     )
 
 
-def _info(reqs, store):
+def _info(reqs, pool):
     slots = torch.tensor([r.kv.req_pool_idx for r in reqs])
     bs = len(reqs)
     info = SamplingBatchInfo(
@@ -44,14 +44,14 @@ def _info(reqs, store):
         vocab_size=VOCAB_SIZE,
         device="cpu",
     )
-    info.set_step_penalties(StepPenalties.build(reqs, slots, store))
+    info.set_step_penalties(StepPenalties.build(reqs, slots, pool))
     return info
 
 
 class TestVerifyPenaltyCommit(CustomTestCase):
     def setUp(self):
         super().setUp()
-        self.store = PenaltyStore(VOCAB_SIZE, 4, "cpu")
+        self.pool = PenaltyStatusPool(VOCAB_SIZE, 4, "cpu")
         # The middle request uses no penalty and holds no row.
         self.reqs = [
             _req(1, frequency_penalty=1.0),
@@ -59,10 +59,10 @@ class TestVerifyPenaltyCommit(CustomTestCase):
             _req(3, frequency_penalty=1.0),
         ]
         for req in self.reqs:
-            self.store.admit(req)
+            self.pool.admit(req)
 
     def _counts(self):
-        additive, _ = _info(self.reqs, self.store).step_penalties.logit_penalties()
+        additive, _ = _info(self.reqs, self.pool).step_penalties.logit_penalties()
         return (-additive).long()
 
     def _expected(self, histories):
@@ -78,7 +78,7 @@ class TestVerifyPenaltyCommit(CustomTestCase):
         predict = torch.tensor([4, 4, 6, 1, 2, 3, 5, 9, 9])
         accept_index = torch.tensor([[0, 1, -1], [3, 4, 5], [6, -1, -1]])
         commit_accept_tokens_to_penalties(
-            _info(self.reqs, self.store), predict, accept_index
+            _info(self.reqs, self.pool), predict, accept_index
         )
         torch.testing.assert_close(self._counts(), self._expected([[4, 4], [], [5]]))
 
@@ -86,7 +86,7 @@ class TestVerifyPenaltyCommit(CustomTestCase):
         out_tokens = torch.tensor([[4, 4, 6], [1, 2, 3], [5, 9, 9]])
         commit_lens = torch.tensor([2, 3, 1], dtype=torch.int32)
         commit_block_accept_tokens_to_penalties(
-            _info(self.reqs, self.store), out_tokens, commit_lens
+            _info(self.reqs, self.pool), out_tokens, commit_lens
         )
         torch.testing.assert_close(self._counts(), self._expected([[4, 4], [], [5]]))
 

@@ -396,7 +396,7 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
-from sglang.srt.sampling.penalties import PenaltyStore, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -701,7 +701,7 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
-        self.init_penalty_store()
+        self.init_penalty_status_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -1394,8 +1394,8 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
-    def init_penalty_store(self) -> None:
-        self.penalty_store = PenaltyStore(
+    def init_penalty_status_pool(self) -> None:
+        self.penalty_status_pool = PenaltyStatusPool(
             vocab_size=self.model_config.vocab_size,
             num_slots=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
@@ -3019,7 +3019,7 @@ class Scheduler(
             beam_coordinator=self.beam_coordinator,
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
-            penalty_store=self.penalty_store,
+            penalty_status_pool=self.penalty_status_pool,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
         )
@@ -4607,7 +4607,7 @@ class Scheduler(
     def admit_penalty_rows(self, batch: ScheduleBatch) -> None:
         """Each admission (re)sets a penalized request's history from its outputs."""
         for req in batch.reqs:
-            self.penalty_store.admit(req)
+            self.penalty_status_pool.admit(req)
 
     def _get_new_batch_prefill_raw(
         self,
@@ -5446,7 +5446,7 @@ class Scheduler(
             # read lives on the device and is read and written at sampling.
             batch.sampling_info.set_step_penalties(
                 StepPenalties.build(
-                    batch.reqs, batch.req_pool_indices, self.penalty_store
+                    batch.reqs, batch.req_pool_indices, self.penalty_status_pool
                 )
             )
             if self.enable_overlap:

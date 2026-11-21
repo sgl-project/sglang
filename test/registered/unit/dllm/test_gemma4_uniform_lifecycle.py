@@ -18,7 +18,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import (
     FakeReq,
-    idle_penalty_store,
+    idle_penalty_status_pool,
     release_only_retirer,
 )
 
@@ -409,7 +409,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.beam_coordinator = Mock()
         scheduler.hisparse_coordinator = None
         scheduler.uocr_runtime = None
-        scheduler.penalty_store = idle_penalty_store()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,

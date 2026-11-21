@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import (
     FakeReq,
     empty_request_lists,
-    idle_penalty_store,
+    idle_penalty_status_pool,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -433,7 +433,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.hisparse_coordinator = None
-        scheduler.penalty_store = idle_penalty_store()
+        scheduler.penalty_status_pool = idle_penalty_status_pool()
         scheduler.init_request_retirer()
 
         with patch(

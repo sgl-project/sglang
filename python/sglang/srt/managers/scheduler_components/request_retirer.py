@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
         UocrSchedulerRuntime,
     )
-    from sglang.srt.sampling.penalties import PenaltyStore
+    from sglang.srt.sampling.penalties import PenaltyStatusPool
 
 
 class RequestRetirer:
@@ -43,7 +43,7 @@ class RequestRetirer:
         beam_coordinator: BeamCoordinator,
         hisparse_coordinator: Optional[HiSparseCoordinator],
         uocr_runtime: Optional[UocrSchedulerRuntime],
-        penalty_store: PenaltyStore,
+        penalty_status_pool: PenaltyStatusPool,
         send_abort_output: Callable[[AbortReq, Req], None],
         stream_output: Callable[..., None],
     ):
@@ -51,7 +51,7 @@ class RequestRetirer:
         self.beam_coordinator = beam_coordinator
         self.hisparse_coordinator = hisparse_coordinator
         self.uocr_runtime = uocr_runtime
-        self.penalty_store = penalty_store
+        self.penalty_status_pool = penalty_status_pool
         self.send_abort_output = send_abort_output
         self.stream_output = stream_output
         # Called once per ended request; gamma-Ada records its latency.
@@ -97,7 +97,7 @@ class RequestRetirer:
         record_exit(req, "release")
         if self.release_observer is not None:
             self.release_observer(req)
-        self.penalty_store.free(req)
+        self.penalty_status_pool.free(req)
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
             # A checkpoint hands the KV to the cache, whose store settles the attempt.
@@ -144,7 +144,7 @@ class RequestRetirer:
         _leave_owner_list(req)
         record_exit(req, "abort_retracted")
         # retract kept the penalty row for the re-admission.
-        self.penalty_store.free(req)
+        self.penalty_status_pool.free(req)
         self._detach(req)
         # retract released the KV without a checkpoint.
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)

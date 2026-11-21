@@ -327,7 +327,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.profiler_manager = MagicMock()
         s.forward_sleep_time = None
         s.enable_overlap = True
-        s.penalty_store = None  # no request uses a penalty
+        s.penalty_status_pool = None  # no request uses a penalty
         s.future_map = Mock()
         s.future_map.resolve_seq_lens_cpu.side_effect = _ForwardLaunched
         # Each launch's rows, and whether each has an earlier step unprocessed.
