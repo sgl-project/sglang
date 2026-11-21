@@ -13,12 +13,11 @@
 # ==============================================================================
 """Kimi-K3 ROCm MLA decode: write the query and the latent KV cache in one launch.
 
-K3 MLA applies no RoPE. The writer runs AITER's fused RoPE/concat/cache kernel, the
-one DeepSeek MLA uses on ROCm (rocm_linear_utils), against one-row identity cos/sin
-tables with all-zero positions, which leaves finite Q and cache values equal to the
-split concat/cache chain's (a -0.0 PE lane can come out as +0.0). Where the attention
-backend reads an FP8 query padded to its kernel head count (mla_fp8_q_out), the same
-launch casts Q into that buffer.
+K3 MLA applies no RoPE. The writer runs AITER's NoPE fused concat/cache kernel
+(fused_qk_cat_and_cache_mla): it copies the PE halves through unrotated, so Q and the
+cache values equal the split concat/cache chain's, bit for bit including -0.0, inf and
+NaN lanes. Where the attention backend reads an FP8 query padded to its kernel head
+count (mla_fp8_q_out), the same launch casts Q into that buffer.
 
 kimi_k3 calls create_q_cache_writer on every platform; this module alone decides
 where the fused write runs (fused_q_cache_available) and returns None elsewhere.
@@ -30,8 +29,6 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_buffer
-from sglang.srt.utils.device import is_device_stream_capturing
 from sglang.srt.utils.log_utils import print_info_once
 
 _KV_LORA_RANK = 512
@@ -44,54 +41,6 @@ _CACHE_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 # Triton target-verify runs its extend kernel, which also reads k.
 _DECODE_BACKENDS = frozenset({"aiter", "triton"})
 _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
-
-
-class _IdentityRope:
-    """The identity-RoPE inputs every K3 MLA layer shares: one-row cos = 1 and
-    sin = 0 tables, a unit scale, and int64 zero positions.
-
-    Only eager steps allocate or grow them; the graph runner's eager warmups before
-    each capture size the positions, so a capture never allocates.
-    """
-
-    def __init__(self) -> None:
-        self.tables: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
-        self.positions: Optional[torch.Tensor] = None
-        self.retired: list[torch.Tensor] = []
-
-    def get(
-        self, *, tokens: int, half_rope_dim: int, device: torch.device
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """(cos, sin, unit scale, the first `tokens` zero positions), or None inside
-        a capture the warmup did not size."""
-        positions = self.positions
-        grow = (
-            positions is None
-            or positions.device != device
-            or positions.numel() < tokens
-        )
-        new_tables = self.tables is None or self.tables[0].device != device
-        if grow or new_tables:
-            if is_device_stream_capturing(device):
-                return None
-            # Captured graphs keep reading the old pointers.
-            if grow and positions is not None:
-                self.retired.append(positions)
-            if new_tables and self.tables is not None:
-                self.retired.extend(self.tables)
-        if grow:
-            # Power-of-two growth keeps retired buffers smaller than the live one.
-            rows = 1 << (tokens - 1).bit_length()
-            self.positions = positions = torch.zeros(
-                (rows,), dtype=torch.int64, device=device
-            )
-        if new_tables:
-            self.tables = (
-                torch.ones((1, half_rope_dim), dtype=torch.bfloat16, device=device),
-                torch.zeros((1, half_rope_dim), dtype=torch.bfloat16, device=device),
-                torch.ones((1,), dtype=torch.float32, device=device),
-            )
-        return (*self.tables, positions[:tokens])
 
 
 def fused_q_cache_available() -> bool:
@@ -117,17 +66,18 @@ def create_q_cache_writer(
         _ROPE_HEAD_DIM,
     ) or not fused_q_cache_available():
         return None
-    # rocm_linear_utils imports AITER at module level.
-    from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+    # Present in every AITER pinned in docker/rocm.Dockerfile; not on gfx1250, which this
+    # writer never targets (fused_q_cache_available).
+    from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_cat_and_cache_mla
 
     print_info_once(
         "Kimi-K3 MLA: decode and target-verify write Q and the latent KV cache "
-        "in one AITER launch (fused_qk_rope_cat_and_cache_mla)"
+        "in one AITER launch (fused_qk_cat_and_cache_mla)"
     )
     return KimiK3RocmMlaQCacheWriter(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
-        fused_rope_cat_and_cache=fused_qk_rope_cat_and_cache_mla,
+        fused_cat_and_cache=fused_qk_cat_and_cache_mla,
     )
 
 
@@ -171,11 +121,10 @@ class KimiK3RocmMlaQCacheWriter:
         *,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
-        fused_rope_cat_and_cache: Callable[..., Tuple[torch.Tensor, ...]],
+        fused_cat_and_cache: Callable[..., Tuple[torch.Tensor, ...]],
     ) -> None:
-        self._fused_rope_cat_and_cache = fused_rope_cat_and_cache
+        self._fused_cat_and_cache = fused_cat_and_cache
         self._head_dim = kv_lora_rank + qk_rope_head_dim
-        self._half_rope_dim = qk_rope_head_dim // 2
 
     def write(
         self,
@@ -192,7 +141,7 @@ class KimiK3RocmMlaQCacheWriter:
         get_fp8_q_out: Optional[Callable[[], Optional[torch.Tensor]]] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Return (q, k placeholder) after writing Q and the KV cache,
-        or None to leave both to the split rope/concat/cache chain.
+        or None to leave both to the split concat/cache chain.
 
         ``get_fp8_q_out`` is the attention backend's ``mla_fp8_q_out``, called only
         once the launch will run. If it returns a buffer, Q is cast into its first
@@ -224,8 +173,6 @@ class KimiK3RocmMlaQCacheWriter:
             slot_mapping=slot_mapping,
             get_fp8_q_out=get_fp8_q_out,
         )
-        if q is None:
-            return None
         # The KV cache is already written; attention reads only the shape of k.
         k_placeholder = torch.empty(
             (q_nope.shape[0], 1, self._head_dim),
@@ -244,33 +191,20 @@ class KimiK3RocmMlaQCacheWriter:
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         get_fp8_q_out: Optional[Callable[[], Optional[torch.Tensor]]],
-    ) -> Optional[torch.Tensor]:
-        """Q from the fused launch, or None inside a capture the eager warmup did
-        not size the zero positions for."""
-        # The identity tables have one row, so every token reads row 0.
-        rope = get_buffer("kimi_k3_mla_identity_rope", _IdentityRope).get(
-            tokens=q_nope.shape[0],
-            half_rope_dim=self._half_rope_dim,
-            device=q_nope.device,
-        )
-        if rope is None:
-            return None
-        cos, sin, unit_scale, positions = rope
+    ) -> torch.Tensor:
         fp8_q = None if get_fp8_q_out is None else get_fp8_q_out()
         if fp8_q is not None:
             _check_fp8_q_out(fp8_q, q_nope=q_nope, head_dim=self._head_dim)
-        q, _, _, _ = self._fused_rope_cat_and_cache(
+        q, _, _, _ = self._fused_cat_and_cache(
             q_nope=q_nope,
             q_pe=q_pe,
             k_nope=k_nope,
             k_pe=k_pe,
             kv_cache=kv_cache,
             slot_mapping=slot_mapping,
-            pos=positions,
-            cos=cos,
-            sin=sin,
-            k_scale=unit_scale,
-            is_neox=True,  # identity tables make the layout moot
+            # K3's KV scale is 1 (write checks it), so the kernel skips the scale.
+            k_scale=None,
+            apply_scale=False,
             # The kernel casts unscaled and saturating, which is the asm verify's
             # static FP8 quant at its unit q scale; the pad heads stay zero.
             q_out=None if fp8_q is None else fp8_q[:, : q_nope.shape[1]],

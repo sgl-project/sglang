@@ -10,7 +10,6 @@ from sglang.srt.models.kimi_k3_amd.mla import (
     create_q_cache_writer,
     fused_q_cache_available,
 )
-from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -61,8 +60,9 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
             self.writer = create_q_cache_writer(kv_lora_rank=512, qk_rope_head_dim=64)
 
     def test_writer_matches_split_chain_bytes(self):
-        """K3's KV scale is 1, so the fused write must store the split chain's bytes.
-        A slot < 0 token skips only its cache write; its Q row is still written."""
+        """K3's KV scale is 1, so the fused write must store the split chain's bytes,
+        also for -0.0, inf and NaN lanes. A slot < 0 token skips only its cache write;
+        its Q row is still written."""
         for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for tokens in (1, 33, 256):
                 with self.subTest(cache_dtype=cache_dtype, tokens=tokens):
@@ -70,13 +70,22 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
 
     def _check_split_chain_bytes(self, cache_dtype, tokens):
         values = _inputs(tokens, cache_dtype=cache_dtype, cache_rows=tokens + 8)
+        if tokens >= 4:
+            # The PE halves are copied, not rotated: an inf lane must not turn its
+            # partner into NaN, and a -0.0 lane must keep its sign.
+            values["q_pe"][0, 0, 0] = float("inf")
+            values["q_pe"][1, 0, 0] = -0.0
+            values["q_pe"][1, 0, 1] = -3.0
+            values["k_pe"][2, 0, 0] = -0.0
+            values["k_pe"][2, 0, 1] = -3.0
+            values["q_nope"][3, 0, 0] = float("nan")
         slots = torch.randperm(tokens + 8, device="cuda")[:tokens]
         slots[-1] = -1
         values["slot_mapping"] = slots
         q, k = _write(self.writer, values)
         torch.cuda.synchronize()
         expected_q, expected_k = _split_chain(values)
-        self.assertTrue(torch.equal(q, expected_q))
+        self.assertTrue(torch.equal(q.view(torch.int16), expected_q.view(torch.int16)))
         self.assertEqual(k.shape, expected_k.shape)
         cache = values["kv_cache"].view(torch.uint8)
         written = slots[:-1]
@@ -126,22 +135,13 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
         cache = values["kv_cache"].view(torch.uint8)
         self.assertTrue(torch.equal(cache[:tokens], expected_k.view(torch.uint8)))
 
-    def test_writer_graph_survives_a_larger_eager_batch(self):
-        """A captured step keeps reading the zero positions it saw,
-        even after a larger eager batch replaces the shared buffer."""
-        # Start from no shared buffer so the larger batch below has to replace it.
-        get_resources().buffers.pop("kimi_k3_mla_identity_rope", None)
+    def test_writer_captures_without_a_warmup_and_replays_on_new_inputs(self):
+        """The launch allocates no persistent buffer, so a capture needs no eager warmup
+        and a replay must read the live inputs, not the ones it was captured with."""
         small = _inputs(4)
-        _write(self.writer, small)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             q, _ = _write(self.writer, small)
-        _write(self.writer, _inputs(1000))
-        torch.cuda.synchronize()
-        # Refill freed small blocks so a dropped buffer would hold non-zero positions.
-        junk = [  # noqa: F841
-            torch.full((64,), 1, dtype=torch.int64, device="cuda") for _ in range(256)
-        ]
         for name in ("q_nope", "q_pe", "k_nope", "k_pe"):
             small[name].copy_(torch.randn_like(small[name]))
         small["kv_cache"].zero_()
@@ -150,19 +150,6 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
         expected_q, expected_k = _split_chain(small)
         self.assertTrue(torch.equal(q, expected_q))
         self.assertTrue(torch.equal(small["kv_cache"][:4], expected_k))
-
-    def test_capture_never_allocates_the_zero_positions(self):
-        """A capture the eager warmup did not size must not allocate the shared buffers
-        inside the graph; the writer declines and that step keeps the split chain."""
-        get_resources().buffers.pop("kimi_k3_mla_identity_rope", None)
-        values = _inputs(4)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            result = _write(self.writer, values)
-        self.assertIsNone(result)
-        rope = get_resources().buffers["kimi_k3_mla_identity_rope"]
-        self.assertIsNone(rope.positions)
-        self.assertIsNone(rope.tables)
 
     def test_writer_raises_on_a_strided_slot_mapping(self):
         """The kernel reads slot_mapping at stride 1, so a strided one must fail loudly

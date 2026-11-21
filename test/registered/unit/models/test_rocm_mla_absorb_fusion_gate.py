@@ -29,7 +29,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 )
 from sglang.srt.models.kimi_k3_amd import mla as k3_mla
 from sglang.srt.models.kimi_k3_amd.mla import KimiK3RocmMlaQCacheWriter
-from sglang.srt.runtime_context import get_parallel, get_resources
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -138,7 +138,7 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
         self.writer = KimiK3RocmMlaQCacheWriter(
             kv_lora_rank=512,
             qk_rope_head_dim=64,
-            fused_rope_cat_and_cache=mock.Mock(side_effect=AssertionError),
+            fused_cat_and_cache=mock.Mock(side_effect=AssertionError),
         )
         self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
         # The kernel is the boundary; the gate in front of it is under test.
@@ -195,14 +195,6 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             self._write(
                 attention_backend="aiter", is_target_verify=False, k_scale_float=2.0
             )
-        )
-
-    def test_unsized_capture_keeps_the_split_chain(self):
-        """A capture the eager warmup did not size gets no fused launch;
-        the writer must hand that step back to the split chain."""
-        self.writer._write_fused = lambda **_: None
-        self.assertIsNone(
-            self._write(attention_backend="aiter", is_target_verify=False)
         )
 
     def test_cache_the_op_cannot_write_keeps_the_split_chain(self):
@@ -277,14 +269,11 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                     self._write(attention_backend="dsa", is_target_verify=verify)
                 )
 
-    def _use_kernel(self, rope=(None, None, None, None)):
+    def _use_kernel(self):
         """Run the real _write_fused against a recording kernel stub."""
         del self.writer._write_fused
         kernel = mock.Mock(side_effect=lambda *a, **kw: (kw["q_out"], None, None, None))
-        self.writer._fused_rope_cat_and_cache = kernel
-        buffers = get_resources().buffers
-        buffers["kimi_k3_mla_identity_rope"] = SimpleNamespace(get=lambda **_: rope)
-        self.addCleanup(buffers.pop, "kimi_k3_mla_identity_rope", None)
+        self.writer._fused_cat_and_cache = kernel
         return kernel
 
     def test_declined_write_requests_no_fp8_query_buffer(self):
@@ -299,16 +288,7 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 get_fp8_q_out=get_fp8_q_out,
             )
         )
-        kernel = self._use_kernel(rope=None)
-        self.assertIsNone(
-            self._write(
-                attention_backend="aiter",
-                is_target_verify=True,
-                get_fp8_q_out=get_fp8_q_out,
-            )
-        )
         get_fp8_q_out.assert_not_called()
-        kernel.assert_not_called()
 
     def test_fp8_query_buffer_takes_q_in_its_first_heads(self):
         """With the backend's padded FP8 buffer, the launch writes q into its first
