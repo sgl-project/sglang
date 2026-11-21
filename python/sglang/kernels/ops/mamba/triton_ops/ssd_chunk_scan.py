@@ -245,7 +245,9 @@ def _chunk_scan_fwd_kernel(
         c_idx = pid_c
         c_off = 0
     else:
-        c_idx = tl.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0)
+        c_idx = tl.load(chunk_indices_ptr + pid_c, mask=pid_c > -1, other=0).to(
+            tl.int64
+        )
         c_off = tl.load(chunk_offsets_ptr + pid_c, mask=pid_c > -1, other=0)
 
     pid_h = tl.program_id(axis=2)
