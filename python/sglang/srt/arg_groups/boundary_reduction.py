@@ -74,7 +74,7 @@ def resolve_boundary_reduction(view):
             and draft_path is not None
             and draft_path != view.model_path
         ):
-            from sglang.srt.utils.hf_transformers import get_config
+            from sglang.srt.hf_transformers import get_config
 
             kwargs = {}
             if view.decrypted_draft_config_file:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterable
+from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -13,6 +14,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 
@@ -27,23 +29,53 @@ class FakeReq(SimpleNamespace):
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
+    owner_list = None
+    # Req's exit_ledger fields.
+    exit_via = None
+    send_via = None
 
-def release_only_retirer(tree_cache=None, hisparse_coordinator=None) -> RequestRetirer:
-    """A `RequestRetirer` for a test that only releases finished requests."""
+
+def release_only_retirer(
+    tree_cache=None, hisparse_coordinator=None, beam_coordinator=None
+) -> RequestRetirer:
+    """A `RequestRetirer` for a test that only releases requests, never aborts
+    a queued one."""
     return RequestRetirer(
         tree_cache=tree_cache,
-        beam_coordinator=None,
+        beam_coordinator=beam_coordinator
+        or SimpleNamespace(retire_group=lambda req: None),
         hisparse_coordinator=hisparse_coordinator,
         uocr_runtime=None,
         send_abort_output=None,
+        stream_output=None,
     )
+
+
+def leaving_retirer() -> MagicMock:
+    """A mock `RequestRetirer` whose exits take the request out of its list."""
+    retirer = MagicMock()
+
+    def leave(req, *_, **__):
+        if req.owner_list is not None:
+            req.owner_list._leave([req])
+
+    for exit_ in (
+        "abort",
+        "retire_unadmitted",
+        "release",
+        "abort_retracted",
+        "abandon",
+        "settle_output",
+    ):
+        getattr(retirer, exit_).side_effect = leave
+    return retirer
 
 
 def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:
     """A PD decode queue of `kind` holding `decode_reqs`, each a wrapper with
     `.req`."""
     queue = IndexedReqList(kind, req_of=lambda x: x.req)
-    queue.join(decode_reqs)
+    move(decode_reqs, queue)
     return queue
 
 
@@ -71,5 +103,7 @@ def empty_request_lists(scheduler: Scheduler) -> None:
     scheduler.deferred_responses = DeferredResponses(
         disaggregation_mode=DisaggregationMode.NULL,
         output_streamer=None,
+        request_retirer=None,
         send_abort=None,
     )
+    scheduler.decode_offload_manager = None

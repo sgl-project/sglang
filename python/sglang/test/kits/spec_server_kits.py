@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from sglang.srt.utils.common import kill_process_tree
+from sglang.srt.utils.process import kill_process_tree
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -536,8 +536,13 @@ class SpecPenaltyKit:
 class SpecFeatureKit:
     """Radix attention, constrained decoding, concurrent abort."""
 
+    radix_num_nodes = 400
+    radix_seed = None
+
     def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
+        run_radix_attention_test(
+            self.base_url, num_nodes=self.radix_num_nodes, seed=self.radix_seed
+        )
         self.assertIsNone(self.process.poll())
 
     def test_request_abort(self):

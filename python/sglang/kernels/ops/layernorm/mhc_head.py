@@ -42,6 +42,7 @@ def _hc_head_kernel(
     BLOCK_D: tl.constexpr,
     norm_eps: tl.constexpr,
     hc_eps: tl.constexpr,
+    EPS_OUTSIDE_SQRT: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
 
@@ -64,7 +65,10 @@ def _hc_head_kernel(
         fn_tile = tl.load(fn_ptr + fn_offs, mask=fn_mask, other=0.0)
         mix += tl.sum(fn_tile * x_tile[None, :], axis=1)
 
-    rsqrt = tl.rsqrt(sumsq / K_TOTAL + norm_eps)
+    if EPS_OUTSIDE_SQRT:
+        rsqrt = 1.0 / (tl.sqrt(sumsq / K_TOTAL) + norm_eps)
+    else:
+        rsqrt = tl.rsqrt(sumsq / K_TOTAL + norm_eps)
     scale_v = tl.load(scale_ptr).to(tl.float32)
     base_v = tl.load(base_ptr + m_idx).to(tl.float32)
 
@@ -94,6 +98,7 @@ def fused_hc_head(
     hc_base: torch.Tensor,
     norm_eps: float,
     hc_eps: float,
+    eps_outside_sqrt: bool = False,
 ) -> torch.Tensor:
     """Fused (RMSNorm + Linear + Sigmoid-gate + weighted-sum) for the DSV4 hc_head.
 
@@ -104,6 +109,7 @@ def fused_hc_head(
         hc_base   : (hc_mult,) fp32
         norm_eps  : RMS epsilon
         hc_eps    : additive epsilon after sigmoid
+        eps_outside_sqrt : normalize by 1 / (sqrt(mean_sq) + eps), as mhc_pre does
 
     Returns:
         y : (T, hidden_size) same dtype as x
@@ -146,6 +152,7 @@ def fused_hc_head(
         BLOCK_D=BLOCK_D,
         norm_eps=norm_eps,
         hc_eps=hc_eps,
+        EPS_OUTSIDE_SQRT=eps_outside_sqrt,
         num_warps=4,
     )
     return y

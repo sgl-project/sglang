@@ -36,6 +36,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -46,7 +47,7 @@ from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_t
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
-from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from sglang.srt.utils import BumpAllocator, is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 

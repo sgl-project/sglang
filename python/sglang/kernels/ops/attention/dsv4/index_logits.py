@@ -5,16 +5,18 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 from __future__ import annotations
 
 import functools
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 import torch
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.quantization.fp4_to_fp8 import widen_fp4_to_fp8
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import ceil_align
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
@@ -40,6 +42,12 @@ def index_weights_dtype() -> torch.dtype:
     if index_logits_dtype() == torch.bfloat16 and _is_sm100():
         return torch.bfloat16
     return torch.float32
+
+
+def deep_gemm_paged_varlen() -> bool:
+    """Whether paged DeepGEMM logits take the current API: SM100 with bf16 weights
+    and logits, query rows as varlen tokens grouped by request ``indices``."""
+    return index_weights_dtype() == torch.bfloat16
 
 
 # Width alignment of the flat logits: covers block-wise reads of up to 64 columns, and 128 B of bf16, which
@@ -81,6 +89,38 @@ def flat_index_logits_rows_per_tile(
     return rows_per_tile
 
 
+def flat_index_logits_widen_to_fp8() -> bool:
+    """Whether the flat logits run DeepGEMM's fp8 kernel on the operands widened
+    to e4m3: Hopper, which has no fp4 MMA for ``fp8_fp4_mqa_logits``."""
+    return get_platform().is_sm90
+
+
+def _flat_index_logits_tiles_fp8(
+    q, kv, weights, starts, lengths, width, rows_per_tile
+) -> Iterator[tuple[slice, torch.Tensor]]:
+    """fp32 logits tiles of the widened operands, with the query scale folded
+    into the head weights. K is widened once for all the tiles."""
+    from deep_gemm import fp8_mqa_logits
+
+    k = widen_fp4_to_fp8(*kv)
+    for offset in range(0, q[0].shape[0], rows_per_tile):
+        tile = slice(offset, offset + rows_per_tile)
+        q_fp8, q_scale = widen_fp4_to_fp8(q[0][tile], q[1][tile])
+        tile_starts = starts[tile]
+        yield (
+            slice(offset, offset + q_fp8.shape[0]),
+            fp8_mqa_logits(
+                q_fp8,
+                k,
+                weights[tile] * q_scale,
+                tile_starts,
+                tile_starts + lengths[tile],
+                clean_logits=False,
+                max_seqlen_k=width,
+            ),
+        )
+
+
 def flat_index_logits_tiles(
     *,
     q: tuple[torch.Tensor, torch.Tensor],
@@ -95,8 +135,6 @@ def flat_index_logits_tiles(
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
     aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
@@ -104,6 +142,13 @@ def flat_index_logits_tiles(
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
+    if flat_index_logits_widen_to_fp8():
+        yield from _flat_index_logits_tiles_fp8(
+            q, kv, weights, starts, lengths, width, rows_per_chunk
+        )
+        return
+    from deep_gemm import fp8_fp4_mqa_logits
+
     weights = weights.to(index_weights_dtype())
     if weights.dtype == torch.bfloat16:
         logits_args, logits_kwargs = (width,), {}
@@ -135,14 +180,20 @@ def deep_gemm_fp4_paged_mqa_logits(
     page_table: torch.Tensor,
     deep_gemm_metadata,
     max_seq_len: int,
+    indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
+    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one.
+
+    With ``indices`` (the request of each query row, see
+    :func:`deep_gemm_paged_varlen`) the rows are varlen tokens with per-row
+    ``seq_lens`` / ``page_table`` and ``deep_gemm_metadata`` was built with the
+    same ``indices``; without, the 0.2.3-style call."""
     from deep_gemm import fp8_fp4_paged_mqa_logits
 
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
-    return fp8_fp4_paged_mqa_logits(
+    args = (
         q_fp4,
         k_cache,
         weights.to(index_weights_dtype()),
@@ -150,9 +201,10 @@ def deep_gemm_fp4_paged_mqa_logits(
         page_table,
         deep_gemm_metadata,
         max_seq_len,
-        False,
-        logits_dtype=index_logits_dtype(),
     )
+    if indices is not None:
+        return fp8_fp4_paged_mqa_logits(*args, indices=indices)
+    return fp8_fp4_paged_mqa_logits(*args, False, logits_dtype=index_logits_dtype())
 
 
 def sparse_logits(

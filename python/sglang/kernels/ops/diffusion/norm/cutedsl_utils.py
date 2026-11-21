@@ -1,5 +1,3 @@
-from typing import Optional
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -13,23 +11,10 @@ TORCH_TO_CUTE_DTYPE = {
 }
 
 
-def to_cute_arg(
-    t,
-    *,
-    assume_aligned: Optional[int] = 32,
-    use_32bit_stride: bool = False,
-    enable_tvm_ffi: bool = True,
-):
+def to_cute_arg(t):
     """
-    Convert a Python value into a CuTeDSL value.
+    Convert a Python scalar into a CuTeDSL value.
     """
-    if isinstance(t, torch.Tensor):
-        return cute.runtime.from_dlpack(
-            t,
-            assumed_align=assume_aligned,
-            use_32bit_stride=use_32bit_stride,
-            enable_tvm_ffi=enable_tvm_ffi,
-        )
     if isinstance(t, int):
         return cutlass.Int32(t)
     if isinstance(t, float):

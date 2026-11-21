@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 from .awq_scheme import AWQMoESchemeBase
 

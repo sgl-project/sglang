@@ -73,7 +73,7 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora_two_stream(
         maybe_overlap_staged_shared_add,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.utils.common import next_power_of_2
+    from sglang.srt.utils.triton_utils import next_power_of_2
 
     assert runner_config.activation == "silu" and runner_config.is_gated, (
         "experimental_sgl_trtllm LoRA currently supports the gated SwiGLU FP8 "

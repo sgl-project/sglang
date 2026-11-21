@@ -28,8 +28,8 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --prompt "A curiou
 sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --num-gpus 4
 
 # Python API
-from sglang import DiffGenerator
-gen = DiffGenerator.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+from sglang.multimodal_gen import DiffGenerator
+gen = DiffGenerator.from_pretrained(model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
 result = gen.generate(sampling_params_kwargs={"prompt": "A curious raccoon"})
 ```
 

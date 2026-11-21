@@ -1,3 +1,4 @@
+import logging
 from array import array
 from typing import Iterable, List, Optional, Tuple
 
@@ -20,7 +21,8 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.srt.multimodal.modality import Modality
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class InternS1ForConditionalGeneration(nn.Module):

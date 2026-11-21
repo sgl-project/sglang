@@ -24,6 +24,7 @@ import torch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -33,10 +34,9 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     prepare_cp_forward,
 )
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size, require_mlp_sync
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-    build_eager_registry,
-)
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_registry
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     forward_context,
@@ -45,6 +45,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.model_interfaces import prepare_language_model_inputs
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
@@ -57,11 +58,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import is_hip, is_npu
-from sglang.srt.utils.common import (
-    ceil_align,
-    get_eager_max_batch_size,
-    require_mlp_sync,
-)
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
@@ -122,7 +119,6 @@ class EagerRunner(BaseRunner):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
-        self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
             device=mr.device,
@@ -281,6 +277,11 @@ class EagerRunner(BaseRunner):
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )
                 and forward_batch.extend_prefix_lens is not None
+                # MLA target verify reads rank-local decode KV, not the gathered layout.
+                and not (
+                    forward_batch.forward_mode.is_target_verify()
+                    and model_runner.model_config.attention_arch == AttentionArch.MLA
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
@@ -305,8 +306,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
             shared_read_ends = (
                 model_runner.attn_backend.resolve_prefill_shared_read_ends(
-                    forward_batch,
-                    num_qo_tokens=len(forward_batch.input_ids),
+                    forward_batch
                 )
             )
             maybe_publish_prefill_shared_read_done(
@@ -331,8 +331,9 @@ class EagerRunner(BaseRunner):
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
-                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
-                # Other group-sharing models keep owning the layout in forward().
+                # GLM and Kimi-K3 delegate their CP boundary to this runner via
+                # prepare_cp_inputs. Other group-sharing models keep owning the
+                # layout in forward().
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
@@ -351,14 +352,19 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
+        input_ids = forward_batch.input_ids
         if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
             input_embeds, positions, model_kwargs = prepare_inputs(
                 forward_batch, **kwargs
             )
         else:
             input_embeds = kwargs.get("input_embeds")
+            # Prepare multimodal embeddings and model IDs in global token order.
+            input_ids, input_embeds = prepare_language_model_inputs(
+                model, input_ids, forward_batch, input_embeds
+            )
             if input_embeds is None:
-                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+                input_embeds = model.get_input_embeddings()(input_ids)
             positions = forward_batch.positions
             model_kwargs = {}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
@@ -368,26 +374,32 @@ class EagerRunner(BaseRunner):
             input_embeds,
             positions,
             forward_batch,
-            forward_batch.input_ids,
+            input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
-            hidden_states = model.model(
+            body = model.model
+            if hasattr(body, "logits_processor"):
+                # A multimodal wrapper exposes its causal LM as `.model`; run
+                # that LM's text body, as the gather/logits tail below does.
+                body = body.model
+            hidden_states = body(
                 model_input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,
             )
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
-        aux_hidden_states = None
-        if capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
         if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
+            # A middle stage may return a PP proxy rather than a tuple.
+            return hidden_states
+
+        # A model with compact output rows must gather with its output layout and
+        # pass matching token indices and lengths to logits/aux-state consumers.
+        if postprocess_cp_output := getattr(model, "postprocess_cp_output", None):
+            return postprocess_cp_output(hidden_states, forward_batch)
+
+        aux_hidden_states = None
+        if getattr(model, "capture_aux_hidden_states", False):
+            hidden_states, aux_hidden_states = hidden_states
 
         stream = torch.cuda.current_stream()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
@@ -411,7 +423,7 @@ class EagerRunner(BaseRunner):
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
         return model.logits_processor(
-            forward_batch.input_ids,
+            input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,

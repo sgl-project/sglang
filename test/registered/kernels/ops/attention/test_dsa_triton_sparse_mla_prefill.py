@@ -234,6 +234,8 @@ class TestDSATritonPrefillBackendAdapter(CustomTestCase):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.dsa_triton_union = union
         return backend
 
