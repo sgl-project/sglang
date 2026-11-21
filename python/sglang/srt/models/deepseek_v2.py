@@ -502,6 +502,12 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def routes_with_fp32_correction_bias(config) -> bool:
+    """GLM-5.3-Flash's 288 fp32 biases per layer sit in a ~0.4-wide band where bf16
+    keeps 8-11 of them, which reorders top-k, so it routes with the fp32 bias."""
+    return config.model_type == "glm5_next_text"
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -528,7 +534,11 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
             # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not is_glm_moe_dsa(config):
+            if (
+                quant_config is not None
+                and not is_glm_moe_dsa(config)
+                and not routes_with_fp32_correction_bias(config)
+            ):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -1346,6 +1356,33 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _gate_and_topk(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator: BumpAllocator,
+        input_ids_global: Optional[torch.Tensor],
+        use_vision_topk: bool,
+    ):
+        # router_logits: (num_tokens, n_experts)
+        if _is_hip:
+            router_logits, router_logits_partials = _hip_moe.forward_gate(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator,
+                fused_gate=not use_vision_topk,
+            )
+        else:
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            router_logits_partials = None
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
+        )
+        if router_logits_partials is not None:
+            topk_kwargs["router_logits_partials"] = router_logits_partials
+        if use_vision_topk:
+            return vision_topk(self, router_logits, input_ids_global)
+        return self.topk(hidden_states, router_logits, **topk_kwargs)
+
     def _finalize_normal_output(
         self,
         final_hidden_states: torch.Tensor,
@@ -1399,35 +1436,17 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
-            # router_logits: (num_tokens, n_experts)
-            if _is_hip:
-                router_logits, router_logits_partials = _hip_moe.forward_gate(
-                    self,
+            topk_output = (
+                _hip_moe.smallm_router_topk_output(self, hidden_states)
+                if _use_aiter_gfx95 and not use_vision_topk
+                else None
+            )
+            if topk_output is None:
+                topk_output = self._gate_and_topk(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    fused_gate=not use_vision_topk,
-                )
-            else:
-                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-                router_logits_partials = None
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            if router_logits_partials is not None:
-                topk_kwargs["router_logits_partials"] = router_logits_partials
-            if use_vision_topk:
-                topk_output = vision_topk(
-                    self,
-                    router_logits,
                     input_ids_global,
-                )
-            else:
-                topk_output = self.topk(
-                    hidden_states,
-                    router_logits,
-                    **topk_kwargs,
+                    use_vision_topk,
                 )
         else:
             pre_quant_input = None
