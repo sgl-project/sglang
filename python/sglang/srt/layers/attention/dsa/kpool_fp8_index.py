@@ -778,7 +778,10 @@ def topk_from_pooled_history_logits(
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
     topk_v2_plan: torch.Tensor | None = None,
+    out_col_align: int = 1,
 ) -> torch.Tensor:
+    """``out_col_align`` only reaches the fused JIT path (the ROCm decode path);
+    the other paths return the unpadded width and the consumer pads as before."""
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
     assert logits.shape[0] == group_lengths.shape[0]
@@ -835,6 +838,7 @@ def topk_from_pooled_history_logits(
             row_starts=row_starts,
             seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
             page_table_row_index=page_table_row_index,
+            out_col_align=out_col_align,
         )
         if out_rows is None or out_rows == result.shape[0]:
             return result
@@ -1871,3 +1875,104 @@ def kpool_write_tail_and_maybe_compress(
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
     )
+
+
+@triton.jit
+def _kpool_q_rotate_quant_gate_kernel(
+    q_ptr,
+    q_stride_t,
+    q_stride_h,
+    q_fp8_ptr,
+    w_ptr,
+    w_stride_t,
+    w_out_ptr,
+    N_HEADS: tl.constexpr,
+    ROTATE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+    W_SCALE_1: tl.constexpr,
+    W_SCALE_2: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MAX_INV: tl.constexpr,
+):
+    """One (token, head) row of the indexer query: Hadamard rotation (bf16
+    result, as fast_hadamard_transform), 128-wide fp8 quantization (as the
+    TileLang act_quant, ue8m0 scales when ROUND_SCALE), and the head gate
+    w * W_SCALE_1 * q_scale * W_SCALE_2 in the order _get_logits_head_gate
+    multiplies."""
+    pid = tl.program_id(0)
+    t = pid // N_HEADS
+    h = pid % N_HEADS
+    offs = tl.arange(0, 128)
+    x = tl.load(q_ptr + t * q_stride_t + h * q_stride_h + offs).to(tl.float32)
+    if ROTATE:
+        x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+    if ROUND_SCALE:
+        # TileLang fast_round_scale: 2 ** ceil(log2(amax / fp8_max)) from the bits
+        bits = (amax * FP8_MAX_INV).to(tl.uint32, bitcast=True)
+        e = (
+            ((bits >> 23) & 0xFF).to(tl.int32)
+            - 127
+            + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        )
+        scale = ((e + 127).to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    else:
+        scale = amax * FP8_MAX_INV
+    y = tl.minimum(tl.maximum(x / scale, -FP8_MAX), FP8_MAX)
+    tl.store(q_fp8_ptr + pid * 128 + offs, y.to(q_fp8_ptr.dtype.element_ty))
+    w = tl.load(w_ptr + t * w_stride_t + h).to(tl.float32)
+    w = w * W_SCALE_1
+    w = w * scale
+    w = w * W_SCALE_2
+    tl.store(w_out_ptr + pid, w)
+
+
+def kpool_q_rotate_quant_gate(
+    query: torch.Tensor,
+    head_weights: torch.Tensor,
+    *,
+    rotate: bool,
+    round_scale: bool,
+    weight_scale_1: float,
+    weight_scale_2: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode query prep of the k-pool indexer in one launch.
+
+    Replaces rotate_activation(query) -> act_quant(query, 128) -> the head-gate
+    scaling of IndexerKPool._get_logits_head_gate. ``query`` is [n, heads, 128]
+    (any token / head stride, unit inner stride), ``head_weights`` the raw
+    weights_proj output [n, heads] (unit inner stride). Returns q_fp8 [n, heads,
+    128] and the logits weights [n, heads, 1] fp32.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+
+    n, heads, dim = query.shape
+    assert dim == 128 and query.stride(2) == 1
+    assert head_weights.shape == (n, heads) and head_weights.stride(1) == 1
+    fnuz = is_fp8_fnuz()
+    fp8_max = 224.0 if fnuz else 448.0
+    q_fp8 = torch.empty(
+        (n, heads, dim),
+        dtype=torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn,
+        device=query.device,
+    )
+    weights = torch.empty((n, heads, 1), dtype=torch.float32, device=query.device)
+    if n == 0:
+        return q_fp8, weights
+    _kpool_q_rotate_quant_gate_kernel[(n * heads,)](
+        query,
+        query.stride(0),
+        query.stride(1),
+        q_fp8,
+        head_weights,
+        head_weights.stride(0),
+        weights,
+        N_HEADS=heads,
+        ROTATE=rotate,
+        ROUND_SCALE=round_scale,
+        W_SCALE_1=weight_scale_1,
+        W_SCALE_2=weight_scale_2,
+        FP8_MAX=fp8_max,
+        FP8_MAX_INV=1.0 / fp8_max,
+    )
+    return q_fp8, weights

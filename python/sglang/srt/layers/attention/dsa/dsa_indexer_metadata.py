@@ -107,6 +107,9 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     # (see DSATopKBackend); unsharded batches take it either way
     packed_extend_topk: bool = False
     indexer_page_table: Optional[torch.Tensor] = None
+    # Decode top-k width alignment wanted by the attention kernel that consumes
+    # the indices as its page table (TileLang: 64), 1 = no padding.
+    topk_out_col_align: int = 1
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
