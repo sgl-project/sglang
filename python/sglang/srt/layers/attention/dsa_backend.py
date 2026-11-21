@@ -89,6 +89,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.kpool_backend import (
+    uses_raw_fp8_dsa_kv_layout as uses_raw_fp8_dsa_kv_layout,
+)
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
@@ -492,11 +495,6 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "prims_ts",
     "intel_xpu",
 ]
-
-
-def uses_raw_fp8_dsa_kv_layout(backend: Optional[str]) -> bool:
-    # The raw FP8 MLA cache layout: 576 B/token, no fp8_ds_mla tile scales.
-    return backend in ("trtllm", "prims_ts")
 
 
 # Largest head count the kernel has been measured at. Above it BLOCK_H=64/128
