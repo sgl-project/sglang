@@ -436,9 +436,17 @@ class TestFoundryGraphPersistence(CustomTestCase):
         for engine in ("save", "load"):
             log = self.runs[engine]["log"]
             with self.subTest(engine=engine):
-                prebuilt = _PREBUILT_STATE.search(log)
-                if prebuilt is not None:
-                    capture = _CAPTURE_BEGIN.search(log)
+                if save:
+                    # capture messages from other ranks can arrive before this worker starts
+                    prebuilt = re.search(
+                        r"\b(PID\d+)\] " + _PREBUILT_STATE.pattern, log
+                    )
+                    self.assertIsNotNone(
+                        prebuilt, "no scheduler PID on the prebuild line"
+                    )
+                    capture = re.search(
+                        rf"\b{prebuilt[1]}\] {_CAPTURE_BEGIN.pattern}", log
+                    )
                     self.assertIsNotNone(capture, "no capture-begin line in the log")
                     self.assertLess(prebuilt.start(), capture.start())
 
