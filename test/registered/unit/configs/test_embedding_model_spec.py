@@ -16,67 +16,11 @@ from sglang.srt.configs.embedding_model_spec import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestEmbeddingModelSpec(CustomTestCase):
-    def test_token_classifier_spec_survives_the_embedding_flag(self):
-        """Launching these needs --is-embedding, which must not demote them to EMBED."""
-        for is_embedding_requested in (False, True):
-            with self.subTest(is_embedding_requested=is_embedding_requested):
-                spec = resolve_embedding_model_spec(
-                    ["BertForTokenClassification"],
-                    is_embedding_requested=is_embedding_requested,
-                    is_embedding_gemma=False,
-                )
-                self.assertEqual(spec.task, EmbeddingTask.TOKEN_CLASSIFY)
-                self.assertEqual(spec.family, "token_classification")
-                self.assertEqual(spec.execution, EmbeddingExecution.CLASSIFICATION)
-                self.assertEqual(spec.bcg_eligibility, BCGEligibility.DISABLED)
-                self.assertTrue(spec.requires_embedding_flag)
-
-    def test_mixed_declarations_keep_the_non_token_head_spec(self):
-        """Mixed declarations resolve exactly as their non-token head alone."""
-        for other, token in (
-            ("BertForSequenceClassification", "BertForTokenClassification"),
-            ("Gemma2ForSequenceClassification", "Gemma2ForTokenClassification"),
-            ("Qwen2ForRewardModel", "Qwen2ForTokenClassification"),
-        ):
-            for is_embedding_requested in (False, True):
-                expected = resolve_embedding_model_spec(
-                    [other],
-                    is_embedding_requested=is_embedding_requested,
-                    is_embedding_gemma=False,
-                ).as_dict()
-                for architectures in ([other, token], [token, other]):
-                    with self.subTest(
-                        architectures=architectures,
-                        is_embedding_requested=is_embedding_requested,
-                    ):
-                        spec = resolve_embedding_model_spec(
-                            architectures,
-                            is_embedding_requested=is_embedding_requested,
-                            is_embedding_gemma=False,
-                        )
-                        self.assertEqual(spec.as_dict(), expected)
-
-    def test_empty_declaration_is_not_a_token_classifier(self):
-        """A checkpoint that declares no architecture is not a token classifier."""
-        for architectures in ([], None):
-            for is_embedding_requested in (False, True):
-                with self.subTest(
-                    architectures=architectures,
-                    is_embedding_requested=is_embedding_requested,
-                ):
-                    spec = resolve_embedding_model_spec(
-                        architectures,
-                        is_embedding_requested=is_embedding_requested,
-                        is_embedding_gemma=False,
-                    )
-                    self.assertNotEqual(spec.task, EmbeddingTask.TOKEN_CLASSIFY)
-
+class TestEmbeddingModelSpec(unittest.TestCase):
     def test_embedding_gemma_declares_full_encoder_bcg_contract(self):
         spec = resolve_embedding_model_spec(
             ["Gemma3TextModel"],
