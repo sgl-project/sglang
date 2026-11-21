@@ -1109,6 +1109,9 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
+    # CSV of exact-shape decode GEMM kernels for gfx950 under AITER (empty: none);
+    # Kimi-K3 loads its kernels at startup, about 2.7 GiB a rank outside torch
+    SGLANG_ROCM_DECODE_GEMM_TABLE = EnvStr("")
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
     SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
@@ -1228,6 +1231,10 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Kimi-K3.1 MLA decode / verify on ROCm: one GEMM for q_a + kv_a, g_proj and the
+    # indexer's wk + weights_proj from MIN_TOKENS rows up (measured faster at 360-800)
+    SGLANG_ENABLE_ROCM_K3_MLA_PROJ_FRONT = EnvBool(False)
+    SGLANG_ROCM_K3_MLA_PROJ_FRONT_MIN_TOKENS = EnvInt(360)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
