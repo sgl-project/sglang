@@ -155,6 +155,17 @@ class LayerWiseLoadCounter:
         self.blocked_seconds.clear()
 
 
+class OffsetLayerCounter:
+    """Layer wait hook for a pool whose layer ``i`` rides transfer layer ``offset + i``."""
+
+    def __init__(self, counter: object, offset: int):
+        self.counter = counter
+        self.offset = offset
+
+    def wait_until(self, threshold: int) -> None:
+        self.counter.wait_until(self.offset + threshold)
+
+
 class TransferReady(NamedTuple):
     events: list[torch.cuda.Event]
 
@@ -198,6 +209,16 @@ class UnifiedCacheLinker(ABC):
             forward_done.record(self.forward_stream)
             events.append(forward_done)
         return TransferReady(events)
+
+    def draft_layer_counter(self) -> OffsetLayerCounter:
+        """Layer wait hook for the sidecar draft pool.
+
+        The offset comes from the DRAFT entry's transfer layers, so the wait
+        follows wherever the pool assembler placed the draft bytes.
+        """
+        return OffsetLayerCounter(
+            self.layer_done_counter, min(self.pools[PoolName.DRAFT].layer_mapping)
+        )
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
