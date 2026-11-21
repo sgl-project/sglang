@@ -1259,6 +1259,33 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         self.assertEqual(len(kv_offload.keys), 2)
 
+    def test_offload_skips_pools_the_reader_does_not_load(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=2,
+            kv_size=64,
+            max_context_len=64,
+        )
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        cache.init_cache_linker(linker)
+
+        reader_pools = [PoolName.DEEPSEEK_V4_C1.value]
+        with cache.linker.skip_offload_prefix(0, reader_pools=reader_pools):
+            self._insert(cache, allocator, req_pool, list(range(1, 7)))
+        self.assertIsNone(cache.linker.offload_reader_pools)
+        self.assertGreaterEqual(len(linker.offload_calls), 1)
+        for transfers in linker.offload_calls:
+            self.assertEqual([t.name for t in transfers], [PoolName.KV])
+
+        linker.offload_calls.clear()
+        self._insert(cache, allocator, req_pool, list(range(11, 17)))
+        self.assertGreaterEqual(len(linker.offload_calls), 1)
+        for transfers in linker.offload_calls:
+            self.assertEqual({t.name for t in transfers}, {PoolName.KV, PoolName.SWA})
+
     def test_decode_match_skips_linker_lookup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg

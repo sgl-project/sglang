@@ -1947,6 +1947,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefill_info is not None and prefill_info.stores_to_linker
                 else 0
             )
+            decode_req.req.linker_offload_pools = (
+                prefill_info.linker_pools if prefill_info is not None else None
+            )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,

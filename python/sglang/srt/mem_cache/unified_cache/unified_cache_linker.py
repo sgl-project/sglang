@@ -348,6 +348,7 @@ class UnifiedCacheLinkerWrapper:
         self.pending_offloads: list[_PendingOffload] = []
         # Page-aligned radix-key prefix excluded from offload during an insert.
         self.offload_skip_prefix_len = 0
+        self.offload_reader_pools: Optional[frozenset[str]] = None
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -786,14 +787,20 @@ class UnifiedCacheLinkerWrapper:
 
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain, skipping nodes already in the store."""
+        skipped = {window.pool_name for window in self._skipped_windows}
+        if self.offload_reader_pools is not None:
+            skipped.update(
+                window.pool_name
+                for window in self._windows
+                if window.pool_name not in self.offload_reader_pools
+            )
         for node_id in node_ids:
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
             )
             if transfers is None:
                 continue
-            if self._skipped_windows:
-                skipped = {window.pool_name for window in self._skipped_windows}
+            if skipped:
                 transfers = [t for t in transfers if t.name not in skipped]
             if self.offload_skip_prefix_len:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
@@ -802,13 +809,23 @@ class UnifiedCacheLinkerWrapper:
             self._offload_node(node_id, transfers)
 
     @contextmanager
-    def skip_offload_prefix(self, length: int):
-        """Skip offloading the first ``length`` radix-key units during an insert."""
+    def skip_offload_prefix(
+        self, length: int, reader_pools: Optional[Sequence[str]] = None
+    ):
+        """Skip offloading the first ``length`` radix-key units during an insert.
+
+        ``reader_pools``, when set, also drops every window whose pool is not in
+        it: the reader of this offload never loads that window.
+        """
         self.offload_skip_prefix_len = length
+        self.offload_reader_pools = (
+            None if reader_pools is None else frozenset(reader_pools)
+        )
         try:
             yield
         finally:
             self.offload_skip_prefix_len = 0
+            self.offload_reader_pools = None
 
     def _drop_offload_skip_prefix(
         self, node_id: NodeId, transfers: list[PoolTransfer]
