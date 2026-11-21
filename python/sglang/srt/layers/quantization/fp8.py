@@ -3234,6 +3234,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+            # The Parameter wrap drops the is_shuffled tag shuffle_weight sets;
+            # aiter's gfx950 fp8 CK MoE rejects untagged per-tensor weights.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
             layer._aiter_gate_up_interleaved = False
 
             # ROCm (_use_aiter): using column-wise scaling
