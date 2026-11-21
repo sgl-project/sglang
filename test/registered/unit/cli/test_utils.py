@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import httpx
+import requests
 from huggingface_hub.errors import (
     GatedRepoError,
     RemoteEntryNotFoundError,
@@ -41,6 +44,39 @@ class TestDiffusionModelDetection(CustomTestCase):
         )
         modelscope_patcher.start()
         self.addCleanup(modelscope_patcher.stop)
+
+    def test_remote_modular_index(self):
+        from modelscope.hub.errors import NotExistError
+
+        repo = "test/modular-pipeline"
+        # ModelScope's compatibility client wraps its missing-file error.
+        missing = requests.HTTPError("file not found")
+        missing.__cause__ = NotExistError("file not found")
+        hubs = (
+            (
+                False,
+                "huggingface_hub.hf_hub_download",
+                _hub_error(RemoteEntryNotFoundError, 404),
+            ),
+            (True, "modelscope.model_file_download", missing),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            index = Path(tmp) / "modular_model_index.json"
+            index.write_text('{"_diffusers_version": "0.39.0"}')
+            for use_modelscope, target, error in hubs:
+                with (
+                    self.subTest(target=target),
+                    patch(
+                        "sglang.cli.utils.envs.SGLANG_USE_MODELSCOPE.get",
+                        return_value=use_modelscope,
+                    ),
+                    patch(target, side_effect=[error, str(index)]) as download,
+                ):
+                    self.assertTrue(get_is_diffusion_model(repo))
+                    self.assertEqual(
+                        download.call_args_list,
+                        [call(repo, "model_index.json"), call(repo, index.name)],
+                    )
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")

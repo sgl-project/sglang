@@ -4,15 +4,18 @@ import os
 import subprocess
 from functools import lru_cache
 
-from huggingface_hub.errors import GatedRepoError
+from huggingface_hub.errors import GatedRepoError, RemoteEntryNotFoundError
 
 from sglang.srt.environ import envs
 from sglang.utils import (
     has_diffusion_overlay_registry_match,
+    is_modelscope_not_found_error,
     load_diffusion_overlay_registry_from_env,
 )
 
 logger = logging.getLogger(__name__)
+
+_DIFFUSERS_INDEX_FILES = ("model_index.json", "modular_model_index.json")
 
 
 @lru_cache(maxsize=1)
@@ -67,13 +70,17 @@ def is_registered_native_pipeline(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in _PIPELINE_REGISTRY
 
 
+def _is_diffusers_model_index(path: str) -> bool:
+    with open(path) as f:
+        return "_diffusers_version" in json.load(f)
+
+
 def _is_diffusers_model_dir(model_dir: str) -> bool:
     """Check for a standard or modular Diffusers pipeline index."""
-    for filename in ("model_index.json", "modular_model_index.json"):
+    for filename in _DIFFUSERS_INDEX_FILES:
         config_path = os.path.join(model_dir, filename)
         if os.path.isfile(config_path):
-            with open(config_path) as f:
-                return "_diffusers_version" in json.load(f)
+            return _is_diffusers_model_index(config_path)
     return False
 
 
@@ -93,7 +100,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
 
     For registered models, consults the diffusion registry first.
     For other local directories, checks the filesystem directly.
-    For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
+    For other HF/ModelScope model IDs, checks the standard or modular index.
     For gated HF repos where file download fails, falls back to HF model card
     metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
@@ -115,17 +122,21 @@ def get_is_diffusion_model(model_path: str) -> bool:
 
     try:
         if use_modelscope:
-            from modelscope import model_file_download
-
-            file_path = model_file_download(
-                model_id=model_path, file_path="model_index.json"
-            )
+            from modelscope import model_file_download as download
         else:
-            from huggingface_hub import hf_hub_download
+            from huggingface_hub import hf_hub_download as download
 
-            file_path = hf_hub_download(repo_id=model_path, filename="model_index.json")
-
-        return _is_diffusers_model_dir(os.path.dirname(file_path))
+        for filename in _DIFFUSERS_INDEX_FILES:
+            try:
+                file_path = download(model_path, filename)
+            except Exception as exc:
+                if isinstance(
+                    exc, RemoteEntryNotFoundError
+                ) or is_modelscope_not_found_error(exc):
+                    continue
+                raise
+            return _is_diffusers_model_index(file_path)
+        return False
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
         if not use_modelscope and isinstance(e, GatedRepoError):
