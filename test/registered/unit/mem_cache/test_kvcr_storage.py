@@ -10,6 +10,7 @@ import importlib.util
 import json
 import mmap
 import re
+import socket
 import sys
 import time
 import types
@@ -1182,6 +1183,31 @@ class TestKVCRStorage(CustomTestCase):
                     storage_namespace(config, self.backend._layouts), namespace
                 )
 
+    def test_extra_backend_tag_separates_namespace(self):
+        """Same served name, different weights: the tag keeps their pages apart."""
+        namespace = storage_namespace(self.config, self.backend._layouts)
+        tagged = [
+            storage_namespace(
+                dataclasses.replace(
+                    self.config, extra_config={"extra_backend_tag": tag}
+                ),
+                self.backend._layouts,
+            )
+            for tag in ("ckpt-a", "ckpt-b")
+        ]
+        self.assertEqual(len({namespace, *tagged}), 3)
+        for tag in ("", 7):
+            with (
+                self.subTest(tag=tag),
+                self.assertRaisesRegex(ValueError, "extra_backend_tag"),
+            ):
+                KVCRStore(
+                    dataclasses.replace(
+                        self.config, extra_config={"extra_backend_tag": tag}
+                    ),
+                    self.pool,
+                )
+
     def test_trailing_window_holes_do_not_become_contiguous_prefixes(self):
         self.assertEqual(resume_boundaries([False, True, True, False], trailing=2), [3])
         self.assertEqual(resume_boundaries([True, False, True], trailing=None), [1])
@@ -1646,6 +1672,61 @@ class TestKVCRInventoryPublication(CustomTestCase):
                 else:
                     self.assertIsNone(bindings[0]["inventory_sink"])
 
+    def test_control_endpoint_exists_only_with_remote_hints(self):
+        """Peers fetch through the unauthenticated control endpoint, so a
+        local-only store neither binds nor serves one."""
+        for hinted in (True, False):
+            with self.subTest(enable_remote_hint=hinted):
+                backend = self._backend(
+                    enable_remote_hint=hinted,
+                    publish_inventory=False,
+                    local_dram_bytes=128,
+                )
+                channels, bindings = [], []
+
+                def channel(created=channels, **kwargs):
+                    created.append(kwargs)
+                    return SimpleNamespace(endpoint="tcp://x:1", close=lambda: None)
+
+                def construct(captured=bindings, **kwargs):
+                    captured.append(vars(kwargs["bindings"]))
+                    raise RuntimeError("stop after construction")
+
+                modules = {
+                    "kvcr": SimpleNamespace(
+                        KVCR=construct,
+                        KVCRBindings=SimpleNamespace,
+                        ZmqPeerControlChannel=channel,
+                    ),
+                    "kvcr.config": SimpleNamespace(
+                        KVCRBackendConfigs=SimpleNamespace,
+                        KVCRConfig=SimpleNamespace,
+                        LocalDramOptions=SimpleNamespace,
+                    ),
+                    "kvcr.types": SimpleNamespace(
+                        KVCRStartupError=type("StartupError", (RuntimeError,), {}),
+                        RegionDescriptor=SimpleNamespace,
+                    ),
+                }
+                with (
+                    patch.dict("sys.modules", modules),
+                    patch(
+                        "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                        side_effect=SystemExit(1),
+                    ),
+                    self.assertLogs(
+                        "sglang.srt.mem_cache.storage.kvcr.kvcr_store",
+                        level="CRITICAL",
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    backend._start()
+                self.assertEqual(len(channels), int(hinted))
+                if hinted:
+                    self.assertIsNotNone(bindings[0]["framework_control"])
+                else:
+                    self.assertIsNone(bindings[0]["framework_control"])
+
     def test_unified_radix_cache_publishes_only_for_inventory(self):
         for publish in (True, False):
             with self.subTest(publish=publish):
@@ -1876,6 +1957,48 @@ class TestRealKVCR(CustomTestCase):
         self.assertEqual(backend.batch_get_v1(keys, torch.arange(8, 12)), [True] * 2)
         for buffer in pool.buffers:
             self.assertTrue(torch.equal(buffer[:2], buffer[4:6]))
+
+    def test_local_only_round_trip_without_a_control_endpoint(self):
+        """Remote hints off: KVCR runs with no control channel at all."""
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        self.enterContext(
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                side_effect=lambda code: self.fail(f"os._exit({code})"),
+            )
+        )
+        control_port = find_available_port(34100)
+        config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="kvcr-real-local",
+            extra_config={
+                "control_port": control_port,
+                "nixl_listen_port": find_available_port(control_port + 2000),
+                "local_dram_bytes": 1 << 20,
+            },
+        )
+        pool = _HostPool()
+        backend = KVCRStore(config, pool)
+        self.addCleanup(backend.close)
+        keys = [f"{i + 1:064x}" for i in range(2)]
+        for buffer in pool.buffers:
+            buffer[:2].copy_(torch.randint(0, 256, buffer[:2].shape, dtype=torch.uint8))
+        self.assertEqual(backend.batch_set_v1(keys, torch.arange(4)), [True] * 2)
+        self.assertEqual(backend.batch_exists_v2(keys).kv_hit_pages, 2)
+        self.assertEqual(backend.batch_get_v1(keys, torch.arange(8, 12)), [True] * 2)
+        for buffer in pool.buffers:
+            self.assertTrue(torch.equal(buffer[:2], buffer[4:6]))
+        # Nothing listens on the control port.
+        with socket.socket() as probe:
+            self.assertNotEqual(probe.connect_ex(("127.0.0.1", control_port)), 0)
 
 
 if __name__ == "__main__":

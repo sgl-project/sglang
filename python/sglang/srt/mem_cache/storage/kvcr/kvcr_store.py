@@ -73,6 +73,7 @@ _EXTRA_CONFIG_KEYS = frozenset(
         "control_host",
         "control_port",
         "enable_remote_hint",
+        "extra_backend_tag",
         "local_dram_bytes",
         "local_dram_pool_pages",
         "nixl_listen_port",
@@ -199,6 +200,9 @@ class KVCRStore(HiCacheStorage):
             or self._extra["startup_timeout_seconds"] <= 0
         ):
             raise ValueError("startup_timeout_seconds must be a positive integer")
+        tag = self._extra.get("extra_backend_tag")
+        if tag is not None and (type(tag) is not str or not tag):
+            raise ValueError("KVCR extra_backend_tag must be a non-empty string")
         self._offset = rank_offset(storage_config)
         # Fail the attach, not every later storage call, on a static
         # misconfiguration. Memory registration and the port binds stay at the
@@ -221,8 +225,10 @@ class KVCRStore(HiCacheStorage):
         ):
             raise ValueError("Invalid KVCR local DRAM budget")
         # KVCR's own rule, checked here so that it cannot fail the first IO.
-        self._operation_timeout_ms = self._extra.get("operation_timeout_ms", 30000)
-        self._abandon_timeout_ms = self._extra.get("abandon_timeout_ms", 60000)
+        # Abandonment bounds both a dead peer's stall and how long a slow but
+        # healthy transfer may run before the worker exits (see README).
+        self._operation_timeout_ms = self._extra.get("operation_timeout_ms", 5000)
+        self._abandon_timeout_ms = self._extra.get("abandon_timeout_ms", 30000)
         if (
             type(self._operation_timeout_ms) is not int
             or type(self._abandon_timeout_ms) is not int
@@ -390,14 +396,19 @@ class KVCRStore(HiCacheStorage):
                         label=component.name,
                     )
                 )
-        channel = ZmqPeerControlChannel(
-            bind_host=self._extra.get("control_host", "0.0.0.0"),
-            bind_port=port,
-            advertise_host=host,
-        )
+        # Peers fetch through the control endpoint, unauthenticated, so it
+        # exists only with remote hints on; local DRAM IO does not use it.
+        channel = None
+        if self._remote_hint:
+            channel = ZmqPeerControlChannel(
+                bind_host=self._extra.get("control_host", "0.0.0.0"),
+                bind_port=port,
+                advertise_host=host,
+            )
         allocations, mappings = [], []
         with ExitStack() as resources:
-            resources.callback(channel.close)
+            if channel is not None:
+                resources.callback(channel.close)
             for name, length in plans:
                 allocation = _allocate_dram_pool(length)
                 resources.callback(allocation.close)
@@ -461,7 +472,7 @@ class KVCRStore(HiCacheStorage):
         self._poll_thread.start()
         logger.info(
             "KVCR L3 ready: endpoint=%s physical_pools=%s bytes=%d namespace=%s",
-            channel.endpoint,
+            channel.endpoint if channel is not None else None,
             layouts,
             sum(size for _, _, size in allocations),
             self._namespace,

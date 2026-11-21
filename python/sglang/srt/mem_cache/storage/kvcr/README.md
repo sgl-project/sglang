@@ -45,17 +45,28 @@ Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
 
 - `control_advertise_host` (`127.0.0.1`): host peers and routers dial for this
   worker's control endpoint.
-- `control_host` (`0.0.0.0`): host the control endpoint binds.
+- `control_host` (`0.0.0.0`): host the control endpoint binds. The endpoint
+  exists only with `enable_remote_hint`; peers fetch through it without
+  authentication, so bind it to the peer-facing interface where possible.
 - `control_port` (`32100`): base control port.
 - `nixl_listen_port` (`control_port + 1024`): base NIXL listen port.
 - `local_dram_bytes` (8 GiB): KVCR DRAM per rank; each pool gets the same
   fraction of its host pages (bytes split in proportion to host bytes).
 - `local_dram_pool_pages` (`{}`): `{pool name: pages}`, an integer of at least
   1 per named pool, overriding that split.
-- `operation_timeout_ms` (`30000`) and `abandon_timeout_ms` (`60000`): KVCR's
-  transfer and abandonment deadlines; KVCR requires abandonment to be at least
-  twice the operation deadline.
+- `operation_timeout_ms` (`5000`) and `abandon_timeout_ms` (`30000`): KVCR's
+  deadlines, counted from each deposit or deliver call; KVCR requires
+  abandonment to be at least twice the operation deadline. An operation not
+  started by the operation deadline is a miss, and one in flight then fails. A
+  transfer, local or remote, still in flight at the abandonment deadline is
+  uncertain and ends the worker (see Failure handling). Size both from one
+  HiCache batch (128 pages times the page bytes per rank) over the slowest
+  expected link.
 - `enable_remote_hint` and `publish_inventory` (`false`): see below.
+- `extra_backend_tag` (unset): hashed into the storage namespace. The namespace
+  keys on the served model name and the KV layout, not on the weights, so
+  deployments that serve different weights under one served model name and
+  share a router must set different tags.
 
 An optional positive integer `startup_timeout_seconds` overrides KVCR's startup
 budget; omitting it keeps KVCR's default. Unknown keys are ignored with a
@@ -68,7 +79,9 @@ recorded for KVCR.
 ## Remote hints
 
 `enable_remote_hint` is off by default; without it, KVCR serves only its own
-local DRAM. Add `"enable_remote_hint": true` to the extra config to turn it on.
+local DRAM and binds no control endpoint (each rank still binds its NIXL
+listen port). Add `"enable_remote_hint": true` to the extra config to turn it
+on.
 When on, lookups and reads consume the request's `kv_hints`
 (`kv.fetch` actions, version 1.0, copy mode). A hint names a source replica's
 `tcp://` control endpoint, and each rank fetches from the same shard offset
@@ -194,6 +207,16 @@ per-pool DRAM split when the cache attaches its host pools; memory
 registration and the control/NIXL binds happen on the first storage operation
 (a draft sidecar pool may still register until then), where a failure, e.g. a
 port already in use, terminates the worker.
+
+A peer that dies or hangs during a fetch is the main case of an uncertain
+transfer. Nothing fails fast: the reading rank's prefetch IO waits until
+`abandon_timeout_ms`, and then the worker exits, because KVCR cannot prove that
+the source will not still write into the HiCache host pages. The fetch becomes
+a miss only if the peer answers KVCR's probe before it has started writing, or
+its write finishes within `abandon_timeout_ms` of the read. A peer that
+restarted mid-transfer still leaves the pull uncertain: proving a restarted
+source dead needs KVCR's guard, which this backend does not run. A source whose
+own write is still running past its abandonment deadline exits as well.
 
 ## Validation
 

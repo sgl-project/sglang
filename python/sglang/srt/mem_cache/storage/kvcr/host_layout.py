@@ -80,7 +80,12 @@ def page_slots(layout: PoolLayout, keys: list[str], indices: torch.Tensor) -> li
 
 
 def storage_namespace(config, layouts: dict[str, PoolLayout]) -> str:
-    """Model, byte format and shard identity, but not replica/DP identity."""
+    """Model, byte format and shard identity, but not replica/DP identity.
+
+    The served model name does not identify the weights: deployments that
+    serve different weights under one name tell their pages apart with an
+    ``extra_backend_tag``.
+    """
     identity = [
         "sglang-kvcr-v1",
         config.model_name,
@@ -100,6 +105,10 @@ def storage_namespace(config, layouts: dict[str, PoolLayout]) -> str:
             for name, layout in sorted(layouts.items())
         ],
     ]
+    tag = (config.extra_config or {}).get("extra_backend_tag")
+    if tag is not None:
+        # Appended only when set, so untagged namespaces keep their value.
+        identity.append(["extra_backend_tag", tag])
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
 
 
