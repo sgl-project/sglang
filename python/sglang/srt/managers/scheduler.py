@@ -335,6 +335,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -1559,6 +1560,13 @@ class Scheduler(
             uniboost_rank_invariant=get_parallel().tp_size > 1
             or get_parallel().pp_size > 1,
             uniboost_step_clock=lambda: self.forward_ct,
+            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
+                chunked_prefill_size=self.chunked_prefill_size,
+                halving_chunks=get_schedule().shortest_prefill_boundary_halving_chunks,
+                decay_start_chunks=get_schedule().shortest_prefill_boundary_decay_start_chunks,
+                budget_min_ratio=get_schedule().shortest_prefill_budget_min_ratio,
+                budget_doubling_chunks=get_schedule().shortest_prefill_budget_doubling_chunks,
+            ),
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -4656,6 +4664,7 @@ class Scheduler(
                     if self.disagg_prefill_bootstrap_queue is not None
                     else []
                 ),
+                chunked_req=self.chunked_req,
             )
         )
 
@@ -4672,6 +4681,16 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        max_prefill_tokens = self.max_prefill_tokens
+        num_mixed_decode_tokens = running_bs if self.is_mixed_chunk else 0
+        token_budget = self.policy.prefill_token_budget(
+            page_size=self.page_size, align=self.truncation_align_size
+        )
+        if token_budget is not None:
+            # The budget counts prefill tokens; the adder takes the decode rows out.
+            token_budget += num_mixed_decode_tokens
+            chunked_prefill_size = min(chunked_prefill_size, token_budget)
+            max_prefill_tokens = min(max_prefill_tokens, token_budget)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4687,9 +4706,9 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            num_mixed_decode_tokens,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4773,6 +4792,13 @@ class Scheduler(
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
+                break
+            # Beside a continuing chunk, admission stops at the first request the
+            # shortest-prefill class boundary orders by arrival.
+            if (
+                self.chunked_req is not None
+                and not self.policy.can_join_continuing_chunk(req)
+            ):
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 if bounded_active:

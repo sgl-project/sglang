@@ -163,6 +163,7 @@ class TestAllPPLoras(CustomTestCase):
                 calc_priority=lambda waiting, *args, **kwargs: list(waiting),
                 admission_candidates=mock.Mock(side_effect=iter),
                 allows_admission=mock.Mock(return_value=True),
+                prefill_token_budget=lambda **kwargs: None,
             ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,

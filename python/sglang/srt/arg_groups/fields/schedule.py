@@ -119,6 +119,22 @@ class Schedule(msgspec.Struct):
         bool,
         "Adapt --uniboost-gamma online to the observed latency tail (gamma-Ada): a heavy tail lowers gamma, a flat tail raises it.",
     ] = False
+    shortest_prefill_boundary_halving_chunks: A[
+        float,
+        "With --schedule-policy shortest-prefill-first, scale the order and the prefill batches with the backlog B: the uncached waiting tokens plus the continuing chunk's remainder. Requests with at least boundary = chunk * 2 ** (-max(0, B - decay_start) / (halving_chunks * chunk)) uncached tokens go in arrival order after the shorter ones and never join a continuing chunk, so they are not passed indefinitely; the --shortest-prefill-budget-* token budget caps each prefill batch. In units of the chunked prefill size per DP attention rank, so the policy keeps its shape when the chunk size changes. Requires chunked prefill. 0 disables.",
+    ] = 0.0
+    shortest_prefill_boundary_decay_start_chunks: A[
+        Optional[float],
+        "With --shortest-prefill-boundary-halving-chunks, the backlog, in chunks, up to which the class boundary stays at the chunked prefill size; beyond it the boundary halves every halving_chunks. 0 halves from an empty queue. Unset: 2 * halving_chunks.",
+    ] = None
+    shortest_prefill_budget_min_ratio: A[
+        Optional[float],
+        "With --shortest-prefill-boundary-halving-chunks, cap each prefill batch at budget = min_ratio * chunk * 2 ** (B / (doubling_chunks * chunk)) prefill tokens, rounded down to the page and the chunk alignment; no cap once the budget reaches the chunked prefill size. Small batches on a short queue lower time to first token. A fraction of the chunked prefill size per DP attention rank, at most 1. 0 disables the budget. Unset: 1/8.",
+    ] = None
+    shortest_prefill_budget_doubling_chunks: A[
+        Optional[float],
+        "With the --shortest-prefill-budget-min-ratio budget, the backlog, in chunks, over which the budget doubles. Unset: halving_chunks.",
+    ] = None
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

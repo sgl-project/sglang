@@ -1,6 +1,8 @@
 """A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537),
-and a parked chunked request lets no one be admitted ahead of it."""
+a parked chunked request lets no one be admitted ahead of it, and the shortest-prefill-first
+load scaling reaches admission."""
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -12,7 +14,11 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    AddReqResult,
+    PrefillAdder,
+    SchedulePolicy,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -20,6 +26,8 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -30,7 +38,16 @@ NUM_ROWS = 4
 class _Req:
     owner_list = None
 
-    def __init__(self, holds_row):
+    def __init__(self, holds_row, rid=None, input_len=0, prefix_len=0):
+        self.rid = rid
+        self.origin_input_ids = [0] * input_len
+        self.output_ids = []
+        self.full_untruncated_fill_ids = self.origin_input_ids
+        self.num_matched_prefix_tokens = prefix_len
+        self.prefix_len = prefix_len
+        self.arrival_processed_tokens = 0
+        self.cache_request_handle = None
+        self.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
@@ -67,6 +84,22 @@ class _ParkingAdder(_Adder):
         return req
 
 
+class _LimitsAdder(_Adder):
+    """Records the pass limits it gets; the chunked request may continue."""
+
+    def __init__(self, chunk_continues, *args, **kwargs):
+        super().__init__()
+        limits = inspect.signature(PrefillAdder).bind(*args, **kwargs).arguments
+        self.chunk_continues = chunk_continues
+        self.rem_input_tokens = limits["rem_input_tokens"]
+        self.rem_chunk_tokens = limits["rem_chunk_tokens"]
+        self.chunked_req_limit = None
+
+    def add_chunked_req(self, req):
+        self.can_run_list.append(req)
+        return req if self.chunk_continues else None
+
+
 class _BatchBuilt(Exception):
     pass
 
@@ -91,6 +124,7 @@ class TestHeldRowAdmission(CustomTestCase):
             admission_candidates=lambda waiting: iter(waiting),
         )
         s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.policy.prefill_token_budget.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -187,6 +221,84 @@ class TestHeldRowAdmission(CustomTestCase):
         self.assertIsNone(new_batch)
         self.assertIs(s.chunked_req, parked)
         self.assertEqual(list(s.waiting_queue), [waiting])
+
+    def _build_batch(self, s, running_batch, chunk_continues):
+        adders = []
+
+        def make_adder(*args, **kwargs):
+            adders.append(_LimitsAdder(chunk_continues, *args, **kwargs))
+            return adders[-1]
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        s.get_prefill_adder_class = lambda: make_adder
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None, running_batch=running_batch
+                )
+        return built.exception.args[0], adders[0]
+
+    def _admit_beside_chunk(self, chunk_continues):
+        # 4096 tokens left in the chunk and 4096 waiting: the class boundary
+        # halves twice to 2048, and the budget doubles once to 2048.
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
+                chunked_prefill_size=8192,
+                halving_chunks=0.5,
+                decay_start_chunks=0,
+                budget_min_ratio=0.125,
+                budget_doubling_chunks=1,
+            ),
+        )
+        chunk = _Req(holds_row=True, rid="chunk", input_len=6096, prefix_len=2000)
+        small = _Req(holds_row=False, rid="small", input_len=500)
+        mid = _Req(holds_row=False, rid="mid", input_len=3596)
+        s = self._scheduler(DisaggregationMode.NULL, [], chunk, [mid, small])
+        s.policy = policy
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+            can_run_list, adder = self._build_batch(
+                s, ScheduleBatch(reqs=[]), chunk_continues
+            )
+        return [req.rid for req in can_run_list], adder
+
+    def test_adder_gets_the_load_scaled_budget(self):
+        _, adder = self._admit_beside_chunk(chunk_continues=True)
+        self.assertEqual(adder.rem_input_tokens, 2048)
+        self.assertEqual(adder.rem_chunk_tokens, 2048)
+        # The small request joins out of the same budget.
+        self.assertEqual(adder.chunked_req_limit, 2048 - 500)
+
+    def test_arrival_ordered_request_waits_only_beside_a_continuing_chunk(self):
+        for chunk_continues, admitted in (
+            (True, ["chunk", "small"]),
+            (False, ["chunk", "small", "mid"]),
+        ):
+            with self.subTest(chunk_continues=chunk_continues):
+                self.assertEqual(self._admit_beside_chunk(chunk_continues)[0], admitted)
+
+    def test_mixed_decode_rows_do_not_come_out_of_the_budget(self):
+        """With mixed chunk the adder takes the decode rows out of its limits, so a
+        token budget must reach it with those rows added back."""
+        running = [_Req(holds_row=True), _Req(holds_row=True)]
+        s = self._scheduler(
+            DisaggregationMode.NULL, running, _Req(holds_row=True), [_Req(False)]
+        )
+        s.is_mixed_chunk = True
+        s.policy.prefill_token_budget.return_value = 1024
+        _, adder = self._build_batch(s, ScheduleBatch(reqs=running), False)
+        self.assertEqual(adder.rem_input_tokens, 1024 + len(running))
+        self.assertEqual(adder.rem_chunk_tokens, 1024 + len(running))
 
 
 class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
