@@ -1507,7 +1507,11 @@ def megakernel_can_run_graph(
     model: torch.nn.Module, forward_batch: ForwardBatch
 ) -> bool:
     installed = _installed(model)
-    if installed is None or not _decode_entry_kind(installed.built):
+    if (
+        installed is None
+        or installed.tensor_entry is None
+        or not _decode_entry_kind(installed.built)
+    ):
         return True
     return installed.tensor_entry.can_run_graph(installed.built, forward_batch)
 
