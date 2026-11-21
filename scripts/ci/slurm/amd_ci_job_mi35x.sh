@@ -134,6 +134,9 @@ else
     echo "[amd-ci-job] GPUs $gpus -> $AMD_CI_RENDER_DEVICES, container $CI_CONTAINER_NAME"
 fi
 bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
+# Keep the newest 7 nightly images of this job's ROCm line; rmi without -f skips images in use.
+docker images "rocm/sgl-dev:v*-${CI_ROCM_VERSION}-mi35x-*" --format '{{.Repository}}:{{.Tag}}' \
+    | tail -n +8 | xargs -r docker rmi >/dev/null 2>&1 || true
 bash scripts/ci/amd/amd_ci_install_dependency.sh
 # --env pairs from the launcher, one KEY=VAL per line.
 # CI_IMAGE: the image amd_ci_start_container.sh picked, which can be an older
