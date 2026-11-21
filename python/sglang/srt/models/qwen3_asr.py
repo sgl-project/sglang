@@ -19,7 +19,10 @@ from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
+from sglang.srt.models.qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoder,
+    pack_audio_features,
+)
 from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
@@ -68,40 +71,23 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = next(self.audio_tower.parameters()).device
-
-        input_features = (
-            torch.cat([item.feature for item in items])
-            .type(self.audio_tower.dtype)
-            .to(device)
-        )
-
         has_mask = all(
             getattr(item, "feature_attention_mask", None) is not None for item in items
         )
-
-        if has_mask:
-            feature_attention_mask = (
+        input_features, feature_lens, feature_lens_cpu = pack_audio_features(
+            torch.cat([item.feature for item in items]),
+            (
                 torch.cat([item.feature_attention_mask for item in items], dim=0)
-                .type(torch.long)
-                .to(device)
-            )
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[
-                feature_attention_mask.bool()
-            ].permute(1, 0)
-        else:
-            audio_feature_lengths = torch.tensor(
-                [input_features.shape[-1]] * input_features.shape[0],
-                dtype=torch.long,
-                device=device,
-            )
-            input_features = input_features.permute(0, 2, 1).reshape(
-                -1, input_features.shape[1]
-            )
-
+                if has_mask
+                else None
+            ),
+            device,
+            self.audio_tower.dtype,
+        )
         audio_outputs = self.audio_tower(
             input_features,
-            feature_lens=audio_feature_lengths,
+            feature_lens=feature_lens,
+            feature_lens_cpu=feature_lens_cpu,
         )
         return audio_outputs.last_hidden_state
 
