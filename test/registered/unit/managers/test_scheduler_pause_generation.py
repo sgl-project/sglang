@@ -59,7 +59,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 
 class _FakeReq(SimpleNamespace):

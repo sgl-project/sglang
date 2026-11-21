@@ -189,6 +189,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.beam_group = None
         req.last_node = MagicMock()
         return req
 
@@ -1325,6 +1326,25 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
+
+    def test_ignore_eos_chunks_a_streaming_session_turn_after_its_prefix(self):
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = 4096
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=128)
+
+        req = self.create_mock_req("session-turn", priority=0, max_new_tokens=8)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(512))
+        req.full_untruncated_fill_ids = list(range(512))
+        req.prefix_len = 64
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_end, 64 + 128)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
 
     def create_sharded_adder(
         self,

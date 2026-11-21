@@ -1124,9 +1124,11 @@ def build_mamba_host_pool(
         (draft_info,) = draft_pool.get_device_pool_infos()
         draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
         draft_buffer_infos.append(draft_info.buffer_info)
+    from sglang.srt.mem_cache.pool_host.rocm_budget import mamba_host_ratio
+
     return MambaPoolHost(
         pool_info.buffer_info,
-        get_memory().hicache_ratio,
+        mamba_host_ratio(get_memory().hicache_ratio),
         host_size,
         device_capacity=_device_capacity_tokens(mamba_pool),
         mtp_draft_buffer_infos=draft_buffer_infos,
@@ -1964,9 +1966,9 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
+    router = draft_kv_pool.layer_router
     if (
-        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
+        isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
         or draft_kv_pool.follows_target_swa_ids
     ):
         return build_swa_draft_pools(
@@ -1974,10 +1976,23 @@ def build_hicache_draft_sidecars(
             tree_cache=tree_cache,
             target_window_host=target_window_host_pool(tree_cache),
         )
-    return build_full_draft_pools(
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None:
+        return build_full_draft_pools(
+            draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+        )
+    # A hybrid draft keeps full-attention layers next to its SWA layers;
+    # both must be restored or the draft reads stale KV after a hit.
+    specs, entries = build_swa_draft_pools(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
+        target_window_host=target_window_host_pool(tree_cache),
     )
+    if router.routes_to(IdSpaceKind.FULL):
+        full_specs, full_entries = build_full_draft_pools(
+            draft_kv_pool=router.view(IdSpaceKind.FULL), tree_cache=tree_cache
+        )
+        specs, entries = full_specs + specs, full_entries + entries
+    return specs, entries
 
 
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
