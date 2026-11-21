@@ -157,6 +157,7 @@ class BaseLayerWithLoRA(nn.Module):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         snapshot_base: bool = True,
+        defer_snapshot: bool = False,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
@@ -168,7 +169,14 @@ class BaseLayerWithLoRA(nn.Module):
         # valid only while every merge on this layer is a copy-merge (the
         # merged-store path), which never writes the base storage. H3's DiT
         # backup alone is 38 GB of anonymous memory under clone().
-        if snapshot_base:
+        # defer_snapshot=True takes no snapshot until something first needs
+        # one (an in-place merge, or a read of cpu_weight): dynamic LoRA never
+        # writes the base, so a device-resident DiT skips a host copy of all
+        # its weights.
+        self._cpu_weight: torch.Tensor | None = None
+        if defer_snapshot:
+            self._base_is_view = False
+        elif snapshot_base:
             self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
             self._base_is_view = False
         else:
@@ -574,9 +582,24 @@ class BaseLayerWithLoRA(nn.Module):
             return packed, torch.device("cpu")
         return weight, weight.device
 
+    @property
+    def cpu_weight(self) -> torch.Tensor:
+        if self._cpu_weight is None:
+            # Deferred snapshot: the base has not been written yet.
+            self._cpu_weight = self.base_layer.weight.detach().to("cpu").clone()
+        return self._cpu_weight
+
+    @cpu_weight.setter
+    def cpu_weight(self, value: torch.Tensor) -> None:
+        self._cpu_weight = value
+
     def _ensure_base_snapshot_owned(self) -> None:
-        """An in-place merge is about to write the base storage; if the
-        snapshot is a zero-copy view into it, materialize the clone now."""
+        """An in-place merge is about to write the base storage; take a
+        deferred snapshot, or if the snapshot is a zero-copy view into it,
+        materialize the clone now."""
+        if self._cpu_weight is None:
+            self.cpu_weight  # noqa: B018 - takes the deferred snapshot
+            return
         if self._base_is_view:
             self.cpu_weight = self.cpu_weight.to("cpu", copy=True)
             self._base_is_view = False
@@ -1149,14 +1172,19 @@ def wrap_with_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # type: ignore[arg-type]
+            device_type = layer.weight.device.type
+            numel = layer.weight.numel()
             effective_snapshot_base = _use_owned_base_snapshot(
-                snapshot_base, layer.weight.device.type, layer.weight.numel()
+                snapshot_base, device_type, numel
             )
             ret = lora_layer_type(
                 layer,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 snapshot_base=effective_snapshot_base,
+                # A device-resident weight's owned snapshot is a host copy;
+                # take it only if the layer is ever merged in place.
+                defer_snapshot=device_type not in ("cpu", "meta") and numel > 1,
             )
             return ret
     return None
