@@ -15,9 +15,14 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_bf16_,
     indexed_scale_shift_fp32_,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+
+DEVICE = "xpu" if torch.xpu.is_available() else "cuda"
+# the FP32-table kernels use PTX-only rounding helpers
+_CUDA_ONLY = pytest.mark.skipif(DEVICE != "cuda", reason="PTX-only kernel")
 
 # one tile, a partial tile, whole tiles, and MiniMax-H3's 5376 (2 full + 1 partial)
 HIDDEN = [1000, 2048, 4096, 5376]
@@ -29,14 +34,14 @@ def _bf16(t: torch.Tensor) -> torch.Tensor:
 
 
 def _inputs(rows: int, hidden: int, seed: int):
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn(rows, hidden, device="cuda", generator=g).to(torch.bfloat16)
-    other = torch.randn(rows, hidden, device="cuda", generator=g).to(torch.bfloat16)
-    shift = torch.randn(3, hidden, device="cuda", generator=g).to(torch.bfloat16)
-    scale = (0.1 * torch.randn(3, hidden, device="cuda", generator=g)).to(
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    x = torch.randn(rows, hidden, device=DEVICE, generator=g).to(torch.bfloat16)
+    other = torch.randn(rows, hidden, device=DEVICE, generator=g).to(torch.bfloat16)
+    shift = torch.randn(3, hidden, device=DEVICE, generator=g).to(torch.bfloat16)
+    scale = (0.1 * torch.randn(3, hidden, device=DEVICE, generator=g)).to(
         torch.bfloat16
     )
-    indices = torch.randint(0, 3, (rows,), device="cuda", generator=g)
+    indices = torch.randint(0, 3, (rows,), device=DEVICE, generator=g)
     return x, other, shift, scale, indices
 
 
@@ -63,11 +68,12 @@ def test_indexed_gate_matches_torch(rows: int, hidden: int) -> None:
 
 def _fp32_table(rows: int, hidden: int, seed: int) -> torch.Tensor:
     """A [rows, hidden] slice of a [rows, 6 * hidden] AdaLN table: row stride > width."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    table = torch.randn(rows, 6 * hidden, device="cuda", generator=g)
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    table = torch.randn(rows, 6 * hidden, device=DEVICE, generator=g)
     return table[:, 2 * hidden : 3 * hidden]
 
 
+@_CUDA_ONLY
 @pytest.mark.parametrize("hidden", HIDDEN)
 @pytest.mark.parametrize("rows", ROWS)
 def test_indexed_scale_shift_fp32_matches_torch(rows: int, hidden: int) -> None:
@@ -81,6 +87,7 @@ def test_indexed_scale_shift_fp32_matches_torch(rows: int, hidden: int) -> None:
     assert torch.equal(indexed_scale_shift_fp32_(x.clone(), shift, scale, indices), ref)
 
 
+@_CUDA_ONLY
 @pytest.mark.parametrize("hidden", HIDDEN)
 @pytest.mark.parametrize("rows", ROWS)
 def test_indexed_gate_fp32_matches_torch(rows: int, hidden: int) -> None:
