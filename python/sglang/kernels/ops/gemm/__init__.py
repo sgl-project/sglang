@@ -626,6 +626,15 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+# Kimi-K3 latent MoE projections on gfx950 (AITER gemm_a4w4); available() bounds the arch.
+register_kernel(
+    KernelSpec(
+        op="gemm.kimi_k3_latent_mxfp4",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.gemm.latent_mxfp4_aiter_hip:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 # Vendored tlx.ops.mm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
 register_kernel(
     KernelSpec(
