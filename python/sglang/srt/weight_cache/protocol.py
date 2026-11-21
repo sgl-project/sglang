@@ -211,6 +211,15 @@ MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
 # and the CPU storages' bytes (sglang.srt.weight_cache.load_diff).
 PROTOCOL_VERSION = 2
 
+# The models a daemon serves, named by a fetch_state request's "role" and
+# echoed in the response: the target, and with speculative decoding its draft
+# (weight_cache/draft.py). A request without a role is for the target, so the
+# field needs no new protocol version: a daemon that predates it ignores the
+# field and answers with its target, which a draft runner refuses because the
+# response names no "draft" role.
+TARGET_ROLE = "target"
+DRAFT_ROLE = "draft"
+
 
 class ProtocolVersionError(RuntimeError):
     """The peer does not use a compatible weight cache protocol."""

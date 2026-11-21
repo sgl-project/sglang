@@ -13,6 +13,10 @@ Each GPU runs one daemon process for its TP rank. The daemon:
    requesting engine processes
 4. Validates the protocol version and CacheConfig compatibility before serving
 
+With speculative decoding it serves the draft model as well (draft.py): it
+loads the draft after the target, as an engine does, describes it in a
+manifest of its own, and exports a storage the two share once.
+
 Usage:
     # Single-node: launch all TP rank daemons with a single command:
     python -m sglang.srt.weight_cache.daemon \
@@ -40,6 +44,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -67,8 +72,10 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
+    DRAFT_ROLE,
     MAX_MSG_SIZE,
     PROTOCOL_VERSION,
+    TARGET_ROLE,
     CacheConfig,
     ProtocolVersionError,
     check_ipc_quant_support,
@@ -101,6 +108,30 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+
+@dataclasses.dataclass
+class ServedDraft:
+    """The speculative decoding draft a daemon serves next to its target."""
+
+    model: Any
+    config: CacheConfig
+    # What a client installs, as the target's (WeightCacheDaemon.manifest)
+    manifest: Dict[str, Any]
+    # Its storage -> the name it is exported under: its own, or the target's
+    # for a storage the two share
+    names: Dict[str, str]
+    # draft.draft_stamp() taken in its build scope, which the client compares
+    stamp: Dict[str, str]
+    preloaded_weights_bytes: int = 0
+    # Its storage -> transport-specific entry, filled by the export
+    entries: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+
+def _storage_key(tensor: torch.Tensor) -> Tuple[str, int, int]:
+    """What tells one of load_diff.export's storages (a whole allocation as
+    uint8) from another."""
+    return (str(tensor.device), tensor.data_ptr(), tensor.nbytes)
 
 
 @dataclasses.dataclass
@@ -164,6 +195,9 @@ class WeightCacheDaemon:
     transport: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed as
     file descriptors (vmm_fd).
     """
+
+    # With speculative decoding: the draft model it serves too (draft.py)
+    draft: Optional[ServedDraft] = None
 
     def __init__(
         self,
@@ -320,9 +354,11 @@ class WeightCacheDaemon:
             ),
         )
 
-        from sglang.srt.layers.moe import initialize_moe_config
+        # With speculative decoding the engine's draft runner fetches its draft
+        # from here too (draft.py); refuse a setup it cannot serve before loading.
+        from .draft import plan_draft
 
-        initialize_moe_config()
+        plan = plan_draft(server_args)
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -334,6 +370,15 @@ class WeightCacheDaemon:
             dtype=self.dtype,
             quantization=self.quantization,
         )
+
+        # The MoE flags as the engine's scheduler seeds them: for a model with
+        # MoE layers only. A draft built later in this process reads them, as
+        # the engine's draft runner reads its scheduler's.
+        from sglang.srt.layers.moe import initialize_moe_config
+        from sglang.srt.layers.moe.utils import has_moe_layers
+
+        if has_moe_layers(model_config.hf_text_config):
+            initialize_moe_config()
 
         # Build cache config fingerprint before loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via
@@ -436,21 +481,52 @@ class WeightCacheDaemon:
             0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
 
+        if plan is not None:
+            from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+                reserve_rope_cache_for_long_sequences,
+            )
+
+            # The target's config as the engine's target runner holds it
+            target_model_config = ModelConfig.from_server_args(server_args)
+            memory_before_draft = torch.cuda.memory_reserved(self.gpu_id)
+            # The engine's target runner grows the RoPE caches after loading,
+            # and its draft is built after that, holding the same RoPE module
+            # when it asks for the same RoPE (get_rope's process-wide cache).
+            # Grow them here too, before the target is described, so that the
+            # draft is built as in the engine and the grown table is the one
+            # both are served with.
+            reserve_rope_cache_for_long_sequences(self.model, target_model_config)
+
         # Describe the loaded model for clients (load_diff), then export its
         # storages through the transport backend. Nothing but the model and
         # the storage table refers to the originals by then.
         state_tensors = self._snapshot(constructed)
         del constructed
+        if plan is not None:
+            self._load_draft(
+                plan,
+                state_tensors,
+                target_model_config=target_model_config,
+                target_load_config=load_config,
+                memory_before=memory_before_draft,
+            )
         self._export_state(state_tensors)
         if self.transport_name == VMM_FD_BACKEND:
             # The packed weights live in cuMemCreate allocations, which the
             # caching allocator does not count. Add them to what it still
-            # holds (originals that something else kept alive, if any).
+            # holds (originals that something else kept alive, if any). The
+            # draft's runner reports its part of that, the target's the rest.
             current_platform.empty_cache()
-            self.preloaded_weights_bytes = (
+            total = (
                 max(0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load)
                 + self.transport_backend.exported_bytes
             )
+            if self.draft is not None:
+                self.draft.preloaded_weights_bytes = min(
+                    self.draft.preloaded_weights_bytes, total
+                )
+                total -= self.draft.preloaded_weights_bytes
+            self.preloaded_weights_bytes = total
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
@@ -492,6 +568,14 @@ class WeightCacheDaemon:
         CPU, and returns those on this daemon's device, which the transport
         exports, by name. Raises, listing them, when loading left anything a
         client cannot get."""
+        self.manifest, storages = self._describe(self.model, constructed)
+        return {name: (tensor, False) for name, tensor in storages.items()}
+
+    def _describe(
+        self, model, constructed
+    ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+        """(manifest, the storages on this daemon's device by name) of
+        ``model``: see _snapshot."""
         from sglang.srt.weight_cache import load_diff
 
         if constructed is None:
@@ -500,9 +584,9 @@ class WeightCacheDaemon:
                 f"The model loader did not build the model through "
                 f"_initialize_model, so what loading changed is unknown."
             )
-        storages, payload = load_diff.export(model=self.model, constructed=constructed)
+        storages, payload = load_diff.export(model=model, constructed=constructed)
         device = torch.device(current_platform.get_device(self.gpu_id))
-        self.manifest = {
+        manifest = {
             "load_diff": payload,
             "storages": {
                 name: [tensor.nbytes, tensor.device.type]
@@ -514,33 +598,160 @@ class WeightCacheDaemon:
                 if tensor.device != device
             },
         }
-        return {
-            name: (tensor, False)
-            for name, tensor in storages.items()
-            if tensor.device == device
+        return manifest, {
+            name: tensor for name, tensor in storages.items() if tensor.device == device
         }
 
+    def _load_draft(
+        self,
+        plan,
+        state_tensors: Dict[str, Tuple[torch.Tensor, bool]],
+        *,
+        target_model_config,
+        target_load_config: LoadConfig,
+        memory_before: int,
+    ) -> None:
+        """Load, describe and add to ``state_tensors`` the draft the engine's
+        draft runner fetches, as its worker builds it (draft.py), after the
+        target has been described. A storage the target exports already is
+        not added again: the draft's transport entry for it is the target's."""
+        from sglang.srt.configs.device_config import DeviceConfig
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.model_loader.loader import (
+            get_model_loader,
+            on_model_constructed,
+        )
+        from sglang.srt.runtime_context import get_model, get_spec
+        from sglang.srt.weight_cache import load_diff
+
+        from .draft import draft_stamp, share_like_engine
+        from .ipc_loader import WeightCacheModelLoader
+
+        tag = f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank} draft]"
+        spec = get_spec()
+        # TpModelWorker._init_model_config of the draft worker
+        model_config = ModelConfig.from_server_args(
+            self.server_args,
+            model_path=spec.speculative_draft_model_path,
+            model_revision=spec.speculative_draft_model_revision,
+            is_draft_model=True,
+            context_length=target_model_config.context_len,
+        )
+        load_format = spec.speculative_draft_load_format
+        layout = plan.layout(self.server_args, target_model_config)
+        logger.info(
+            f"{tag} Loading the draft model "
+            f"{model_config.hf_config.architectures} from {model_config.model_path}"
+        )
+        tic = time.perf_counter()
+        with (
+            plan.scope(layout),
+            # ModelRunner._load_format_scope of the draft runner
+            get_model().override(load_format=load_format)
+            if load_format is not None
+            else contextlib.nullcontext(),
+        ):
+            # What the engine's draft runner states, before loading changes
+            # the quantization config
+            quant_method, quant_config = WeightCacheModelLoader._resolve_engine_quant(
+                model_config
+            )
+            check_ipc_quant_support(quant_method, quant_config, where="daemon")
+            config = WeightCacheModelLoader.cache_config(model_config)
+            stamp = draft_stamp()
+            loader = get_model_loader(
+                load_config=LoadConfig(
+                    load_format=load_format or self.load_format,
+                    model_loader_extra_config=self.model_loader_extra_config,
+                    # the draft runner's rank, in the draft's TP group
+                    tp_rank=get_parallel().tp_rank,
+                ),
+                model_config=model_config,
+            )
+            records = {}
+            with on_model_constructed(
+                lambda m: records.__setitem__(id(m), load_diff.record_construction(m))
+            ):
+                model = loader.load_model(
+                    model_config=model_config,
+                    device_config=DeviceConfig(
+                        current_platform.device_type, self.gpu_id
+                    ),
+                )
+            constructed = records.pop(id(model), None)
+            records.clear()
+        current_platform.synchronize()
+        step = plan.share_step(
+            target_model=self.model,
+            draft_model=model,
+            target_model_config=target_model_config,
+            target_load_config=target_load_config,
+        )
+        shared = [] if step is None else share_like_engine(self.model, model, step, tag)
+        current_platform.synchronize()
+        current_platform.empty_cache()
+        preloaded_weights_bytes = max(
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before
+        )
+        manifest, storages = self._describe(model, constructed)
+        del constructed
+        exported = {_storage_key(t): name for name, (t, _) in state_tensors.items()}
+        names = {}
+        for name, tensor in storages.items():
+            names[name] = exported.get(_storage_key(tensor))
+            if names[name] is None:
+                names[name] = exported[_storage_key(tensor)] = f"{DRAFT_ROLE}/{name}"
+                state_tensors[names[name]] = (tensor, False)
+        self.draft = ServedDraft(
+            model=model,
+            config=config,
+            manifest=manifest,
+            names=names,
+            stamp=stamp,
+            preloaded_weights_bytes=preloaded_weights_bytes,
+        )
+        logger.info(
+            f"{tag} Draft model loaded in {time.perf_counter() - tic:.2f}s: "
+            f"{preloaded_weights_bytes / (1 << 30):.2f} GiB, "
+            f"{sum(not n.startswith(DRAFT_ROLE) for n in names.values())} of its "
+            f"{len(names)} storages are the target's; {len(shared)} tensor(s) "
+            f"hold the target's data {shared}"
+        )
+
     def _export_state(self, state_tensors: Dict[str, Tuple[torch.Tensor, bool]]):
-        """Export the snapshot's storages through the selected transport
-        backend, which consumes ``state_tensors``."""
+        """Export the snapshot's storages (the target's, and its draft's)
+        through the selected transport backend, which consumes
+        ``state_tensors``."""
         self.state_entries.clear()
 
         if self.transport_name == VMM_FD_BACKEND:
             # Packing consumes detached storage aliases. The daemon never runs
             # the model, so release its object graph before moving any bytes.
             self.model = None
+            if self.draft is not None:
+                self.draft.model = None
             from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
             from sglang.srt.models.transformers import _TRANSFORMERS_MOE_LAYERS
 
-            # This process-wide cache also owns model buffers. The standalone
-            # daemon loads one model and does not need to construct another.
+            # This process-wide cache also owns model buffers. The daemon has
+            # built its models (the target, and a draft) and builds no more.
             _ROPE_DICT.clear()
             # The Transformers backend registers every MoE layer in this dict,
             # which would keep the experts' original weights alive next to
             # their packed copies.
             _TRANSFORMERS_MOE_LAYERS.clear()
             gc.collect()
-        self.state_entries = self.transport_backend.prepare_export(state_tensors)
+        entries = self.transport_backend.prepare_export(state_tensors)
+        host = self.manifest["host"]
+        self.state_entries = {
+            name: entries[name]
+            for name in self.manifest["storages"]
+            if name not in host
+        }
+        if self.draft is not None:
+            self.draft.entries = {
+                name: entries[as_name] for name, as_name in self.draft.names.items()
+            }
 
         if self.transport_name == VMM_FD_BACKEND:
             # vmm_fd entries carry no handle blob: a client maps the packed
@@ -564,27 +775,58 @@ class WeightCacheDaemon:
         # A response that a client would refuse to read must fail here, not
         # on every client. The rest of the response (pid, version, sizes)
         # fits in the 1 MiB left over.
-        size = len(
-            pickle.dumps(
-                {
-                    "config": self.config.to_dict(),
-                    "entries": self.state_entries,
-                    "manifest": self.manifest,
-                },
-                protocol=pickle.HIGHEST_PROTOCOL,
+        sizes = []
+        for role in (TARGET_ROLE, DRAFT_ROLE) if self.draft else (TARGET_ROLE,):
+            config, entries, manifest, _ = self._served(role)
+            size = len(
+                pickle.dumps(
+                    {
+                        "config": config.to_dict(),
+                        "entries": entries,
+                        "manifest": manifest,
+                    },
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
             )
+            if size > MAX_MSG_SIZE - (1 << 20):
+                raise RuntimeError(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] A fetch_state response "
+                    f"for the {role} would take {size} bytes, more than the "
+                    f"{MAX_MSG_SIZE}-byte cap."
+                )
+            sizes.append(f"{size / (1 << 20):.1f} MiB")
+        draft = (
+            ""
+            if self.draft is None
+            else f" and {len(self.draft.entries)} of the draft "
+            f"({len(set(self.draft.names.values()) - set(self.state_entries))} its own)"
         )
-        if size > MAX_MSG_SIZE - (1 << 20):
-            raise RuntimeError(
-                f"[WeightCacheDaemon gpu={self.gpu_id}] A fetch_state response "
-                f"would take {size} bytes, more than the {MAX_MSG_SIZE}-byte cap."
-            )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Exported {len(self.state_entries)} storages, "
+            f"Exported {len(self.state_entries)} storages of the target{draft}, "
             f"transport={self.transport_backend.name}, {exported}, "
-            f"response {size / (1 << 20):.1f} MiB"
+            f"response {' / '.join(sizes)}"
         )
+
+    def _served(self, role: str):
+        """(config, entries, manifest, preloaded weight bytes) of the model
+        served under ``role``; None when this daemon serves no such model."""
+        if role == TARGET_ROLE:
+            return (
+                self.config,
+                self.state_entries,
+                self.manifest,
+                self.preloaded_weights_bytes,
+            )
+        if role == DRAFT_ROLE and self.draft is not None:
+            draft = self.draft
+            return (
+                draft.config,
+                draft.entries,
+                draft.manifest,
+                draft.preloaded_weights_bytes,
+            )
+        return None
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
         """Build the same initial physical expert layout as the engine."""
@@ -692,6 +934,29 @@ class WeightCacheDaemon:
             )
             return
 
+        # Which model: a request without a role is for the target
+        role = req.get("role", TARGET_ROLE)
+        served = None
+        if req.get("type") in ("query_config", "fetch_state"):
+            served = self._served(role)
+            if served is None:
+                send_msg(
+                    conn,
+                    {
+                        "status": "error",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "message": (
+                            f"this daemon serves "
+                            f"{[TARGET_ROLE, *([DRAFT_ROLE] if self.draft else [])]}, "
+                            f"not {role!r}. A daemon serves the speculative "
+                            f"decoding draft when it runs with the engine's "
+                            f"speculative decoding settings."
+                        ),
+                    },
+                )
+                return
+            config, entries, manifest, preloaded_weights_bytes = served
+
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
             send_msg(
@@ -699,16 +964,17 @@ class WeightCacheDaemon:
                 {
                     "status": "ok",
                     "protocol_version": PROTOCOL_VERSION,
-                    "config": self.config.to_dict(),
+                    "config": config.to_dict(),
+                    "role": role,
                 },
             )
 
         elif req.get("type") == "fetch_state":
             # Client requests full state with IPC handles
             engine_config = CacheConfig.from_dict(req["config"])
-            if not self.config.matches(engine_config):
+            if not config.matches(engine_config):
                 # Log detailed mismatch info for debugging
-                daemon_dict = self.config.to_dict()
+                daemon_dict = config.to_dict()
                 engine_dict = engine_config.to_dict()
                 mismatches = {
                     k: (daemon_dict.get(k), engine_dict.get(k))
@@ -717,34 +983,39 @@ class WeightCacheDaemon:
                 }
                 logger.warning(
                     f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                    f"Config mismatch: {mismatches}"
+                    f"Config mismatch ({role}): {mismatches}"
                 )
                 send_msg(
                     conn,
                     {
                         "status": "mismatch",
                         "protocol_version": PROTOCOL_VERSION,
-                        "daemon_config": self.config.to_dict(),
+                        "daemon_config": config.to_dict(),
                     },
                 )
                 return
 
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                f"Serving {len(self.state_entries)} storages via "
+                f"Serving {len(entries)} storages of the {role} via "
                 f"{self.transport_backend.name} transport"
             )
             self.transport_backend.send_fetch_state_response(
                 conn,
-                config=self.config.to_dict(),
-                entries=self.state_entries,
+                config=config.to_dict(),
+                entries=entries,
                 # PID so the client can watch daemon liveness: with
                 # torch_ipc, if this process dies while clients hold IPC
                 # mappings, their param.data (and any CUDA-graph-captured
                 # addresses) dangle.
                 pid=os.getpid(),
-                preloaded_weights_bytes=self.preloaded_weights_bytes,
-                extra={"protocol_version": PROTOCOL_VERSION, "manifest": self.manifest},
+                preloaded_weights_bytes=preloaded_weights_bytes,
+                extra={
+                    "protocol_version": PROTOCOL_VERSION,
+                    "manifest": manifest,
+                    "role": role,
+                    **({"draft_stamp": self.draft.stamp} if role == DRAFT_ROLE else {}),
+                },
             )
 
         elif req.get("type") == "ping":
@@ -767,6 +1038,7 @@ class WeightCacheDaemon:
         if self.model is not None:
             del self.model
             self.model = None
+        self.draft = None
         self.state_entries.clear()
         self.manifest = None
         if self.transport_backend is not None:

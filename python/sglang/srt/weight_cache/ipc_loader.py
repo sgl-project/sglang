@@ -34,7 +34,9 @@ from sglang.srt.weight_cache import load_diff
 from sglang.srt.weight_cache.schema import SnapshotManifest, StorageMeta
 
 from .protocol import (
+    DRAFT_ROLE,
     PROTOCOL_VERSION,
+    TARGET_ROLE,
     CacheConfig,
     ProtocolVersionError,
     check_ipc_quant_support,
@@ -141,6 +143,10 @@ class WeightCacheModelLoader(BaseModelLoader):
         self._fallback_load_format = fallback_load_format
         self.preloaded_weights_bytes = 0
         self._transport_backend = get_client_transport_backend(TORCH_IPC_BACKEND)
+        # Which of the daemon's models this loader fetches (protocol.py):
+        # the target, or a speculative decoding draft (weight_cache/draft.py).
+        self.role = TARGET_ROLE
+        self._tag = "[WeightCacheModelLoader]"
 
     def load_model(
         self,
@@ -156,6 +162,10 @@ class WeightCacheModelLoader(BaseModelLoader):
         """
         self.preloaded_weights_bytes = 0
         tic = time.perf_counter()
+        # A draft runner fetches the daemon's draft: the same path, another model
+        if getattr(model_config, "is_draft_model", False):
+            self.role = DRAFT_ROLE
+            self._tag = f"[WeightCacheModelLoader {DRAFT_ROLE}]"
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
         # unsupported model fails explicitly instead of silently disk-loading
@@ -199,7 +209,7 @@ class WeightCacheModelLoader(BaseModelLoader):
                     f"metadata: {preloaded_weights_bytes=}"
                 )
             logger.info(
-                f"[WeightCacheModelLoader] Fetched {len(entries)} storages from daemon "
+                f"{self._tag} Fetched {len(entries)} storages from daemon "
                 f"(transport={self._transport_backend.name}) "
                 f"in {time.perf_counter() - tic:.2f}s"
             )
@@ -210,6 +220,8 @@ class WeightCacheModelLoader(BaseModelLoader):
 
             quant_config = _get_quantization_config(model_config, self.load_config)
 
+            if self.role == DRAFT_ROLE:
+                self._check_draft_stamp(cache_data.get("draft_stamp"))
             model = self._install(model_config, device_config, cache_data, quant_config)
         except BaseException:
             # Until load_diff.install runs, nothing refers to what the
@@ -234,7 +246,7 @@ class WeightCacheModelLoader(BaseModelLoader):
         )
 
         logger.info(
-            f"[WeightCacheModelLoader] Loaded model via IPC "
+            f"{self._tag} Loaded model via IPC "
             f"(mode={self.weight_cache_mode}), "
             f"total={time.perf_counter() - tic:.2f}s"
         )
@@ -294,7 +306,8 @@ class WeightCacheModelLoader(BaseModelLoader):
             f"pid={daemon_pid}"
         )
 
-    def _resolve_engine_quant(self, model_config):
+    @staticmethod
+    def _resolve_engine_quant(model_config):
         """Return (quant_method, quant_config) matching the daemon's fingerprint.
 
         Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
@@ -307,6 +320,61 @@ class WeightCacheModelLoader(BaseModelLoader):
         if not quant_method and quant_config is not None:
             quant_method = get_quant_method_name(quant_config)
         return quant_method, quant_config
+
+    @staticmethod
+    def _check_draft_stamp(daemon_stamp) -> None:
+        """The daemon built its draft where this runner builds it (draft.py):
+        refuse it unless what that scope sets beyond CacheConfig agrees."""
+        from .draft import draft_stamp
+
+        here = draft_stamp()
+        if daemon_stamp != here:
+            raise RuntimeError(
+                f"[WeightCacheModelLoader {DRAFT_ROLE}] The daemon built the draft "
+                f"under other settings than this engine's draft runner (daemon: "
+                f"{daemon_stamp}, here: {here}); its weights would not fit this "
+                f"engine. Run the same SGLang and speculative decoding settings on "
+                f"both."
+            )
+
+    @staticmethod
+    def cache_config(model_config) -> CacheConfig:
+        """The fingerprint a runner states for ``model_config``, from the
+        parallel layout in effect. A daemon states its draft's with this same
+        code, in the scope the engine's draft runner loads in."""
+        parallel = get_parallel()
+        quant_method, quant_config = WeightCacheModelLoader._resolve_engine_quant(
+            model_config
+        )
+        return CacheConfig(
+            model_path=model_config.model_path,
+            model_arch=(
+                model_config.hf_config.architectures[0]
+                if model_config.hf_config.architectures
+                else ""
+            ),
+            tp_size=parallel.tp_size,
+            tp_rank=parallel.tp_rank,
+            pp_size=parallel.pp_size,
+            pp_rank=parallel.pp_rank,
+            dp_size=parallel.dp_size,
+            ep_size=parallel.moe_ep_size,
+            # The configured width, as the daemon states it: the MoE
+            # communicator is wider when it aliases attention CP.
+            moe_dp_size=parallel.moe_dp_size,
+            moe_dp_rank=parallel.moe_dp_rank,
+            moe_ep_rank=parallel.moe_ep_rank,
+            attn_dp_size=parallel.attn_dp_size,
+            enable_dp_lm_head=parallel.enable_dp_lm_head,
+            attn_cp_size=parallel.attn_cp_size,
+            moe_dense_tp_size=parallel.moe_dense_tp_size,
+            moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+            quant_method=quant_method,
+            quant_config_hash=hash_quant_config(quant_config),
+            dtype=str(model_config.dtype),
+            revision=model_config.revision or "",
+            **compute_env_stamp(),
+        )
 
     def _install(
         self, model_config, device_config, cache_data, quant_config
@@ -370,24 +438,38 @@ class WeightCacheModelLoader(BaseModelLoader):
         model._ipc_imported_tensors = list(storages.values())
         model._weight_cache_transport_backend = backend
         logger.info(
-            f"[WeightCacheModelLoader] Installed the daemon's snapshot "
+            f"{self._tag} Installed the daemon's snapshot "
             f"(build_s={built_s:.3f}, install_s="
             f"{time.perf_counter() - tic - built_s:.3f})"
         )
         return model
 
     @staticmethod
-    def _check_response(result, engine_config) -> None:
+    def _check_response(result, engine_config, role: str = TARGET_ROLE) -> None:
         """Refuse a fetch_state response before any handle is opened or fd
-        mapped: another protocol version, a config mismatch, or storages that
-        do not add up (a transport entry for every GPU storage, each a whole
-        uint8 storage of its size, and the bytes of every CPU storage). The
-        load_diff bytes themselves are checked by load_diff.install."""
+        mapped: another protocol version, another model than ``role`` asked
+        for, a config mismatch, or storages that do not add up (a transport
+        entry for every GPU storage, each a whole uint8 storage of its size,
+        and the bytes of every CPU storage). The load_diff bytes themselves
+        are checked by load_diff.install."""
         if not isinstance(result, dict):
             raise RuntimeError("[WeightCacheModelLoader] Invalid daemon response")
         if result.get("status") == "protocol_mismatch":
             raise ProtocolVersionError(result.get("message", result))
         check_protocol_version(result.get("protocol_version"))
+        if result.get("status") == "error":
+            raise RuntimeError(
+                f"[WeightCacheModelLoader] The daemon refused the {role} model: "
+                f"{result.get('message')}"
+            )
+        # A daemon that predates roles answers every request with its target
+        if result.get("status") == "ok" and result.get("role", TARGET_ROLE) != role:
+            raise RuntimeError(
+                f"[WeightCacheModelLoader] The daemon answered a request for its "
+                f"{role} model with its {result.get('role', TARGET_ROLE)} model: "
+                f"it does not serve speculative decoding drafts. Run the same "
+                f"SGLang in the engine and the daemon."
+            )
         if result.get("status") != "ok" or result.get("config") != (
             engine_config.to_dict()
         ):
@@ -516,52 +598,10 @@ class WeightCacheModelLoader(BaseModelLoader):
             handshake_with_daemon(sock)
 
             # Build engine's config fingerprint
-            parallel = get_parallel()
-            tp_size = parallel.tp_size
-            tp_rank = parallel.tp_rank
-
-            pp_size = parallel.pp_size
-            pp_rank = parallel.pp_rank
-
-            ep_size = parallel.moe_ep_size
-            # The configured width, as the daemon states it: the MoE
-            # communicator is wider when it aliases attention CP.
-            moe_dp_size = parallel.moe_dp_size
-            moe_dp_rank = parallel.moe_dp_rank
-            moe_ep_rank = parallel.moe_ep_rank
-
-            quant_method, quant_config = self._resolve_engine_quant(model_config)
-
-            engine_config = CacheConfig(
-                model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                pp_size=pp_size,
-                pp_rank=pp_rank,
-                dp_size=parallel.dp_size,
-                ep_size=ep_size,
-                moe_dp_size=moe_dp_size,
-                moe_dp_rank=moe_dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_dp_size=parallel.attn_dp_size,
-                enable_dp_lm_head=parallel.enable_dp_lm_head,
-                attn_cp_size=parallel.attn_cp_size,
-                moe_dense_tp_size=parallel.moe_dense_tp_size,
-                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
-                quant_method=quant_method,
-                quant_config_hash=hash_quant_config(quant_config),
-                dtype=str(model_config.dtype),
-                revision=model_config.revision or "",
-                **compute_env_stamp(),
-            )
+            engine_config = self.cache_config(model_config)
 
             logger.info(
-                f"[WeightCacheModelLoader] Requesting weights from daemon at "
+                f"{self._tag} Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
                 f"model={engine_config.model_path}, "
                 f"arch={engine_config.model_arch}, "
@@ -576,10 +616,11 @@ class WeightCacheModelLoader(BaseModelLoader):
                     "type": "fetch_state",
                     "protocol_version": PROTOCOL_VERSION,
                     "config": engine_config.to_dict(),
+                    "role": self.role,
                 },
             )
             result = recv_msg(sock)
-            self._check_response(result, engine_config)
+            self._check_response(result, engine_config, self.role)
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)
             check_served_transport(self.weight_cache_transport, backend_name)
             self._transport_backend = get_client_transport_backend(backend_name)
@@ -606,6 +647,9 @@ class WeightCacheModelLoader(BaseModelLoader):
             download_dir=self.load_config.download_dir,
             model_loader_extra_config=self.load_config.model_loader_extra_config,
             tp_rank=self.load_config.tp_rank,
+            # Which layers a draft runner loads, and the group it loads in
+            draft_model_idx=self.load_config.draft_model_idx,
+            load_group=self.load_config.load_group,
         )
         loader_cls = self._fallback_loader_cls or DefaultModelLoader
         fallback = loader_cls(fallback_config)

@@ -275,16 +275,18 @@ def handle_load_format(server_args: Any):
             "that selects IPC loading automatically."
         )
 
-    # Speculative decoding loads an extra draft model whose weights the
-    # daemon does not export, so refuse the combination up front instead of
-    # failing deep inside draft-worker load (draft-model daemon TBD).
+    # Speculative decoding: the daemon loads the draft model too and serves it
+    # to the engine's draft runner (weight_cache/draft.py). Refuse up front
+    # what it does not serve, instead of failing deep inside draft-worker load.
     if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "--weight-cache-mode is not supported together with speculative "
-            "decoding (--speculative-algorithm): the weight cache daemon does "
-            "not export the draft model's weights. Disable one of them "
-            "(--weight-cache-mode off) for this configuration."
-        )
+        from sglang.srt.weight_cache.draft import unsupported_reason
+
+        reason = unsupported_reason(server_args)
+        if reason is not None:
+            raise ValueError(
+                f"--weight-cache-mode does not support {reason}. Use "
+                f"--weight-cache-mode off for this configuration."
+            )
 
 
 def validate_transfer_engine(server_args: Any):
