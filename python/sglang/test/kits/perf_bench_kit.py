@@ -6,7 +6,12 @@ Bounds are tuned per CI runner, so a local run prints them without asserting.
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
-from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
+from sglang.test.test_utils import (
+    dump_metric,
+    is_in_amd_ci,
+    is_in_ci,
+    write_github_step_summary,
+)
 
 
 @dataclass
@@ -51,6 +56,9 @@ def check_perf(test_case, *metrics: Metric, suffix: str = "") -> None:
     label = test_case._testMethodName + suffix
     report = f"### {label}\n" + "".join(m.line() + "\n" for m in metrics)
     print(report, end="")
+    for m in metrics:
+        labels = {"label": label, **({"unit": m.unit} if m.unit else {})}
+        dump_metric(m.name, m.value, labels=labels)
     if not is_in_ci():
         return
     write_github_step_summary(report)

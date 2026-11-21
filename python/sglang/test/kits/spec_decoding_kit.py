@@ -1,7 +1,7 @@
 import requests
 
 from sglang.test.send_one import BenchArgs, send_one_prompt
-from sglang.test.test_utils import is_in_ci, write_github_step_summary
+from sglang.test.test_utils import dump_metric, is_in_ci, write_github_step_summary
 
 
 class SpecDecodingMixin:
@@ -23,6 +23,9 @@ class SpecDecodingMixin:
             if acc_length > self.accept_length_thres and speed > self.bs_1_speed_thres:
                 break
         self.flush_cache_for_spec_benchmark()
+        labels = {"model": getattr(self, "model", None), "attempts": attempt}
+        dump_metric("bs_1_accept_length", acc_length, labels=labels)
+        dump_metric("bs_1_speed", speed, labels={**labels, "unit": "token/s"})
 
         if is_in_ci():
             write_github_step_summary(

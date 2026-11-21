@@ -12,10 +12,42 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    dump_metric,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
+
+# BenchmarkResult fields reported as metrics, with their units.
+BENCHMARK_RESULT_METRICS = {
+    "latency": "s",
+    "input_throughput": "token/s",
+    "output_throughput": "token/s",
+    "overall_throughput": "token/s",
+    "last_ttft": "s",
+    "last_gen_throughput": "token/s",
+    "acc_length": "",
+}
+
+
+def dump_benchmark_result(result: BenchmarkResult) -> None:
+    """Print one [METRIC] line per number in a benchmark result, labelled with
+    the case it measured."""
+    labels = {
+        "model": result.model_path,
+        "run_name": result.run_name,
+        "batch_size": result.batch_size,
+        "input_len": result.input_len,
+        "output_len": result.output_len,
+    }
+    gpu_config = os.getenv("GPU_CONFIG", "")
+    if gpu_config:
+        labels["gpu_config"] = gpu_config
+    for name, unit in BENCHMARK_RESULT_METRICS.items():
+        value = getattr(result, name)
+        if value is not None:
+            unit_label = {"unit": unit} if unit else {}
+            dump_metric(f"bench_{name}", value, labels={**labels, **unit_label})
 
 
 class NightlyBenchmarkRunner:
@@ -186,6 +218,8 @@ class NightlyBenchmarkRunner:
             print(
                 f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
             )
+            for benchmark_result in benchmark_results:
+                dump_benchmark_result(benchmark_result)
 
             # Note: JSON files are preserved for metrics collection by CI scripts
             # They will be collected by scripts/ci/utils/save_metrics.py
@@ -305,6 +339,7 @@ class NightlyBenchmarkRunner:
                     accept_length = internal_states[0].get("avg_spec_accept_length")
                     if accept_length is not None:
                         print(f"  avg_spec_accept_length={accept_length:.2f}")
+                        dump_metric("avg_spec_accept_length", accept_length)
                         return accept_length
         except Exception as e:
             print(f"  Warning: Could not fetch spec accept length: {e}")
