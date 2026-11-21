@@ -50,6 +50,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import math
 import re
 import sys
 import weakref
@@ -2707,6 +2708,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Donated depth must land on the actual DCP-widened radix page, while
         # kernel snapshots stay on the cache chunk grid.
         checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
+        external_store_alignment = self.tree_cache.external_store_alignment()
+        externally_aligned_grid = math.lcm(checkpoint_grid, external_store_alignment)
 
         def _force_track_h(i: int) -> int:
             # h is indexed relative to the extend start, so check that offset.
@@ -2727,10 +2730,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         prefix_len = req.prefix_len
         seq_end = req.extend_end
-        if get_parallel().dcp_enabled:
+        if get_parallel().dcp_enabled or external_store_alignment > 1:
             # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
             # absolute page depth only when the kernel produced an h snapshot.
-            mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
+            # External stores likewise need the checkpoint and stored token key
+            # to end at the same absolute chunk boundary.
+            mamba_track_seqlen_aligned = (
+                seq_end // externally_aligned_grid * externally_aligned_grid
+            )
             mask = (
                 mamba_track_seqlen_aligned > prefix_len
                 and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0

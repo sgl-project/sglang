@@ -44,6 +44,7 @@ def _prepare_extend(
     prefix_len: int,
     extend_len: int,
     dcp_enabled: bool = False,
+    external_store_alignment: int = 1,
     next_idx: int = 0,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
@@ -71,7 +72,10 @@ def _prepare_extend(
     batch.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
     )
-    batch.tree_cache = SimpleNamespace(page_size=tree_page)
+    batch.tree_cache = SimpleNamespace(
+        page_size=tree_page,
+        external_store_alignment=lambda: external_store_alignment,
+    )
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1 - next_idx
 
@@ -93,6 +97,18 @@ def _track_seqlen(**kwargs) -> int | None:
 
 
 class TestMambaCheckpointDepth(unittest.TestCase):
+    def test_external_store_uses_its_absolute_chunk_boundary(self):
+        # The second chunk starts at 8192 and ends at 8809. The ordinary
+        # prefix-relative 64-token checkpoint is 8768, which cannot name an
+        # LMCache key made of 256-token chunks. Track 8704 instead.
+        depth = _track_seqlen(
+            tree_page=64,
+            prefix_len=8192,
+            extend_len=617,
+            external_store_alignment=256,
+        )
+        self.assertEqual(depth, 8704)
+
     def test_widened_tree_page_moves_the_donated_depth_onto_it(self):
         # 4066 tokens past a 16384 prefix: the chunk grid would stop at 20416,
         # which a 256-token page cannot name.

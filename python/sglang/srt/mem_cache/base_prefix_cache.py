@@ -879,6 +879,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         behind (decode holds up to this less a row past it); 0 without them."""
         return 0
 
+    def external_store_alignment(self) -> int:
+        """Absolute token alignment required by an attached external store."""
+        return 1
+
     def window_lengths(self) -> tuple[tuple[str, int], ...]:
         """Each window sub-pool and the history a running request keeps
         behind its frontier in it."""
