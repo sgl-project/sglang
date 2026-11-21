@@ -17,6 +17,7 @@ import torch
 from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
 from .protocol import send_msg
+from .schema import SnapshotManifest
 from .vmm_layout import pack_slot, plan_vmm_pack, validate_vmm_layout, view_from_entry
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,35 @@ def _prefix_offsets(sizes: Sequence[int]) -> List[int]:
     return offsets
 
 
+class WeightTransport(ABC):
+    """Moves one rank's storages from an owner to a reader, and withdraws them.
+
+    It knows nothing about models or other ranks. A reader's transport is made by
+    the loader's lookup for one load, so it may hold that load's session, such as
+    the daemon connection that vmm_fd sends its file descriptors over.
+    """
+
+    @abstractmethod
+    def publish(self, *, storages: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """Owner: make ``storages`` readable; returns the manifest's ``source``.
+
+        It may consume ``storages`` (vmm_fd repacks them), so nothing reads them after.
+        """
+
+    @abstractmethod
+    def fetch(
+        self, *, manifest: SnapshotManifest, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Reader: every storage of ``manifest`` as uint8 bytes, all or nothing.
+
+        Returns once the bytes are visible on the current stream; raises otherwise.
+        """
+
+    @abstractmethod
+    def close(self) -> None:
+        """Withdraw what publish or fetch set up. Idempotent."""
+
+
 class WeightCacheTransportBackend(ABC):
     name: str
 
@@ -145,8 +175,10 @@ class WeightCacheTransportBackend(ABC):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Send a successful fetch_state response."""
+        """Send a successful fetch_state response, with the fields of
+        ``extra`` (the protocol version, the load-diff manifest)."""
 
     @abstractmethod
     def recv_fetch_state_response(
@@ -215,6 +247,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         send_msg(
             conn,
@@ -225,6 +258,7 @@ class TorchIpcTransportBackend(WeightCacheTransportBackend):
                 "pid": pid,
                 "transport_backend": self.name,
                 "preloaded_weights_bytes": preloaded_weights_bytes,
+                **(extra or {}),
             },
         )
 
@@ -465,6 +499,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         entries: Dict[str, Dict[str, Any]],
         pid: int,
         preloaded_weights_bytes: int = 0,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         fds = self._export_fds()
         try:
@@ -478,6 +513,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
                     "transport_backend": self.name,
                     "preloaded_weights_bytes": preloaded_weights_bytes,
                     "allocation_sizes": list(self._alloc_sizes),
+                    **(extra or {}),
                 },
             )
             send_fds(conn, fds)
@@ -586,11 +622,17 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
     def close(self) -> None:
         """Unmap every allocation and free the address range; the daemon also
         releases its allocation handles. Tensors built on these mappings must
-        not be used afterwards."""
+        not be used afterwards. Work already queued on the device (a failed
+        load's checks) finishes first."""
         self._storages.clear()
         self._handles = []
         reservation, self._reservation = self._reservation, None
         if reservation is not None:
+            if self._device is not None and self._device.type == "cuda":
+                try:
+                    torch.cuda.synchronize(self._device)
+                except RuntimeError:
+                    logger.exception("vmm_fd: could not synchronize before unmapping")
             reservation.close()
 
 

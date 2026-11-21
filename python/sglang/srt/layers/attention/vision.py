@@ -696,6 +696,10 @@ class VisionFlash4Attention(nn.Module):
 
 
 class VisionFlashInferAttention(nn.Module):
+    # The cuDNN prefill workspace, written on every call: valid in this process
+    # only, so a weight snapshot gives each reader its own.
+    _process_local_fields = frozenset({"workspace_buffer"})
+
     def __init__(
         self,
         **kwargs,
@@ -1142,6 +1146,9 @@ class VisionAttention(nn.Module):
             Otherwise, it will be performed in half-precision
 
     """
+
+    # The flashinfer_cudnn backend's workspace (see VisionFlashInferAttention).
+    _process_local_fields = frozenset({"workspace_buffer"})
 
     def __init__(
         self,

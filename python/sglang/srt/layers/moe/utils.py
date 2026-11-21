@@ -341,6 +341,19 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
     ue8m0: bool
 
 
+class AiterQuantType(str, Enum):
+    """The quantization type a MoE layer hands AITER. It lives here, not in
+    moe_runner/aiter.py (which re-exports it): the FP8 MoE methods store a
+    member in their dispatcher's config on every platform, and a process that
+    receives a loaded model without post-processing it (the weight cache)
+    needs the class without importing the AITER runner."""
+
+    NONE = "No"
+    PER_TOKEN = "per_Token"
+    PER_128X128 = "per_128x128"
+    PER_1X32 = "per_1x32"
+
+
 class DeepEPMode(Enum):
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"

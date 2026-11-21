@@ -4,11 +4,14 @@ TP-sharded model weights in GPU memory and serves them via pluggable transport b
 
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
-2. Exports every parameter/buffer through the selected transport
+2. Describes the loaded model for engines (weight_cache/load_diff.py): every
+   tensor it holds as a view of a storage, and every plain value that
+   loading changed; and exports the storages through the selected transport
    (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
    allocations shared as file descriptors (vmm_fd)
-3. Serves transport entries over a Unix socket to requesting engine processes
-4. Validates CacheConfig compatibility before serving
+3. Serves the description and transport entries over a Unix socket to
+   requesting engine processes
+4. Validates the protocol version and CacheConfig compatibility before serving
 
 Usage:
     # Single-node: launch all TP rank daemons with a single command:
@@ -43,6 +46,7 @@ import gc
 import logging
 import multiprocessing
 import os
+import pickle
 import signal
 import socket
 import time
@@ -63,8 +67,12 @@ from sglang.srt.runtime_context import (
 )
 
 from .protocol import (
+    MAX_MSG_SIZE,
+    PROTOCOL_VERSION,
     CacheConfig,
+    ProtocolVersionError,
     check_ipc_quant_support,
+    check_protocol_version,
     cleanup_stale_daemon_files,
     compute_env_stamp,
     compute_global_rank,
@@ -195,8 +203,12 @@ class WeightCacheDaemon:
 
         self.model = None
         self.config: Optional[CacheConfig] = None
-        # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
+        # storage id -> transport-specific entry of the load-diff storage
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        # What a client installs (data only): the load_diff bytes, every
+        # storage's size and device, and the bytes of the CPU storages, which
+        # travel in the response (the transports move GPU memory).
+        self.manifest: Optional[Dict[str, Any]] = None
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
@@ -390,12 +402,24 @@ class WeightCacheDaemon:
         )
         tic = time.perf_counter()
 
-        # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
+        # Load model using DefaultModelLoader (includes TP sharding + quant
+        # post-process), recording each model as built to tell what loading
+        # changed (load_diff).
+        from sglang.srt.model_loader.loader import on_model_constructed
+        from sglang.srt.weight_cache import load_diff
+
         loader = get_model_loader(load_config=load_config, model_config=model_config)
-        self.model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(current_platform.device_type, self.gpu_id),
-        )
+        records = {}
+        with on_model_constructed(
+            lambda m: records.__setitem__(id(m), load_diff.record_construction(m))
+        ):
+            self.model = loader.load_model(
+                model_config=model_config,
+                device_config=DeviceConfig(current_platform.device_type, self.gpu_id),
+            )
+        # A throwaway build in the same load is dropped.
+        constructed = records.pop(id(self.model), None)
+        records.clear()
 
         elapsed = time.perf_counter() - tic
         logger.info(
@@ -412,8 +436,12 @@ class WeightCacheDaemon:
             0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
 
-        # Export all parameters and buffers through the transport backend
-        self._export_state()
+        # Describe the loaded model for clients (load_diff), then export its
+        # storages through the transport backend. Nothing but the model and
+        # the storage table refers to the originals by then.
+        state_tensors = self._snapshot(constructed)
+        del constructed
+        self._export_state(state_tensors)
         if self.transport_name == VMM_FD_BACKEND:
             # The packed weights live in cuMemCreate allocations, which the
             # caching allocator does not count. Add them to what it still
@@ -426,7 +454,7 @@ class WeightCacheDaemon:
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors "
+            f"Exported {len(self.state_entries)} storages "
             f"(transport={self.transport_name}, "
             f"preloaded_weights_bytes={self.preloaded_weights_bytes})."
         )
@@ -457,36 +485,45 @@ class WeightCacheDaemon:
                         f"engine itself), or use --weight-cache-transport vmm_fd."
                     )
 
-    def _export_state(self):
-        """Export model state entries through the selected transport backend."""
-        self.state_entries.clear()
+    def _snapshot(self, constructed) -> Dict[str, Tuple[torch.Tensor, bool]]:
+        """Describe the loaded model for clients (load_diff.export): every
+        tensor it holds as a view of a storage, and every plain value loading
+        changed. Keeps the manifest, with the bytes of the storages on the
+        CPU, and returns those on this daemon's device, which the transport
+        exports, by name. Raises, listing them, when loading left anything a
+        client cannot get."""
+        from sglang.srt.weight_cache import load_diff
 
-        # remove_duplicate=False so tied weights are recognized as parameters
-        # under every name. state_dict() below emits both tied keys, and with the
-        # deduped set the duplicate would be mis-registered as a buffer, not a
-        # parameter, on the client.
-        param_names = set(
-            name for name, _ in self.model.named_parameters(remove_duplicate=False)
-        )
-        state_dict_names = set(self.model.state_dict().keys())
-
-        # Comprehensions below leave no loop variable behind: with vmm_fd, a
-        # leftover reference would keep its original alive while packing.
-
-        # Export all items from state_dict (parameters + persistent buffers)
-        state_tensors: Dict[str, Tuple[torch.Tensor, bool]] = {
-            name: (tensor.data, name in param_names)
-            for name, tensor in self.model.state_dict().items()
+        if constructed is None:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+                f"The model loader did not build the model through "
+                f"_initialize_model, so what loading changed is unknown."
+            )
+        storages, payload = load_diff.export(model=self.model, constructed=constructed)
+        device = torch.device(current_platform.get_device(self.gpu_id))
+        self.manifest = {
+            "load_diff": payload,
+            "storages": {
+                name: [tensor.nbytes, tensor.device.type]
+                for name, tensor in storages.items()
+            },
+            "host": {
+                name: bytes(tensor.numpy())
+                for name, tensor in storages.items()
+                if tensor.device != device
+            },
+        }
+        return {
+            name: (tensor, False)
+            for name, tensor in storages.items()
+            if tensor.device == device
         }
 
-        # Also export non-persistent buffers (not in state_dict but needed
-        # for inference, e.g. rotary embedding cos_sin_cache)
-        state_tensors.update(
-            (name, (buf.data, False))
-            for name, buf in self.model.named_buffers()
-            if name not in state_dict_names
-        )
-        non_persistent_count = len(state_tensors) - len(state_dict_names)
+    def _export_state(self, state_tensors: Dict[str, Tuple[torch.Tensor, bool]]):
+        """Export the snapshot's storages through the selected transport
+        backend, which consumes ``state_tensors``."""
+        self.state_entries.clear()
 
         if self.transport_name == VMM_FD_BACKEND:
             # Packing consumes detached storage aliases. The daemon never runs
@@ -524,11 +561,29 @@ class WeightCacheDaemon:
                 if isinstance(handle, (str, bytes, bytearray))
             )
             exported = f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+        # A response that a client would refuse to read must fail here, not
+        # on every client. The rest of the response (pid, version, sizes)
+        # fits in the 1 MiB left over.
+        size = len(
+            pickle.dumps(
+                {
+                    "config": self.config.to_dict(),
+                    "entries": self.state_entries,
+                    "manifest": self.manifest,
+                },
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+        )
+        if size > MAX_MSG_SIZE - (1 << 20):
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] A fetch_state response "
+                f"would take {size} bytes, more than the {MAX_MSG_SIZE}-byte cap."
+            )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
-            f"Exported {len(self.state_entries)} tensors "
-            f"({non_persistent_count} non-persistent buffers), "
-            f"transport={self.transport_backend.name}, {exported}"
+            f"Exported {len(self.state_entries)} storages, "
+            f"transport={self.transport_backend.name}, {exported}, "
+            f"response {size / (1 << 20):.1f} MiB"
         )
 
     def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
@@ -617,9 +672,36 @@ class WeightCacheDaemon:
         """Handle a single client connection."""
         req = recv_msg(conn)
 
+        try:
+            if req.get("type") == "handshake":
+                check_protocol_version(req.get("protocol_version"))
+                send_msg(conn, {"status": "ok", "protocol_version": PROTOCOL_VERSION})
+                req = recv_msg(conn)
+            if req.get("type") == "fetch_state":
+                # Before the config is read or any handle or fd exported: a
+                # client of another version would misread the response.
+                check_protocol_version(req.get("protocol_version"))
+        except ProtocolVersionError as e:
+            send_msg(
+                conn,
+                {
+                    "status": "protocol_mismatch",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "message": str(e),
+                },
+            )
+            return
+
         if req.get("type") == "query_config":
             # Client asks for config without requesting handles
-            send_msg(conn, {"status": "ok", "config": self.config.to_dict()})
+            send_msg(
+                conn,
+                {
+                    "status": "ok",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "config": self.config.to_dict(),
+                },
+            )
 
         elif req.get("type") == "fetch_state":
             # Client requests full state with IPC handles
@@ -638,13 +720,18 @@ class WeightCacheDaemon:
                     f"Config mismatch: {mismatches}"
                 )
                 send_msg(
-                    conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
+                    conn,
+                    {
+                        "status": "mismatch",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "daemon_config": self.config.to_dict(),
+                    },
                 )
                 return
 
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                f"Serving {len(self.state_entries)} tensors via "
+                f"Serving {len(self.state_entries)} storages via "
                 f"{self.transport_backend.name} transport"
             )
             self.transport_backend.send_fetch_state_response(
@@ -657,16 +744,18 @@ class WeightCacheDaemon:
                 # addresses) dangle.
                 pid=os.getpid(),
                 preloaded_weights_bytes=self.preloaded_weights_bytes,
+                extra={"protocol_version": PROTOCOL_VERSION, "manifest": self.manifest},
             )
 
         elif req.get("type") == "ping":
-            send_msg(conn, {"status": "ok"})
+            send_msg(conn, {"status": "ok", "protocol_version": PROTOCOL_VERSION})
 
         else:
             send_msg(
                 conn,
                 {
                     "status": "error",
+                    "protocol_version": PROTOCOL_VERSION,
                     "message": f"Unknown request type: {req.get('type')}",
                 },
             )
@@ -679,6 +768,7 @@ class WeightCacheDaemon:
             del self.model
             self.model = None
         self.state_entries.clear()
+        self.manifest = None
         if self.transport_backend is not None:
             # Release any model references before closing transport resources.
             self.transport_backend.close()

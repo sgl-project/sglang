@@ -14,7 +14,6 @@ from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelL
 from sglang.srt.layers.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -245,22 +244,19 @@ class TestCpuOffloader(CustomTestCase):
             self.assertEqual(convolution.weight.device.type, self.device.type)
             self.assertEqual(convolution.bias.device.type, "cpu")
 
-    def test_loaders_rebuild_replaced_convolution_view(self) -> None:
-        for rebind in (
-            PreshardedModelLoader._rebind_parameter_aliases,
-            WeightCacheModelLoader._rebuild_stale_views,
-        ):
-            with self.subTest(loader=rebind.__qualname__), torch.no_grad():
-                model = CachedConvolution("conv1d", self.device)
-                model.conv1d.weight = nn.Parameter(torch.ones_like(model.conv1d.weight))
-                model.projection.weight.fill_(1)
+    def test_presharded_rebuilds_replaced_convolution_view(self) -> None:
+        # The weight cache installs the daemon's views with load_diff instead.
+        with torch.no_grad():
+            model = CachedConvolution("conv1d", self.device)
+            model.conv1d.weight = nn.Parameter(torch.ones_like(model.conv1d.weight))
+            model.projection.weight.fill_(1)
 
-                rebind(model)
-                output = model(torch.ones((1, 3, 3), device=self.device))
+            PreshardedModelLoader._rebind_parameter_aliases(model)
+            output = model(torch.ones((1, 3, 3), device=self.device))
 
-                torch.testing.assert_close(
-                    output, torch.full((1, 2), 9.0, device=self.device)
-                )
+            torch.testing.assert_close(
+                output, torch.full((1, 2), 9.0, device=self.device)
+            )
 
 
 if __name__ == "__main__":
