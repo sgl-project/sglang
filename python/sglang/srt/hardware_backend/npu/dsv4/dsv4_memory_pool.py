@@ -24,6 +24,7 @@ import torch_npu
 from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog, kv_compress_epilog_v2
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.utils import is_ascend_910b, is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
@@ -135,6 +136,7 @@ class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
     ):
         assert layout in (
             NPUDSV4KVLayout.V41_BF16,
+            NPUDSV4KVLayout.V41_INT8,
             NPUDSV4KVLayout.V41_SWA_FP8,
             NPUDSV4KVLayout.V41_CMP_FP4,
         ), layout
@@ -448,6 +450,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         epilog_v2 fp4 row; the V4 ratios follow the part."""
         if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS and self._is_v41_model():
             if is_ascend_910b():
+                if envs.SGLANG_DSV41_NPU_INT8_MAIN_CACHE.get():
+                    return NPUDSV4KVLayout.V41_INT8
                 return NPUDSV4KVLayout.V41_BF16
             return NPUDSV4KVLayout.V41_CMP_FP4
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
@@ -501,6 +505,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         if kv_layout in (
             NPUDSV4KVLayout.V41_BF16,
+            NPUDSV4KVLayout.V41_INT8,
             NPUDSV4KVLayout.V41_SWA_FP8,
             NPUDSV4KVLayout.V41_CMP_FP4,
         ):
@@ -1024,7 +1029,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             return
         compress_pool = item.compress_kv_pool
         assert compress_pool is not None, "Missing compressed KV pool"
-        if compress_pool.layout is NPUDSV4KVLayout.V41_BF16:
+        if compress_pool.layout in (NPUDSV4KVLayout.V41_BF16, NPUDSV4KVLayout.V41_INT8):
+            if compress_pool.layout is NPUDSV4KVLayout.V41_INT8:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_kv import pack_kv
+
+                kv = pack_kv(kv)
             _store_dsv41_rows(compress_pool.kv_buffer[compress_layer_id], loc, kv)
             return
         if device_type == "npu":

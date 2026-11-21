@@ -57,6 +57,20 @@ def attend(backend, query, layer, forward_batch, sink, ratio):
             cmp_block_table=getattr(fm, f"c{ratio}_page_table").int(),
             cmp_sparse_indices=indices.reshape(-1, 1, indices.shape[-1]).int(),
         )
+        if kwargs["cmp_kv"].dtype == torch.uint8:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_kv import (
+                materialize_kv_pages,
+            )
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_is_capture_mode,
+            )
+
+            kwargs["cmp_kv"], kwargs["cmp_block_table"] = materialize_kv_pages(
+                kwargs["cmp_kv"],
+                kwargs["cmp_block_table"],
+                kwargs["seqused_cmp_kv"],
+                fixed_shape=get_is_capture_mode(),
+            )
     metadata = fm.kernel_metadata[f"c{ratio}a_metadata" if ratio else "win_metadata"]
     output, _ = sparse_flash_mla(
         query,
