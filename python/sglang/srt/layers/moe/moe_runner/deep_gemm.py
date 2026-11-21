@@ -268,6 +268,27 @@ def _get_compact_all_tokens(
     )
 
 
+def _bucket_rows(rows: int) -> int:
+    # Contiguous-layout buffers are sized by the routed row count, which changes every
+    # layer; exact sizes ratchet the caching allocator (each new maximum adds a segment
+    # while the smaller ones stay cached: ~5 GiB cached for ~1.3 GiB live in an 8x B200
+    # GLM-5.3 prefill). Eight buckets per octave bound the slack at 12.5%.
+    if rows <= 1024:
+        return rows
+    step = 1 << (rows.bit_length() - 4)
+    return -(-rows // step) * step
+
+
+def _empty_bucketed_rows(
+    rows: int, cols: int, *, dtype: torch.dtype, device, zero: bool = False
+) -> torch.Tensor:
+    """A contiguous (rows, cols) tensor whose storage is allocated with bucketed rows."""
+    alloc = torch.zeros if zero else torch.empty
+    return alloc((_bucket_rows(rows), cols), dtype=dtype, device=device).resize_(
+        rows, cols
+    )
+
+
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -459,10 +480,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         w2_weight_fp8 = (quant_info.w2_weight, quant_info.w2_scale)
 
-        gateup_output = torch.empty(
-            (all_tokens, N),
-            device=hidden_states_device,
-            dtype=torch.bfloat16,
+        gateup_output = _empty_bucketed_rows(
+            all_tokens, N, dtype=torch.bfloat16, device=hidden_states_device
         )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
@@ -568,14 +587,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             del gateup_output
         else:
             from sglang.kernels.ops.quantization.fp8_kernel import (
+                fp8_dtype,
                 sglang_per_token_group_quant_fp8,
             )
 
             if not _is_musa:
-                down_input = torch.empty(
-                    (all_tokens, N // 2),
-                    device=gateup_output.device,
+                down_input = _empty_bucketed_rows(
+                    all_tokens,
+                    N // 2,
                     dtype=torch.bfloat16,
+                    device=gateup_output.device,
                 )
                 if self.swiglu_limit is not None:
                     # Fuse the SwiGLU limit with the activation. The quantizing
@@ -599,6 +620,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                output_q=_empty_bucketed_rows(
+                    *down_input.shape, dtype=fp8_dtype, device=down_input.device
+                ),
             )
             del down_input
         if trace_deepep_v2_contig:
@@ -628,10 +652,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
-            down_output = torch.empty(
-                (all_tokens, K),
-                device=hidden_states_device,
-                dtype=torch.bfloat16,
+            down_output = _empty_bucketed_rows(
+                all_tokens, K, dtype=torch.bfloat16, device=hidden_states_device
             )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
@@ -651,6 +673,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a_down,
             recipe_b=recipe_b_down,
         )
+        # Free now rather than at frame exit: a reference that outlives this frame
+        # (e.g. a host stack sampler) would otherwise pin the buffer into later layers.
+        dispose_tensor(down_input_fp8)
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig down GEMM returned")
@@ -1415,10 +1440,12 @@ def pre_permute_deepep_normal_to_deep_gemm(
     deterministic = get_exec().deterministic.enable_deterministic_inference
     buffer_init = torch.zeros if deterministic else torch.empty
 
-    input_tensor = buffer_init(
-        (all_tokens, K),
-        device=hidden_states.device,
+    input_tensor = _empty_bucketed_rows(
+        all_tokens,
+        K,
         dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        zero=deterministic,
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
         # TODO check whether need `zeros`
@@ -1492,12 +1519,13 @@ def post_permute_deep_gemm_to_deepep_normal(
     topk_weights = running_state["topk_weights"]
     output_index = running_state["output_index"]
 
-    gather_out = torch.empty(
-        running_state["hidden_states_shape"],
-        device=running_state["hidden_states_device"],
+    gather_out = _empty_bucketed_rows(
+        *running_state["hidden_states_shape"],
         dtype=torch.bfloat16,
+        device=running_state["hidden_states_device"],
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+    dispose_tensor(hidden_states)
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,

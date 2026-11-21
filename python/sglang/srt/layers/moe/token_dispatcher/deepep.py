@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -30,6 +31,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
+    dispose_tensor,
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
@@ -104,6 +106,20 @@ def _deepep_precompile_tp_barrier() -> None:
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_parallel().tp_group.barrier()
+
+
+# Consumed DeepEP event handles, dropped here on the forward thread once evicted. DeepEP's
+# wrapper frames also reference them; if a frame that outlived its call (e.g. one held by a
+# host stack sampler) dropped the last reference, the c10::Event would be destroyed on that
+# thread, whose device restore initializes a stray ~600 MiB CUDA context on GPU 0.
+_retired_event_handles: deque = deque(maxlen=4096)
+
+
+def _release_event_handles(*events) -> None:
+    for event in events:
+        if event is not None and event.event is not None:
+            _retired_event_handles.append(event.event)
+            event.event = None
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -335,6 +351,23 @@ class DeepEPBuffer:
             raise Exception("unsupported mode")
 
 
+# Measured on 8x B200 (4096-token prefill, hidden 6144, top-8 of 256 experts): DeepEP's
+# 20-SM default leaves NVLink dispatch + combine SM-bound at ~2.5 ms per MoE layer;
+# 64 SMs keep the same NVL buffer (32 channels * 80 == 10 * 256 slots) and take ~0.85 ms.
+_SM100_INTRANODE_NORMAL_NUM_SMS = 64
+
+
+def _sm100_intranode_normal_configs(num_ranks: int) -> Optional[Tuple[Config, Config]]:
+    """(dispatch, combine) normal-mode configs for one 8-GPU SM100 NVLink node."""
+    if _is_npu or is_hip() or num_ranks != 8:
+        return None
+    num_sms = _SM100_INTRANODE_NORMAL_NUM_SMS
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if props.major != 10 or props.multi_processor_count < 2 * num_sms:
+        return None
+    return Config(num_sms, 12, 80, 6, 128), Config(num_sms, 6, 80, 6, 128)
+
+
 class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
@@ -352,6 +385,13 @@ class DeepEPConfig(BaseDispatcherConfig):
 
             assert config_dispatch["num_sms"] == config_combine["num_sms"]
             self.num_sms = config_dispatch["num_sms"]
+        elif (
+            tuned := _sm100_intranode_normal_configs(
+                get_parallel().tp_group.device_group.size()
+            )
+        ) is not None:
+            self.normal_dispatch_config, self.normal_combine_config = tuned
+            self.num_sms = _SM100_INTRANODE_NORMAL_NUM_SMS
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
@@ -627,6 +667,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             event,
         ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        _release_event_handles(event)
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -654,7 +695,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank,
             num_tokens_per_expert,
             is_token_in_rank,
-            previous_event,
+            layout_event,
         ) = buffer.get_dispatch_layout(
             topk_ids,
             self.num_experts,
@@ -662,6 +703,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
+        _release_event_handles(previous_event)
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
@@ -683,13 +725,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=previous_event,
+            previous_event=layout_event,
             async_finish=self.async_finish,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            allocate_on_comm_stream=(layout_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
             **npu_quantization_opts,
         )
+        _release_event_handles(layout_event)
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -723,6 +766,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_b(self, output, previous_event):
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
+        _release_event_handles(previous_event, event)
+        # The current stream is now ordered after the combine read of `output`.
+        dispose_tensor(output)
         self.handle = None
         self.src2dst = None
         return hidden_states
