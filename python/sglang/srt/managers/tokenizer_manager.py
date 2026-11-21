@@ -57,6 +57,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
@@ -90,6 +91,10 @@ from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import (
     PositionalEmbeds,
     validate_positional_embed_overrides,
+)
+from sglang.srt.managers.embedding_truncation import (
+    embedding_input_token_limit,
+    truncate_embedding_input,
 )
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1191,11 +1196,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return input_ids, token_type_ids
 
     async def _tokenize_texts(
-        self, texts: Union[str, List[str]], is_cross_encoder: bool = False
+        self,
+        texts: Union[str, List[str]],
+        is_cross_encoder: bool = False,
+        add_special_tokens: Optional[bool] = None,
+        return_special_tokens_mask: bool = False,
     ) -> Union[
-        Tuple[List[int], Optional[List[int]]],
-        Tuple[List[List[int]], Optional[List[List[int]]]],
+        Tuple[List[int], Optional[List[int]], Optional[List[int]]],
+        Tuple[List[List[int]], Optional[List[List[int]]], Optional[List[List[int]]]],
     ]:
+        """Return input_ids, token_type_ids, and the tokenizer's special-token
+        mask; the mask is None unless return_special_tokens_mask is set."""
         if (
             texts is None
             or (isinstance(texts, list) and len(texts) == 0)
@@ -1213,6 +1224,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             {"return_token_type_ids": is_cross_encoder} if is_cross_encoder else {}
         )
 
+        if add_special_tokens is not None:
+            tokenizer_kwargs["add_special_tokens"] = add_special_tokens
+        if return_special_tokens_mask:
+            tokenizer_kwargs["return_special_tokens_mask"] = True
+        special_tokens_mask = None
+
         # Step 3: Choose tokenization strategy
         use_async_tokenizer = (
             self.async_dynamic_batch_tokenizer is not None
@@ -1226,6 +1243,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             # Convert to batch format for consistency
             input_ids = [result["input_ids"]]
+            if return_special_tokens_mask:
+                special_tokens_mask = [result["special_tokens_mask"]]
             token_type_ids = (
                 [result["token_type_ids"]]
                 if is_cross_encoder and result.get("token_type_ids")
@@ -1234,12 +1253,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
 
-            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
-                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+            if (
+                not is_cross_encoder
+                and not return_special_tokens_mask
+                and not isinstance(self.tokenizer, PreTrainedTokenizerFast)
+            ):
+                input_ids = [
+                    self.tokenizer.encode(t, **tokenizer_kwargs)
+                    for t in tokenizer_input
+                ]
                 token_type_ids = None
             else:
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
                 input_ids = encoded["input_ids"]
+                if return_special_tokens_mask:
+                    special_tokens_mask = encoded["special_tokens_mask"]
                 token_type_ids = (
                     encoded.get("token_type_ids") if is_cross_encoder else None
                 )
@@ -1250,21 +1278,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # rather than mutating tokenizer-global post-processing state.
         if (
             self.model_config.is_embedding_gemma
+            and add_special_tokens is not False
             and self.tokenizer.eos_token_id is not None
         ):
-            input_ids = [
-                (
-                    ids
-                    if ids and ids[-1] == self.tokenizer.eos_token_id
-                    else [*ids, self.tokenizer.eos_token_id]
-                )
-                for ids in input_ids
-            ]
+            # Preserve tokenizer-owned output buffers across requests.
+            input_ids = list(input_ids)
+            if special_tokens_mask is not None:
+                special_tokens_mask = list(special_tokens_mask)
+            for index, ids in enumerate(input_ids):
+                if not ids or ids[-1] != self.tokenizer.eos_token_id:
+                    input_ids[index] = [*ids, self.tokenizer.eos_token_id]
+                    if special_tokens_mask is not None:
+                        special_tokens_mask[index] = [*special_tokens_mask[index], 1]
+                elif special_tokens_mask is not None:
+                    special_tokens_mask[index] = [*special_tokens_mask[index][:-1], 1]
 
         # Step 4: Extract results based on input format
-        return self._extract_tokenizer_results(
+        input_ids, token_type_ids = self._extract_tokenizer_results(
             input_ids, token_type_ids, input_format, original_batch_size
         )
+        if special_tokens_mask is not None:
+            special_tokens_mask, _ = self._extract_tokenizer_results(
+                special_tokens_mask, None, input_format, original_batch_size
+            )
+        return input_ids, token_type_ids, special_tokens_mask
 
     async def _tokenize_one_request(
         self,
@@ -1275,6 +1312,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        special_tokens_mask = None
         contains_mm_input = obj.contains_mm_input()
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
@@ -1316,8 +1354,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
+                (
+                    input_ids,
+                    token_type_ids,
+                    special_tokens_mask,
+                ) = await self._tokenize_texts(
+                    input_text,
+                    is_cross_encoder_request,
+                    **self._embedding_tokenizer_kwargs(obj),
                 )
 
         if contains_mm_input and get_disagg().language_model_only:
@@ -1444,6 +1488,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
+        input_ids, token_type_ids, mm_inputs = self._truncate_embedding_input(
+            obj, input_ids, token_type_ids, mm_inputs, special_tokens_mask
+        )
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
@@ -1479,6 +1526,64 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Conflicting content hashes for image_data[{index}]")
             normalized.append(provided or embedded)
         obj.mm_content_hashes = normalized
+
+    @staticmethod
+    def _embedding_tokenizer_kwargs(obj) -> Dict[str, bool]:
+        """Tokenizer options an embedding request opts into; empty otherwise."""
+        if not isinstance(obj, EmbeddingReqInput):
+            return {}
+        kwargs = {}
+        if obj.embedding_add_special_tokens is not None:
+            kwargs["add_special_tokens"] = obj.embedding_add_special_tokens
+        # Only tokenizer-added tokens in plain, single-sequence text have a
+        # generic truncation rule. Rendered templates disable special tokens;
+        # multimodal requests are validated after processor expansion instead.
+        if (
+            obj.embedding_truncate in ("END", "START")
+            and obj.embedding_add_special_tokens is not False
+            and not obj.is_cross_encoder_request
+            and not obj.contains_mm_input()
+        ):
+            kwargs["return_special_tokens_mask"] = True
+        return kwargs
+
+    def _truncate_embedding_input(
+        self,
+        obj,
+        input_ids,
+        token_type_ids=None,
+        mm_inputs=None,
+        special_tokens_mask=None,
+    ):
+        if not isinstance(obj, EmbeddingReqInput) or obj.embedding_truncate is None:
+            return input_ids, token_type_ids, mm_inputs
+
+        schedule = get_schedule()
+        limit = embedding_input_token_limit(
+            context_len=self.context_len,
+            num_reserved_tokens=self.num_reserved_tokens,
+            max_req_input_len=self.max_req_input_len,
+            max_prefill_tokens=(
+                schedule.max_prefill_tokens
+                if schedule.chunked_prefill_size <= 0
+                else None
+            ),
+        )
+        input_ids, token_type_ids, mm_inputs = truncate_embedding_input(
+            input_ids,
+            truncate=obj.embedding_truncate,
+            max_tokens=obj.embedding_max_tokens,
+            input_token_limit=limit,
+            token_type_ids=token_type_ids,
+            mm_inputs=mm_inputs,
+            special_tokens_mask=special_tokens_mask,
+        )
+        if not input_ids:
+            raise ValueError(
+                "Embedding input is empty after preprocessing or truncation; "
+                "provide non-empty input and use max_tokens greater than 0."
+            )
+        return input_ids, token_type_ids, mm_inputs
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1978,6 +2083,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
+        # A request-scoped token budget applies after processor expansion, so
+        # budgeted multimodal embeddings take the per-request path.
+        if any(
+            isinstance(obj[i], EmbeddingReqInput)
+            and obj[i].embedding_truncate is not None
+            and obj[i].contains_mm_input()
+            for i in range(batch_size)
+        ):
+            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
+
         # If batch does not have text nothing to tokenize
         # so lets construct the return object
         if not self._batch_has_text(batch_size, obj):
@@ -1997,20 +2112,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         # Batch tokenize all texts using unified method
-        input_ids_list, token_type_ids_list = await self._tokenize_texts(
-            texts, is_cross_encoder_request
+        (
+            input_ids_list,
+            token_type_ids_list,
+            special_tokens_masks,
+        ) = await self._tokenize_texts(
+            texts, is_cross_encoder_request, **self._embedding_tokenizer_kwargs(obj)
         )
 
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self._validate_one_request(obj[i], input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
+            input_ids, token_type_ids, _ = self._truncate_embedding_input(
+                req,
+                input_ids_list[i],
+                token_type_ids,
+                special_tokens_mask=(
+                    special_tokens_masks[i]
+                    if special_tokens_masks is not None
+                    else None
+                ),
+            )
+            self._validate_one_request(req, input_ids)
             tokenized_objs.append(
                 self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], None, None, token_type_ids
+                    req, req.text, input_ids, None, None, token_type_ids
                 )
             )
         logger.debug(f"Completed batch processing for {batch_size} requests")

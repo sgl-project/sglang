@@ -151,10 +151,22 @@ class TiktokenTokenizer:
         )
         return self.encode(ret) if tokenize else ret
 
-    def __call__(self, text: List[str], **kwargs):
-        return {
-            "input_ids": [self.encode(x) for x in text],
-        }
+    def __call__(
+        self,
+        text: Union[str, List[str]],
+        return_special_tokens_mask: bool = False,
+        **kwargs,
+    ):
+        # A lone string yields one flat sequence, as with HF tokenizers.
+        is_single = isinstance(text, str)
+        input_ids = [self.encode(x) for x in ([text] if is_single else text)]
+        encoded = {"input_ids": input_ids}
+        if return_special_tokens_mask:
+            # encode() adds no special tokens, so every position is content.
+            encoded["special_tokens_mask"] = [[0] * len(ids) for ids in input_ids]
+        if is_single:
+            return {key: value[0] for key, value in encoded.items()}
+        return encoded
 
     def init_xgrammar(self):
         from xgrammar import TokenizerInfo

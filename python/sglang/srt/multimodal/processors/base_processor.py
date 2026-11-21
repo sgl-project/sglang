@@ -1384,7 +1384,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             input_ids = tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
-                add_special_tokens=True,
+                add_special_tokens=kwargs.get("add_special_tokens", True),
             ).input_ids.flatten()
             return [], input_ids, {}
 
@@ -1503,7 +1503,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             input_ids = tokenizer(
                 base_output.input_text,
                 return_tensors="pt",
-                add_special_tokens=True,
+                add_special_tokens=kwargs.get("add_special_tokens", True),
             ).input_ids.flatten()
 
         # Add offsets to all items
