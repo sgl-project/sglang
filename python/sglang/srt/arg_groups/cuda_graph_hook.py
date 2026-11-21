@@ -175,19 +175,28 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        is_kimi_k31,
         uses_compressed_kv_attention,
         uses_kda_attention,
     )
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+    from sglang.srt.utils.device import is_hip
+
+    def kimi_k31_on_cuda() -> bool:
+        """Kimi-K3.1's breakable prefill capture is validated on CUDA, with and
+        without decode context parallelism."""
+        return is_kimi_k31(model_config_of(server_args).hf_config) and not is_hip()
 
     rules = [
         (
             "KDA hybrid linear attention",
-            # GLM-5.3 Flash is BCG-validated; other KDA models stay off by default.
+            # GLM-5.3 Flash and Kimi-K3.1 on CUDA are BCG-validated; other KDA
+            # models stay off by default.
             lambda: (
                 uses_kda_attention(model_config_of(server_args).hf_config)
                 and "Glm5NextForConditionalGeneration"
                 not in model_config_of(server_args).hf_config.architectures
+                and not kimi_k31_on_cuda()
             ),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
@@ -209,10 +218,11 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not supports_prefill_cp_bcg(server_args)
             ),
         ),
-        # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+        # The runner plans the DCP gather at capture and at replay; the capture
+        # stays opt-in under DCP except for models validated with it.
         (
             "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1,
+            lambda: cfg.dcp_size > 1 and not kimi_k31_on_cuda(),
         ),
         # TBO capture is unsupported.
         (
