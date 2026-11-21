@@ -15,7 +15,12 @@ import numpy.typing as npt
 import torch
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferMetric,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -228,7 +233,9 @@ class KVArgsRegisterInfo:
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            staging=StagingRegisterInfo.from_zmq_fields(
+                msg, 14, slot_ids_index=18, deduplicate_index=20
+            ),
         )
 
 
@@ -261,8 +268,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
-    # P writer offsets, D staging allocation and D scatter slots must agree; both
-    # sides of a Mooncake staging transfer use the compact replica layout.
+    # Decode advertises compact staging slots in StagingRegisterInfo; prefill
+    # enables deduplication only when both sides negotiate it.
     deduplicate_kv_staging = True
 
     def __init__(
@@ -643,10 +650,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return (-1, True)
 
         # Non-writers still take part in CHUNK_READY and final ACK fan-in. Decode
-        # scatters only the compact slots populated by elected writers.
-        if not self.deduplicate_kv_staging or self._should_send_main_kv(
-            req, target_info
-        ):
+        # scatters compact slots only when both sides negotiated deduplication.
+        if not self._peer_deduplicates_staging(
+            target_info
+        ) or self._should_send_main_kv(req, target_info):
             ret = staging_strategy.transfer(
                 req.mooncake_session_id,
                 kv_chunk.prefill_kv_indices,
@@ -695,6 +702,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             prefetch_staging_reqs,
         )
 
+        deduplicate_sessions = {
+            tinfo.mooncake_session_id
+            for tinfo in room_infos.values()
+            if not tinfo.is_dummy
+            and (peer := self.decode_kv_args_table.get(tinfo.mooncake_session_id))
+            is not None
+            and self._peer_deduplicates_staging(peer)
+        }
         prefetch_staging_reqs(
             room,
             self.transfer_infos,
@@ -703,6 +718,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
+            deduplicate_sessions=deduplicate_sessions,
         )
 
     def send_kvcache_staged(
@@ -717,6 +733,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: List[int],
         staging_buffer=None,
         dst_slot_layer_ids: Optional[List[int]] = None,
+        deduplicate: Optional[bool] = None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -770,6 +787,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             pairs = None
             dst_num_layers = num_layers
 
+        if deduplicate is None:
+            deduplicate = self.deduplicate_kv_staging
         _, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
@@ -778,14 +797,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             num_tokens,
             head_dim * dtype_size,
             dst_num_layers,
-            deduplicate=self.deduplicate_kv_staging,
+            deduplicate=deduplicate,
         )
         writer_idx = staging_writer_slot(
             self.attn_tp_size,
             dst_attn_tp_size,
             local_tp_rank,
             total_kv_heads,
-            self.deduplicate_kv_staging,
+            deduplicate,
         )
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
@@ -1688,6 +1707,48 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._total_kv_heads(),
         )
 
+    def _peer_deduplicates_staging(self, peer: KVArgsRegisterInfo) -> bool:
+        staging = getattr(peer, "staging", None)
+        return bool(
+            self.deduplicate_kv_staging and staging is not None and staging.deduplicate
+        )
+
+    def _sends_main_kv_to_peer(
+        self, req: TransferInfo, peer: KVArgsRegisterInfo
+    ) -> bool:
+        if (
+            getattr(peer, "requires_dcp_relayout", False)
+            or self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or self.attn_tp_size == peer.dst_attn_tp_size
+        ):
+            return True
+        uses_staging = (
+            getattr(self, "enable_staging", False)
+            and getattr(self, "kv_buffer_tensors", None) is not None
+            and (
+                getattr(peer, "staging_base_ptr", 0) != 0
+                or getattr(peer, "staging_total_size", 0) != 0
+            )
+        )
+        if uses_staging and not self._peer_deduplicates_staging(peer):
+            return True
+        return self._should_send_main_kv(req, peer)
+
+    def sends_main_kv_for_room(self, room: int) -> bool:
+        room_infos = getattr(self, "transfer_infos", {}).get(room)
+        if not room_infos:
+            return True
+        table = getattr(self, "decode_kv_args_table", {})
+        active = [
+            (req, table[req.mooncake_session_id])
+            for req in room_infos.values()
+            if not req.is_dummy and req.mooncake_session_id in table
+        ]
+        if not active:
+            return True
+        return any(self._sends_main_kv_to_peer(req, peer) for req, peer in active)
+
     def _can_send_whole_kv_pages(self, peer: KVArgsRegisterInfo) -> bool:
         """Whether heterogeneous attention TP still leaves identical page layouts.
 
@@ -1710,7 +1771,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
-        room: int,
         dst_layer_ids: Optional[List[int]] = None,
     ):
         """
@@ -1734,17 +1794,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
-
-        # Replicated heads map to the same destination bytes; one replica writes.
-        if not should_send_kv_replica(
-            room,
-            self.attn_tp_size,
-            dst_attn_tp_size,
-            self.kv_args.engine_rank,
-            dst_tp_rank,
-            total_kv_heads,
-        ):
-            return 0
 
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
         bytes_per_head_slice_to_send = (
@@ -2813,17 +2862,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 else 0
                             )
                         else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
-                                req.room,
-                                target_rank_registration_info.dst_kv_layer_ids,
+                            ret = (
+                                self.send_kvcache_slice(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    target_rank_registration_info.dst_kv_item_len,
+                                    executor,
+                                    target_rank_registration_info.dst_kv_layer_ids,
+                                )
+                                if self._should_send_main_kv(
+                                    req, target_rank_registration_info
+                                )
+                                else 0
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -3331,9 +3385,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             _alloc = self._staging_ctx.allocator
             packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
             staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
+            packed_staging_deduplicate = b"1" if self.deduplicate_kv_staging else b""
         else:
             packed_staging_base_ptr = b""
             staging_total_size_str = b""
+            packed_staging_deduplicate = b""
         staging_slots = getattr(self, "kv_buffer_tensors", None) or {}
         packed_staging_slot_layer_ids = b"".join(
             struct.pack("Q", layer_id)
@@ -3364,6 +3420,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            packed_staging_deduplicate,
         ]
 
     def build_receiver_metadata_message(
@@ -3399,6 +3456,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
 
+    def _resolve_sends_main_kv(self) -> bool:
+        sends_main_kv = getattr(self, "_sends_main_kv", None)
+        if sends_main_kv is None:
+            sends_main_fn = getattr(self.kv_mgr, "sends_main_kv_for_room", None)
+            sends_main_kv = (
+                sends_main_fn(self.bootstrap_room)
+                if sends_main_fn is not None
+                else True
+            )
+            self._sends_main_kv = sends_main_kv
+        return sends_main_kv
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
@@ -3407,6 +3476,8 @@ class MooncakeKVSender(CommonKVSender):
         num_kv_tokens: Optional[int] = None,
         indices_event: Optional[object] = None,
     ):
+        # Resolve before enqueueing: the worker pops transfer_infos on completion.
+        self._resolve_sends_main_kv()
         super().send(
             kv_indices=kv_indices,
             state_indices=state_indices,
@@ -3414,11 +3485,23 @@ class MooncakeKVSender(CommonKVSender):
             indices_event=indices_event,
         )
 
+    def get_transfer_metric(self) -> KVTransferMetric:
+        metric = super().get_transfer_metric()
+        if (
+            getattr(self, "_skipped_replica_kv", False)
+            and metric.transfer_total_bytes == 0
+        ):
+            metric.transfer_total_bytes = None
+        return metric
+
     def _record_transfer_indices(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List],
     ):
+        if not self._resolve_sends_main_kv() and len(kv_indices) > 0:
+            self._skipped_replica_kv = True
+            kv_indices = kv_indices[:0]
         metric_state_indices = state_indices
         if metric_state_indices and get_parallel().enable_kv_cache_sharding:
             # The queued state remains logical and is filtered by the worker.

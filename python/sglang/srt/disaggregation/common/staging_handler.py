@@ -501,7 +501,11 @@ class DecodeStagingHandler:
                 self.decode_tp,
                 dst_tp_rank,
                 self.total_kv_heads,
-                deduplicate=self.kv_manager.deduplicate_kv_staging,
+                deduplicate=getattr(
+                    receiver,
+                    "staging_deduplicate",
+                    self.kv_manager.deduplicate_kv_staging,
+                ),
             )
 
         return True
@@ -612,10 +616,16 @@ class StagingRegisterInfo:
     # Staging slots stay [all K, all V] after draft buffers alter kv_data_ptrs order;
     # older peers leave this empty and callers fall back to kv_layer_ids.
     slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    # Compact replica-slot capability advertised by decode; older peers omit it.
+    deduplicate: bool = False
 
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
+        cls,
+        msg: list,
+        msg_start_offset: int,
+        slot_ids_index: Optional[int] = None,
+        deduplicate_index: Optional[int] = None,
     ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
@@ -636,8 +646,16 @@ class StagingRegisterInfo:
         ):
             raw = msg[slot_ids_index]
             slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
+        deduplicate = (
+            msg[deduplicate_index] == b"1"
+            if deduplicate_index is not None and len(msg) > deduplicate_index
+            else False
+        )
         return cls(
-            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+            base_ptr=base_ptr,
+            total_size=total_size,
+            slot_layer_ids=slot_layer_ids,
+            deduplicate=deduplicate,
         )
 
 
@@ -736,6 +754,9 @@ class PrefillStagingStrategy:
                     target_info.staging.slot_layer_ids
                     if target_info.staging is not None
                     else None
+                ),
+                deduplicate=bool(
+                    target_info.staging is not None and target_info.staging.deduplicate
                 ),
             )
         except Exception as e:
@@ -846,7 +867,7 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
-    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
+    requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 and msg[5] else None
 
     if staging_allocator is None:
         logger.warning(
@@ -979,6 +1000,13 @@ class StagingManagerMixin:
             )
             return
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        # Older prefills omit frame 6 and write non-deduplicated slots.
+        peer_deduplicate = (
+            self.deduplicate_kv_staging and len(msg) > 6 and msg[6] == b"1"
+        )
+        receiver = self._staging_ctx.room_receivers.get(room)
+        if receiver is not None:
+            receiver.staging_deduplicate = peer_deduplicate
         handle_staging_req(
             msg,
             self._staging_ctx.allocator,
@@ -988,10 +1016,9 @@ class StagingManagerMixin:
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
-            deduplicate=self.deduplicate_kv_staging,
+            deduplicate=peer_deduplicate,
         )
 
-        receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is not None:
             handler.register_wm_subscriber(receiver, session_id)
 
@@ -1004,6 +1031,7 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
+    deduplicate_sessions: Optional[set] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -1052,6 +1080,10 @@ def prefetch_staging_reqs(
                 ]
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
+                if deduplicate_sessions and session_id in deduplicate_sessions:
+                    if requester_pp_rank is None:
+                        request.append(b"")
+                    request.append(b"1")
                 prefetch_sockets[ep].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)

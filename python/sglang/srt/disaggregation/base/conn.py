@@ -158,8 +158,8 @@ class BaseKVManager(ABC):
     # Opt-in per backend: set True and implement teardown() to support runtime PD
     # role switch (release transfer resources; the scheduler owns the KV pool).
     supports_role_switch: bool = False
-    # P writer offsets, D staging allocation and D scatter slots must agree, so
-    # all three read this single per-backend switch.
+    # Advertised by decode in StagingRegisterInfo and echoed by prefill in
+    # STAGING_REQ, so mixed-version peers fall back to the non-deduplicated layout.
     deduplicate_kv_staging: bool = False
 
     # Opt-in per backend: set True once the prefill acks a drained abort

@@ -226,3 +226,84 @@ def test_whole_page_transfer_requires_identical_page_layout(
         dst_attn_tp_size=dst_tp, dst_kv_item_len=256 * dst_item_scale
     )
     assert not manager._can_send_whole_kv_pages(peer)
+
+
+def _registration_zmq_frames(staging_ptr=0x3000, staging_size=4096):
+    return [
+        b"None",
+        b"127.0.0.1",
+        b"1234",
+        b"decode:0",
+        b"\x00" * 8,
+        b"\x00" * 8,
+        b"",
+        b"0",
+        b"1",
+        b"256",
+        b"",
+        b"",
+        b"",
+        b"",
+        int(staging_ptr).to_bytes(8, "little"),
+        str(staging_size).encode("ascii"),
+        b"1",
+        b"0",
+        b"",
+        int(256).to_bytes(8, "little"),
+    ]
+
+
+def test_staging_deduplication_negotiates_across_mixed_versions():
+    # Old decode omits frame 20 -> prefill falls back to non-deduplicated layout.
+    old_peer = mooncake_conn.KVArgsRegisterInfo.from_zmq(_registration_zmq_frames())
+    assert old_peer.staging is not None
+    assert not old_peer.staging.deduplicate
+
+    # New decode advertises b"1" in frame 20 -> prefill enables compact layout.
+    new_peer = mooncake_conn.KVArgsRegisterInfo.from_zmq(
+        _registration_zmq_frames() + [b"1"]
+    )
+    assert new_peer.staging is not None
+    assert new_peer.staging.deduplicate
+
+    mgr = object.__new__(mooncake_conn.MooncakeKVManager)
+    assert not mgr._peer_deduplicates_staging(old_peer)
+    assert mgr._peer_deduplicates_staging(new_peer)
+
+    # New decode receiving an older 6-frame STAGING_REQ allocates all replicas;
+    # receiving frame 6 == b"1" allocates the compact deduplicated layout.
+    from sglang.srt.disaggregation.common import staging_handler
+
+    for req_frames, expected_bytes in (
+        ([b"STAGING_REQ", b"7", b"0", b"1", b"decode:0", b"0"], 8 * 256),
+        ([b"STAGING_REQ", b"7", b"0", b"1", b"decode:0", b"0", b"1"], 256),
+    ):
+        assigned = []
+        allocator = SimpleNamespace(
+            assign=lambda n: assigned.append(n) or (0, 0, 0),
+            total_size=1 << 20,
+        )
+        receiver = SimpleNamespace(
+            chunk_staging_infos=[],
+            prefill_info=SimpleNamespace(attn_tp_size=8),
+        )
+        decode_mgr = object.__new__(mooncake_conn.MooncakeKVManager)
+        decode_mgr.attn_tp_size = 1
+        decode_mgr.kv_args = SimpleNamespace(
+            page_size=4,
+            kv_item_lens=[128, 128],
+            total_kv_head_num=1,
+            engine_rank=0,
+        )
+        decode_mgr._staging_ctx = SimpleNamespace(
+            allocator=allocator,
+            room_receivers={7: receiver},
+            room_bootstrap={},
+        )
+        decode_mgr._staging_handler = SimpleNamespace(
+            _room_to_decode_req={7: SimpleNamespace(kv_receiver=receiver)},
+            register_wm_subscriber=lambda *_: None,
+        )
+        staging_handler.StagingManagerMixin._handle_staging_req(decode_mgr, req_frames)
+        assert assigned == [expected_bytes]
+        assert receiver.staging_deduplicate is (expected_bytes == 256)
