@@ -417,6 +417,90 @@ class TestDeepSeekV32Streaming(unittest.TestCase):
         self.assertEqual(first.calls, [])
         self.assertEqual(second.normal_text, " tail")
 
+    def test_streaming_skips_unknown_tool_like_one_shot(self):
+        """An invoke naming a tool that is not in the request is skipped by
+        parse_base_json on the one-shot path; the streaming path used to
+        forward it, so the same completion produced a call with stream=true
+        and none with stream=false (#44941)."""
+        text = "Checking.\n\n" + _wrapped(
+            _invoke("no_such_tool", _param("city", "true", "SF"))
+            + "\n"
+            + _invoke("get_weather", _param("city", "true", "NY"))
+        )
+
+        for width in (1, 4, len(text)):
+            with self.subTest(width=width):
+                normal, calls = self._feed(
+                    [text[i : i + width] for i in range(0, len(text), width)]
+                )
+                result = DeepSeekV32Detector().detect_and_parse(text, self.tools)
+                self.assertEqual(
+                    [(c.name, c.parameters) for c in calls],
+                    [(c.name, c.parameters) for c in result.calls],
+                )
+                self.assertEqual(normal, result.normal_text)
+
+    def test_stray_left_angle_pipe_in_prose_keeps_streaming(self):
+        """A `<｜` in prose is not a tag forming (a real tag's `<` immediately
+        precedes the marker), so the reply must keep streaming instead of
+        being held hostage until finish() (#44941)."""
+        chunks = ["Use the ", "<｜", "end｜> token", " to stop.", " More text."]
+        text = "".join(chunks)
+
+        detector = DeepSeekV32Detector()
+        normals = [
+            detector.parse_streaming_increment(chunk, self.tools).normal_text
+            for chunk in chunks
+        ]
+        # The text after the stray marker pair must stream out before the
+        # stream ends; the old guard held everything until finish().
+        self.assertTrue(any("token" in n for n in normals))
+        self.assertEqual(
+            "".join(normals) + detector.finish(self.tools).normal_text, text
+        )
+        self.assertEqual(
+            DeepSeekV32Detector().detect_and_parse(text, self.tools).normal_text,
+            text,
+        )
+
+    def test_literal_dsml_token_in_prose_streams_like_one_shot(self):
+        """A literal ｜DSML｜ in prose is not a call boundary: both paths must
+        return the full sentence (#44941)."""
+        chunks = ["The tag ", DSML, " marks", " tool calls."]
+        text = "".join(chunks)
+
+        for width in (1, 3, len(text)):
+            with self.subTest(width=width):
+                normal, calls = self._feed(
+                    [text[i : i + width] for i in range(0, len(text), width)]
+                )
+                self.assertEqual(normal, text)
+                self.assertEqual(calls, [])
+
+        self.assertEqual(
+            DeepSeekV32Detector().detect_and_parse(text, self.tools).normal_text,
+            text,
+        )
+
+    def test_prose_after_seen_invoke_stays_dropped_at_every_chunk_width(self):
+        """Once an invoke has been seen (even a malformed or unknown one), the
+        turn belongs to the calls block: later prose must stay dropped on both
+        paths, whatever the delta boundaries."""
+        text = (
+            "Checking.\n\n"
+            + _wrapped(_invoke("no_such_tool", _param("city", "true", "SF")))
+            + "\nAfter the block."
+        )
+
+        for width in (1, 5, len(text)):
+            with self.subTest(width=width):
+                normal, calls = self._feed(
+                    [text[i : i + width] for i in range(0, len(text), width)]
+                )
+                result = DeepSeekV32Detector().detect_and_parse(text, self.tools)
+                self.assertEqual(normal, result.normal_text)
+                self.assertEqual(calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
