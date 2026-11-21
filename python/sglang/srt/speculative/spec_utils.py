@@ -1487,7 +1487,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
-    if batch.spec_algorithm.is_dflash_family():
+    if batch.spec_algorithm.uses_block_verify():
         # Per branch, not above the dispatch: eagle_prepare_for_decode cumulates
         # its own, and frequency/presence penalties are counters.
         if batch.sampling_info.penalizer_orchestrator.is_required:

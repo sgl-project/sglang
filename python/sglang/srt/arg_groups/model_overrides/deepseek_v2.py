@@ -45,7 +45,8 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
 
 def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
     unsupported = {
-        "speculative decoding": cfg.speculative_algorithm is not None,
+        "speculative decoding other than DFLY": cfg.speculative_algorithm
+        not in (None, "DFLY"),
         "DP attention": attn_dp_enabled_of(cfg),
         "--moe-a2a-backend": cfg.moe_a2a_backend != "none" or cfg.enable_waterfill,
         "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
