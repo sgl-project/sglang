@@ -119,6 +119,16 @@ def flash_attn_gqa_512(
     return out
 
 
+@cache
+def _uses_dedicated_hd256_kernel() -> bool:
+    # Mirrors use_dedicated_hd256_kernel in flash_attn/cute/interface.py.
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+        _get_device_arch,
+    )
+
+    return _get_device_arch() // 10 in (10, 11)
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -229,8 +239,16 @@ def flash_attn_varlen_func(
         ) from _flash_attn_import_error
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
-    if qv is None and q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256:
-        # The vendored hd256 kernel assumes dense Q/K/V strides.
+    if (
+        qv is None
+        and q.shape[-1] == 256
+        and k.shape[-1] == 256
+        and v.shape[-1] == 256
+        and _uses_dedicated_hd256_kernel()
+    ):
+        # The vendored dedicated hd256 kernel assumes dense Q/K/V strides. Other
+        # archs read the real strides, so a strided paged KV cache (e.g. a layer of
+        # the unified-memory pool) must not be copied whole on every call.
         # TODO: Remove this workaround after the FA4 in current environment includes
         # https://github.com/Dao-AILab/flash-attention/pull/2670 (flash-attn-4 >= 4.0.0b20).
         q, k, v = [t.contiguous() for t in (q, k, v)]

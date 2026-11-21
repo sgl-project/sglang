@@ -1943,6 +1943,74 @@ class TestFlashAttention4SM90(CustomTestCase):
                 ]
                 torch.testing.assert_close(outs[0], outs[1], atol=1e-2, rtol=1e-2)
 
+    def test_hd256_strided_paged_kv_read_in_place(self):
+        """An hd256 paged KV cache that is a strided view is read in place.
+
+        In the unified-memory pool one token slot holds the K and V of several
+        layers, so a layer's cache is a view whose token stride is the whole
+        slot. The SM90 kernel reads the real strides: the output matches a
+        dense copy bit for bit, and the call allocates no copy of the cache.
+        """
+        torch.manual_seed(0)
+        pages, page_size, kv_heads, dim, layers = 512, 64, 8, 256, 4
+        cell = kv_heads * dim
+        slot = 2 * layers * cell
+        band = torch.empty(
+            pages * page_size * slot, dtype=torch.uint8, device="cuda"
+        ).random_(0, 256)
+        band &= 0xBF  # |x| < 2, never an e4m3 NaN encoding
+        band = band.view(torch.float8_e4m3fn)
+        shape, stride = (
+            (pages, page_size, kv_heads, dim),
+            (page_size * slot, slot, dim, 1),
+        )
+        k = band.as_strided(shape, stride, 2 * cell)
+        v = band.as_strided(shape, stride, 3 * cell)
+        self.assertFalse(k.is_contiguous())
+
+        lengths, q_len, q_heads = (9, 1100, 3000), 8, 16
+        batch = len(lengths)
+        pages_per_seq = (max(lengths) + page_size - 1) // page_size
+        table = (
+            torch.randperm(pages, device="cuda")[: batch * pages_per_seq]
+            .view(batch, pages_per_seq)
+            .int()
+        )
+        q = torch.randn(
+            batch * q_len, q_heads, dim, device="cuda", dtype=torch.bfloat16
+        )
+        descale = torch.ones(batch, kv_heads, device="cuda", dtype=torch.float32)
+
+        def run(k_cache, v_cache):
+            return flash_attn_with_kvcache_v4(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+                page_table=table,
+                cu_seqlens_q=torch.arange(
+                    0, (batch + 1) * q_len, q_len, device="cuda"
+                ).int(),
+                max_seqlen_q=q_len,
+                softmax_scale=dim**-0.5,
+                causal=True,
+                window_size=(1023, 0),
+                k_descale=descale,
+                v_descale=descale,
+            )
+
+        dense = run(k.contiguous(), v.contiguous())
+        run(k, v)  # compile outside the measured call
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        out = run(k, v)
+        torch.cuda.synchronize()
+        extra = torch.cuda.max_memory_allocated() - base
+        self.assertTrue(torch.equal(out, dense))
+        # a dense copy of K alone takes k.numel() bytes (fp8)
+        self.assertLess(extra, k.numel() // 4)
+
     def test_image_mask(self):
         """Future tokens are visible only within one image, also after a prefix.
 
