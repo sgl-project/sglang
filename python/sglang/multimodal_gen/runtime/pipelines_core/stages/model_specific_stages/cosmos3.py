@@ -61,6 +61,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    decode_parallelism_type,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
     streamed_video_output_path,
@@ -2558,8 +2561,6 @@ class Cosmos3DecodingStage(PipelineStage):
     Returns OutputBatch instead of Req to signal pipeline completion.
     """
 
-    parallelism_type = StageParallelismType.REPLICATED
-
     def __init__(self, vae, guardrails: bool = False, sound_tokenizer=None):
         super().__init__()
         self.vae = vae
@@ -2573,6 +2574,10 @@ class Cosmos3DecodingStage(PipelineStage):
             )
 
             _init_guardrails()
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        return decode_parallelism_type(self.vae)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

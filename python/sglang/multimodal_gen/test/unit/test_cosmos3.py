@@ -70,6 +70,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     shard_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
     Cosmos3DenoisingStage,
@@ -1436,6 +1439,33 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
                             self._batch(**batch_fields), types.SimpleNamespace()
                         )
                     )
+
+
+class TestCosmos3DecodeRanks(unittest.TestCase):
+    def test_cfg_parallel_decodes_on_the_main_rank_unless_the_vae_shards(self):
+        """The other CFG rank holds the same latents and its decode is dropped."""
+        decoding = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        cases = (
+            (False, False, StageParallelismType.REPLICATED),
+            (True, False, StageParallelismType.MAIN_RANK_ONLY),
+            (True, True, StageParallelismType.REPLICATED),
+        )
+        for cfg_parallel, sharded_decode, expected in cases:
+            stage.vae = types.SimpleNamespace(use_parallel_decode=sharded_decode)
+            server_args = types.SimpleNamespace(enable_cfg_parallel=cfg_parallel)
+            with (
+                mock.patch(
+                    f"{decoding}.get_global_server_args", return_value=server_args
+                ),
+                mock.patch(
+                    f"{decoding}.model_parallel_is_initialized", return_value=True
+                ),
+                mock.patch(
+                    f"{decoding}.get_decode_parallel_world_size", return_value=2
+                ),
+            ):
+                self.assertEqual(stage.parallelism_type, expected)
 
 
 class TestCosmos3DecodeFastPath(unittest.TestCase):
