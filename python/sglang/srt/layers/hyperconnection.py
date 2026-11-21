@@ -12,6 +12,7 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -30,6 +31,23 @@ class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_lowrank: int = 16
     rms_norm_eps: float = 1e-6
     hc_per_branch_norm: bool = False
+
+
+def _flydsl_mix_could_apply(config: HyperConnectionConfig) -> bool:
+    """Static half of ``flydsl_hc_mix_weights_supported``, for init time.
+
+    The device half (CUDA, gfx950) cannot be evaluated before the weights
+    move to device. On a ROCm build with matching shapes the packed cache
+    may exist, so treat it as possible; the loader hook refreshes it.
+    """
+    return (
+        torch.version.hip is not None
+        and config.hc_count == 4
+        and config.hc_lowrank > 0
+        and config.hc_lowrank % 32 == 0
+        and (config.hc_count * config.hidden_size) % 64 == 0
+        and config.params_dtype == torch.bfloat16
+    )
 
 
 class GroupedGemmaRMSNorm(nn.Module):
@@ -183,6 +201,29 @@ class GatedResidual(HyperConnectionBase):
             self._mix_flydsl_ok = None
             self._mix_flydsl_weights = None
             self._mix_flydsl_weight_key = None
+            # The JIT mix path keeps a permuted/padded copy of
+            # input_mix_weight_up, and the FlyDSL path keeps packed weights
+            # keyed on (data_ptr, version), which in-place loader writes do
+            # not change. Load both weights through a loader that refreshes
+            # the derived caches, so online weight updates do not leave them
+            # serving the launch weights.
+            set_weight_attrs(
+                self.input_mix_weight_down.weight,
+                {"weight_loader": self._load_input_mix_weight},
+            )
+            set_weight_attrs(
+                self.input_mix_weight_up.weight,
+                {"weight_loader": self._load_input_mix_weight},
+            )
+            # load_format="direct" bypasses load_weights (and these loaders),
+            # so refuse it while a derived mix-weight cache can exist.
+            self._direct_weight_update_error = (
+                "load_format='direct' does not refresh the GatedResidual "
+                "fused mix weight caches; update weights with the default "
+                "load format."
+                if self._jit_mix_ok or _flydsl_mix_could_apply(config)
+                else None
+            )
 
         self._gate_stream = None
         if use_combine:
@@ -266,6 +307,40 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
             )
         return self._mix_flydsl_ok
+
+    def _load_input_mix_weight(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        """Load a mix weight and refresh the derived mix-weight caches.
+
+        Online weight updates land as in-place ``param.data.copy_`` writes,
+        which leave the JIT padded copy and the FlyDSL packed weights serving
+        the launch weights. Refresh them here, while the load still goes
+        through ``load_weights``; ``load_format='direct'`` skips this hook
+        and is refused by ``_direct_weight_update_error`` instead.
+        """
+        assert param.size() == loaded_weight.size(), (
+            f"Attempted to load weight ({loaded_weight.size()}) "
+            f"into parameter ({param.size()})"
+        )
+        param.data.copy_(loaded_weight)
+        self._refresh_mix_weight_caches()
+
+    def _refresh_mix_weight_caches(self) -> None:
+        # The padded copy is referenced by captured CUDA graphs, so rewrite
+        # it in place (same storage) instead of replacing it.
+        if self._mix_up_weight_padded is not None:
+            from sglang.kernels.ops.gemm.hc_mix_splitk import (
+                permute_pad_up_weight,
+            )
+
+            self._mix_up_weight_padded.copy_(
+                permute_pad_up_weight(self.input_mix_weight_up.weight, self.hc_count)
+            )
+        # Inference tensors have no version counter, so the FlyDSL key
+        # (data_ptr, version) cannot see an in-place update: drop it and let
+        # the next mix() re-pack from the new weights.
+        self._mix_flydsl_weight_key = None
 
     def mix(
         self,
