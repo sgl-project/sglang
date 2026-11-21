@@ -535,20 +535,6 @@ def check_server_args(server_args: Any):
             )
     if cfg.gc_freeze_on_idle_secs < 0:
         raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
-    if cfg.gc_dp_lockstep_steps < 0:
-        raise ValueError("--gc-dp-lockstep-steps must be >= 0.")
-    if cfg.gc_dp_lockstep_steps > 0:
-        if not attn_dp_enabled_of(cfg):
-            raise ValueError(
-                "--gc-dp-lockstep-steps needs DP attention (--attn-dp-size > 1)."
-            )
-        if cfg.gc_threshold and len(cfg.gc_threshold) == 3:
-            # The post-warmup /freeze_gc applies --gc-threshold in the scheduler
-            # and would turn automatic full collections back on.
-            raise ValueError(
-                "--gc-dp-lockstep-steps sets the third GC threshold itself; "
-                "pass at most two --gc-threshold values."
-            )
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(

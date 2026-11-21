@@ -5900,41 +5900,18 @@ class TestPagedExpertsNumResident(unittest.TestCase):
                 _paged_experts_num_resident(bad)
 
 
-class TestGCDPLockstepSteps(CustomTestCase):
-    @staticmethod
-    def _check(**kwargs) -> None:
+class TestGCThresholdWithDPAttention(CustomTestCase):
+    def test_a_third_gc_threshold_is_accepted_with_dp_attention(self):
+        # Lockstep full GC stays off then (GCFreezer) instead of rejecting it.
         ServerArgs(
             model_path="dummy",
             served_model_name="dummy",
             device="cpu",
             chunked_prefill_size=-1,
-            **kwargs,
-        ).check_server_args()
-
-    def test_accepted_with_dp_attention(self):
-        self._check(gc_dp_lockstep_steps=30000, tp_size=2, attn_dp_size=2)
-        self._check(
-            gc_dp_lockstep_steps=30000,
             tp_size=2,
             attn_dp_size=2,
-            gc_threshold=[700, 10],
-        )
-
-    def test_rejected_without_dp_attention_or_when_negative(self):
-        with self.assertRaisesRegex(ValueError, "needs DP attention"):
-            self._check(gc_dp_lockstep_steps=30000)
-        with self.assertRaisesRegex(ValueError, "must be >= 0"):
-            self._check(gc_dp_lockstep_steps=-1)
-
-    def test_rejected_with_a_third_gc_threshold(self):
-        # The post-warmup /freeze_gc would restore automatic full collections.
-        with self.assertRaisesRegex(ValueError, "at most two --gc-threshold"):
-            self._check(
-                gc_dp_lockstep_steps=30000,
-                tp_size=2,
-                attn_dp_size=2,
-                gc_threshold=[700, 10, 10],
-            )
+            gc_threshold=[700, 10, 10],
+        ).check_server_args()
 
 
 if __name__ == "__main__":

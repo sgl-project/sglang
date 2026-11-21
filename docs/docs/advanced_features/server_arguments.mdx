@@ -3105,12 +3105,6 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--gc-dp-lockstep-steps`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With DP attention, run the scheduler's full garbage collections at the same step on every attention-DP rank. Left to itself, each rank starts a full collection whenever its own allocation counts say so, and every other rank waits for it at the next batch gather. At the first gather this freezes the heap and turns off automatic full collections (the third GC threshold; the younger generations stay automatic). Then every rank runs one full collection every this many batch gathers (one or two per scheduler step). Each one also frees the cyclic garbage that reached the oldest generation since the last, so its pause grows with this value: tune it so a pass stays within your step-time budget (--gc-warning-threshold-secs reports long ones). Set to 0 to disable.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
-    </tr>
 </tbody>
 </table>
 
