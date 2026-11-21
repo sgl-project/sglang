@@ -289,4 +289,11 @@ AUX_NAMES: frozenset[str] = frozenset().union(*(p.all_names for p in _plugins))
 
 def _infer_positions(*, seq_lens: torch.Tensor) -> torch.Tensor:
     """Infer positions when position_ids is missing (THD only)."""
-    return torch.cat([torch.arange(int(slen.item())) for slen in seq_lens])
+    seq_lens = seq_lens.to(dtype=torch.long)
+    total_tokens = int(seq_lens.sum().item()) if seq_lens.numel() > 0 else 0
+    if total_tokens == 0:
+        return torch.empty(0, dtype=torch.long, device=seq_lens.device)
+    starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    return torch.arange(
+        total_tokens, dtype=torch.long, device=seq_lens.device
+    ) - torch.repeat_interleave(starts, seq_lens)
