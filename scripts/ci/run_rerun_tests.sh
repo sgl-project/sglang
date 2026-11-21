@@ -25,6 +25,8 @@ case "$mode" in
   cpu)
     cd test/
     ;;
+  xpu)
+    ;;
   amd)
     read -ra kvs <<< "$EXEC_ENV"
     exec_env=()
@@ -62,6 +64,12 @@ run_test() {
       ;;
     amd)
       bash scripts/ci/amd/amd_ci_exec.sh "${exec_env[@]}" -w /sglang-checkout/test python3 $cmd -f
+      ;;
+    xpu)
+      # $cmd goes in as arguments, not into the bash -c string, so it is never evaluated.
+      # shellcheck disable=SC2086
+      docker exec -e SGLANG_IS_IN_CI=true -w /sglang-checkout/test "${CONTAINER_NAME:-ci_sglang_xpu}" \
+        bash -c 'source /opt/venv/bin/activate && exec python3 "$@" -f' _ $cmd
       ;;
   esac
 }
