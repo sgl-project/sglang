@@ -482,6 +482,23 @@ def initialize_dp_attention(server_args: ServerArgs):
         parallel.attn_cp_size,
     )
     parallel.override_permanently(attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank)
+    # Reserve before model consumers keep communicator handles or capture.
+    # The capacity covers 48 BF16 rows/rank (64 requests, DSPARK5), while the
+    # existing AR algorithm policy and counter/block counts stay unchanged.
+    from sglang.srt.runtime_context import get_platform
+
+    comm = parallel.tp_group.ca_comm
+    if (
+        get_platform().is_sm90
+        and parallel.tp_size == parallel.attn_dp_size == parallel.moe_ep_size == 8
+        and parallel.attn_tp_size == parallel.attn_cp_size == 1
+        and parallel.moe_tp_size == parallel.moe_dp_size == 1
+        and parallel.tp_group.ranks == list(range(8))
+        and isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and comm.group is parallel.tp_group.cpu_group
+    ):
+        comm.reserve_push_capacity(512 * 1024)
 
 
 def init_dp_gathered_buffer(model_config: ModelConfig):
@@ -709,6 +726,60 @@ def _dp_gather_via_all_reduce(
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+def _try_hopper_dp_all_gather(global_tokens, local_tokens) -> bool:
+    """Reuse the existing NVLink row gather for short EP8 decode buffers."""
+    from sglang.srt.model_executor.runner_utils.prefill_graph import (
+        is_in_prefill_graph_scope,
+    )
+    from sglang.srt.runtime_context import get_platform
+
+    parallel = get_parallel()
+    group = parallel.tp_group
+    comm = group.ca_comm
+    if not (
+        get_platform().is_sm90
+        and not get_is_extend_in_batch()
+        and not is_in_prefill_graph_scope()
+        and not get_flags().dp.capturing_prefill_graph
+        and not world_dp_gather_enabled()
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and not get_exec().comm.enable_quant_communications
+        and parallel.tp_size == parallel.attn_dp_size == parallel.moe_ep_size == 8
+        and parallel.attn_tp_size == parallel.attn_cp_size == 1
+        and parallel.moe_tp_size == parallel.moe_dp_size == 1
+        and group.ranks == list(range(8))
+        and isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and comm.has_multicast
+        and comm.world_size == 8
+        and comm.group is group.cpu_group
+        and global_tokens.is_cuda
+        and global_tokens.dtype == torch.bfloat16
+        and global_tokens.ndim == 2
+        and global_tokens.shape[1] == 5120
+        and 1 <= global_tokens.shape[0] <= 384
+        and global_tokens.shape[0] % 8 == 0
+        and global_tokens.is_contiguous()
+        and global_tokens.numel() * global_tokens.element_size()
+        <= comm.max_push_size * 8
+    ):
+        return False
+    rows = global_tokens.shape[0] // 8
+    assert parallel.attn_dp_rank == parallel.tp_rank == group.rank_in_group == comm.rank
+    assert (
+        local_tokens.shape == (rows, 5120) and local_tokens.dtype == global_tokens.dtype
+    )
+    assert local_tokens.device == global_tokens.device and local_tokens.is_contiguous()
+    assert (
+        local_tokens.untyped_storage().data_ptr()
+        != global_tokens.untyped_storage().data_ptr()
+    )
+    from sglang.kernels.ops.communication.nvlink_comm import all_gather_push
+
+    all_gather_push(comm.obj, local_tokens, global_tokens)
+    return True
+
+
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -725,7 +796,10 @@ def _dp_gather_via_all_gather(
                 group=torch.distributed.group.WORLD,
             )
         else:
-            get_parallel().tp_group.all_gather_into_tensor(global_tokens, local_tokens)
+            if not _try_hopper_dp_all_gather(global_tokens, local_tokens):
+                get_parallel().tp_group.all_gather_into_tensor(
+                    global_tokens, local_tokens
+                )
         return
 
     if not is_partial:
@@ -1111,6 +1185,54 @@ def can_use_dp_reduce_scatter() -> bool:
 
     parallel = get_parallel()
     return parallel.tp_size == parallel.num_dp_ranks * parallel.attn_tp_size
+
+
+def dp_reduce_scatterv(output: torch.Tensor, input: torch.Tensor, sizes):
+    """Reuse native fixed-size NCCL for equal decode row partitions."""
+    from sglang.srt.model_executor.runner_utils.prefill_graph import (
+        is_in_prefill_graph_scope,
+    )
+    from sglang.srt.runtime_context import get_platform
+
+    parallel = get_parallel()
+    group = parallel.tp_group
+    # Global forward metadata chooses the same collective on all eight peers.
+    uniform_decode = (
+        get_platform().is_sm90
+        and not get_is_extend_in_batch()
+        and not is_in_prefill_graph_scope()
+        and not get_flags().dp.capturing_prefill_graph
+        and not world_dp_gather_enabled()
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and not get_exec().comm.enable_quant_communications
+        and parallel.tp_size == parallel.attn_dp_size == parallel.moe_ep_size == 8
+        and parallel.attn_tp_size == parallel.attn_cp_size == 1
+        and parallel.moe_tp_size == parallel.moe_dp_size == 1
+        and group.ranks == list(range(8))
+        and input.is_cuda
+        and input.dtype == torch.bfloat16
+        and input.ndim == 2
+        and input.shape[1] == 5120
+        and 1 <= input.shape[0] <= 384
+        and input.is_contiguous()
+        and sizes is not None
+        and len(sizes) == 8
+        and sizes[0] > 0
+        and all(n == sizes[0] for n in sizes)
+        and sum(sizes) == input.shape[0]
+    )
+    if uniform_decode:
+        # Local destination validity is a caller contract, not a fallback vote.
+        assert parallel.attn_dp_rank == parallel.tp_rank == group.rank_in_group
+        assert output.shape == (sizes[0], 5120)
+        assert output.dtype == input.dtype and output.device == input.device
+        assert output.is_contiguous()
+        assert output.untyped_storage().data_ptr() != input.untyped_storage().data_ptr()
+        # Keep the SAME GroupCoordinator / PyNccl communicator and stream.
+        # sizes=None reaches ncclReduceScatter rather than eight ncclReduce calls.
+        group.reduce_scatterv(input, output=output, sizes=None)
+    else:
+        group.reduce_scatterv(input, output=output, sizes=sizes)
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
