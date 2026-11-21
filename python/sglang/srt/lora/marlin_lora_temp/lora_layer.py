@@ -32,6 +32,11 @@ def init_experimental_sgl_marlin_lora(layer, base_layer) -> None:
     )
 
     quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        warn_if_up_scale_ratio_unused,
+    )
+
+    warn_if_up_scale_ratio_unused(quant_info)
     weight_device = quant_info.w13_qweight.device
     device_capability = (
         torch.cuda.get_device_capability(weight_device)
