@@ -923,6 +923,7 @@ def apply_logits_adjustments_strided(
     next_token_logits: torch.Tensor,
     sampling_info,
     verify_num_draft_tokens: int,
+    verify_tokens: Optional[torch.Tensor],
 ) -> None:
     if sampling_info is None:
         return
@@ -930,6 +931,7 @@ def apply_logits_adjustments_strided(
         next_token_logits=next_token_logits,
         sampling_info=sampling_info,
         draft_token_num=verify_num_draft_tokens,
+        verify_tokens=verify_tokens,
     )
 
 
