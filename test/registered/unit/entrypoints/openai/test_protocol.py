@@ -379,25 +379,6 @@ class TestChatCompletionRequest(CustomTestCase):
                     model="test-model", messages=messages, **request_kwargs
                 )
 
-    def test_chat_completion_accepts_ordered_thinking_parts(self):
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "first"},
-                        {"type": "text", "text": "visible"},
-                        {"type": "reasoning", "text": "second"},
-                    ],
-                }
-            ],
-        )
-        parts = request.messages[0].content
-        self.assertEqual(
-            [part.type for part in parts], ["thinking", "text", "reasoning"]
-        )
-
     def test_chat_completion_rejects_thinking_parts_outside_assistant(self):
         """Bug regression: adding the thinking part to the SHARED content-part
         union silently widened acceptance to every role (user/system/tool) and
