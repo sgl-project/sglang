@@ -7,9 +7,13 @@ import unittest
 import torch
 
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
+    accept_sampling_sharded,
+)
 from sglang.test.test_utils import CustomTestCase
 
 DEVICE = torch.device("cuda")
+_SEED_ZERO_DRAFT_KEY = 0x2D2A9C317E44B1F3
 
 
 def _offset(value: int) -> torch.Tensor:
@@ -30,6 +34,39 @@ def _call(impl, *, base, bias, temps, step_dtype, offset=7, step=2, **kwargs):
 
 
 class TestMarkovSampleStep(CustomTestCase):
+    def test_single_supported_token_at_philox_endpoint(self):
+        # For token 1 this counter draws 0xffff_ff9f, which rounds to 2**32 in FP32.
+        for device in ("cpu", "cuda"):
+            with self.subTest(device=device):
+                logits = torch.tensor([[-torch.inf, 0.0]], device=device)
+                token = MarkovSampleStep.execute(
+                    base_logits=logits,
+                    bias=torch.zeros_like(logits),
+                    temperatures=torch.ones(1, device=device),
+                    key=_SEED_ZERO_DRAFT_KEY,
+                    offset=torch.tensor([4_757_896], device=device),
+                    step=0,
+                    step_dtype=torch.float32,
+                )
+                self.assertEqual(token.item(), 1)
+
+    def test_single_supported_bonus_at_philox_endpoint(self):
+        # The bonus uses a different Philox step. Token 1 draws 0xffff_ffe5.
+        logits = torch.tensor([[-torch.inf, 0.0], [-torch.inf, 0.0]], device=DEVICE)
+        accepted, bonus, _ = accept_sampling_sharded(
+            candidates=torch.tensor([[0, 1]], device=DEVICE),
+            target_logits=logits,
+            draft_logits=logits[:1].unsqueeze(0),
+            temperatures=torch.ones(1, device=DEVICE),
+            vocab_start=0,
+            width=2,
+            gather_stacked=lambda local: local,
+            key=_SEED_ZERO_DRAFT_KEY,
+            offset=_offset(1_781_785),
+        )
+        self.assertEqual(accepted.item(), 1)
+        self.assertEqual(bonus.item(), 1)
+
     def test_triton_matches_torch_reference(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)
         rows, padded, width = 64, 9000, 8990
