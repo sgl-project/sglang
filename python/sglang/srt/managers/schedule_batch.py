@@ -2272,6 +2272,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             and not self.spec_algorithm.supports_grammar_overlap()
         )
 
+    def custom_logit_processor_needs_sync(self) -> bool:
+        """Whether a speculative verify of the next batch needs this batch's result
+        processed first: its custom logit processors read req.output_ids, which
+        only result processing extends. DFlash and DSpark verify does not read
+        the row prefixes yet, so it keeps its overlap."""
+        return (
+            self.sampling_info is not None
+            and self.sampling_info.has_custom_logit_processor
+            and not self.spec_algorithm.is_none()
+            and not self.spec_algorithm.is_dflash_family()
+        )
+
     def prepare_encoder_info_extend(
         self, input_ids: List[array[int]], seq_lens: List[int]
     ):

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.eagle_worker_common import post_verify_hook_applies
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,7 +22,7 @@ class TestNativeEagerVerify(CustomTestCase):
                 for n in ast.walk(tree)
                 if isinstance(n, ast.If)
                 and ast.unparse(n.test)
-                == "envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()"
+                == "post_verify_hook_applies(batch.sampling_info)"
                 and any(
                     isinstance(c, ast.Call)
                     and isinstance(c.func, ast.Name)
@@ -33,7 +34,7 @@ class TestNativeEagerVerify(CustomTestCase):
             for enabled in (False, True):
                 with self.subTest(module=module, enabled=enabled):
                     batch = SimpleNamespace(
-                        sampling_info=object(),
+                        sampling_info=SimpleNamespace(has_custom_logit_processor=False),
                         seq_lens=object(),
                         req_pool_indices=object(),
                         device="cpu",
@@ -59,7 +60,7 @@ class TestNativeEagerVerify(CustomTestCase):
                         Mock(return_value=object()),
                     )
                     scope = dict(
-                        envs=envs,
+                        post_verify_hook_applies=post_verify_hook_applies,
                         batch=batch,
                         verify_input=object(),
                         logits_output=object(),
@@ -100,7 +101,7 @@ class TestNativeEagerVerify(CustomTestCase):
                     else:
                         make_io.assert_not_called()
                         hooks.post_verify.assert_not_called()
-                        kwargs = dict(watermark=scope["watermark"])
+                        kwargs = dict(watermark=scope["watermark"], row_prefixes=None)
                         if module == "eagle_worker_common":
                             kwargs.update(
                                 uno_target_max_top_k=17,

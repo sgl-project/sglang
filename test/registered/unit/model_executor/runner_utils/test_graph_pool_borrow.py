@@ -196,6 +196,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             acc_additive_penalties=None,
             acc_scaling_penalties=None,
             logit_bias=None,
+            has_custom_logit_processor=False,
             is_all_greedy=False,
             temperatures=torch.ones((1, 1)),
             need_top_k_sampling=False,

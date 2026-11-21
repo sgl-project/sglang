@@ -24,6 +24,7 @@ from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.sampling.custom_logit_processor import ROW_PREFIX_KEY
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -1081,11 +1082,16 @@ def apply_custom_logit_processor(
     logits: torch.Tensor,
     sampling_batch_info: SamplingBatchInfo,
     num_tokens_in_batch: int = 1,
+    row_prefixes: Optional[List[List[int]]] = None,
 ):
     """Apply custom logit processors to the logits.
     This function will modify the logits in-place.
     num_tokens_in_batch is needed to support spec decoding, where each batch can contain multiple
     tokens. By default, we assume each batch contains only 1 token.
+    row_prefixes, at speculative verify: per logits row, the draft tokens between
+    the request's committed output and that row. A processor that supports them
+    runs on every row with them in its params; any other runs on each request's
+    first row only, which has no draft token before it.
     """
 
     assert logits.shape[0] == len(sampling_batch_info) * num_tokens_in_batch, (
@@ -1105,6 +1111,7 @@ def apply_custom_logit_processor(
         if num_tokens_in_batch == 1
         else torch.arange(num_tokens_in_batch, device=sampling_batch_info.device)
     )
+    params = sampling_batch_info.custom_params
     for entry in sampling_batch_info.custom_logit_processor.values():
         rows, indices = entry.rows, entry.indices
         assert len(rows) == indices.numel(), (
@@ -1115,12 +1122,27 @@ def apply_custom_logit_processor(
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )
 
-        custom_params = [
-            sampling_batch_info.custom_params[i]
-            for i in rows
-            for _ in range(num_tokens_in_batch)
-        ]
-        if len(rows) == batch_size:
+        first_row_only = (
+            row_prefixes is not None and not entry.processor.supports_row_prefix
+        )
+        if first_row_only:
+            custom_params = [params[i] for i in rows]
+        elif row_prefixes is None:
+            custom_params = [
+                params[i] for i in rows for _ in range(num_tokens_in_batch)
+            ]
+        else:
+            custom_params = [
+                None
+                if params[i] is None
+                else {
+                    **params[i],
+                    ROW_PREFIX_KEY: row_prefixes[i * num_tokens_in_batch + offset],
+                }
+                for i in rows
+                for offset in range(num_tokens_in_batch)
+            ]
+        if len(custom_params) == logits.shape[0]:
             # Rows are ascending and duplicate-free, so every row opted in and
             # gather and scatter-back are the identity.
             result = entry.processor(logits, custom_params)
@@ -1129,7 +1151,9 @@ def apply_custom_logit_processor(
                 # a processor that builds a fresh tensor must still land here.
                 logits.copy_(result)
         else:
-            if token_offsets is not None:
+            if first_row_only:
+                indices = indices * num_tokens_in_batch
+            elif token_offsets is not None:
                 indices = (
                     indices[:, None] * num_tokens_in_batch + token_offsets
                 ).flatten()

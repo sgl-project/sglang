@@ -48,6 +48,7 @@ def _sampling_info(*, greedy: bool):
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
         logit_bias=None,
+        has_custom_logit_processor=False,
         sampling_seed=None,
         is_all_greedy=greedy,
         need_top_k_sampling=False,

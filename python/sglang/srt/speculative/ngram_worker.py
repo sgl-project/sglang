@@ -10,7 +10,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.reconstruct_tree import (
     reconstruct_indices_from_tree_mask_func,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -33,6 +32,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     make_post_verify_io,
+    post_verify_hook_applies,
 )
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
@@ -42,6 +42,7 @@ from sglang.srt.speculative.spec_utils import (
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
+    verify_row_prefixes,
 )
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
@@ -119,7 +120,7 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
-        self.grammar_tree_host: Optional[tuple] = None
+        self.draft_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
@@ -348,8 +349,13 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
-        # Staged for the grammar bitmask, derived after the verify launch below.
-        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
+        # Staged for the grammar bitmask and the custom logit processors' row
+        # prefixes, derived after the verify launch below.
+        self.draft_tree_host = (
+            (mask, req_drafts)
+            if batch.has_grammar or batch.sampling_info.has_custom_logit_processor
+            else None
+        )
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask_func(
@@ -452,21 +458,24 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            grammar_mask = None
-            if batch.has_grammar:
+            verify_tree_host = None
+            if self.draft_tree_host is not None:
                 # From the host tree rather than the device output: no readback to
                 # wait on, and deriving here keeps it under the verify forward.
-                mask, req_drafts = self.grammar_tree_host
+                mask, req_drafts = self.draft_tree_host
                 retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
                     mask, bs, self.draft_token_num
                 )
+                verify_tree_host = GrammarTree.from_host(
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
+                )
+            grammar_mask = None
+            if batch.has_grammar:
                 grammar_mask = build_grammar_vocab_mask(
                     reqs=batch.reqs,
-                    tree=GrammarTree.from_host(
-                        retrieve_next_token_cpu,
-                        retrieve_next_sibling_cpu,
-                        torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
-                    ),
+                    tree=verify_tree_host,
                     sampling_info=batch.sampling_info,
                     device=verify_input.retrieve_next_token.device,
                     # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
@@ -488,7 +497,7 @@ class NGRAMWorker(BaseSpecWorker):
                 if self.model_runner.watermark is not None
                 else None
             )
-            if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+            if post_verify_hook_applies(batch.sampling_info):
                 post_verify_output = self._speculative_runtime_hooks.post_verify(
                     make_post_verify_io(
                         verify_input=verify_input,
@@ -508,6 +517,11 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_lens = post_verify_output.accepted_lengths
                 accept_index = post_verify_output.accepted_indices
             else:
+                row_prefixes = (
+                    verify_row_prefixes(*verify_tree_host.resolve())
+                    if batch.sampling_info.has_custom_logit_processor
+                    else None
+                )
                 (
                     predict,
                     accept_lens,
@@ -518,6 +532,7 @@ class NGRAMWorker(BaseSpecWorker):
                     logits_output,
                     grammar_mask,
                     watermark=watermark,
+                    row_prefixes=row_prefixes,
                 )
             commit_accept_tokens_to_penalties(
                 batch.sampling_info, predict, accept_index

@@ -39,7 +39,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    ROW_PREFIX_KEY,
+    CustomLogitProcessor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +311,8 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
     no-ops — both must be present together.
     """
 
+    supports_row_prefix = True
+
     @classmethod
     def build_sampling_params(cls, config: "LocateAnythingConfig") -> Dict[str, Any]:
         """Build the two request fields needed to enable constrained decoding.
@@ -361,7 +366,7 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
             # <box>: a closed <box>...</box> in a few-shot / multi-turn prompt is
             # harmless (last_open finds no open box here), but an unclosed <box>
             # left dangling in the prompt would not be constrained.
-            output_ids = list(req.output_ids)
+            output_ids = [*req.output_ids, *params.get(ROW_PREFIX_KEY, ())]
 
             # Find the last box_start; if a box_end follows it, no box is open.
             try:

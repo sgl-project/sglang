@@ -2330,8 +2330,12 @@ class Scheduler(
             if last_batch_is_extend:
                 return True
 
-        # The next batch's grammar bitmask needs this result's FSM advance.
-        return last_batch.grammar_needs_sync()
+        # The next batch's grammar bitmask needs this result's FSM advance, and its
+        # custom logit processors at verify need its tokens in req.output_ids.
+        return (
+            last_batch.grammar_needs_sync()
+            or last_batch.custom_logit_processor_needs_sync()
+        )
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet

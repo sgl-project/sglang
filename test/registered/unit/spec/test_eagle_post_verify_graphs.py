@@ -157,6 +157,7 @@ def _round(bs, generator, vocab=VOCAB):
             acc_additive_penalties=None,
             acc_scaling_penalties=None,
             logit_bias=None,
+            has_custom_logit_processor=False,
             sampling_seed=None,
             watermark=None,
             temperatures=None,
@@ -216,7 +217,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         has_grammar=False,
         device="cpu",
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
-        sampling_info=SimpleNamespace(watermark=None),
+        sampling_info=SimpleNamespace(watermark=None, has_custom_logit_processor=False),
         return_logprob=False,
     )
     target_worker = SimpleNamespace(
@@ -321,6 +322,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             info = dict(
                 step_penalties=None,
                 logit_bias=None,
+                has_custom_logit_processor=False,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,
@@ -455,6 +457,7 @@ class TestPostVerifyGraphs(CustomTestCase):
                 acc_additive_penalties=None,
                 acc_scaling_penalties=None,
                 logit_bias=None,
+                has_custom_logit_processor=False,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,

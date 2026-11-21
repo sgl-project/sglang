@@ -753,6 +753,7 @@ def eagle_sample(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
+    row_prefixes: Optional[List[List[int]]] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -761,11 +762,13 @@ def eagle_sample(
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
     it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
     injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    too, as on the dense one. row_prefixes: per verify row, the draft tokens
+    before it (verify_row_prefixes), for a batch with custom logit processors.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
+    from sglang.srt.layers.sampler import apply_custom_logit_processor
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
     from sglang.srt.speculative.spec_utils import (
@@ -820,6 +823,22 @@ def eagle_sample(
     # Apply grammar mask if provided
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
+
+    # After the penalties, the bias, and the grammar mask, as in ordinary sampling.
+    first_row_only_entries = []
+    if sampling_info.has_custom_logit_processor:
+        assert row_prefixes is not None, "verify needs the draft row prefixes"
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=verify_input.draft_token_num,
+            row_prefixes=row_prefixes,
+        )
+        first_row_only_entries = [
+            entry
+            for entry in sampling_info.custom_logit_processor.values()
+            if not entry.processor.supports_row_prefix
+        ]
 
     if watermark is not None:
         next_token_logits, sampling_info = watermark.apply(
@@ -1187,6 +1206,11 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
+    for entry in first_row_only_entries:
+        # The processor saw only the first row, so these requests commit one token:
+        # its marginal is that row's distribution, which keeps the sampling exact.
+        accept_lens.index_fill_(0, entry.indices, 1)
+        accept_index[:, 1:].index_fill_(0, entry.indices, -1)
     if watermark is not None:
         watermark.record(accept_index, accept_lens)
     return predict, accept_lens, accept_index

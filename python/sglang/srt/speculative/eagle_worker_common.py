@@ -39,6 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
+    verify_row_prefixes,
 )
 from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import (
@@ -252,6 +253,15 @@ def make_post_verify_io(
         simulated_accept_length_rng=simulated_accept_length_rng,
         sparse_target_max_top_k=sparse_target_max_top_k,
         sparse_bonus_argmax=sparse_bonus_argmax,
+    )
+
+
+def post_verify_hook_applies(sampling_info: Any) -> bool:
+    """Whether verify runs through the runtime hooks; their sampling view carries
+    no custom logit processors, so a batch with one stays on eagle_sample."""
+    return (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        and not sampling_info.has_custom_logit_processor
     )
 
 
@@ -847,13 +857,13 @@ def run_eagle_verify(
         )
 
     # Must stay ahead of the target verify launch below.
-    grammar_tree = (
+    verify_tree_host = (
         GrammarTree.from_device(
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
         )
-        if batch.has_grammar
+        if batch.has_grammar or batch.sampling_info.has_custom_logit_processor
         else None
     )
 
@@ -931,7 +941,7 @@ def run_eagle_verify(
     if batch.has_grammar:
         grammar_mask = build_grammar_vocab_mask(
             reqs=batch.reqs,
-            tree=grammar_tree,
+            tree=verify_tree_host,
             sampling_info=batch.sampling_info,
             device=verify_input.retrieve_next_token.device,
             barrier=grammar_barrier,
@@ -953,7 +963,7 @@ def run_eagle_verify(
         if watermark_engine is not None
         else None
     )
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+    if post_verify_hook_applies(batch.sampling_info):
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
         simulated_accept_length = None
@@ -984,6 +994,11 @@ def run_eagle_verify(
         accept_lens = post_verify_output.accepted_lengths
         accept_index = post_verify_output.accepted_indices
     else:
+        row_prefixes = (
+            verify_row_prefixes(*verify_tree_host.resolve())
+            if batch.sampling_info.has_custom_logit_processor
+            else None
+        )
         (
             predict,
             accept_lens,
@@ -997,6 +1012,7 @@ def run_eagle_verify(
             watermark=watermark,
             simulated_acc_len_rng=simulated_acc_len_rng,
             sparse_bonus_argmax=sparse_bonus_argmax,
+            row_prefixes=row_prefixes,
         )
     commit_accept_tokens_to_penalties(batch.sampling_info, predict, accept_index)
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()

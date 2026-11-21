@@ -270,6 +270,12 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     def acc_scaling_penalties(self) -> Optional[torch.Tensor]:
         return self.scaling_penalties
 
+    @property
+    def has_custom_logit_processor(self) -> bool:
+        # A batch with custom logit processors never reaches this view: the
+        # runtime verifies it with eagle_sample on its own sampling info.
+        return False
+
 
 class WatermarkStateView(Protocol):
     """The watermark operations used during speculative verification."""

@@ -136,6 +136,7 @@ class EaglePostVerifyGraphs:
             or verify_input.draft_probs is not None
             or info.step_penalties is not None
             or info.logit_bias is not None
+            or info.has_custom_logit_processor
             or info.sampling_seed is not None
             or info.need_min_p_sampling
             or info.watermark is not None
