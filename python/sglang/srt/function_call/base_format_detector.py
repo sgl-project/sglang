@@ -122,6 +122,12 @@ class BaseFormatDetector(ABC):
                 return i
         return 0
 
+    def _parse_streaming_parts(
+        self, new_text: str, tools: List[Tool]
+    ) -> List[StreamingParseResult]:
+        """Return ordered output parts for the streaming protocol emitter."""
+        return [self.parse_streaming_increment(new_text, tools)]
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
