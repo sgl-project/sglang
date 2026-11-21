@@ -236,3 +236,76 @@ def swa_verify_splitkv(
         num_warps=4,
     )
     return out
+
+
+def muse_decode_splitkv(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    seqused_k,
+    block_table,
+    softmax_scale,
+    window,
+    k_descale,
+    v_descale,
+    *,
+    defer_reduce=False,
+):
+    """One-query-row decode on the verify partials kernel: sliding (``window`` 2047) or full (``window`` 0) layers.
+
+    The unified kernel runs a sliding-window decode on 2 programs per request at 2 KV heads (slow at TP8 on
+    gfx1250); 64 splits x 2 KV heads (SWA: 32-key tiles, full: 64-key tiles) are much faster.
+    """
+    assert q.dtype == torch.bfloat16 and k.dtype == v.dtype == torch.float8_e4m3fn
+    assert q.shape[0] == seqused_k.numel() and q.shape[1] == 8 * k.shape[2]
+    splits = 64
+    state_shape = (q.shape[0], q.shape[1], splits)
+    partial = torch.empty((*state_shape, 64), dtype=torch.float32, device=q.device)
+    maximum = torch.empty(state_shape, dtype=torch.float32, device=q.device)
+    denom = torch.empty(state_shape, dtype=torch.float32, device=q.device)
+    _swa_verify_partials[(1, k.shape[2], seqused_k.numel() * splits)](
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        partial,
+        maximum,
+        denom,
+        None,
+        k_descale,
+        q.stride(0),
+        q.stride(1),
+        *k.stride(),
+        *v.stride(),
+        block_table.stride(0),
+        q.shape[1],
+        8,
+        k.shape[1],
+        window if window > 0 else 1 << 30,
+        splits,
+        softmax_scale,
+        16,
+        32 if window > 0 else 64,
+        num_warps=4,
+        num_stages=2,
+    )
+    if defer_reduce:
+        # the caller merges the partials itself (verify_reduce_norm_gate)
+        return partial, maximum, denom
+    _swa_verify_reduce[(q.shape[0], q.shape[1])](
+        partial,
+        maximum,
+        denom,
+        out,
+        v_descale,
+        q.shape[1],
+        splits,
+        out.stride(0),
+        out.stride(1),
+        num_warps=4,
+    )
+    return out

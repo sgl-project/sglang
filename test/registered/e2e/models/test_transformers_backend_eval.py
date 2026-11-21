@@ -13,8 +13,8 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import auto_config_device
 
 register_cuda_ci(est_time=65, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=48, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=206, suite="stage-b-test-cpu-intel")
+register_amd_ci(est_time=48, suite="base-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=206, suite="extra-test-cpu-intel")
 
 
 class TestTransformersBackendEval(DefaultServerBase):
@@ -28,7 +28,8 @@ class TestTransformersBackendEval(DefaultServerBase):
         "--enable-torch-compile",
         "--torch-compile-max-bs",
         "4",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
     ]
     if auto_config_device() == "cpu":
         other_args += [

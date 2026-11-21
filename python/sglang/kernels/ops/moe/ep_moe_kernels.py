@@ -1,4 +1,3 @@
-import logging
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -7,9 +6,6 @@ import triton
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_div, is_cuda, is_musa
-
-logger = logging.getLogger(__name__)
-
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -949,7 +945,6 @@ def post_reorder_triton_kernel_for_cutlass_moe(
             if (expert_id >= 0) & (expert_id < num_local_experts):
                 dst_idx_int32 = tl.load(token_src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
-                dst_idx = dst_idx
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
@@ -1036,7 +1031,6 @@ def post_reorder_deepgemm_triton_kernel(
     ):
         src_idx = src_idx_int32.to(tl.int64)
         token_src2dst_ptr = src2dst_ptr + src_idx * topk
-        token_topk_ids_ptr = topk_ids_ptr + src_idx * topk
         token_topk_weights_ptr = topk_weights_ptr + src_idx * topk
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -1785,7 +1779,7 @@ def moe_ep_deepgemm_preprocess(
     if block_shape is None:
         block_shape = [128, 128]
     assert len(block_shape) == 2
-    block_n, block_k = block_shape[0], block_shape[1]
+    block_k = block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
     # Quantize FP8 values with the UE8M0 scale directly. Rounding only the
     # scale afterward can change the represented activation by up to 2x.
@@ -1909,9 +1903,7 @@ def compute_identity_kernel(
 def zero_experts_compute_triton(
     expert_indices, expert_scales, num_experts, zero_expert_type, hidden_states
 ):
-    N = expert_indices.numel()
     top_k = expert_indices.size(-1)
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
 
     if zero_expert_type == "identity":
         zero_expert_mask = expert_indices < num_experts

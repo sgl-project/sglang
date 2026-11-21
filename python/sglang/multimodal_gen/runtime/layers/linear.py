@@ -653,9 +653,6 @@ class ColumnParallelLinear(ParallelLinear):
 
         self.gather_output = gather_output
 
-        if output_sizes is None:
-            output_sizes = [output_size]
-
         assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,

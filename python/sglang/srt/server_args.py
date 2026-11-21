@@ -36,9 +36,8 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
-    DeprecatedChoiceToFlagAction,
-    DeprecatedStoreTrueAction,
 )
+from sglang.srt.arg_groups.choices import reject_removed_choice
 from sglang.srt.arg_groups.model_override_base import (
     ep_joiner_of,
     ep_scale_joiner_of,
@@ -61,6 +60,11 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
     publish,
+)
+from sglang.srt.sampling.watermarking.redaction import (
+    WATERMARK_SECRET_FIELD_NAMES,
+    redact_watermark_command_line,
+    redact_watermark_secrets,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import (
@@ -112,6 +116,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     GRAMMAR_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     LOAD_FORMAT_CHOICES,
+    LORA_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     MXFP8_MOE_RUNNER_BACKEND_CHOICES,
     QUANTIZATION_CHOICES,
@@ -218,29 +223,46 @@ def _plain(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+# CLI flags removed in SGLang 1.0, each with what to pass instead. They stay
+# registered only to stop a launch that still passes one with that message.
+REMOVED_FLAGS = {
+    "--disable-cuda-graph": "use --disable-decode-cuda-graph "
+    "--disable-prefill-cuda-graph",
+    "--enable-dp-attention": "use --attn-dp-size <N> instead of "
+    "--dp-size <N> --enable-dp-attention",
+    "--monokernel-backend": "use --enable-amd-monokernel instead of "
+    "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
+    "--monokernel-backend msa",
+    "--enable-flashinfer-allreduce-fusion": "use "
+    "--flashinfer-allreduce-fusion-backend auto",
+    "--disable-fast-image-processor": "use --image-processor-backend pil",
+    "--disable-outlines-disk-cache": "it had no effect, drop it",
+    "--show-time-cost": "it had no effect, drop it",
+    "--triton-attention-reduce-in-fp32": "it had no effect, drop it",
+}
+
+
+def reject_removed_kwargs(server_args_class: type, kwargs: dict) -> None:
+    """Stop on a keyword for a flag in `REMOVED_FLAGS` that is no longer a
+    field, naming what to use, instead of the constructor's generic error."""
+    for key in kwargs:
+        flag = "--" + key.replace("_", "-")
+        if flag in REMOVED_FLAGS and key not in server_args_class.__struct_fields__:
+            raise TypeError(f"{key} was removed in SGLang 1.0; {REMOVED_FLAGS[flag]}.")
+
+
 class ServerArgs:
     """Raw server configuration, sealed when resolution starts.
 
     Add fields to the matching namespace in ``arg_groups/fields/`` using
     ``A[T, help]`` or ``A[T, Arg(...)]``; see ``arg_utils.Arg`` for CLI metadata.
-    Only dynamic choices, deprecated flags, and ``--config`` need manual
+    Only dynamic choices, removed flags, and ``--config`` need manual
     registration in ``add_cli_args``. ``POSITIONAL_FIELD_ORDER`` preserves
     the positional constructor signature when these namespaces are assembled.
     """
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
-        for name in (
-            "disable_outlines_disk_cache",
-            "show_time_cost",
-            "triton_attention_reduce_in_fp32",
-        ):
-            if getattr(self, name) is not None:
-                logger.warning(
-                    "'%s' is deprecated and has no effect. It will be removed "
-                    "in a future release.",
-                    name,
-                )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.
@@ -309,12 +331,7 @@ class ServerArgs:
         return getattr(self, "_launch_command", None)
 
     def __repr__(self) -> str:
-        hidden = {
-            "watermark_key",
-            "watermark_key_b",
-            "watermark_config",
-            *SERVER_ARGS_SECRET_FIELD_NAMES,
-        }
+        hidden = {*WATERMARK_SECRET_FIELD_NAMES, *SERVER_ARGS_SECRET_FIELD_NAMES}
         values = ", ".join(
             f"{field.name}={getattr(self, field.name)!r}"
             for field in record_fields(type(self))
@@ -325,19 +342,16 @@ class ServerArgs:
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
 
-        One exception: the deprecated `enable_dp_attention` reports whether an
-        attention-DP width was configured, for clients that still read it from
-        `/server_info`. Resolution leaves the field false. It reports the width
-        rather than `attn_dp_enabled`, whose elastic scale-joiner arm is true at
-        width one: a dump carrying that would fold the joiner's replicas into
-        attention-DP groups when it is read back.
+        One addition: `enable_dp_attention`, no longer a field, reports whether
+        an attention-DP width was configured, for clients that still read it
+        from `/server_info`. It reports the width rather than `attn_dp_enabled`,
+        whose elastic scale-joiner arm is true at width one.
         """
 
         resolved = {
             field.name: _plain(resolution_result(self, field.name))
             for field in record_fields(type(self))
         }
-        # TODO: drop together with `--enable-dp-attention` after 2026-12-31.
         resolved["enable_dp_attention"] = resolving_view(self).attn_dp_size > 1
         return resolved
 
@@ -347,6 +361,7 @@ class ServerArgs:
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
         "Gemma4ForConditionalGeneration",
+        "HYV4FlashForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
@@ -355,7 +370,7 @@ class ServerArgs:
     # construction in model_runner_kv_cache_mixin._init_pools.
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
-        return {"mooncake"}
+        return {"mooncake", "nixl"}
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -387,7 +402,7 @@ class ServerArgs:
         tool_call_parser_choices = _tool_call_parser_choices()
         parser.add_argument(
             "--tool-call-parser",
-            type=str,
+            type=reject_removed_choice("tool_call_parser"),
             choices=["auto"] + tool_call_parser_choices,
             default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
@@ -414,36 +429,15 @@ class ServerArgs:
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
         )
 
-        # --- Deprecated argument registrations ---
-        # `disable_cuda_graph` is `no_cli=True`, so this deprecated spelling is
-        # its only command-line entry point.
-        parser.add_argument(
-            "--disable-cuda-graph",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
-            help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
-        )
-        # `enable_dp_attention` is `no_cli=True` too; resolution turns it into
-        # `attn_dp_size`. TODO: remove the flag and the field after 2026-12-31.
-        parser.add_argument(
-            "--enable-dp-attention",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--attn-dp-size <dp-size>",
-            help="Deprecated. Use --attn-dp-size <dp-size> instead of "
-            "--dp-size <dp-size> --enable-dp-attention.",
-        )
-        parser.add_argument(
-            "--monokernel-backend",
-            action=DeprecatedChoiceToFlagAction,
-            dest="monokernel_backend",
-            flags={
-                "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
-                "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
-            },
-            help="Deprecated. Use --enable-amd-monokernel instead of "
-            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
-            "--monokernel-backend msa.",
-        )
+        for flag, replacement in REMOVED_FLAGS.items():
+            parser.add_argument(
+                flag,
+                action=DeprecatedAction,
+                nargs="?",
+                default=argparse.SUPPRESS,
+                error_message=f"{flag} was removed in SGLang 1.0; {replacement}.",
+                help=argparse.SUPPRESS,
+            )
         # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
         parser.add_argument(
             "--mamba-max-states-per-path",
@@ -453,23 +447,6 @@ class ServerArgs:
             type=int,
             default=None,
             help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
-        )
-        for flag in (
-            "--disable-outlines-disk-cache",
-            "--show-time-cost",
-            "--triton-attention-reduce-in-fp32",
-        ):
-            parser.add_argument(
-                flag,
-                action=DeprecatedAction,
-                default=argparse.SUPPRESS,
-                help="Deprecated. Has no effect.",
-            )
-        parser.add_argument(
-            "--enable-flashinfer-allreduce-fusion",
-            action="store_true",
-            help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
-            "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
 
     @classmethod
@@ -719,9 +696,6 @@ def redact_server_args_secrets(values: dict[str, Any]) -> dict[str, Any]:
     """A copy of a server-args mapping with the credentials and the watermark
     secrets replaced. An unset credential stays None, so readers can still
     tell whether one is configured."""
-    # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-
     return redact_watermark_secrets(
         {
             name: (
@@ -833,9 +807,6 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
-
     server_args._launch_command = redact_watermark_command_line(
         redact_secret_cli_args(argv, parser), raw_args.watermark_config
     )
@@ -862,9 +833,6 @@ class PortArgs:
 
     # The port for nccl initialization (torch.dist)
     nccl_port: int
-
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
 
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
@@ -930,7 +898,6 @@ class PortArgs:
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
-                rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 decoupled_spec_ipc_config=decoupled_spec_ipc_config,
@@ -965,7 +932,7 @@ class PortArgs:
                 port_base = dist_init_port + 1
 
             detokenizer_port = port_base + 1
-            rpc_port = port_base + 2
+            # port_base + 2 is unused; the slot stays so the ports below keep their offsets.
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
             if dp_rank is None:
@@ -995,7 +962,6 @@ class PortArgs:
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     if not dist_init_overridden:
                         wait_port_available(nccl_port, "nccl_port")
-                    wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
@@ -1018,7 +984,6 @@ class PortArgs:
                     dist_init_host, detokenizer_port
                 ).to_tcp(),
                 nccl_port=nccl_port,
-                rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
                 decoupled_spec_ipc_config=decoupled_spec_ipc_config,
