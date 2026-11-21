@@ -1,5 +1,3 @@
-"""Real provider methods test admission, geometry, and finalization with GPU boundaries mocked."""
-
 from __future__ import annotations
 
 import sys
@@ -16,41 +14,38 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestNvFp4PreparedQuantInfo(CustomTestCase):
-    def test_non_bf16_activations_fail_without_mutation(self):
-        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+class TestMxfp4PreparedQuantInfo(CustomTestCase):
+    def test_loader_padded_hidden_width_is_rejected(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraMxfp4MarlinQuantInfo
 
-        # FP16 is the silent case: Marlin accepts half activations while the
-        # runner allocates BF16 stage buffers; FP32 fails loudly in the JIT.
         layer = SimpleNamespace(
-            params_dtype=torch.float16,
-            w13_weight=torch.zeros((2, 4, 512), dtype=torch.int32),
-            w2_weight=torch.zeros((2, 8, 128), dtype=torch.int32),
-            w13_weight_scale=torch.zeros((2, 4, 256), dtype=torch.float8_e4m3fn),
-            w2_weight_scale=torch.zeros((2, 8, 64), dtype=torch.float8_e4m3fn),
-            w13_weight_scale_2=torch.ones(2, dtype=torch.float16),
-            w2_weight_scale_2=torch.zeros(2, dtype=torch.float16),
+            params_dtype=torch.bfloat16,
+            w13_weight=torch.zeros((2, 16, 512), dtype=torch.int32),
+            w2_weight=torch.zeros((2, 8, 512), dtype=torch.int32),
+            w13_weight_scale=torch.zeros((2, 8, 256), dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            ),
+            w2_weight_scale=torch.zeros((2, 4, 256), dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            ),
             moe_runner_config=SimpleNamespace(is_gated=True),
             num_local_experts=2,
             intermediate_size_per_partition=128,
-            hidden_size=64,
+            hidden_size=200,
         )
-        original = vars(layer).copy()
-        with self.assertRaisesRegex(NotImplementedError, "BF16 activations"):
-            MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
-        for name, value in original.items():
-            self.assertIs(getattr(layer, name), value)
+        with self.assertRaisesRegex(NotImplementedError, "hidden_size % 256"):
+            MoeLoraMxfp4MarlinQuantInfo.from_layer(layer)
 
 
 class TestProviderGeometry(CustomTestCase):
     def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
-        from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
-            TritonBf16ContiguousProvider,
+        from sglang.srt.lora.moe.base_gemm_provider.triton import (
+            TritonBf16PairProvider,
         )
 
         # The FP8 provider shares the method; the stand-in below carries its
         # block shape and dtype tag.
-        config_for = TritonBf16ContiguousProvider._config_for
+        config_for = TritonBf16PairProvider._config_for
         module = types.ModuleType(
             "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config"
         )
@@ -69,6 +64,7 @@ class TestProviderGeometry(CustomTestCase):
             ),
             _config_dtype_tag="fp8_w8a8",
             _config_block_shape=[128, 128],
+            _config_per_channel_quant=False,
             _configs={},
         )
         with mock.patch.dict(sys.modules, {module.__name__: module}):
@@ -79,6 +75,173 @@ class TestProviderGeometry(CustomTestCase):
             self.assertEqual(cached, original)
             self.assertIsNot(actual, cached)
         module.try_get_optimal_moe_config.assert_called_once()
+
+
+class TestDerivedBaseWeights(CustomTestCase):
+    def test_providers_expose_whether_base_weights_are_derived(self):
+        from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
+
+        cases = (
+            ("fp8", "cutedsl", False),
+            ("bf16", "triton", False),
+        )
+        for family, vendor, derived in cases:
+            cls = select_provider_cls("expert_major", family, vendor)
+            self.assertEqual(
+                cls.derived_base_weights is not None, derived, cls.__name__
+            )
+
+
+class TestActQuantReadiness(CustomTestCase):
+    @staticmethod
+    def _provider(cls, **attributes):
+        provider = object.__new__(cls)
+        provider.quant_info = SimpleNamespace(
+            num_local_experts=2, intermediate_size=128, hidden_size=128
+        )
+        provider._launch = mock.Mock()
+        for name, value in attributes.items():
+            setattr(provider, name, value)
+        return provider
+
+    @staticmethod
+    def _row_state(cls, **fields):
+        import msgspec
+
+        names, defaults = cls.__struct_fields__, cls.__struct_defaults__
+        # The defaults tuple omits required fields before the first default.
+        defaults = (msgspec.NODEFAULT,) * (len(names) - len(defaults)) + defaults
+        required = dict.fromkeys(
+            name
+            for name, default in zip(names, defaults)
+            if default is msgspec.NODEFAULT
+        )
+        return cls(**(required | fields))
+
+    @staticmethod
+    def _activate(provider, row_state, *, fused, tile_width=64):
+        from sglang.kernels.ops.lora.moe import activation_delta, fused_act
+
+        with (
+            mock.patch.object(activation_delta, "act_delta") as act_delta,
+            mock.patch.object(fused_act, "fused_b_act") as fused_b_act,
+        ):
+            if not fused:
+                provider.act_with_delta(row_state, None, None, None, None, None)
+                return act_delta.call_args.kwargs["act_quant"]
+            provider.fused_act(
+                row_state,
+                activation="silu",
+                base_gateup=None,
+                act_rows=None,
+                act_pairs=None,
+                routing=None,
+                config={"BLOCK_SIZE_W": tile_width},
+            )
+            return fused_b_act.call_args.kwargs["act_quant"]
+
+    def test_fp8_down_quantizes_after_fused_activation(self):
+        from sglang.srt.lora.moe.base_gemm_provider import cutedsl_fp8
+
+        for cls, group in ((cutedsl_fp8.CuteDslFp8ContiguousProvider, 128),):
+            with (
+                self.subTest(provider=cls.__name__),
+                mock.patch.object(
+                    cutedsl_fp8, "quantize_pair_rows_fp8", return_value=("q", "scales")
+                ) as quantize,
+            ):
+                provider = self._provider(cls)
+                provider.quant_info.intermediate_size = 256
+                state = self._row_state(
+                    provider._row_state_cls,
+                    act_fp8="act_fp8",
+                    act_scale="act_scale",
+                    pair_to_row="pair_to_row",
+                )
+                self.assertEqual(
+                    self._activate(provider, state, fused=False),
+                    ("act_fp8", "act_scale", group),
+                )
+                provider.down(state, "act_out", "out")
+                quantize.assert_not_called()
+                self.assertIsNone(self._activate(provider, state, fused=True))
+                provider.down(state, "act_out", "out")
+                quantize.assert_called_once_with(
+                    "act_out",
+                    q_out="act_fp8",
+                    scale_out="act_scale",
+                    pair_to_row="pair_to_row",
+                    group=group,
+                )
+
+    def test_triton_fp8_down_takes_rows_only_from_the_activation_that_just_ran(self):
+        from sglang.srt.lora.moe.base_gemm_provider import triton
+
+        provider = self._provider(
+            triton.TritonFp8PairProvider,
+            act_out_shape=lambda row_state: (4, 128),
+            _invoke=mock.Mock(),
+        )
+        provider.quant_info.w2_weight = provider.quant_info.w2_scale = None
+        state = self._row_state(
+            triton.TritonRowState,
+            pair_to_row=torch.zeros(4, dtype=torch.int32),
+            workspace=None,
+            down_config={},
+        )
+
+        def down_input():
+            provider._invoke.reset_mock()
+            provider.down(state, "act_out", "out")
+            call = provider._invoke.call_args
+            return call.args[0], call.kwargs["a_scale"]
+
+        self.assertIsNotNone(self._activate(provider, state, fused=False))
+        rows, scales = state.act_quant
+        self.assertTrue(state.act_quant_ready)
+        self.assertEqual([id(x) for x in down_input()], [id(rows), id(scales)])
+        # Fused B/activation leaves stale FP8 buffers, so down quantizes BF16 again.
+        self.assertIsNone(self._activate(provider, state, fused=True))
+        self.assertIs(state.act_quant[0], rows)
+        self.assertFalse(state.act_quant_ready)
+        self.assertEqual(down_input(), ("act_out", None))
+
+
+class TestCompileCache(CustomTestCase):
+    def test_stage_constants_separate_compiled_code(self):
+        """Different gate/up and down epilogue constants must compile separately."""
+        from sglang.srt.lora.moe.base_gemm_provider import cutedsl_common
+
+        class Provider(cutedsl_common.CuteDslTileMixin):
+            _ROW_MODE = "masked"
+            _DTYPE_TAG = "nvfp4"
+
+            def __init__(self):
+                self.quant_info = SimpleNamespace(num_local_experts=2)
+                self._compiled = {64: {}}
+                self._as_dynamic_cute_tensor = lambda tensor, leading_dim: tensor
+                self.compiles = 0
+
+            def _stage_weight(self, stage):
+                return torch.zeros((2, 256, 128), dtype=torch.uint8)
+
+            def _stage_constexprs(self, stage):
+                return (16, True, 128 if stage == "gemm1" else 1 << 30)
+
+            def _prepare_dummy(self, stage, config):
+                self.compiles += 1
+                return SimpleNamespace(launch=lambda: None, compiled_fn=object())
+
+        with mock.patch.dict(cutedsl_common._COMPILE_CACHE, clear=True):
+            provider = Provider()
+            provider._compile_stage(64, "gemm1", config="tile")
+            provider._compile_stage(64, "gemm2", config="tile")
+            self.assertEqual(provider.compiles, 2)
+            calls = provider._compiled[64]
+            self.assertIsNot(calls["gemm1"].compiled_fn, calls["gemm2"].compiled_fn)
+            # The same geometry and constants reuse the compiled code.
+            provider._compile_stage(64, "gemm1", config="tile")
+            self.assertEqual(provider.compiles, 2)
 
 
 class TestMaterializedFinalize(CustomTestCase):
@@ -197,16 +360,25 @@ class TestRunnerAdmission(CustomTestCase):
     def test_binding_surfaces_plan_validation(self):
         """A provider exposing one gate/up slice cannot serve a gated layer."""
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe import runner as runner_module
         from sglang.srt.lora.moe.runner import MoeLoraRunner
         from sglang.srt.runtime_context import get_context, get_flags
 
-        provider = SimpleNamespace(
-            hidden_size=2048,
-            intermediate_size=768,
-            num_local_experts=256,
-            gate_up_slices=1,
-            contract=SimpleNamespace(lora_delta_dtype=torch.bfloat16),
-        )
+        class QuantInfo:
+            @staticmethod
+            def from_layer(base_layer):
+                return None
+
+        class Provider:
+            contract = SimpleNamespace(quant_info_cls=QuantInfo)
+            hidden_size = 2048
+            intermediate_size = 768
+            num_local_experts = 256
+            gate_up_slices = 1
+
+            def __init__(self, quant_info):
+                self.quant_info = quant_info
+
         layer = SimpleNamespace(
             w2_weight=SimpleNamespace(
                 device=torch.device("cuda"), shape=(256, 2048, 768)
@@ -220,21 +392,25 @@ class TestRunnerAdmission(CustomTestCase):
         # from_layer reads the published MoE runner backend for its vendor.
         with (
             mock.patch.object(MoeLoraRunner, "_admit", return_value="bf16"),
-            mock.patch.object(MoeLoraRunner, "_build_provider", return_value=provider),
+            mock.patch.object(
+                runner_module, "select_provider_cls", return_value=Provider
+            ),
             get_context().override_server_args(),
             get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL),
-            self.assertRaisesRegex(ValueError, "gate/up slices"),
         ):
-            MoeLoraRunner.from_layer(
+            with self.assertRaisesRegex(ValueError, "gate/up slices"):
+                MoeLoraRunner.from_layer(
+                    layer, workspace=object(), is_shared_outer=False, physical_rank=64
+                )
+            Provider.gate_up_slices = 2
+            runner = MoeLoraRunner.from_layer(
                 layer, workspace=object(), is_shared_outer=False, physical_rank=64
             )
+        self.assertIs(runner.providers["expert_major"], runner.providers["route_major"])
 
 
 class TestLayerRunnerBackendResolution(CustomTestCase):
-    """The selected lora runner backend binds the new MoE runner and rebinds
-    run_moe_core."""
-
-    def test_v2_accepts_each_new_moe_runner(self):
+    def test_v2_binds_the_selected_moe_runner(self):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.lora.layers import FusedMoEWithLoRA

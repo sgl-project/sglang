@@ -161,6 +161,7 @@ def _build_runner(
         activation=activation,
         hidden_size=_HIDDEN,
         num_local_experts=_EXPERTS,
+        vendor=vendor,
     )[phase]
     launch_config = choice.tiles.config_for(_NUM_TOKENS)
     provider_cls = select_provider_cls(choice.base_gemm_rows, "bf16", vendor)

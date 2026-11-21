@@ -1,8 +1,4 @@
-"""NVFP4 provider against exact dequantization, using the serving repack helper.
-Checkpoint format: packed E2M1 (even index in low nibble), group-16 E4M3 scales,
-and an FP32 per-expert global scale. Compare raw pair-major outputs, then drive
-the sm100 shared-outer decode plan through the runner.
-"""
+"""NVFP4 and MXFP4 Marlin repack, provider numerics, and decode replay."""
 
 from __future__ import annotations
 
@@ -13,20 +9,16 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.lora.moe.activation import ActivationFn
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
-from sglang.srt.lora.moe.plan import AFamily, BFamily, resolve_plans
-from sglang.srt.lora.moe.runner import MoeLoraBatch, MoeLoraRunner
+from sglang.srt.lora.moe.plan import resolve_plans
+from sglang.srt.lora.moe.runner import MoeLoraBatch
 from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels.moe_lora import rel_l2, standalone_output_allocation
+from sglang.test.kernels.moe_lora import check_marlin_lora_replay, rel_l2
+from sglang.test.quant_ref_utils import quantize_mx_ref, quantize_nvfp4_static_ref
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-# The H100 pool skips the sm100 shared-outer NVFP4 decode plan row (skipped elsewhere); the B200 pool runs it per PR.
-# The test runs on one GPU: 4-gpu-b200 is the kernel lane's only SM100 pool, so
-# its four GPUs are allocation granularity, not multi-GPU coverage.
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _E = 4
@@ -35,76 +27,58 @@ _I = 128
 _TOPK = 2
 _T = 32
 
-_E2M1_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-
 
 def _skip_unless_supported():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("Marlin NVFP4 needs SM90+ here")
+        pytest.skip("Marlin FP4 needs SM90+ here")
 
 
-def _quant_nvfp4(weight: torch.Tensor):
-    """[E, N, K] bf16 -> (packed uint8 [E,N,K/2], e4m3 [E,N,K/16], fp32 [E])
-    plus the exact dequantized weights."""
-    e, n, k = weight.shape
-    w = weight.float()
-    global_scale = (w.abs().amax(dim=(1, 2)) / (448.0 * 6.0)).clamp(min=1e-12)
-    groups = w.view(e, n, k // 16, 16)
-    amax16 = groups.abs().amax(dim=-1)
-    block_scale = (
-        (amax16 / (6.0 * global_scale[:, None, None]))
-        .clamp(min=2**-6)
-        .to(torch.float8_e4m3fn)
+def _marlin_quant_info(family, w13, w2, gated):
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        prepare_moe_mxfp4_layer_for_marlin,
+        prepare_moe_nvfp4_layer_for_marlin,
     )
-    denom = block_scale.float() * global_scale[:, None, None]
-    scaled = groups / denom[..., None]
-    table = _E2M1_VALUES.to(weight.device)
-    idx = (scaled.abs().unsqueeze(-1) - table).abs().argmin(dim=-1)
-    sign = scaled < 0
-    codes = (idx | (sign.long() << 3)).to(torch.uint8).view(e, n, k)
-    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
-    dequant = (torch.where(sign, -table[idx], table[idx]) * denom[..., None]).view(
-        e, n, k
+    from sglang.srt.lora.moe.quant_info import (
+        MoeLoraMxfp4MarlinQuantInfo,
+        MoeLoraNvFp4MarlinQuantInfo,
     )
-    return packed, block_scale, global_scale, dequant
 
-
-def _fake_layer(w13, w2, gated=True):
-    w13_q, w13_bs, w13_gs, w13_eff = _quant_nvfp4(w13)
-    w2_q, w2_bs, w2_gs, w2_eff = _quant_nvfp4(w2)
+    fields, dequant = {}, []
+    for name, w in (("w13", w13), ("w2", w2)):
+        if family == "mxfp4":
+            q, scale, w_eff = quantize_mx_ref(w, 32, "e2m1")
+            fields[f"{name}_weight"] = q.view(torch.int8)
+            fields[f"{name}_weight_scale_inv"] = scale.view(torch.float8_e8m0fnu)
+        else:
+            gs = (w.float().abs().amax(dim=(1, 2)) / (448.0 * 6.0)).clamp(min=1e-12)
+            q, scale, w_eff = quantize_nvfp4_static_ref(w, gs)
+            fields[f"{name}_weight"] = q
+            fields[f"{name}_weight_scale"] = scale.view(torch.float8_e4m3fn)
+            fields[f"{name}_weight_scale_2"] = gs
+        dequant.append(w_eff)
     layer = SimpleNamespace(
-        w13_weight=SimpleNamespace(data=w13_q),
-        w2_weight=SimpleNamespace(data=w2_q),
-        w13_weight_scale=SimpleNamespace(data=w13_bs),
-        w2_weight_scale=SimpleNamespace(data=w2_bs),
-        w13_weight_scale_2=SimpleNamespace(data=w13_gs),
-        w2_weight_scale_2=SimpleNamespace(data=w2_gs),
-        quant_config=SimpleNamespace(group_size=16),
+        **{key: SimpleNamespace(data=value) for key, value in fields.items()},
         moe_runner_config=SimpleNamespace(is_gated=gated),
         num_local_experts=w2.shape[0],
         intermediate_size_per_partition=w2.shape[2],
         hidden_size=w2.shape[1],
         params_dtype=torch.bfloat16,
     )
-    return layer, w13_eff, w2_eff
+    if family == "mxfp4":
+        prepare_moe_mxfp4_layer_for_marlin(layer)
+        return MoeLoraMxfp4MarlinQuantInfo.from_layer(layer), *dequant
+    prepare_moe_nvfp4_layer_for_marlin(layer, group_size=16)
+    return MoeLoraNvFp4MarlinQuantInfo.from_layer(layer), *dequant
 
 
-def _marlin_quant_info(layer):
-    """Repack the fake layer in place and bind it as serving does."""
-    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-        prepare_moe_nvfp4_layer_for_marlin,
-    )
-    from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
-
-    prepare_moe_nvfp4_layer_for_marlin(layer)
-    # The fake layer has no quant_method: use the repacked tensors directly.
-    return MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
-
-
-@pytest.mark.parametrize("slices,intermediate", [(2, _I), (1, _I), (1, 64)])
-def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
+# Exercise gated MXFP4 and non-gated NVFP4 intermediate padding.
+@pytest.mark.parametrize(
+    "family,slices,intermediate",
+    [("mxfp4", 2, 96), ("nvfp4", 2, _I), ("nvfp4", 1, 64)],
+)
+def test_fp4_marlin_gateup_and_down_match_reference(family, slices, intermediate):
     _skip_unless_supported()
     device = torch.device("cuda")
     g = torch.Generator(device="cpu").manual_seed(11)
@@ -119,14 +93,14 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
         [torch.randperm(_E, generator=g)[:_TOPK] for _ in range(_T)]
     ).to(device=device, dtype=torch.int32)
 
-    layer, w13_eff, w2_eff = _fake_layer(w13, w2, gated=slices == 2)
-    quant_info = _marlin_quant_info(layer)
+    quant_info, w13_eff, w2_eff = _marlin_quant_info(family, w13, w2, gated=slices == 2)
     assert (quant_info.gate_up_slices, quant_info.intermediate_size) == (
         slices,
         intermediate,
     )
+    assert quant_info.w2_qweight.shape[1] * 16 == _I
 
-    provider = select_provider_cls("route_major", "nvfp4", "marlin")(quant_info)
+    provider = select_provider_cls("route_major", family, "marlin")(quant_info)
 
     with get_context().override_server_args():
         state = provider.prepare(hidden, topk_ids, _TOPK)
@@ -168,10 +142,9 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
 
         from sglang.srt.lora.workspace import LoraWorkspace
 
-        assert layer.w2_weight.shape[1] * 16 == 128
         rank = 16
         a13 = rand(_E, rank, _H).float()[experts]
-        b13 = rand(_E, intermediate, rank).float()[experts]
+        b13 = rand(_E, slices * intermediate, rank).float()[experts]
         a2 = rand(_E, rank, intermediate).float()[experts]
         b2 = rand(_E, _H, rank).float()[experts]
         weights = torch.tensor([0.65, 0.35], device=device).repeat(_T, 1)
@@ -181,6 +154,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
         )
         workspace = LoraWorkspace()
         workspace.begin_forward(graph_mode=True)
+        activation = "silu" if slices == 2 else "relu2"
 
         def delta(a, b, x):
             return torch.bmm(b, torch.bmm(a, x.unsqueeze(-1))).squeeze(-1)
@@ -192,14 +166,14 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
             provider.act_with_delta(
                 state,
                 gateup,
-                gate_delta.view(_T, _TOPK, intermediate),
+                gate_delta.view(_T, _TOPK, slices * intermediate),
                 topk_ids,
                 act,
                 act_pairs,
-                activation="relu2",
+                activation=activation,
             )
             # Padding must be cleared even when its reusable storage is poisoned.
-            state.padded_intermediate[:, intermediate:].fill_(float("nan"))
+            state.padded_act[:, intermediate:].fill_(float("nan"))
             provider.down(state, act, down)
             down_delta = delta(a2, b2, act_pairs.flatten(0, 1).float()).to(
                 torch.bfloat16
@@ -216,10 +190,16 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
 
         def reference():
             inputs = hidden[tokens].float()
-            gate = torch.einsum("ph,pih->pi", inputs, w13_eff[experts])
-            activation = (gate + delta(a13, b13, inputs)).relu().square()
-            pairs = torch.einsum("pi,phi->ph", activation, w2_eff[experts])
-            pairs += delta(a2, b2, activation)
+            gate_up = torch.einsum("ph,pnh->pn", inputs, w13_eff[experts])
+            gate_up = gate_up + delta(a13, b13, inputs)
+            if slices == 2:
+                activation_out = (
+                    F.silu(gate_up[:, :intermediate]) * gate_up[:, intermediate:]
+                )
+            else:
+                activation_out = gate_up.relu().square()
+            pairs = torch.einsum("pi,phi->ph", activation_out, w2_eff[experts])
+            pairs += delta(a2, b2, activation_out)
             return (pairs.view(_T, _TOPK, _H) * weights[..., None]).sum(1) * 0.75
 
         stream = torch.cuda.Stream()
@@ -239,21 +219,21 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
             assert rel_l2(output.float(), reference()) < 3e-2
 
 
-@pytest.mark.parametrize("slices", (2, 1), ids=("gated-silu", "relu2"))
-def test_nvfp4_shared_outer_decode_plan_matches_reference(
-    monkeypatch: pytest.MonkeyPatch, slices: int
+@pytest.mark.parametrize(
+    "family,slices",
+    [("mxfp4", 1), ("nvfp4", 2), ("nvfp4", 1)],
+    ids=("mxfp4-relu2", "nvfp4-gated-silu", "nvfp4-relu2"),
+)
+def test_fp4_marlin_shared_outer_decode_plan_matches_reference(
+    monkeypatch: pytest.MonkeyPatch, family: str, slices: int
 ) -> None:
-    """Run the sm100 ``decode.shared.nvfp4`` row end to end: token_dense gate/up-A
-    planes selected by per_row B, Marlin base GEMMs, per_row down-A, and the
-    shared one-pass finalize. Eager first, then a graph replayed with changed
-    adapter slots, routing, and inputs.
-    """
     _skip_unless_supported()
     device = torch.device("cuda")
-    major = torch.cuda.get_device_capability(device)[0]
-    if major != 10:
-        pytest.skip("decode.shared.nvfp4 is an sm100 plan row")
-    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
+    architecture = architecture_for_capability(
+        torch.cuda.get_device_capability(device)[0]
+    )
+    if family == "nvfp4" and architecture != "sm100":
+        pytest.skip("the NVFP4 case covers the SM100 shared decode row")
     g = torch.Generator(device="cpu").manual_seed(23)
 
     def rand(*shape, scale=0.05):
@@ -261,43 +241,32 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
 
     tokens, slots, rank = 8, 2, 16
     activation = ActivationFn.SILU if slices == 2 else ActivationFn.RELU2
-    layer, w13_eff, w2_eff = _fake_layer(
-        rand(_E, slices * _I, _H), rand(_E, _H, _I), gated=slices == 2
+    quant_info, w13_eff, w2_eff = _marlin_quant_info(
+        family, rand(_E, slices * _I, _H), rand(_E, _H, _I), gated=slices == 2
     )
-    quant_info = _marlin_quant_info(layer)
     selected = resolve_plans(
-        architecture=architecture_for_capability(major),
+        architecture=architecture,
         is_shared_outer=True,
         physical_rank=rank,
         activation=activation,
         hidden_size=_H,
         num_local_experts=_E,
-        quant_family="nvfp4",
+        quant_family=family,
+        vendor="marlin",
     )[Phase.DECODE]
-    assert (
-        selected.name,
-        selected.plan.gate_up_a.family,
-        selected.plan.gate_up_b.family,
-    ) == ("decode.shared.nvfp4", AFamily.TOKEN_DENSE, BFamily.PER_ROW)
-    provider = select_provider_cls(selected.base_gemm_rows, "nvfp4", "marlin")(
+    rows = {
+        "sm90": "decode.shared",
+        "sm100": "decode.shared.nvfp4" if family == "nvfp4" else "decode.shared.marlin",
+    }
+    assert selected.name == rows[architecture]
+    provider = select_provider_cls(selected.base_gemm_rows, family, "marlin")(
         quant_info
     )
-    runner = MoeLoraRunner(
-        providers={selected.base_gemm_rows: provider},
-        top_k=_TOPK,
-        routed_scaling_factor=0.75,
-        activation=activation,
-        is_gated=slices == 2,
-    )
-    runner.validate_plan(selected.plan, base_gemm_rows=selected.base_gemm_rows)
-    runner.plans = {Phase.DECODE: selected}
-
     hidden = rand(tokens, _H, scale=0.2)
     topk_ids = torch.stack(
         [torch.randperm(_E, generator=g)[:_TOPK] for _ in range(tokens)]
     ).to(device=device, dtype=torch.int32)
     topk_ids[3, 1] = -1  # an EP hole on an adapter token
-    weights = torch.tensor([0.65, 0.35], device=device).repeat(tokens, 1)
     # Outer factors (gate/up-A, down-B) per slot; inner ones per (slot, expert).
     gate_up_a = rand(slots, 1, slices * rank, _H, scale=0.1)
     gate_up_b = rand(slots, _E, slices * _I, rank, scale=0.1)
@@ -305,51 +274,6 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
     down_b = rand(slots, 1, _H, rank, scale=0.1)
     mapping = torch.tensor([0, 1, -1, 0, 1, -1, 0, 1], dtype=torch.int32, device=device)
 
-    def reference(mapping):
-        pair_tokens = torch.arange(tokens, device=device).repeat_interleave(_TOPK)
-        experts = topk_ids.flatten().long()
-        routed = (experts >= 0).float()[:, None]
-        experts = experts.clamp(min=0)
-        slot = mapping[pair_tokens].long()
-        adapted = (slot >= 0).float()[:, None]
-        slot = slot.clamp(min=0)
-        inputs = hidden.float()[pair_tokens]
-        gate_up = torch.einsum("ph,pnh->pn", inputs, w13_eff[experts])
-        outer = torch.einsum("ph,prh->pr", inputs, gate_up_a.float()[slot, 0])
-        inner = gate_up_b.float()[slot, experts]
-        delta = torch.cat(
-            [
-                torch.einsum(
-                    "pir,pr->pi",
-                    inner[:, s * _I : (s + 1) * _I],
-                    outer[:, s * rank : (s + 1) * rank],
-                )
-                for s in range(slices)
-            ],
-            dim=1,
-        )
-        gate_up = gate_up + adapted * delta
-        if slices == 2:
-            act = F.silu(gate_up[:, :_I]) * gate_up[:, _I:]
-        else:
-            act = gate_up.relu().square()
-        pairs = torch.einsum("pi,phi->ph", act, w2_eff[experts])
-        down_rank = torch.einsum("pi,pri->pr", act, down_a.float()[slot, experts])
-        pairs = pairs + adapted * torch.einsum(
-            "pr,phr->ph", down_rank, down_b.float()[slot, 0]
-        )
-        pairs = pairs * routed
-        return (pairs.view(tokens, _TOPK, _H) * weights[..., None]).sum(1) * 0.75
-
-    dispatch = StandardDispatchOutput(
-        hidden_states=hidden,
-        hidden_states_scale=None,
-        topk_output=StandardTopKOutput(
-            topk_weights=weights,
-            topk_ids=topk_ids,
-            router_logits=torch.zeros((tokens, _E), device=device),
-        ),
-    )
     batch = MoeLoraBatch(
         gate_up_lora_a=gate_up_a,
         gate_up_lora_b=gate_up_b,
@@ -357,48 +281,21 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
         down_lora_b=down_b,
         token_lora_mapping=mapping,
     )
-
-    def forward():
-        with get_context().override_server_args():
-            return runner.run(dispatch, batch).hidden_states
-
-    output = forward()
-    torch.cuda.synchronize()
-    assert rel_l2(output.float(), reference(mapping)) < 3e-2
-    # LoRA math must be present, not bypassed within tolerance.
-    assert rel_l2(reference(torch.full_like(mapping, -1)), reference(mapping)) > 0.1
-
-    batch.use_cuda_graph = True
-    # Workspace scratch is stream-local: warm up on the capture stream.
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(2):
-            forward()
-    torch.cuda.synchronize()
-    runner.workspace.routes.clear()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        captured = forward()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert rel_l2(captured.float(), reference(mapping)) < 3e-2
-
-    # Replay over new adapter slots, routing, and inputs in the captured buffers.
-    mapping.copy_(mapping.roll(1))
-    topk_ids.copy_(topk_ids.flip(1))
-    hidden.mul_(-0.5)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert rel_l2(captured.float(), reference(mapping)) < 3e-2
+    check_marlin_lora_replay(
+        monkeypatch,
+        selected,
+        provider,
+        hidden,
+        topk_ids,
+        batch,
+        w13_eff,
+        w2_eff,
+        tol=3e-2,
+    )
 
 
 def test_single_token_align_matches_general_path_with_invalid_ids():
-    """Single-token alignment matches the general path with invalid EP ids excluded,
-    and all-valid ids match the upstream CUDA warp kernel. ``align_rows`` takes
-    the single-token path for one token and the general path for more; both
-    write -1 into pair_to_row for invalid pairs.
-    """
+    """Both alignment paths exclude dropped expert-parallel routes."""
     _skip_unless_supported()
     from sglang.kernels.ops.lora.moe.align_rows import (
         moe_align_single_token,
