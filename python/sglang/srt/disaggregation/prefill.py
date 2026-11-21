@@ -523,7 +523,10 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
             prompt_fingerprint=kv_transfer_fingerprint(
-                req.origin_input_ids, lora_name=req.lora_name
+                req.origin_input_ids,
+                lora_name=req.lora_name,
+                input_embeds=req.input_embeds,
+                positional_embed_overrides=req.positional_embed_overrides,
             ),
         )
         req.pending_bootstrap = True

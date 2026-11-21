@@ -9,10 +9,13 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation import decode as decode_module
 from sglang.srt.disaggregation import prefill as prefill_module
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import SessionParams, TokenizedGenerateReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_parallel
@@ -35,6 +38,8 @@ def _decode_req(origin_input_ids=PROMPT, output_ids=(), **fields):
         bootstrap_port=8998,
         bootstrap_room=ROOM,
         lora_name=None,
+        input_embeds=None,
+        positional_embed_overrides=None,
     )
     req.__dict__.update(fields)
     return req
@@ -47,6 +52,8 @@ def _prefill_req(origin_input_ids=PROMPT, **fields):
         bootstrap_room=ROOM,
         disagg_prefill_dp_rank=None,
         lora_name=None,
+        input_embeds=None,
+        positional_embed_overrides=None,
     )
     req.__dict__.update(fields)
     return req
@@ -91,6 +98,53 @@ class TestLoraInFingerprint(CustomTestCase):
     def test_same_adapter_on_both_sides_agrees(self):
         decode_fp, prefill_fp = _fingerprints(
             _decode_req(lora_name="adapter-a"), _prefill_req(lora_name="adapter-a")
+        )
+        self.assertEqual(decode_fp, prefill_fp)
+
+
+class TestEmbeddingsInFingerprint(CustomTestCase):
+    def test_same_placeholder_ids_with_other_input_embeds_differ(self):
+        # The scheduler gives every input_embeds request dummy ids of the same length.
+        dummy = [1] * 4
+        (a,) = _fingerprints(
+            prefill_req=_prefill_req(dummy, input_embeds=[[0.25] * 8] * 4)
+        )
+        (b,) = _fingerprints(
+            decode_req=_decode_req(dummy, input_embeds=[[0.5] * 8] * 4)
+        )
+        self.assertNotEqual(a, b)
+
+    def test_same_input_embeds_agree(self):
+        dummy, embeds = [1] * 4, [[0.25] * 8] * 4
+        decode_fp, prefill_fp = _fingerprints(
+            _decode_req(dummy, input_embeds=[list(row) for row in embeds]),
+            _prefill_req(dummy, input_embeds=embeds),
+        )
+        self.assertEqual(decode_fp, prefill_fp)
+
+    def test_overrides_with_other_vectors_or_positions_differ(self):
+        base = PositionalEmbeds(embeds=torch.ones(2, 8), positions=[1, 3])
+        (a,) = _fingerprints(prefill_req=_prefill_req(positional_embed_overrides=base))
+        others = {
+            "vectors": PositionalEmbeds(embeds=torch.zeros(2, 8), positions=[1, 3]),
+            "positions": PositionalEmbeds(embeds=torch.ones(2, 8), positions=[1, 2]),
+            "none": None,
+        }
+        for name, other in others.items():
+            with self.subTest(other=name):
+                (b,) = _fingerprints(
+                    decode_req=_decode_req(positional_embed_overrides=other)
+                )
+                self.assertNotEqual(a, b)
+
+    def test_equal_overrides_agree(self):
+        # Each server builds its own tensor from the request, so equal values must match.
+        def override():
+            return PositionalEmbeds(embeds=torch.ones(2, 8) * 0.5, positions=[1, 3])
+
+        decode_fp, prefill_fp = _fingerprints(
+            _decode_req(positional_embed_overrides=override()),
+            _prefill_req(positional_embed_overrides=override()),
         )
         self.assertEqual(decode_fp, prefill_fp)
 

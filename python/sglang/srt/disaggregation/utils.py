@@ -337,20 +337,45 @@ def pre_alloc_fill_len(req: Req) -> int:
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
 
+def _update_with_float_rows(digest, rows) -> None:
+    """Feed embedding rows to the digest as float32, one row at a time."""
+    if isinstance(rows, torch.Tensor):
+        # One device-to-host copy for the whole tensor, then the rows are hashed on the host.
+        rows = rows.detach().to("cpu", torch.float32).numpy()
+    digest.update(array("q", [len(rows)]))
+    for row in rows:
+        # A list row is converted on its own, so no copy of the whole input is made.
+        data = np.asarray(row, dtype=np.float32)
+        digest.update(array("q", [data.size]))
+        digest.update(data.tobytes())
+
+
 def kv_transfer_fingerprint(
-    *token_id_runs: Sequence[int], lora_name: Optional[str] = None
+    *token_id_runs: Sequence[int],
+    lora_name: Optional[str] = None,
+    input_embeds=None,
+    positional_embed_overrides=None,
 ) -> str:
     """Digest of the ids a PD request fills KV for; prefill and decode must agree."""
     digest = hashlib.blake2b(digest_size=8)
     for token_ids in token_id_runs:
         digest.update(array("q", token_ids))
+    # Token ids are never negative, so each negative marker below cannot be read as ids.
     if lora_name is not None:
         # The KV depends on the adapter, so the adapter name is part of the digest.
         # lora_id is not used, because a dynamic load mints it per server.
-        # Token ids are never negative, so the -1 marker cannot be read as ids.
         name = lora_name.encode()
         digest.update(array("q", [-1, len(name)]))
         digest.update(name)
+    if input_embeds is not None:
+        # An input_embeds request carries placeholder ids, so the embeddings are its prompt.
+        digest.update(array("q", [-2]))
+        _update_with_float_rows(digest, input_embeds)
+    if positional_embed_overrides is not None:
+        # Overrides replace the embeddings at their positions, so vectors and positions both count.
+        digest.update(array("q", [-3, len(positional_embed_overrides.positions)]))
+        digest.update(array("q", positional_embed_overrides.positions))
+        _update_with_float_rows(digest, positional_embed_overrides.embeds)
     return digest.hexdigest()
 
 

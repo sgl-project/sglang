@@ -287,6 +287,8 @@ class TestBootstrapRoomOwner(CustomTestCase):
                     routing_key=None,
                     disagg_prefill_dp_rank=None,
                     lora_name=None,
+                    input_embeds=None,
+                    positional_embed_overrides=None,
                 )
                 prefill_ids = (
                     Req.build_rebootstrap_payload(decode_req)["input_ids"]
@@ -299,6 +301,8 @@ class TestBootstrapRoomOwner(CustomTestCase):
                     bootstrap_room=ROOM,
                     disagg_prefill_dp_rank=None,
                     lora_name=None,
+                    input_embeds=None,
+                    positional_embed_overrides=None,
                 )
                 kv_class = MagicMock()
                 decode_queue = decode_module.DecodePreallocQueue.__new__(
