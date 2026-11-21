@@ -82,11 +82,15 @@ def causal_conv1d_fn(
     out: (batch, dim, seqlen)
     """
     # Use Triton when: (1) there is no compiled conv1d kernel for this device,
-    # or (2) input is non-contiguous and seq_lens_cpu is pre-computed by caller.
+    # (2) input is non-contiguous and seq_lens_cpu is pre-computed by caller, or
+    # (3) conv_states has a different dtype than x (e.g. SGLANG_MAMBA_CONV_DTYPE=float32),
+    # since the compiled kernel requires states and x to share a dtype.
     # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
     # copy that can cost >0.6 ms/layer on large prefill batches.
-    use_triton = not _HAS_CONV1D_KERNEL or (
-        x.stride(-1) != 1 and "seq_lens_cpu" in kwargs
+    use_triton = (
+        not _HAS_CONV1D_KERNEL
+        or (x.stride(-1) != 1 and "seq_lens_cpu" in kwargs)
+        or (conv_states is not None and conv_states.dtype != x.dtype)
     )
     if use_triton:
         if "seq_lens_cpu" not in kwargs:
@@ -157,7 +161,9 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
-    use_triton = not _HAS_CONV1D_KERNEL
+    use_triton = not _HAS_CONV1D_KERNEL or (
+        conv_state is not None and conv_state.dtype != x.dtype
+    )
     if use_triton:
         return _causal_conv1d_update_triton(
             x,
