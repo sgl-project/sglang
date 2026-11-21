@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sampling parameters of Kandinsky 6 video super-resolution (video -> video)."""
 
-import os
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -111,14 +109,6 @@ class Kandinsky6SRSamplingParams(SamplingParams):
                 )
             path = path[0]
         return path
-
-    def _set_output_file_name(self):
-        path = self.source_video_path() if self.video_path is not None else None
-        if self.output_file_name is None and path:
-            stem = os.path.splitext(os.path.basename(path))[0]
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = f"{stem}_sr{self.sr_resolution_scale:g}x_{stamp}"
-        super()._set_output_file_name()
 
 
 __all__ = ["Kandinsky6SRSamplingParams"]

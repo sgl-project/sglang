@@ -83,7 +83,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.req_types import MultimodalInputs
+    from sglang.srt.managers.req_types import MultimodalInputs, TokenIdRows
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -238,6 +238,18 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def input_candidate_selectors(batch: ScheduleBatch) -> Optional[List[Optional[Any]]]:
+    """The requests' input candidate selectors, or None when an extend batch
+    has none: only prefill reads them."""
+    if (
+        not batch.return_logprob
+        or not batch.forward_mode.is_extend_without_speculative()
+    ):
+        return None
+    selectors = [req.logprob.input_candidate_selector for req in batch.reqs]
+    return selectors if any(s is not None for s in selectors) else None
 
 
 def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
@@ -541,7 +553,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    input_candidate_selectors: Optional[List[Optional[Any]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -1076,6 +1089,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
+            input_candidate_selectors=input_candidate_selectors(batch),
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
