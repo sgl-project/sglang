@@ -14,15 +14,7 @@ import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from time import perf_counter
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -30,6 +22,7 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.utils import MappedRegions
+from sglang.multimodal_gen.runtime.managers.memory_managers import shared_pinned_store
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
     LAYERWISE_OFFLOAD,
@@ -494,6 +487,26 @@ def _pinned_empty(*size: int, dtype: torch.dtype, stride=None) -> torch.Tensor:
     if stride is None:
         return torch.empty(*size, dtype=dtype, pin_memory=True)
     return torch.empty_strided(size=shape, stride=stride, dtype=dtype, pin_memory=True)
+
+
+def _store_holds(buf, dtype, offsets, contiguous_weights) -> bool:
+    """Whether a shared store holds the weights this process loaded.
+
+    The key naming a store is structural -- the manager cannot see which
+    checkpoint the weights came from -- so the bytes are compared rather than
+    trusted. A store holding different weights is refused, and the caller falls
+    back to a private allocation.
+    """
+    store = torch.frombuffer(buf, dtype=dtype)
+    for name, _weight, local_weight in contiguous_weights:
+        off = offsets[name]
+        source = local_weight.flatten()
+        if source.device.type != "cpu":
+            source = source.to("cpu")
+        stored = store[off : off + source.numel()]
+        if not torch.equal(stored.view(torch.uint8), source.view(torch.uint8)):
+            return False
+    return True
 
 
 class _DirectReader:
@@ -1023,8 +1036,19 @@ class LayerwiseOffloadManager:
         residency_lifetime: str = RESIDENCY_LIFETIME_FORWARD,
         pin_budget: HostPinBudget | None = None,
         pin_component_name: str = "layerwise offload",
+        store_shard: int = 0,
     ) -> None:
         self.model = model
+        # Which slice of a folded component this rank holds. Only folded
+        # components have more than one; see _shared_store_key.
+        self._store_shard = store_shard
+        # One pool per slice: only the pool's owner may create its segments, so
+        # two slices sharing a pool would leave one of them unpublished.
+        self._store_pool = (
+            f"{pin_component_name}#s{store_shard}"
+            if store_shard
+            else pin_component_name
+        )
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
         self._synchronous_mps = current_platform.is_mps()
@@ -1124,6 +1148,7 @@ class LayerwiseOffloadManager:
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
         # stores the consolidated weight from a same layer, of same dtype
         self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
+        self._shared_cpu_weights: set[tuple[int, torch.dtype]] = set()
         # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
         # stores tensors whose original non-contiguous stride/layout must be preserved
         self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -1497,6 +1522,20 @@ class LayerwiseOffloadManager:
             placed_bytes / (1 << 30),
         )
 
+    def _shared_store_key(self, layer_idx: int, dtype, total_numel: int) -> str:
+        """Structural name of one layer store, shared across co-resident runs.
+
+        It names the store's shape, not the checkpoint that filled it: a store
+        holding other weights is refused by the byte comparison instead. A
+        folded component holds a different slice of every layer per rank, so
+        the slice has to be part of the name -- otherwise two ranks collide on
+        one name and both fall back private. The same slice in another engine
+        still produces the same name, which is what makes a folded component
+        shareable at all.
+        """
+        name = f"{self._pin_component_name}:{layer_idx}:{dtype}:{total_numel}"
+        return f"{name}:s{self._store_shard}" if self._store_shard else name
+
     def _initialize_host_stores(
         self, layer_groups: Dict, layer_hosting: Dict[int, str]
     ) -> Iterator[torch.UntypedStorage]:
@@ -1594,13 +1633,40 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                cpu_buffer, populated = self._prepare_host_buffer(
-                    contiguous_weights,
-                    aligned_offsets,
-                    total_numel,
-                    dtype,
-                    pin_this_layer,
-                )
+                shared = None
+                if pin_this_layer and envs.SGLANG_DIFFUSION_SHARE_PINNED_STORES:
+                    shared = shared_pinned_store.begin(
+                        self._shared_store_key(layer_idx, dtype, total_numel),
+                        total_numel * dtype.itemsize,
+                        lambda buf: _store_holds(
+                            buf, dtype, aligned_offsets, contiguous_weights
+                        ),
+                        pool=self._store_pool,
+                    )
+                if shared is not None:
+                    cpu_buffer = shared.tensor(dtype)
+                    if shared.created:
+                        for name, _weight, local_weight in contiguous_weights:
+                            off = aligned_offsets[name]
+                            count = local_weight.numel()
+                            cpu_buffer[off : off + count].copy_(local_weight.flatten())
+                    if shared_pinned_store.commit(shared):
+                        self._shared_cpu_weights.add((layer_idx, dtype))
+                        populated = True
+                    else:
+                        # Parameters still hold the originals. Drop every view
+                        # before closing the failed mapping, then let the normal
+                        # private path create the allocation whose lease is yielded.
+                        del cpu_buffer
+                        shared = None
+                if shared is None:
+                    cpu_buffer, populated = self._prepare_host_buffer(
+                        contiguous_weights,
+                        aligned_offsets,
+                        total_numel,
+                        dtype,
+                        pin_this_layer,
+                    )
                 if pin_this_layer:
                     yield cpu_buffer.untyped_storage()
 
@@ -1627,6 +1693,9 @@ class LayerwiseOffloadManager:
                     current_offset += numel
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+        if envs.SGLANG_DIFFUSION_SHARE_PINNED_STORES:
+            shared_pinned_store.summary(self._store_pool)
 
     @staticmethod
     def _prepare_host_buffer(
@@ -2441,6 +2510,7 @@ class LayerwiseOffloadManager:
             )
 
         self._consolidated_cpu_weights.clear()
+        self._shared_cpu_weights.clear()
         self._strided_cpu_weights.clear()
         self._mapped_cpu_weights.clear()
         self._mps_cpu_weights.clear()
@@ -2481,7 +2551,7 @@ class LayerwiseOffloadManager:
             gpu_weight = target_local.flatten().cpu()
 
             dtype = meta["dtype"]
-            cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+            cpu_buffer = self._writable_cpu_buffer(layer_idx, dtype)
             offset = meta["offset"]
             numel = meta["numel"]
             cpu_buffer[offset : offset + numel].copy_(gpu_weight)
@@ -2503,6 +2573,34 @@ class LayerwiseOffloadManager:
         if src.device.type == "cuda" and not src.is_contiguous():
             src = src.contiguous()
         dest.copy_(src)
+
+    def _writable_cpu_buffer(self, layer_idx: int, dtype: torch.dtype) -> torch.Tensor:
+        """Detach shared weights before any refit, LoRA or device writeback."""
+        buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+        key = (layer_idx, dtype)
+        if key not in self._shared_cpu_weights:
+            return buffer
+
+        # The shared lease still belongs to its last tensor view. Book a new
+        # allowance for the private copy; when there is no headroom, a pageable
+        # copy preserves isolation without overrunning the pin budget.
+        nbytes = buffer.numel() * buffer.element_size()
+        pin = self._pin_budget.request(
+            component_name=self._pin_component_name, weight_bytes=nbytes
+        )
+        if pin:
+            try:
+                private = _pinned_empty(buffer.numel(), dtype=dtype)
+            except Exception:
+                self._pin_budget.release(nbytes)
+                raise
+            self._pin_budget.track_storage(private.untyped_storage())
+        else:
+            private = torch.empty(buffer.numel(), dtype=dtype)
+        private.copy_(buffer)
+        self._consolidated_cpu_weights[layer_idx][dtype] = private
+        self._shared_cpu_weights.remove(key)
+        return private
 
     @torch.compiler.disable
     def update_cpu_weights(
@@ -2621,7 +2719,7 @@ class LayerwiseOffloadManager:
             else:
                 offset = meta["offset"]
                 numel = meta["numel"]
-                cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+                cpu_buffer = self._writable_cpu_buffer(layer_idx, dtype)
                 self._issue_host_copy(
                     cpu_buffer[offset : offset + numel], src.flatten()
                 )
@@ -2764,6 +2862,13 @@ class LayerwiseOffloadManager:
 
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
+
+    def _layerwise_store_shard(self) -> int:
+        """Which slice of this component this rank holds; 0 when it holds all.
+
+        Only a folded encoder shards its weights, and an encoder overrides this.
+        """
+        return 0
 
     # whether the current module is selected by the `dit` group
     layerwise_offload_dit_group_enabled: bool = True
@@ -3121,6 +3226,7 @@ class LayerwiseOffloadableModuleMixin:
                 initialize=False,
                 residency_policy=residency_policy,
                 residency_lifetime=residency_lifetime,
+                store_shard=self._layerwise_store_shard(),
             )
             self.layerwise_offload_managers.append(manager)
 
