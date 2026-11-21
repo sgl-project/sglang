@@ -69,7 +69,6 @@ def mla_gluon_dcp_unsupported_reason(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> str | None:
-    # Why aiter's Gluon MLA cannot run a DCP decode or verify here, or None if it can.
     # Mirrors mla_gluon's bh16 asserts as of ROCm/aiter@285579b62 (aiter/ops/triton/gluon/mla_gluon.py);
     # update it when aiter relaxes them.
     mla_gluon = _gluon_fn()

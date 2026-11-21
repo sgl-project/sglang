@@ -595,7 +595,15 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
     """DCP over a non-fp8 KV cache must fail at backend build when Gluon cannot run it;
     fp8-cache routes to Gluon (e.g. a Gluon verify) must still start."""
 
-    def _build(self, *, kv_cache_dtype, verify_backend="asm", dcp_size=8):
+    def _build(
+        self,
+        *,
+        kv_cache_dtype,
+        verify_backend="asm",
+        dcp_size=8,
+        decode_backend="aiter",
+        speculative_algorithm="EAGLE",
+    ):
         # Kimi K3 at TP8 DCP8 (96 gathered heads, 4 draft tokens),
         # on a Gluon that cannot run it, so any route that reaches Gluon must raise.
         from sglang.srt.configs.model_config import AttentionArch
@@ -604,7 +612,7 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
         runner = mock.Mock(
             kv_cache_dtype=kv_cache_dtype,
             device="cpu",
-            decode_attention_backend_str="aiter",
+            decode_attention_backend_str=decode_backend,
         )
         runner.req_to_token_pool.size = 4
         cfg = runner.model_config
@@ -623,7 +631,7 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
             envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override(verify_backend),
             get_context().override_server_args(
                 page_size=1,
-                speculative_algorithm="EAGLE",
+                speculative_algorithm=speculative_algorithm,
                 speculative_num_draft_tokens=4,
                 speculative_num_steps=3,
                 speculative_attention_mode="decode",
@@ -657,6 +665,15 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
 
     def test_bf16_cache_without_dcp_is_not_checked(self):
         be = self._build(kv_cache_dtype=torch.bfloat16, dcp_size=1)
+        self.assertFalse(be.use_mla_dcp_asm)
+
+    def test_bf16_cache_on_a_backend_that_never_decodes_is_not_checked(self):
+        # e.g. --prefill-attention-backend aiter --decode-attention-backend triton
+        be = self._build(
+            kv_cache_dtype=torch.bfloat16,
+            decode_backend="triton",
+            speculative_algorithm=None,
+        )
         self.assertFalse(be.use_mla_dcp_asm)
 
     def test_fp8_cache_with_a_gluon_verify_still_starts(self):

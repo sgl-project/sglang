@@ -3,12 +3,12 @@
 import itertools
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.aiter_mla_gluon import _gluon_fn
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -20,8 +20,6 @@ HEAD_DIM = KV_LORA + ROPE
 SCALING = HEAD_DIM**-0.5
 
 
-# The tolerances below are loose sanity bounds, not measured error: the empty-row assertions are exact, and
-# these only catch NaN, stale or zeroed values in the other rows (bf16 and a8w8 fp8 rounding is the floor).
 def _reference(q, kv, kv_lens, offsets):
     # fp32 attention over each row's local KV -> (out, natural-log lse).
     out = torch.zeros(len(kv_lens), NUM_HEADS, KV_LORA, device=q.device)
@@ -85,6 +83,8 @@ class TestMlaDcpDecodeEmptyRowsGfx950(CustomTestCase):
         empty = torch.tensor([n == 0 for n in kv_lens], device=device)
         self.assertTrue(torch.all(out[empty] == 0))
         self.assertTrue(torch.all(lse[empty] == -1e30))
+        # Loose sanity bounds, not measured error: the empty-row assertions above are exact,
+        # and these only catch NaN, stale or zeroed values in the other rows.
         torch.testing.assert_close(
             out[~empty].float(), ref_out[~empty], atol=atol, rtol=atol
         )
@@ -149,10 +149,7 @@ class TestMlaDcpDecodeEmptyRowsGfx950(CustomTestCase):
 
         _poison_cached_blocks(n_rows, device)
         # Rank 1 returns its prefix partial without attending the verify window.
-        with mock.patch(
-            "sglang.srt.layers.attention.aiter_backend.get_parallel",
-            return_value=SimpleNamespace(attn_dcp_rank=1),
-        ):
+        with get_parallel().override(attn_dcp_size=2, attn_dcp_rank=1):
             out, lse = be._forward_verify_dcp(q, None, layer, k_descale=1.0)
         self._check(out, lse, q, kv, kv_lens, atol=2e-2)
 
