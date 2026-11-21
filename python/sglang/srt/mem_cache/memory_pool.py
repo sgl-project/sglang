@@ -47,9 +47,12 @@ from sglang.kernels.ops.kvcache.cache_move import (
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    NVFP4_DS_MLA_ROW_BYTES,
+    dequantize_nvfp4_ds_mla,
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_cast_triton,
     set_mla_kv_buffer_dcp_sharded_triton,
+    set_mla_kv_buffer_nvfp4_ds_mla_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -4283,6 +4286,7 @@ class HybridLinearKVPool(KVCache):
         skip_topk_layers: Optional[List[bool]] = None,
         kv_scale_ue8m0: bool = False,
         fp8_cast_on_write: bool = False,
+        nvfp4_ds_mla: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4354,6 +4358,9 @@ class HybridLinearKVPool(KVCache):
                 if host_to_device_ratio is None
                 else {"host_to_device_ratio": host_to_device_ratio}
             )
+            # Only DSATokenToKVPool takes the flag (HiSparse rejects nvfp4_ds_mla
+            # at startup, and its pool class has no such argument).
+            nvfp4_kwargs = {"nvfp4_ds_mla": True} if nvfp4_ds_mla else {}
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4374,6 +4381,7 @@ class HybridLinearKVPool(KVCache):
                 fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
+                **nvfp4_kwargs,
             )
         else:
             MLAPoolClass = (
@@ -4432,6 +4440,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def use_fp4_indexer(self) -> bool:
         return getattr(self.full_kv_pool, "use_fp4_indexer", False)
+
+    @property
+    def dsa_kv_nvfp4(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_nvfp4", False)
 
     @property
     def kv_cache_dim(self):
@@ -4892,6 +4904,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         use_dsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
         dcp_replicated: bool = False,
+        nvfp4_ds_mla: bool = False,
     ):
         super().__init__(
             size,
@@ -4908,16 +4921,26 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
         self.dcp_replicated = dcp_replicated
+        # NVFP4 D576 rows for the Prims-TS DSA backend (352 B/token, see
+        # NVFP4_DS_MLA_ROW_BYTES): quantized on write, read only by Prims-TS.
+        self.dsa_kv_nvfp4 = bool(use_dsa and nvfp4_ds_mla)
+        if self.dsa_kv_nvfp4:
+            assert (
+                dtype == torch.float8_e4m3fn
+                and override_kv_cache_dim == NVFP4_DS_MLA_ROW_BYTES
+                and (kv_lora_rank, qk_rope_head_dim) == (512, 64)
+            ), "NVFP4 DSA KV needs fp8_e4m3 storage and the D576 latent"
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
+            and not self.dsa_kv_nvfp4
         )
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8 or self.dsa_kv_nvfp4
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -5087,6 +5110,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_nvfp4, "NVFP4 DSA KV is written by set_mla_kv_buffer"
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
         assert (
@@ -5121,7 +5145,20 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if (
+        if self.dsa_kv_nvfp4:
+            # Quantize BF16 (or already-E4M3) rows to the NVFP4 D576 record in
+            # the scatter. The kernel keeps rows with loc % world == rank, so a
+            # span of 1 must pass rank 0.
+            world = self._write_loc_dcp_span
+            set_mla_kv_buffer_nvfp4_ds_mla_triton(
+                dst_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                dcp_world_size=world,
+                dcp_rank=get_parallel().attn_dcp_rank if world > 1 else 0,
+            )
+        elif (
             _is_hip
             and self.use_dsa
             and self.dtype == fp8_dtype
@@ -5235,6 +5272,13 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         )
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
+        if self.dsa_kv_nvfp4:
+            rows = kv_buffer.view(torch.uint8).view(-1, self.kv_cache_dim)
+            nope, rope = dequantize_nvfp4_ds_mla(rows[loc.long()], torch.float32)
+            return (
+                nope.to(dst_dtype).unsqueeze(1),
+                rope.to(dst_dtype).unsqueeze(1),
+            )
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,
@@ -5511,10 +5555,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
+        nvfp4_ds_mla: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
+        if nvfp4_ds_mla != (kv_cache_dim == NVFP4_DS_MLA_ROW_BYTES):
+            raise ValueError(
+                f"DSA pool kv_cache_dim={kv_cache_dim} disagrees with "
+                f"nvfp4_ds_mla={nvfp4_ds_mla} ({NVFP4_DS_MLA_ROW_BYTES} B rows are "
+                "nvfp4_ds_mla records and nothing else)."
+            )
 
         super().__init__(
             size,
@@ -5530,6 +5581,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             use_dsa=True,
             override_kv_cache_dim=override_dim,
             dcp_replicated=dcp_replicated,
+            nvfp4_ds_mla=nvfp4_ds_mla,
         )
         self.kv_scale_ue8m0 = kv_scale_ue8m0
         # Only the raw fp8 layout (no fp8_ds_mla tiles) casts on write.
@@ -5538,6 +5590,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             and _is_cuda
             and dtype == torch.float8_e4m3fn
             and not self.dsa_kv_cache_store_fp8
+            and not self.dsa_kv_nvfp4
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32

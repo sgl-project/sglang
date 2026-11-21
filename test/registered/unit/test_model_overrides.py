@@ -4888,6 +4888,74 @@ class TestKimiK31HiSparseDsaBackends(CustomTestCase):
             self._resolve(dsa_decode_backend="trtllm")
 
 
+class TestKimiK31Nvfp4DsMlaBackends(CustomTestCase):
+    """--kv-cache-dtype nvfp4_ds_mla: Kimi-K3.1 DSA resolves both phases to
+    prims_ts, the only reader of the records."""
+
+    @staticmethod
+    def _resolve(*, capability=(10, 0), latent=(512, 64), **fields):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
+
+        hf = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        args = dict(
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=False,
+            dcp_size=1,
+        )
+        args.update(fields)
+        model_config = SimpleNamespace(
+            hf_config=hf, kv_lora_rank=latent[0], qk_rope_head_dim=latent[1]
+        )
+        view = ResolvedView(SimpleNamespace(_model_config=model_config, **args))
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=capability),
+        ):
+            return _dsa_split_backend_resolution(view)
+
+    def test_nvfp4_ds_mla_selects_prims_ts_with_dcp(self):
+        """nvfp4_ds_mla rows have one reader (Prims-TS): an unset phase must not
+        fall back to the flashmla_kv default, and DCP stays allowed."""
+        both = {"dsa_prefill_backend": "prims_ts", "dsa_decode_backend": "prims_ts"}
+        self.assertEqual(self._resolve(kv_cache_dtype="nvfp4_ds_mla"), both)
+        self.assertEqual(self._resolve(kv_cache_dtype="nvfp4_ds_mla", dcp_size=8), both)
+
+    def test_nvfp4_ds_mla_rejections(self):
+        cases = [
+            (dict(dsa_decode_backend="trtllm"), "read only by the prims_ts"),
+            (dict(dsa_prefill_backend="flashmla_kv"), "read only by the prims_ts"),
+            (dict(capability=(9, 0)), "SM100 or SM103"),
+            (dict(capability=(12, 0)), "SM100 or SM103"),
+            (dict(latent=(512, 0)), "D576"),
+        ]
+        for fields, pattern in cases:
+            with self.subTest(**fields):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    self._resolve(kv_cache_dtype="nvfp4_ds_mla", **fields)
+
+    def test_kv_cache_dtype_accepts_nvfp4_ds_mla_not_fp4_recipe(self):
+        from sglang.srt.arg_groups.overrides import _kimi_k31_kv_cache_dtype
+
+        with override_platform(is_hip=False):
+            self.assertEqual(
+                _kimi_k31_kv_cache_dtype(
+                    SimpleNamespace(kv_cache_dtype="nvfp4_ds_mla")
+                ),
+                {},
+            )
+            # "nvfp4" is the float4_e2m1fn_x2 pool recipe, a different layout.
+            with self.assertRaisesRegex(ValueError, "nvfp4_ds_mla"):
+                _kimi_k31_kv_cache_dtype(SimpleNamespace(kv_cache_dtype="nvfp4"))
+
+
 class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
     """The deterministic fallback must not hand XPU a CUDA-only backend.
 

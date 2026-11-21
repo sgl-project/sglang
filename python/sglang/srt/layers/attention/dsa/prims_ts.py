@@ -4,7 +4,9 @@ The kernel reads the raw FP8 MLA cache rows that the ``trtllm`` DSA backend writ
 (576 B/token: 512 NoPE + 64 RoPE E4M3, one per-tensor scale) with an E4M3 query
 and FP8 QK/PV MMA, and returns BF16 output with a natural-log LSE. It shares the
 ``trtllm`` route's query preparation, KV store, top-k transforms and DCP slot
-localization; only the attention kernel differs.
+localization; only the attention kernel differs. With ``--kv-cache-dtype
+nvfp4_ds_mla`` it reads 352 B NVFP4 records instead (``kv_cache_format
+"nvfp4.fp8rope"``; layout in ``sglang.kernels.ops.kvcache.mla_buffer``).
 """
 
 from __future__ import annotations
@@ -28,8 +30,18 @@ def _plan_capacity(rows: int) -> Optional[int]:
     return 1 << (rows - 1).bit_length()
 
 
+# Bytes per cache row: raw E4M3 D576, and the nvfp4_ds_mla record
+# (sglang.kernels.ops.kvcache.mla_buffer.NVFP4_DS_MLA_ROW_BYTES).
+_ROW_BYTES = {"native": 576, "nvfp4.fp8rope": 352}
+
+
 def check_prims_ts_sparse_mla_support(
-    *, device: torch.device, num_heads: int, kv_lora_rank: int, qk_rope_head_dim: int
+    *,
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    kv_cache_format: str = "native",
 ) -> None:
     """Fail at startup, not at the first forward, when the installed FlashInfer
     cannot plan the D576 native-E4M3 sparse MLA this backend needs."""
@@ -53,14 +65,14 @@ def check_prims_ts_sparse_mla_support(
             max_topk=2048,
             q_dtype=torch.float8_e4m3fn,
             qk_rope_head_dim=qk_rope_head_dim,
-            kv_cache_format="native",
+            kv_cache_format=kv_cache_format,
             return_lse=True,
         )
-    except (ImportError, TypeError, ValueError, NotImplementedError) as exc:
+    except (ImportError, TypeError, ValueError, NotImplementedError, KeyError) as exc:
         raise RuntimeError(
-            "--dsa-*-backend prims_ts needs FlashInfer Prims-TS with D576 native-FP8 "
-            "sparse MLA (flashinfer-ai/flashinfer#7410 and #7984; #8186 on SM107): "
-            f"{exc}"
+            f"--dsa-*-backend prims_ts needs FlashInfer Prims-TS with D576 "
+            f"{kv_cache_format} sparse MLA (flashinfer-ai/flashinfer#7410 and #7984; "
+            f"#8186 on SM107): {exc}"
         ) from exc
 
 
@@ -71,11 +83,17 @@ class PrimsTSSparseMLA:
     runner's eager warmups plan every captured row count before its capture.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, kv_cache_format: str = "native"):
         # Plans compare tensor devices with this one, so it carries the index.
         if device.index is None:
             device = torch.device(device.type, torch.cuda.current_device())
         self.device = device
+        # "native": raw E4M3 rows of 576 B. "nvfp4.fp8rope": 352 B records of
+        # E2M1 NoPE + unscaled E4M3 RoPE + E4M3 block16 scales (no global scale).
+        assert kv_cache_format in ("native", "nvfp4.fp8rope"), kv_cache_format
+        self.kv_cache_format = kv_cache_format
+        self.nvfp4 = kv_cache_format == "nvfp4.fp8rope"
+        self.row_bytes = _ROW_BYTES[kv_cache_format]
         self._plans: dict[tuple[int, int, int, bool], object] = {}
         # packed plans' [0, rows] query offsets, keyed like _plans
         self._qo_indptr: dict[tuple[int, int, int, bool], torch.Tensor] = {}
@@ -104,7 +122,7 @@ class PrimsTSSparseMLA:
             packed_query=packed,
             q_dtype=torch.float8_e4m3fn,
             qk_rope_head_dim=64,
-            kv_cache_format="native",
+            kv_cache_format=self.kv_cache_format,
             return_lse=True,
         )
         self._plans[key] = wrapper
@@ -122,8 +140,9 @@ class PrimsTSSparseMLA:
         sm_scale: float,
         kv_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """q [rows, H, 576] E4M3; kv_cache raw rows viewable as [N, 576] E4M3;
-        indices [rows, K] int32 cache rows (-1 holes); lengths [rows] int32 <= K.
+        """q [rows, H, 576] E4M3; kv_cache raw rows viewable as [N, 576] E4M3
+        (native) or [N, 352] uint8 records (nvfp4.fp8rope); indices [rows, K]
+        int32 cache rows (-1 holes); lengths [rows] int32 <= K.
         Returns BF16 [rows, H, 512] and natural-log LSE [rows, H] (-inf, zero
         output for a row with no keys)."""
         rows, heads, head_dim = q.shape
@@ -132,10 +151,20 @@ class PrimsTSSparseMLA:
         if rows == 0:
             return out, lse
         width = indices.shape[1]
+        row_bytes = kv_cache.shape[-1] * kv_cache.element_size()
+        if row_bytes != self.row_bytes:
+            raise ValueError(
+                f"Prims-TS {self.kv_cache_format} reads {self.row_bytes} B cache rows; "
+                f"got {row_bytes} B (--kv-cache-dtype and the pool layout disagree)."
+            )
         wrapper, qo_indptr = self._wrapper(rows=rows, heads=heads, width=width)
-        kv_rows = kv_cache.view(torch.float8_e4m3fn).view(-1, head_dim)
+        if self.nvfp4:
+            kv_rows = kv_cache.view(torch.uint8).view(-1, self.row_bytes)
+        else:
+            kv_rows = kv_cache.view(torch.float8_e4m3fn).view(-1, head_dim)
         # The per-tensor KV descale multiplies both the QK logits and the
-        # weighted V sum; the query is cast unscaled.
+        # weighted V sum; the query is cast unscaled. nvfp4_ds_mla has none
+        # (kv_scale 1, checked at backend init).
         kwargs = dict(
             softmax_scale=sm_scale * kv_scale,
             output_scale=kv_scale,
