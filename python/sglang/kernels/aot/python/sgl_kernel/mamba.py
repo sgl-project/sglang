@@ -79,7 +79,7 @@ def causal_conv1d_update_cpu(
     mixed_qkv, conv_states, conv_weights, bias, activation, conv_state_indices
 ):
     return torch.ops.sgl_kernel.causal_conv1d_update_cpu(
-        mixed_qkv,
+        mixed_qkv.contiguous(),
         conv_states,
         conv_weights,
         bias,

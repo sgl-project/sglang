@@ -128,17 +128,31 @@ class TestBiasedGroupedTopK(CustomTestCase):
                 for gating_dtype in [torch.float32, torch.bfloat16]:
                     for routed_scaling_factor in [None, 1.125]:
                         for E_num in [128, 192, 256, 384]:
-                            self._run_single_test(
-                                34,
-                                E_num,
-                                8,
-                                8,
-                                2,
-                                renormalize,
-                                gating_dtype,
-                                bias_dtype,
-                                routed_scaling_factor,
-                            )
+                            for topk in [6, 8, 22]:
+                                self._run_single_test(
+                                    34,
+                                    E_num,
+                                    8,
+                                    topk,
+                                    2,
+                                    renormalize,
+                                    gating_dtype,
+                                    bias_dtype,
+                                    routed_scaling_factor,
+                                )
+
+                        # Nemotron-3-Super-120B uses 512 experts with topk=22.
+                        self._run_single_test(
+                            34,
+                            512,
+                            8,
+                            22,
+                            2,
+                            renormalize,
+                            gating_dtype,
+                            bias_dtype,
+                            routed_scaling_factor,
+                        )
 
 
 class TestBiasedTopK(CustomTestCase):

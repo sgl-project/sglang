@@ -227,7 +227,9 @@ void causal_conv1d_fwd_kernel_impl(
     int64_t dim,
     int64_t seqlen,
     int64_t width,
-    int64_t num_seq_blocks) {
+    int64_t num_seq_blocks,
+    int64_t num_cache_lines,
+    int64_t pad_slot_id) {
   // handle 32 x 64 per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n() * 2;
@@ -251,8 +253,18 @@ void causal_conv1d_fwd_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
-        const bool has_initial_states_value = has_conv_states ? has_initial_state[bs] : false;
+        const bool has_initial_states_value = has_conv_states && has_initial_state != nullptr && has_initial_state[bs];
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (has_conv_indices && conv_state_index == pad_slot_id) {
+          for (int64_t m = 0; m < mb_size; ++m) {
+            std::memset(out + bs * seqlen * dim + (mb_start + m) * dim + nb_start, 0, nb_size * sizeof(scalar_t));
+          }
+          data_index_step(mb, num_seq_blocks, nb, NB);
+          continue;
+        }
+        if (has_conv_states) {
+          TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
+        }
 
         switch (width << 4 | nb_size >> 4) {
           case 0x42:
@@ -275,26 +287,35 @@ void causal_conv1d_fwd_kernel_impl(
   if (has_conv_states) {
     at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
       for (int64_t bs = begin; bs < end; ++bs) {
+        int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (has_conv_indices && conv_state_index == pad_slot_id) {
+          continue;
+        }
+        TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
         update_conv_state(
-            conv_states + bs * (width - 1) * dim, input + bs * seqlen * dim, width, dim, seqlen, has_initial_state[bs]);
+            conv_states + conv_state_index * (width - 1) * dim,
+            input + bs * seqlen * dim,
+            width,
+            dim,
+            seqlen,
+            has_initial_state != nullptr && has_initial_state[bs]);
       }
     });
   }
 }
 
-#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                   \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply( \
-      input + batch_offset * dim + mb_start * dim + nb_start,       \
-      weight + nb_start * width,                                    \
-      out + batch_offset * dim + mb_start * dim + nb_start,         \
-      has_bias ? bias + nb_start : nullptr,                         \
-      nullptr,                                                      \
-      false,                                                        \
-      mb_size,                                                      \
-      dim,                                                          \
+#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                                                     \
+  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                                   \
+      input + batch_offset * dim + mb_start * dim + nb_start,                                         \
+      weight + nb_start * width,                                                                      \
+      out + batch_offset * dim + mb_start * dim + nb_start,                                           \
+      has_bias ? bias + nb_start : nullptr,                                                           \
+      has_initial_states_value ? conv_states + conv_state_index * (K - 1) * dim + nb_start : nullptr, \
+      has_initial_states_value,                                                                       \
+      mb_size,                                                                                        \
+      dim,                                                                                            \
       mb_start == 0);
 
-// TODO: add `has_initial_state` support for varlen kernel
 template <typename scalar_t>
 void causal_conv1d_fwd_varlen_kernel_impl(
     scalar_t* __restrict__ out,
@@ -306,6 +327,8 @@ void causal_conv1d_fwd_varlen_kernel_impl(
     const int32_t* __restrict__ conv_indices,
     const bool* __restrict__ has_initial_state,
     const int32_t* __restrict__ block_indices,
+    int64_t num_cache_lines,
+    int64_t pad_slot_id,
     bool silu_activation,
     int64_t batch,
     int64_t dim,
@@ -335,6 +358,19 @@ void causal_conv1d_fwd_varlen_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
+        int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (has_conv_indices && conv_state_index == pad_slot_id) {
+          for (int64_t m = 0; m < mb_size; ++m) {
+            std::memset(out + batch_offset * dim + (mb_start + m) * dim + nb_start, 0, nb_size * sizeof(scalar_t));
+          }
+          data_index_step(mb, num_seq_blocks, nb, NB);
+          continue;
+        }
+        if (has_conv_states) {
+          TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
+        }
+        const bool has_initial_states_value = has_conv_states && has_initial_state != nullptr && has_initial_state[bs];
+
         switch (width << 4 | nb_size >> 4) {
           case 0x42:
             LAUNCH_TINYGEMM_VARLEN_KERNEL(4, 32);
@@ -357,15 +393,20 @@ void causal_conv1d_fwd_varlen_kernel_impl(
     at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
       for (int64_t bs = begin; bs < end; ++bs) {
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (has_conv_indices && conv_state_index == pad_slot_id) {
+          continue;
+        }
+        TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
         int32_t seqlen = query_start_loc[bs + 1] - query_start_loc[bs];
         int32_t batch_offset = query_start_loc[bs];
+        const bool has_initial_states_value = has_initial_state != nullptr && has_initial_state[bs];
         update_conv_state(
             conv_states + conv_state_index * (width - 1) * dim,
             input + batch_offset * dim,
             width,
             dim,
             seqlen,
-            /* has_initial_state */ false);
+            has_initial_states_value);
       }
     });
   }
@@ -383,7 +424,9 @@ void causal_conv1d_update_kernel_impl(
     int64_t batch,
     int64_t dim,
     int64_t seqlen,
-    int64_t width) {
+    int64_t width,
+    int64_t num_cache_lines,
+    int64_t pad_slot_id) {
   // handle 32 x 64 per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n() * 2;
@@ -406,6 +449,12 @@ void causal_conv1d_update_kernel_impl(
 
         const bool has_initial_states_value = true;
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (has_conv_indices && conv_state_index == pad_slot_id) {
+          std::memset(out + bs * dim + nb_start, 0, nb_size * sizeof(scalar_t));
+          data_index_step(bs, batch, nb, NB);
+          continue;
+        }
+        TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
 
         switch (width << 4 | nb_size >> 4) {
           case 0x42:
@@ -431,6 +480,10 @@ void causal_conv1d_update_kernel_impl(
     for (int64_t bs = begin; bs < end; ++bs) {
       // update old states, range [1, width - 1)
       int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+      if (has_conv_indices && conv_state_index == pad_slot_id) {
+        continue;
+      }
+      TORCH_CHECK(conv_state_index >= 0 && conv_state_index < num_cache_lines, "conv state index out of range");
       for (int64_t w = 1; w < width - 1; ++w) {
         std::memcpy(CONV_STATE_INDEXR(w - 1), CONV_STATE_INDEXR(w), dim * sizeof(scalar_t));
       }
@@ -608,6 +661,8 @@ at::Tensor causal_conv1d_fwd_cpu(
           conditional_data_ptr<int32_t>(conv_state_indices),
           conditional_data_ptr<bool>(has_initial_state),
           block_indices.data_ptr<int32_t>(),
+          conv_states.has_value() ? conv_states.value().size(0) : 0,
+          pad_slot_id,
           silu_activation,
           batch,
           dim,
@@ -627,7 +682,9 @@ at::Tensor causal_conv1d_fwd_cpu(
           dim,
           seqlen,
           width,
-          num_seq_blocks);
+          num_seq_blocks,
+          conv_states.has_value() ? conv_states.value().size(0) : 0,
+          pad_slot_id);
     }
   });
   return out;
@@ -697,7 +754,9 @@ at::Tensor causal_conv1d_update_cpu(
         batch,
         dim,
         seqlen,
-        width);
+        width,
+        conv_states.size(0),
+        pad_slot_id);
   });
   return out;
 }
