@@ -680,8 +680,9 @@ class DsparkVerifyEpilogue:
         self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
-        # Per captured static batch size; the sampling-accept region's replays read them.
-        self.static_io: dict[int, StaticVerifyIO] = {}
+        # Per captured static verify graph, by batch size and hidden output address
+        # (one batch size can have several graphs). Sampling-accept replays read them.
+        self.static_io: dict[tuple[int, int], StaticVerifyIO] = {}
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -753,7 +754,7 @@ class DsparkVerifyEpilogue:
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
         if capturing:
-            self.static_io[bs] = io
+            self.static_io[(bs, io.hidden.data_ptr())] = io
         committed_engram = self.run_static(
             io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
         )
