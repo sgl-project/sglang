@@ -99,6 +99,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
     get_spec,
+    is_control_broadcast_local,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -207,8 +208,7 @@ class TokenizerControlMixin:
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
-            get_parallel().attn_dp_enabled
-            and not get_parallel().enable_dp_attention_local_control_broadcast
+            get_parallel().attn_dp_enabled and not is_control_broadcast_local()
         )
         if primary_group_control:
             control_fan_out = (

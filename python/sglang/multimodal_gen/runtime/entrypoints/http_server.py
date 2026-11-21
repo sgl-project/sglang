@@ -510,45 +510,48 @@ async def stop_profile():
     errors = []
     profile_id = _global_profiler_state.get("profile_id", "unknown")
 
+    host_failed = False
     try:
-        # 1. Stop profiler in HTTP Server process
         profiler = _global_profiler_state["profiler"]
         if profiler is not None:
-            profiler.stop(export_trace=True, dump_rank=None)  # Save for all ranks
-
-        stop_req = StopProfileReq(export_trace=True)
-        try:
-            response = await async_scheduler_client.forward(stop_req)
-            if response.error:
-                errors.append(f"GPU Worker: {response.error}")
-        except Exception as e:
-            errors.append(f"GPU Worker: {str(e)}")
-
-        _global_profiler_state["profiler"] = None
-        _global_profiler_state["is_profiling"] = False
-        _global_profiler_state["profile_id"] = None
-
-        logger.info(f"Profilers stopped (profile_id={profile_id}). Traces saved.")
-
-        if errors:
-            return Response(
-                content=f"Profiling stopped (profile_id={profile_id}) with warnings: {'; '.join(errors)}\n",
-                status_code=200,
-            )
-        return Response(
-            content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
-            status_code=200,
-        )
-
+            profiler.stop(export_trace=True, dump_rank=None)
     except Exception as e:
-        logger.error(f"Failed to stop profiler: {e}")
+        host_failed = True
+        errors.append(f"HTTP Server: {e}")
+
+    try:
+        response = await async_scheduler_client.forward(
+            StopProfileReq(export_trace=True)
+        )
+        if response.error:
+            errors.append(f"GPU Worker: {response.error}")
+    except Exception as e:
+        errors.append(f"GPU Worker: {e}")
+    finally:
         _global_profiler_state["profiler"] = None
         _global_profiler_state["is_profiling"] = False
         _global_profiler_state["profile_id"] = None
-        return Response(
-            content=f"Failed to stop profiler: {str(e)}\n",
-            status_code=500,
+
+    if errors:
+        details = "; ".join(errors)
+        if host_failed:
+            logger.error(
+                "Failed to stop profiler (profile_id=%s): %s", profile_id, details
+            )
+            return Response(
+                content=f"Failed to stop profiler: {details}\n", status_code=500
+            )
+        message = (
+            f"Profiling stopped (profile_id={profile_id}) with warnings: {details}"
         )
+        logger.warning(message)
+        return Response(content=f"{message}\n", status_code=200)
+
+    logger.info("Profilers stopped (profile_id=%s).", profile_id)
+    return Response(
+        content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
+        status_code=200,
+    )
 
 
 def make_serializable(obj):

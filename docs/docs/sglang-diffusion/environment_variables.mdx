@@ -46,7 +46,7 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_TORCH_PROFILER_DIR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Directory for torch profiler traces (absolute path). Enables profiling when set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Directory for the torch profiler traces of requests that ask for profiling (<code>profile</code> / <code>--profile</code>); it does not enable profiling by itself. Falls back to <code>SGLANG_TORCH_PROFILER_DIR</code>, then <code>./logs</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_CACHE_ROOT</code></td>
@@ -428,12 +428,12 @@ These variables configure S3-compatible cloud storage for automatically uploadin
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_S3_ACCESS_KEY_ID`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AWS Access Key ID</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Optional explicit access key ID. Leave both key variables unset to use Boto3's credential providers.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_S3_SECRET_ACCESS_KEY`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AWS Secret Access Key</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Secret key for the explicit access key ID. Not needed for an IAM role.</td>
     </tr>
   </tbody>
 </table>

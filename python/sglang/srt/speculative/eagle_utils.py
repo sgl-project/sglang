@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.core import WatermarkState
+    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -748,8 +748,7 @@ def eagle_sample(
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
     *,
-    watermark_state: Optional[WatermarkState] = None,
-    watermark_full_mask: bool = True,
+    watermark: Optional[VerifyWatermark] = None,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
@@ -768,9 +767,7 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
+    from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -797,8 +794,7 @@ def eagle_sample(
         verify_input=verify_input,
         batch=batch,
         grammar_mask=grammar_mask,
-        watermark=watermark_state is not None
-        and sampling_info.has_watermark_candidates,
+        watermark=watermark is not None,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -811,21 +807,9 @@ def eagle_sample(
 
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
+    apply_acc_penalties(
+        next_token_logits, sampling_info, rows_per_request=verify_input.draft_token_num
+    )
     if sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -837,45 +821,18 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
-    watermark_context_hashes = None
-    watermark_selected = None
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        if batch.return_logprob:
+    if watermark is not None:
+        next_token_logits, sampling_info = watermark.apply(
+            next_token_logits,
+            sampling_info=sampling_info,
+            req_pool_indices=batch.req_pool_indices,
+            draft_tokens=verify_input.draft_token,
+            positions=verify_input.positions,
+            draft_token_num=verify_input.draft_token_num,
+            custom_mask=verify_input.custom_mask,
             # compute_spec_logprobs reads logits_output after verify.
-            next_token_logits = next_token_logits.clone()
-        if next_token_logits.is_cuda:
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative_from_tree(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    draft_tokens=verify_input.draft_token,
-                    custom_mask=verify_input.custom_mask,
-                    positions=verify_input.positions,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                    full_mask=watermark_full_mask,
-                )
-            )
-        else:
-            contexts, context_lengths = watermark_state.speculative_contexts(
-                req_pool_indices=batch.req_pool_indices,
-                draft_tokens=verify_input.draft_token,
-                custom_mask=verify_input.custom_mask,
-                positions=verify_input.positions,
-                draft_token_num=verify_input.draft_token_num,
-                full_mask=watermark_full_mask,
-                context_windows=watermark_state.context_windows(sampling_info),
-            )
-            watermark_context_hashes, watermark_selected = (
-                watermark_state.force_speculative(
-                    logits=next_token_logits,
-                    req_pool_indices=batch.req_pool_indices,
-                    contexts=contexts,
-                    context_lengths=context_lengths,
-                    sampling_info=sampling_info,
-                    draft_token_num=verify_input.draft_token_num,
-                )
-            )
+            keep_logits=batch.return_logprob,
+        )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -923,8 +880,7 @@ def eagle_sample(
         simulated_acc_len=simulated_acc_len,
         simulate_acc_len=SIMULATE_ACC_LEN,
         simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
-        watermark=watermark_state is not None
-        and sampling_info.has_watermark_candidates,
+        watermark=watermark is not None,
     )
     fused_verify = chain and (greedy or sparse or vocab_shard is not None)
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
@@ -1231,15 +1187,21 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
-    if watermark_state is not None and sampling_info.has_watermark_candidates:
-        watermark_state.record_speculative(
-            batch.req_pool_indices,
-            watermark_context_hashes,
-            watermark_selected,
-            accept_index,
-            accept_lens,
-        )
+    if watermark is not None:
+        watermark.record(accept_index, accept_lens)
     return predict, accept_lens, accept_index
+
+
+def commit_accept_tokens_to_penalties(
+    sampling_info: SamplingBatchInfo,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+) -> None:
+    if sampling_info.step_penalties is not None:
+        # Guarded here: building the arguments launches device work.
+        sampling_info.step_penalties.commit(
+            predict[accept_index.clamp(min=0)], accept_mask=accept_index >= 0
+        )
 
 
 def _chain_accept_applies(
@@ -1329,11 +1291,6 @@ def _verify_outputs(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
