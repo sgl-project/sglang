@@ -282,6 +282,7 @@ def _runner(result=(True, "ok")):
         ("weight", torch.tensor([1.0]))
     ]
     runner.weight_updater.load_rejection.return_value = None
+    runner.weight_updater.end_weight_update.return_value = None
     return runner
 
 
@@ -307,9 +308,27 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
-        patcher = patch("torch.distributed.barrier")
+        patcher = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # a single rank, whose gathers return its own outcome
+        group_gather = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            side_effect=lambda obj: [obj],
+        )
+        group_gather.start()
+        self.addCleanup(group_gather.stop)
+        gather = patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
+        )
+        gather.start()
+        self.addCleanup(gather.stop)
+        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
         self.recorded = []
 
     def _build_manager(self, target, draft):
@@ -402,7 +421,9 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
-        with patch("torch.distributed.barrier"):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
+        ):
             output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
@@ -508,6 +529,33 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
                 run_post_load=False
             )
 
+    def test_end_reports_an_incomplete_update_and_closes_the_session(self):
+        """A fused param whose other half never arrived keeps old values; the caller must hear it."""
+        target, draft = _runner(), _runner()
+        draft.weight_updater.end_weight_update.return_value = "only one half"
+        manager = self._manager(target, draft)
+
+        output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "draft: only one half")
+        target.weight_updater.end_weight_update.assert_called_once()
+        self.assertIsNone(manager._session)
+
+    def test_end_reports_other_ranks_incomplete_update_once(self):
+        """Only one rank of the group replies: halves left unpaired on its peers fail its reply, named once."""
+        manager = self._manager(_runner())
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[None, "target: only one half", "target: only one half"],
+        ):
+            output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "target: only one half")
+        self.assertIsNone(manager._session)
+
     def test_session_selector_confines_begin_and_end_to_selected_runners(self):
         """end finalizing a runner begin never restored would repack unrestored weights."""
         target, draft = _runner(), _runner()
@@ -559,15 +607,6 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
 class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
     def setUp(self):
         super().setUp()
-        gather = patch(
-            "torch.distributed.all_gather_object",
-            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
-        )
-        gather.start()
-        self.addCleanup(gather.stop)
-        override = get_parallel().override(tp_rank=0, tp_size=1)
-        override.__enter__()
-        self.addCleanup(override.__exit__, None, None, None)
         self.flushes = []
 
     def _manager_serving(self, handlers, *, target=None, draft=None, session=True):
@@ -725,10 +764,10 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
         manager.scheduler = None
         manager.memory_saver_adapter = Mock()
 
-        def a_peer_is_busy(busy, **kwargs):
-            busy.fill_(1)
-
-        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
+        with patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
+            return_value=[True, False],
+        ):
             output = manager.release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
             )
@@ -751,15 +790,6 @@ class _RecordingStream:
 class TestWeightWritesWaitForLaunchedForward(_WeightUpdaterManagerTestBase):
     def setUp(self):
         super().setUp()
-        gather = patch(
-            "torch.distributed.all_gather_object",
-            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
-        )
-        gather.start()
-        self.addCleanup(gather.stop)
-        override = get_parallel().override(tp_rank=0, tp_size=1)
-        override.__enter__()
-        self.addCleanup(override.__exit__, None, None, None)
 
         def transport(*, context, payload):
             self.log.append("write transport")

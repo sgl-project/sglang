@@ -243,6 +243,7 @@ class ComposedPipelineBase(ABC):
                     self.model_path,
                     allow_patterns=[f"{model_subfolder}/**"],
                     revision=self.server_args.revision,
+                    model_subfolder=model_subfolder,
                 )
             model_path = os.path.join(model_root, model_subfolder)
 
