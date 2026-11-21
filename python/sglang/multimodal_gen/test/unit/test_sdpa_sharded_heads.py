@@ -7,7 +7,6 @@ the per-shard outputs must then equal the unsharded output bit for bit.
 The padding serves "exact" quality requests only."""
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -17,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     CudnnSDPAImpl,
     SDPAImpl,
 )
+from sglang.multimodal_gen.runtime.managers import forward_context
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,22 +33,24 @@ def _impl(cls=SDPAImpl, heads=_GLOBAL_HEADS, head_dim=128, **kwargs):
     )
 
 
-def _qkv(seq_len, head_dim, dtype=torch.bfloat16, heads=_GLOBAL_HEADS):
+def _qkv(seq_len, head_dim, dtype=torch.bfloat16, heads=_GLOBAL_HEADS, batch=1):
     generator = torch.Generator(device="cuda").manual_seed(seq_len + head_dim)
     return tuple(
         torch.randn(
-            1, seq_len, heads, head_dim, device="cuda", dtype=dtype, generator=generator
+            batch,
+            seq_len,
+            heads,
+            head_dim,
+            device="cuda",
+            dtype=dtype,
+            generator=generator,
         )
         for _ in range(3)
     )
 
 
 def _request(quality="exact"):
-    return set_forward_context(
-        current_timestep=0,
-        attn_metadata=None,
-        forward_batch=SimpleNamespace(quality=quality),
-    )
+    return set_forward_context(current_timestep=0, attn_metadata=None, quality=quality)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -122,6 +124,15 @@ class TestSDPAShardedHeads(CustomTestCase):
         with self.subTest("lossless request"), _request("lossless"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
+        with (
+            self.subTest("no forward context"),
+            patch.object(forward_context, "_forward_context", None),
+        ):
+            impl = _impl(heads=6, global_num_heads=24)
+            self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
+        with self.subTest("rocm"), patch.object(torch.version, "hip", "6.4"):
+            impl = _impl(heads=6, global_num_heads=24)
+            self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
         with self.subTest("short keys never split"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 128), 1025)
@@ -130,6 +141,39 @@ class TestSDPAShardedHeads(CustomTestCase):
             self.assertEqual(
                 _impl(heads=6, global_num_heads=24)._unsplit_query_len(short, 1025), 64
             )
+
+    @torch.no_grad()
+    def test_padded_output_keeps_the_unpadded_layout(self):
+        """A padded call returns the contiguous [B, S, H, D] layout of an unpadded one,
+        which callers such as HunyuanVideo's single-stream block view as [B, S, H * D]."""
+        probe = torch.empty(1, 6, 1025, 128, device="cuda", dtype=torch.bfloat16)
+        impl = _impl(heads=6, global_num_heads=_GLOBAL_HEADS)
+        if impl._unsplit_query_len(probe, 1025) == 1025:
+            self.skipTest("too few SMs for these shapes to split")
+        for batch in (1, 2):
+            with self.subTest(batch=batch):
+                query, key, value = _qkv(1025, 128, batch=batch)
+                shard_probe = query[:, :, :6].transpose(1, 2)
+                self.assertGreater(impl._unsplit_query_len(shard_probe, 1025), 1025)
+                expected = F.scaled_dot_product_attention(
+                    *(x.transpose(1, 2) for x in (query, key, value)),
+                    scale=128**-0.5,
+                ).transpose(1, 2)
+                shards = [
+                    impl.forward(q, k, v, None)
+                    for q, k, v in zip(
+                        query.split(6, dim=2),
+                        key.split(6, dim=2),
+                        value.split(6, dim=2),
+                    )
+                ]
+                for shard in shards:
+                    self.assertEqual(tuple(shard.shape), (batch, 1025, 6, 128))
+                    self.assertTrue(shard.is_contiguous())
+                    shard.view(batch, 1025, -1)
+                torch.testing.assert_close(
+                    torch.cat(shards, dim=2), expected, atol=0, rtol=0
+                )
 
     @torch.no_grad()
     def test_causal_and_masked_calls_are_not_padded(self):

@@ -64,8 +64,7 @@ def _request_quality_is_exact() -> bool:
     # Split versus unsplit flash only moves rounding, which "lossless" allows;
     # the slower unsplit kernel is reserved for "exact" requests.
     context = get_forward_context_or_none()
-    batch = getattr(context, "forward_batch", None)
-    return getattr(batch, "quality", None) == "exact"
+    return context is not None and context.quality == "exact"
 
 
 def torch_default_sdpa_backends():
@@ -136,6 +135,8 @@ class SDPAImpl(AttentionImpl):
             or heads >= self.global_num_heads
             or self.dropout
             or not query.is_cuda
+            # ROCm SDPA does not use the CUDA flash split heuristic modeled here.
+            or torch.version.hip is not None
             or query.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
             or key_len <= _FLASH_UNSPLIT_KEY_LEN
@@ -189,25 +190,22 @@ class SDPAImpl(AttentionImpl):
         }
         if query.shape[1] != key.shape[1]:
             attn_kwargs["enable_gqa"] = True
-        query_len = query.shape[-2]
+        batch, heads, query_len, head_dim = query.shape
+        padded_len = query_len
         if attn_mask is None and not is_causal:
             padded_len = self._unsplit_query_len(query, key.shape[-2])
-            if padded_len > query_len:
-                query = torch.cat(
-                    [
-                        query,
-                        query.new_zeros(
-                            *query.shape[:2], padded_len - query_len, query.shape[-1]
-                        ),
-                    ],
-                    dim=2,
-                )
+        if padded_len > query_len:
+            # Pad in the caller's [B, S, H, D] layout: flash allocates its output
+            # with the query's strides, and callers view the result as [B, S, H * D].
+            padding = query.new_zeros(batch, padded_len - query_len, heads, head_dim)
+            query = torch.cat([query.transpose(1, 2), padding], dim=1).transpose(1, 2)
         with self._sdpa_context(query):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **attn_kwargs
             )
-        output = output[:, :, :query_len].transpose(1, 2)
-        return output
+        if padded_len > query_len:
+            return output[:, :, :query_len].transpose(1, 2).contiguous()
+        return output.transpose(1, 2)
 
     def forward_varlen(
         self,

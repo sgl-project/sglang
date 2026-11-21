@@ -62,9 +62,7 @@ def _worker() -> int:
     torch.set_default_dtype(torch.bfloat16)
 
     request = set_forward_context(
-        current_timestep=0,
-        attn_metadata=None,
-        forward_batch=SimpleNamespace(quality="exact"),
+        current_timestep=0, attn_metadata=None, quality="exact"
     )
     request.__enter__()
 

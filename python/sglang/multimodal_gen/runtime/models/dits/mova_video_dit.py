@@ -228,6 +228,7 @@ class CrossAttention(_MOVAAttention):
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
             num_heads=self.num_heads_per_rank,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
