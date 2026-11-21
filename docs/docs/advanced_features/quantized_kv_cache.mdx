@@ -35,6 +35,8 @@ FP4 quantization is currently experimental.
 - **`nvfp4`**: NVIDIA FP4 with 16-value blocks, E4M3 block scales, and a per-tensor global scale.
 - **`fp4_mx_block16`**: An E2M1 block-size-16 compatibility recipe. It is distinct from the standard OCP MXFP4 block-size-32 format.
 
+DeepSeek-style sparse attention (DSA) models can also store their MLA cache as NVFP4 records with `nvfp4_ds_mla`, read by the `prims_ts` DSA backend; see [DSA NVFP4 MLA records](#dsa-nvfp4-mla-records).
+
 ### Platform-registered formats
 
 A hardware platform plugin can register further `--kv-cache-dtype` values for KV cache formats that only its own KV pool implements (see the [SGLang Plugin System](/docs/hardware-platforms/plugin#platform-registered-kv-cache-dtypes)). The platform defines each format's layout and attention kernels. Every in-tree platform rejects these values at startup, and PD disaggregation, hierarchical KV cache, LMCache and `--prefill-only-disable-kv-cache` are not supported with them.
@@ -138,6 +140,41 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 **FP4 (MXFP4)**: Unlike FP8, FP4 quantization handles scaling factors automatically on-the-fly during quantization and dequantization. No pre-quantized models or external scaling factor files are required—the block-based scaling factors are computed dynamically as needed.
 </Tip>
 
+<a id="dsa-nvfp4-mla-records" />
+
+### DSA NVFP4 MLA records (`nvfp4_ds_mla`)
+
+For DSA models with the D576 MLA latent (`kv_lora_rank` 512, `qk_rope_head_dim` 64), such as Kimi-K3.1, `--kv-cache-dtype nvfp4_ds_mla` stores each token of the DSA MLA cache as a 352-byte NVFP4 record instead of a 576-byte raw FP8 row. The record is FlashInfer Prims-TS's `nvfp4.fp8rope` format:
+
+| Bytes | Content |
+|---|---|
+| `[0, 256)` | the 512 NoPE values as E2M1, two per byte |
+| `[256, 320)` | the 64 RoPE values as unscaled E4M3 |
+| `[320, 352)` | 32 E4M3 block-16 scales (block `b` at byte `320 + 8*(b%4) + b//4`); no global scale |
+
+Rows are quantized as they are written, and only the `prims_ts` DSA backend reads them, with E4M3 queries. The 132-byte index-K cache is unchanged, so a DSA layer stores 484 bytes per token instead of 708: about 1.46x more KV tokens in the same GPU memory, and 1.64x in the hierarchical (host) cache, which holds only the MLA rows.
+
+Requirements:
+- `--dsa-prefill-backend prims_ts` and `--dsa-decode-backend prims_ts`. An unset phase defaults to `prims_ts` with this dtype; any other DSA backend is rejected at startup.
+- An SM100 or SM103 GPU.
+- `--dcp-size` > 1 is supported.
+- With PD disaggregation, launch the prefill and decode servers with the same `--kv-cache-dtype`.
+- The records carry their own block scales, so a per-tensor KV scale loaded from the checkpoint is rejected.
+- A speculative draft model that is not a DSA model keeps an FP8 E4M3 KV cache.
+
+Add the flag to the model's usual launch command, for example a [Kimi-K3.1-Pro](/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro) recipe:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path moonshotai/Kimi-K3.1-Pro \
+    ... \
+    --kv-cache-dtype nvfp4_ds_mla \
+    --dsa-prefill-backend prims_ts \
+    --dsa-decode-backend prims_ts
+```
+
+The format helps where KV capacity limits prefix reuse, as in PD prefill pools. On Kimi-K3.1-Pro (GB300, PD disaggregation, agentic multi-turn traffic) it raised the GPU prefix-cache hit rate by about 13 points and cut P90 TTFT by 7-17%, with GSM8K unchanged (0.967 with either dtype). The NVFP4 attention kernel dequantizes the records, so per call it is somewhat slower than raw FP8; the dtype is opt-in for that reason.
+
 ## Performance Considerations
 
 ### Memory Savings
@@ -150,6 +187,8 @@ FP4 and FP8 quantization require additional memory for block-based scaling facto
 </Note>
 
 This enables longer context lengths or more concurrent requests within the same memory budget.
+
+For `nvfp4_ds_mla`, a DSA layer's MLA row shrinks from 576 to 352 bytes per token (708 to 484 bytes with the index-K cache), about 1.46x more tokens than `fp8_e4m3`.
 
 For native `nvfp4`, each logical scalar costs 0.5 bytes of packed FP4 data plus 1/16 byte of block-scale storage, compared with 2 bytes for BF16. The resulting theoretical KV-token capacity multiplier is `2 / 0.5625 = 3.56×`. The mixed SM100 recipe owns a second scale layout and a shared one-layer FP8 prefill workspace, so its exact capacity depends on the number of full-attention layers. SGLang includes those auxiliary buffers in its KV-pool sizing calculation.
 
