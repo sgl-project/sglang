@@ -768,7 +768,12 @@ fn prompt_dp_rank(
     if let (Some(rank), Some(provider), Some(tokens)) =
         (rank, &ctx.dp_rank_prefix_provider, &request.tokens)
     {
-        provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+        if let Some(chain) = &placement.media_chain {
+            provider.record_rank_chain(chain, &worker.url, rank);
+        } else if key.is_some() {
+            // Sticky routing skips the prefix lookup above.
+            provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+        }
     }
     rank
 }
