@@ -504,12 +504,17 @@ class Runtime:
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(self.generate_url, json=json_data) as response:
+                # A chunk can hold several events, or part of one.
+                buffer = b""
                 async for chunk, _ in response.content.iter_chunks():
-                    chunk = chunk.decode("utf-8")
-                    if chunk and chunk.startswith("data:"):
-                        if chunk == "data: [DONE]\n\n":
-                            break
-                        data = json.loads(chunk[5:].strip("\n"))
+                    *events, buffer = (buffer + chunk).split(b"\n\n")
+                    for event in events:
+                        event = event.decode("utf-8")
+                        if not event.startswith("data:"):
+                            continue
+                        if event == "data: [DONE]":
+                            return
+                        data = json.loads(event[5:])
                         if "text" in data:
                             cur = data["text"][pos:]
                             if cur:

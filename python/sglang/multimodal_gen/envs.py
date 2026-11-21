@@ -23,6 +23,13 @@ if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LOCAL_RANK: int = 0
+    SGLANG_DIFFUSION_ATTENTION_CONFIG: str | None = None
+    SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND: str | None = None
+    SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK: bool = False
+    SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN: bool = False
+    SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV: bool = False
+    SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION: bool = False
+    SGLANG_DIFFUSION_TORCH_PROFILER_DIR: str | None = None
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
@@ -42,6 +49,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_HOST_SPILL: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
+    SGLANG_TEST_NUM_INFERENCE_STEPS: int | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
@@ -55,9 +63,14 @@ if TYPE_CHECKING:
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
     SGLANG_DIFFUSION_IPC_A2A: bool = True
-    # copy-engine all-to-all for Ulysses groups of any size on one host; off by
-    # default while it is validated. Falls back to NCCL when unavailable.
-    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool = False
+    # copy-engine transport for the plain Ulysses all-to-all on one host: unset
+    # picks it where it measured faster than NCCL (see plain_exchange_ready),
+    # 1 forces it for every exchange, 0 keeps NCCL
+    SGLANG_DIFFUSION_IPC_A2A_MULTI: bool | None = None
+    # Ordinary unquantized FlashInfer Ulysses; overrides the IPC pipeline.
+    # Set identically on every rank. Uneven sequence shards retain their transport.
+    SGLANG_DIFFUSION_FLASHINFER_ULYSSES: bool = False
+    SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND: str = "auto"
     # head groups for pipelining the Ulysses exchange against dense attention
     # over the copy-engine transport (MiniMax-H3, and USPAttention's plain path),
     # or over the collective one for MiniMax-H3 on aiter:
@@ -175,6 +188,15 @@ def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
     return lambda: get_bool_env_var(key, default)
 
 
+def _lazy_optional_bool(key: str) -> Callable[[], bool | None]:
+    def _getter():
+        if os.getenv(key) is None:
+            return None
+        return get_bool_env_var(key)
+
+    return _getter
+
+
 def _lazy_path(
     key: str, default_func: Callable[[], str] | None = None
 ) -> Callable[[], str | None]:
@@ -269,8 +291,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Import an installed package that registers out-of-tree diffusion models
     # and pipelines. This is shared with the SRT model plugin mechanism.
     "SGLANG_EXTERNAL_MODEL_PACKAGE": _lazy_str("SGLANG_EXTERNAL_MODEL_PACKAGE", ""),
-    # Enables torch profiler if set. Path to the directory where torch profiler
-    # traces are saved. Note that it must be an absolute path.
+    # Trace directory for requests sent with profile=True; it does not enable
+    # profiling. Falls back to SGLANG_TORCH_PROFILER_DIR, then ./logs.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
     ),
@@ -305,6 +327,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
         "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
     ),
+    # Test hook: run every request with this many denoising steps instead of
+    # its own count, so CI on slow runners stays short.
+    "SGLANG_TEST_NUM_INFERENCE_STEPS": _lazy_int("SGLANG_TEST_NUM_INFERENCE_STEPS"),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
@@ -401,8 +426,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
-    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
-        "SGLANG_DIFFUSION_IPC_A2A_MULTI", "false"
+    "SGLANG_DIFFUSION_FLASHINFER_ULYSSES": _lazy_bool(
+        "SGLANG_DIFFUSION_FLASHINFER_ULYSSES", "false"
+    ),
+    "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND": lambda: os.getenv(
+        "SGLANG_DIFFUSION_FLASHINFER_ULYSSES_BACKEND", "auto"
+    ),
+    "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_optional_bool(
+        "SGLANG_DIFFUSION_IPC_A2A_MULTI"
     ),
     "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
         "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1

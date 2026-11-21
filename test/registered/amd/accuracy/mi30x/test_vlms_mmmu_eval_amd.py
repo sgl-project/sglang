@@ -97,7 +97,8 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.25,
         "extra_args": [
             "--trust-remote-code",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--mem-fraction-static",
             "0.70",
             "--max-total-tokens",

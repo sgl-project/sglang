@@ -436,6 +436,7 @@ def fetch_server_context(
         )
     if (
         info.get("disable_cuda_graph")
+        or info.get("disable_decode_cuda_graph")
         or info.get("cuda_graph_backend_decode") == "disabled"
     ):
         raise ValueError(

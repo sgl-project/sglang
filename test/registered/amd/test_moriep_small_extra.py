@@ -255,7 +255,7 @@ class TestEPLBMoriStat(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
-        env["SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"] = "32"
+        env["SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE"] = "32"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"

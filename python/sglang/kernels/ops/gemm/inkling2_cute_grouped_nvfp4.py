@@ -1867,7 +1867,7 @@ def routed_swap_matmul(
 ):
     """out[r] = values[r] @ weight[e].T for the routed rows r of each local expert
     e (offsets[e] <= r < offsets[e] + counts[e]); values/x_scales are what the routed
-    quantize kernels write, scales what swizzle_weight_scales returns, schedule is route_metadata's 128-row block
+    quantize kernels write, scales what swizzle_blockscale returns, schedule is route_metadata's 128-row block
     schedule. Other rows of out are left unset."""
     experts, n, packed = weight.shape
     k = packed * 2

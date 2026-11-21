@@ -21,7 +21,7 @@ ARG MINDIESD_VERSION="3.2.0"
 ARG TORCH_NPU_INDEX_URL="https://ascend.devcloud.huaweicloud.com/pypi/simple/"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
-ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post6
+ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post10
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
 ARG MODELSCOPE_VERSION=""
