@@ -1,23 +1,17 @@
 """Sampling-penalty history: output-token counts and lengths, one table row per
 penalized request, addressed by the request's penalty index.
 
-Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only
-queue writes; the tables are written, grown, and read on the sampling stream, so
-a step sees the tokens of every step sampled before it.
-
-A penalized request takes a penalty index at its first extend admission, and
-every extend admission resets its row and replays `output_ids` into it. A
-retraction keeps the index; the request's exit (`RequestRetirer`) frees it.
-
-A step reads and commits the indices it was built with. The scheduler admits no
-request between a step's build and its sampling, so none of those indices goes
-to another request before the step samples.
-
-Freeing the last live index drops the tables at once. That is safe because they
-were allocated on the sampling stream, so their memory goes only to later
-allocations there, after the kernels already issued; by the rule above, a step
-whose indices were all freed sees no live index and reads zeros and commits
-nothing, rather than indexing tables regrown for new requests.
+- Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only queue
+  writes; the tables are written, grown, and read on the sampling stream.
+- A request takes an index at its first extend admission; every extend admission
+  resets its row and replays `output_ids`. A retraction keeps the index;
+  `RequestRetirer` frees it at exit.
+- A step reads and commits the indices it was built with. No request is admitted
+  between a step's build and its sampling, so none of them is reused before then.
+- Freeing the last live index drops the tables at once. That is safe because they
+  were allocated on the sampling stream, so their memory goes only to later
+  allocations there. A step whose indices were all freed sees no live index:
+  it reads zeros and commits nothing.
 """
 
 from __future__ import annotations
@@ -165,8 +159,7 @@ class PenaltyStatusPool:
         weights = counted.to(torch.int32)
         token_ids = token_ids.clamp(0, self.vocab_size - 1)
         if token_ids.shape[1] == 1:
-            # Indices are distinct, so with one token each no (index, token) pair repeats
-            # and a plain add is exact.
+            # Indices are distinct, so no (index, token) pair repeats: a plain add is exact.
             self.counts[indices, token_ids.view(-1)] += weights.view(-1)
         else:
             self.counts.index_put_(
@@ -334,7 +327,7 @@ def _stop_token_ids(req, vocab_size: int) -> List[int]:
             else set()
         )
     )
-    # Out-of-vocab ids can never be sampled and would index outside the penalty tensor.
+    # Out-of-vocab ids would index outside the penalty tensor.
     return [
         token_id
         for token_id in stop_ids

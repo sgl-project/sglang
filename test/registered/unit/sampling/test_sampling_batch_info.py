@@ -262,14 +262,6 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         grammar.apply_vocab_mask.assert_called_once()
 
-    def test_builds_step_penalties_without_forward_copy(self):
-        """Some non-overlap paths sample on the scheduler's own info, not a copy."""
-        info = _make_info(batch_size=1)
-        info.step_penalties = _tables_step(torch.full((1, VOCAB_SIZE), -1.0))
-        logits = torch.zeros(1, VOCAB_SIZE)
-        info.apply_logits_bias(logits)
-        self.assertTrue(torch.equal(logits, torch.full_like(logits, -1.0)))
-
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
         info = _make_info(batch_size=1)

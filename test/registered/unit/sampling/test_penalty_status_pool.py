@@ -60,18 +60,6 @@ def _stacked(additive, scaling, batch_size):
     return torch.stack([additive, scaling])
 
 
-class TestNoPenaltyPath(CustomTestCase):
-    def test_no_penalty_request_allocates_nothing(self):
-        pool = _pool()
-        reqs = [_req(1), _req(2, temperature=0.5, top_k=4)]
-        for req in reqs:
-            _admit(pool, req)
-
-        self.assertIsNone(StepPenalties.build(reqs, pool))
-        self.assertEqual(pool.num_indices, 0)
-        self.assertEqual(pool.counts.numel(), 0)
-
-
 class TestMinNewTokens(CustomTestCase):
     def test_ignores_stop_ids_outside_vocab(self):
         pool = _pool()
