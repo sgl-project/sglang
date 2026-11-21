@@ -1,0 +1,31 @@
+{
+  "platform": {
+    "accelerator": {"name": "a100_sxm", "hbm_capacity_gb": 80}
+  },
+  "predictor": {
+    "name": "replay",
+    "database_path": "../assets/replay_table.json",
+    "miss_fallback_seconds": 0.001,
+    "miss_strategy": "zero"
+  },
+  "memory_budget": {
+    "provider": "simopus",
+    "provider_revision": "284f19f736cda6275870dc1b032ff850635aa01f",
+    "model_id": "Qwen/Qwen3-8B",
+    "model_revision": null,
+    "policy": {
+      "schema_version": 1,
+      "mem_fraction_static": 0.8,
+      "runtime_reserve_bytes": 2147483648
+    }
+  },
+  "scheduler": {
+    "tp_size": 2,
+    "ep_size": 1,
+    "pp_size": 1,
+    "dp_size": 1,
+    "cp_size": 1,
+    "data_type": "BF16",
+    "kv_cache_data_type": "BF16"
+  }
+}

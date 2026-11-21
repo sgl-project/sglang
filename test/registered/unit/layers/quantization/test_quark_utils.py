@@ -4,7 +4,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import os
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -104,6 +108,112 @@ class TestE8M0ToF32(CustomTestCase):
     def test_shape_preserved(self):
         x = torch.zeros((3, 4, 5), dtype=torch.uint8)
         self.assertEqual(tuple(e8m0_to_f32(x).shape), (3, 4, 5))
+
+
+class TestOptionalAiterImport(CustomTestCase):
+    def test_defers_aiter_and_delegates_actual_call(self):
+        env = os.environ.copy()
+        env.pop("SGLANG_SIMULATOR_BOOTSTRAP", None)
+        env.pop("SGLANG_USE_CPU_ENGINE", None)
+        source = (
+            Path(__file__).resolve().parents[5]
+            / "python/sglang/srt/layers/quantization/quark/utils.py"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-c",
+                """
+import builtins, importlib.abc, runpy, sys
+from types import ModuleType, SimpleNamespace
+
+torch = ModuleType('torch')
+torch.Tensor = object
+torch.nn = SimpleNamespace(Module=object)
+sys.modules['torch'] = torch
+
+attempts = []
+
+class BlockAiter(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == 'aiter' or fullname.startswith('aiter.'):
+            attempts.append(fullname)
+            raise ImportError('AITER intentionally absent')
+
+blocker = BlockAiter()
+sys.meta_path.insert(0, blocker)
+namespace = runpy.run_path(sys.argv[1])
+assert 'aiter' not in sys.modules
+assert attempts == []
+events = []
+
+class Input:
+    shape = (2, 3, 64)
+    def reshape(self, *shape):
+        events.append(('reshape', shape))
+        return self
+
+try:
+    namespace['b_dynamic_mxfp4_quant'](Input())
+except ImportError as error:
+    assert 'Failed to import aiter' in str(error)
+    assert isinstance(error.__cause__, ImportError)
+else:
+    raise AssertionError('the actual call must require AITER')
+assert events == []
+assert attempts == ['aiter']
+sys.meta_path.remove(blocker)
+
+class Result:
+    def __init__(self, name):
+        self.name = name
+    def view(self, *shape):
+        events.append((self.name, shape))
+        return (self.name, shape)
+
+def quantize(value):
+    assert isinstance(value, Input)
+    events.append(('quantize',))
+    return Result('packed'), Result('scales')
+
+for name in ('aiter', 'aiter.ops', 'aiter.ops.triton', 'aiter.ops.triton.quant'):
+    module = ModuleType(name)
+    module.__path__ = []
+    sys.modules[name] = module
+sys.modules['aiter.ops.triton.quant'].dynamic_mxfp4_quant = quantize
+imports = []
+original_import = builtins.__import__
+
+def observe_import(name, *args, **kwargs):
+    if name == 'aiter.ops.triton.quant':
+        imports.append(name)
+    return original_import(name, *args, **kwargs)
+
+def unexpected_quantizer(value):
+    raise AssertionError('a successful quantizer binding must remain cached')
+
+builtins.__import__ = observe_import
+try:
+    expected = (('packed', (2, 3, 32)), ('scales', (2, 3, 2)))
+    assert namespace['b_dynamic_mxfp4_quant'](Input()) == expected
+    sys.modules['aiter.ops.triton.quant'].dynamic_mxfp4_quant = unexpected_quantizer
+    assert namespace['b_dynamic_mxfp4_quant'](Input()) == expected
+finally:
+    builtins.__import__ = original_import
+assert imports == ['aiter.ops.triton.quant']
+assert events == [('reshape', (-1, 64)), ('quantize',),
+                  ('packed', (2, 3, 32)), ('scales', (2, 3, 2))] * 2
+""",
+                str(source),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 QKV_MAPPING = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
