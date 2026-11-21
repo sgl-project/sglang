@@ -865,8 +865,8 @@ def _requires_route_sort_aiter():
 
 
 def _k3_fused_moe_call(m, mode, device, num_experts, model_dim, inter_dim):
-    """The fused_moe keyword arguments the AITER runner passes a K3 layer:
-    preshuffled MXFP4 weights, SiTUv2, gate/up interleaved for A8W4."""
+    # The fused_moe keyword arguments the AITER runner passes a K3 layer:
+    # preshuffled MXFP4 weights, SiTUv2, gate/up interleaved for A8W4.
     from aiter import ActivationType, QuantType, dtypes
     from aiter.ops.flydsl.moe_common import GateMode
 
@@ -989,8 +989,7 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     sizes = [1, 16, 64, 65, 128, 256, 512]
     expected = {}
     for m in sizes:
-        block_m = aiter_block_m(get_2stage_cfgs(**consumer.cfg_args(m)))
-        expected[m] = block_m if m <= moe_route_radix4.SORT_MAX_TOKENS else None
+        expected[m] = aiter_block_m(get_2stage_cfgs(**consumer.cfg_args(m)))
     registered = {}
     for m in sizes:
         registrations = []
@@ -1007,6 +1006,44 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
             select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
         registered[m] = registrations[0]["block_m"] if len(registrations) == 2 else None
     assert registered == expected
+
+
+def test_sort_tail_declines_on_a_cu_masked_stream():
+    """A stream restricted to fewer CUs than the sort tail has helper CTAs
+    must not launch the fused sort, since the helpers would wait forever."""
+    import ctypes
+
+    hip = ctypes.CDLL("libamdhip64.so")
+    cus = torch.cuda.get_device_properties(0).multi_processor_count
+    words = (cus + 31) // 32
+    mask = (ctypes.c_uint32 * words)()
+    mask[0] = 0xFF  # 8 CUs: fewer than the 16 helpers of a 256-token tail
+    handle = ctypes.c_void_p()
+    hip.hipExtStreamCreateWithCUMask.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    assert hip.hipExtStreamCreateWithCUMask(ctypes.byref(handle), words, mask) == 0
+    try:
+        scores = torch.zeros((256, NUM_EXPERTS), dtype=torch.float32, device="cuda")
+        bias = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda")
+        sort_ws = moe_route_radix4.new_sort_workspace(scores.device)
+        with torch.cuda.stream(torch.cuda.ExternalStream(handle.value)):
+            assert moe_route_radix4.sort_tail_fits(64, scores.device)
+            assert not moe_route_radix4.sort_tail_fits(256, scores.device)
+            with pytest.raises(RuntimeError, match="too few CUs"):
+                moe_route_radix4.route_radix4_with_sort(
+                    scores,
+                    bias,
+                    TOPK,
+                    True,
+                    2.5,
+                    sort_ws=sort_ws,
+                )
+        assert moe_route_radix4.sort_tail_fits(256, scores.device)
+    finally:
+        hip.hipStreamDestroy(handle)
 
 
 if __name__ == "__main__":

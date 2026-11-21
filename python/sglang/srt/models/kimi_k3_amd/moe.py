@@ -173,8 +173,11 @@ class KimiK3MoEHipMixin:
         return core.route_sort_consumer()
 
     def _route_sort_scope(self) -> ContextManager[None]:
+        # Resolving the consumer is host-side work that tracing cannot follow.
+        if torch.compiler.is_compiling():
+            return contextlib.nullcontext()
         consumer = self._route_sort_consumer
-        if consumer is None or torch.compiler.is_compiling():
+        if consumer is None:
             return contextlib.nullcontext()
         # A sort that no experts call consumed must not outlive this layer.
         return route_sort.scope(consumer)

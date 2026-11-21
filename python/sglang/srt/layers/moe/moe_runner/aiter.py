@@ -185,7 +185,8 @@ class AiterRunnerCore(MoeRunnerCore):
         # AITER drops a registered sort under an expert mask, which EP passes.
         if self.config.moe_ep_size != 1 or not aiter_route_sort.available():
             return None
-        self._route_sort_consumer = aiter_route_sort.AiterRouteSortConsumer()
+        if self._route_sort_consumer is None:
+            self._route_sort_consumer = aiter_route_sort.AiterRouteSortConsumer()
         return self._route_sort_consumer
 
     def run(

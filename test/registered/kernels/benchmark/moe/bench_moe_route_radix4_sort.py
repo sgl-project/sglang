@@ -10,8 +10,8 @@ register_amd_ci(est_time=30, stage="base-a-jit-kernel-benchmark", runner_config=
 
 NUM_EXPERTS = 896
 TOPK = 16
-# Kimi-K3's latent width, the row the fused launch also zeroes.
-MODEL_DIM = 7168
+# Kimi-K3's routed latent width, the row the fused launch also zeroes.
+MODEL_DIM = 3584
 SCALING = 2.5
 
 if not moe_route_radix4.supported_hardware():
@@ -24,7 +24,8 @@ from aiter.fused_moe import moe_sorting  # noqa: E402
 SORT_WS = moe_route_radix4.new_sort_workspace(torch.device("cuda"))
 
 
-def _aiter_sort(ids, weights, block_m):
+def _aiter_sort(ids, weights, moe_buf, block_m):
+    # The aux-sort pipeline's call: it also writes the aux tensors and zeroes moe_buf.
     return moe_sorting(
         ids,
         weights,
@@ -32,6 +33,8 @@ def _aiter_sort(ids, weights, block_m):
         MODEL_DIM,
         torch.bfloat16,
         block_size=block_m,
+        output_aux=True,
+        output=moe_buf,
     )
 
 
@@ -39,12 +42,12 @@ def _aiter_route_then_sort(scores, bias, moe_buf, block_m):
     weights = torch.empty((scores.shape[0], TOPK), dtype=torch.float32, device="cuda")
     ids = torch.empty((scores.shape[0], TOPK), dtype=torch.int32, device="cuda")
     aiter_biased_grouped_topk(scores, bias, weights, ids, 1, 1, True, SCALING)
-    return _aiter_sort(ids, weights, block_m)
+    return _aiter_sort(ids, weights, moe_buf, block_m)
 
 
 def _radix4_then_aiter_sort(scores, bias, moe_buf, block_m):
     weights, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, SCALING)
-    return _aiter_sort(ids, weights, block_m)
+    return _aiter_sort(ids, weights, moe_buf, block_m)
 
 
 def _radix4_fused_sort(scores, bias, moe_buf, block_m):

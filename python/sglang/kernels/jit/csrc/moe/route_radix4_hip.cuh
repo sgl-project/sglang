@@ -735,7 +735,7 @@ struct RouteRadix4SortKernel {
         .verify(scores);
     TensorMatcher({N_}).with_dtype<bf16_t, fp32_t>(score_dtype).with_device(device_).verify(bias);
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device_).verify(out_w);
-    // The streamed sort reads ids, and the pad sweep writes the sorted rows, as int4.
+    // The sort reads ids, and the pad sweep writes the sorted rows, as int4.
     TensorMatcher({M_, K_})  //
         .with_dtype<int32_t>()
         .with_device(device_)
