@@ -37,6 +37,50 @@ def _resolve_llada_image_component_path(
     return str(Path(model_root) / component_name)
 
 
+def llada_image_text_encoder_quantization(text_encoder_config: dict) -> dict | None:
+    """Map the checkpoint's FP8 expert metadata to srt's FP8 quantization config."""
+    if "quantization_config" in text_encoder_config:
+        raise ValueError(
+            "LLaDA-Image does not serve a text encoder that declares "
+            "quantization_config. The FP8 checkpoint "
+            "inclusionAI/LLaDA-Image-Turbo-FP8 declares llada_fp8_experts instead."
+        )
+    experts = text_encoder_config.get("llada_fp8_experts")
+    if experts is None or not experts.get("enabled"):
+        return None
+    unsupported = {
+        key: experts.get(key)
+        for key, supported in (
+            ("format", ("e4m3", "e4m3fn")),
+            ("weight_method", ("symmetric_absmax_rtn",)),
+            ("weight_granularity", ("per_expert_2d_block",)),
+            ("weight_block_size", ([128, 128],)),
+            ("activation_method", ("dynamic_absmax_rtn",)),
+            ("activation_granularity", ("per_token",)),
+        )
+        if experts.get(key) not in supported
+    }
+    if unsupported:
+        raise ValueError(
+            "LLaDA-Image serves FP8 text encoder experts in the format of "
+            "inclusionAI/LLaDA-Image-Turbo-FP8, but llada_fp8_experts sets "
+            f"unsupported values {unsupported}"
+        )
+    dense_layers = range(text_encoder_config["first_k_dense_replace"])
+    return {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        # Only the routed experts are FP8. Attention, shared experts, and dense
+        # MLPs keep their BF16 checkpoint weights.
+        "ignored_layers": [
+            "attention",
+            "shared_experts",
+            *(f"layers.{layer}.mlp" for layer in dense_layers),
+        ],
+    }
+
+
 def format_llada_image_prompt(prompt: str | None) -> str:
     if prompt is None:
         return "<role>HUMAN</role> Generate an image.\n<role>ASSISTANT</role>\n<IMAGE1>"
@@ -79,13 +123,7 @@ class LLaDAImageTextEncoderRunner:
         text_encoder_config = json.loads(
             (Path(text_encoder_path) / "config.json").read_text()
         )
-        if "quantization_config" in text_encoder_config or (
-            text_encoder_config.get("llada_fp8_experts", {}).get("enabled")
-        ):
-            raise ValueError(
-                "LLaDA-Image serves only the BF16 checkpoints, such as "
-                "inclusionAI/LLaDA-Image, and this text encoder is quantized"
-            )
+        quantization = llada_image_text_encoder_quantization(text_encoder_config)
         tokenizer_path = _resolve_llada_image_component_path(
             model_root, server_args, "tokenizer"
         )
@@ -107,6 +145,9 @@ class LLaDAImageTextEncoderRunner:
             max_prefill_tokens=8192,
             max_total_tokens=8192,
             max_running_requests=2,
+            json_model_override_args=json.dumps(
+                {} if quantization is None else {"quantization_config": quantization}
+            ),
         )
         self.runtime_context = create_context(
             srt_args,
