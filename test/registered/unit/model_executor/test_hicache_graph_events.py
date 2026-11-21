@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import sglang.srt.model_executor.runner_backend_utils.hicache_graph_events as events
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )

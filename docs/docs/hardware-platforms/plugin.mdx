@@ -626,6 +626,11 @@ field defaults to the conservative answer.
       <td>Return this platform&#39;s KV pool class for <code>kind</code> in <code>"mha"</code> / <code>"mla"</code> / <code>"dsa"</code>, or <code>None</code> for the in-tree class. The class must subclass <code>MHATokenToKVPool</code> / <code>MLATokenToKVPool</code> / <code>DSATokenToKVPool</code>; core constructs it with exactly the keyword arguments the in-tree class receives, at every site the in-tree class is built (standalone, inside the SWA composite, as the hybrid-linear full-attention leaf). Override <code>_create_buffers</code> to change how the backing storage is carved -- addressing, index translation and PD registration stay core&#39;s. If you override <code>_create_buffers</code> entirely you also own <code>_kv_buffer_descs</code> (PD transfer and post-capture backing read it); override <code>_create_buffers_normal</code> or <code>_kv_buffer_shapes</code> instead to keep the base descriptors, which require the leading buffer axis to be tokens or pages. The in-tree pool allocates on <code>device</code> and is correct on any torch device, so most platforms return <code>None</code>.</td>
     </tr>
     <tr>
+      <td><code>supports_kv_cache_dtype(kv_cache_dtype)</code></td>
+      <td><code>return False</code></td>
+      <td>Whether the platform serves a KV cache dtype added with <code>register_kv_cache_dtype</code> (see <a href="#platform-registered-kv-cache-dtypes">Platform-registered KV cache dtypes</a>). Core consults it only for registered values and only on out-of-tree platforms; in-tree platforms reject them at startup.</td>
+    </tr>
+    <tr>
       <td><code>get_paged_allocator_cls()</code></td>
       <td><code>return None</code></td>
       <td>Paged allocator class, honored at every paged-allocator construction site. With <code>capabilities.supports_triton=False</code> the in-tree allocator already uses torch-native kernels, so most platforms return <code>None</code>. At <code>page_size == 1</code> core uses the flat allocator on every platform.</td>
@@ -664,6 +669,31 @@ In-tree platforms and unregistered classes keep their existing backend.
 Subclass `GDNAttnBackend` or `KDAAttnBackend` and override
 `_create_kernel_dispatcher()` to customize kernels while reusing cache and
 forward-metadata handling. Your backend owns validation of its supported options.
+
+#### Platform-registered KV cache dtypes
+
+A platform whose KV pool stores a format SGLang has no in-tree implementation for can make it selectable with `--kv-cache-dtype`. Register the name, together with the storage dtype the pool is built with, from your package's general plugin entry point (`sglang.srt.plugins`). `load_plugins()` runs that entry point in every process before arguments are parsed. A platform can register several names for one format:
+
+```python
+import torch
+
+from sglang.srt.mem_cache.platform_kv_cache_dtype import register_kv_cache_dtype
+
+
+def register():
+    register_kv_cache_dtype("my_kv_format", storage_dtype=torch.uint8)
+```
+
+Then override `supports_kv_cache_dtype(name)` to return True for the names your platform serves. Return True only if the pools from `get_kv_pool_cls` store the format and your own attention backend reads it. In-tree pools and attention backends have no path for a registered format, so a platform that reuses `FlashAttentionBackend` registers a subclass (`register_attention_backend`) that overrides query preparation (`prepare_paged_mha_query`) and the kernels. The pool reads the selected format from the `kv_cache_dtype` server argument. Core sizes the pool from the storage dtype's element size.
+
+Core rejects a registered value:
+
+- on every in-tree platform, and on any out-of-tree platform that does not declare it;
+- for a model whose KV layout builds a pool kind that gets `None` from `get_kv_pool_cls` (a hybrid DSA model with sliding-window layers, for example, builds both a `dsa` and an `mla` pool);
+- for model families whose KV pools SGLang builds without consulting `get_kv_pool_cls`;
+- together with PD disaggregation, hierarchical cache, LMCache or `--prefill-only-disable-kv-cache`.
+
+Reject any other combination your platform cannot serve, such as pool kinds, head sizes or speculative decoding.
 
 #### Lifecycle Hooks (from SRTPlatform)
 

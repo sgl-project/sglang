@@ -35,6 +35,9 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # The room's send record this chunk was counted in when queued (a
+    # `SendRecord`); the worker reports the chunk finished to it only.
+    send_record: Optional[object] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
@@ -180,6 +183,7 @@ def build_dcp_token_transfer_plan(
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
+    draft_rows_collapsed: bool = False,
 ) -> DCPTokenTransferPlan:
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
@@ -214,5 +218,9 @@ def build_dcp_token_transfer_plan(
     )
     target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
+    if draft_rows_collapsed:
+        return DCPTokenTransferPlan(
+            target_src, target_dst, target_src.copy(), target_dst.copy()
+        )
     draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)

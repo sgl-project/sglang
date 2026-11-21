@@ -2,8 +2,12 @@ import math
 from typing import Optional
 
 import torch
-from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
-from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+from sgl_kernel_npu.operators.attention.kda import (
+    chunk_kda_fwd,
+    fused_kda_gate,
+    kda_target_verify,
+)
+from sgl_kernel_npu.operators.mamba import causal_conv1d
 
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
@@ -20,6 +24,9 @@ class _AscendKDAExtendKernel:
     """Ascend-only KDA prefill decomposition backed by sgl-kernel-npu."""
 
     uses_state_checkpoints: bool = False
+    wants_int64_query_start_loc: bool = False
+
+    wants_int64_query_start_loc: bool = False
 
     def extend(
         self,
@@ -60,7 +67,7 @@ class _AscendKDAExtendKernel:
         scale = k.shape[-1] ** -0.5
         query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
 
-        outputs = torch.ops.npu.chunk_kda_fwd(
+        outputs = chunk_kda_fwd(
             q,
             k,
             v,
@@ -160,7 +167,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         # setting activation_mode to 1 means using SiLU activation after conv.
-        qkv = torch.ops.npu.causal_conv1d(
+        qkv = causal_conv1d(
             mixed_qkv.contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,
@@ -261,7 +268,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         kernel_size = layer.conv_weights.shape[-1]
         conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
-        mixed_qkv = torch.ops.npu.causal_conv1d(
+        mixed_qkv = causal_conv1d(
             mixed_qkv.contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states_for_prefill,
@@ -322,7 +329,9 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         Optional[torch.Tensor],
     ]:
         """Activate raw gate and beta projections in FP32 for Ascend prefill."""
-        preactivated_g = fused_kda_gate_npu(
+        if g.ndim == 3:
+            g = g.unflatten(-1, (-1, layer.head_k_dim))
+        preactivated_g = fused_kda_gate(
             g.flatten(-2),
             layer.A_log,
             layer.head_k_dim,
@@ -392,7 +401,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             dtype=torch.int32,
             device=mixed_qkv.device,
         )
-        processed_qkv = torch.ops.npu.causal_conv1d(
+        processed_qkv = causal_conv1d(
             dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,
@@ -412,7 +421,9 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # Activate the forget gate and beta in FP32 before entering the
         # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
-        preactivated_a = fused_kda_gate_npu(
+        if dense_a.ndim == 3:
+            dense_a = dense_a.unflatten(-1, (-1, layer.head_k_dim))
+        preactivated_a = fused_kda_gate(
             dense_a.flatten(-2),
             layer.A_log,
             layer.head_k_dim,
@@ -420,7 +431,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             lower_bound=layer.lower_bound,
         )
         preactivated_b = dense_b.float().sigmoid()
-        out = kda_target_verify_npu(
+        out = kda_target_verify(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
@@ -494,23 +505,26 @@ class AscendKDAHybridLinearAttnBackend:
                 mamba_steps_to_track,
                 model,
                 req_pool_indices=None,
+                state_slots=None,
             ):
-                from sgl_kernel_npu.mamba.mamba_state_update_triton import (
+                from sgl_kernel_npu.operators.mamba import (
                     conv_state_rollback,
                     move_intermediate_cache_kda,
-                )
-                from sgl_kernel_npu.mamba.speculative_state_scatter import (
-                    speculative_state_scatter_npu,
+                    speculative_state_scatter,
                 )
 
                 del req_pool_indices
                 request_number = last_correct_step_indices.shape[0]
 
-                state_indices_tensor = (
-                    self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                        :request_number
-                    ]
-                )
+                if state_slots is None:
+                    state_slots = self.forward_state_slots(
+                        request_number, mamba_track_indices
+                    )
+                state_indices_tensor = state_slots.working[:request_number]
+                # Checkpoints go to the slots the same forward resolved.
+                if mamba_track_indices is not None:
+                    assert state_slots.track is not None
+                    mamba_track_indices = state_slots.track[:request_number]
 
                 mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
@@ -543,7 +557,7 @@ class AscendKDAHybridLinearAttnBackend:
                     intermediate_conv_window_cache = (
                         mamba_caches.intermediate_conv_window[0]
                     )
-                    speculative_state_scatter_npu(
+                    speculative_state_scatter(
                         conv_states,
                         intermediate_conv_window_cache,
                         dst_indices_tensor,
@@ -565,7 +579,7 @@ class AscendKDAHybridLinearAttnBackend:
                     )
 
                     if has_conv_snapshots:
-                        speculative_state_scatter_npu(
+                        speculative_state_scatter(
                             conv_states,
                             intermediate_conv_window_cache,
                             mamba_track_indices,

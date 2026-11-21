@@ -34,7 +34,7 @@ from sglang.test.cpu_test_utils import (
     unpack_and_dequant_awq,
 )
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=7, suite="extra-test-cpu-intel")
 
 
 def run_fused_experts(
@@ -436,6 +436,29 @@ class TestFusedExperts:
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
+    def test_mxfp4_moe_rejects_wrong_scale_shape(self):
+        """A packed MXFP4 scale that lacks a group per 32 weights must be rejected."""
+        M, N, K, E, topk = 2, 352, 256, 8, 4
+        a = torch.randn(M, K, dtype=dtype) / 10
+        _, w1_packed, w1s_packed = make_mxfp4_weights(E, 2 * N, K, dtype=dtype)
+        _, w2_packed, w2s_packed = make_mxfp4_weights(E, K, N, dtype=dtype)
+        topk_weight, topk_ids = make_routing(M, E, topk, dtype=dtype)
+
+        with pytest.raises(RuntimeError, match="one scale per 32 weights"):
+            run_fused_experts(
+                a,
+                w1_packed,
+                w2_packed,
+                topk_weight,
+                topk_ids,
+                quant=CPUQuantMethod.MXFP4,
+                w1_scale=w1s_packed[..., :-1].contiguous(),
+                w2_scale=w2s_packed,
+                is_vnni=True,
+                activation="silu",
+                inplace=False,
+            )
+
     @pytest.mark.parametrize("m", [1, 32])
     @pytest.mark.parametrize("n", [128, 64])
     @pytest.mark.parametrize("k", [128, 64])
@@ -555,6 +578,27 @@ class TestFusedExperts:
 
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
+        # bf16 routing weights are converted to float like in the other quant methods.
+        topk_weight_bf16 = topk_weight.to(torch.bfloat16)
+        outs = [
+            run_fused_experts(
+                a,
+                awq_w13_weight_pack,
+                awq_w2_weight_pack,
+                weights,
+                topk_ids,
+                quant=CPUQuantMethod.INT4_W4A8,
+                w1_scale=awq_w13_scales_pack,
+                w2_scale=awq_w2_scales_pack,
+                w1_zp=awq_w13_zero_pack,
+                w2_zp=awq_w2_zero_pack,
+                is_vnni=True,
+                inplace=False,
+            )
+            for weights in (topk_weight_bf16, topk_weight_bf16.float())
+        ]
+        torch.testing.assert_close(outs[0], outs[1], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

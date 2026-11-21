@@ -34,7 +34,9 @@ from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     NVFP4_BIAS_GELU,
     QWEN_IMAGE_ADDED_QKV,
+    SANA_VIDEO2_SOFTMAX_ATTENTION,
     SANA_VIDEO_LINEAR_ATTENTION,
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     QualityGatedFusion,
 )
 from sglang.multimodal_gen import envs
@@ -191,6 +193,8 @@ _QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
     # Ideogram's reference keeps the norm statistics in fp32; the
     # BF16-native kernel rounds them, which lowers accumulation precision
     ("high", FUSED_GATE_RMSNORM),
+    # Wan FlyDSL converts FP32 gate/modulation operands and residuals to BF16.
+    ("high", WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT),
     ("lossless", HUNYUAN_QKNORM),
     ("lossless", LINGBOT_VIDEO_RMSNORM),
     ("lossless", LINGBOT_VIDEO_GATED_RESIDUAL),
@@ -199,6 +203,9 @@ _QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
     # the first attention GEMM takes BF16 inputs where the reference
     # promotes them to FP32
     ("high", SANA_VIDEO_LINEAR_ATTENTION),
+    # the anchor layers' SDPA takes BF16 inputs where the reference promotes
+    # them to FP32, so the probabilities round to BF16 before the PV GEMM
+    ("high", SANA_VIDEO2_SOFTMAX_ATTENTION),
 )
 
 
@@ -363,12 +370,6 @@ class DenoisingStage(PipelineStage):
         self._attn_metadata_head_size = attn_head_size
         self._attention_backend_active_override: AttentionBackendEnum | None = None
         self._skip_softmax_forced_fa = False
-
-        # cfg
-        self.guidance = None
-
-        # misc
-        self.profiler = None
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
@@ -2441,18 +2442,16 @@ class DenoisingStage(PipelineStage):
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
-                raw_latent_shape=batch.raw_latent_shape
+                raw_latent_shape=batch.raw_latent_shape,
+                attention_backend_config=server_args.attention_backend_config,
+                ring_degree=server_args.ring_degree,
             )
         elif self.attn_backend.get_enum() in [
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.ASCEND_SPARSE_ATTN,
         ]:
-            sparse_config = server_args.attention_backend_config
-
-            current_timestep = i
-            skip_first_steps = sparse_config.get("skip_first_steps", 10)
-            sparsity = sparse_config.get("sparsity", 0.2)
-
+            sparse_config = server_args.attention_backend_config or {}
             raw_latent_shape = batch.raw_latent_shape
             patch_size = server_args.pipeline_config.dit_config.patch_size
 
@@ -2465,13 +2464,25 @@ class DenoisingStage(PipelineStage):
                 else:
                     patch_size = (patch_size, patch_size, patch_size)
 
-            attn_metadata = self.attn_metadata_builder.build(
-                current_timestep=current_timestep,
-                skip_first_steps=skip_first_steps,
-                sparsity=sparsity,
-                raw_latent_shape=raw_latent_shape,
-                patch_size=patch_size,
-            )
+            if self.attn_backend.get_enum() == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+                metadata_kwargs = dict(sparse_config)
+                metadata_kwargs.update(
+                    current_timestep=i,
+                    num_steps=None if timesteps is None else len(timesteps),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
+                if metadata_kwargs.get("video_spans") is not None:
+                    metadata_kwargs["raw_latent_shape"] = None
+                attn_metadata = self.attn_metadata_builder.build(**metadata_kwargs)
+            else:
+                attn_metadata = self.attn_metadata_builder.build(
+                    current_timestep=i,
+                    skip_first_steps=sparse_config.get("skip_first_steps", 10),
+                    sparsity=sparse_config.get("sparsity", 0.2),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
         else:
             # attn_metadata can be None for SDPA attention backend
             return None

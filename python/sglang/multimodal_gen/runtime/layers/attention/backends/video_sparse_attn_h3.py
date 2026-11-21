@@ -158,8 +158,6 @@ def _h3_segment_tile_geometry(
 
 
 class VideoSparseAttentionH3Backend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]

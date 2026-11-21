@@ -130,6 +130,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     identity: Optional[bytes] = None
     pad_values: Optional[Tuple[int, ...]] = None
     processor_fingerprint: Optional[str] = None
+    # Caller routing label (routing metadata only; never part of identity).
+    routing_label: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.hash is not None and not 0 <= self.hash <= _MM_HASH_MASK:
@@ -213,12 +215,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         repeats, remainder = divmod(length, len(values))
         return list(values) * repeats + list(values[:remainder])
 
-    @staticmethod
-    def is_empty_list(l):
-        if l is None:
-            return True
-        return len([item for item in flatten_nested_list(l) if item is not None]) == 0
-
     def set_pad_value(self):
         if self.identity is not None:
             if self.pad_value is None:
@@ -263,9 +259,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     def validate(self):
         ...
         # TODO
-
-    def is_precomputed_embedding(self):
-        return self.format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING
 
     @staticmethod
     def from_dict(obj: dict):
@@ -334,14 +327,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
                 for value in self.model_specific_data.values()
             )
         )
-
-    def acknowledge_deferred_cuda_ipc_feature(self, consumer_count: int = 1):
-        """Release a lazy IPC feature when an embedding-cache hit skips ViT."""
-        if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            consumer_count = self._resolve_transport_consumer_count(
-                self.feature, consumer_count
-            )
-            self.feature.acknowledge_consumption(consumer_count)
 
     def release_transport_proxies(self, consumer_count: int = 1) -> None:
         """Best-effort release of proxies left by an abandoned request."""
@@ -627,11 +612,20 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    mrope_position_delta_device_cache: Optional[torch.Tensor] = None
 
     # Moss-VL related
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+
+    def get_mrope_position_delta_on_device(self, device) -> torch.Tensor:
+        # Rebuilding this from Python ints every decode step costs a blocking H2D copy.
+        if self.mrope_position_delta_device_cache is None:
+            self.mrope_position_delta_device_cache = self.mrope_position_delta.reshape(
+                1
+            ).to(device=device, dtype=torch.int64)
+        return self.mrope_position_delta_device_cache
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -700,6 +694,10 @@ class MultimodalInputs:
 
         for item in mm_items:
             item.set_pad_value()
+
+        from sglang.srt.mem_cache.events import register_mm_routing_labels
+
+        register_mm_routing_labels(mm_items)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in mm_items:

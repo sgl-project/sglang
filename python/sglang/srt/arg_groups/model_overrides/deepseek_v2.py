@@ -5,8 +5,8 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
-    context_parallel_attn_dp_size,
     is_attention_backend_not_set,
+    reject_dp_size_under_context_parallel,
     resolving_view,
     use_mla_backend,
 )
@@ -18,19 +18,26 @@ logger = logging.getLogger(__name__)
 def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
-    if cfg.enable_hisparse or cfg.enable_hierarchical_cache:
-        raise ValueError("DSA DCP does not support HiSparse or HiCache.")
-    if cfg.disaggregation_mode != "null":
+    if cfg.enable_hisparse:
+        raise ValueError("DSA DCP does not support HiSparse.")
+    platform = get_platform()
+    if cfg.enable_hierarchical_cache and not platform.is_hip:
+        raise ValueError("DSA DCP supports HiCache only on ROCm.")
+    if cfg.disaggregation_mode != "null" and not platform.is_npu:
         raise ValueError("DSA DCP does not support PD disaggregation.")
     if cfg.speculative_eagle_topk not in (None, 1):
         raise ValueError("DSA DCP requires --speculative-eagle-topk 1.")
-    # The DCP paths: trtllm on CUDA, triton on ROCm.
-    backend = "triton" if get_platform().is_hip else "trtllm"
-    overrides = {
-        name: backend
-        for name in ("dsa_prefill_backend", "dsa_decode_backend")
-        if getattr(cfg, name) is None
-    }
+    # NPU has its own DSA DCP attention path; these split backends are CUDA/ROCm.
+    overrides = {}
+    if not platform.is_npu:
+        backend = "triton" if platform.is_hip else "trtllm"
+        overrides.update(
+            {
+                name: backend
+                for name in ("dsa_prefill_backend", "dsa_decode_backend")
+                if getattr(cfg, name) is None
+            }
+        )
     if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
         overrides["dcp_replicate_q_proj"] = True
     return overrides
@@ -58,6 +65,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         is_deepseek_dsa,
+        is_kimi_k31,
         unwrap_modelopt_quantization_config,
     )
 
@@ -101,7 +109,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        overrides.update(_dsa_dcp_overrides(cfg))
+        if not is_kimi_k31(hf_config):
+            overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
@@ -111,11 +120,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 logger.warning(
                     "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                 )
-                attn_dp_size = context_parallel_attn_dp_size(
-                    cfg, "DSA context parallelism"
-                )
-                overrides["attn_dp_size"] = attn_dp_size
-                overrides["dp_size"] = 1
+                reject_dp_size_under_context_parallel(cfg, "DSA context parallelism")
                 if cfg.cp_strategy == "zigzag":
                     overrides["moe_dense_tp_size"] = 1
                     overrides["moe_a2a_backend"] = "deepep"
@@ -133,12 +138,12 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 attn_cp_size = (
                     cfg.attn_cp_size
                     if cfg.cp_strategy == "interleave" and cfg.attn_cp_size > 1
-                    else cfg.tp_size // attn_dp_size
+                    else cfg.tp_size // cfg.attn_dp_size
                 )
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "
-                    f"strategy={cfg.cp_strategy}, attn_dp_size={attn_dp_size}, "
+                    f"strategy={cfg.cp_strategy}, attn_dp_size={cfg.attn_dp_size}, "
                     f"moe_dense_tp_size={overrides.get('moe_dense_tp_size', cfg.moe_dense_tp_size)}, "
                     f"ep_size={overrides.get('ep_size', cfg.ep_size)}, tp_size={cfg.tp_size}, "
                     f"attn_cp_size={attn_cp_size}, "
@@ -175,6 +180,16 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 page_size = 64 * index_kpool
                 overrides["page_size"] = page_size
                 logger.warning(f"Setting page size to {page_size} for DeepSeek DSA.")
+        elif get_platform().is_npu:
+            index_kpool = get_dsa_index_kpool(hf_config)
+            if index_kpool > 1:
+                if cfg.dcp_size > 1:
+                    raise ValueError("NPU DSA KPool does not support --dcp-size > 1.")
+                overrides["page_size"] = 128 * index_kpool
+                logger.warning(
+                    "Setting logical page size to %d for NPU DSA KPool.",
+                    overrides["page_size"],
+                )
         elif get_platform().is_xpu:
             overrides["page_size"] = 128
             logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
@@ -197,9 +212,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "MLA prefill context parallel is still experimental. "
                 "Verified on Hopper with the fa3 backend."
             )
-            attn_dp_size = context_parallel_attn_dp_size(cfg, "MLA context parallelism")
-            overrides["attn_dp_size"] = attn_dp_size
-            overrides["dp_size"] = 1
+            reject_dp_size_under_context_parallel(cfg, "MLA context parallelism")
             # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
             overrides["moe_dense_tp_size"] = 1
             overrides["moe_a2a_backend"] = "deepep"
@@ -210,11 +223,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
             # The DSA / MLA CP gather and reduce-scatter
             # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
-            attn_cp_size = cfg.tp_size // attn_dp_size
+            attn_cp_size = cfg.tp_size // cfg.attn_dp_size
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(
                 f"Enable Context Parallel opt for MLA, "
-                f"Setting attn_dp_size == {attn_dp_size} and "
+                f"Setting attn_dp_size == {cfg.attn_dp_size} and "
                 f"attn_cp_size == {attn_cp_size}, "
                 f"moe_dense_tp_size == {overrides['moe_dense_tp_size']}, "
                 f"ep_size == {overrides['ep_size']}, "

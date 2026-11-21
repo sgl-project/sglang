@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""runner_backend utilities — phase → BaseCudaGraphBackend resolution.
+"""runner_backend utilities — phase → BaseGraphBackend resolution.
 
 Centralizes per-phase backend resolution so platform overrides (NPU,
 out-of-tree) and future backend additions can plug in without
@@ -25,8 +25,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -67,7 +67,7 @@ def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
 
 def resolve_decode_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
-) -> BaseCudaGraphBackend:
+) -> BaseGraphBackend:
     """Pick a backend instance from cuda_graph_config['decode']['backend'].
 
     NPU device returns NPUCudaGraphBackend regardless of mode (only
@@ -135,11 +135,28 @@ def resolve_decode_backend(
 
 def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
-) -> BaseCudaGraphBackend:
+) -> BaseGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
     model_runner = cuda_graph_runner.model_runner
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
+
+    enable_memory_saver = get_exec().features.enable_memory_saver
+
+    if model_runner.device == "npu":
+        if backend_name != Backend.BREAKABLE:
+            raise ValueError(
+                f"NPU prefill graph only supports 'breakable', got '{backend_name}'"
+            )
+        from sglang.srt.hardware_backend.npu.graph_runner.breakable_npu_graph_backend import (
+            BreakableNPUGraphBackend,
+        )
+
+        return BreakableNPUGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=enable_memory_saver,
+            debug_eager=get_exec().graph.debug_cuda_graph,
+        )
 
     if model_runner.device == "xpu" and backend_name == Backend.FULL:
         from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
@@ -155,7 +172,7 @@ def resolve_prefill_backend(
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_memory_saver=enable_memory_saver,
             debug_eager=get_exec().graph.debug_cuda_graph,
             enable_hicache_event_capture=_needs_hicache_event_capture(
                 cuda_graph_runner.model_runner
@@ -164,7 +181,7 @@ def resolve_prefill_backend(
     if backend_name == Backend.FULL:
         return FullCudaGraphBackend(
             cuda_graph_runner,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
+            enable_memory_saver=enable_memory_saver,
             reuse_output_buffer=True,
         )
     raise ValueError(f"Unsupported prefill graph backend: {backend_name}")

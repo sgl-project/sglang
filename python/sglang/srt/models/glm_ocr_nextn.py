@@ -30,6 +30,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,7 +39,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4 import Glm4DecoderLayer
 from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
