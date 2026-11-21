@@ -9,6 +9,7 @@ from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
+    compress_fused_norm_rope_store,
     compress_norm_rope_store,
 )
 from .norm_rope import (
@@ -32,6 +33,7 @@ from .utils import make_name
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
+    "compress_fused_norm_rope_store",
     "compress_forward",
     "compress_norm_rope_store",
     "fused_norm_rope_inplace",
