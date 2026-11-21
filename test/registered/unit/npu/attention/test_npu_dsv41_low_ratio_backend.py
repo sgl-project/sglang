@@ -38,6 +38,7 @@ for mod in (
     "sgl_kernel_npu.operators.attention",
     "sgl_kernel_npu.operators.indexer",
     "sgl_kernel_npu.operators.mem_cache",
+    "sgl_kernel_npu.operators.data_move",
     # pool_host/{mha,mamba}.py import this under ``if _is_npu``, so only a
     # real-NPU environment reaches the import; a mock parent without
     # ``__path__`` would fail the from-import before the names resolve.
@@ -350,6 +351,7 @@ class TestPoolFactory(unittest.TestCase):
             setattr(pool, key, value)
         return pool
 
+    @patch.object(dsv4_memory_pool, "is_ascend_910b", new=lambda: False)
     def test_window_layout_resolves_the_row_format(self):
         fake = self._pool((0, 1, 2))
         self.assertIs(
@@ -368,6 +370,7 @@ class TestPoolFactory(unittest.TestCase):
                 NPUDSV4KVLayout.V4_BF16,
             )
 
+    @patch.object(dsv4_memory_pool, "is_ascend_910b", new=lambda: False)
     def test_pinned_generation_overrides_the_ratio_list(self):
         # A draft worker pins the V4 generation while its ratio list is empty:
         # its forward still runs the V4 sparse-attention op.
@@ -387,6 +390,23 @@ class TestPoolFactory(unittest.TestCase):
             NPUDSV4KVLayout.V41_SWA_FP8,
         )
 
+    def test_910b_bf16_window_compressed_and_index_rows(self):
+        pool = self._pool((0, 1, 2))
+        with patch.object(dsv4_memory_pool, "is_ascend_910b", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(pool), NPUDSV4KVLayout.V41_BF16
+            )
+            for ratio in (1, 2):
+                self.assertIs(
+                    DSV4NPUTokenToKVPool.compressed_kv_layout(pool, ratio),
+                    NPUDSV4KVLayout.V41_BF16,
+                )
+            dims = dsv4_memory_pool.DSV41NPUIndexerPool._npu_index_row_dims(
+                SimpleNamespace(index_head_dim=128)
+            )
+            self.assertEqual(dims, (128, 0, torch.bfloat16, torch.uint8))
+
+    @patch.object(dsv4_memory_pool, "is_ascend_910b", new=lambda: False)
     def test_compressed_kv_layout_tags_every_ratio(self):
         fake = self._pool((0, 1, 2))
         self.assertIs(

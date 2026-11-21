@@ -2083,6 +2083,8 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Signed C1/C2 index keys and their group metadata on 910B.
+    SGLANG_DSV41_NPU_INT8_INDEX_CACHE = EnvBool(False)
     # DeepSeek-V4 default when a request carries no reasoning_effort: a
     # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

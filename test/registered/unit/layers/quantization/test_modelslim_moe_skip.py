@@ -1,4 +1,7 @@
 import unittest
+from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +30,41 @@ def _w123_quant_description(w1: str, w3: str, w2: str):
 
 
 class TestModelSlimMoESkip(CustomTestCase):
+    def test_910b_w4a8_intermediate_padding_preserves_gate_up_pairs(self):
+        from sglang.srt.layers.quantization.modelslim.schemes.modelslim_w4a8_int8_moe import (
+            ModelSlimW4A8Int8MoE,
+        )
+
+        width = 288
+        fields = {
+            "w13_weight": torch.arange(width * 4).to(torch.int8).view(1, width, 4),
+            "w13_weight_scale": torch.arange(width * 2).float().view(1, -1, 1),
+            "w13_weight_offset": torch.ones(1, width * 2, 1),
+            "w13_scale_bias": torch.arange(width * 2).float().view(1, -1, 1),
+            "w2_weight": torch.arange(width * 2).to(torch.int8).view(1, 2, width),
+        }
+        layer = SimpleNamespace(
+            **{
+                name: torch.nn.Parameter(value.clone(), requires_grad=False)
+                for name, value in fields.items()
+            }
+        )
+        ModelSlimW4A8Int8MoE._align_910b_intermediate(layer)
+        self.assertEqual(layer.intermediate_size_per_partition, 320)
+        for name, before in fields.items():
+            after = getattr(layer, name)
+            if name == "w2_weight":
+                torch.testing.assert_close(after[..., :width], before)
+                self.assertEqual(after[..., width:].count_nonzero().item(), 0)
+                continue
+            for got, expected in zip(after.chunk(2, dim=1), before.chunk(2, dim=1)):
+                torch.testing.assert_close(got[:, : expected.shape[1]], expected)
+                fill = int(name == "w13_weight_scale")
+                self.assertTrue((got[:, expected.shape[1] :] == fill).all())
+        weight_pointer = layer.w13_weight.data_ptr()
+        ModelSlimW4A8Int8MoE._align_910b_intermediate(layer)
+        self.assertEqual(layer.w13_weight.data_ptr(), weight_pointer)
+
     def test_all_float_experts_are_skipped(self):
         config = ModelSlimConfig(_moe_quant_description("FLOAT", "FLOAT", "FLOAT"))
 

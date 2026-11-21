@@ -27,6 +27,12 @@ gva_is_inited = False
 
 
 @functools.lru_cache(maxsize=1)
+def is_ascend_910b() -> bool:
+    """Identify the 910B family, which shares arch22 with other devices."""
+    return is_npu() and torch.npu.get_device_name(0).lower().startswith("ascend910b")
+
+
+@functools.lru_cache(maxsize=1)
 def is_npu_arch35() -> bool:
     """Whether the runtime is on NPU architecture 35."""
     if not is_npu():
@@ -258,17 +264,20 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
-    try:
-        # Registers the ds41 (DeepSeek-V4.1) Python operators under the
-        # vendor operator extension's ds41 namespace. Absent for DSV4-only
-        # deployments.
-        import cann_ops_transformer  # noqa: F401
-    except ImportError as e:
-        logger.warning(
-            "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
-            "operators will not be registered: %s",
-            e,
-        )
+    # The 910B low-ratio CANN package registers its operators on first use.
+    # The standalone A5 extension exports overlapping dispatcher names.
+    if not is_ascend_910b():
+        try:
+            # Registers the ds41 (DeepSeek-V4.1) Python operators under the
+            # vendor operator extension's ds41 namespace. Absent for DSV4-only
+            # deployments.
+            import cann_ops_transformer  # noqa: F401
+        except ImportError as e:
+            logger.warning(
+                "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
+                "operators will not be registered: %s",
+                e,
+            )
 
     import torch_npu
 

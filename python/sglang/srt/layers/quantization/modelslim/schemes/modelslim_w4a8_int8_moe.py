@@ -140,6 +140,43 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
         set_weight_attrs(scale_bias, extra_weight_attrs)
 
+    @staticmethod
+    def _align_910b_intermediate(layer: torch.nn.Module) -> None:
+        """Align the W2 contraction width before casting its packed weights to NZ."""
+        from torch.nn.functional import pad
+
+        width = layer.w2_weight.shape[-1]
+        extra = (-width) % 64
+        if not extra:
+            return
+        if width % 2 or layer.w13_weight.shape[1] != width:
+            raise ValueError("Unexpected packed W4A8 gate/up projection shape")
+        # Each byte encodes two output channels. Each gate and up shard needs
+        # its own zero tail so SwiGLU continues to pair matching channels.
+        for param, padding, fill in (
+            (layer.w13_weight, extra // 2, 0),
+            (layer.w13_weight_scale, extra, 1),
+            (layer.w13_weight_offset, extra, 0),
+            (layer.w13_scale_bias, extra, 0),
+        ):
+            gate, up = param.data.chunk(2, dim=1)
+            param.data = torch.cat(
+                [pad(part, (0, 0, 0, padding), value=fill) for part in (gate, up)],
+                dim=1,
+            )
+        layer.w2_weight.data = pad(layer.w2_weight.data, (0, extra))
+        layer.intermediate_size_per_partition = width + extra
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
+        from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
+
+        if (
+            self.weight_prefix == "w13"
+            and self.is_per_channel_weight
+            and isinstance(getattr(layer, "w2_scheme", None), ModelSlimW4A8Int8MoE)
+            and layer.w2_scheme.is_per_channel_weight
+            and is_ascend_910b()
+        ):
+            self._align_910b_intermediate(layer)
         self.kernel.process_weights_after_loading(layer, self.weight_prefix)

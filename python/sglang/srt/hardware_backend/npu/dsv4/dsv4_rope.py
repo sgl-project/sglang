@@ -162,24 +162,32 @@ class Dsv4NpuRoPE:
         rope_dim = cos4.shape[-1]
         from sgl_kernel_npu.operators.rope import inplace_partial_rotary_mul
 
-        inplace_partial_rotary_mul(
-            q_rope.unsqueeze(1),
-            cos4,
-            sin4,
-            rotary_mode="interleave",
-            partial_slice=[qk_nope_dim, qk_nope_dim + rope_dim],
-        )
-        if kv_rope is not None:
-            if kv_rope.dim() == 3:
-                kv_view = kv_rope.unsqueeze(1)
-            else:
-                kv_view = kv_rope.view(-1, 1, 1, rope_dim)
+        from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
+
+        def rotate(tensor):
+            work = tensor
+            if is_ascend_910b() and tensor.dtype != cos4.dtype:
+                # CANN 9.1's 910B operator needs matching argument types.
+                # Keep the precision of the position table before rounding back.
+                work = tensor.to(
+                    torch.promote_types(tensor.dtype, cos4.dtype)
+                ).contiguous()
             inplace_partial_rotary_mul(
-                kv_view,
-                cos4,
-                sin4,
+                work,
+                cos4.to(work.dtype) if work is not tensor else cos4,
+                sin4.to(work.dtype) if work is not tensor else sin4,
                 rotary_mode="interleave",
                 partial_slice=[qk_nope_dim, qk_nope_dim + rope_dim],
+            )
+            if work is not tensor:
+                tensor.copy_(work)
+
+        rotate(q_rope.unsqueeze(1))
+        if kv_rope is not None:
+            rotate(
+                kv_rope.unsqueeze(1)
+                if kv_rope.dim() == 3
+                else kv_rope.view(-1, 1, 1, rope_dim)
             )
 
 

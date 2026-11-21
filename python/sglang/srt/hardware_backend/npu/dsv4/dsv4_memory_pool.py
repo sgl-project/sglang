@@ -21,14 +21,12 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
-from sgl_kernel_npu.operators.mem_cache import (
-    kv_compress_epilog,
-    kv_compress_epilog_v2,
-)
+from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog, kv_compress_epilog_v2
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_ascend_910b, is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
@@ -106,6 +104,16 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         )
 
 
+def _store_dsv41_rows(buffer, locations, values):
+    """The fused compressor marks padding with -1. Page zero is reserved."""
+    rows = buffer.flatten(0, 1)
+    slots = locations.reshape(-1).long()
+    data = values.reshape(-1, *rows.shape[1:]).to(rows.dtype)
+    rows.index_copy_(
+        0, slots.clamp_min(0), torch.where(slots[:, None, None] > 0, data, 0)
+    )
+
+
 class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
     """NPU DeepSeek-V4.1 KV pool.
 
@@ -127,6 +135,7 @@ class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
         **kwargs,
     ):
         assert layout in (
+            NPUDSV4KVLayout.V41_BF16,
             NPUDSV4KVLayout.V41_SWA_FP8,
             NPUDSV4KVLayout.V41_CMP_FP4,
         ), layout
@@ -136,7 +145,7 @@ class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
 
     @property
     def dsv41_row_bytes(self) -> int:
-        return self.kv_cache_total_dim
+        return self.bytes_per_page_padded // self.kernel_page_size
 
     def create_buffer(self, *, num_pages: int):
         kv_dim, kv_dtype = self.layout.kv_info(
@@ -308,7 +317,9 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 self.index_scale_buffer,
                 page_slots=self._kernel_page_size,
                 layout="pa_nd",
-            ),
+            )
+            if self.index_scale_buffer and self.index_scale_buffer[0].shape[-1]
+            else None,
         )
 
     @property
@@ -333,6 +344,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         return [
             buf.view(torch.uint8).flatten(1)
             for buf in (*self.index_k_buffer, *self.index_scale_buffer)
+            if buf.shape[-1]
         ]
 
     def set_index_k_scale(
@@ -381,7 +393,31 @@ class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
 
     def _npu_index_row_dims(self) -> Tuple[int, int, torch.dtype, torch.dtype]:
         assert self.index_head_dim > 0, self.index_head_dim
+        if is_ascend_910b() and envs.SGLANG_DSV41_NPU_INT8_INDEX_CACHE.get():
+            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_indexer import (
+                INDEX_HEAD_DIM,
+                INDEX_METADATA_BYTES,
+            )
+
+            if self.index_head_dim != INDEX_HEAD_DIM:
+                raise ValueError("DeepSeek-V4.1 INT8 index keys require 128 components")
+            return INDEX_HEAD_DIM, INDEX_METADATA_BYTES, torch.int8, torch.uint8
+        if is_ascend_910b():
+            return NPUDSV4KVLayout.V41_BF16.indexer_kv_info(self.index_head_dim)
         return NPUDSV4KVLayout.V41_CMP_FP4.indexer_kv_info(self.index_head_dim)
+
+    def store_index_rows(self, layer_id, locations, keys):
+        key_buffer = self.index_k_buffer[layer_id]
+        if key_buffer.dtype == torch.int8:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_indexer import (
+                write_index_rows,
+            )
+
+            write_index_rows(
+                key_buffer, self.index_scale_buffer[layer_id], locations, keys
+            )
+        else:
+            _store_dsv41_rows(key_buffer, locations, keys)
 
 
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
@@ -431,8 +467,20 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """Row format of a compressed pool. V4.1's low ratios always take the
         epilog_v2 fp4 row; the V4 ratios follow the part."""
         if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS and self._is_v41_model():
+            if is_ascend_910b():
+                return NPUDSV4KVLayout.V41_BF16
             return NPUDSV4KVLayout.V41_CMP_FP4
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
+
+    def pd_kv_layout(self):
+        layout = super().pd_kv_layout()
+        if (
+            self._is_v41_model()
+            and is_ascend_910b()
+            and envs.SGLANG_DSV41_NPU_INT8_INDEX_CACHE.get()
+        ):
+            return layout + ",indexer:int8_g128_s16_v2"
+        return layout
 
     def _window_kv_layout(self):
         """Row format of the non-compressed (full/swa/window) pools.
@@ -442,6 +490,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         pins that through ``npu_window_generation``.
         """
         if self._is_v41_model():
+            if is_ascend_910b():
+                return NPUDSV4KVLayout.V41_BF16
             return NPUDSV4KVLayout.V41_SWA_FP8
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
 
@@ -480,6 +530,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             f"NPU pools require an NPUDSV4KVLayout, got {kv_layout!r}"
         )
         if kv_layout in (
+            NPUDSV4KVLayout.V41_BF16,
             NPUDSV4KVLayout.V41_SWA_FP8,
             NPUDSV4KVLayout.V41_CMP_FP4,
         ):
@@ -603,12 +654,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 device,
                 enable_memory_saver,
                 kernel_page_size=page_size,
-                use_fp4_indexer=True,
+                use_fp4_indexer=not is_ascend_910b(),
                 global_page_size=global_page_size,
             )
             # Same fp4 reference-rounding marker the base sets for `force_fp4`
             # pools; index_k_page8 is CUDA/AITER-only and stays False here.
-            pool.index_k_rne = True
+            pool.index_k_rne = not is_ascend_910b()
             return pool
         # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(
@@ -670,6 +721,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 *indexer_pool.index_k_buffer,
                 *indexer_pool.index_scale_buffer,
             ):
+                if not buf.shape[-1]:
+                    continue
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
@@ -838,6 +891,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # Index by PP-stage-local layer_id (see get_swa_buffer).
         pool = self.swa_kv_pool
         buf = pool.kv_buffer[self._swa_local_layer_id(layer_id)]
+        if pool.layout is NPUDSV4KVLayout.V41_BF16:
+            _store_dsv41_rows(buf, loc, cache)
+            return
         if isinstance(pool, DSV41NPUSingleKVPool):
             # A V4.1 window row is FP8 E4M3 group 32 (544 B), not the V4 584-byte
             # arch35 row: the ds41 attention op reads ori_kv with all head_dim values
@@ -982,6 +1038,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         device_type = kv.device.type
         if from_indexer:
             indexer_pool = self._indexer_pool(ratio)
+            if isinstance(indexer_pool, DSV41NPUIndexerPool) and is_ascend_910b():
+                indexer_pool.store_index_rows(compress_layer_id, loc, kv)
+                return
             if device_type == "npu":
                 assert indexer_pool.has_npu_storage, (
                     "NPU index buffers not allocated; pool was init'd on CUDA?"
@@ -995,6 +1054,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             return
         compress_pool = item.compress_kv_pool
         assert compress_pool is not None, "Missing compressed KV pool"
+        if compress_pool.layout is NPUDSV4KVLayout.V41_BF16:
+            _store_dsv41_rows(compress_pool.kv_buffer[compress_layer_id], loc, kv)
+            return
         if device_type == "npu":
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
