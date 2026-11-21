@@ -522,7 +522,9 @@ class PrefillBootstrapQueue:
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
-            prompt_fingerprint=kv_transfer_fingerprint(req.origin_input_ids),
+            prompt_fingerprint=kv_transfer_fingerprint(
+                req.origin_input_ids, lora_name=req.lora_name
+            ),
         )
         req.pending_bootstrap = True
 

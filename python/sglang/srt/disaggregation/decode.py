@@ -1225,7 +1225,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             bootstrap_room=req.bootstrap_room,
             # The ids that pre_alloc_fill_len covers; a rebootstrap prefills them.
             prompt_fingerprint=kv_transfer_fingerprint(
-                req.origin_input_ids, req.output_ids[:-1]
+                req.origin_input_ids, req.output_ids[:-1], lora_name=req.lora_name
             ),
         )
 

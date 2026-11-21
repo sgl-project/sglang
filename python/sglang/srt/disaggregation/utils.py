@@ -337,11 +337,20 @@ def pre_alloc_fill_len(req: Req) -> int:
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
 
-def kv_transfer_fingerprint(*token_id_runs: Sequence[int]) -> str:
+def kv_transfer_fingerprint(
+    *token_id_runs: Sequence[int], lora_name: Optional[str] = None
+) -> str:
     """Digest of the ids a PD request fills KV for; prefill and decode must agree."""
     digest = hashlib.blake2b(digest_size=8)
     for token_ids in token_id_runs:
         digest.update(array("q", token_ids))
+    if lora_name is not None:
+        # The KV depends on the adapter, so the adapter name is part of the digest.
+        # lora_id is not used, because a dynamic load mints it per server.
+        # Token ids are never negative, so the -1 marker cannot be read as ids.
+        name = lora_name.encode()
+        digest.update(array("q", [-1, len(name)]))
+        digest.update(name)
     return digest.hexdigest()
 
 
