@@ -7,7 +7,8 @@ import tempfile
 from collections.abc import Callable
 from contextlib import closing
 from io import BytesIO
-from urllib.parse import unquote, urlparse
+from typing import BinaryIO
+from urllib.parse import unquote, urljoin, urlparse
 
 import imageio
 import numpy as np
@@ -20,6 +21,7 @@ from packaging import version
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
+from sglang.srt.multimodal.media_io import validate_remote_media_url
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -211,6 +213,62 @@ def load_image(
 _VIDEO_DOWNLOAD_TIMEOUT_S = 60
 
 
+# Upper bound for one client-supplied video download. Videos are much larger
+# than the 64 MiB default cap for still media, so remote videos get their own
+# cap instead of sharing it; the bound still stops a hostile URL from filling
+# server disk or memory.
+_VIDEO_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
+
+_VIDEO_DOWNLOAD_MAX_REDIRECTS = 5
+
+_VIDEO_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+
+
+def download_video_to_stream(video: str, output: BinaryIO) -> None:
+    """Fetch a remote video into a caller-owned stream under the media URL policy.
+
+    Redirects are followed manually so every hop is validated (scheme and
+    resolved IP) before a connection is made, and the body is streamed to
+    disk under a size cap instead of being buffered in memory.
+    """
+    current_url = video
+    for redirect_count in range(_VIDEO_DOWNLOAD_MAX_REDIRECTS + 1):
+        prepared_url = validate_remote_media_url(current_url)
+        with closing(
+            requests.get(
+                prepared_url,
+                stream=True,
+                allow_redirects=False,
+                timeout=_VIDEO_DOWNLOAD_TIMEOUT_S,
+            )
+        ) as response:
+            location = response.headers.get("Location")
+            if response.status_code in _VIDEO_REDIRECT_STATUS_CODES and location:
+                if redirect_count == _VIDEO_DOWNLOAD_MAX_REDIRECTS:
+                    raise requests.exceptions.TooManyRedirects(
+                        f"Video URL exceeded {_VIDEO_DOWNLOAD_MAX_REDIRECTS} redirects"
+                    )
+                current_url = urljoin(response.url, location)
+                continue
+            if response.status_code != 200:
+                raise ValueError(
+                    f"Failed to download video. Status code: {response.status_code}"
+                )
+            total_bytes = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total_bytes += len(chunk)
+                if total_bytes > _VIDEO_DOWNLOAD_MAX_BYTES:
+                    raise ValueError(
+                        "Video exceeds the "
+                        f"{_VIDEO_DOWNLOAD_MAX_BYTES} byte download limit"
+                    )
+                output.write(chunk)
+            return
+    raise AssertionError("unreachable")
+
+
 # adapted from diffusers.utils import load_video
 def load_video(
     video: str,
@@ -254,16 +312,8 @@ def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Ima
         suffix = os.path.splitext(file_name)[1] or ".mp4"
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
-            with closing(
-                requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
-            ) as response:
-                if response.status_code != 200:
-                    raise ValueError(
-                        f"Failed to download video. Status code: {response.status_code}"
-                    )
-                with open(video_path, "wb") as temp_file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        temp_file.write(chunk)
+            with open(video_path, "wb") as output:
+                download_video_to_stream(video, output)
             return _read_video_frames(video_path, max_frames)
     return _read_video_frames(video, max_frames)
 

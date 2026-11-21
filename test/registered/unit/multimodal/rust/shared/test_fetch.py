@@ -13,7 +13,11 @@ import threading
 import unittest
 from pathlib import Path
 
-from sglang.srt.multimodal.media_io import get_image_bytes
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    get_image_bytes,
+    media_url_security_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,7 +63,9 @@ class TestRustMediaSourceLoading(CustomTestCase):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        self.addCleanup(configure_media_url_security, *media_url_security_config())
         try:
+            configure_media_url_security([server.server_address[0]])
             url = f"http://127.0.0.1:{server.server_port}/image"
             self.assertEqual(bytes(FETCH(url)), get_image_bytes(url))
         finally:

@@ -540,7 +540,7 @@ class TestTokenSpaceSGLangProcessor(CustomTestCase):
         )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
         self.assertEqual(
-            media_url_security_config(), (["media.example.com"], 7, 3.0, False)
+            media_url_security_config(), (["media.example.com"], 7, 3.0, False, False)
         )
 
     def test_serving_offsets_come_from_mm_spans(self):

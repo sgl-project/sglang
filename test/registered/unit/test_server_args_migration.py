@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.choices import REMOVED_CHOICES
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.multimodal.media_io import (
     configure_media_url_security,
+    media_url_security_config,
     media_url_timeout,
     read_local_media_file,
 )
@@ -129,6 +130,19 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             self.assertEqual(media_url_timeout(3), 2.5)
             with self.assertRaisesRegex(ValueError, "not allowed"):
                 read_local_media_file(__file__)
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
+    def test_allow_private_media_hosts_arg(self):
+        try:
+            sa = self._parse([])
+            self.assertFalse(sa.allow_private_media_hosts)
+            sa = self._parse(["--allow-private-media-hosts"])
+            self.assertTrue(sa.allow_private_media_hosts)
+            # Parsing applies the policy to this process.
+            self.assertEqual(media_url_security_config()[4], True)
+            sa = self._parse(["--no-allow-private-media-hosts"])
+            self.assertFalse(sa.allow_private_media_hosts)
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 

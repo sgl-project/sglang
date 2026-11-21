@@ -578,6 +578,10 @@ def test_undeliverable_response_format_is_rejected_before_generation(
 
 def _patch_download(monkeypatch, tmp_path, handler):
     """Route the download through handler; return the dir holding partial files."""
+    # Only the synthetic origin is allowed; neither DNS nor HTTP needs a network.
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._allowed_media_domains", frozenset({"x.test"})
+    )
     part_dir = tmp_path / "parts"
     part_dir.mkdir()
     monkeypatch.setattr(utils.tempfile, "tempdir", str(part_dir))

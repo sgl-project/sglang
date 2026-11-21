@@ -105,6 +105,8 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
     def test_unfetchable_url_every_request_exception(self):
         # download_remote_media() fetches through get_mm_http_session(); HTTPError,
         # ConnectionError and Timeout all subclass RequestException.
+        # A literal public IP keeps the URL past host validation (no DNS
+        # lookup) so the mocked fetch failure is what gets reclassified.
         for exc in (
             requests.exceptions.HTTPError("404 from media host"),
             requests.exceptions.ConnectionError("dns failure"),
@@ -116,7 +118,7 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
                     return_value=_session_raising(exc),
                 ):
                     with self.assertRaises(ValueError) as ctx:
-                        _resolve_media_item({"url": "https://media.host/clip.png"})
+                        _resolve_media_item({"url": "https://93.184.216.34/clip.png"})
                     # the raw RequestException must not leak past the boundary
                     self.assertNotIsInstance(
                         ctx.exception, requests.exceptions.RequestException

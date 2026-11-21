@@ -104,6 +104,19 @@ class Mm(msgspec.Struct):
         "exact hostnames. Redirect destinations are checked against the same "
         "allowlist. When unset, remote media from any domain is allowed.",
     ] = msgspec.field(default_factory=list)
+    allow_private_media_hosts: A[
+        bool,
+        Arg(
+            help=(
+                "Allow client-supplied HTTP(S) media URLs to resolve to private, "
+                "loopback, or link-local IP addresses (including cloud metadata "
+                "endpoints such as 169.254.169.254). Disabled by default; enable "
+                "only when the server intentionally fetches media from a private "
+                "network. An explicitly allowlisted domain is exempt regardless."
+            ),
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = False
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "

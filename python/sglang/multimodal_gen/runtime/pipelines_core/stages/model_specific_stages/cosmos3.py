@@ -12,12 +12,16 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
+import os
+import tempfile
 from collections import deque
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 from fractions import Fraction
 from itertools import islice
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import DataHandler, Request
 
 import numpy as np
 import PIL.Image
@@ -97,6 +101,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.vision import (
+    download_video_to_stream,
     load_image,
     load_video,
     preprocess_image,
@@ -237,6 +242,40 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     return video.contiguous()
 
 
+@contextmanager
+def _open_video_stream(video_path: str):
+    """Give PyAV a seekable stream; remote clips are fully staged under the download cap."""
+    with ExitStack() as files:
+        try:
+            scheme = urlparse(video_path).scheme.lower()
+            if scheme in ("http", "https"):
+                # An explicitly configured scratch volume must not fall back to another disk.
+                root = os.environ.get("TMPDIR") or None
+                if root is not None and not os.path.isabs(root):
+                    raise ValueError("TMPDIR must be absolute")
+                stream = files.enter_context(tempfile.TemporaryFile(dir=root))
+                download_video_to_stream(video_path, stream)
+                stream.seek(0)
+            elif scheme == "data":
+                # DataHandler only reads inline bytes; it does not dispatch URLs.
+                stream = files.enter_context(
+                    DataHandler().data_open(Request(video_path))
+                )
+            elif not scheme or len(scheme) == 1:
+                stream = files.enter_context(open(video_path, "rb"))
+            else:
+                stream = None
+        except (ValueError, OSError) as exc:
+            # Both HTTP and filesystem exceptions may retain the original source.
+            category = type(exc).__name__
+        else:
+            if stream is None:
+                raise ValueError("Unsupported video path scheme")
+            yield stream
+            return
+        raise ValueError(f"Could not open video source ({category}).")
+
+
 def _iter_video_frames_pyav(
     video_path: str, num_frames: int, keep: str = "first"
 ) -> Iterator[np.ndarray]:
@@ -253,9 +292,12 @@ def _iter_video_frames_pyav(
     if keep not in ("first", "last"):
         raise ValueError("keep must be 'first' or 'last'")
 
-    with av.open(video_path) as container:
+    with (
+        _open_video_stream(video_path) as source,
+        av.open(source, options={"protocol_whitelist": "data"}) as container,
+    ):
         if not container.streams.video:
-            raise ValueError(f"No video stream in {video_path!r}")
+            raise ValueError("Input media has no video stream.")
         stream = container.streams.video[0]
         stream.codec_context.thread_type = "SLICE"
         stream.codec_context.thread_count = 1
@@ -338,7 +380,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
         frames = load_video(control_path, max_frames=max_frames)
         if not frames:
-            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
+            raise ValueError("No frames decoded from transfer video.")
         frames = frames[:max_frames]
         frames_cthw = torch.stack(
             [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
@@ -568,7 +610,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 else:
                     processed = _preprocess_video_frames_gpu(frames, target_h, target_w)
             if not processed:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
+                raise ValueError("No frames decoded from input video.")
             # Pad CUDA frames after conversion to the VAE dtype instead.
             if force_cpu:
                 if len(processed) < num_source_frames:

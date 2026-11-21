@@ -5725,6 +5725,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "allow_private_media_hosts": ["--allow-private-media-hosts"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],
