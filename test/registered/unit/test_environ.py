@@ -227,26 +227,8 @@ class TestOptRenamedEnvAliases(CustomTestCase):
 
     RENAMED = (
         # (new name, old name, value set on the old name, parsed value)
-        (
-            "SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT",
-            "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT",
-            "1",
-            True,
-        ),
-        (
-            "SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM",
-            "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM",
-            "1",
-            True,
-        ),
         ("SGLANG_OPT_HIP_K3_AITER", "SGLANG_AITER_K3_OPT", "1", True),
         ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK", "1", True),
-        (
-            "SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY",
-            "SGLANG_OPT_FUSED_KDA_VERIFY",
-            "1",
-            True,
-        ),
     )
 
     def test_old_name_forwards_with_warning(self):

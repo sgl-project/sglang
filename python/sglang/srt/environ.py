@@ -1104,13 +1104,9 @@ class Envs:
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Kimi-K3 gfx950 prefill: the MoE front on row shards, shared experts TP-sharded
-    SGLANG_OPT_HIP_K3_ROW_SHARDED_ROUTED_FRONT = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT"
-    )
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
-    SGLANG_OPT_HIP_K3_ROW_SHARDED_STREAM = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM"
-    )
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
@@ -1232,8 +1228,8 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    # Kimi-K3 on ROCm: declare a 128-aligned MXFP4 intermediate on the routed experts,
-    # and skip the router-logits contiguous copy.
+    # Kimi-K3 on ROCm: keep a 128-aligned MXFP4 MoE intermediate, and skip the
+    # router-logits contiguous copy.
     SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_AITER_K3_OPT"
     )
@@ -1857,11 +1853,7 @@ class Envs:
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
-    # KDA chain (topk 1) target verify: conv + gated delta rule in one launch
-    # (fused_kda_conv_recurrent_verify.py). Only used with --linear-attn-verify-backend triton.
-    SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_OPT_FUSED_KDA_VERIFY"
-    )
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
