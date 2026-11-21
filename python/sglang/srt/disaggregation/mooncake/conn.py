@@ -630,6 +630,30 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return PrefillStagingStrategy(self, staging_buffer)
 
+    def _staging_route(
+        self, *, kv_chunk, target_info, staging_strategy, is_dcp_transfer: bool
+    ) -> Tuple[bool, bool]:
+        """(uses_staging, skips_empty_chunk) for one chunk and decode target."""
+        uses_staging = (
+            not is_dcp_transfer
+            and not (
+                self.is_mla_backend
+                or self.is_hybrid_mla_backend
+                or self.attn_tp_size == target_info.dst_attn_tp_size
+            )
+            and self.enable_staging
+            and staging_strategy is not None
+            and (
+                target_info.staging_base_ptr != 0 or target_info.staging_total_size != 0
+            )
+        )
+        # A shard writer with no pages here must still report the chunk, or
+        # decode waits for it forever.
+        skips_empty_chunk = len(kv_chunk.prefill_kv_indices) == 0 and not (
+            uses_staging and kv_chunk.chunk_slice is not None
+        )
+        return uses_staging, skips_empty_chunk
+
     def _do_staging_transfer(
         self,
         staging_strategy,
@@ -647,10 +671,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         falling back to the slice path, which would leak the decode-side
         allocation. deferred=True means caller should re-enqueue and break.
         """
+        if kv_chunk.chunk_slice is None:
+            page_start = kv_chunk.index_slice.start
+            num_pages = len(kv_chunk.prefill_kv_indices)
+            page_positions = None
+        else:
+            page_start = kv_chunk.chunk_slice.start
+            num_pages = kv_chunk.chunk_slice.stop - kv_chunk.chunk_slice.start
+            page_positions = np.asarray(kv_chunk.index_slice) - page_start
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
-            kv_chunk.index_slice.start,
-            len(kv_chunk.prefill_kv_indices),
+            page_start,
+            num_pages,
         )
         if not ready:
             from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
@@ -672,13 +704,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             queue.put(kv_chunk)
             return (-1, True)
 
-        ret = staging_strategy.transfer(
-            req.mooncake_session_id,
-            kv_chunk.prefill_kv_indices,
-            target_info.staging_base_ptr + c_offset,
-            target_info.staging_total_size - c_offset,
-            target_info,
-        )
+        if len(kv_chunk.prefill_kv_indices) == 0:
+            ret = 0
+        else:
+            ret = staging_strategy.transfer(
+                req.mooncake_session_id,
+                kv_chunk.prefill_kv_indices,
+                target_info.staging_base_ptr + c_offset,
+                target_info.staging_total_size - c_offset,
+                target_info,
+                page_positions=page_positions,
+                chunk_num_pages=num_pages,
+            )
         if ret == -1:
             # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
             # not fall back to the slice path (leaks the decode-side allocation).
@@ -692,8 +729,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.send_chunk_ready(
                 room=req.room,
                 chunk_idx=chunk_idx,
-                page_start=kv_chunk.index_slice.start,
-                num_pages=len(kv_chunk.prefill_kv_indices),
+                page_start=page_start,
+                num_pages=num_pages,
                 writer_id=req.mooncake_session_id,
                 targets=[(req.endpoint, req.dst_port)],
             )
@@ -741,12 +778,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: List[int],
         staging_buffer=None,
         dst_slot_layer_ids: Optional[List[int]] = None,
+        page_positions: Optional[npt.NDArray[np.int64]] = None,
+        chunk_num_pages: Optional[int] = None,
     ) -> int:
-        """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
+        """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode).
+
+        With KV sharding, page_positions places this rank's pages within a
+        chunk_num_pages chunk, whose region every shard writer fills in part.
+        """
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
             compute_staging_layout,
             resolve_total_kv_heads,
+            sharded_staging_transfer_blocks,
         )
 
         if self.kv_buffer_tensors is None or staging_buffer is None:
@@ -773,6 +817,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_tokens = len(prefill_kv_indices) * page_size
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
         local_bytes = per_layer_bytes * num_layers * 2
+        chunk_tokens = (
+            num_tokens if page_positions is None else chunk_num_pages * page_size
+        )
 
         if self.pp_size > 1:
             # Pair staging slots in [all K, all V] order; draft buffers make
@@ -798,7 +845,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_attn_tp_size,
             dst_tp_rank,
             total_kv_heads,
-            num_tokens,
+            chunk_tokens,
             head_dim * dtype_size,
             dst_num_layers,
         )
@@ -831,7 +878,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             page_size,
         )
 
-        if pairs is None:
+        if page_positions is not None:
+            bytes_per_token = num_heads_to_send * head_dim * dtype_size
+            transfer_blocks = sharded_staging_transfer_blocks(
+                src_ptr=staging_buffer.get_ptr(),
+                dst_ptr=dst_staging_ptr + rank_offset,
+                page_positions=page_positions,
+                slab_pairs=(
+                    pairs
+                    if pairs is not None
+                    else [(slab, slab) for slab in range(num_layers * 2)]
+                ),
+                src_slab_bytes=per_layer_bytes,
+                dst_slab_bytes=chunk_tokens * bytes_per_token,
+                page_bytes=page_size * bytes_per_token,
+            )
+        elif pairs is None:
             transfer_blocks = [
                 (
                     staging_buffer.get_ptr(),
@@ -3038,8 +3100,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        uses_staging, skips_empty_chunk = self._staging_route(
+                            kv_chunk=kv_chunk,
+                            target_info=target_rank_registration_info,
+                            staging_strategy=staging_strategy,
+                            is_dcp_transfer=is_dcp_transfer,
+                        )
                         if (
-                            len(kv_chunk.prefill_kv_indices) == 0
+                            skips_empty_chunk
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
                         ):
@@ -3096,14 +3164,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                                 dst_num_draft_entries=target_rank_registration_info.num_draft_entries,
                             )
-                        elif (
-                            self.enable_staging
-                            and staging_strategy is not None
-                            and (
-                                target_rank_registration_info.staging_base_ptr != 0
-                                or target_rank_registration_info.staging_total_size != 0
-                            )
-                        ):
+                        elif uses_staging:
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,
                                 kv_chunk,
@@ -3516,6 +3577,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        chunk_slice: Optional[slice] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3558,6 +3620,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 wait_event=wait_event,
                 indices_event=indices_event,
                 send_record=self.send_record(bootstrap_room),
+                chunk_slice=chunk_slice,
             )
         )
         self.note_send_enqueued(bootstrap_room)

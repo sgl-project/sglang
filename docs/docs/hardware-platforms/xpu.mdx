@@ -486,3 +486,91 @@ curl http://127.0.0.1:8000/v1/completions \
 ```
 
 > **Note:** If UCX's shared-memory transport fails to attach a peer's segment (it opens `/proc/<pid>/fd/<fd>`, which needs ptrace rights), set `UCX_POSIX_USE_PROC_LINK=n` to have it open the segment by its `/dev/shm` path instead.
+
+### KV cache sharding on the prefill server
+
+`--enable-kv-cache-sharding` on a PD prefill server stripes KV pages across the
+prefill ranks, so each rank stores and sends only its own pages and a request's KV
+can exceed one rank's pool. On XPU, with `--attention-backend intel_xpu`, it
+supports:
+
+- MLA models, striped over attention TP (no attention CP).
+- GQA models, striped over zigzag prefill CP ranks (see below).
+
+Each layer's prefix is all-gathered over XCCL into a scratch buffer that attention
+reads, one layer ahead on a side stream and on a process group of its own. To
+measure that gather's bandwidth and how much of it hides behind compute on your
+cards, run
+`torchrun --nproc-per-node 2 benchmark/kernels/all_gather/bench_kv_shard_gather.py --device xpu`.
+DSA models are refused. Use the Mooncake or NIXL transfer backend, and set
+`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` on the prefill server. Both
+backends are tested on Arc Pro B60; the NIXL run is a manual test
+(`test/manual/kv_transfer/test_disaggregation_kv_cache_sharding_nixl_xpu.py`),
+because the XPU CI image does not install NIXL.
+
+For GQA sharding over prefill CP with Mooncake, also set
+`SGLANG_DISAGG_STAGING_BUFFER=1` on both the prefill and the decode server.
+Prefill CP runs attention TP 1, so a decode server with a larger attention TP
+needs only part of each token's KV heads. Without staging, Mooncake sends that
+as one small copy per token per layer; with staging, each prefill rank packs its
+pages and sends them in a few large copies, which decode unpacks. The NIXL
+backend refuses staging together with sharding.
+
+Without staging, the per-token copies also depend on how fast Mooncake runs many
+small copies between XPUs. Mooncake 0.3.13 waits for each one before submitting
+the next; [kvcache-ai/Mooncake#5153](https://github.com/kvcache-ai/Mooncake/pull/5153)
+submits them in one batch and roughly halves the time per copy.
+
+**Example: GQA sharded over prefill CP, on four cards.** The prefill server runs
+TP 2 with zigzag CP 2 on cards 0 and 1, and the decode server runs TP 2 on cards
+2 and 3. Follow the [Mooncake backend](#mooncake-backend) prerequisites first.
+
+Start the prefill server:
+
+```bash
+ZE_AFFINITY_MASK=0,1,2,3 MC_USE_TENT=1 SGLANG_DISAGG_STAGING_BUFFER=1 \
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B --trust-remote-code --device xpu \
+    --attention-backend intel_xpu --page-size 128 \
+    --tp-size 2 --attn-cp-size 2 --enable-prefill-cp --cp-strategy zigzag \
+    --enable-kv-cache-sharding \
+    --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
+```
+
+Start the decode server:
+
+```bash
+ZE_AFFINITY_MASK=0,1,2,3 MC_USE_TENT=1 SGLANG_DISAGG_STAGING_BUFFER=1 \
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B --trust-remote-code --device xpu \
+    --attention-backend intel_xpu --page-size 128 \
+    --tp-size 2 --base-gpu-id 2 --mem-fraction-static 0.75 \
+    --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
+```
+
+Start the router and send a request as shown for [NIXL](#nixl-backend), using
+`Qwen/Qwen3-8B` as the model. For an MLA model, drop `--attn-cp-size`,
+`--enable-prefill-cp`, `--cp-strategy` and `SGLANG_DISAGG_STAGING_BUFFER`: MLA
+shards over the prefill server's attention TP.
+
+### Prefill context parallelism
+
+`--enable-prefill-cp --cp-strategy zigzag --attn-cp-size N` splits each prefill
+across N ranks on XPU for dense GQA/MHA models with `--attention-backend intel_xpu`:
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --device xpu \
+    --attention-backend intel_xpu --tp-size 2 --attn-cp-size 2 \
+    --enable-prefill-cp --cp-strategy zigzag
+```
+
+Each rank all-gathers the chunk's K/V into its pool and attends its two zigzag
+segments against the full cache. The server refuses MLA models, other CP
+strategies, other attention backends and decode context parallelism (`--dcp-size`).
+Sliding-window, local, cross and bidirectional attention fail at the first prefill.
+
+The model must split its attention heads by attention TP rather than by the full
+TP size. Qwen3 does, and is what the XPU CP tests use. Llama models do not: with
+`--attn-cp-size 2` the first prefill fails with an error that names the mismatch.

@@ -202,7 +202,10 @@ if [[ -n "${HF_TOKEN_VALUE}" ]]; then
 fi
 for model in \
     "meta-llama/Llama-3.2-1B-Instruct" \
-    "rescommons/SpecForge-EAGLE3-Llama-3.2-1B-Instruct"; do
+    "rescommons/SpecForge-EAGLE3-Llama-3.2-1B-Instruct" \
+    "Qwen/Qwen3-0.6B" \
+    "Qwen/Qwen3-8B" \
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"; do
   echo "Pre-downloading HF model: ${model}"
   docker exec "${CONTAINER_NAME}" /opt/venv/bin/hf download "${model}" \
     >/dev/null 2>&1 || echo "Warning: pre-download of ${model} failed; test will retry online" >&2

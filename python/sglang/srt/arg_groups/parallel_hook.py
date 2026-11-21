@@ -11,9 +11,11 @@ from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
 from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
     model_config_of,
     resolved_view,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
@@ -69,6 +71,27 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     return {}
 
 
+def _validate_xpu_prefill_cp(server_args: Any, cfg: Any) -> None:
+    """intel_xpu implements zigzag CP for dense attention only; any other
+    combination would ignore the CP split and compute wrong attention."""
+    prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    if prefill_backend != "intel_xpu":
+        raise ValueError(
+            "Prefill CP on XPU requires the intel_xpu prefill attention backend; "
+            f"got {prefill_backend!r}."
+        )
+    if cfg.cp_strategy != "zigzag":
+        raise ValueError(
+            f"Prefill CP on XPU supports --cp-strategy zigzag only; got {cfg.cp_strategy!r}."
+        )
+    if use_mla_backend(server_args):
+        raise ValueError("Prefill CP on XPU does not support MLA models yet.")
+    if cfg.dcp_size > 1:
+        raise ValueError(
+            "Prefill CP on XPU cannot be combined with decode context parallelism."
+        )
+
+
 def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
@@ -98,6 +121,8 @@ def handle_context_parallelism(server_args: Any):
                 "Prefill CP on HIP is only supported for "
                 f"DeepseekV4ForCausalLM, got {model_arch!r}."
             )
+        if cfg.enable_prefill_cp and get_platform().is_xpu:
+            _validate_xpu_prefill_cp(server_args, cfg)
         if (
             cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"

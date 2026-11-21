@@ -2495,7 +2495,12 @@ class CommonKVSender(BaseKVSender):
                 shard_size=self.kv_mgr.kv_shard_size,
             )
             # Like the scheduler, skip a non-final chunk with nothing to send.
-            if len(kv_indices) == 0 and not is_last_chunk:
+            # GQA staging keeps it: decode fans in one arrival per shard writer.
+            if (
+                len(kv_indices) == 0
+                and not is_last_chunk
+                and not (self.kv_mgr.enable_staging and not self.kv_mgr.is_mla_backend)
+            ):
                 return kv_indices, index_slice, is_last_chunk, True
         elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
@@ -2526,6 +2531,12 @@ class CommonKVSender(BaseKVSender):
         if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
             return
 
+        # Taken before sharding narrows index_slice to this rank's pages.
+        chunk_slice = (
+            slice(self.curr_idx, self.curr_idx + len(kv_indices))
+            if self.kv_mgr.kv_shard_size > 1
+            else None
+        )
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
@@ -2552,6 +2563,7 @@ class CommonKVSender(BaseKVSender):
             num_kv_tokens=num_kv_tokens,
             wait_event=wait_event,
             indices_event=indices_event,
+            chunk_slice=chunk_slice,
             trace_ctx=self.trace_ctx.copy_for_thread(),
         )
         self._record_transfer_indices(kv_indices, state_indices)
