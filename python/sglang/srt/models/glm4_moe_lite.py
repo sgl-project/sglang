@@ -937,7 +937,6 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -1053,48 +1052,28 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
-                        cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = (
-                            name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                        )
-                        kv_a_proj_name = (
-                            name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        )
-
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                        if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
-                        ):
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = fuse_qkv_a_proj_tensors(
-                                name,
-                                q_a=q_a_proj_weight,
-                                kv_a=kv_a_proj_weight,
-                                quant_config=self.quant_config,
-                            )
-                            param_name = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                                if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
+                        is_q = "q_a_proj" in name
+                        source = "q_a_proj" if is_q else "kv_a_proj_with_mqa"
+                        other = "kv_a_proj_with_mqa" if is_q else "q_a_proj"
+                        param_name = name.replace(source, "fused_qkv_a_proj_with_mqa")
+                        if param_name in params_dict:
+                            pending = self._get_pending_weight_halves().qkv_a_proj
+                            partner = pending.pop(name.replace(source, other), None)
+                            if partner is None:
+                                # The sender can reuse the bucket before the other half arrives.
+                                pending[name] = loaded_weight.clone()
+                            else:
+                                fused_weight = fuse_qkv_a_proj_tensors(
+                                    name,
+                                    q_a=loaded_weight if is_q else partner,
+                                    kv_a=partner if is_q else loaded_weight,
+                                    quant_config=self.quant_config,
                                 )
-                            )
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
-                            if param_name not in params_dict:
-                                continue
-                            param = params_dict[param_name]
-
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            weight_loader(param, fused_weight)
+                                param = params_dict[param_name]
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                weight_loader(param, fused_weight)
                     else:
                         if (
                             "k_scale" in name or "v_scale" in name
