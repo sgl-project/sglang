@@ -516,8 +516,8 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
+        # Only tags not yet released; each is recorded once its own release succeeds.
+        tags = set(tags) - self.offload_tags
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
@@ -534,6 +534,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             # Cannot be refused: its idle gate is the check at the top.
             self.flush_cache()
+            self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
@@ -542,9 +543,11 @@ class SchedulerWeightUpdaterManager:
             )
             control_request_barrier()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            self.offload_tags.add(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            self.offload_tags.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
         # The verdict leaves on return; every peer that received the request must have released by then.
@@ -558,11 +561,12 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.remove(tag)
+        # Only released tags; each is cleared once its own resume succeeds.
+        tags = self.offload_tags.intersection(tags)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
@@ -573,6 +577,7 @@ class SchedulerWeightUpdaterManager:
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+            self.offload_tags.discard(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
@@ -586,6 +591,7 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+            self.offload_tags.discard(GPU_MEMORY_TYPE_KV_CACHE)
 
         return ResumeMemoryOccupationReqOutput()
 
