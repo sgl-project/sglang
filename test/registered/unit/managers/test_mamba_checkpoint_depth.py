@@ -46,6 +46,7 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    branching_seqlen: int | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -65,7 +66,7 @@ def _prepare_extend(
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching_seqlen
 
     batch = ScheduleBatch(reqs=[req])
     batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
@@ -397,16 +398,15 @@ class TestMambaBranchChunkAlignment(unittest.TestCase):
 
         # Chunks: [0, 960), [960, 1920), [1920, 2416).
         self.assertEqual(cuts, [(0, 960), (960, 960), (1920, 496)])
-        # The chunk covering 2368 starts at 1920, so (2368 - 1920) % 64 == 0.
+        # The chunk covering 2368 starts at 1920, so the tracker captures 2368.
         entry, tracked_req = _prepare_extend(
-            tree_page=1, prefix_len=1920, extend_len=496
+            tree_page=1,
+            prefix_len=1920,
+            extend_len=496,
+            branching_seqlen=2368,
         )
-        # Re-run with mamba_branching_seqlen=2368 to verify exact capture.
-        tracked_req.mamba_branching_seqlen = 2368
-        from sglang.srt.managers.schedule_batch import branch_checkpoint
-
-        self.assertEqual(branch_checkpoint(1920, 2368, 2416, CHUNK), 2368)
         self.assertTrue(entry.track_mask)
+        self.assertEqual(tracked_req.kv.mamba_last_track_seqlen, 2368)
 
     def test_off_grid_prefix_hit_splits_before_fork_when_allowed(self):
         # Request resumed from an off-grid checkpoint at 1448 with fork at 2368.
@@ -424,6 +424,15 @@ class TestMambaBranchChunkAlignment(unittest.TestCase):
             req, 1448, 1052, allow_new_split=False
         )
         self.assertEqual(unsplit, 1052)
+        # Under strict_chunk_grid, do not split to a chunk shorter than grid.
+        strict_adder = self._adder()
+        strict_adder.strict_chunk_grid = True
+        self.assertEqual(
+            strict_adder.align_branch_chunk_tokens(
+                req, 2280, 200, allow_new_split=True
+            ),
+            200,
+        )
 
     def test_no_branch_or_tiny_chunk_is_untouched(self):
         adder = self._adder()

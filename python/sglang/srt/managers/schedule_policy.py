@@ -1334,6 +1334,7 @@ class PrefillAdder:
         if branch is None or prefix_len >= branch or grid <= 1 or extend_len <= 0:
             return extend_len
         step = math.lcm(grid, align_size) if align_size and align_size > 1 else grid
+        strict = getattr(self, "strict_chunk_grid", False)
         end = prefix_len + extend_len
         if end < branch:
             # Intermediate chunk strictly before the fork: round its end down
@@ -1341,8 +1342,9 @@ class PrefillAdder:
             rem = (branch - end) % step
             if rem != 0:
                 drop = step - rem
-                if extend_len > drop:
-                    return extend_len - drop
+                new_len = extend_len - drop
+                if new_len > 0 and (not strict or new_len >= grid):
+                    return new_len
             return extend_len
         # This chunk reaches or crosses `branch`. If `prefix_len` started off
         # the checkpoint grid relative to `branch` (e.g. from an earlier
@@ -1354,6 +1356,8 @@ class PrefillAdder:
             and branch - grid > prefix_len
         ):
             cut_len = (branch - grid) - prefix_len
+            if strict and cut_len < grid:
+                return extend_len
             if align_size and align_size > 1 and cut_len % align_size != 0:
                 return extend_len
             return cut_len
