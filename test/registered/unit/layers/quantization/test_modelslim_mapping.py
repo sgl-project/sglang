@@ -284,20 +284,30 @@ class TestModelSlimMapping(CustomTestCase):
         self.assertEqual(original, before)
         self.assertEqual(incoming, before_incoming)
 
-    def test_incomplete_mixed_and_ambiguous_layouts_raise(self):
-        """Require all q/k/v parts with one scheme; reject whole + split layouts."""
+    def test_partial_mixed_and_ambiguous_layouts(self):
+        """Warn if Q and V descriptions are missing. Use K's scheme."""
+        config = ModelSlimConfig({"visual.attn.k_proj.weight": "W8A8"})
+        with self.assertLogs(ModelSlimConfig.__module__, "WARNING"):
+            layer = self.make_linear(config, "visual.attn.qkv_proj")
+        self.assertEqual(layer.weight.dtype, torch.int8)
         parts = {
             "visual.attn." + part + ".weight": "W8A8"
             for part in ("q_proj", "k_proj", "v_proj")
         }
         cases = (
-            ({"visual.attn.q_proj.weight": "W8A8"}, "Missing ModelSlim"),
             (
                 {**parts, "visual.attn.v_proj.weight": "FLOAT"},
                 "same quantization scheme",
             ),
             ({**parts, "visual.attn.qkv_proj.weight": "W8A8"}, "Ambiguous ModelSlim"),
             ({**parts, "visual.attn.qkv.weight": "W8A8"}, "Ambiguous ModelSlim"),
+            (
+                {
+                    "visual.attn.qkv.weight": "W8A8",
+                    "packed_modules_mapping": {"qkv_proj": ["qkv", "extra"]},
+                },
+                "Ambiguous ModelSlim",
+            ),
         )
         for entries, error in cases:
             with (
@@ -306,8 +316,8 @@ class TestModelSlimMapping(CustomTestCase):
             ):
                 self.make_linear(ModelSlimConfig(entries), "visual.attn.qkv_proj")
 
-    def test_zero_width_components_are_optional_only_with_matching_sizes(self):
-        """Allow missing V for sizes [8, 4, 0], but not for a shorter size list."""
+    def test_zero_width_components_are_skipped_only_with_matching_sizes(self):
+        """Skip V for sizes [8, 4, 0]. Warn if V's description is missing for [8, 4]."""
         parent = "model.layers.0.self_attn."
         config = ModelSlimConfig(
             {
@@ -322,10 +332,11 @@ class TestModelSlimMapping(CustomTestCase):
             SimpleNamespace(output_sizes=[8, 4, 0]), parent + "index_qkv_proj"
         )
         self.assertIsNotNone(scheme)
-        with self.assertRaisesRegex(ValueError, "Missing ModelSlim"):
+        with self.assertLogs(ModelSlimConfig.__module__, "WARNING") as logs:
             config.get_linear_scheme(
                 SimpleNamespace(output_sizes=[8, 4]), parent + "index_qkv_proj"
             )
+        self.assertIn(parent + "index_v_proj.weight", logs.output[0])
 
     def test_float_missing_and_unsupported_descriptions_are_distinct(self):
         """FLOAT stays BF16; missing names warn; unsupported W16A16S raises."""

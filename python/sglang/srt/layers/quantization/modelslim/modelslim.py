@@ -662,8 +662,8 @@ class ModelSlimConfig(QuantizationConfig):
             If no description matches, returns [prefix] for the caller to handle.
 
         Raises:
-            ValueError: Some components are missing, their schemes differ,
-                whole and split layouts both exist, or a mapping group is invalid.
+            ValueError: Component schemes differ, whole and split layouts both exist,
+                or a mapping group is invalid.
         """
         # Original name: look for attn.qkv_proj.weight, including mapper aliases.
         direct = self._resolve_quant_prefix(prefix)
@@ -686,20 +686,23 @@ class ModelSlimConfig(QuantizationConfig):
             self._resolve_quant_prefix(parent + separator + shard) for shard in shards
         ]
         present = [p + ".weight" in self.quant_description for p in components]
-        if any(present):
+        components_present = [p for p, found in zip(components, present) if found]
+        if components_present:
             if not all(present):
                 missing = [
                     p + ".weight" for p, found in zip(components, present) if not found
                 ]
-                raise ValueError(
+                logger.warning(
                     f"Missing ModelSlim quantization descriptions for some components "
                     f"of fused layer {prefix}. Missing keys: {missing}"
                 )
-            schemes = {self.quant_description[p + ".weight"] for p in components}
+            schemes = {
+                self.quant_description[p + ".weight"] for p in components_present
+            }
             if len(schemes) != 1:
                 entries = {
                     p + ".weight": self.quant_description[p + ".weight"]
-                    for p in components
+                    for p in components_present
                 }
                 raise ValueError(
                     f"ModelSlim requires all components of fused layer {prefix} "
@@ -708,14 +711,14 @@ class ModelSlimConfig(QuantizationConfig):
 
         # Reject whole + split descriptions: qkv_proj and separate q/k/v.
         # A single part equal to the whole name is the same entry, not a conflict.
-        if any(present):
+        if components_present:
             if whole_quant_prefix is not None and components != [whole_quant_prefix]:
                 raise ValueError(
                     f"Ambiguous ModelSlim layout for {prefix}: whole tensor "
-                    f"{whole_quant_prefix}.weight and component tensors "
-                    f"{[p + '.weight' for p in components]} are both described"
+                    f"{whole_quant_prefix}.weight is described and the packed "
+                    f"mapping expects {[p + '.weight' for p in components]}"
                 )
-            return components
+            return components_present
         if whole_quant_prefix is not None:
             return [whole_quant_prefix]
         # No description found; let the caller handle the missing .weight key.
@@ -781,7 +784,7 @@ class ModelSlimConfig(QuantizationConfig):
             A scheme, e.g. ModelSlimW8A8Int8; None for FLOAT or no description.
 
         Raises:
-            ValueError: Fusion descriptions conflict or are incomplete,
+            ValueError: Component schemes differ, whole and split layouts both exist,
                 a mapping group is invalid, or the declared scheme is unsupported.
         """
 
