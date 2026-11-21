@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
 
 # bumped on any breaking change to the contracts in this module
-MEGAKERNEL_API_VERSION = 2
+MEGAKERNEL_API_VERSION = 3
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
@@ -239,6 +239,17 @@ class VerifyTreeView(msgspec.Struct, frozen=True):
         return self.topk
 
 
+class VerifyPenaltiesView(Protocol):
+    def apply_verify(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        next_child: Optional[torch.Tensor] = None,
+        next_sibling: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Apply each verify row's own sampling penalties to ``logits`` in place."""
+
+
 class VerifySamplingView(msgspec.Struct, frozen=True):
     """Borrowed model-independent sampling tensors and resolved host flags."""
 
@@ -247,8 +258,7 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     top_ks: torch.Tensor
     top_ps: torch.Tensor
     min_ps: torch.Tensor
-    additive_penalties: Optional[torch.Tensor]
-    scaling_penalties: Optional[torch.Tensor]
+    step_penalties: Optional[VerifyPenaltiesView]
     logit_bias: Optional[torch.Tensor]
     sampling_seed: Optional[torch.Tensor]
     is_all_greedy: bool
@@ -261,14 +271,6 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     has_watermark_candidates: bool
     max_top_k: Optional[int]
     device: torch.device
-
-    @property
-    def acc_additive_penalties(self) -> Optional[torch.Tensor]:
-        return self.additive_penalties
-
-    @property
-    def acc_scaling_penalties(self) -> Optional[torch.Tensor]:
-        return self.scaling_penalties
 
 
 class WatermarkStateView(Protocol):

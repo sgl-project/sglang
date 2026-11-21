@@ -369,6 +369,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                verify_tokens=verify_ids_2d,
             )
 
         return result
@@ -507,14 +508,19 @@ class TargetVerifyExecutor:
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         stride = self.verify_num_draft_tokens
         full_block = layout.is_full_block(stride)
+        # [bs, stride] block input tokens, the anchor then the drafts; built only
+        # where read: a full block's verify ids, or the penalties.
+        verify_ids_2d = None
+        if full_block or (
+            sampling_info is not None and sampling_info.step_penalties is not None
+        ):
+            verify_ids_2d = torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
         if full_block:
             # Nothing to pack: the verify rows are the verify window.
             ragged_window = RaggedVerifyWindow(
                 positions=verify_window.positions_2d.reshape(-1),
                 verify_cache_loc=verify_window.verify_cache_loc,
-                verify_ids=torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
-                .reshape(-1)
-                .to(torch.int64),
+                verify_ids=verify_ids_2d.reshape(-1).to(torch.int64),
                 window_index=None,
             )
         else:
@@ -575,6 +581,7 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            verify_tokens=verify_ids_2d,
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided

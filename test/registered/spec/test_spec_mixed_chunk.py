@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.sampling_penalty_kit import PenalizedEOSMixin
 from sglang.test.kits.spec_server_kits import (
     SpecAccuracyKit,
     SpecCorrectnessKit,
@@ -47,7 +48,7 @@ class TestEagle3MixedChunk(
     extra_args = ("--enable-mixed-chunk",)
 
 
-class TestDFlashMixedChunk(GSM8KMixin, CustomTestCase):
+class TestDFlashMixedChunk(PenalizedEOSMixin, GSM8KMixin, CustomTestCase):
     model = DEFAULT_TARGET_MODEL_DFLASH
 
     gsm8k_num_questions = 200
@@ -90,7 +91,7 @@ DSPARK_TARGET_MODEL = "Qwen/Qwen3-14B"
 DSPARK_DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
 
 
-class TestDSparkMixedChunk(GSM8KMixin, CustomTestCase):
+class TestDSparkMixedChunk(PenalizedEOSMixin, GSM8KMixin, CustomTestCase):
     model = DSPARK_TARGET_MODEL
 
     gsm8k_num_questions = 200

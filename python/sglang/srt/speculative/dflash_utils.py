@@ -25,10 +25,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.sampling.penalties import uses_penalty
-from sglang.srt.sampling.sampling_batch_info import (
-    SamplingBatchInfo,
-    apply_acc_penalties,
-)
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -230,11 +227,13 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    verify_tokens: Optional[torch.Tensor],
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    Per-request penalties are broadcast over the verify block instead of
-    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    `verify_tokens` [bs, draft_token_num] are the block's input tokens: the
+    anchor, then the drafts each row's penalties count up to its own position.
+    Only penalties read them; they may be None when the step has none.
     """
     if sampling_info is None:
         return
@@ -252,13 +251,6 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits,
-            sampling_info,
-            num_tokens_in_batch=draft_token_num,
-        )
-
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -270,9 +262,9 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
-    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
-    apply_acc_penalties(next_token_logits, sampling_info, draft_token_num)
+    # Same order as SamplingBatchInfo.apply_logits_bias.
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(next_token_logits, verify_tokens)
 
     if grammar_mask is not None:
         vocab_mask_bias = torch.zeros(
@@ -286,15 +278,16 @@ def apply_dflash_verify_logits_adjustments(
         )
 
     if logit_bias is not None:
-        if (
-            logit_bias.device != next_token_logits.device
-            or logit_bias.dtype != next_token_logits.dtype
-        ):
-            logit_bias = logit_bias.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(logit_bias[:, None, :])
+        # In the bias's own dtype, so the sum rounds once to the logits dtype.
+        get_logits_3d().add_(logit_bias.to(device=next_token_logits.device)[:, None, :])
+
+    # Last, as Sampler applies it after ModelRunner._preprocess_logits.
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
 
 
 def commit_block_accept_tokens_to_penalties(

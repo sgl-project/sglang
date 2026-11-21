@@ -686,13 +686,12 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-    def test_returns_copy_with_step_tables(self):
+    def test_returns_copy(self):
         """Both copy implementations preserve every field, including fields
-        declared with init=False, and build the step's tables at the copy."""
+        declared with init=False, and leave the step's tables to sampling."""
         for fast_path in (False, True):
             info = _make_info(batch_size=1)
             step = MagicMock()
-            step.logit_penalties.return_value = (torch.zeros(1, VOCAB_SIZE), None)
             info.step_penalties = step
             with (
                 self.subTest(fast_path=fast_path),
@@ -702,7 +701,7 @@ class TestCopyForForward(CustomTestCase):
                 ),
             ):
                 copied = info.copy_for_forward()
-            step.logit_penalties.assert_called_once_with()
+            step.logit_penalties.assert_not_called()
             for name, value in info.__dict__.items():
                 self.assertIs(copied.__dict__[name], value, name)
 

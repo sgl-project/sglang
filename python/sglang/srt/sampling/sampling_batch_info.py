@@ -93,28 +93,6 @@ def _filler_seeds(n: int, device: str) -> torch.Tensor:
     )
 
 
-def has_acc_penalties(info) -> bool:
-    """Whether `info` (a SamplingBatchInfo or a view with the same acc_* fields)
-    carries accumulated penalties."""
-    return (
-        info.acc_additive_penalties is not None
-        or info.acc_scaling_penalties is not None
-    )
-
-
-def apply_acc_penalties(logits: torch.Tensor, info, rows_per_request: int = 1):
-    """Apply `info`'s accumulated penalties to `logits` in place: additive, then
-    scaling. `logits` holds `rows_per_request` consecutive rows per request (the
-    verify rows in speculative decoding), which share that request's penalties."""
-    if not has_acc_penalties(info):
-        return
-    by_request = logits.view(-1, rows_per_request, logits.shape[-1])
-    if info.acc_additive_penalties is not None:
-        by_request.add_(info.acc_additive_penalties[:, None, :])
-    if info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(by_request, info.acc_scaling_penalties[:, None, :])
-
-
 @dataclasses.dataclass
 class ProcessorEntry:
     """A custom logit processor and the batch rows it applies to."""
@@ -435,22 +413,14 @@ class SamplingBatchInfo:
         vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
         self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
-    # The step's [bs, vocab] penalty tables, under the names the verify paths
-    # and provider views read.
-    @property
-    def acc_additive_penalties(self) -> Optional[torch.Tensor]:
-        if self.step_penalties is None:
-            return None
-        return self.step_penalties.logit_penalties()[0]
-
-    @property
-    def acc_scaling_penalties(self) -> Optional[torch.Tensor]:
-        if self.step_penalties is None:
-            return None
-        return self.step_penalties.logit_penalties()[1]
-
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        apply_acc_penalties(logits, self)
+        if self.step_penalties is None:
+            return
+        additive, scaling = self.step_penalties.logit_penalties()
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(logits, scaling)
 
     def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.logit_bias is not None:
@@ -710,9 +680,6 @@ class SamplingBatchInfo:
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
         else:
             new = dataclasses.replace(self)
-        if new.step_penalties is not None:
-            # Built at launch, on the forward stream, while the step's rows are live.
-            new.step_penalties.logit_penalties()
         return new
 
 
