@@ -52,6 +52,7 @@ from sglang.auto_tune.aiter_comms import (
     backend_plan,
     format_scan,
     scan_aiter,
+    scan_dirs,
     scan_sglang,
     short_name,
     source_name,
@@ -124,6 +125,7 @@ class AllreduceTuneResult(TypedDict, total=False):
     num_iters: int
     ingraph_calls: Optional[int]
     skip: List[str]
+    scandirs: List[str]
     timing: str
     configs: List[_ConfigDict]
     measurements: List[_Measurement]
@@ -979,11 +981,13 @@ def tune_allreduce(
     sglang_dir: str = DEFAULT_SGLANG_DIR,
     num_warmups: int = DEFAULT_NUM_WARMUP,
     skip: Sequence[str] = (),
+    scandirs: Sequence[str] = (),
 ) -> Tuple[List[AllreduceConfig], List[_Measurement]]:
     """Time each backend at each size in ``mode`` and return the fastest per size.
 
     The AITER tree at ``aiter_dir`` and the SGLang tree at ``sglang_dir`` are
-    parsed for their communicator classes. A class is timed when this tuner
+    parsed for their communicator classes, in ``scandirs`` or, when that is
+    empty, in ``DEFAULT_SCAN_DIRS``. A class is timed when this tuner
     can construct it. HIP QuickReduce and FlyDSL are timed only when
     ``qr_quant`` is declared in AITER.
     """
@@ -1016,8 +1020,8 @@ def tune_allreduce(
     cpu_group = _cpu_group(group)
     device = torch.device("cuda", torch.cuda.current_device())
     sizes = _normalize_sizes(sizes)
-    scan = scan_aiter(aiter_dir)
-    sglang_scan = scan_sglang(sglang_dir)
+    scan = scan_aiter(aiter_dir, scandirs)
+    sglang_scan = scan_sglang(sglang_dir, scandirs)
     plan, skipped, quant_left_out = backend_plan(
         scan,
         sglang_scan,
@@ -1028,6 +1032,9 @@ def tune_allreduce(
         skip=skip,
     )
     if verbose:
+        print("Scan directories:", flush=True)
+        for entry in scan_dirs(scandirs):
+            print(f"  {entry}", flush=True)
         print(format_scan(scan, sglang_scan, qr_quant), flush=True)
         print(f"FlyDSL algorithm: {fly_algorithm}", flush=True)
         print("Opened from the scan:", flush=True)
@@ -1218,6 +1225,7 @@ def run_allreduce_tuning(
     sglang_dir: str = DEFAULT_SGLANG_DIR,
     num_warmups: int = DEFAULT_NUM_WARMUP,
     skip: Sequence[str] = (),
+    scandirs: Sequence[str] = (),
 ) -> AllreduceTuneResult:
     """Tune, then write ``allreduce_configs_<mode>.json`` into ``output_dir``."""
     if verbose:
@@ -1243,6 +1251,7 @@ def run_allreduce_tuning(
         sglang_dir=sglang_dir,
         num_warmups=num_warmups,
         skip=skip,
+        scandirs=scandirs,
     )
     if not results:
         if verbose:
@@ -1262,6 +1271,7 @@ def run_allreduce_tuning(
         "num_iters": int(num_iters),
         "ingraph_calls": int(ingraph_calls) if mode == "graph" else None,
         "skip": list(skip),
+        "scandirs": list(scan_dirs(scandirs)),
         "timing": "median" if use_median else "mean",
         "configs": [r.to_dict() for r in results],
         "measurements": measurements,

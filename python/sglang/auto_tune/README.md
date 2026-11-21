@@ -19,6 +19,27 @@ At startup the tuner parses `/sgl-workspace/aiter` (`--aiter-dir`) and the SGLan
 
 Use it when a class is obsolete on the AITER pin under test, or when its accuracy is not acceptable. The built-in skip list is empty, so `QuickAllReduceInt4` competes unless a run names it. A skipped class is logged under `Not opened` and is not written into the table. A name that matches no scanned class is logged and does not stop the run. The names are also stored in the JSON `skip` field.
 
+`--scandir` sets which directories or files the scan reads. Without it the scan reads [`DEFAULT_SCAN_DIRS`](aiter_comms.py#L31-L35):
+
+| Default entry | Tree |
+| --- | --- |
+| `aiter/dist/device_communicators` | `--aiter-dir` |
+| `aiter/ops/flydsl/quick_allreduce*.py` | `--aiter-dir` |
+| `sglang/srt/distributed/device_communicators` | `--sglang-dir` |
+
+The second entry covers both FlyDSL layouts: `quick_allreduce.py` on current AITER and `quick_allreduce_int4.py` on older pins such as `90596736`.
+
+- A relative path is looked up under `--aiter-dir` and under `--sglang-dir`, and is read from whichever tree has it. An absolute path must lie inside one of the two trees.
+- `*` is expanded, so `aiter/ops/flydsl/*.py` works. A path that neither tree has is ignored.
+- Giving `--scandir` replaces the defaults. List the SGLang directory as well if SGLang's communicators should still compete.
+- Several paths can follow one `--scandir`, and the flag can be repeated.
+- The class names come from the file path, so keep the path relative to the tree root.
+- The run logs the entries under `Scan directories` and stores them in the JSON `scandirs` field. When the flag is not given, that field holds the defaults.
+
+```bash
+--scandir aiter/dist/device_communicators aiter/ops/flydsl/quick_allreduce.py sglang/srt/distributed/device_communicators
+```
+
 ## Tuner
 
 ```bash
@@ -38,6 +59,7 @@ torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
     --num-warmups 100 \
     -n 5000 \
     --timeout 240 \
+    --skip QuickAllReduceInt4 \
     --output-dir /workspace/inference-testing/ar-tune \
     --sizes 16384 40960 65536 98304 131072 196608 \
             262144 393216 524288 786432 1048576 1572864 \
@@ -52,35 +74,35 @@ Tested on aiter pin `90596736`, the output looks like this:
 ============================================================
 All-reduce tuning summary (eager, median)
 ============================================================
-     16384B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     11.64 us
-     40960B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     12.08 us
-     65536B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     12.16 us
-     98304B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     11.92 us
-    131072B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     12.32 us
-    196608B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     13.12 us
-    262144B  sglang.srt.distributed.device_communicators.pynccl.PyNcclCommunicator     14.92 us
-    393216B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     16.80 us
-    524288B  sglang.srt.distributed.device_communicators.custom_all_reduce.CustomAllreduce     19.04 us
-    786432B  aiter.dist.device_communicators.communicator_cuda.CudaCommunicator     20.12 us
-   1048576B  aiter.dist.device_communicators.communicator_cuda.CudaCommunicator     19.80 us
-   1572864B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     20.28 us
-   2097152B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     20.60 us
-   3145728B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     20.76 us
-   4194304B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     21.24 us
-   6291456B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     25.32 us
-   8388608B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     31.04 us
-  12582912B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     39.88 us
-  16777216B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     49.88 us
-  25165824B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     68.68 us
-  33554432B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     82.16 us
-  50331648B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    107.84 us
-  67108864B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    136.16 us
- 100663296B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    190.52 us
- 134217728B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    243.88 us
- 201326592B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    352.68 us
- 268435456B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    467.00 us
+       16384B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     10.88 us
+       40960B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     10.68 us
+       65536B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     11.24 us
+       98304B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     10.72 us
+      131072B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     11.76 us
+      196608B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2     13.28 us
+      262144B  sglang.srt.distributed.device_communicators.pynccl.PyNcclCommunicator     14.24 us
+      393216B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     15.08 us
+      524288B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     15.24 us
+      786432B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     15.32 us
+     1048576B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     14.20 us
+     1572864B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     18.60 us
+     2097152B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     18.40 us
+     3145728B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     18.16 us
+     4194304B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     19.48 us
+     6291456B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     22.52 us
+     8388608B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     25.80 us
+    12582912B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     33.12 us
+    16777216B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     45.44 us
+    25165824B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     59.40 us
+    33554432B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     74.96 us
+    50331648B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    105.40 us
+    67108864B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    136.80 us
+   100663296B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    196.84 us
+   134217728B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    240.12 us
+   201326592B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    351.36 us
+   268435456B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    458.97 us
 ============================================================
-  Use it with SGLANG_TUNED_EAGER_CONFIG=ar-tune/allreduce_configs_eager.json
+  Use it with SGLANG_TUNED_EAGER_CONFIG=/workspace/inference-testing/ar-tune/allreduce_configs_eager.json
 ```
 
 `--ingraph-calls` is how many all-reduces are captured back to back in one graph. The reported time is per call.
@@ -100,6 +122,7 @@ torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
     -n 500 \
     --timeout 240 \
     --output-dir /workspace/inference-testing/ar-tune \
+    --skip QuickAllReduceInt4 \
     --sizes 16384 40960 65536 98304 131072 196608 \
             262144 393216 524288 786432 1048576 1572864 \
             2097152 3145728 4194304 6291456 8388608 12582912 \
@@ -113,35 +136,35 @@ The output looks like this:
 ============================================================
 All-reduce tuning summary (graph, median)
 ============================================================
-     16384B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2      4.77 us
-     40960B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2      4.75 us
-     65536B  sglang.srt.distributed.device_communicators.custom_all_reduce_v2.CustomAllReduceV2      5.88 us
-     98304B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      6.79 us
-    131072B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      6.81 us
-    196608B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      6.88 us
-    262144B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      7.03 us
-    393216B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      7.50 us
-    524288B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      8.11 us
-    786432B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     10.20 us
-   1048576B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     10.70 us
-   1572864B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     13.27 us
-   2097152B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     14.77 us
-   3145728B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     16.32 us
-   4194304B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     18.17 us
-   6291456B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     22.75 us
-   8388608B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     28.32 us
-  12582912B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     36.77 us
-  16777216B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     46.72 us
-  25165824B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     66.09 us
-  33554432B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4     80.39 us
-  50331648B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    105.05 us
-  67108864B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    133.75 us
- 100663296B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    188.12 us
- 134217728B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    241.58 us
- 201326592B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    349.63 us
- 268435456B  aiter.ops.flydsl.quick_allreduce_int4.QuickAllReduceInt4    463.43 us
+       16384B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      3.85 us
+       40960B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      4.39 us
+       65536B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      5.13 us
+       98304B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      5.61 us
+      131072B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      5.69 us
+      196608B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      5.88 us
+      262144B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      6.14 us
+      393216B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      6.86 us
+      524288B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      7.64 us
+      786432B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce      8.99 us
+     1048576B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     10.87 us
+     1572864B  aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce     13.17 us
+     2097152B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     14.25 us
+     3145728B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     15.65 us
+     4194304B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     17.21 us
+     6291456B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     20.45 us
+     8388608B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     23.72 us
+    12582912B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     30.68 us
+    16777216B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     42.94 us
+    25165824B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     56.95 us
+    33554432B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce     72.58 us
+    50331648B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    102.45 us
+    67108864B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    134.05 us
+   100663296B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    194.26 us
+   134217728B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    237.48 us
+   201326592B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    348.75 us
+   268435456B  aiter.ops.flydsl.quick_allreduce.FlyQuickAllReduce    455.25 us
 ============================================================
-  Use it with SGLANG_TUNED_GRAPH_CONFIG=ar-tune/allreduce_configs_graph.json
+  Use it with SGLANG_TUNED_GRAPH_CONFIG=/workspace/inference-testing/ar-tune/allreduce_configs_graph.json
 ```
 
 The tuner writes the JSON files and logs its progress and results.
@@ -178,3 +201,12 @@ How to read a dump:
 - A rank inside `torch.cuda.synchronize` or a kernel launch is waiting on a GPU kernel. The custom kernels spin-wait on their peers.
 - A rank inside `barrier`, `broadcast_object_list` or another collective is waiting on another rank.
 - If a rank's file has a `Fatal Python error: Segmentation fault` section, that section is the crash. If it has none, the process did not reach the fatal handler. Then find the size and backend that were running in the last terminal lines: `  [i/N] <bytes>B` is the size, and the `  <class>: ...` line after it is the backend.
+
+
+Could you now, similarly to /home/oshkarav/inference-testing/docker/reduce_tuned  create dockerfiles (feature branch reduce_tuned_injection) and its last rebase/merge main sglang ) for the last aiter main 9f3cba25ee1117e8152112e46b8984d94c90b676, however you would need to remove aiter PR, for both, featture and main branch.  
+Create 5 confugurations:
+-- baseline main 
+-- feature both tuned configs set, 
+-- feature branch only tuned config set
+-- feature branch only eager config set
+ -- feature branch no configs set 
