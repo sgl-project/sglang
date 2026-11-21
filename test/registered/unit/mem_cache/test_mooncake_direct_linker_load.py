@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
+    TransferReady,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,13 +29,13 @@ class FakePool:
     def prepare_locations(self, host_indices):
         return list(host_indices)
 
-    def get_prepared_layer_range_meta(self, locations, layer):
-        if layer in self.skip_layers:
+    def get_prepared_layers_range_meta(self, locations, layers):
+        layers = [layer for layer in layers if layer not in self.skip_layers]
+        if not layers:
             return None
-        ptrs = [[(row, layer)] for row in locations]
-        # DevicePoolEntry shares these read-only rows across locations.
-        sizes = [[SLICE]] * len(locations)
-        offsets = [[layer * SLICE]] * len(locations)
+        ptrs = [[(row, layer) for layer in layers] for row in locations]
+        sizes = [[SLICE] * len(layers) for _ in locations]
+        offsets = [[layer * SLICE for layer in layers] for _ in locations]
         return ptrs, sizes, offsets
 
 
@@ -161,7 +162,8 @@ class TestGroupedLoad(CustomTestCase):
 
     def test_failure_waits_for_inflight_reads_before_releasing_consumers(self):
         """Failed loads must stop writing before consumers can recycle their rows."""
-        for failure in ("read", "metadata", "submit"):
+        # Range-building failures happen before any read; see TestLoadFence.
+        for failure in ("read", "submit"):
             with self.subTest(failure=failure):
                 self._check_failure_drains_reads(failure)
 
@@ -188,20 +190,10 @@ class TestGroupedLoad(CustomTestCase):
                     keys, ptrs, sizes, offsets
                 )
 
-        class FailingPool(FakePool):
-            def get_prepared_layer_range_meta(self, locations, layer):
-                fail()
-
         store = BlockingStore()
         pools = {PoolName.KV: FakePool()}
         keys = ["bad", "slow"] if failure == "read" else ["slow", "bad"]
         transfers = [transfer(PoolName.KV, keys)]
-        if failure == "metadata":
-            pools[PoolName.INDEXER] = FailingPool()
-            transfers = [
-                transfer(PoolName.KV, ["slow"]),
-                transfer(PoolName.INDEXER, ["bad"]),
-            ]
         linker = make_linker(store, num_layers=1, layer_group=1, threads=2, pools=pools)
         self.addCleanup(linker.load_io_executor.shutdown)
         submit = linker.load_io_executor.submit
@@ -231,6 +223,116 @@ class TestGroupedLoad(CustomTestCase):
         last_get = max(t for kind, t in store.events if kind == "get")
         first_end = min(t for kind, t in store.events if kind == "end")
         self.assertGreater(first_end, last_get)
+
+
+class TestLoadFence(CustomTestCase):
+    def test_locations_resolve_before_the_forward_and_reads_follow_it(self):
+        order = []
+
+        class Event:
+            def __init__(self, name):
+                self.name = name
+
+            def synchronize(self):
+                order.append(self.name)
+
+        class Pool(FakePool):
+            def prepare_locations(self, host_indices):
+                order.append("prepare")
+                return super().prepare_locations(host_indices)
+
+        class Store(FakeStore):
+            def batch_get_session_start(self, keys):
+                order.append("start")
+                return super().batch_get_session_start(keys)
+
+            def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+                order.append("get")
+                return super().batch_get_into_multi_buffer_ranges(
+                    keys, ptrs, sizes, offsets
+                )
+
+        linker = make_linker(
+            Store(),
+            num_layers=2,
+            layer_group=1,
+            threads=1,
+            pools={PoolName.KV: Pool(), PoolName.INDEXER: Pool()},
+        )
+        self.addCleanup(linker.load_io_executor.shutdown)
+        index = linker.layer_done_counter.update_producer()
+        linker.load_layer_wise(
+            index,
+            [[transfer(PoolName.KV, ["k0", "k1"]), transfer(PoolName.INDEXER, ["i0"])]],
+            TransferReady(Event("indices"), Event("forward")),
+        )
+        self.assertTrue(linker.layer_done_counter.finish(index))
+        # Locations wait only for the indices; sessions and reads wait for the forward.
+        self.assertEqual(order[:3], ["indices", "prepare", "prepare"])
+        forward = order.index("forward")
+        self.assertEqual(order[forward + 1 :], ["start"] + ["get"] * 4)
+
+    def test_range_building_finishes_before_the_forward_fence(self):
+        """Reads are built before the fence; a build failure reads nothing."""
+        for fail_layer in (None, 2):
+            with self.subTest(fail_layer=fail_layer):
+                events = []
+
+                class Event:
+                    def __init__(self, name):
+                        self.name = name
+
+                    def synchronize(self):
+                        events.append(self.name)
+
+                class Pool(FakePool):
+                    def get_prepared_layers_range_meta(self, locations, layers):
+                        events.append("build")
+                        if fail_layer in layers:
+                            raise RuntimeError("Injected range build failure")
+                        return super().get_prepared_layers_range_meta(locations, layers)
+
+                class Store(FakeStore):
+                    def batch_get_session_start(self, keys):
+                        events.append("start")
+                        return super().batch_get_session_start(keys)
+
+                    def batch_get_session_end(self, keys):
+                        events.append("end")
+                        super().batch_get_session_end(keys)
+
+                store = Store()
+                linker = make_linker(
+                    store,
+                    num_layers=3,
+                    layer_group=1,
+                    threads=2,
+                    pools={PoolName.KV: Pool()},
+                )
+                self.addCleanup(linker.load_io_executor.shutdown)
+                index = linker.layer_done_counter.update_producer()
+                linker.load_layer_wise(
+                    index,
+                    [[transfer(PoolName.KV, ["k0", "k1"])]],
+                    TransferReady(Event("indices"), Event("forward")),
+                )
+                landed = linker.layer_done_counter.finish(index)
+                if fail_layer is None:
+                    self.assertTrue(landed)
+                    # The fence waits on the indices again, then the forward.
+                    self.assertEqual(
+                        events,
+                        ["indices"]
+                        + ["build"] * 3
+                        + ["indices", "forward", "start", "end"],
+                    )
+                    self.assertEqual(len(store.calls), 6)
+                else:
+                    # Nothing was read or opened, and every layer is failed.
+                    self.assertFalse(landed)
+                    self.assertEqual(events, ["indices"] + ["build"] * 3)
+                    self.assertEqual(store.calls, [])
+                    self.assertEqual(linker.layer_done_counter.order, [])
 
 
 if __name__ == "__main__":
