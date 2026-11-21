@@ -14,7 +14,8 @@
   "amd": {
     "label": null,
     "workflows": [
-      ".github/workflows/pr-test-amd.yml"
+      ".github/workflows/pr-test-amd.yml",
+      ".github/workflows/pr-test-amd-mi355x-disagg.yml"
     ]
   },
   "nv": {
