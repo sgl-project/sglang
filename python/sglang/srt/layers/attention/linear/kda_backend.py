@@ -5,6 +5,9 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl import (
+    kda_verify_gfx950_supported,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -531,7 +534,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         self._fused_chain_verify_fn = None
         if (
-            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            (
+                envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+                or (is_hip() and is_gfx95_supported())
+            )
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
@@ -1392,7 +1398,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
-            if self._hip_chain_verify_fn is not None:
+            # GLM-5.3-Flash TP4's ring verify (16 heads, 6 tokens) takes the FlyDSL
+            # kernel in the fused path below; MI355X, us per call vs the HIP kernel:
+            # B6 7.2 vs 8.6, B16 9.6 vs 13.6, B64 28.2 vs 38.9, tied up to B4.
+            flydsl_first = (
+                layer.num_v_heads == 16
+                and draft_token_num == 6
+                and self._flydsl_ring_verify_ok(
+                    layer=layer,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    draft_token_num=draft_token_num,
+                    conv_states=conv_states,
+                    ssm_states=ssm_states,
+                    intermediate_state_cache=intermediate_state_cache,
+                    intermediate_conv_window_cache=intermediate_conv_window_cache,
+                    replayssm_on=replayssm_rawv is not None,
+                )
+            )
+            if self._hip_chain_verify_fn is not None and not flydsl_first:
                 core_attn_out = self._hip_chain_verify_fn(
                     layer,
                     mixed_qkv=mixed_qkv,
@@ -1599,6 +1624,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ):
             return False
         replayssm_on = replayssm_rawv is not None
+        if is_hip() and not replayssm_on and not envs.SGLANG_OPT_FUSED_KDA_VERIFY.get():
+            # On by default on gfx950 only for the ReplaySSM ring; the snapshot path
+            # stays opt-in.
+            return False
         if draft_token_num < 3 or mixed_qkv.shape[0] % draft_token_num != 0:
             return False
         if (
@@ -1617,8 +1646,30 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        # gfx950 ring path, T=6 GLM-5.3-Flash TP4, us vs the pair: the Triton kernel
+        # wins up to B8; the FlyDSL kernel (kda_verify_gfx950_flydsl) B6 7.4 vs 18.3,
+        # B16 12.3 vs 27.2, B64 31.9 vs 64.9.
+        gfx950_ring = self._flydsl_ring_verify_ok(
+            layer=layer,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            conv_states=conv_states,
+            ssm_states=ssm_states,
+            intermediate_state_cache=intermediate_state_cache,
+            intermediate_conv_window_cache=intermediate_conv_window_cache,
+            replayssm_on=replayssm_on,
+        )
+        if (
+            replayssm_on
+            and not (
+                is_hip() and is_gfx95_supported() and (batch_size <= 8 or gfx950_ring)
+            )
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1628,7 +1679,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if is_hip() and not (
             is_gfx95_supported()
-            and 1 <= batch_size <= 16
+            and (1 <= batch_size <= 16 or gfx950_ring)
             and draft_token_num in (6, 8)
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
@@ -1665,10 +1716,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
+        # The ring path only reads the state; the FlyDSL kernel widens a bf16 pool on
+        # load.
+        state_dtypes = (
+            (torch.float32, torch.bfloat16) if gfx950_ring else (torch.float32,)
+        )
         if (
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
-            or ssm_states.dtype != torch.float32
+            or ssm_states.dtype not in state_dtypes
         ):
             return False
         if replayssm_on:
@@ -1749,6 +1805,53 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if not replayssm_on:
             tensors += (intermediate_state_cache,)
         return all(tensor.device == mixed_qkv.device for tensor in tensors)
+
+    @staticmethod
+    def _flydsl_ring_verify_ok(
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        draft_token_num: int,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        intermediate_state_cache: Optional[torch.Tensor],
+        intermediate_conv_window_cache: torch.Tensor,
+        replayssm_on: bool,
+    ) -> bool:
+        # The check fused_kda_conv_gating_verify makes before it hands the call to the
+        # gfx950 FlyDSL kernel; anything it rejects there runs the Triton fused kernel.
+        return (
+            replayssm_on
+            and intermediate_state_cache is None
+            and is_hip()
+            and is_gfx95_supported()
+            and isinstance(layer.conv_weights, torch.Tensor)
+            and isinstance(layer.A_log, torch.Tensor)
+            and isinstance(layer.dt_bias, torch.Tensor)
+            and kda_verify_gfx950_supported(
+                mixed_qkv=mixed_qkv,
+                conv_weight=layer.conv_weights,
+                conv_bias=layer.bias,
+                conv_state=conv_states.transpose(-1, -2),
+                intermediate_conv_window=intermediate_conv_window_cache.transpose(
+                    -1, -2
+                ),
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                T=draft_token_num,
+                num_q_heads=layer.num_q_heads,
+                num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                lower_bound=layer.lower_bound,
+                use_qk_l2norm_in_kernel=True,
+            )
+        )
 
     @staticmethod
     def _replayssm_ring_ok(
