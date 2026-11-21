@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
 
 import unittest
 from unittest.mock import MagicMock
@@ -165,7 +165,7 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         """Test that cumulating a token applies frequency penalty to its logit."""
         orch, pen = self._setup([2.0])
         output_ids = torch.tensor([5])
-        pen.cumulate_output_tokens(output_ids)
+        pen.cumulate_output_tokens(output_ids, torch.tensor([0]))
 
         logits = torch.zeros(1, VOCAB_SIZE)
         pen.apply(logits)
@@ -176,8 +176,8 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
     def test_cumulate_twice_doubles_penalty(self):
         """Test that frequency penalty scales linearly with occurrence count."""
         orch, pen = self._setup([1.0])
-        pen.cumulate_output_tokens(torch.tensor([3]))
-        pen.cumulate_output_tokens(torch.tensor([3]))
+        pen.cumulate_output_tokens(torch.tensor([3]), torch.tensor([0]))
+        pen.cumulate_output_tokens(torch.tensor([3]), torch.tensor([0]))
 
         logits = torch.zeros(1, VOCAB_SIZE)
         pen.apply(logits)
@@ -210,7 +210,9 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
         """Test that cumulate before prepare does not crash."""
         _, pen = self._setup([0.0])
         # pen is not prepared (is_required=False)
-        pen.cumulate_output_tokens(torch.tensor([1]))  # should not raise
+        pen.cumulate_output_tokens(
+            torch.tensor([1]), torch.tensor([0])
+        )  # should not raise
 
     def test_apply_when_not_prepared_is_noop(self):
         """Test that apply on an unprepared penalizer leaves logits unchanged."""
@@ -240,8 +242,10 @@ class TestBatchedPresencePenalizer(CustomTestCase):
     def test_presence_penalty_does_not_scale(self):
         """Test that presence penalty is flat (same value regardless of count)."""
         orch, pen = self._setup([1.0])
-        pen.cumulate_output_tokens(torch.tensor([7]))
-        pen.cumulate_output_tokens(torch.tensor([7]))  # same token again
+        pen.cumulate_output_tokens(torch.tensor([7]), torch.tensor([0]))
+        pen.cumulate_output_tokens(
+            torch.tensor([7]), torch.tensor([0])
+        )  # same token again
 
         logits = torch.zeros(1, VOCAB_SIZE)
         pen.apply(logits)
@@ -306,8 +310,8 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         """Test that EOS is allowed after generating min_new_tokens."""
         orch, pen = self._setup([(2, None, 2)])
         # Generate 2 tokens
-        pen.cumulate_output_tokens(torch.tensor([10]))
-        pen.cumulate_output_tokens(torch.tensor([11]))
+        pen.cumulate_output_tokens(torch.tensor([10]), torch.tensor([0]))
+        pen.cumulate_output_tokens(torch.tensor([11]), torch.tensor([0]))
         # Now len=2 >= min=2 → EOS should NOT be blocked
         logits = torch.zeros(1, VOCAB_SIZE)
         pen.apply(logits)
@@ -481,7 +485,7 @@ class TestOrchestratorMultiplePenalizers(CustomTestCase):
 
         # Cumulate one token
         output_ids = torch.tensor([5])
-        orch.cumulate_output_tokens(output_ids)
+        orch.cumulate_output_tokens(output_ids, torch.tensor([0]))
 
         # Apply all penalties
         logits = torch.zeros(1, VOCAB_SIZE)
