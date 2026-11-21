@@ -17,6 +17,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
@@ -73,11 +74,9 @@ class TestFusedAbsorbGate(CustomTestCase):
         self._saved = forward_mla_rocm._use_aiter_gfx95
         forward_mla_rocm._use_aiter_gfx95 = True
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
-        kill_switch = mock.patch.object(
-            forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", True
-        )
-        kill_switch.start()
-        self.addCleanup(kill_switch.stop)
+        kill_switch = envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(True)
+        kill_switch.__enter__()
+        self.addCleanup(kill_switch.__exit__, None, None, None)
 
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
@@ -108,15 +107,16 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
-        for module_flag, broken in (
-            ("_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False),
-            ("_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
+        with (
+            self.subTest(term="SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE"),
+            envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(False),
         ):
-            with (
-                self.subTest(term=module_flag),
-                mock.patch.object(forward_mla_rocm, module_flag, broken),
-            ):
-                self.assertFalse(_CAN_FUSE(_attn()))
+            self.assertFalse(_CAN_FUSE(_attn()))
+        with (
+            self.subTest(term="_SGLANG_EXPERIMENTAL_LORA_OPTI"),
+            mock.patch.object(forward_mla_rocm, "_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
+        ):
+            self.assertFalse(_CAN_FUSE(_attn()))
 
 
 class TestAbsorbBmmConfig(CustomTestCase):
@@ -183,9 +183,7 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
     def _aiter_gfx95_env(self):
         with (
             mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
-            mock.patch.object(
-                forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", True
-            ),
+            envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(True),
             get_parallel().override(dcp_enabled=False),
         ):
             yield
@@ -230,7 +228,6 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                     self.assertFalse(self._can_fuse(attn, forward_batch))
             for module_flag, broken in (
                 ("_use_aiter_gfx95", False),
-                ("_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False),
                 ("_SGLANG_EXPERIMENTAL_LORA_OPTI", True),
             ):
                 with (
@@ -238,6 +235,11 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                     mock.patch.object(forward_mla_rocm, module_flag, broken),
                 ):
                     self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
+            with (
+                self.subTest(term="SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE"),
+                envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(False),
+            ):
+                self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
             with (
                 self.subTest(term="dcp_enabled"),
                 get_parallel().override(dcp_enabled=True),
@@ -579,6 +581,48 @@ class TestGfx1250RopePlacement(_Gfx1250Case):
                 fused = self.run_core(attn, forward_batch)
                 self.assertEqual(fused, mode == ForwardMode.DECODE)
                 self.assertNotEqual(attn._applies_rope_in_prepare(forward_batch), fused)
+
+
+class TestMxfp4PrepareCoreHandoff(_Gfx1250Case):
+    def test_core_absorbs_with_the_fused_fp4_kernel(self):
+        """Prepare leaves the MXFP4 absorb to core, which has no q_nope_out to rope."""
+        calls = []
+
+        def kernel(q_nope, w_kc, w_scale, q_pe, k_nope, k_pe, *args, **kwargs):
+            calls.append((q_nope, w_scale))
+            return torch.cat([q_pe.new_zeros(*q_pe.shape[:-1], 512), q_pe], -1), None, None, k_nope
+
+        self.patch_attr(forward_mla_rocm, "fused_fp4_bmm_rope_cat_and_cache_mla", kernel)
+        self.patch_attr(forward_mla_rocm, "_use_gfx1250_fused_mla_rope", False)
+        self.use_pool(torch.zeros(8, 1, 576, dtype=torch.bfloat16))
+        attn = _RocmAttn(
+            w_kc=torch.empty(4, 512, 64, dtype=torch.uint8),
+            w_scale_k=torch.empty(4, 512, 2),
+            rotary_emb=SimpleNamespace(
+                cos_cache=torch.zeros(32, 32),
+                sin_cache=torch.zeros(32, 32),
+                is_neox_style=False,
+            ),
+            _skip_rope_for_aiter_fused_mla=lambda: True,
+        )
+        tokens, heads = 2, 4
+        q_nope = torch.zeros(heads, tokens, 512)
+        with self.assertRaises(_CoreDone):
+            attn.forward_absorb_rocm_core(
+                q_pe=torch.zeros(tokens, heads, _ROPE_HEAD_DIM),
+                k_pe=torch.zeros(tokens, 1, _ROPE_HEAD_DIM),
+                q_nope_out=None,
+                k_nope=torch.zeros(tokens, 1, 512),
+                forward_batch=_batch(out_cache_loc=torch.arange(tokens)),
+                zero_allocator=None,
+                positions=torch.zeros(tokens, dtype=torch.int64),
+                topk_indices=None,
+                llama_4_scaling=None,
+                q_nope_unabsorbed=q_nope.transpose(0, 1),
+            )
+        self.assertEqual(len(calls), 1)
+        # The fused kernel writes the cache, so the backend must not write it again.
+        self.assertFalse(attn.attn_mqa.save_kv_cache)
 
 
 class TestGfx1250FusedRopeCall(_Gfx1250Case):

@@ -48,7 +48,7 @@ class TestRocmHiSparseFusedKV(CustomTestCase):
         return mapping
 
     def invoke(self, locations):
-        """Slots each fused KV writer hands its AITER kernel, keyed by writer."""
+        # Slots each fused KV writer hands its AITER kernel, keyed by writer.
         slots = {}
 
         def kernel(writer, kv_cache_arg):

@@ -86,9 +86,6 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
-_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE = (
-    envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.get()
-)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -547,7 +544,7 @@ def _can_fuse_bmm_rope_cat_and_cache(
     """
     if not (
         _use_aiter_gfx95
-        and _SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE
+        and envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.get()
         and attn.dcp_size == 1
         and attn.rotary_emb is not None
         and not attn.use_deep_gemm_bmm
