@@ -55,15 +55,13 @@ _TWO_SHOT_GEOMETRY = {
     True: ((208, 1, 4), (232, 1, 3), (None, 2, 3)),
 }
 
-# TP2 at hidden 6144 (B300, graph-replayed; untuned elsewhere): 1shot wins wherever the default runs one
-# vector per thread, by up to 1.3 us at 48-96 rows. Entries keep that one vector per
-# thread, and with one vector per thread the RMS reduction order does not depend on
-# the cluster size or on 1shot / 2shot, so the output is bitwise the default's.
-# ``(max_rows, two_shot, vecs_per_thread, cluster_size)``; past the last row bound
-# the default policy applies.
+# TP2 at hidden 6144 on SM100: 1shot, one vector per thread, ``(max_rows,
+# cluster_size)``; past the last row bound the default policy applies. With one
+# vector per thread the RMS reduction order does not depend on the cluster size or
+# on 1shot / 2shot, so the output is bitwise the default's.
 _TP2_GEOMETRY = {
-    False: ((160, False, 1, 6), (272, False, 1, 4)),
-    True: ((96, False, 1, 8), (160, False, 1, 6), (208, False, 1, 4)),
+    False: ((160, 6), (272, 4)),
+    True: ((96, 8), (160, 6), (208, 4)),
 }
 
 _COMMS = CommRegistry("all_reduce_fusion")
@@ -448,16 +446,12 @@ def _norm_launch(
         and cluster_size is None
         and current_arch().is_sm(10)
     ):
-        tuned = next(
-            (
-                geo
-                for max_rows, *geo in _TP2_GEOMETRY[finalize]
-                if num_tokens <= max_rows
-            ),
+        cluster = next(
+            (c for max_rows, c in _TP2_GEOMETRY[finalize] if num_tokens <= max_rows),
             None,
         )
-        if tuned is not None:
-            return tuple(tuned)
+        if cluster is not None:
+            return False, 1, cluster
     if two_shot is None:
         two_shot = num_tokens >= TWO_SHOT_MIN_TOKENS.get(world_size, 48)
     if vecs_per_thread is None and cluster_size is None and two_shot:
