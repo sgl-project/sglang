@@ -100,6 +100,11 @@ class SchedulerInternalStateController:
             return
         graph_memory = state["memory_usage"]["graph"]
         state["disaggregation_mode"] = mode.value
+        # Last chunks this PP prefill stage sent at forward end
+        # (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND).
+        early_send = getattr(self.scheduler, "disagg_prefill_early_send_stats", None)
+        if early_send is not None:
+            state["pp_pd_prefill_early_sends"] = early_send["early"]
         state["decode_cuda_graph_bs"] = (
             self.scheduler.tp_worker.get_decode_cuda_graph_bs()
         )

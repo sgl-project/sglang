@@ -25,7 +25,8 @@ import time
 from array import array
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -71,6 +72,7 @@ from sglang.srt.disaggregation.utils import (
     state_indices_per_entry,
 )
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
@@ -169,6 +171,41 @@ def _uses_write_through_cache(cache: object) -> bool:
         and cache.cache_controller is not None
         and cache.cache_controller.write_policy == "write_through"
     )
+
+
+def _sender_takes_host_indices(sender) -> bool:
+    """Whether sender takes host-tensor indices and waits on their copy's event
+    itself. CP and shard filtering read the indices on the scheduler before that
+    wait, so those paths need a completed host copy even with CP-TP group sharing."""
+    return (
+        getattr(sender, "supports_host_tensor_indices", False)
+        and sender.kv_mgr.kv_shard_size <= 1
+        and not (
+            sender.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not get_parallel().enable_dsa_cache_layer_split
+        )
+    )
+
+
+def _may_send_last_chunk_early(req: Req) -> bool:
+    """The part of early-send eligibility every PP stage and rank sees alike: what
+    the request asks for and how its sender takes indices."""
+    # No pending_bootstrap check: held frees are applied only on the inflight
+    # Success/Failed path, which a parked request skips. That relies on optimistic
+    # prefill being off for pp_size > 1, the only setting this loop runs in.
+    return (
+        not req.return_logprob
+        and not req.return_sampling_mask
+        and req.grammar is None
+        and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+        # Without host indices the send would read them on this thread.
+        and _sender_takes_host_indices(req.disagg_kv_sender)
+    )
+
+
+# Layouts a token-exact PD check covered with SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND
+# on: no MLA, and no transferred state but these. Others keep the result path.
+_PP_PD_EARLY_SEND_STATE_TYPES: frozenset = frozenset()
 
 
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
@@ -676,6 +713,14 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    # Rids whose last KV chunk this stage sent when its forward ended
+    # (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND); the PP prefill loop sets a real set.
+    disagg_prefill_early_sent_rids: frozenset = frozenset()
+    # Whether every PP stage runs early send; the PP prefill loop sets it.
+    disagg_prefill_early_send_on: bool = False
+    # Results' checkpoint device frees held until their transfer ends, by request.
+    disagg_prefill_deferred_frees: Mapping[Req, list] = MappingProxyType({})
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -1284,7 +1329,12 @@ class SchedulerDisaggregationPrefillMixin:
                 self.batch_result_processor._maybe_collect_customized_info(
                     i, req, logits_output
                 )
-                self.checkpoint_disagg_prefill(req)
+                if self.disagg_prefill_early_send_on and _may_send_last_chunk_early(
+                    req
+                ):
+                    self._checkpoint_holding_frees(req)
+                else:
+                    self.checkpoint_disagg_prefill(req)
                 move(
                     [req],
                     self.disagg_prefill_transfer_queue,
@@ -1507,12 +1557,14 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
+                self._apply_deferred_frees(req)
                 self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
+                self._apply_deferred_frees(req)
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
             else:
@@ -1588,6 +1640,9 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
+        # An early-sent last chunk still in flight is released like any other
+        # in-flight chunk of an aborted request.
+        self._forget_early_sent_last_chunk(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
@@ -1750,12 +1805,162 @@ class SchedulerDisaggregationPrefillMixin:
             req.disagg_kv_sender._early_send_wait_event = ev
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
+    def _pp_pd_early_send_enabled(self: Scheduler) -> bool:
+        """SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND, where the last chunk needs nothing
+        that only the result brings and the engine can leave the aux to another stage
+        (only the Mooncake sender takes ``send_aux``), on a verified layout."""
+        if not (
+            envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get()
+            and get_parallel().pp_size > 1
+        ):
+            return False
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        return (
+            get_disagg().disaggregation_transfer_backend == "mooncake"
+            and not kv_mgr.is_mla_backend
+            and set(kv_mgr.kv_args.state_types) <= _PP_PD_EARLY_SEND_STATE_TYPES
+            and get_disagg().disaggregation_decode_allocation_policy
+            != "prefill_complete"
+            and self.kv_checksum_computer is None
+            and not self.enable_staging
+            and not self.enable_unified_cache_external_linker
+            and not self.spec_algorithm.is_eagle()
+            and not _is_npu
+        )
+
+    def _pp_pd_early_send_eligible(self: Scheduler, batch: ScheduleBatch, req: Req):
+        """Whether req finishes its prefill in batch and its last chunk can leave
+        before the result: bootstrapped, not aborted, aux needs only the token."""
+        return (
+            req is not batch.chunked_req
+            and req.extend_end >= len(req.origin_input_ids)
+            and not req.pending_bootstrap
+            and req.metadata_buffer_index >= 0
+            and req.discard_output_reason is None
+            and not is_aborted(req)
+            and _may_send_last_chunk_early(req)
+        )
+
+    def _pp_pd_early_send_last_chunks(
+        self: Scheduler, batch: ScheduleBatch, result, launch_event
+    ) -> None:
+        """Send the last KV chunk of each request batch finishes when this stage's
+        forward of it ends, not when its result returns pp_size - 1 micro-batches
+        later. A non-last stage sends now, fenced on the forward, without aux; the
+        last stage sends with the first token once its D2H lands."""
+        reqs = [
+            (i, req)
+            for i, req in enumerate(batch.reqs)
+            if self._pp_pd_early_send_eligible(batch, req)
+        ]
+        if not reqs:
+            return
+        if not self.pp_group.is_last_rank:
+            pp_size = get_parallel().pp_size
+            last_stage_layers = range(
+                *get_pp_indices(
+                    self.model_config.num_hidden_layers, pp_size - 1, pp_size
+                )
+            )
+            for _, req in reqs:
+                # A decode rank that never pulls the last stage (decode runs PP)
+                # reads its aux from this stage, so it keeps the result path.
+                sender = req.disagg_kv_sender
+                if sender.kv_mgr.decode_pulls_last_pp_stage(
+                    sender.bootstrap_room, last_stage_layers
+                ):
+                    self._pp_pd_send_last_chunk_early(req, launch_event, None)
+            return
+        logits_output = result.logits_output
+        if logits_output is not None and logits_output.customized_info is not None:
+            return
+        with self.forward_stream_ctx:
+            first_tokens = async_d2h(result.next_token_ids)
+            ready = self.device_module.Event()
+            ready.record(self.device_module.current_stream())
+        self.disagg_prefill_early_send_pending.append(
+            (batch.forward_iter, ready, first_tokens, reqs)
+        )
+
+    def _pp_pd_flush_early_sends(
+        self: Scheduler, block_upto_forward_iter: Optional[int] = None
+    ) -> None:
+        """Last stage: send the queued last chunks whose first-token D2H landed;
+        wait for those launched at or before block_upto_forward_iter."""
+        pending = self.disagg_prefill_early_send_pending
+        while pending:
+            forward_iter, ready, first_tokens, reqs = pending[0]
+            if (
+                block_upto_forward_iter is not None
+                and forward_iter <= block_upto_forward_iter
+            ):
+                ready.synchronize()
+            elif not ready.query():
+                return
+            pending.popleft()
+            for i, req in reqs:
+                # Aborted since launch: its result retires it instead.
+                if not is_aborted(req):
+                    self._pp_pd_send_last_chunk_early(req, None, int(first_tokens[i]))
+
+    def _pp_pd_send_last_chunk_early(
+        self: Scheduler, req: Req, wait_event, first_output_id: Optional[int]
+    ) -> None:
+        if wait_event is not None:
+            # Consumed by the first transfer chunk; the worker waits before reading.
+            req.disagg_kv_sender._early_send_wait_event = wait_event
+        self._send_kv_chunk(
+            req,
+            last_chunk=True,
+            first_output_id=first_output_id,
+            send_aux=first_output_id is not None,
+        )
+        self.disagg_prefill_early_sent_rids.add(req.rid)
+        stats = self.disagg_prefill_early_send_stats
+        stats["early"] += 1
+        (logger.info if stats["early"] == 1 else logger.debug)(
+            "PP PD prefill early send: %d last chunks sent at forward end; "
+            "%d results held their checkpoint frees until the transfer's end.",
+            stats["early"],
+            stats["deferred"],
+        )
+
+    def _checkpoint_holding_frees(self: Scheduler, req: Req) -> None:
+        """Checkpoint a result whose last chunk some PP stage may have sent at forward
+        end. That transfer may still read pages the checkpoint's dedup frees, so the
+        frees wait for the inflight release. Every stage and rank decides this from
+        the same inputs, never from whether it sent early itself, so their trees and
+        pools change alike."""
+        self.disagg_prefill_early_send_stats["deferred"] += 1
+        if not isinstance(self.tree_cache, UnifiedRadixCache):
+            return  # The release after the transfer publishes the KV.
+        frees = []
+        with self.tree_cache.defer_device_frees(frees):
+            self.checkpoint_disagg_prefill(req)
+        if frees:
+            self.disagg_prefill_deferred_frees[req] = frees
+
+    def _apply_deferred_frees(self: Scheduler, req: Req) -> None:
+        frees = self.disagg_prefill_deferred_frees.get(req)
+        if frees is not None:
+            del self.disagg_prefill_deferred_frees[req]
+            self.tree_cache.apply_deferred_frees(frees)
+
+    def _forget_early_sent_last_chunk(self: Scheduler, req: Req) -> bool:
+        """Whether req's last chunk already left at forward end."""
+        if req.rid not in self.disagg_prefill_early_sent_rids:
+            return False
+        self.disagg_prefill_early_sent_rids.discard(req.rid)
+        return True
+
     def send_kv_chunk(
         self,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
+        if last_chunk and self._forget_early_sent_last_chunk(req):
+            return  # Sent when this stage's forward of it ended.
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
             if is_health_check_req(req):
@@ -1782,9 +1987,13 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        first_output_id: Optional[int] = None,
+        send_aux: bool = True,
     ) -> None:
         """
-        Send a prefilled chunk to the decode server
+        Send a prefilled chunk to the decode server. A last chunk sent before its
+        result passes the first token, or send_aux=False to leave the aux to the
+        last PP stage (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND).
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
@@ -1817,18 +2026,8 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         sender = req.disagg_kv_sender
-        # The schedule stream may wait on the in-flight forward. A sender that takes
-        # host-tensor indices waits on their copy's event itself. CP and shard
-        # filtering read the indices on the scheduler before that wait, so those
-        # paths need a completed host copy even with CP-TP group sharing.
-        host_indices = (
-            getattr(sender, "supports_host_tensor_indices", False)
-            and sender.kv_mgr.kv_shard_size <= 1
-            and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            )
-        )
+        # The schedule stream may wait on the in-flight forward.
+        host_indices = _sender_takes_host_indices(sender)
 
         def page_indices_of(kv_indices: torch.Tensor):
             """The pages a send takes, and the same pages for the page-move
@@ -1850,7 +2049,10 @@ class SchedulerDisaggregationPrefillMixin:
         state_types = ()
         if last_chunk:
             try:
-                self.disagg_metadata_buffers.set_buf(req)
+                if first_output_id is not None:
+                    self.disagg_metadata_buffers.set_buf(req, first_output_id)
+                elif send_aux:
+                    self.disagg_metadata_buffers.set_buf(req)
             except CustomizedInfoError as exc:
                 # customized_info may be unserializable or exceed the transfer buffer.
                 req.customized_info = None
@@ -2057,6 +2259,7 @@ class SchedulerDisaggregationPrefillMixin:
             if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
+            aux_kwargs = {} if send_aux else {"send_aux": False}
             # The engine reads these rows by physical id until it is done.
             record_network_transfer(
                 kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator),
@@ -2074,12 +2277,14 @@ class SchedulerDisaggregationPrefillMixin:
                     send_state_indices,
                     num_kv_tokens=seg_end - seg_start,
                     indices_event=indices_event,
+                    **aux_kwargs,
                 )
             else:
                 sender.send(
                     page_indices,
                     send_state_indices,
                     num_kv_tokens=seg_end - seg_start,
+                    **aux_kwargs,
                 )
         req.start_send_idx = end_idx
 

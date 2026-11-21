@@ -3178,7 +3178,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     break
 
                             # Only the last chunk we need to send the aux data;
-                            # a non-peer sends KV pages only.
+                            # a non-peer sends KV pages only, and with no aux
+                            # index another PP stage sends it.
                             ret = (
                                 self.send_aux(
                                     req,
@@ -3187,6 +3188,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_aux_item_lens,
                                 )
                                 if is_request_peer
+                                and kv_chunk.prefill_aux_index is not None
                                 else 0
                             )
                             if ret != 0:
@@ -3485,6 +3487,38 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         t = self._start_heartbeat_checker_thread()
         self._worker_threads.append(t)
 
+    def decode_pulls_last_pp_stage(
+        self, bootstrap_room: int, last_stage_layers: range
+    ) -> bool:
+        """Whether every decode peer of this room also pulls the last prefill PP
+        stage, which writes the aux when this stage leaves it out. A decode rank
+        that runs PP may hold only earlier stages' layers and needs aux from here."""
+        infos = self.transfer_infos.get(bootstrap_room)
+        if not infos:
+            return False
+        for info in list(infos.values()):
+            if info.is_dummy:
+                continue
+            peer = self.decode_kv_args_table.get(info.mooncake_session_id)
+            if peer is None:
+                return False
+            if peer.dst_kv_layer_ids:
+                pulls_last = any(
+                    layer_id in last_stage_layers for layer_id in peer.dst_kv_layer_ids
+                )
+            else:
+                # Positional pairing: decode PP is 1 or matches prefill's, so a
+                # peer with exactly every layer's pointers runs no PP and pulls
+                # every stage. Any other count (extra per-layer or draft pointers)
+                # keeps the aux here.
+                ptrs_per_layer = 1 if self.is_mla_backend else 2
+                pulls_last = (
+                    len(peer.dst_kv_ptrs) == ptrs_per_layer * last_stage_layers.stop
+                )
+            if not pulls_last:
+                return False
+        return True
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -3500,7 +3534,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+        # Only an early send leaves a last chunk's aux to another PP stage.
+        assert (
+            not is_last_chunk
+            or aux_index is not None
+            or envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get()
+        )
 
         if (
             bootstrap_room not in self.request_status
@@ -3736,12 +3775,14 @@ class MooncakeKVSender(CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         indices_event: Optional[object] = None,
+        send_aux: bool = True,
     ):
         super().send(
             kv_indices=kv_indices,
             state_indices=state_indices,
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
+            send_aux=send_aux,
         )
 
     def _record_transfer_indices(

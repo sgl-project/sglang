@@ -307,6 +307,26 @@ class SchedulerPPMixin:
         release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
+        early_send = self._pp_pd_early_send_enabled()
+        if envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.get():
+            # All stages or none: results hold their checkpoint frees alike. Set the
+            # variable the same on every node, or the stages that skip this gather
+            # leave the others waiting in it.
+            votes = [None] * get_parallel().pp_size
+            torch.distributed.all_gather_object(
+                votes, early_send, group=self.pp_group.cpu_group
+            )
+            early_send = all(votes)
+        if early_send:
+            self.disagg_prefill_early_send_on = True
+            self.disagg_prefill_early_sent_rids = set()
+            self.disagg_prefill_early_send_pending = deque()
+            self.disagg_prefill_early_send_stats = {"early": 0, "deferred": 0}
+            self.disagg_prefill_deferred_frees = {}
+            logger.info(
+                "PP PD prefill: each stage sends a request's last KV chunk when its "
+                "own forward ends (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND)."
+            )
 
         while True:
             server_is_idle = True
@@ -375,6 +395,12 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if early_send:
+                        self._pp_pd_early_send_last_chunks(
+                            cur_batch, result, self.launch_event
+                        )
+                if early_send:
+                    self._pp_pd_flush_early_sends()
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -394,6 +420,10 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    if early_send:
+                        # Its early sends must be made first; the queue is in
+                        # launch order, so later forwards stay queued on the GPU.
+                        self._pp_pd_flush_early_sends(self.mbs[next_mb_id].forward_iter)
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,

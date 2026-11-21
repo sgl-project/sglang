@@ -2,6 +2,9 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import requests
+
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -14,7 +17,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=246, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
@@ -92,6 +95,42 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
         self.assertGreater(metrics["score"], 0.24)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
+
+
+class TestDisaggregationPrefillPPEarlySendAccuracy(
+    TestDisaggregationPrefillPPDynamicChunkAccuracy
+):
+    """The same PP prefill with each stage sending its last KV chunk when its
+    forward ends (SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._early_send_ctx = envs.SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND.override(True)
+        cls._early_send_ctx.__enter__()
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            cls._early_send_ctx.__exit__(None, None, None)
+
+    def test_gsm8k(self):
+        # Checks the path runs and answers stay sane; a few examples suffice.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=40,
+            num_threads=40,
+        )
+        metrics = run_sgl_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.24)
+        info = requests.get(self.prefill_url + "/get_server_info", timeout=30).json()
+        self.assertGreater(info["internal_states"][0]["pp_pd_prefill_early_sends"], 0)
 
 
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
