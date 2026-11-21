@@ -640,8 +640,6 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
-        # Whether a waiting-queue ranking pass has matched this request yet.
-        self.waiting_prefix_matched = False
         # Prefix end restorable from the external store, looked up once for ranking.
         self.external_hit_end: Optional[int] = None
         # gamma-Ada step clock when a sort pass first saw it (tp or pp > 1); kept on retraction.
@@ -1522,7 +1520,6 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
-        self.waiting_prefix_matched = False
         self.external_hit_end = None
         self.lock = None
         self.swa_branching_seqlen = None

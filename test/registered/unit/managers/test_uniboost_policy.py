@@ -65,9 +65,6 @@ class FakeReq:
         self.cache_salt = None
         self.priority = 0
 
-    def refresh_fill_ids(self):
-        self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
-
 
 class FakeTreeCache:
     def __init__(self, disable=True):
