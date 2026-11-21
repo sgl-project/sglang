@@ -56,6 +56,7 @@ from sglang.benchmark.serving import (
     _finite_positive_float,
     _validate_parsed_gsp_args,
     async_request_openai_embeddings,
+    benchmark,
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -569,6 +570,188 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             if tools:
                 expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
             self.assertEqual(row.prompt_len, expected_prompt_len)
+
+    def test_embedding_dataset_filters_records_and_counts_batch_tokens(self):
+        path = self.tmpdir_path / "embedding.jsonl"
+        invalid = [
+            None,
+            [],
+            {},
+            {"input": 3},
+            {"input": [1, 2]},
+            {"input": []},
+            {"input": " "},
+            {"input": ["text", None]},
+            {"input": ["text", ""]},
+        ]
+        valid = [
+            {"input": "hello 世界", "dimensions": 2, "model": "ignored"},
+            {"input": ["hello world", "bonjour 世界"], "encoding_format": "float"},
+        ]
+        with path.open("w", encoding="utf-8") as f:
+            f.write("\nnot json\n")
+            for record in invalid + valid + [{"input": "not selected"}]:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.tokenizer.chat_template = None
+        args = make_args(
+            dataset_name="embedding",
+            dataset_path=str(path),
+            num_prompts=2,
+            sharegpt_output_len=999,
+        )
+        rows = get_dataset(args, self.tokenizer)
+        self.assertEqual([row.prompt for row in rows], [row["input"] for row in valid])
+        self.assertEqual([row.output_len for row in rows], [0, 0])
+        expected_lengths = [
+            len(self.tokenizer.encode(valid[0]["input"])),
+            sum(len(self.tokenizer.encode(x)) for x in valid[1]["input"]),
+        ]
+        self.assertEqual([row.prompt_len for row in rows], expected_lengths)
+        self.assertEqual(rows[0].extra_request_body, {"dimensions": 2})
+        self.assertEqual(rows[1].extra_request_body, {"encoding_format": "float"})
+
+    def _run_http_benchmark(self, backend, rows):
+        received = []
+
+        class BenchmarkHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                received.append((self.path, body))
+                response = {
+                    "data": [],
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                }
+                payload = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), BenchmarkHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        benchmark_args = make_args(
+            backend=backend,
+            dataset_name="embedding" if backend in _EMBEDDING_BACKENDS else "openai",
+            header=[],
+            disable_stream=True,
+            disable_ignore_eos=True,
+            warmup_requests=1,
+            plot_throughput=False,
+            goodput=None,
+            cache_report=False,
+            output_file=str(self.tmpdir_path / "benchmark-results.jsonl"),
+            output_details=True,
+        )
+        try:
+            with (
+                patch("sglang.benchmark.serving.args", benchmark_args, create=True),
+                patch.dict("os.environ", {"SGLANG_IS_IN_CI": "0"}),
+            ):
+                result = asyncio.run(
+                    benchmark(
+                        backend=backend,
+                        api_url=base_url + _BACKEND_API_PATHS[backend],
+                        base_url=base_url,
+                        model_id="local-model",
+                        tokenizer=self.tokenizer,
+                        input_requests=rows,
+                        request_rate=float("inf"),
+                        max_concurrency=1,
+                        disable_tqdm=True,
+                        lora_names=None,
+                        lora_request_distribution=None,
+                        lora_zipf_alpha=None,
+                        extra_request_body={},
+                        profile=False,
+                        warmup_requests=1,
+                    )
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        return result, received
+
+    def test_embedding_dataset_parameters_reach_embedding_http_endpoint(self):
+        records = [
+            {"input": "hello 世界", "dimensions": 2, "encoding_format": "float"},
+            {
+                "input": ["hello world", "bonjour 世界"],
+                "dimensions": 3,
+                "encoding_format": "base64",
+            },
+        ]
+        for backend in sorted(_EMBEDDING_BACKENDS):
+            for selected in [records, records[::-1], records[:1], records[1:]]:
+                with self.subTest(backend=backend, inputs=selected):
+                    path = self.tmpdir_path / "embedding.jsonl"
+                    path.write_text(
+                        "".join(
+                            json.dumps(x, ensure_ascii=False) + "\n" for x in selected
+                        ),
+                        encoding="utf-8",
+                    )
+                    rows = get_dataset(
+                        make_args(dataset_name="embedding", dataset_path=str(path)),
+                        self.tokenizer,
+                    )
+                    result, received = self._run_http_benchmark(backend, rows)
+                    self.assertEqual(result["completed"], len(rows))
+                    self.assertEqual(result["total_output_tokens"], 0)
+                    self.assertEqual(
+                        result["total_input_tokens"], sum(r.prompt_len for r in rows)
+                    )
+                    self.assertEqual(
+                        received,
+                        [
+                            (
+                                "/v1/embeddings",
+                                {"input": selected[0]["input"], "model": "local-model"},
+                            )
+                        ]
+                        + [
+                            ("/v1/embeddings", {**record, "model": "local-model"})
+                            for record in selected
+                        ],
+                    )
+
+    def test_benchmark_keeps_single_shot_and_multi_turn_chat_routing(self):
+        user = {"role": "user", "content": "hello"}
+        assistant = {"role": "assistant", "content": "ok"}
+        cases = [
+            ("hello", [[user]]),
+            ([user], [[user]]),
+            (
+                ["hello", "again"],
+                [[user], [user, assistant, {"role": "user", "content": "again"}]],
+            ),
+            (
+                [[user], [{"role": "user", "content": "again"}]],
+                [[user], [user, assistant, {"role": "user", "content": "again"}]],
+            ),
+        ]
+        for prompt, messages in cases:
+            with self.subTest(prompt=prompt):
+                rows = [DatasetRow(prompt=prompt, prompt_len=2, output_len=1)]
+                result, received = self._run_http_benchmark("vllm-chat", rows)
+                self.assertEqual(result["completed"], len(messages))
+                self.assertEqual(
+                    [body["messages"] for _, body in received], messages * 2
+                )
+                self.assertTrue(
+                    all(path == "/v1/chat/completions" for path, _ in received)
+                )
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
