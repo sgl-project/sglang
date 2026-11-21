@@ -162,16 +162,16 @@ SGL_DEVICE void wave_sum_dpp(uint32_t (&x)[N]) {
   dpp_add_stage<0x143, 0xc, 0xf>(x);  // row_bcast:31
 }
 
-// One DPP move: a lane reads the lane CTRL selects, or `identity` when the
-// row/bank masks switch it off or its source falls outside the row.
+// One DPP move: a lane reads the lane CTRL selects,
+// or `identity` when the row/bank masks switch it off or its source falls outside the row.
 template <int CTRL, int RM, int BM>
 SGL_DEVICE uint32_t dpp_move(uint32_t x, uint32_t identity) {
   return static_cast<uint32_t>(
       __builtin_amdgcn_update_dpp(static_cast<int>(identity), static_cast<int>(x), CTRL, RM, BM, false));
 }
 
-// Wave-wide inclusive scan under an associative, commutative op whose identity is 'identity': lane 63
-// ends with the whole-wave result. Same ladder and masks as wave_sum_dpp.
+// Wave-wide inclusive scan under an associative, commutative op whose identity is `identity`;
+// lane 63 ends with the whole-wave result. Same ladder and masks as wave_sum_dpp.
 template <typename Op>
 SGL_DEVICE uint32_t wave_scan_dpp(uint32_t x, uint32_t identity, Op op) {
   x = op(x, dpp_move<0x111, 0xf, 0xf>(x, identity));  // row_shr:1
