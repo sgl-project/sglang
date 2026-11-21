@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1604,15 +1605,17 @@ class TestL2TransferRecordStream(CustomTestCase):
 
 
 class TestDirectBackendMetadataWarning(CustomTestCase):
-    """The direct backend warns about copy-engine queueing on CUDA, which ROCm no longer does."""
+    """The direct backend warns about copy-engine queueing on CUDA and stays silent on ROCm."""
 
     def _construct(self, *, hip, fill=False, io_backend="direct", engines=1):
         transfer_module._warn_direct_without_metadata_kernels.cache_clear()
+        is_hip.cache_clear()
+        self.addCleanup(is_hip.cache_clear)
         with (
             mock.patch.object(transfer_module, "device_module", torch.cuda),
             mock.patch.object(torch.cuda, "Stream"),
-            # create=True: the module only imports is_hip once this check exists.
-            mock.patch.object(transfer_module, "is_hip", return_value=hip, create=True),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.version, "hip", "7.2" if hip else None),
             envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.override(fill),
         ):
             for _ in range(engines):
