@@ -90,7 +90,10 @@ def handle_moe_kernel_config(server_args: Any):
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
-    if view.moe_runner_backend == "flashinfer_cutlass":
+    if view.moe_runner_backend in (
+        "flashinfer_cutlass",
+        "flashinfer_cutlass_sm120_swiglu",
+    ):
         assert view.quantization in [
             "modelopt_fp4",
             "modelopt_fp8",

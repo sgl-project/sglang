@@ -206,6 +206,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
     "flashinfer_cutlass",
+    "flashinfer_cutlass_sm120_swiglu",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "flashinfer_megamoe",

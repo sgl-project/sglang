@@ -6,7 +6,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import FusedOpPool, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     FlashInferCutlassMoeQuantInfo,
     FlashInferCutlassMxfp4MoeQuantInfo,
@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -225,6 +226,33 @@ class TestCutlassMoeTuneMaxNumTokens(CustomTestCase):
                             ),
                             per_call,
                         )
+
+
+class TestSm120SwigluBackend(CustomTestCase):
+    def test_is_a_flashinfer_cutlass_variant(self):
+        backend = MoeRunnerBackend("flashinfer_cutlass_sm120_swiglu")
+        self.assertTrue(backend.is_flashinfer_cutlass())
+        self.assertTrue(backend.is_flashinfer_cutlass_sm120_swiglu())
+        self.assertFalse(
+            MoeRunnerBackend.FLASHINFER_CUTLASS.is_flashinfer_cutlass_sm120_swiglu()
+        )
+
+    def test_only_this_backend_asks_for_the_fused_kernel(self):
+        quant_info = mock.Mock(spec=FlashInferCutlassMoeQuantInfo)
+        for backend, sm120_swiglu in (
+            ("flashinfer_cutlass", False),
+            ("flashinfer_cutlass_sm120_swiglu", True),
+        ):
+            fused_func = FusedOpPool.get_fused_func("none", backend)
+            with (
+                self.subTest(backend=backend),
+                mock.patch(
+                    "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass._run_flashinfer_cutlass",
+                    return_value=torch.zeros(1),
+                ) as run,
+            ):
+                fused_func(mock.Mock(), quant_info, MoeRunnerConfig())
+                self.assertEqual(run.call_args.kwargs["sm120_swiglu"], sm120_swiglu)
 
 
 if __name__ == "__main__":
