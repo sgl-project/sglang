@@ -267,6 +267,7 @@ class ErnieImageSelfAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
+            global_num_heads=num_heads,
             head_size=head_dim,
             prefix=f"{prefix}.attn",
             skip_sequence_parallel=get_ring_parallel_world_size() > 1,
