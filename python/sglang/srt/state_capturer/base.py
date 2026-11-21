@@ -1,10 +1,9 @@
 import dataclasses
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     HostTensorAllocator,
@@ -12,6 +11,9 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_hip
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +200,7 @@ class BaseTopkCapturer:
         self,
         req_pool_idx: int,
         seqlen: int,
-        req_to_token_pool: ReqToTokenPool,
+        req_to_token_pool: "ReqToTokenPool",
         start_len: int = 0,
     ) -> torch.Tensor:
         if not self.has_host_cache:

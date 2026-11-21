@@ -29,7 +29,7 @@ import time
 import uuid
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -753,13 +753,15 @@ def _copy(copies) -> None:
 # -- filling a layer's store ----------------------------------------------------------------
 
 
-def fill_store(step, cache: Optional[ExpertCache], width: int) -> HostExpertStore:
+def fill_store(
+    step, cache: Optional[ExpertCache], width: int, *, alloc: Optional[Callable] = None
+) -> HostExpertStore:
     """The serving store of a layer whose loads ``step`` (a ``formats.PostLoad``) turns into
     paged rows: read from ``cache`` once the checked groups (``width`` wide: the router's
     top-k) give its bytes, else built from every expert, K at a time, and kept in ``cache``
     for later starts."""
     if cache is None:
-        return build_store(step)
+        return build_store(step, alloc=alloc)
     if not _directory:
         _directory.append(os.path.dirname(cache.path))
     loads = step.loads
@@ -773,7 +775,7 @@ def fill_store(step, cache: Optional[ExpertCache], width: int) -> HostExpertStor
     restored = ran_check = False
     try:
         first = step.run(groups[0])  # also gives the paged layout
-        store = HostExpertStore(step.rows_like, loads.num_experts)
+        store = HostExpertStore(step.rows_like, loads.num_experts, alloc)
         if cache.read(store.host):
             ran_check = True
             # Compared on the host: a repacking step's rows are views of the layer's whole
