@@ -75,7 +75,7 @@ def fused_topk_npu(
                 router_logits, k=topk_config.top_k,
             )
         if renormalize:
-            from sgl_kernel_npu.norm.l1_norm import l1_norm
+            from sgl_kernel_npu.operators.norm import l1_norm
 
             if (
                 os.getenv("SGLANG_NPU_MOE_PADDED_L1", "0") == "1"

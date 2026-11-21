@@ -426,7 +426,7 @@ def test_camera_helpers_run_without_host_reads():
 
 
 @torch.no_grad()
-def test_forward_long_windows_chunk_inputs_once():
+def test_forward_long_windows_chunk_inputs_once(single_threaded_cpu):
     model = _tiny_model(num_layers=4)
     torch.manual_seed(0)
     inputs = dict(
