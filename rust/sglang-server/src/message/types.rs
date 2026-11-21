@@ -338,6 +338,18 @@ impl SequencedControlReq {
                 "expected [tag, rid, http_worker_ipc, seq, payload]",
             ));
         };
+        let nested =
+            rmpv::decode::read_value(&mut &header[..])
+                .ok()
+                .is_some_and(|inner| match inner {
+                    rmpv::Value::Array(items) => {
+                        items.first().and_then(rmpv::Value::as_str) == Some(Self::TAG)
+                    }
+                    _ => false,
+                });
+        if nested {
+            return Err(invalid("a numbered message cannot wrap a numbered message"));
+        }
         Ok(Some(Self {
             seq,
             rid: rid.to_owned(),
@@ -373,6 +385,28 @@ mod tests {
             ])
         );
         assert!(SequencedControlReq::parse(&header).unwrap().is_none());
+    }
+
+    /// A numbered message wrapping a numbered message is refused, so no
+    /// caller recurses over a crafted chain of wrappers.
+    #[test]
+    fn sequenced_control_refuses_a_nested_wrapper() {
+        let inner = SequencedControlReq {
+            seq: 1,
+            rid: "rid-7".into(),
+            header: Bytes::from(rmp_serde::to_vec(&("FlushCacheReqInput", "rid-7")).unwrap()),
+        };
+        let outer = SequencedControlReq {
+            seq: 2,
+            rid: "rid-7".into(),
+            header: inner.encode().unwrap(),
+        };
+        assert!(SequencedControlReq::parse(&outer.encode().unwrap()).is_err());
+        assert!(
+            SequencedControlReq::parse(&inner.encode().unwrap())
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// A forwarded header's rid is the one at the `BaseReq` position, so the

@@ -36,37 +36,14 @@ pub(crate) trait ControlTarget: Send + Sync {
     /// Deliver one request built by `build` and collect this target's replies.
     fn control<'a>(&'a self, build: &'a RequestBuilder<'a>) -> BoxFuture<'a, Vec<RankReply>>;
 
-    /// Why this target would refuse to relay `message` (its wire bytes), or
-    /// `None`.
-    fn relay_refusal(&self, message: &[u8]) -> Option<RelayRefusal> {
-        let _ = message;
-        None
-    }
-
     /// Ask this target for the next control-request number (only DP rank 0's
-    /// listener gives them out; see `core::control_seq`), or `None` when this
-    /// target cannot be asked.
-    fn next_control_seq(&self) -> Option<BoxFuture<'_, Result<u64, CoreError>>> {
-        None
-    }
-}
-
-/// Why a peer listener refuses to relay a control message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RelayRefusal {
-    /// No route fans this message out.
-    NotRelayed,
-    /// An admin-only operation, on a server with no admin key.
-    AdminKeyMissing,
-}
-
-impl std::fmt::Display for RelayRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotRelayed => "not a control message a peer listener relays",
-            Self::AdminKeyMissing => {
-                "a peer listener refuses an admin-only operation without an admin API key"
-            }
+    /// listener gives them out; see `core::control_seq`). An error by default:
+    /// a target that is not that listener gives out none.
+    fn next_control_seq(&self) -> BoxFuture<'_, Result<u64, CoreError>> {
+        Box::pin(async {
+            Err(CoreError::Internal(
+                "this target gives out no control-request numbers".into(),
+            ))
         })
     }
 }
@@ -130,15 +107,15 @@ impl Replies {
 
     /// Every rank in `ranks` failed with `error`.
     pub(crate) fn failed(ranks: impl IntoIterator<Item = RankId>, error: &CoreError) -> Self {
-        Self {
-            replies: ranks
-                .into_iter()
-                .map(|rank| RankReply {
-                    rank,
-                    outcome: Err(CoreError::Internal(error.to_string())),
-                })
-                .collect(),
-        }
+        let mut replies: Vec<RankReply> = ranks
+            .into_iter()
+            .map(|rank| RankReply {
+                rank,
+                outcome: Err(error.clone()),
+            })
+            .collect();
+        replies.sort_by_key(|reply| reply.rank);
+        Self { replies }
     }
 
     /// Decode every rank's reply as `T`, in rank order. Any rank that failed

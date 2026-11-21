@@ -28,12 +28,16 @@ use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
     AbortHook, ControlSequencer, CoreError, DrainEnd, DrainState, FrontendMetrics,
-    GenerateValidator, RequestLog,
+    GenerateValidator, RelayRefusal, RequestLog,
 };
 
 /// How long the listeners keep open connections after a drain's requests
 /// finished: enough to flush the last responses and close idle connections.
 pub(crate) const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a peer listener would refuse to relay a control message (its wire
+/// bytes), or `None`.
+type PeerRelayRule = Box<dyn Fn(&[u8]) -> Option<RelayRefusal> + Send + Sync>;
 
 pub(crate) struct CoreConfig {
     pub(crate) response_capacity: usize,
@@ -178,11 +182,14 @@ pub(super) struct CoreInner {
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
     /// Whether control requests fanned out to every rank are numbered: the
     /// attention-DP groups apply them in the same step (see `core::control_seq`).
-    pub(super) sequences_control_reqs: bool,
+    pub(super) control_reqs_numbered: bool,
     pub(super) control_sequencer: ControlSequencer,
     /// The peer that gives out the numbers: DP rank 0's listener, when this
     /// listener is another rank's.
     pub(super) control_seq_issuer: Option<Arc<dyn ControlTarget>>,
+    /// What every peer listener refuses to relay, checked before a numbered
+    /// fan-out takes a number (see [`CoreHandle::set_peer_relay_rule`]).
+    pub(super) peer_relay_rule: OnceLock<PeerRelayRule>,
     pub(super) generate_validator: Option<Arc<dyn GenerateValidator>>,
     pub(super) abort_hook: Option<Arc<dyn AbortHook>>,
     /// Shared by every transport (see [`CoreHandle::begin_drain`]).
@@ -222,7 +229,7 @@ impl CoreHandle {
                 metrics: config.metrics,
                 request_log: config.request_log,
                 dp_rank,
-                sequences_control_reqs: metadata.deployment_info.enable_dp_attention
+                control_reqs_numbered: metadata.deployment_info.enable_dp_attention
                     && !config.peer_endpoints.is_empty(),
                 control_seq_issuer: config
                     .peer_endpoints
@@ -231,6 +238,7 @@ impl CoreHandle {
                     .cloned(),
                 peer_endpoints: config.peer_endpoints,
                 control_sequencer: ControlSequencer::default(),
+                peer_relay_rule: OnceLock::new(),
                 generate_validator: config.generate_validator,
                 abort_hook: config.abort_hook,
                 drain: Arc::default(),
@@ -302,6 +310,16 @@ impl CoreHandle {
     /// Set the graceful-close timeout once, at boot; the first value wins.
     pub(crate) fn set_graceful_close_timeout(&self, timeout: Duration) {
         let _ = self.inner.graceful_close_timeout.set(timeout);
+    }
+
+    /// Install the rule every peer listener relays a control message (its wire
+    /// bytes) by, so a numbered fan-out refuses what they would refuse before
+    /// it takes a number.
+    pub(crate) fn set_peer_relay_rule(
+        &self,
+        rule: impl Fn(&[u8]) -> Option<RelayRefusal> + Send + Sync + 'static,
+    ) {
+        let _ = self.inner.peer_relay_rule.set(Box::new(rule));
     }
 
     pub(crate) fn is_draining(&self) -> bool {

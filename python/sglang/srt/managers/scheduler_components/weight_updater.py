@@ -47,6 +47,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RpcReqInput,
+    RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -611,6 +613,11 @@ class SchedulerWeightUpdaterManager:
                 # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
                 per_rank = payload if isinstance(payload, list) else [payload]
                 payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
+                # Under local control broadcast every attention-DP group's
+                # leader replies with this same TP-wide list; only the first
+                # group's carries it, so the replies list each rank once.
+                if get_parallel().attn_dp_rank != 0:
+                    payload = []
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -618,6 +625,26 @@ class SchedulerWeightUpdaterManager:
             logger.warning(f"check_weights see error: {e}")
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
+
+    def handle_rpc_request(self, recv_req: RpcReqInput) -> RpcReqOutput:
+        logger.info(
+            f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
+        )
+
+        error = None
+        try:
+            if recv_req.method not in RPC_METHODS:
+                raise ValueError(
+                    f"{recv_req.method!r} is not an RPC method; allowed: "
+                    f"{', '.join(RPC_METHODS)}"
+                )
+            getattr(self, recv_req.method)(recv_req.parameters or {})
+        except Exception as e:
+            error = str(e)
+            logger.error(f"Failed to call rpc {recv_req.method}: {error}")
+
+        success, message, _ = self._agree_across_tp_ranks(error=error, count=0)
+        return RpcReqOutput(success=success, message=message)
 
     def save_remote_model(self, params):
         if _is_later_dp_replica():

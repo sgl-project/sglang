@@ -21,6 +21,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.control_seq_gate import ControlSeqGate
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -180,6 +181,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.enable_lmcache = False
         scheduler.dp_attn_adapter = MagicMock()
         scheduler.pause_state = PauseState()
+        scheduler.control_seq_gate = ControlSeqGate()
         receiver = object.__new__(UocrRequestReceiver)
         object.__setattr__(receiver, "async_shm_materializer", materializer)
         scheduler.request_receiver = receiver

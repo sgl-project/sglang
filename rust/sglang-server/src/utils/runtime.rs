@@ -576,7 +576,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
                 &cfg.server_args.api_keys,
-                crate::api_server::http::peer_relay_refusal,
             )?,
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
                 .with_server_info_state_keys(cfg.server_info_state_keys.clone()),
@@ -587,6 +586,10 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
+    let admin_key_configured = cfg.server_args.api_keys.admin_api_key.is_some();
+    core.set_peer_relay_rule(move |message| {
+        crate::api_server::http::peer_relay_refusal(message, admin_key_configured)
+    });
     if cfg.server_args.custom_warmups_pending {
         core.hold_for_custom_warmups();
     }

@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.control_seq_gate import ControlSeqGate
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -201,6 +202,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
         self.pause_state = PauseState()
+        self.control_seq_gate = ControlSeqGate()
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_hierarchical_cache = False
@@ -474,7 +476,7 @@ def _rank_consensus_worker(rank, rendezvous):
                 assert [a[2] for a in scheduler.actions if a[1] == "result"] == list(
                     names
                 )
-                assert not scheduler.pause_state.holds_pause()
+                assert not scheduler.pause_state.holds_inputs()
                 for name, event in scheduler.copy_events.items():
                     assert event.synchronizations == 1
                     assert event.blocking_synchronizations == int(

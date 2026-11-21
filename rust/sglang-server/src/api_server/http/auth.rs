@@ -364,13 +364,7 @@ mod tests {
             ("API key only", keys(Some(API), None), false),
             ("no key", ApiKeys::default(), false),
         ] {
-            let peers = peer_endpoints(
-                &info,
-                0,
-                &relay_keys,
-                crate::api_server::http::peer_relay_refusal,
-            )
-            .unwrap();
+            let peers = peer_endpoints(&info, 0, &relay_keys).unwrap();
             let outcome = peers[0].control(&flush).await.remove(0).outcome;
             match outcome {
                 Ok(_) => assert!(accepted, "{case}: must be refused"),

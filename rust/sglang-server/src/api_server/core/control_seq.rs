@@ -46,7 +46,7 @@ impl ControlSequencer {
         let _ = next.wait_for(|next| *next == seq).await;
         // Passes the turn on even if this future is dropped mid-submit.
         let _turn = Turn {
-            seq: self,
+            sequencer: self,
             done: seq,
         };
         submit.await
@@ -54,13 +54,13 @@ impl ControlSequencer {
 }
 
 struct Turn<'a> {
-    seq: &'a ControlSequencer,
+    sequencer: &'a ControlSequencer,
     done: u64,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        self.seq.next_submit.send_replace(self.done + 1);
+        self.sequencer.next_submit.send_replace(self.done + 1);
     }
 }
 

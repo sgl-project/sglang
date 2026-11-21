@@ -551,7 +551,7 @@ impl CoreHandle {
 
     /// Deliver one control request to every DP rank of the deployment.
     pub(super) async fn control(&self, build: &RequestBuilder<'_>) -> fanout::Replies {
-        if self.inner.sequences_control_reqs {
+        if self.inner.control_reqs_numbered {
             return self.control_numbered(build).await;
         }
         fanout::fan_out(
@@ -589,9 +589,11 @@ impl CoreHandle {
         // hand that number to its scheduler, and its listener would then hold
         // every later number; so refuse here, before numbering, what every peer
         // would refuse.
-        if let Some(refusal) = peers
-            .iter()
-            .find_map(|peer| peer.relay_refusal(&messages[0].1))
+        if let Some(refusal) = self
+            .inner
+            .peer_relay_rule
+            .get()
+            .and_then(|rule| rule(&messages[0].1))
         {
             return fanout::Replies::failed(
                 ranks,
@@ -648,13 +650,8 @@ impl CoreHandle {
         if self.inner.dp_rank == 0 {
             return self.issue_control_seq();
         }
-        match self
-            .inner
-            .control_seq_issuer
-            .as_ref()
-            .and_then(|issuer| issuer.next_control_seq())
-        {
-            Some(fetch) => fetch.await,
+        match self.inner.control_seq_issuer.as_ref() {
+            Some(issuer) => issuer.next_control_seq().await,
             None => Err(CoreError::Internal(
                 "no peer listener gives out control-request numbers".into(),
             )),
@@ -1078,8 +1075,9 @@ mod tests {
     /// refuse is refused before it takes a number, so no rank misses one.
     #[tokio::test]
     async fn attention_dp_numbers_the_fan_out_from_rank_0() {
+        use crate::api_server::core::RelayRefusal;
         use crate::api_server::core::fanout::testing::status_bytes;
-        use crate::api_server::core::fanout::{ControlTarget, RankId, RelayRefusal};
+        use crate::api_server::core::fanout::{ControlTarget, RankId};
         use crate::message::config::DeploymentInfo;
         use futures::future::BoxFuture;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1088,15 +1086,11 @@ mod tests {
         struct Numbered {
             rank: [RankId; 1],
             seen: Arc<Mutex<Vec<u64>>>,
-            refuses: bool,
             fetches: Arc<AtomicUsize>,
         }
         impl ControlTarget for Numbered {
             fn ranks(&self) -> &[RankId] {
                 &self.rank
-            }
-            fn relay_refusal(&self, _message: &[u8]) -> Option<RelayRefusal> {
-                self.refuses.then_some(RelayRefusal::AdminKeyMissing)
             }
             fn control<'a>(
                 &'a self,
@@ -1113,18 +1107,17 @@ mod tests {
                     }]
                 })
             }
-            fn next_control_seq(&self) -> Option<BoxFuture<'_, Result<u64, CoreError>>> {
+            fn next_control_seq(&self) -> BoxFuture<'_, Result<u64, CoreError>> {
                 self.fetches.fetch_add(1, Ordering::SeqCst);
-                (self.rank[0] == 0).then(|| Box::pin(async { Ok(1_u64) }) as BoxFuture<'_, _>)
+                Box::pin(async { Ok(1_u64) })
             }
         }
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fetches = Arc::new(AtomicUsize::new(0));
-        let target = |rank, refuses| {
+        let target = |rank| {
             Arc::new(Numbered {
                 rank: [rank],
                 seen: seen.clone(),
-                refuses,
                 fetches: fetches.clone(),
             }) as Arc<dyn ControlTarget>
         };
@@ -1157,7 +1150,7 @@ mod tests {
                 },
             )
         };
-        let handle = handle_with(vec![target(0, false), target(2, false)]);
+        let handle = handle_with(vec![target(0), target(2)]);
         let local = async {
             let request = accept_intake(intake_rx.recv_async().await.unwrap());
             let RequestKind::Control(control) = &request.kind else {
@@ -1179,10 +1172,10 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec![1, 1]);
 
         let fetched = fetches.load(Ordering::SeqCst);
-        let refused = handle_with(vec![target(0, false), target(2, true)])
-            .flush_cache(1.0)
-            .await;
-        assert!(!matches!(refused, Ok(ref output) if output.success));
+        let refusing = handle_with(vec![target(0), target(2)]);
+        refusing.set_peer_relay_rule(|_| Some(RelayRefusal::AdminKeyMissing));
+        let refused = refusing.flush_cache(1.0).await;
+        assert!(matches!(refused, Err(CoreError::InvalidArgument(_))));
         assert_eq!(
             fetches.load(Ordering::SeqCst),
             fetched,

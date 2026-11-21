@@ -13,6 +13,7 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.control_seq_gate import ControlSeqGate
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -246,7 +247,7 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler.enable_lmcache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.enable_hisparse = True  # skips the pool accounting checks
-    scheduler.pause_state = PauseState()
+    scheduler.control_seq_gate = ControlSeqGate()
 
     def poll():
         if state == "batch":

@@ -705,10 +705,12 @@ class TestDPShutdownVote(CustomTestCase):
         # The adapter reads the scheduler's own exit flag, a peer's vote sets it,
         # and the rank keeps one gather pending until its own vote went out.
         from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.scheduler_components.pause_state import PauseState
+        from sglang.srt.managers.scheduler_components.control_seq_gate import (
+            ControlSeqGate,
+        )
 
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.pause_state = PauseState()
+        scheduler.control_seq_gate = ControlSeqGate()
         scheduler.tp_worker = SimpleNamespace(model_runner=Mock())
         scheduler.req_to_token_pool = Mock()
         scheduler.token_to_kv_pool_allocator = Mock()

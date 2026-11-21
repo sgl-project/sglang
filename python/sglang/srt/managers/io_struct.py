@@ -2966,7 +2966,7 @@ WORK_REQ_TYPES = (
 class SequencedControlReq(BaseReq, kw_only=True):
     """A control request numbered so that, under local control broadcast, every
     attention-DP group applies it between the same two MLP-sync gathers (see
-    PauseState.take_inputs). The DP controller numbers and sends it; on the Rust
+    ControlSeqGate.take_inputs). The DP controller numbers and sends it; on the Rust
     server, DP rank 0's listener gives the number to whichever listener fans the
     request out. payload is the request, msgpack-encoded, or pickled when
     `pickled` (the DP controller under pickle IPC; Rust listeners always send

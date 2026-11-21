@@ -901,7 +901,7 @@ class RustServer:
             obj = msgpack_decode_explained(header)
             if isinstance(obj, SequencedControlReq):
                 # Decode the wrapped request too: a malformed one gets the same
-                # 400 as an unnumbered one instead of failing in PauseState, and
+                # 400 as an unnumbered one instead of failing in ControlSeqGate, and
                 # every DP group drops the same number and goes on from the next.
                 msgpack_decode_explained(obj.payload)
         except MsgpackDecodeError as e:

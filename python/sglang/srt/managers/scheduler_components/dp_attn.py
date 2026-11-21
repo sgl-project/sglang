@@ -591,7 +591,7 @@ class DPControlSeqColumn:
     ``local`` is the highest number this rank received; ``released`` gets the
     minimum over the active DP groups whenever the gather produced metadata.
     Every group has received every request up to it that was sent to it, so
-    each applies them before its next gather (see PauseState.take_inputs).
+    each applies them before its next gather (see ControlSeqGate.take_inputs).
     """
 
     __slots__ = ("local", "released")

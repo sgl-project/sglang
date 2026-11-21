@@ -55,6 +55,7 @@ impl ToSchedulerTx {
     /// the aborts, in-flight control requests bound the numbered ones (the
     /// one-way messages are one-off), and request-ring saturation must not
     /// make any of them lossy.
+    ///
     /// The scheduler drains this lane first, so its messages can pass requests
     /// queued earlier on the ring.
     #[inline]

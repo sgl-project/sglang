@@ -257,6 +257,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.control_seq_gate import ControlSeqGate
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -331,7 +332,6 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
-    RPC_METHODS,
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -712,6 +712,7 @@ class Scheduler(
         # Init running status
         self.init_running_status()
         self.init_pause_state()
+        self.init_control_seq_gate()
 
         # Init chunked prefill
         self.init_chunked_prefill()
@@ -1440,6 +1441,9 @@ class Scheduler(
     def init_pause_state(self):
         self.pause_state = PauseState()
 
+    def init_control_seq_gate(self):
+        self.control_seq_gate = ControlSeqGate()
+
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
@@ -2066,7 +2070,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (GetHiCacheL3LayoutReq, self.get_hicache_l3_cache_layout),
-                (RpcReqInput, self.handle_rpc_request),
+                (RpcReqInput, self.weight_updater.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (
@@ -2353,7 +2357,7 @@ class Scheduler(
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
-            not self.pause_state.holds_pause()
+            not self.pause_state.holds_inputs()
             and get_parallel().pp_rank == 0
             and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
@@ -2361,11 +2365,10 @@ class Scheduler(
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
-        recv_reqs = self.pause_state.take_inputs(
-            received_reqs,
-            stop_at_pause=stop_at_pause,
-            align_control_reqs=self.dp_attn_adapter.runs_mlp_sync_gather(),
+        recv_reqs = self.control_seq_gate.take_inputs(
+            received_reqs, align=self.dp_attn_adapter.runs_mlp_sync_gather()
         )
+        recv_reqs = self.pause_state.take_inputs(recv_reqs, stop_at_pause=stop_at_pause)
 
         if recv_reqs:
             # Count successful receive/broadcast time as active; empty polls stay idle.
@@ -2781,8 +2784,8 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
-            get_control_seq_received=lambda: self.pause_state.control_seq_received,
-            on_control_seq_released=self.pause_state.release_control_seqs,
+            get_control_seq_received=lambda: self.control_seq_gate.seq_received,
+            on_control_seq_released=self.control_seq_gate.release,
             **self._dp_drain_column_callbacks(),
         )
 
@@ -6133,7 +6136,7 @@ class Scheduler(
             # Held responses are released by polling, not by a socket event:
             # keep polling, and yield the GIL to the completion's worker.
             time.sleep(0)
-        elif not self.pause_state.holds_control_reqs():
+        elif not self.control_seq_gate.holds_inputs():
             # sleep until next event; a held control request waits on the next
             # MLP-sync gathers, which no socket event wakes
             self.maybe_sleep_on_idle()
@@ -6500,31 +6503,6 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
-
-    def handle_rpc_request(self, recv_req: RpcReqInput):
-        logger.info(
-            f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
-        )
-
-        error = None
-        try:
-            if recv_req.method not in RPC_METHODS:
-                raise ValueError(
-                    f"{recv_req.method!r} is not an RPC method; allowed: "
-                    f"{', '.join(RPC_METHODS)}"
-                )
-            getattr(self.weight_updater, recv_req.method)(recv_req.parameters or {})
-        except Exception as e:
-            error = str(e)
-            logger.error(f"Failed to call rpc {recv_req.method}: {error}")
-
-        errors = [error]
-        tp_group = get_parallel().tp_group
-        if tp_group.world_size > 1:
-            errors = [None] * tp_group.world_size
-            torch.distributed.all_gather_object(errors, error, group=tp_group.cpu_group)
-        errors = [e for e in dict.fromkeys(errors) if e is not None]
-        return RpcReqOutput(success=not errors, message="; ".join(errors))
 
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput

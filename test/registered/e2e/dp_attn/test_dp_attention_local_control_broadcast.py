@@ -127,6 +127,19 @@ class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCa
             "greedy outputs changed after the second flush_cache",
         )
 
+    def test_checksum_lists_each_tp_rank_once(self):
+        # Every attention-DP group's leader replies to the weights checker.
+        resp = admin_post(
+            f"{self.base_url}/weights_checker",
+            json={"action": "checksum"},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        tp_ranks = [
+            rank["parallelism_info"][0]["tp_rank"] for rank in resp.json()["ranks"]
+        ]
+        self.assertEqual(sorted(tp_ranks), [0, 1, 2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

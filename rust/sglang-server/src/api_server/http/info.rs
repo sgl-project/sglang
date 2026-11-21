@@ -26,8 +26,7 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::auth::DeclaredRoute;
 use super::native_api::native_error;
-use crate::api_server::core::fanout::RelayRefusal;
-use crate::api_server::core::{CONTROL_SEQ_PATH, CoreError, FORWARD_PEER_PATH};
+use crate::api_server::core::{CONTROL_SEQ_PATH, CoreError, FORWARD_PEER_PATH, RelayRefusal};
 use crate::api_server::handlers::{AbortEnding, DumperOutcome, ElasticEpState, ProfileOutcome};
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::{
@@ -583,11 +582,13 @@ async fn issue_control_seq(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// A forwarded control message's type tag, the first element of its array;
-/// for a numbered message, the tag of the message it numbers.
+/// for a numbered message, the tag of the message it numbers (one level:
+/// `SequencedControlReq::parse` refuses a numbered message inside one).
 fn forwarded_tag(body: &[u8]) -> Option<String> {
-    if let Some(numbered) = SequencedControlReq::parse(body).ok()? {
-        return forwarded_tag(&numbered.header);
-    }
+    let body = match SequencedControlReq::parse(body).ok()? {
+        Some(numbered) => numbered.header,
+        None => Bytes::copy_from_slice(body),
+    };
     match rmpv::decode::read_value(&mut &body[..]).ok()? {
         rmpv::Value::Array(items) => items.first()?.as_str().map(str::to_owned),
         _ => None,
@@ -1665,7 +1666,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0, &Default::default(), peer_relay_refusal).unwrap();
+        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
         let (state, intake_rx, abort_rx) = test_state_with_peers(
             ServerArgs {
                 deployment_info: info,
@@ -1778,7 +1779,7 @@ mod tests {
             rust_server_endpoints: vec![endpoint(0, &own), endpoint(1, &own)],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0, &Default::default(), peer_relay_refusal).unwrap();
+        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
         let (state, _intake_rx, _abort_rx) = test_state_with_peers(
             ServerArgs {
                 deployment_info: info,
@@ -2585,35 +2586,6 @@ mod tests {
             drop(request);
             let _ = response.await;
         }
-    }
-
-    /// The peers a listener builds refuse at the origin what the peer route
-    /// refuses, so a numbered fan-out the peers would refuse never takes a
-    /// number (see `CoreHandle::control_numbered`).
-    #[test]
-    fn built_peers_refuse_what_the_peer_route_refuses() {
-        use crate::message::io_struct::{ControlRequest, FlushCacheReqInput, ProfileReq};
-        let info = DeploymentInfo {
-            dp_rank: Some(0),
-            rust_server_endpoints: vec![endpoint(1, "http://127.0.0.1:1")],
-            ..Default::default()
-        };
-        let admin_only = ControlRequest::ProfileReq(ProfileReq::stop("rid".into()))
-            .encode()
-            .unwrap();
-        let open = ControlRequest::FlushCacheReqInput(FlushCacheReqInput::new("rid".into(), None))
-            .encode()
-            .unwrap();
-        let without_key =
-            peer_endpoints(&info, 0, &Default::default(), peer_relay_refusal).unwrap();
-        assert_eq!(
-            without_key[0].relay_refusal(&admin_only),
-            Some(RelayRefusal::AdminKeyMissing)
-        );
-        assert_eq!(without_key[0].relay_refusal(&open), None);
-        let keys = crate::message::config::ApiKeys::new(None, Some("sk-admin".into()));
-        let with_key = peer_endpoints(&info, 0, &keys, peer_relay_refusal).unwrap();
-        assert_eq!(with_key[0].relay_refusal(&admin_only), None);
     }
 
     #[test]
