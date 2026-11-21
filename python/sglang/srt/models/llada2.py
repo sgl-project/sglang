@@ -31,7 +31,6 @@ from torch import nn
 from transformers import PretrainedConfig
 from triton.language.extra import libdevice
 
-from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hf_transformers import get_rope_config
@@ -65,6 +64,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
     capture_routed_experts_if_allowed,
+    routing_simulation_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
@@ -103,20 +103,10 @@ def _require_block_routing_ep1(moe_ep_size: int) -> None:
 
 
 def _require_block_routing_simulated_experts_compatibility() -> None:
-    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    if simulate_uniform_experts and simulate_round_robin_experts:
+    if routing_simulation_enabled():
         raise ValueError(
-            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
-        )
-    if simulate_uniform_experts:
-        raise ValueError(
-            "LLaDA2 block routing does not support SGLANG_SIMULATE_UNIFORM_EXPERTS"
-        )
-    if simulate_round_robin_experts:
-        raise ValueError(
-            "LLaDA2 block routing does not support SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+            "LLaDA2 block routing does not support SGLANG_SIMULATE_UNIFORM_EXPERTS / "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
         )
 
 

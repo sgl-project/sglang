@@ -272,7 +272,7 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
             envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.override(False),
             envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.override(True),
             self.assertRaisesRegex(
-                ValueError, r"does not support SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
+                ValueError, r"does not support .*SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS"
             ),
         ):
             LLaDA2MoeSparseMoeBlock(

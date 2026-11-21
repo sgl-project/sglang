@@ -1741,6 +1741,7 @@ class FusedMoE(torch.nn.Module):
                     topk_output.topk_config.renormalize,
                     self.layer_id,
                     topk_output.topk_config.allow_routed_experts_capture,
+                    topk_output.topk_config.routing_simulation_encoded,
                 )
             else:
                 # Make sure there is torch lib op registration for the whole moe layer
@@ -2032,6 +2033,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
     renormalize: bool,
     layer_id: int,
     allow_routed_experts_capture: bool,
+    routing_simulation_encoded: bool,
 ) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
@@ -2044,6 +2046,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
             renormalize=renormalize,
             allow_routed_experts_capture=allow_routed_experts_capture,
             layer_id=layer_id,
+            routing_simulation_encoded=routing_simulation_encoded,
         ),
     )
     forward_context = get_tc_piecewise_forward_context()
