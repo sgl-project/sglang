@@ -69,6 +69,7 @@ from .custom_all_reduce_utils import (
     is_weak_contiguous,
 )
 from .dpx_hier_all_reduce import DpxHierAllReduce
+from .gfx1250_fabric import probe_spx
 from .ring_simple_all_reduce import (
     HIER_RING_SIMPLE_BUFFER_SIZE,
     RING_SIMPLE_BUFFER_SIZE,
@@ -102,6 +103,11 @@ _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
+
+
+def _is_gfx1250(device: torch.device) -> bool:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_properties(index).gcnArchName.startswith("gfx1250")
 
 
 # (JIT module, algorithm name, multicast) of one eager launch
@@ -154,20 +160,22 @@ class CustomAllReduceV2:
         self,
         group: ProcessGroup,
         device: torch.device,
-        max_size: int = _DEFAULT_MAX_SIZE,
+        max_size: Optional[int] = None,
         *,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
-        ring_simple_buffer_size: int = RING_SIMPLE_BUFFER_SIZE,
+        ring_simple_buffer_size: Optional[int] = None,
         hier_ring_simple_buffer_size: int = HIER_RING_SIMPLE_BUFFER_SIZE,
     ) -> None:
         """
         :param max_size: direction-agnostic memory cap. Each workspace is
                          sized to what the tuned config wants, clipped to
                          this bound. Defaults to
-                         ``SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB`` (16 MB).
+                         ``SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB`` (16 MB),
+                         or the tuned config's ``default_max_size`` when that
+                         is larger and the variable is unset.
         :param max_pull_size: explicit pull buffer size; overrides both
                               the tuned size and ``max_size``. ``0`` builds a
                               push-only instance.
@@ -179,7 +187,9 @@ class CustomAllReduceV2:
         :param ring_simple_buffer_size: FIFO bytes per channel of the ring
                                  all-reduce (``ring_simple``, where the tuned
                                  config enables it: ROCm gfx1250): two
-                                 chunk-sized slices.
+                                 chunk-sized slices. Defaults to the tuned
+                                 config's ``ring_simple_buffer_size``, else
+                                 ``RING_SIMPLE_BUFFER_SIZE``.
         :param hier_ring_simple_buffer_size: bytes per FIFO (cross, pair-in,
                                  pair-out) of each channel of the ring
                                  all-reduce (``hier_ring_simple``, where the
@@ -198,7 +208,16 @@ class CustomAllReduceV2:
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-        base_config = get_all_reduce_config(self.world_size)
+        spx = _is_hip and _is_gfx1250(device) and probe_spx(group, device)
+        base_config = get_all_reduce_config(self.world_size, spx=spx)
+        if max_size is None:
+            max_size = _DEFAULT_MAX_SIZE
+            if not envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.is_set():
+                max_size = max(max_size, base_config.default_max_size)
+        if ring_simple_buffer_size is None:
+            ring_simple_buffer_size = (
+                base_config.ring_simple_buffer_size or RING_SIMPLE_BUFFER_SIZE
+            )
         dpx_pairs, hier_max_bytes = None, 0
         hier_ring_pairs, hier_ring_slot_bytes = None, 0
         if _is_hip:
