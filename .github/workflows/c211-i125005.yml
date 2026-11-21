@@ -80,6 +80,8 @@ jobs:
       shell: bash
       run: |
         set -u
+        set +e
+        set +o pipefail
         W="$HOME/c211-i125005"
         TAG='${{ matrix.tag }}'
         N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
@@ -92,8 +94,8 @@ jobs:
             f="$W/wr-$i.log"
             acc=$(grep -c 'accepted' "$f" 2>/dev/null || true); acc=${acc:-0}
             rej=$(grep -c 'rejected' "$f" 2>/dev/null || true); rej=${rej:-0}
-            last=$(grep 'accepted' "$f" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-120)
-            uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$i" 2>/dev/null)
+            last=$(grep 'accepted' "$f" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-120) || true
+            uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$i" 2>/dev/null) || true
             tot=$((tot+acc))
             echo "DET g=$i acc=$acc rej=$rej uuid=$uuid lastacc=\"$last\""
           done
@@ -209,6 +211,8 @@ jobs:
       shell: bash
       run: |
         set -u
+        set +e
+        set +o pipefail
         W="$HOME/c211-i125005"
         TAG='${{ matrix.tag }}'
         N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')
@@ -222,7 +226,7 @@ jobs:
             f="$W/wr-$i.log"
             acc=$(grep -c 'accepted' "$f" 2>/dev/null || true); acc=${acc:-0}
             rej=$(grep -c 'rejected' "$f" 2>/dev/null || true); rej=${rej:-0}
-            last=$(grep 'accepted' "$f" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-120)
+            last=$(grep 'accepted' "$f" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-120) || true
             tot=$((tot+acc))
             echo "DET g=$i acc=$acc rej=$rej lastacc=\"$last\""
           done
