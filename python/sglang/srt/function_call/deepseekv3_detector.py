@@ -69,21 +69,26 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
-        try:
-            for match_result in match_result_list:
+        had_parse_error = False
+        for match_result in match_result_list:
+            try:
                 # Get function name
                 func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+                if func_detail is None:
+                    raise ValueError("Malformed DeepSeek tool call")
                 func_name = func_detail.group(2)
                 func_args = func_detail.group(3)
                 func_args = json.loads(func_args)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": func_args}
                 calls.extend(self.parse_base_json(match_result, tools))
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
+            except Exception as e:
+                logger.error(f"Error in detect_and_parse: {e}")
+                had_parse_error = True
+        # Keep valid siblings; retain the original fallback if none survive.
+        if had_parse_error and not calls:
             return StreamingParseResult(normal_text=text)
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
