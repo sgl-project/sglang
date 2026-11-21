@@ -2387,7 +2387,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
     def _mla_verify_runs_gluon(self, q_len: int) -> bool:
-        """Whether MLA target verify runs on Gluon instead of the asm kernel."""
+        # Whether MLA target verify runs on Gluon instead of the asm kernel.
         return prefer_mla_gluon_decode(
             head_pad_mode=self.head_pad_mode,
             num_head=self.num_head,

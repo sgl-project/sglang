@@ -954,6 +954,23 @@ class TestFp8QOut(CustomTestCase):
         # The writer fills heads 0..11 only; the pad heads must start zero.
         self.assertEqual(torch.count_nonzero(buf.view(torch.uint8)).item(), 0)
 
+    def test_buffer_grows_by_powers_of_two_and_retires_the_old_one(self):
+        """A graph that captured the old buffer's pointer must keep it alive."""
+        be = self._make_backend()
+        with mock.patch.object(be, "_mla_verify_runs_gluon", return_value=False):
+            small = be.mla_fp8_q_out(
+                forward_batch=self._fb(verify=True), num_tokens=5, head_dim=576
+            )
+            big = be.mla_fp8_q_out(
+                forward_batch=self._fb(verify=True), num_tokens=10, head_dim=576
+            )
+        self.assertEqual(be._fp8_q_buffer.shape[0], 16)
+        self.assertEqual(big.shape[0], 10)
+        self.assertEqual(torch.count_nonzero(big.view(torch.uint8)).item(), 0)
+        self.assertEqual(len(be._retired_fp8_q_buffers), 1)
+        self.assertEqual(be._retired_fp8_q_buffers[0].shape[0], 8)
+        self.assertEqual(be._retired_fp8_q_buffers[0].data_ptr(), small.data_ptr())
+
     def test_capture_never_allocates(self):
         """A buffer created during capture would be zeroed only at replay."""
         be = self._make_backend()
@@ -1016,6 +1033,9 @@ class TestFp8QOut(CustomTestCase):
         """Behind a TBO or prefill/decode-split wrapper the writer must still reach
         the AITER backend's buffer; the base hook would silently return None."""
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
         inner = mock.Mock()
@@ -1024,7 +1044,10 @@ class TestFp8QOut(CustomTestCase):
         tbo.primary = inner
         hybrid = HybridAttnBackend.__new__(HybridAttnBackend)
         hybrid._select_backend = mock.Mock(return_value=inner)
-        for wrapper in (tbo, hybrid):
+        # Kimi-K3's KDA + MLA stack.
+        hybrid_linear = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid_linear.full_attn_backend = inner
+        for wrapper in (tbo, hybrid, hybrid_linear):
             with self.subTest(wrapper=type(wrapper).__name__):
                 inner.mla_fp8_q_out.reset_mock()
                 out = wrapper.mla_fp8_q_out(

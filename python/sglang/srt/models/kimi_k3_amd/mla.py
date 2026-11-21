@@ -46,8 +46,7 @@ _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
 
 
 def fused_q_cache_available() -> bool:
-    """Whether the fused write runs here: gfx950 with SGLANG_USE_AITER=1, the only
-    target it was measured on."""
+    # gfx950 with SGLANG_USE_AITER=1, the only target it was measured on.
     if not (
         envs.SGLANG_USE_AITER.get()
         and torch.version.hip is not None
@@ -61,8 +60,7 @@ def fused_q_cache_available() -> bool:
 def create_q_cache_writer(
     *, kv_lora_rank: int, qk_rope_head_dim: int
 ) -> Optional["KimiK3RocmMlaQCacheWriter"]:
-    """The writer where the fused kernel runs, else None, which keeps the split
-    chain."""
+    # None keeps the split chain.
     if (kv_lora_rank, qk_rope_head_dim) != (
         _KV_LORA_RANK,
         _ROPE_HEAD_DIM,
@@ -84,8 +82,8 @@ def create_q_cache_writer(
 
 
 def _supports_cache(kv_cache: torch.Tensor) -> bool:
-    """Whether the kernel can write this KV cache: the [slots, 1, 576] MLA pool in
-    BF16 or e4m3fn. A paged 4D cache would be indexed as one slot per block."""
+    # The [slots, 1, 576] MLA pool in BF16 or e4m3fn; a paged 4D cache would be
+    # indexed as one slot per block.
     return (
         kv_cache.ndim == 3
         and kv_cache.shape[1] == 1
@@ -97,8 +95,8 @@ def _supports_cache(kv_cache: torch.Tensor) -> bool:
 def _check_fp8_q_out(
     fp8_q: torch.Tensor, *, q_nope: torch.Tensor, head_dim: int
 ) -> None:
-    """The backend's FP8 query buffer must be a contiguous [tokens, >= q heads,
-    head_dim] e4m3fn tensor on the query device; anything else is a backend bug."""
+    # A malformed buffer is a backend bug: it must be a contiguous
+    # [tokens, >= q heads, head_dim] e4m3fn tensor on the query device.
     tokens, heads = q_nope.shape[:2]
     if not (
         fp8_q.dtype == torch.float8_e4m3fn
@@ -142,13 +140,9 @@ class KimiK3RocmMlaQCacheWriter:
         is_target_verify: bool,
         get_fp8_q_out: Optional[Callable[[], Optional[torch.Tensor]]] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Return (q, k placeholder) after writing Q and the KV cache,
-        or None to leave both to the split concat/cache chain.
-
-        ``get_fp8_q_out`` is the attention backend's ``mla_fp8_q_out``, called only
-        once the launch will run. If it returns a buffer, Q is cast into its first
-        heads in FP8 and the padded buffer is returned as q.
-        """
+        # Returns (q, k placeholder), or None to leave both to the split chain.
+        # get_fp8_q_out is the backend's mla_fp8_q_out, called only once the launch
+        # will run; a buffer it returns takes q in FP8 and is returned as q.
         backends = _TARGET_VERIFY_BACKENDS if is_target_verify else _DECODE_BACKENDS
         if (
             # An idle rank has nothing to write.

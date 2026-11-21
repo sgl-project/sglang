@@ -460,7 +460,6 @@ def rocm_absorb_v_bmm(
 def _mla_cache_slot_mapping(
     *, kv_pool: KVCache, out_cache_loc: torch.Tensor
 ) -> torch.Tensor:
-    """out_cache_loc as the slot_mapping a fused AITER MLA cache write takes."""
     if isinstance(kv_pool, HiSparseDSATokenToKVPool):
         # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)

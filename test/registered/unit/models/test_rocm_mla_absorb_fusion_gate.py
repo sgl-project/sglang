@@ -331,6 +331,7 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
             torch.zeros(2, 8, 576, dtype=torch.float8_e4m3fn),
             torch.zeros(2, 16, 512, dtype=torch.float8_e4m3fn),
             torch.zeros(2, 1, 576, dtype=torch.float8_e4m3fn).expand(2, 16, 576),
+            torch.empty(2, 16, 576, dtype=torch.float8_e4m3fn, device="meta"),
         ):
             with self.subTest(shape=tuple(buf.shape), dtype=buf.dtype):
                 with self.assertRaises(ValueError):
