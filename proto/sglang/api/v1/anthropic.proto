@@ -1,0 +1,354 @@
+// Anthropic Messages data plane: `/v1/messages` and
+// `/v1/messages/count_tokens`, as `entrypoints/anthropic/protocol.py`
+// declares them (mirroring anthropic-sdk-python). The server translates onto
+// the chat path; shared by the HTTP adapter, the gRPC service, and the router.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+// ---- Errors ----------------------------------------------------------------
+
+// `error.type` is one of Anthropic's documented values (invalid_request_error,
+// authentication_error, permission_error, not_found_error, request_too_large,
+// rate_limit_error, api_error, overloaded_error); strict SDK clients parse it.
+message AnthropicError {
+  string type = 1;
+  string message = 2;
+}
+
+// The HTTP error envelope: `{"type": "error", "error": {...}}`.
+message AnthropicErrorResponse {
+  string type = 1;
+  AnthropicError error = 2;
+}
+
+// ---- Usage -----------------------------------------------------------------
+
+// `input_tokens` excludes cached prompt tokens, which go to
+// `cache_read_input_tokens`. A streamed `message_delta` carries only
+// `output_tokens`; `message_start` and the unary reply carry both.
+message AnthropicUsage {
+  optional int64 input_tokens = 1;
+  optional int64 output_tokens = 2;
+  optional int64 cache_creation_input_tokens = 3;
+  optional int64 cache_read_input_tokens = 4;
+}
+
+// ---- Content blocks (tagged by `type`) ---------------------------------------
+
+message AnthropicContentBlock {
+  oneof block {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_TAGGED;
+    option (sglang.json.v1.oneof_json).tag = "type";
+    AnthropicTextBlock text = 1;
+    AnthropicImageBlock image = 2;
+    AnthropicToolUseBlock tool_use = 3;
+    AnthropicToolResultBlock tool_result = 4;
+    AnthropicToolReferenceBlock tool_reference = 5;
+    AnthropicSearchResultBlock search_result = 6;
+    AnthropicThinkingBlock thinking = 7;
+    AnthropicRedactedThinkingBlock redacted_thinking = 8;
+  }
+}
+
+message AnthropicContentBlockList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated AnthropicContentBlock items = 1;
+}
+
+// A message's `content` and the request `system`: a string or a block list.
+message AnthropicContent {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string text = 1;
+    AnthropicContentBlockList blocks = 2;
+  }
+}
+
+message AnthropicTextBlock {
+  string text = 1;
+}
+
+// `source` is `{"type": "base64", "media_type", "data"}` or `{"url"}`; a bare
+// string is accepted and ignored, as in Python.
+message AnthropicImageBlock {
+  optional AnthropicImageSource source = 1;
+}
+
+message AnthropicImageSource {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string reference = 1;
+    AnthropicImageSourceObject object = 2;
+  }
+}
+
+message AnthropicImageSourceObject {
+  optional string type = 1;
+  optional string media_type = 2;
+  optional string data = 3;
+  optional string url = 4;
+}
+
+// The tool arguments object, passed through as JSON text.
+message AnthropicToolUseBlock {
+  string id = 1;
+  string name = 2;
+  optional string input = 3 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `tool_use_id` per the spec; legacy payloads send `id` instead.
+message AnthropicToolResultBlock {
+  optional string tool_use_id = 1;
+  optional string id = 2;
+  optional AnthropicContent content = 3;
+  optional bool is_error = 4;
+}
+
+// SGLang extension: names a deferred-loaded tool (`tool_name` or `name`).
+message AnthropicToolReferenceBlock {
+  optional string name = 1;
+  optional string tool_name = 2;
+  optional string id = 3;
+}
+
+message AnthropicSearchResultBlock {
+  optional AnthropicSearchSource source = 1;
+  optional string title = 2;
+  repeated AnthropicSearchResultItem content = 3;
+}
+
+// A URL / identifier string, or an object with `url` or `text`.
+message AnthropicSearchSource {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    string reference = 1;
+    AnthropicSearchSourceObject object = 2;
+  }
+}
+
+message AnthropicSearchSourceObject {
+  optional string url = 1;
+  optional string text = 2;
+}
+
+// Only `type: "text"` items are read.
+message AnthropicSearchResultItem {
+  optional string type = 1;
+  optional string text = 2;
+}
+
+// `signature` is omitted when the backend has none; an empty string would
+// fail downstream signature verifiers.
+message AnthropicThinkingBlock {
+  string thinking = 1;
+  optional string signature = 2;
+}
+
+message AnthropicRedactedThinkingBlock {
+  optional string data = 1;
+}
+
+// ---- Messages, tools, controls -----------------------------------------------
+
+// `role` is "user", "assistant", or "system".
+message AnthropicMessage {
+  string role = 1;
+  AnthropicContent content = 2;
+}
+
+// One flat shape for every tool family. A custom tool has no `type` (or
+// "custom") and an `input_schema`; the server tools (`web_search_*`,
+// `computer_*`, `bash_*`, `text_editor_*`) carry their own knobs and are
+// skipped by the server, which has no implementation for them.
+message AnthropicTool {
+  optional string type = 1;
+  string name = 2;
+  optional string description = 3;
+  // The JSON Schema of the arguments; `{"type": "object"}` is filled when the
+  // schema has no `type`.
+  optional string input_schema = 4 [(sglang.json.v1.field_json).raw_json = true];
+  optional bool defer_loading = 5;
+  optional int64 max_uses = 6;
+  repeated string allowed_domains = 7;
+  repeated string blocked_domains = 8;
+  optional int64 display_width_px = 9;
+  optional int64 display_height_px = 10;
+  optional int64 display_number = 11;
+}
+
+// `type` is "auto", "any", "tool" (with `name`), or "none".
+message AnthropicToolChoice {
+  string type = 1;
+  optional string name = 2;
+}
+
+// `type` is "enabled" (`budget_tokens` >= 1024 required), "disabled" (no
+// other field), or "adaptive" (no `budget_tokens`). The budget is accepted
+// and not enforced; `display` "omitted" cannot hide reasoning here.
+message AnthropicThinkingParam {
+  string type = 1;
+  optional int64 budget_tokens = 2;
+  optional string display = 3;
+}
+
+// A soft hint; `max_tokens` stays the hard cap.
+message AnthropicTaskBudget {
+  string type = 1;
+  int64 total = 2;
+  optional int64 remaining = 3;
+}
+
+// `effort` is "minimal" | "low" | "medium" | "high" | "xhigh" | "max".
+message AnthropicOutputConfig {
+  optional string effort = 1;
+  optional AnthropicTaskBudget task_budget = 2;
+}
+
+// `POST /v1/messages`. The routing fields are the P/D and DP hints a router
+// may inject, as on the OpenAI routes.
+message AnthropicMessagesRequest {
+  string model = 1;
+  repeated AnthropicMessage messages = 2;
+  int64 max_tokens = 3;
+  // Opaque client metadata; accepted and ignored.
+  optional string metadata = 4 [(sglang.json.v1.field_json).raw_json = true];
+  repeated string stop_sequences = 5;
+  optional bool stream = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  optional AnthropicContent system = 7;
+  optional double temperature = 8;
+  optional AnthropicThinkingParam thinking = 9;
+  optional AnthropicToolChoice tool_choice = 10;
+  repeated AnthropicTool tools = 11;
+  optional int64 top_k = 12;
+  optional double top_p = 13;
+  optional AnthropicOutputConfig output_config = 14;
+  // SDK beta opt-ins; accepted and ignored.
+  repeated string betas = 15;
+  optional StringOrList bootstrap_host = 16;
+  optional OptionalInt64OrList bootstrap_port = 17;
+  optional Int64OrList bootstrap_room = 18;
+  optional int64 routed_dp_rank = 19;
+  optional int64 disagg_prefill_dp_rank = 20;
+}
+
+// The unary reply, and the `message` of a streamed `message_start` (where
+// `content` is empty and `output_tokens` 0). `stop_reason` is "end_turn",
+// "max_tokens", "stop_sequence", or "tool_use".
+message AnthropicMessagesResponse {
+  string id = 1;
+  string type = 2;
+  string role = 3;
+  AnthropicContentBlockList content = 4;
+  string model = 5;
+  optional string stop_reason = 6;
+  optional string stop_sequence = 7;
+  optional AnthropicUsage usage = 8;
+}
+
+// `POST /v1/messages/count_tokens`: the rendered prompt's token count.
+message AnthropicCountTokensRequest {
+  string model = 1;
+  repeated AnthropicMessage messages = 2;
+  optional AnthropicContent system = 3;
+  optional AnthropicThinkingParam thinking = 4;
+  optional AnthropicToolChoice tool_choice = 5;
+  repeated AnthropicTool tools = 6;
+  optional AnthropicOutputConfig output_config = 7;
+  repeated string betas = 8;
+}
+
+message AnthropicCountTokensResponse {
+  int64 input_tokens = 1;
+}
+
+// ---- Stream events (tagged by `type`) ----------------------------------------
+
+// One SSE event of a streamed `/v1/messages`; the SSE `event:` name is the
+// tag. The sequence is message_start, then content_block_start / delta /
+// stop groups, then message_delta and message_stop; a failure closes any
+// open block, then emits error and message_stop.
+message AnthropicStreamEvent {
+  oneof event {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_TAGGED;
+    option (sglang.json.v1.oneof_json).tag = "type";
+    AnthropicMessageStartEvent message_start = 1;
+    AnthropicMessageDeltaEvent message_delta = 2;
+    AnthropicMessageStopEvent message_stop = 3;
+    AnthropicContentBlockStartEvent content_block_start = 4;
+    AnthropicContentBlockDeltaEvent content_block_delta = 5;
+    AnthropicContentBlockStopEvent content_block_stop = 6;
+    AnthropicPingEvent ping = 7;
+    AnthropicErrorEvent error = 8;
+  }
+}
+
+message AnthropicMessageStartEvent {
+  AnthropicMessagesResponse message = 1;
+}
+
+message AnthropicMessageDeltaEvent {
+  AnthropicMessageEndDelta delta = 1;
+  AnthropicUsage usage = 2;
+}
+
+// No `type` inside: the event name already says message_delta.
+message AnthropicMessageEndDelta {
+  optional string stop_reason = 1;
+  optional string stop_sequence = 2;
+}
+
+message AnthropicMessageStopEvent {}
+
+message AnthropicContentBlockStartEvent {
+  int64 index = 1;
+  AnthropicContentBlock content_block = 2;
+}
+
+message AnthropicContentBlockDeltaEvent {
+  int64 index = 1;
+  AnthropicContentDelta delta = 2;
+}
+
+message AnthropicContentBlockStopEvent {
+  int64 index = 1;
+}
+
+message AnthropicPingEvent {}
+
+message AnthropicErrorEvent {
+  AnthropicError error = 1;
+}
+
+message AnthropicContentDelta {
+  oneof delta {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_TAGGED;
+    option (sglang.json.v1.oneof_json).tag = "type";
+    AnthropicTextDelta text_delta = 1;
+    AnthropicInputJsonDelta input_json_delta = 2;
+    AnthropicThinkingDelta thinking_delta = 3;
+    AnthropicSignatureDelta signature_delta = 4;
+  }
+}
+
+message AnthropicTextDelta {
+  string text = 1;
+}
+
+message AnthropicInputJsonDelta {
+  string partial_json = 1;
+}
+
+message AnthropicThinkingDelta {
+  string thinking = 1;
+}
+
+message AnthropicSignatureDelta {
+  string signature = 1;
+}
