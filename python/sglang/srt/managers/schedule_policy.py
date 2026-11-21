@@ -251,6 +251,15 @@ class SchedulePolicy:
         self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self.lpm_compute_weight = envs.SGLANG_HICACHE_LPM_COMPUTE_WEIGHT.get()
+        if self.lpm_compute_weight < 0:
+            raise ValueError("SGLANG_HICACHE_LPM_COMPUTE_WEIGHT must be nonnegative")
+        if self.lpm_compute_weight and (
+            self.policy != CacheAwarePolicy.LPM
+            or not enable_hierarchical_cache
+            or get_disagg().disaggregation_mode != "prefill"
+        ):
+            self.lpm_compute_weight = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -332,7 +341,9 @@ class SchedulePolicy:
             deprioritized = self._compute_prefix_matches(
                 self._bounded_members, CacheAwarePolicy.LPM
             )
-            self._sort_by_longest_prefix(self._bounded_members, deprioritized)
+            self._sort_by_longest_prefix(
+                self._bounded_members, deprioritized, self.lpm_compute_weight
+            )
             next_ids = {id(r) for r in self._bounded_next_members}
             return (
                 self._bounded_members
@@ -365,7 +376,7 @@ class SchedulePolicy:
             )
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
-                    waiting_queue, temporary_deprioritized
+                    waiting_queue, temporary_deprioritized, self.lpm_compute_weight
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
@@ -487,7 +498,9 @@ class SchedulePolicy:
             deprioritized = self._compute_prefix_matches(
                 self._bounded_next_members, CacheAwarePolicy.LPM
             )
-            self._sort_by_longest_prefix(self._bounded_next_members, deprioritized)
+            self._sort_by_longest_prefix(
+                self._bounded_next_members, deprioritized, self.lpm_compute_weight
+            )
             yield from self._bounded_next_members
 
     def allows_admission(self, req: Req) -> bool:
@@ -733,9 +746,20 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_longest_prefix(
-        waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        compute_weight: int = 0,
     ) -> None:
         """Sorts the waiting queue based on the longest prefix match."""
+        if compute_weight:
+            waiting_queue.sort(
+                key=lambda r: (
+                    r.rid in temporary_deprioritized,
+                    compute_weight * SchedulePolicy._uncached_len(r)
+                    + max(0, r.host_hit_length - r.host_loaded_length),
+                )
+            )
+            return
         waiting_queue.sort(
             key=lambda r: (
                 -r.num_matched_prefix_tokens
