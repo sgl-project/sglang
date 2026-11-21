@@ -504,7 +504,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                 )
                 with patch.object(
                     scoring,
-                    "_index_q_and_weights",
+                    "index_q_and_weights",
                     return_value=(*source["q"], source["weights"]),
                 ):
                     published = backend.publish_prefill(inputs)
@@ -515,7 +515,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                 )
                 with patch.object(
                     scoring,
-                    "_index_q_and_weights",
+                    "index_q_and_weights",
                     return_value=(*consumer["q"], consumer["weights"]),
                 ):
                     backend.consume_prefill(inputs, published)

@@ -910,6 +910,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             new_seq_lens=new_seq_lens,
         )
+        chunk = get_schedule().chunked_prefill_size
+        if chunk and chunk > 0 and 2 * (batch.extend_num_tokens or chunk) <= chunk:
+            # Mixed small prefills would otherwise fragment the allocator cache past
+            # the footprint of a full chunk; this step returns what it left free.
+            torch.cuda.empty_cache()
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):

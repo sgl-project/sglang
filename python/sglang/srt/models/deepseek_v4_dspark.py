@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Tuple
@@ -11,6 +12,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
+from sglang.kernels.ops.attention.dsv4.wo_a import (
+    can_use_fused_wo_a,
+    fused_rope_wo_a_bf16,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
@@ -32,6 +38,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import (
     remap_dspark_weight_name_npu,
 )
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -54,6 +61,7 @@ from sglang.srt.models.deepseek_v4 import (
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
+    _fused_wo_a_arch_supported,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -191,11 +199,15 @@ class DSparkAttention(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q, _ = self.wq_b(q)
+        _, q_for_wqb = self._normalize_q_lora(q)
+        q, _ = self.wq_b(q_for_wqb)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
+                fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
+                return q_out
+            if _is_cuda and q_out is not None:
+                # RoPE written straight into q_out (eps None: no norm), no copy.
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
             if not _is_npu:
@@ -330,6 +342,13 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
+        if (
+            _is_cuda
+            and self._use_fused_wo_a
+            and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+        ):
+            return self._fused_rope_wo_a_wo_b(o, positions, defer_all_reduce)
+
         if not _is_npu:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
@@ -377,8 +396,43 @@ class DSparkAttention(MqaAttentionBase):
             else out
         )
 
+    @functools.cached_property
+    def _use_fused_wo_a(self) -> bool:
+        """The target's inverse-RoPE + WO-A launch (MQALayer.use_fused_wo_a) fits
+        this draft stage; read after the weights load."""
+        return (
+            self.is_dsv41
+            and _fused_wo_a_arch_supported()
+            and self.wo_a.weight.dtype == torch.bfloat16
+            and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
+            and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
+        )
+
+    def _fused_rope_wo_a_wo_b(
+        self, o: torch.Tensor, positions: torch.Tensor, defer_all_reduce: bool
+    ):
+        """o [T, heads, head_dim] before its inverse RoPE -> the wo_b output; the
+        WO-A epilogue quantizes for wo_b when wo_b takes FlashInfer MXFP8."""
+        fuse_mxfp8_quant = self.use_flashinfer_mxfp8_wo_b
+        out = fused_rope_wo_a_bf16(
+            o.view(o.shape[0], self.n_local_groups, -1),
+            self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1),
+            torch.view_as_real(self.freqs_cis).flatten(1),
+            positions,
+            out_mxfp8=fuse_mxfp8_quant,
+        )
+        value = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
+        out, _ = self.wo_b(value, skip_all_reduce=defer_all_reduce)
+        return (
+            mhc.AttnOutput(out) if defer_all_reduce and self.attn_tp_size > 1 else out
+        )
+
     @staticmethod
     def accepts_mxfp8_swizzled_input():
+        return False
+
+    @staticmethod
+    def accepts_deepgemm_mxfp8_input():
         return False
 
 
@@ -585,7 +639,9 @@ class DSparkV4StageMixin:
             prefix=prefix,
             is_nextn=True,
             boundary_pre_from_prev=config.hc_pre_from_prev_sublayer,
-            boundary_mhc_fusions=False,
+            # The target's fused all-reduce + mHC post at each stage boundary; the
+            # draft's numerics only move acceptance, greedy verify decides outputs.
+            boundary_mhc_fusions=True,
             alt_streams=alt_streams,
             hc_stats_stream=hc_stats_stream,
             moe_routed_quant_stream=moe_routed_quant_stream,

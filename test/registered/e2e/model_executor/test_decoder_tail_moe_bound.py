@@ -72,7 +72,7 @@ class TestDecoderTailMoeBound(CustomTestCase):
     def _record(self, captures):
         # Replace only distributed breakable recording; the runner still owns
         # batch copies, count allocations, replay fills and graph cache selection.
-        def record(body, rows, local, batch, start, free_before):
+        def record(body, rows, local, batch, start, free_before, output_key=None):
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):

@@ -11,6 +11,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     NamedTuple,
@@ -75,6 +76,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import index_q_and_weights
 from sglang.srt.layers.attention.graph_utils import (
     pad_with_zero_rows,
     real_rows_scope,
@@ -1018,6 +1020,9 @@ class MqaAttentionBase(nn.Module):
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
     use_mega_attention: bool = False
+    # ROCm q_norm state, read by _normalize_q_lora through _hip.q_norm_for_wq_b.
+    # __init__ resolves it from the quant config on HIP.
+    fused_rmsnorm_fake_quant: bool = False
 
     def __init__(
         self,
@@ -1054,6 +1059,12 @@ class MqaAttentionBase(nn.Module):
         self.eps = config.rms_norm_eps
         self.softmax_scale = self.head_dim**-0.5
         self.q_head_norm = config.q_head_norm
+
+        # _normalize_q_lora below is this base's, and on HIP it reads the state that
+        # init_mqa_layer resolves. Every subclass goes through it -- DSparkAttention
+        # among them -- so the state is initialised here rather than in MQALayer.
+        if _is_hip:
+            _hip.init_mqa_layer(self, quant_config)
 
         self.compress_ratio: int = (
             compress_ratio
@@ -1349,6 +1360,45 @@ class MqaAttentionBase(nn.Module):
             self.__dict__[key] = cached
         return cached
 
+    def _normalize_q_lora(
+        self, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
+        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
+        if _is_hip:
+            return _hip.q_norm_for_wq_b(self, q)
+        method = self.wq_b.quant_method
+        if (
+            _is_cuda
+            and self.is_dsv41
+            and get_platform().is_blackwell
+            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
+            and q.ndim == 2
+            and q.shape[0] > 0
+            and q.shape[1] == 1280
+            and q.stride(1) == 1
+            and getattr(method, "mxfp8_dense_backend", None)
+            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+            and (
+                getattr(method, "use_mxfp8", False)
+                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
+            )
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.runtime_context import get_exec
+
+            if not (
+                is_batch_invariant_mode_enabled()
+                or get_exec().deterministic.enable_deterministic_inference
+            ):
+                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
+
+                y, quant, scale = rmsnorm_mxfp8(
+                    q, self.q_norm.weight, self.q_norm.variance_epsilon
+                )
+                return y, Mxfp8SwizzledInput(quant, scale)
+        q = self.q_norm(q)
+        return q, q
+
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         ctx = get_cp_decode_attn_tp_ctx()
@@ -1566,9 +1616,6 @@ class MQALayer(MqaAttentionBase):
             and self.qk_rope_head_dim == 64
             and self.head_dim == 512
         )
-        if _is_hip:
-            _hip.init_mqa_layer(self, quant_config)
-
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
@@ -1768,45 +1815,6 @@ class MQALayer(MqaAttentionBase):
         ok = all(_takes_swizzled(linear) for linear in linears)
         self._accepts_mxfp8_swizzled_input = ok
         return ok
-
-    def _normalize_q_lora(
-        self, q: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
-        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
-        if _is_hip:
-            return _hip.q_norm_for_wq_b(self, q)
-        method = self.wq_b.quant_method
-        if (
-            _is_cuda
-            and self.is_dsv41
-            and get_platform().is_blackwell
-            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
-            and q.ndim == 2
-            and q.shape[0] > 0
-            and q.shape[1] == 1280
-            and q.stride(1) == 1
-            and getattr(method, "mxfp8_dense_backend", None)
-            == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
-            and (
-                getattr(method, "use_mxfp8", False)
-                or getattr(self.wq_b, "block_fp8_mxfp8_ready", False)
-            )
-        ):
-            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-            from sglang.srt.runtime_context import get_exec
-
-            if not (
-                is_batch_invariant_mode_enabled()
-                or get_exec().deterministic.enable_deterministic_inference
-            ):
-                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
-
-                y, quant, scale = rmsnorm_mxfp8(
-                    q, self.q_norm.weight, self.q_norm.variance_epsilon
-                )
-                return y, Mxfp8SwizzledInput(quant, scale)
-        q = self.q_norm(q)
-        return q, q
 
     def _compute_q_a(
         self,
@@ -2008,6 +2016,20 @@ class MQALayer(MqaAttentionBase):
         # NOTE: wait for x ready
         if self.compressor is not None:
             stream_sources.wait_stream(current_stream)
+        # A decode indexer projects its queries beside the compressor and the Q
+        # chain, so only its scoring waits on both; no collective runs there.
+        index_positions = (
+            attn_backend.low_ratio_decode_index_positions(
+                layer=self, positions=positions, forward_batch=forward_batch
+            )
+            if self.indexer is not None
+            else None
+        )
+        stream_index_q = self.alt_streams[1]
+        if index_positions is not None:
+            stream_index_q.wait_stream(current_stream)
+            with torch.cuda.stream(stream_index_q):
+                index_weights_raw = self.indexer.head_weights_raw(x)
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -2028,6 +2050,19 @@ class MQALayer(MqaAttentionBase):
         # NOTE: wait for the q_lora ready
         if self.indexer is not None:
             stream_sources.wait_stream(current_stream)
+        index_q = None
+        if index_positions is not None:
+            stream_index_q.wait_stream(current_stream)
+            with torch.cuda.stream(stream_index_q):
+                index_q = index_q_and_weights(
+                    indexer=self.indexer,
+                    x=x,
+                    q_lora=q_lora,
+                    freqs_cis=self.freqs_cis,
+                    positions=index_positions,
+                    head_weights_raw=index_weights_raw,
+                )
+            stream_sources.wait_stream(stream_index_q)
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
         if self.indexer is not None:
@@ -2044,6 +2079,7 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                     run_compressor=False,
+                    index_q=index_q,
                 )
 
         with torch.cuda.stream(stream_kv):
@@ -3914,8 +3950,9 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
-    # Class-level default for instances built without running __init__.
+    # Class-level defaults for instances built without running __init__.
     decoder_replay_tail: Optional[DecoderReplayTail] = None
+    engram_kv_stream = None
 
     def __init__(
         self,
@@ -4022,6 +4059,12 @@ class DeepseekV4Model(nn.Module):
                 self.engram_layout,
                 image_token_id=_engram_image_token_id(config),
             )
+        # A decode step's Engram value projections, beside the first layers.
+        self.engram_kv_stream = (
+            device_module.Stream()
+            if _is_cuda and self.engram_layout is not None
+            else None
+        )
 
         if not _is_cuda:
             self.use_fused_mhc_post_pre = (
@@ -4141,6 +4184,54 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay tail misses prompt-logprob rows"
             )
 
+    def _hoist_engram_kv(
+        self,
+        hash_ids: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        *,
+        num_tokens: int,
+    ) -> Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]]]:
+        """A decode or verify step's Engram keys and value per layer id, with the
+        event that marks them ready. They read only the token hashes, so the lookups
+        run before the first layer and their projections on a side stream beside the
+        first layers. None leaves each Engram to its own layer."""
+        mode = forward_batch.forward_mode
+        if (
+            self.engram_kv_stream is None
+            or hash_ids is None
+            or num_tokens == 0
+            or not (mode.is_decode() or mode.is_target_verify())
+            or get_parallel().attn_dp_size > 1
+            or is_cp_active(forward_batch)
+        ):
+            return None
+        layer_ids = [
+            i
+            for i in range(self.start_layer, self.end_layer)
+            if self.layers[i].engram is not None
+        ]
+        if not layer_ids:
+            return None
+        current_stream = torch.cuda.current_stream()
+        # Every rank looks up in layer order: the lookups' TP all-reduces stay here.
+        embs = [
+            self.layers[i].engram.embed_rows(
+                hash_ids[:, self.layers[i].engram.layer_hash_index],
+                forward_batch,
+                False,
+            )
+            for i in layer_ids
+        ]
+        side_stream = self.engram_kv_stream
+        side_stream.wait_stream(current_stream)
+        hoisted = {}
+        with torch.cuda.stream(side_stream):
+            for i, emb in zip(layer_ids, embs):
+                kv = self.layers[i].engram.project(emb)
+                # emb is held until the layer joins this stream.
+                hoisted[i] = (emb, kv, side_stream.record_event())
+        return hoisted
+
     def _forward_layers_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -4222,6 +4313,9 @@ class DeepseekV4Model(nn.Module):
                 tail_in_graph=tail_in_graph,
             )
         saved_full = None
+        hoisted_engram_kv = self._hoist_engram_kv(
+            hash_ids, forward_batch, num_tokens=input_ids.shape[0]
+        )
         # The HIP defer_post gate excludes residual readers. CUDA materializes
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
@@ -4360,13 +4454,19 @@ class DeepseekV4Model(nn.Module):
             if engram is not None:
                 # No local name holds the pre-Engram residual: it would stay alive
                 # until the next Engram layer.
-                hidden_states = engram(
-                    state.residual,
-                    hash_ids[:, engram.layer_hash_index],
-                    forward_batch,
-                    input_ids=input_ids,
-                    cp_all_tokens=cp_extend,
-                )
+                if hoisted_engram_kv is not None:
+                    _, kv, kv_ready = hoisted_engram_kv.pop(i)
+                    torch.cuda.current_stream().wait_event(kv_ready)
+                    hidden_states = engram.gate(state.residual, kv, input_ids=input_ids)
+                    del kv
+                else:
+                    hidden_states = engram(
+                        state.residual,
+                        hash_ids[:, engram.layer_hash_index],
+                        forward_batch,
+                        input_ids=input_ids,
+                        cp_all_tokens=cp_extend,
+                    )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)

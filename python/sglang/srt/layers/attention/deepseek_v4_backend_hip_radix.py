@@ -3493,9 +3493,17 @@ class DeepseekV4HipRadixBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        index_q=None,
     ) -> None:
         """FlyDSL fp4 paged logits for decode, target-verify and ragged prefill;
-        target-verify takes the decode body (one-token rows)."""
+        target-verify takes the decode body (one-token rows).
+
+        Takes ``index_q`` because the borrowed ``forward_low_ratio_sources`` always
+        passes it, but HIP has no DeepGEMM decode path to project queries ahead, so
+        ``low_ratio_decode_index_positions`` returns None here and nothing is sent."""
+        assert index_q is None, (
+            "HIP paged top-k scores its own queries; index_q has no HIP path"
+        )
         # every body below rewrites the ratio's page indices in place
         self.forward_metadata.core_metadata.drop_folded_sparse_indices(
             layer.compress_ratio

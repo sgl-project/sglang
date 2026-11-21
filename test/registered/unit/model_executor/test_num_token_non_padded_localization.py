@@ -291,7 +291,9 @@ class TestRowBucketMoeBound(CustomTestCase):
                         self.assertFalse(has_forward_context())
                     return inputs
 
-                def record(body, rows, count, batch, start, free_before):
+                def record(
+                    body, rows, count, batch, start, free_before, output_key=None
+                ):
                     body()
                     return SimpleNamespace(
                         batch=(),
@@ -370,7 +372,9 @@ class TestRowBucketMoeBound(CustomTestCase):
                     )
                     return [(torch.arange(inputs[0].shape[0]) < bound).reshape(-1, 1)]
 
-                def record(body, rows, count, batch, start, free_before):
+                def record(
+                    body, rows, count, batch, start, free_before, output_key=None
+                ):
                     outputs = body()
 
                     def replay():
