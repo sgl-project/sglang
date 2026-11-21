@@ -1,5 +1,8 @@
+import copy
 import unittest
 from types import SimpleNamespace
+
+from transformers import AutoConfig, PretrainedConfig
 
 from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -10,6 +13,7 @@ from sglang.srt.configs.embedding_model_spec import (
     EmbeddingExecution,
     EmbeddingTask,
     PoolingStrategy,
+    RerankInputFormat,
     embedding_support_matrix,
     resolve_embedding_model_spec,
     resolved_embedding_plan,
@@ -20,7 +24,110 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
+class _NoSerializationConfig(PretrainedConfig):
+    def to_dict(self):
+        raise AssertionError("Unrelated configs must not be serialized")
+
+
 class TestEmbeddingModelSpec(unittest.TestCase):
+    def test_mistral3_reranker_defaults_require_the_supported_scoring_layout(self):
+        config = {
+            "architectures": ["Mistral3ForSequenceClassification"],
+            "model_type": "mistral3",
+            "is_causal": False,
+            "pooling": "avg",
+            "id2label": {"0": "LABEL_0"},
+            "text_config": {
+                "model_type": "ministral3",
+                "is_causal": False,
+                "pooling": "avg",
+            },
+            "vision_config": {"model_type": "pixtral"},
+        }
+        spec = resolve_embedding_model_spec(
+            config["architectures"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+            hf_config=AutoConfig.for_model(**config),
+        )
+        self.assertEqual(spec.task, EmbeddingTask.CLASSIFY)
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
+        self.assertTrue(spec.auto_enable_embedding)
+        self.assertTrue(spec.safe_disable_radix_cache)
+        self.assertTrue(spec.safe_disable_chunked_prefill)
+        self.assertFalse(spec.normalize)
+        self.assertEqual(
+            spec.rerank_input_format, RerankInputFormat.QUERY_DOCUMENT_CHAT
+        )
+
+        for path, value in [
+            (("architectures",), ["Mistral3ForConditionalGeneration"]),
+            (("model_type",), "llama"),
+            (("text_config", "model_type"), "mistral"),
+            (("vision_config", "model_type"), "clip_vision_model"),
+            (("is_causal",), True),
+            (("text_config", "is_causal"), True),
+            (("pooling",), "last"),
+            (("text_config", "pooling"), "last"),
+            (("id2label",), {"0": "LABEL_0", "1": "LABEL_1"}),
+        ]:
+            with self.subTest(field=".".join(path), value=value):
+                other = copy.deepcopy(config)
+                target = other
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                spec = resolve_embedding_model_spec(
+                    other["architectures"],
+                    is_embedding_requested=False,
+                    is_embedding_gemma=False,
+                    hf_config=AutoConfig.for_model(**other),
+                )
+                self.assertEqual(spec.task, EmbeddingTask.NONE)
+                self.assertFalse(spec.auto_enable_embedding)
+                self.assertFalse(spec.safe_disable_radix_cache)
+                self.assertFalse(spec.safe_disable_chunked_prefill)
+                self.assertEqual(spec.rerank_input_format, RerankInputFormat.DEFAULT)
+
+    def test_unrelated_models_ignore_config_without_serializing_it(self):
+        for architecture, requested, embedding_gemma in [
+            ("Qwen3ForCausalLM", False, False),
+            ("Qwen3ForCausalLM", True, False),
+            ("BertModel", False, False),
+            ("XLMRobertaForSequenceClassification", False, False),
+            ("Gemma3TextModel", False, True),
+            ("EmbeddingGemma2Model", False, False),
+            ("Mistral3ForConditionalGeneration", False, False),
+            (None, False, False),
+        ]:
+            with self.subTest(architecture=architecture, embedding=requested):
+                architectures = [architecture] if architecture else None
+                expected = resolve_embedding_model_spec(
+                    architectures,
+                    is_embedding_requested=requested,
+                    is_embedding_gemma=embedding_gemma,
+                )
+                actual = resolve_embedding_model_spec(
+                    architectures,
+                    is_embedding_requested=requested,
+                    is_embedding_gemma=embedding_gemma,
+                    hf_config=_NoSerializationConfig(),
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual.rerank_input_format, RerankInputFormat.DEFAULT)
+
+    def test_mistral3_architecture_alone_does_not_enable_checkpoint_defaults(self):
+        spec = resolve_embedding_model_spec(
+            ["Mistral3ForSequenceClassification"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+        self.assertEqual(spec.task, EmbeddingTask.NONE)
+        self.assertEqual(spec.rerank_input_format, RerankInputFormat.DEFAULT)
+        self.assertFalse(spec.auto_enable_embedding)
+        self.assertFalse(spec.safe_disable_radix_cache)
+        self.assertFalse(spec.safe_disable_chunked_prefill)
+
     def test_embedding_gemma_declares_full_encoder_bcg_contract(self):
         spec = resolve_embedding_model_spec(
             ["Gemma3TextModel"],
@@ -57,6 +164,20 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         self.assertTrue(spec.safe_disable_chunked_prefill)
         self.assertTrue(spec.safe_disable_kv_cache)
         self.assertTrue(spec.encoder_only_attention)
+
+    def test_embedding_nemotron35_resolves_without_is_embedding(self):
+        """The auto-detected checkpoint must reach the multimodal embedding path."""
+        spec = resolve_embedding_model_spec(
+            ["EmbeddingNemotron35Model"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.family, "embedding_nemotron35")
+        self.assertEqual(spec.execution, EmbeddingExecution.MULTIMODAL)
+        self.assertTrue(spec.auto_enable_embedding)
+        # The KV-cache-free prefill path is not validated with image features.
+        self.assertFalse(spec.safe_disable_kv_cache)
 
     def _resolve_nemotron3_embedding_args(self, attention_backend):
         args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
@@ -107,8 +228,11 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 9)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
+        nemotron35 = by_architecture["Mistral3Model (is_causal=false, pooling=avg)"]
+        self.assertEqual(nemotron35["family"], "embedding_nemotron35")
+        self.assertTrue(nemotron35["supports_multimodal"])
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")
         self.assertEqual(by_architecture["BertModel"]["attention"], "bidirectional")

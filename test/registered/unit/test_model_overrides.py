@@ -1121,6 +1121,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             # Generative Ministral3 checkpoints are unaffected.
             self._construct(*nemotron3)
 
+    def test_nemotron35_embedding_rejects_rocm(self):
+        """Nemotron-3.5-Embed's text model has the same ENCODER_ONLY layers, so it
+        must also fail at startup on ROCm."""
+        # The checkpoint is a bare Mistral3Model; ModelConfig renames it.
+        text_config = dict(self._MINI_CONFIG, model_type="ministral3", is_causal=False)
+        vision_config = {
+            "model_type": "pixtral",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "image_size": 64,
+            "patch_size": 16,
+        }
+        nested = {"text_config": text_config, "vision_config": vision_config}
+        embedding_fields = dict(nested, is_causal=False, pooling="avg")
+        nemotron35 = ("Mistral3Model", "mistral3")
+        with override_platform(is_cuda=True):
+            self._construct(*nemotron35, config_extra=embedding_fields)
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                self._construct(*nemotron35, config_extra=embedding_fields)
+            # Generative Mistral3 checkpoints are unaffected.
+            self._construct(
+                "Mistral3ForConditionalGeneration", "mistral3", config_extra=nested
+            )
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(self._resolved(sa, "enable_tf32_matmul"))
@@ -4922,6 +4949,38 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
                 self._view("triton")
             )
         self.assertEqual(updates, {})
+
+
+class TestNemotron35RerankerPlatformOverride(CustomTestCase):
+    def test_rocm_guard_is_registered_and_scoped_to_the_supported_layout(self):
+        """Reject ROCm instead of silently returning causal reranker scores."""
+        from transformers import Mistral3Config
+
+        config = Mistral3Config(
+            architectures=["Mistral3ForSequenceClassification"],
+            text_config={
+                "model_type": "ministral3",
+                "is_causal": False,
+                "pooling": "avg",
+            },
+            vision_config={"model_type": "pixtral"},
+            is_causal=False,
+            pooling="avg",
+            num_labels=1,
+        )
+        args = SimpleNamespace()
+        architecture = "Mistral3ForSequenceClassification"
+        with override_platform(is_cuda=True, is_hip=False):
+            self.assertEqual(
+                collect_model_override_declarations(architecture, args, config), []
+            )
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                collect_model_override_declarations(architecture, args, config)
+            config.pooling = "last"
+            self.assertEqual(
+                collect_model_override_declarations(architecture, args, config), []
+            )
 
 
 class TestGlm5NextAgenticMambaPool(CustomTestCase):
