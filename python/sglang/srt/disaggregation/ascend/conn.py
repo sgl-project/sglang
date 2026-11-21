@@ -285,6 +285,14 @@ class AscendKVManager(MooncakeKVManager):
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        # Empty DSA entries preserve layer alignment but have no payload.
+        # MemFabric rejects zero-byte transfers and their null data pointers.
+        return super()._transfer_data(
+            mooncake_session_id,
+            [block for block in transfer_blocks if block[2] != 0],
+        )
+
     def send_kvcache(
         self,
         mooncake_session_id: str,
