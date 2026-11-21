@@ -436,5 +436,48 @@ def test_captured_mamba_state_round_trip(layout, io_backend, kind):
         host.destroy()
 
 
+@pytest.mark.parametrize("block_quota", [1, 3, 8, 64])
+@pytest.mark.parametrize(
+    "item_size,num_items",
+    [(1024, 5), (40000, 3), (49152, 16), (1 << 20, 1), (1 << 20, 6)],
+)
+def test_split_mamba_load_matches_the_stock_kernel(item_size, num_items, block_quota):
+    """SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA's split load writes the same bytes as
+    the stock kernel, for chunks smaller than, equal to and unaligned to an item."""
+    from unittest import mock
+
+    from sglang.kernels.ops.mamba import transfer_mamba
+
+    num_slots, num_layers, layer_id = 24, 3, 1
+    src = torch.randint(
+        0, 256, (num_slots, num_layers * item_size), dtype=torch.uint8
+    ).pin_memory()
+    src_indices = torch.randperm(num_slots, device=DEVICE)[:num_items]
+    dst_indices = torch.randperm(num_slots, device=DEVICE)[:num_items]
+    outputs = []
+    for quota in (None, block_quota):
+        dst = torch.zeros(num_slots, item_size, dtype=torch.uint8, device=DEVICE)
+        with mock.patch.object(
+            transfer_mamba, "mamba_split_load_block_quota", return_value=quota
+        ):
+            transfer_mamba.transfer_kv_mamba_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                item_size=item_size,
+                src_layout_dim=num_layers * item_size,
+            )
+        torch.cuda.synchronize()
+        outputs.append(dst)
+    stock, split = outputs
+    expected = src.view(num_slots, num_layers, item_size)[
+        src_indices.cpu(), layer_id
+    ].to(DEVICE)
+    assert torch.equal(stock[dst_indices], expected)
+    assert torch.equal(split, stock)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
