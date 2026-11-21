@@ -269,6 +269,7 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_dcp_push_combine()
+        self._pre_initialize_dcp_ipc_a2a()
         self._pre_initialize_pcie_ipc_workspace()
         self._prepare_capture_state()
 
@@ -385,6 +386,15 @@ class BaseRunner(ABC):
         )
 
         finalize_symm_workspaces()
+
+    def _pre_initialize_dcp_ipc_a2a(self):
+        """Before CG capture: init_dcp_ipc_a2a is a DCP-group collective."""
+        if not get_parallel().dcp_enabled or get_parallel().dcp_comm_backend != "a2a":
+            return
+
+        from sglang.srt.layers.dcp import init_dcp_ipc_a2a
+
+        init_dcp_ipc_a2a(get_parallel().dcp_group)
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.

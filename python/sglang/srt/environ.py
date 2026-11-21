@@ -1107,6 +1107,10 @@ class Envs:
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
     # Kimi-K3 gfx950 prefill: leave the stream on each rank's rows after the row-sharded tail
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # Kimi-K3 gfx950: min tokens for the row-sharded MoE tail; <= 384 preempts the K3.1 column tail
+    SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS = EnvInt(4096)
+    # gfx950 DCP8 a2a: one IPC kernel in place of pack + RCCL all_to_all
+    SGLANG_ENABLE_ROCM_DCP_IPC_A2A = EnvBool(False)
     # GiB of gfx950 memory kept out of torch's allocator for HSA queue scratch (0: none)
     SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
