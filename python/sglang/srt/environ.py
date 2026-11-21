@@ -332,6 +332,10 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Copy Ascend MoE payload tensors reconstructed from a flattened bucket into
+    # independent storage before the expert copy: that copy reads the wrong
+    # addresses when its source is a view of the bucket's byte buffer.
+    SGLANG_MOE_MATERIALIZE_BUCKET_VIEWS = EnvBool(True)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)

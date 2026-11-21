@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.weight_sync.tensor_bucket import is_bucket_view
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -168,26 +169,26 @@ def _maybe_copy_weight_view_before_h2d(
     return _copy_weight_view_before_h2d(loaded_weight)
 
 
-def _materialize_weight_view(loaded_weight: torch.Tensor) -> torch.Tensor:
-    """Give the expert copy paths a source that owns its storage.
+def _materialize_bucket_view(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Detach a flattened-bucket payload view before it is copied.
 
-    Online refits hand every payload tensor over as a view into one shared
-    transfer buffer (``FlattenedTensorBucket`` reconstruction, bucketed
-    distributed receive): the tensor covers a slice of a storage that holds the
-    whole bucket and therefore has a non-zero storage offset.  The copy below
-    writes through ``param.data[expert_id]``, which is itself a non-owning view,
-    and reads only ``loaded_weight``'s own bytes from a buffer whose remaining
-    slices are reused by the transport.  Copying the payload out of that buffer
-    first keeps the expert write independent of how the transport recycles it;
-    dense parameters already copy into a whole-tensor destination and do not
-    need this.
+    ``FlattenedTensorBucket.reconstruct_tensors`` hands every payload tensor
+    over as ``uint8 buffer -> view(dtype) -> reshape``.  A routed expert copies
+    it into ``param.data[expert_id].narrow(...)``, i.e. a destination with a
+    non-zero offset, and on Ascend that copy reads the wrong addresses: about
+    half of the elements land as independent draws (CANN reports
+    ``[Check][offset] ... result is untrustworthy``) while the source and the
+    destination are both exact before it.  Tensor geometry cannot identify such
+    a source - a single-tensor bucket owns its whole storage - so the loader
+    keys off the flag ``reconstruct_tensors`` sets instead.
 
-    CPU checkpoint tensors (mmap views) keep their opt-in switch, so startup
-    loading is unaffected.
+    Materializing costs one device copy per expert tensor.  Tensors that own
+    their storage (every per-tensor refit, every startup load) and non-Ascend
+    platforms are untouched.
     """
-    if loaded_weight.device.type == "cpu":
-        return _maybe_copy_weight_view_before_h2d(loaded_weight)
-    if _owns_storage(loaded_weight):
+    if not is_bucket_view(loaded_weight):
+        return loaded_weight
+    if not (_is_npu and envs.SGLANG_MOE_MATERIALIZE_BUCKET_VIEWS.get()):
         return loaded_weight
     return loaded_weight.clone(memory_format=torch.contiguous_format)
 
@@ -1264,7 +1265,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # if expert_id is None, then
         # all the experts are loaded at the same time
-        loaded_weight = _materialize_weight_view(loaded_weight)
+        loaded_weight = _materialize_bucket_view(loaded_weight)
         if (
             expert_id is None
             and self.quant_config is not None
@@ -1643,7 +1644,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
-        loaded_weight = _materialize_weight_view(loaded_weight)
+        loaded_weight = _materialize_bucket_view(loaded_weight)
         method = _weight_layout_method(self)
         if isinstance(method, KTEPWrapperMethod):
             method = method.gpu_method
