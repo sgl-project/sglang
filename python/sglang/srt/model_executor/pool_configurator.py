@@ -1340,6 +1340,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
+        self._npu_int8_csa = False
+        if _is_npu and any(r in (1, 2) for r in cfg.compress_ratios):
+            from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
+
+            if is_ascend_910b():
+                self._npu_int8_csa = envs.SGLANG_DSV41_NPU_INT8_MAIN_CACHE.get()
+                self.kv_bytes = self.attn_head_dim * torch.bfloat16.itemsize
+                self.low_ratio_index_bytes = (
+                    self.indexer_head_dim * torch.bfloat16.itemsize
+                )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1560,6 +1570,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
+        if getattr(self, "_npu_int8_csa", False) and compress_ratio in (1, 2):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_kv import RECORD_BYTES
+
+            return RECORD_BYTES
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":

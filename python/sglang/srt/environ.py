@@ -2079,6 +2079,8 @@ class Envs:
     # ===================================================================
 
     # Model and Quantization
+    # Signed content channels for C1/C2 compressed rows on 910B.
+    SGLANG_DSV41_NPU_INT8_MAIN_CACHE = EnvBool(False)
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime

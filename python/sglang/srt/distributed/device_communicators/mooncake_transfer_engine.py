@@ -228,13 +228,19 @@ class MooncakeTransferEngine(KVTransferEngine):
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
+        def initialize_engine():
+            if protocol == "ascend":
+                from sglang.srt.disaggregation.common.utils import bind_thread_to_device
+
+                # CANN device contexts are thread-local. The deadline worker
+                # needs the same device as the scheduler rank that created it.
+                bind_thread_to_device(self.gpu_id)
+            return self.engine.initialize(
+                hostname, "P2PHANDSHAKE", protocol, device_name or ""
+            )
+
         ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
-                hostname,
-                "P2PHANDSHAKE",
-                protocol,
-                device_name if device_name is not None else "",
-            ),
+            initialize_engine,
             timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
             what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
         )

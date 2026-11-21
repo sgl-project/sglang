@@ -15,6 +15,7 @@ from sgl_kernel_npu.operators import indexer as npu_indexer_ops
 from sgl_kernel_npu.operators import mem_cache as npu_cache_ops
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention import ascend_dsv41_910b
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     ForwardMetadata,
@@ -24,7 +25,7 @@ from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
     Dsv4PrefillGraphMetadata,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import is_ascend_910b, is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -288,7 +289,7 @@ class CompressorAscendBackendMixin:
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35()
+            if is_npu_arch35() or getattr(self, "_dsv41_910b", False)
             else None
         )
         forward_mode = forward_batch.forward_mode
@@ -1233,6 +1234,7 @@ class LowRatioCompressAscendBackendMixin:
     # The prefill-graph contract is CUDA-only; ``_low_ratio_sources_break``
     # short-circuits on ``is_in_breakable_cuda_graph()`` before this attr is read.
     low_ratio_prefill_graph = False
+    _dsv41_910b = False
     # Read by ``_low_ratio_compress`` below; still unset on NPU because the
     # replay-tail path that writes it is CUDA-only, so it stays None.
     tail_source_kv_layer_id: Optional[int] = None
@@ -1277,7 +1279,7 @@ class LowRatioCompressAscendBackendMixin:
             # No gate and no pairing for ratio 1.
             kv, _ = compressor.project(x)
         else:
-            assert is_npu_arch35(), (
+            assert is_npu_arch35() or self._dsv41_910b, (
                 "the fused DeepSeek-V4.1 compressor needs arch35 "
                 "(kv_compress_epilog_v2 packing); arch22 is not supported."
             )
@@ -1287,13 +1289,16 @@ class LowRatioCompressAscendBackendMixin:
                 "DeepSeek-V4.1 ratio-2 compression on NPU needs the unfused "
                 "compressor (separate wkv/wgate), but the module has wkv_gate."
             )
-            ds41 = _ds41_ops()
+            if self._dsv41_910b:
+                from sgl_kernel_npu.operators.attention import compressor_v2 as compress
+            else:
+                compress = _ds41_ops().compressor
             pool = self.token_to_kv_pool
             # arch35 cache_mode=2 (CYCLE): one request bank per row, the in-bank
             # offset comes from start_pos. Second arg False: the attention
             # state pool, never the nested c4-indexer one.
             state_pool = pool._get_state_pool(layer.layer_id, False)
-            kv = ds41.compressor(
+            kv = compress(
                 x=x.view(-1, x.shape[-1]),
                 wkv=compressor.wkv.weight,
                 wgate=compressor.wgate.weight,
@@ -1417,6 +1422,17 @@ class LowRatioCompressAscendBackendMixin:
             allow_build=False,
             cache_dtype=torch.float32,
         )
+        if self._dsv41_910b:
+            keys = indexer.k_norm(indexer.wk(latent)).to(torch.bfloat16)
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                keys.view(-1, 1, indexer.index_head_dim),
+                None,
+                cos.view(-1, 1, 1, cos.shape[-1]),
+                sin.view(-1, 1, 1, sin.shape[-1]),
+                qk_nope_dim=indexer.index_head_dim - indexer.rope_head_dim,
+            )
+            pool.set_compress_buffer(layer.layer_id, cache_index, keys, None, True)
+            return
         ds41 = _ds41_ops()
         # Keep the NZ cast inside the traced region: hoisting it into a cached
         # attribute makes aclgraph clone an NZ graph input back to ND.
@@ -1482,6 +1498,12 @@ class LowRatioCompressAscendBackendMixin:
             sin,
             qk_nope_dim=indexer.index_head_dim - indexer.rope_head_dim,
         )
+        if self._dsv41_910b:
+            return (
+                q.contiguous(),
+                None,
+                indexer.head_weights(x).reshape(t, indexer.n_heads).float(),
+            )
         q_packed, q_scale = torch_npu.npu_dynamic_mx_quant(
             q, dst_type=torch_npu.float4_e2m1fn_x2
         )
@@ -1508,6 +1530,10 @@ class LowRatioCompressAscendBackendMixin:
         q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
 
         k = pool.get_index_k(layer.layer_id)
+        if self._dsv41_910b:
+            return ascend_dsv41_910b.index_topk(
+                self, layer, forward_batch, q_packed, k, w, publish=candidate
+            )
         k_scale = pool.get_index_scale(layer.layer_id)
         # PA_ND rows are [pages, page_rows, 1, dim]; both views are pure
         # reshapes of the buffers the prologue wrote.
@@ -1632,6 +1658,17 @@ class LowRatioCompressAscendBackendMixin:
                 f"{candidate_indices.shape[0]} rows published, {t} needed."
             )
         q_packed, descale_q, w = self._dsv41_index_q(layer, x, q_lora, pos)
+        if self._dsv41_910b:
+            indices, _ = ascend_dsv41_910b.index_topk(
+                self,
+                layer,
+                forward_batch,
+                q_packed,
+                self.token_to_kv_pool.get_index_k(layer.layer_id),
+                w,
+                candidates=candidate_indices,
+            )
+            return indices
         page_table = getattr(fm, f"c{ratio}_index_page_table", None)
         if page_table is None:
             raise RuntimeError(
@@ -1711,6 +1748,8 @@ class LowRatioCompressAscendBackendMixin:
         """
         fm = self.forward_metadata
         kv_lens = self._dsv41_qli_kv_lens(forward_batch)
+        if self._dsv41_910b:
+            return {}
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
         if cu_seqlens_q is None:
             return {}
@@ -1934,6 +1973,13 @@ class LowRatioCompressAscendBackendMixin:
     def _dsv41_attention_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """MQSMLA dispatch tables: ``win`` (ratio 0) plus ``c{r}a`` (ratio 1/2)."""
         fm = self.forward_metadata
+        if self._dsv41_910b:
+            return ascend_dsv41_910b.attention_metadata(
+                self,
+                fm,
+                self._dsv41_qli_kv_lens(forward_batch).int(),
+                forward_batch.batch_size,
+            )
         _, win_lengths = self._dsv41_window_indices(forward_batch)
         ds41 = _ds41_ops()
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
@@ -1993,6 +2039,10 @@ class LowRatioCompressAscendBackendMixin:
         """
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
+        if self._dsv41_910b:
+            return ascend_dsv41_910b.attend(
+                self, q, layer, forward_batch, attn_sink, compress_ratio
+            )
         # The metadata pass (eager init / capture seeding / replay refresh)
         # owns the window geometry; read the buffers, never recompute here.
         win_indices = fm.dsv41_win_sparse_indices
@@ -2249,6 +2299,12 @@ class LowRatioCompressAscendBackendMixin:
         )
         if not hasattr(metadata, "kernel_metadata") or metadata.kernel_metadata is None:
             metadata.kernel_metadata = {}
+        if self._dsv41_910b:
+            lengths = metadata.actual_seq_lengths_kv.int()
+            metadata.kernel_metadata.update(
+                ascend_dsv41_910b.attention_metadata(self, metadata, lengths, bs)
+            )
+            return
         # Variable-size dispatch tables: probe one tensor per attention type.
         ds41 = _ds41_ops()
         cu_seqlens_q = (
@@ -2599,7 +2655,8 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_has_low_ratio = any(
             ratio in (1, 2) for ratio in self._dsv4_compress_ratios
         )
-        if self._dsv4_has_low_ratio:
+        self._dsv41_910b = self._dsv4_has_low_ratio and is_ascend_910b()
+        if self._dsv4_has_low_ratio and not self._dsv41_910b:
             # MQSMLA fixes N1 = 64 and does not shard query heads over TP; a
             # narrower per-rank width would feed the op the wrong head count.
             assert self._dsv4_q_head_num == 64, (
@@ -3147,7 +3204,7 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        if is_npu_arch35():
+        if is_npu_arch35() or self._dsv41_910b:
             metadata.dsv4_cycle_state_block_table = torch.zeros(
                 bs, dtype=torch.int32, device=device
             )
@@ -3577,7 +3634,7 @@ class DeepseekV4AscendAttnBackend(
 
     def _refresh_cycle_state_block_table(self, ctx) -> None:
         """Arch35 cache_mode=2 request-bank table: one bank id per request."""
-        if is_npu_arch35():
+        if is_npu_arch35() or self._dsv41_910b:
             ctx.fm.dsv4_cycle_state_block_table.copy_(
                 ctx.forward_batch.req_pool_indices[: ctx.bs]
             )
