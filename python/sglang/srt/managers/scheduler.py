@@ -4683,6 +4683,8 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        num_held_rows = 0
+        num_held_rows_scanned = 0
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -4796,7 +4798,10 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            # can_run_list is append-only: count only the newly admitted rows.
+            for r in adder.can_run_list[num_held_rows_scanned:]:
+                num_held_rows += r.kv.holds_kv
+            num_held_rows_scanned = len(adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
