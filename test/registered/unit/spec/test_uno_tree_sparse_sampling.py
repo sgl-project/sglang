@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.speculative.eagle_utils import (
     _can_use_sparse_uno_tree_target_sampling,
+    _verify_sampling_mode,
 )
 from sglang.srt.speculative.uno_utils import sample_uno_tree_target_tokens
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -56,6 +57,51 @@ class TestUnoTreeSparseSampling(CustomTestCase):
             self.assertFalse(
                 _can_use_sparse_uno_tree_target_sampling(128, sampling_info)
             )
+
+    def test_sparse_dispatch_platforms(self):
+        """XPU verify is otherwise forced greedy, so losing XPU here would
+        silently commit argmax for sampled tree requests."""
+        sampling_info = SimpleNamespace(sampling_seed=None, need_min_p_sampling=False)
+        spec_config = SimpleNamespace(speculative_use_rejection_sampling=False)
+        for is_cuda, is_xpu, expected in (
+            (False, True, True),
+            (False, False, False),
+        ):
+            with (
+                self.subTest(is_cuda=is_cuda, is_xpu=is_xpu),
+                patch("sglang.srt.speculative.eagle_utils._is_cuda", is_cuda),
+                patch("sglang.srt.speculative.eagle_utils._is_xpu", is_xpu),
+                patch(
+                    "sglang.srt.speculative.eagle_utils.get_spec",
+                    return_value=spec_config,
+                ),
+            ):
+                self.assertEqual(
+                    _can_use_sparse_uno_tree_target_sampling(50, sampling_info),
+                    expected,
+                )
+
+    def test_sparse_sampling_wins_over_platform_greedy(self):
+        """A sampled UNO tree request on XPU must take the compact sampler, not
+        XPU's forced argmax; greedy requests and non-UNO verify stay greedy."""
+        platform = dict(is_cpu=False, is_hip=False, is_xpu=True)
+        for is_all_greedy, sparse_uno_eligible, expected in (
+            (False, True, (False, True)),
+            (False, False, (True, False)),
+            (True, True, (True, False)),
+        ):
+            with self.subTest(
+                is_all_greedy=is_all_greedy, sparse_uno_eligible=sparse_uno_eligible
+            ):
+                self.assertEqual(
+                    _verify_sampling_mode(
+                        is_all_greedy=is_all_greedy,
+                        sparse_uno_eligible=sparse_uno_eligible,
+                        use_rejection_sampling=False,
+                        **platform,
+                    ),
+                    expected,
+                )
 
     def test_targets_are_sampled_from_compact_support(self):
         support_ids = torch.tensor(

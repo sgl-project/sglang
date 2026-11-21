@@ -568,6 +568,29 @@ def _verify_uses_greedy(
     return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
 
 
+def _verify_sampling_mode(
+    *,
+    is_all_greedy: bool,
+    sparse_uno_eligible: bool,
+    is_cpu: bool,
+    is_hip: bool,
+    is_xpu: bool,
+    use_rejection_sampling: bool,
+) -> tuple[bool, bool]:
+    """``(greedy, sparse)`` for EAGLE verify. UNO's compact target sampler needs
+    no platform sampling kernel, so it wins over the platform greedy fallback
+    (XPU would otherwise commit argmax for sampled requests)."""
+    sparse = not is_all_greedy and sparse_uno_eligible
+    greedy = not sparse and _verify_uses_greedy(
+        is_all_greedy=is_all_greedy,
+        is_cpu=is_cpu,
+        is_hip=is_hip,
+        is_xpu=is_xpu,
+        use_rejection_sampling=use_rejection_sampling,
+    )
+    return greedy, sparse
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
@@ -578,7 +601,7 @@ def _can_use_sparse_uno_tree_target_sampling(
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
     return bool(
-        _is_cuda
+        (_is_cuda or _is_xpu)
         and max_top_k <= _SPARSE_TOP_K_LIMIT
         and sampling_info.sampling_seed is None
         and not sampling_info.need_min_p_sampling
@@ -837,16 +860,16 @@ def eagle_sample(
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    greedy = _verify_uses_greedy(
+    greedy, sparse = _verify_sampling_mode(
         is_all_greedy=sampling_info.is_all_greedy,
+        sparse_uno_eligible=_can_use_sparse_uno_tree_target_sampling(
+            uno_target_max_top_k,
+            sampling_info,
+        ),
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    )
-    sparse = not greedy and _can_use_sparse_uno_tree_target_sampling(
-        uno_target_max_top_k,
-        sampling_info,
     )
     sharded_predict = None
     if vocab_shard is not None:
