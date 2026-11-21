@@ -120,7 +120,6 @@ class TestCustomLogitProcessorRows(CustomTestCase):
             need_top_k_sampling=False,
             need_min_p_sampling=False,
             vocab_size=4,
-            penalizer_orchestrator=MagicMock(is_required=False),
             has_custom_logit_processor=True,
             custom_params=[{"row": i} for i in range(batch_size)],
             custom_logit_processor={
