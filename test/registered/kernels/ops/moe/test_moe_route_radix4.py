@@ -156,10 +156,8 @@ def test_route_radix4_ties(renormalize):
 
 
 def test_route_radix4_one_outlier_in_every_lane():
-    """The search starts from the bits where a row's keys disagree, reduced over
-    every lane of every wave. Each row here has one expert above an otherwise
-    flat field, one row per expert, so a reduction that misses any lane sees no
-    disagreement there and ranks the outlier by tie order instead of first."""
+    """The one high-scoring expert of each row must rank first,
+    with ids and weights matching the oracle."""
     scores = torch.full(
         (NUM_EXPERTS, NUM_EXPERTS), 0.25, dtype=torch.bfloat16, device="cuda"
     )
