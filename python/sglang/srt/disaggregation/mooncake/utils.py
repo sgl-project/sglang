@@ -24,7 +24,12 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
-SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NODE_NVLINK"]
+SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = [
+    "NVLINK",
+    "BAREX",
+    "INTRA_NODE_NVLINK",
+    "AMD_GEM",
+]
 
 
 def _cuda_expandable_segments_enabled() -> Optional[str]:
@@ -93,6 +98,14 @@ def init_mooncake_custom_mem_pool(
                 allocator = BarexAllocator.get_allocator(device)
             elif custom_mem_pool_type == "INTRA_NODE_NVLINK":
                 return False, None, None
+            elif custom_mem_pool_type == "AMD_GEM":
+                # KV pools in amdgpu GEM BOs: amdgpu-dkms 6.18.4 through 7.1.9
+                # count a hipMalloc buffer a NIC pins twice in the KFD
+                # allocation limit, so registering the KV cache leaves no
+                # VRAM for later allocations; a GEM BO is counted once.
+                from mooncake.allocator import HipGemAllocator
+
+                allocator = HipGemAllocator.get_allocator(device)
             else:
                 # This should not happen due to the enable_custom_mem_pool check above
                 raise ValueError(

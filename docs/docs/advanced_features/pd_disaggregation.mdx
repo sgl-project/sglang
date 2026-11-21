@@ -301,7 +301,19 @@ To utilize Intra-Node NVLink for KV cache transfers with the Mooncake backend (r
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
 export MC_INTRANODE_NVLINK=true
 ```
-The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. These pools use Mooncake's CUDA allocators and are CUDA-only; do not set them on Intel XPU.
+The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, `INTRA_NODE_NVLINK` and `AMD_GEM`. The first three use Mooncake's CUDA allocators and are CUDA-only; do not set them on Intel XPU.
+
+#### AMD GPUs: KV pools in amdgpu GEM BOs
+
+On amdgpu-dkms 6.18.4 through at least 7.1.9 (`cat /sys/module/amdgpu/version`), and on kernels without [torvalds/linux 9131cc85d0de](https://github.com/torvalds/linux/commit/9131cc85d0dedd8ba4cae60dbe5985d081551f30) (v7.4-rc1), the KFD allocation limit counts device memory that a NIC pins twice. Once Mooncake registers a KV cache larger than the VRAM left after allocating it, every later device allocation of the process fails: the scheduler typically segfaults in `c10::hip::HIPStream::stream()` (or reports `hipErrorOutOfMemory`) right after the KV registration. `torch.cuda.mem_get_info()` dropping by the registered size, or jumping far above the VRAM size, around the registration shows the same problem.
+
+Set the following on both prefill and decode servers to keep the KV pools in amdgpu GEM BOs, which are counted once:
+
+```bash
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=AMD_GEM
+```
+
+This needs a ROCm build of Mooncake that ships `hip_gem_allocator.so` (`mooncake.allocator.HipGemAllocator`), and RDMA NICs and a kernel that support dma-buf memory registration: Mooncake registers these buffers only through dma-buf. Transfers to them use RDMA, also within a node, and the KV transfer path is otherwise unchanged.
 
 #### Prefill Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

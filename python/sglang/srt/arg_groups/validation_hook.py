@@ -476,8 +476,9 @@ def check_server_args(server_args: Any):
             f"got {cfg.device!r}."
         )
 
-    # Mooncake's custom memory pools (NVLINK, BAREX, INTRA_NODE_NVLINK) use CUDA
-    # allocators, which XPU lacks; MUSA and Ascend NPU have their own paths.
+    # Mooncake's custom memory pools (NVLINK, BAREX, INTRA_NODE_NVLINK; AMD_GEM
+    # on ROCm) use CUDA / HIP allocators, which XPU lacks; MUSA and Ascend NPU
+    # have their own paths.
     if cfg.device == "xpu":
         from sglang.srt.disaggregation.mooncake.utils import (
             check_mooncake_custom_mem_pool_enabled,
