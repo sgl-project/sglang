@@ -8,6 +8,7 @@ import logging
 import torch
 
 from sglang.srt.runtime_context import get_parallel, get_resources
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -78,21 +79,31 @@ class _AttnTpPushComm:
 
 def initialize_attn_tp_push_comm(*, hidden_size: int, uses_megamoe: bool) -> None:
     """Runs once per worker after distributed setup, on every rank of the group."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
+
     parallel = get_parallel()
     group = parallel.attn_tp_group
     # MegaMoE syncs all EP ranks every layer, which orders a slot's reuse across forwards.
     if (
         not uses_megamoe
-        or not torch.cuda.is_available()
+        or not is_cuda()
         or group.world_size != 2
         or parallel.attn_tp_size == parallel.tp_size
     ):
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not in_one_nvlink_domain(group.cpu_group, device):
+        logger.info(
+            "Attention TP2 collectives keep NCCL: the pair is not in one NVLink domain"
+        )
         return
     get_resources().attn_tp_push_comm = _AttnTpPushComm(
         group=group,
         max_rows=_MAX_GATHERED_ROWS,
         hidden=hidden_size,
-        device=torch.device("cuda", torch.cuda.current_device()),
+        device=device,
     )
     logger.info("Attention TP2 collectives use the symmetric-memory push comm")
 
