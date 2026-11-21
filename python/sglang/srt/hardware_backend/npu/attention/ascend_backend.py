@@ -584,7 +584,7 @@ class AscendAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build rank-local paged KV metadata for NPU DSA DCP."""
+        """Build rank-local paged KV metadata for NPU DCP."""
         parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
@@ -592,14 +592,12 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
@@ -833,7 +831,6 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
-                    interleave_size=self.page_size,
                 )
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
@@ -1448,7 +1445,6 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
-                    interleave_size=self.page_size,
                 )
                 active_mask_width = max(1, num_pages) * self.page_size
                 dcp_mask = build_mla_dcp_mtp_mask(
@@ -2267,7 +2263,6 @@ class AscendAttnBackend(AttentionBackend):
                 kv_cached,
                 k_rope_cached,
                 self.forward_metadata.prefix_lens,
-                interleave_size=self.page_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return kv_cached, k_rope_cached

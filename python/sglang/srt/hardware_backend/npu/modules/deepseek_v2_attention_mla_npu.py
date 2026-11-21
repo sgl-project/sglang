@@ -532,7 +532,6 @@ def forward_dsa_prepare_npu(
                 topk_indices,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=forward_context.get_attn_backend().page_size,
             )
     else:
         topk_indices = prev_topk_indices

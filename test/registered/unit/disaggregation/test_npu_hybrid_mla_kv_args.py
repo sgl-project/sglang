@@ -10,6 +10,8 @@ from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.mem_cache.kv.alloc import runner_ids
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -70,6 +72,9 @@ def _register(target, draft):
         num_hidden_layers=_TARGET_LAYERS,
     )
     kv_args = KVArgs()
+    kv_args.num_draft_entries = (
+        len(draft.get_contiguous_buf_infos()[0]) if draft is not None else 0
+    )
     setup_state_kv_args(
         kv_args,
         storage,
@@ -115,6 +120,78 @@ class TestNpuHybridMlaKvArgs(CustomTestCase):
         kv_args = _register(self.target, None)
         self._assert_target_registered(kv_args)
         self.assertEqual(kv_args.draft_kv_layers, 0)
+
+    def test_hybrid_writes_and_pd_use_token_interleaving_by_default(self):
+        target = _hybrid_npu_mla((0, 2, 4), (1, 3, 5))
+        with (
+            patch.object(runner_ids, "_is_npu", True),
+            patch.object(
+                runner_ids,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True, dcp_size=2, dcp_rank=1),
+            ),
+        ):
+            ids = runner_ids.RunnerIds(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=target,
+                page_size=4,
+                device="cpu",
+            )
+            kv_args = _register(target, _npu_mla(layer_num=1))
+        self.assertEqual(
+            ids.space(IdSpaceKind.FULL).write(torch.arange(8)).tolist(),
+            [-1, 0, -1, 1, -1, 2, -1, 3],
+        )
+        self._assert_target_registered(kv_args)
+        self.assertFalse(hasattr(kv_args, "dcp_num_replicated_entries"))
+        self.assertEqual(kv_args.npu_kv_layout, "ND")
+
+    def test_dsa_indexer_registers_as_state_with_draft_layer_ids(self):
+        def dsa_pool(layers, draft=False):
+            return NPUMLATokenToKVPool(
+                **_MLA,
+                kv_lora_rank=16,
+                qk_rope_head_dim=8,
+                layer_num=layers,
+                index_head_dim=128,
+                enable_memory_saver=False,
+                is_draft_worker=draft,
+            )
+
+        target, draft = dsa_pool(2), dsa_pool(1, draft=True)
+        args = _register(target, draft)
+        self.assertEqual(args.state_types, [StateType.DSA])
+        self.assertEqual(args.state_layer_ids, [[0, 1, _TARGET_LAYERS]])
+        self.assertEqual(
+            args.state_data_ptrs[0],
+            target.get_state_buf_infos()[0] + draft.get_state_buf_infos()[0],
+        )
+        self.assertEqual(len(target.get_contiguous_buf_infos()[0]), 4)
+        self.assertEqual(args.num_draft_entries, 2)
+        self.assertEqual(args.kv_buf_groups, 2)
+        self.assertEqual(args.kv_layer_ids, [0, 1, 0, 1, 6, 6])
+
+    def test_plain_mla_writes_use_token_interleaving_by_default(self):
+        with (
+            patch.object(runner_ids, "_is_npu", True),
+            patch.object(
+                runner_ids,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True, dcp_size=4, dcp_rank=2),
+            ),
+        ):
+            ids = runner_ids.RunnerIds(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=_npu_mla(layer_num=1),
+                page_size=4,
+                device="cpu",
+            )
+        self.assertEqual(
+            ids.space(IdSpaceKind.FULL).write(torch.arange(8)).tolist(),
+            [-1, -1, 0, -1, -1, -1, 1, -1],
+        )
 
 
 if __name__ == "__main__":
