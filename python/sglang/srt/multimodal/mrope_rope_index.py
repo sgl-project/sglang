@@ -784,9 +784,12 @@ def get_rope_index_ernie45(
                         w.item() // spatial_conv_size,
                     )
 
-                    for t_idx in range(llm_grid_t):
+                    if llm_grid_t > 0:
+                        # All frames share the spatial grid and starting offset.
+                        # The last frame also has the video's maximum position,
+                        # preserving the starting offset of the following text.
                         t_index = (
-                            torch.tensor(t_idx)
+                            torch.arange(llm_grid_t)
                             .view(-1, 1)
                             .expand(-1, llm_grid_h * llm_grid_w)
                             .flatten()
@@ -794,13 +797,13 @@ def get_rope_index_ernie45(
                         h_index = (
                             torch.arange(llm_grid_h)
                             .view(1, -1, 1)
-                            .expand(1, -1, llm_grid_w)
+                            .expand(llm_grid_t, -1, llm_grid_w)
                             .flatten()
                         )
                         w_index = (
                             torch.arange(llm_grid_w)
                             .view(1, 1, -1)
-                            .expand(1, llm_grid_h, -1)
+                            .expand(llm_grid_t, llm_grid_h, -1)
                             .flatten()
                         )
                         llm_pos_ids_list.append(
