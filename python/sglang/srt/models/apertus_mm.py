@@ -23,6 +23,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -31,16 +32,13 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.apertus import ApertusForCausalLM
 from sglang.srt.runtime_context import get_server_args
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list
 
 _DEFAULT_IMAGE_TOKEN_OFFSET = 131272
 _DEFAULT_AUDIO_TOKEN_OFFSET = 262344
