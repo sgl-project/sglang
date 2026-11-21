@@ -730,6 +730,8 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
             "Ensure ImageVAEEncodingStage runs before this stage."
         )
         ctx = self._prepare_causal_dmd_forward_context(batch, server_args)
+        if batch.is_warmup:
+            batch.record_stage_iterations(len(ctx.timesteps), len(ctx.timesteps))
         latents = ctx.latents
         cache_ctx = self._prepare_realtime_causal_caches(batch, server_args, ctx)
 

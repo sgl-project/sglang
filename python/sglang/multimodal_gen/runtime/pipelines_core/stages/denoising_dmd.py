@@ -29,6 +29,12 @@ class DmdDenoisingStage(DenoisingStage):
     Denoising stage for DMD.
     """
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # a fixed distilled schedule: the same count at any requested step count
+        return len(self.server_args.pipeline_config.dmd_denoising_steps)
+
     def __init__(self, transformer, scheduler, transformer_2=None) -> None:
         super().__init__(
             transformer=transformer, scheduler=scheduler, transformer_2=transformer_2

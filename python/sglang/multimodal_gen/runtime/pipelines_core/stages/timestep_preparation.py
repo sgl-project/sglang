@@ -248,10 +248,10 @@ class DMDTimestepPreparationStage(PipelineStage):
             )
             timesteps = scheduler_timesteps[num_train_timesteps - timesteps]
 
+        if not batch.is_warmup:
+            self.log_debug("DMD timesteps: %s", timesteps)
         batch.timesteps = timesteps.to(get_local_torch_device())
         batch.scheduler = scheduler
-        if not batch.is_warmup:
-            self.log_debug("DMD timesteps: %s", batch.timesteps)
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

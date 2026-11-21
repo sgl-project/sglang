@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import addict
 import yaml
@@ -97,6 +97,11 @@ from sglang.multimodal_gen.runtime.weights.source import (
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        HostPinBudget,
+    )
 
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
 LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
@@ -490,8 +495,20 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
-    _required_resident_components: set[str] = field(
+    _automatic_component_attention_backend_keys: set[str] = field(
         default_factory=set, init=False, repr=False
+    )
+    # component name -> owning feature; the first (loader-time) owner wins so
+    # a runtime feature's rollback can never release a loader hard requirement
+    _required_resident_components: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    # Warmup-calibrated serving placement. This is deliberately separate from
+    # configured CLI placement and loader hard requirements: calibration can
+    # move among all three runtime modes, while a loader-owned resident
+    # requirement must remain authoritative.
+    _auto_residency_modes: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
     )
     _fsdp_disabled_components: set[str] = field(
         default_factory=set, init=False, repr=False
@@ -1924,6 +1941,22 @@ class ServerArgs(DisaggServerArgsMixin):
             return RESIDENT
         if component_name in self._required_resident_components:
             return RESIDENT
+        auto_mode = self.auto_residency_mode(component_name)
+        if auto_mode is not None:
+            return auto_mode
+
+        return self.configured_residency_mode(component_name)
+
+    def configured_residency_mode(self, component_name: str) -> str:
+        """Return placement from user controls and startup auto tuning.
+
+        Unlike :meth:`residency_mode`, this excludes runtime requirements such
+        as warmup-calibrated auto residency. A runtime planner can therefore
+        recover and reconsider the load-safe baseline without overriding an
+        explicit user choice.
+        """
+        if current_platform.is_cpu():
+            return RESIDENT
 
         explicit_mode = self.explicit_residency_mode(component_name)
         if explicit_mode is not None:
@@ -1960,6 +1993,47 @@ class ServerArgs(DisaggServerArgsMixin):
             return COMPONENT_OFFLOAD if self.vae_cpu_offload else RESIDENT
         return RESIDENT
 
+    def component_residency_requirement(self, component_name: str) -> str | None:
+        """Return the feature that currently hard-requires GPU residency."""
+        return self._required_resident_components.get(component_name)
+
+    def auto_residency_mode(self, component_name: str) -> str | None:
+        """Return the warmup-calibrated serving override, if one is active."""
+        return self.__dict__.get("_auto_residency_modes", {}).get(component_name)
+
+    def host_pin_budget(self) -> "HostPinBudget":
+        """Return this worker's shared HostPin ledger.
+
+        Initial and lazily configured layerwise components must spend from the
+        same allowance. Keeping this process-local object out of dataclass
+        fields also keeps ServerArgs serialization and logging unchanged.
+        """
+        from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+            HostPinBudget,
+        )
+
+        budget = self.__dict__.get("_host_pin_budget")
+        if budget is None:
+            local_worker_count = max(1, self.num_gpus // self.nnodes)
+            budget = HostPinBudget.for_local_worker(local_worker_count)
+            self.__dict__["_host_pin_budget"] = budget
+        return budget
+
+    def set_auto_residency_mode(self, component_name: str, mode: str) -> None:
+        """Set one runtime placement without rewriting its configured policy."""
+        if mode not in (RESIDENT, COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
+            raise ValueError(f"invalid auto residency mode {mode!r}")
+        owner = self._required_resident_components.get(component_name)
+        if owner is not None and mode != RESIDENT:
+            raise ValueError(
+                f"cannot set {component_name!r} to {mode!r}; "
+                f"{owner} requires it resident"
+            )
+        self.__dict__.setdefault("_auto_residency_modes", {})[component_name] = mode
+
+    def clear_auto_residency_mode(self, component_name: str) -> None:
+        self.__dict__.get("_auto_residency_modes", {}).pop(component_name, None)
+
     def should_cpu_offload_component(self, component_name: str) -> bool:
         return self.residency_mode(component_name) in (
             COMPONENT_OFFLOAD,
@@ -1982,7 +2056,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{feature_name} requires {component_name!r} to be resident; "
                 f"got {configured_mode!r} from an explicit residency option"
             )
-        self._required_resident_components.add(component_name)
+        self._required_resident_components.setdefault(component_name, feature_name)
+
+    def release_required_component_residency(
+        self, component_name: str, *, feature_name: str
+    ) -> None:
+        """Undo ``require_component_resident`` for the same owning feature.
+
+        A release with a different owner is a no-op: an auto-residency
+        rollback must not clear a loader's hard residency requirement.
+        """
+        if self._required_resident_components.get(component_name) == feature_name:
+            del self._required_resident_components[component_name]
 
     def should_use_fsdp_for_component(self, component_name: str) -> bool:
         return bool(
@@ -4245,6 +4330,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 "to match SGLang SRT defaults.",
                 default_backend,
             )
+
+    def is_layerwise_residency_policy_explicit(
+        self, component_name: str, *, dit_group: bool
+    ) -> bool:
+        """Whether auto placement must preserve this component's policy."""
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy,
+            option="--layerwise-residency-policy",
+        )
+        return component_name in policy_map or (
+            dit_group and self.is_arg_explicitly_set("dit_layerwise_residency_policy")
+        )
 
 
 @dataclasses.dataclass

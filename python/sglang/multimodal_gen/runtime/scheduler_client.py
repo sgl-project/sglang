@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     spill_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    AutoResidencyReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     ReleaseRealtimeSessionReq,
@@ -56,6 +57,7 @@ logger = init_logger(__name__)
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
 # DP they reach every replica unless a fatal device error aborts the fan-out.
 _CONTROL_REQ_TYPES = (
+    AutoResidencyReq,
     StartProfileReq,
     StopProfileReq,
     SetLoraReq,
@@ -143,6 +145,11 @@ def _select_replica(batch: Any, dp_size: int, counter: "itertools.count") -> int
     return next(counter) % dp_size
 
 
+def _is_warmup_batch(batch: Any) -> bool:
+    reqs = batch if isinstance(batch, list) else [batch]
+    return bool(reqs) and all(isinstance(req, Req) and req.is_warmup for req in reqs)
+
+
 def _is_fatal_reply(result: Any) -> bool:
     return (
         isinstance(result, OutputBatch)
@@ -161,6 +168,66 @@ def _merge_fanout_results(results: list[Any]) -> Any:
             if first_error is None:
                 first_error = result
     return first_error if first_error is not None else results[0]
+
+
+def _auto_residency_status(result: Any) -> str | None:
+    if not isinstance(result, OutputBatch) or not isinstance(result.output, dict):
+        return None
+    return result.output.get("status")
+
+
+def _merge_auto_residency_results(results: list[Any]) -> Any:
+    """Preserve the strongest replica-wide auto-residency outcome.
+
+    Replicas plan against their own measured headroom, so one may keep the
+    original placement while another adjusts. If any replica changed, the
+    orchestrator must still run the validation warmup everywhere. A failed
+    local rollback remains fatal and takes precedence over that success.
+    """
+    fatal = next((result for result in results if _is_fatal_reply(result)), None)
+    if fatal is not None:
+        return fatal
+
+    rollback_failed = next(
+        (
+            result
+            for result in results
+            if _auto_residency_status(result) == "rollback_failed"
+        ),
+        None,
+    )
+    if rollback_failed is not None:
+        return rollback_failed
+
+    adjusted = next(
+        (result for result in results if _auto_residency_status(result) == "adjusted"),
+        None,
+    )
+    if adjusted is not None:
+        replica_errors = [
+            result.error
+            for result in results
+            if isinstance(result, OutputBatch) and result.error is not None
+        ]
+        if replica_errors:
+            logger.warning(
+                "Auto residency kept the original placement on %d replica(s): %s",
+                len(replica_errors),
+                replica_errors[0],
+            )
+        return adjusted
+
+    rolled_back = next(
+        (
+            result
+            for result in results
+            if _auto_residency_status(result) == "rolled_back"
+        ),
+        None,
+    )
+    if rolled_back is not None:
+        return rolled_back
+    return _merge_fanout_results(results)
 
 
 class SchedulerClient:
@@ -268,14 +335,20 @@ class SchedulerClient:
             if check_worker_health is not None
             else {}
         )
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _CONTROL_REQ_TYPES) or (
+            replica is None and _is_warmup_batch(batch)
+        ):
             results = []
             for ep in endpoints:
                 reply = self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
                 results.append(reply)
                 if _is_fatal_reply(reply):
                     break
-            output_batch = _merge_fanout_results(results)
+            output_batch = (
+                _merge_auto_residency_results(results)
+                if isinstance(batch, AutoResidencyReq)
+                else _merge_fanout_results(results)
+            )
         else:
             if replica is None:
                 replica = _select_replica(batch, len(endpoints), self._replica_counter)
@@ -367,14 +440,20 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES):
+        if isinstance(batch, _CONTROL_REQ_TYPES) or (
+            replica is None and _is_warmup_batch(batch)
+        ):
             results = []
             for ep in endpoints:
                 reply = await self._forward_one(ep, batch, timeout_ms)
                 results.append(reply)
                 if _is_fatal_reply(reply):
                     break
-            output_batch = _merge_fanout_results(results)
+            output_batch = (
+                _merge_auto_residency_results(results)
+                if isinstance(batch, AutoResidencyReq)
+                else _merge_fanout_results(results)
+            )
         else:
             if replica is None:
                 replica = _select_replica(batch, len(endpoints), self._replica_counter)

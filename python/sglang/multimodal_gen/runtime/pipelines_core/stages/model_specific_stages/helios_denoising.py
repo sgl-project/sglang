@@ -753,5 +753,10 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         # separately to avoid temporal artifacts at chunk boundaries.
         batch.latent_chunks = chunk_latents_list
         batch.latents = history_latents[:, :, -total_generated_latent_frames:]
+        if batch.is_warmup:
+            batch.record_stage_iterations(
+                global_step_offset,
+                global_step_offset if is_enable_stage2 else None,
+            )
 
         return batch
