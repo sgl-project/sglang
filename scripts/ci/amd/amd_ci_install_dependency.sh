@@ -450,7 +450,9 @@ AITER_CACHE_KEY=""
 AITER_CACHE_LOCK=""
 AITER_CACHE_ROOT=/sgl-data/aiter-wheels
 AITER_CACHE_TOOL=/sglang-checkout/scripts/ci/amd/aiter_wheel_cache.py
-if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SKIP_AITER_CACHE}" ]]; then
+if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SKIP_AITER_CACHE}" \
+        && ( "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ) ]]; then
+    # The wheel is built with the gfx942/gfx950 install flags; other archs rebuild from source.
     AITER_IMAGE=$(docker inspect --format '{{.Image}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
     AITER_CACHE_HOST=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/sgl-data"}}{{.Source}}{{end}}{{end}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
     AITER_NAMESPACE="${GITHUB_EVENT_NAME:-local}:${GITHUB_REF:-local}"
