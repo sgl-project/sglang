@@ -5734,7 +5734,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_lora": ["--enable-lora"],
         "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
         "tokenizer_mode": ["--tokenizer-mode", "slow"],
-        "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
         "tokenizer_metrics_allowed_custom_labels": [
             "--tokenizer-metrics-allowed-custom-labels",
             "tenant",
@@ -5768,6 +5767,9 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                     self._resolve(cli_args)
                 # The Python frontend honors them.
                 self._resolve(cli_args, rust_server=False)
+
+    def test_fastokens_tokenizer_backend_is_accepted(self):
+        self._resolve(["--tokenizer-backend", "fastokens"])
 
     def test_error_names_every_offending_flag(self):
         with self.assertRaises(ValueError) as ctx:

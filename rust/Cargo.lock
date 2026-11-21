@@ -4130,6 +4130,7 @@ dependencies = [
  "dynamo-protocols",
  "dynamo-renderer",
  "dynamo-tokenizers",
+ "fastokens",
  "futures",
  "hf-hub",
  "minijinja",

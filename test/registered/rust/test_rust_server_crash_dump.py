@@ -65,6 +65,7 @@ def _server_args(ext, port: int):
         enable_cache_report=False,
         tokenizer_worker_num=1,
         detokenizer_worker_num=1,
+        tokenizer_backend="huggingface",
         skip_tokenizer_init=True,
         skip_server_warmup=True,
         gc_threshold=None,

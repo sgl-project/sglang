@@ -134,7 +134,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "enable_lora",
     "lora_paths",
     "tokenizer_mode",
-    "tokenizer_backend",
     "tokenizer_metrics_allowed_custom_labels",
     # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
     # Python's changes the pad values of the items it serves. A model package

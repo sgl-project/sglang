@@ -51,10 +51,12 @@ DynamoTokenizer::new(without_specials, with_specials)
 trait TextTokenizer { encode(text, add_special_tokens), encode_segments(segments, add_special_tokens) }
 ```
 
-Pass-through. `load_tokenizer` calls `Tokenizer::from_file_with_options`, and
-`encode` / `encode_segments` call the Dynamo tokenizer. Dynamo fixes
-`add_special_tokens` at load time, so `DynamoTokenizer` holds one handle per
-setting and picks one per request.
+`load_tokenizer` calls Dynamo's `Tokenizer::from_file_with_options`.
+`DynamoTokenizer::load_with_backend` can use fastokens over a Hugging Face
+tokenizer JSON for encoding, including its BOS/EOS post-processor. It uses
+Hugging Face's effective added vocabulary for both encoders. Decoding stays
+on Hugging Face, which also handles unsupported tokenizers or inputs. A
+checkpoint resolved to a tiktoken file uses its native tiktoken backend.
 
 ## render
 

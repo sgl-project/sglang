@@ -432,6 +432,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         // `skip_tokenizer_init`.
         (!cfg.server_args.tokenizer_path.is_empty()).then_some(&*cfg.server_args.tokenizer_path),
         cfg.server_args.revision.as_deref(),
+        &cfg.server_args.tokenizer_backend,
         skip_tokenizer_init,
     )?
     .map(Arc::new);

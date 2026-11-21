@@ -53,7 +53,7 @@ pub use render::{
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
-pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+pub use tokenizer::{DynamoTokenizer, TextTokenizer, TokenizerBackend, load_tokenizer};
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use tool_call::tool_call_id;
 
