@@ -5,10 +5,12 @@ Greedy drafts collapse into short repeating loops (DFLASH's default token mode e
 commits one fixed id), so the model runs on a few repeated token ids, unlike real
 traffic, which can skew expert routing and cache locality. Under simulated acceptance
 every draft row therefore samples: a sampled request at its own temperature, a greedy
-one at 1000 (close to uniform) by default, while the target still verifies greedily.
-SGLANG_BENCH_ACC_DRAFT_TEMPERATURE sets the greedy rows' temperature; 0 keeps greedy
-drafts. Left unset, an explicit SGLANG_DSPARK_USE_GREEDY_DRAFT=1 or
-SGLANG_SIMULATE_ACC_TOKEN_MODE wins over the default.
+one at 1 by default, the drafter's own distribution, so the committed text resembles a
+sampled generation (a near-uniform temperature removes loops but yields unnatural
+tokens), while the target still verifies greedily. SGLANG_BENCH_ACC_DRAFT_TEMPERATURE
+sets the greedy rows' temperature; 0 keeps greedy drafts. Left unset, an explicit
+SGLANG_DSPARK_USE_GREEDY_DRAFT=1 or SGLANG_SIMULATE_ACC_TOKEN_MODE wins over the
+default.
 """
 
 from __future__ import annotations
@@ -27,8 +29,9 @@ logger = logging.getLogger(__name__)
 
 ENV_NAME = "SGLANG_BENCH_ACC_DRAFT_TEMPERATURE"
 SUPPORTED_ALGORITHMS = ("DFLASH", "DSPARK")
-# The greedy rows' draft temperature under simulated acceptance when the variable is unset.
-DEFAULT_TEMPERATURE = 1000.0
+# The greedy rows' draft temperature under simulated acceptance when the variable is
+# unset: the drafter's own distribution.
+DEFAULT_TEMPERATURE = 1.0
 # The request clamp: below it the draft kernels' value / temperature overflows.
 _MIN_TEMPERATURE = 1e-5
 

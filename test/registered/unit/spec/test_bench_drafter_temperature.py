@@ -71,7 +71,7 @@ class TestResolve(_Case):
         for value, acc_len, expected in (
             (None, "-1", 0.0),  # no simulated acceptance
             (None, "1.0", 0.0),  # nothing committed past the bonus token
-            (None, "3.8", 1000.0),
+            (None, "3.8", bd.DEFAULT_TEMPERATURE),
             ("0", "3.8", 0.0),  # opted out: greedy drafts
             ("250", "3.8", 250.0),
         ):
@@ -94,7 +94,7 @@ class TestResolve(_Case):
 
     def test_malformed_value_warns_and_falls_back_to_the_default(self):
         # EnvField's fallback for any env var: the default, with a warning.
-        for acc_len, default in (("-1", 0.0), ("3.8", 1000.0)):
+        for acc_len, default in (("-1", 0.0), ("3.8", bd.DEFAULT_TEMPERATURE)):
             with self.subTest(acc_len=acc_len), _bench("1e3x", acc_len):
                 with self.assertWarnsRegex(UserWarning, bd.ENV_NAME):
                     self.assertEqual(bd.bench_drafter_temperature(), default)
@@ -310,6 +310,18 @@ class TestGumbelArgmax(_Case):
         self.assertEqual(int((counts > 0).sum()), vocab)
         self.assertLess(float((counts - expected).abs().max()), 0.3 * expected)
 
+    def test_default_temperature_draws_from_the_softmax(self):
+        probs, draws = torch.tensor([0.1, 0.2, 0.3, 0.4]), 4000
+        logits = probs.log().repeat(1, 1)
+        picks = torch.cat(
+            [
+                _sample(logits, temperature=bd.DEFAULT_TEMPERATURE, offset=s)
+                for s in range(draws)
+            ]
+        )
+        freqs = torch.bincount(picks, minlength=4).float() / draws
+        self.assertLess(float((freqs - probs).abs().max()), 0.03)
+
     def test_low_temperature_follows_the_logits(self):
         logits = torch.tensor([[0.0, 5.0, 1.0, -2.0]])
         picks = {int(_sample(logits, temperature=0.01, offset=s)) for s in range(100)}
@@ -385,9 +397,13 @@ class TestDSparkDraftParams(_Case):
             torch.equal(out.step_temperatures, torch.tensor([1000.0] * 3 + [-1.0] * 2))
         )
 
-    def test_simulated_acceptance_defaults_to_1000(self):
+    def test_simulated_acceptance_samples_greedy_rows_by_default(self):
         params = self._resolve(None, GREEDY, acc_len="3.8")
-        self.assertTrue(torch.equal(params.step_temperatures, torch.full((3,), 1000.0)))
+        self.assertTrue(
+            torch.equal(
+                params.step_temperatures, torch.full((3,), bd.DEFAULT_TEMPERATURE)
+            )
+        )
 
 
 class TestDSparkWorker(_Case):
