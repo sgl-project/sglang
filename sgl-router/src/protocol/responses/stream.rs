@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::{
     call_item, custom_input, failed_error, message_item, new_id, now_secs, output_text_part,
-    reasoning_item, response_object, usage_from_chat, EchoContext, Finish,
+    reasoning_item, response_object, usage_from_chat, CallIds, EchoContext, Finish,
 };
 use crate::protocol::sse::{data_payload, write_event, Data, LineBuffer, SseTransducer};
 use crate::protocol::upstream_error;
@@ -35,6 +35,7 @@ struct Call {
     /// The chat chunk's `index`, which identifies a call only until a new
     /// call reuses it.
     tool_index: u64,
+    upstream_id: Option<String>,
     call_id: String,
     name: String,
     args: String,
@@ -57,6 +58,7 @@ pub struct ResponsesStream {
     terminal: bool,
     open: Option<Open>,
     calls: Vec<Call>,
+    call_ids: CallIds,
     /// Emitted after the calls so it cannot split one.
     held: Vec<(Held, String)>,
     /// The last non-blank delta went to `held`, not a call: a cut-off ends it.
@@ -80,6 +82,7 @@ impl ResponsesStream {
             terminal: false,
             open: None,
             calls: Vec::new(),
+            call_ids: CallIds::default(),
             held: Vec::new(),
             last_held: false,
             next_index: 0,
@@ -287,9 +290,26 @@ impl ResponsesStream {
             .filter(|i| !i.is_empty());
         let existing = match name {
             Some(_) => None,
-            None => chunk_id
-                .and_then(|cid| self.calls.iter().rposition(|c| c.call_id == cid))
-                .or_else(|| self.calls.iter().rposition(|c| c.tool_index == tool_index)),
+            None => {
+                let by_id = chunk_id.and_then(|id| {
+                    let mut matching = self
+                        .calls
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .filter(|(_, call)| call.upstream_id.as_deref() == Some(id));
+                    let (latest, call) = matching.next()?;
+                    if chunk.get("index").is_none() || call.tool_index == tool_index {
+                        return Some(latest);
+                    }
+                    Some(
+                        matching
+                            .find(|(_, call)| call.tool_index == tool_index)
+                            .map_or(latest, |(index, _)| index),
+                    )
+                });
+                by_id.or_else(|| self.calls.iter().rposition(|c| c.tool_index == tool_index))
+            }
         };
         let pos = match existing {
             Some(pos) => pos,
@@ -302,7 +322,8 @@ impl ResponsesStream {
                     id: new_id("fc"),
                     index: self.next_index(),
                     tool_index,
-                    call_id: chunk_id.map_or_else(|| new_id("call"), str::to_owned),
+                    upstream_id: chunk_id.map(str::to_owned),
+                    call_id: self.call_ids.allocate(chunk_id),
                     name: name.unwrap_or("").to_owned(),
                     args: String::new(),
                 };
@@ -658,6 +679,49 @@ mod tests {
             json!({"reason": "max_output_tokens"})
         );
         assert_eq!(data["response"]["output"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repeated_worker_ids_stay_distinct_on_replay() {
+        let delta = |name: Option<&str>, args: &str| {
+            let mut d = indexed(0, name, args);
+            d["tool_calls"][0]["id"] = json!("function.f:0");
+            d
+        };
+        let evs = run(&[
+            chunk(delta(Some("f"), "{}"), None),
+            chunk(delta(Some("f"), "{"), None),
+            chunk(delta(None, "}"), Some("tool_calls")),
+        ]);
+        let output = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(output[0]["call_id"], "function.f:0");
+        assert_eq!(output[1]["call_id"], "function.f:1");
+        assert_eq!(output[1]["arguments"], "{}");
+        let added: Vec<_> = evs
+            .iter()
+            .filter(|(e, _)| e == "response.output_item.added")
+            .map(|(_, e)| &e["item"]["call_id"])
+            .collect();
+        assert_eq!(added, [&output[0]["call_id"], &output[1]["call_id"]]);
+    }
+
+    #[test]
+    fn repeated_ids_with_distinct_indices_accept_interleaved_arguments() {
+        let delta = |i, name, args| {
+            let mut d = indexed(i, name, args);
+            d["tool_calls"][0]["id"] = json!("shared");
+            d
+        };
+        let evs = run(&[
+            chunk(delta(0, Some("a"), "{"), None),
+            chunk(delta(1, Some("b"), "{"), None),
+            chunk(delta(0, None, r#""a":1}"#), None),
+            chunk(delta(1, None, r#""b":2}"#), Some("tool_calls")),
+        ]);
+        let calls = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(calls[0]["arguments"], r#"{"a":1}"#);
+        assert_eq!(calls[1]["arguments"], r#"{"b":2}"#);
+        assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
     }
 
     #[test]
