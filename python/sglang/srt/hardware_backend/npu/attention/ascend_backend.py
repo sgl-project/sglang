@@ -7,7 +7,11 @@ import torch
 import torch_npu
 from sgl_kernel_npu.operators.attention import attention_sinks, attention_sinks_prefill
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -27,12 +31,17 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.kv_capability import resolve_npu_kv_capability
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+    VENDOR_QUANT_INDEXER_NUM_HEADS,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
@@ -71,6 +80,9 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+# Measured handle shape of npu_quant_lightning_indexer_metadata (int32, 910B
+# probes); DSV4 binds the same fixed buffer for this op in graph mode.
+QUANT_INDEXER_METADATA_HANDLE_SIZE = 1024
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -93,6 +105,45 @@ def _reshape_kv_for_fia_nz(
     """Reshapes a tensor for FIA NZ format."""
     tile_size = 32 if tensor.dtype == torch.float8_e4m3fn else 16
     return tensor.view(-1, 1, num_heads * head_dim // tile_size, page_size, tile_size)
+
+
+def _is_dsa_indexer_prefill(forward_mode: ForwardMode) -> bool:
+    # Mirrors is_prefill in DSANPUIndexerMixin.forward_npu.
+    return (
+        forward_mode.is_extend()
+        and not forward_mode.is_draft_extend_v2()
+        and not forward_mode.is_target_verify()
+    )
+
+
+def _uses_int8_quant_indexer(token_to_kv_pool) -> bool:
+    # Same predicate DSANPUIndexerMixin.forward_npu uses to pick the vendor
+    # INT8 kernel; only the NPU MLA pool carries an indexer K scale buffer.
+    return (
+        isinstance(token_to_kv_pool, NPUMLATokenToKVPool)
+        and token_to_kv_pool.index_k_scale_buffer is not None
+        and token_to_kv_pool.kv_capability.indexer_quant
+        and token_to_kv_pool.kv_capability.indexer_kv_dtype == torch.int8
+    )
+
+
+def _quant_indexer_metadata_static_kwargs(*, index_topk: int, head_dim: int) -> dict:
+    # Must match the literals DSANPUIndexerMixin passes to
+    # torch.ops.custom.npu_quant_lightning_indexer with this handle.
+    return {
+        "layout_key": "PA_BSND",
+        "sparse_count": index_topk,
+        "sparse_mode": 3,
+        "layout_query": "TND",
+        # DSA indexer keys are uncompressed, unlike the DSV4 c4 indexer.
+        "cmp_ratio": 1,
+        "key_quant_mode": 0,
+        "query_quant_mode": 0,
+        # The vendor rejects a handle built with the unpadded head count.
+        "num_heads_q": VENDOR_QUANT_INDEXER_NUM_HEADS,
+        "num_heads_k": 1,
+        "head_dim": head_dim,
+    }
 
 
 @dataclass
@@ -149,6 +200,11 @@ class ForwardMetadata:
     # None means the local prefix pages are full and need no token compaction.
     prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+    # The handle and the live device lengths bound by the INT8 indexer.
+    quant_indexer_metadata: Optional[torch.Tensor] = None
+    quant_indexer_cu_q_lens: Optional[torch.Tensor] = None
+    quant_indexer_kv_lens: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -350,6 +406,9 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_capability = resolve_npu_kv_capability(
+            self.kv_cache_dtype, is_draft_worker=model_runner.is_draft_worker
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         modelslim_cache_layout = (
             model_runner.kv_cache_configurator.modelslim_cache_layout
@@ -555,6 +614,99 @@ class AscendAttnBackend(AttentionBackend):
 
         self.attn_cp_size = get_parallel().attn_cp_size
 
+        self.use_int8_quant_indexer = _uses_int8_quant_indexer(self.token_to_kv_pool)
+        self.quant_indexer_metadata_kwargs = None
+        if self.use_int8_quant_indexer:
+            self.quant_indexer_metadata_kwargs = _quant_indexer_metadata_static_kwargs(
+                index_topk=get_dsa_index_topk(model_runner.model_config.hf_text_config),
+                head_dim=model_runner.model_config.index_head_dim,
+            )
+
+    def _build_quant_indexer_metadata(
+        self, *, cu_q_lens: torch.Tensor, kv_lens: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.ops.custom.npu_quant_lightning_indexer_metadata(
+            device=str(cu_q_lens.device),
+            actual_seq_lengths_query=cu_q_lens,
+            actual_seq_lengths_key=kv_lens,
+            **self.quant_indexer_metadata_kwargs,
+        )
+
+    def _init_quant_indexer_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Eager: store the INT8 indexer lengths; the indexer builds the handle."""
+        # Idle ranks have no sequences; the indexer skips the vendor kernel there.
+        if not self.use_int8_quant_indexer or forward_batch.forward_mode.is_idle():
+            return
+        fm = self.forward_metadata
+        # The same length sources DSANPUIndexerMixin.forward_npu reads.
+        if _is_dsa_indexer_prefill(forward_batch.forward_mode):
+            cu_q_lens = forward_batch.extend_seq_lens.cumsum(dim=0)
+            kv_lens = forward_batch.seq_lens
+        else:
+            cu_q_lens = fm.actual_seq_lengths_q
+            kv_lens = (
+                fm.seq_lens if fm.seq_lens_cpu_int is None else fm.seq_lens_cpu_int
+            )
+        fm.quant_indexer_cu_q_lens = cu_q_lens.to(
+            device=self.device, dtype=torch.int32
+        ).contiguous()
+        fm.quant_indexer_kv_lens = kv_lens.to(
+            device=self.device, dtype=torch.int32
+        ).contiguous()
+        # The vendor metadata op rejects a decode-shape build at the eager
+        # init_forward_metadata call site (910B, AICPU error; replay-time
+        # rebuilds outside the forward succeed, so the restriction is
+        # site-specific, cause unknown to us);
+        # dsa_npu_indexer._resolve_int8_indexer_metadata builds it.
+        fm.quant_indexer_metadata = None
+
+    def build_quant_indexer_metadata_in_forward(self) -> torch.Tensor:
+        """Build a handle from this forward's lengths; only inside the model forward."""
+        fm = self.forward_metadata
+        return self._build_quant_indexer_metadata(
+            cu_q_lens=fm.quant_indexer_cu_q_lens,
+            kv_lens=fm.quant_indexer_kv_lens,
+        )
+
+    def _init_graph_quant_indexer_metadata(
+        self, *, metadata: ForwardMetadata, bs: int, seq_lens: torch.Tensor
+    ) -> None:
+        """Capture: allocate the per-bs storage the captured kernel binds."""
+        metadata.quant_indexer_cu_q_lens = metadata.actual_seq_lengths_q
+        # Own storage, never a view of the runner's shared seq_lens buffer;
+        # capture fills seq_lens with 0 and replay refills this in place.
+        metadata.quant_indexer_kv_lens = torch.empty(
+            bs, dtype=torch.int32, device=seq_lens.device
+        )
+        metadata.quant_indexer_kv_lens.copy_(seq_lens[:bs].clamp(min=1))
+        # The metadata op syncs host and device internally, which capture
+        # forbids; bind a zero buffer that replay fills from an eager build.
+        metadata.quant_indexer_metadata = torch.zeros(
+            QUANT_INDEXER_METADATA_HANDLE_SIZE,
+            dtype=torch.int32,
+            device=seq_lens.device,
+        )
+
+    def _refresh_graph_quant_indexer_metadata(
+        self, *, metadata: ForwardMetadata, bs: int
+    ) -> None:
+        """Replay: rebuild the handle off the live lengths, outside the graph."""
+        # metadata.seq_lens is what forward_npu reads in graph mode. Padded rows
+        # hold 0; clamp as the DSV4 graph refresh does for this vendor op.
+        metadata.quant_indexer_kv_lens.copy_(metadata.seq_lens[:bs].clamp(min=1))
+        fresh = self._build_quant_indexer_metadata(
+            cu_q_lens=metadata.quant_indexer_cu_q_lens,
+            kv_lens=metadata.quant_indexer_kv_lens,
+        )
+        captured = metadata.quant_indexer_metadata
+        if fresh.shape != captured.shape or fresh.dtype != captured.dtype:
+            raise RuntimeError(
+                "DSA INT8 NPU graph indexer metadata shape mismatch: "
+                f"runtime={tuple(fresh.shape)} {fresh.dtype}, "
+                f"captured={tuple(captured.shape)} {captured.dtype}."
+            )
+        captured.copy_(fresh)
+
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
             self.is_hybrid_swa
@@ -648,6 +800,7 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
+            in_capture=in_capture,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -952,6 +1105,9 @@ class AscendAttnBackend(AttentionBackend):
             self._prepare_paged_mtp_metadata(
                 self.forward_metadata, forward_batch.seq_lens
             )
+        # Must follow the spec offsets on seq_lens_cpu_int and actual_seq_lengths_q.
+        self._init_quant_indexer_metadata(forward_batch)
+
         self.graph_mode = False
 
     def _create_forward_metadata(self) -> ForwardMetadata:
@@ -1235,6 +1391,13 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=dtype,
                 device=seq_lens.device,
             )
+        # A draft resolves the INT8 indexer as auto, so draft_extend_v2 never needs it.
+        if self.use_int8_quant_indexer and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            self._init_graph_quant_indexer_metadata(
+                metadata=metadata, bs=bs, seq_lens=seq_lens
+            )
         self.graph_metadata[bs] = metadata
         return metadata
 
@@ -1249,6 +1412,8 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
+        *,
+        in_capture: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1474,6 +1639,8 @@ class AscendAttnBackend(AttentionBackend):
         if not self.dense_mla_dcp_target:
             metadata.seq_lens[:bs].copy_(device_kv_lens[:bs])
 
+        if metadata.quant_indexer_metadata is not None and not in_capture:
+            self._refresh_graph_quant_indexer_metadata(metadata=metadata, bs=bs)
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -1889,7 +2056,7 @@ class AscendAttnBackend(AttentionBackend):
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            return self._forward_fp8_sparse(
+            return self._forward_packed_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -1922,7 +2089,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out
 
-    def _forward_fp8_sparse(
+    def _forward_packed_sparse(
         self,
         q_nope,
         q_pe,
@@ -1932,8 +2099,9 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        q_nope = q_nope.to(torch.bfloat16)
+        q_pe = q_pe.to(torch.bfloat16)
+        packed = packed_kv.view(self.kv_capability.kv_cache_dtype)
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed,
@@ -2170,8 +2338,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
-                attn_out = self._forward_fp8_sparse(
+            if self.kv_capability.main_kv_packed:
+                attn_out = self._forward_packed_sparse(
                     q_nope,
                     q_pe,
                     k_nope,

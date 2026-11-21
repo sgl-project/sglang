@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
@@ -29,6 +29,11 @@ if is_npu():
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+        AscendAttnBackend,
+    )
+
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
@@ -46,6 +51,49 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     assert head_dim == 128
     # Match vllm-ascend SFA: BF16 matrix, normalized once on the pool's device.
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
+
+
+# The vendor quant indexer tiling hardcodes num_heads_q == 64; a narrower indexer
+# is padded at the call site, and ascend_backend.py builds its handle at this count.
+VENDOR_QUANT_INDEXER_NUM_HEADS = 64
+# Any finite non-zero dequant scale works for a padded head: its query is zero,
+# so the head contributes nothing whatever the scale is.
+_PADDED_HEAD_QUERY_SCALE = 1.0
+
+
+def _pad_indexer_heads(
+    *,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    query_scale: torch.Tensor,
+    num_heads: int,
+    padded_num_heads: int,
+):
+    # query is [T, N, D], weights and query_scale are [T, N].
+    assert query.shape[1] == num_heads
+    assert weights.shape[1] == num_heads and query_scale.shape[1] == num_heads
+    if num_heads > padded_num_heads:
+        raise ValueError(
+            f"The quantized NPU indexer supports at most {padded_num_heads} "
+            f"heads, got {num_heads}."
+        )
+    if num_heads == padded_num_heads:
+        return query, weights, query_scale
+    pad = padded_num_heads - num_heads
+    rows = query.shape[0]
+    # A zero query and a zero weight each suppress a padded head on their own;
+    # the 910B P7 probe matched this padding's top-k to a float64 reference.
+    return (
+        torch.cat([query, query.new_zeros((rows, pad, query.shape[2]))], dim=1),
+        torch.cat([weights, weights.new_zeros((rows, pad))], dim=1),
+        torch.cat(
+            [
+                query_scale,
+                query_scale.new_full((rows, pad), _PADDED_HEAD_QUERY_SCALE),
+            ],
+            dim=1,
+        ),
+    )
 
 
 def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
@@ -216,6 +264,19 @@ def _get_indexer_query_shard(
     return shard
 
 
+def _resolve_int8_indexer_metadata(attn_backend: AscendAttnBackend) -> torch.Tensor:
+    fm = attn_backend.forward_metadata
+    # A graph binds a handle buffer here; replay refreshes it outside the graph.
+    if fm.quant_indexer_metadata is not None:
+        return fm.quant_indexer_metadata
+    # The vendor metadata op rejects a decode-shape build at the eager
+    # init_forward_metadata call site (910B, AICPU error; replay-time rebuilds
+    # outside the forward succeed, so the restriction is site-specific, cause
+    # unknown to us); AscendAttnBackend._init_quant_indexer_metadata defers it here.
+    fm.quant_indexer_metadata = attn_backend.build_quant_indexer_metadata_in_forward()
+    return fm.quant_indexer_metadata
+
+
 class DSANPUIndexerMixin:
     def _forward_npu_lsa_indexer(
         self,
@@ -301,9 +362,18 @@ class DSANPUIndexerMixin:
         uses_prefill_cp = (
             self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
         )
+        # The metadata-backed operator consumes the full forward's query lengths.
+        pool = get_token_to_kv_pool()
+        index_pool = getattr(pool, "full_kv_pool", pool)
+        capability = getattr(index_pool, "kv_capability", None)
+        uses_metadata_indexer = (
+            capability is not None
+            and capability.indexer_quant
+            and capability.indexer_kv_dtype == torch.int8
+        )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill and not uses_prefill_cp
+            if is_prefill and not uses_prefill_cp and not uses_metadata_indexer
             else None
         )
         q_sliced_early = (
@@ -494,7 +564,6 @@ class DSANPUIndexerMixin:
                 "NPU DSA+DCP origin_out_cache_loc metadata has an incompatible "
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
-        pool = get_token_to_kv_pool()
         # Hybrid pools (Kimi K2/K3) keep the index buffers on the inner
         # full-attn pool, which is keyed by compact (dense) layer ids;
         # translate the global layer id before unwrapping the wrapper.
@@ -651,6 +720,31 @@ class DSANPUIndexerMixin:
                     pool.index_k_store_dtype,
                     pool.index_k_scale_dtype,
                 )
+                if uses_metadata_indexer:
+                    # Idle ranks get no handle from the backend; skip the kernel.
+                    if forward_batch.forward_mode.is_idle():
+                        return torch.full(
+                            (query.shape[0], self.index_topk),
+                            -1,
+                            dtype=torch.int32,
+                            device=query.device,
+                        )
+                    # INT8 indexer K is answered by the vendor kernel;
+                    # it needs a metadata handle the binding below cannot pass.
+                    attn_backend = get_attn_backend()
+                    metadata = _resolve_int8_indexer_metadata(attn_backend)
+                    fm = attn_backend.forward_metadata
+                    return self._npu_vendor_quant_indexer(
+                        query=query,
+                        query_scale=query_scale,
+                        key=past_key_states,
+                        key_scale=pool.get_index_k_scale_buffer(layer_id),
+                        weights=weights,
+                        block_table=block_table,
+                        metadata=metadata,
+                        cu_q_lens=fm.quant_indexer_cu_q_lens,
+                        kv_lens=fm.quant_indexer_kv_lens,
+                    )
 
                 if pool.index_k_store_dtype == torch.int8:
                     # INT8 keys require FP16 weights
@@ -702,6 +796,58 @@ class DSANPUIndexerMixin:
                 forward_batch.npu_indexer_topk_is_local = False
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices
+
+    def _npu_vendor_quant_indexer(
+        self,
+        *,
+        query: torch.Tensor,
+        query_scale: torch.Tensor,
+        key: torch.Tensor,
+        key_scale: torch.Tensor,
+        weights: torch.Tensor,
+        block_table: torch.Tensor,
+        metadata: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        kv_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        # The handle is built from exactly cu_q_lens and kv_lens, by the first
+        # indexer layer in eager or by the backend outside the graph on replay.
+        if metadata is None:
+            raise RuntimeError(
+                "The INT8 DSA NPU indexer found no quant indexer metadata on the "
+                "attention backend's forward metadata for this forward mode."
+            )
+        # The vendor op takes FP16 weights and FP16 for both dequant scales;
+        # INT8 query / key is the only signature it accepts.
+        query, weights, query_scale = _pad_indexer_heads(
+            query=query,
+            weights=weights.to(torch.float16),
+            query_scale=query_scale.to(torch.float16),
+            num_heads=self.n_heads,
+            padded_num_heads=VENDOR_QUANT_INDEXER_NUM_HEADS,
+        )
+        # The literals below must match the handle kwargs in ascend_backend.py.
+        topk_indices, _ = torch.ops.custom.npu_quant_lightning_indexer(
+            query=query,
+            key=key,
+            key_dequant_scale=key_scale.to(torch.float16),
+            weights=weights,
+            query_dequant_scale=query_scale,
+            actual_seq_lengths_query=cu_q_lens,
+            actual_seq_lengths_key=kv_lens,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            cmp_ratio=1,
+            query_quant_mode=0,
+            key_quant_mode=0,
+            sparse_mode=3,
+            sparse_count=self.index_topk,
+            metadata=metadata,
+        )
+        # Keep DSA top-k as [T, K]; sparse FA drops the -1 slots,
+        # which the in-chunk causal mask leaves on early prefill rows.
+        return topk_indices.view(-1, self.index_topk)
 
     def do_npu_cp_balance_indexer(
         self,
