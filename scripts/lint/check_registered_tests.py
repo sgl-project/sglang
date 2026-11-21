@@ -130,6 +130,7 @@ def main() -> int:
     # No CUDA/CPU workflow passes `run_suite.py --nightly`, so a nightly=True
     # registration on these backends is filtered out of every run.
     no_nightly_flag = (cuda, ci_register.HWBackend.CPU)
+    amd = ci_register.HWBackend.AMD
 
     # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
@@ -144,6 +145,7 @@ def main() -> int:
     legacy_shape = []  # (file, suite, stage, runner_config) -- has a -test- split
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
     nightly_flagged = []  # (file, backend, suite) -- nightly=True on CUDA/CPU
+    amd_nightly_mismatch = []  # (file, suite, nightly) -- flag disagrees with suite
     unknown_runner_config = []  # (file, runner_config) -- absent from runner_configs.yml
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     # (file, backend, suite) -- non-CUDA; CUDA suites are built from stage and
@@ -170,6 +172,12 @@ def main() -> int:
                 unrun_candidates.append((f, r.backend.name, r.effective_suite))
             if r.nightly and r.backend in no_nightly_flag:
                 nightly_flagged.append((f, r.backend.name, r.effective_suite))
+            # AMD PR jobs run run_suite.py without --nightly and nightly jobs with
+            # it, so a flag that disagrees with the suite name never runs.
+            if r.backend == amd and r.nightly != (r.effective_suite or "").startswith(
+                "nightly-"
+            ):
+                amd_nightly_mismatch.append((f, r.effective_suite, r.nightly))
             if (
                 r.backend == cuda
                 and r.runner_config is not None
@@ -253,6 +261,17 @@ def main() -> int:
         )
         for f, backend, suite in nightly_flagged:
             print(f'  {f}\n    {backend} suite="{suite}"')
+        print()
+        exit_code = 1
+    if amd_nightly_mismatch:
+        print(
+            "ERROR: AMD test(s) whose nightly= flag disagrees with the suite. "
+            "nightly-test-amd.yml passes `run_suite.py --nightly` and the AMD "
+            "PR-test jobs do not, so these tests never run. Set nightly=True "
+            "exactly on `nightly-*` suites:\n"
+        )
+        for f, suite, nightly in amd_nightly_mismatch:
+            print(f'  {f}\n    suite="{suite}", nightly={nightly}')
         print()
         exit_code = 1
     if unknown_runner_config:
