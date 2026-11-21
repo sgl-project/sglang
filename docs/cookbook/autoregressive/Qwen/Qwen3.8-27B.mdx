@@ -52,9 +52,10 @@ the panels, and the computed value is pinned into the command.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/Qwen/qwen3.8-27b.jsx";
+import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-27b-benchmarks.jsx";
 import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_calculator.jsx";
 
-<Deployment config={config} />
+<Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
   Every cell above — RTX 5090, RTX PRO 6000 and DGX Spark, across all five
@@ -63,6 +64,17 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
   and scored on the full 1319-question GSM8K (93.18-95.15%). The serving
   envelope behind the pins is ISL 8192 / OSL 1024 at concurrency 1; throughput
   and acceptance-length numbers were not re-taken in that sweep.
+</Note>
+
+<Note>
+  H200 FP8 benchmarks with **bfloat16 SSM state** are reported by
+  [dhruvrnaik in #42024](https://github.com/sgl-project/sglang/issues/42024).
+  The four measured selections cover both serving tiers, with EAGLE on or off.
+  Each speed value is the median of three runs after two warmups; latency is
+  the per-run **mean**, and throughput counts input plus output tokens per GPU.
+  GSM8K uses all 1,319 questions, zero-shot, greedy decoding and thinking off,
+  so these scores are not comparable with this page's thinking-mode results.
+  The report includes the pinned image, model revision and reproduction commands.
 </Note>
 
 ### Mamba ratio calculator

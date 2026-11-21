@@ -1,8 +1,8 @@
 // Qwen3.8-27B per-cell benchmark numbers. See _deployment.jsx for the
 // speed/accuracy schema.
 //
-// STRUCTURALLY UNMATCHED since the strategy->overlay migration: every entry
-// below keys on the removed `strategy` match dim, and the three gb300
+// STRUCTURALLY UNMATCHED since the strategy->overlay migration: the six legacy
+// GB300 entries key on the removed `strategy` match dim, and the three gb300
 // `high-throughput` cells they were measured against were deleted (MTP is now
 // the Speculative Decoding OVERLAY row, which never participates in cell
 // matching). No current cell tuple matches these rows, so the UI shows no
@@ -29,6 +29,92 @@
 // 96.44%. FP8 / BF16 GB300 GSM8K has not been measured and stays null below
 // (see journal 2026-08-14-1048-claude-jrn_f6c1265be8cbdf86c44fe36c).
 export const benchmarks = [
+  // H200 FP8 / bf16 SSM-state measurements and raw runs reported in
+  // https://github.com/sgl-project/sglang/issues/42024 by dhruvrnaik.
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single", spec: "eagle", tier: "high-throughput", ssmDtype: "bfloat16" },
+    sglang_version: "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 32, num_prompts: 160 },
+        ttft_ms: 528.48, tpot_ms: 14.17, tokens_per_sec_per_gpu: 9416.88 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 542.77, tpot_ms: 4.74, tokens_per_sec_per_gpu: 1707.48 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 1999.6, tpot_ms: 13.52, tokens_per_sec_per_gpu: 8972.17 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 32, num_prompts: 160 },
+        ttft_ms: 3298.16, tpot_ms: 23.6, tokens_per_sec_per_gpu: 10412.2 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 78.89, tpot_ms: 4.73, tokens_per_sec_per_gpu: 994.92 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 300.25, tpot_ms: 9.16, tokens_per_sec_per_gpu: 7382.3 },
+    ],
+    accuracy: { gsm8k_pct: 90.67 },
+    notes: "Reported by dhruvrnaik in #42024, 2026-09-30 to 2026-10-01: H200 TP1, FP8 weights, bf16 SSM state. Mean latency, not P50; median of three retained runs after two warmups. Total input+output throughput per GPU. Mamba ratio 3.74 (average request length 5120, target concurrency 64). GSM8K: all 1319 questions, zero-shot, greedy, thinking off; not comparable with the thinking-mode scores on this page.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single", spec: "none", tier: "high-throughput", ssmDtype: "bfloat16" },
+    sglang_version: "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 64, num_prompts: 320 },
+        ttft_ms: 2729.66, tpot_ms: 17.86, tokens_per_sec_per_gpu: 11212.39 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 525.83, tpot_ms: 10.22, tokens_per_sec_per_gpu: 839.05 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 5465.65, tpot_ms: 15.32, tokens_per_sec_per_gpu: 6973.43 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64, num_prompts: 320 },
+        ttft_ms: 18683.15, tpot_ms: 33.63, tokens_per_sec_per_gpu: 11104.9 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 75.25, tpot_ms: 10.1, tokens_per_sec_per_gpu: 482.74 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 884.36, tpot_ms: 11.47, tokens_per_sec_per_gpu: 5363.16 },
+    ],
+    accuracy: { gsm8k_pct: 90.37 },
+    notes: "Reported by dhruvrnaik in #42024, 2026-09-30 to 2026-10-01: H200 TP1, FP8 weights, bf16 SSM state. Mean latency, not P50; median of three retained runs after two warmups. Total input+output throughput per GPU. Mamba ratio 1.87 (average request length 5120, target concurrency 64). GSM8K: all 1319 questions, zero-shot, greedy, thinking off; not comparable with the thinking-mode scores on this page.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single", spec: "eagle", tier: "low-latency", ssmDtype: "bfloat16" },
+    sglang_version: "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 32, num_prompts: 160 },
+        ttft_ms: 547.13, tpot_ms: 13.88, tokens_per_sec_per_gpu: 9564.27 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 545.59, tpot_ms: 4.7, tokens_per_sec_per_gpu: 1722.41 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 1953.29, tpot_ms: 13.53, tokens_per_sec_per_gpu: 8985.12 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 32, num_prompts: 160 },
+        ttft_ms: 3267.16, tpot_ms: 23.55, tokens_per_sec_per_gpu: 10461.12 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 83.49, tpot_ms: 4.75, tokens_per_sec_per_gpu: 987.25 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 308.8, tpot_ms: 9.04, tokens_per_sec_per_gpu: 7391.09 },
+    ],
+    accuracy: { gsm8k_pct: 90.37 },
+    notes: "Reported by dhruvrnaik in #42024, 2026-09-30 to 2026-10-01: H200 TP1, FP8 weights, bf16 SSM state. Mean latency, not P50; median of three retained runs after two warmups. Total input+output throughput per GPU. Mamba ratio 4.21 (average request length 5120, target concurrency 64). GSM8K: all 1319 questions, zero-shot, greedy, thinking off; not comparable with the thinking-mode scores on this page.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", nodes: "single", spec: "none", tier: "low-latency", ssmDtype: "bfloat16" },
+    sglang_version: "94602c9c2b7cbdb8efd5c52802dac6a1c180089e",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 64, num_prompts: 320 },
+        ttft_ms: 2772.09, tpot_ms: 17.86, tokens_per_sec_per_gpu: 11162.95 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 532.95, tpot_ms: 10.18, tokens_per_sec_per_gpu: 841.27 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 5525.68, tpot_ms: 15.34, tokens_per_sec_per_gpu: 6945.62 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64, num_prompts: 320 },
+        ttft_ms: 18904.39, tpot_ms: 33.82, tokens_per_sec_per_gpu: 11016.86 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 1, num_prompts: 16 },
+        ttft_ms: 75.17, tpot_ms: 10.07, tokens_per_sec_per_gpu: 483.93 },
+      { workload: { dataset: "random", isl: 1024, osl: 256, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 874.09, tpot_ms: 11.46, tokens_per_sec_per_gpu: 5380.37 },
+    ],
+    accuracy: { gsm8k_pct: 90.3 },
+    notes: "Reported by dhruvrnaik in #42024, 2026-09-30 to 2026-10-01: H200 TP1, FP8 weights, bf16 SSM state. Mean latency, not P50; median of three retained runs after two warmups. Total input+output throughput per GPU. Mamba ratio 2.34 (average request length 5120, target concurrency 64). GSM8K: all 1319 questions, zero-shot, greedy, thinking off; not comparable with the thinking-mode scores on this page.",
+  },
   {
     match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", strategy: "balanced", nodes: "single" },
     sglang_version: "lmsysorg/sglang:dev @ c4271c3fe",
