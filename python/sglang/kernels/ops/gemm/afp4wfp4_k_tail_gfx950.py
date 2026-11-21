@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""aiter's Triton MXFP4 dense GEMM (gemm_afp4wfp4) on gfx950, with a tiling that keeps a masked K tail
-out of an LDS stage no full K block filled.
+"""aiter's Triton MXFP4 dense GEMM (gemm_afp4wfp4) on gfx950 with a K-tail-safe tiling.
 
 Workaround for triton-lang/triton#11256: a masked K-tail scale load keeps stale LDS (NaN). Drop this
 module, and call aiter's gemm_afp4wfp4 directly, once every ROCm image's Triton has the fix, which
@@ -104,8 +103,9 @@ def gemm_afp4wfp4_k_tail_safe(
 ) -> None:
     """y = x @ w.T for MXFP4 x [M, K/2], w [N, K/2] and their e8m0 [*, K/32] scales; writes y in place.
 
-    y is BF16 or FP16 and sets the output dtype. On gfx950 the tiling is narrowed when K's masked tail
-    would land in an unfilled LDS stage; on other HIP archs this is AITER's gemm_afp4wfp4 unchanged.
+    y is BF16 or FP16 and sets the output dtype.
+    On gfx950 the tiling is narrowed when K's masked tail lands in an unfilled LDS stage;
+    on other HIP archs this is AITER's gemm_afp4wfp4 unchanged.
     """
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 
