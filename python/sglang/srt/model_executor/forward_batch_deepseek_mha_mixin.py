@@ -208,6 +208,10 @@ class ForwardBatchDeepSeekMHAMixin:
 
         # chunk_capacity is the maximum number of tokens in each chunk
         chunk_capacity = self.get_max_chunk_capacity()
+        if chunk_capacity <= 0:
+            raise ValueError(
+                f"SGLANG_MAX_KV_CHUNK_CAPACITY={chunk_capacity} must be positive."
+            )
         if single_chunk:
             # The caller has already checked that the full packed prefix fits
             # chunk_capacity. One request-major chunk gives the fused kernel the

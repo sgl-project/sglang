@@ -1,6 +1,7 @@
 """ROCm packed prefix-chunk layout: no chunk exceeds SGLANG_MAX_KV_CHUNK_CAPACITY keys,
 each prefix token is covered once and in order, and only HIP takes this layout."""
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -156,8 +157,15 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         self.assertFalse(any(fb.prefix_chunk_has_zero_kv))
 
     def test_capacity_below_batch_size_packs_on_hip_and_raises_elsewhere(self):
-        # capacity // batch_size is 0, so no request-major chunk exists.
+        """A chunk capacity below the batch size packs on HIP and raises a clear error elsewhere."""
         prefix_lens, capacity = [5, 1, 1], 2
+        for is_hip, bad_capacity in itertools.product((False, True), (0, -2)):
+            with (
+                self.subTest(is_hip=is_hip, capacity=bad_capacity),
+                mock.patch.object(mix, "_is_hip", is_hip),
+                self.assertRaisesRegex(ValueError, "must be positive"),
+            ):
+                _prepare(prefix_lens=prefix_lens, capacity=bad_capacity)
         with mock.patch.object(mix, "_is_hip", False):
             with self.assertRaisesRegex(ValueError, "SGLANG_MAX_KV_CHUNK_CAPACITY"):
                 _prepare(prefix_lens=prefix_lens, capacity=capacity)
