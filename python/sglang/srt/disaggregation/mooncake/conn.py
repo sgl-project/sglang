@@ -2268,6 +2268,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            StateType.DSV4_C128,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2279,6 +2280,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            StateType.DSV4_C128,
         )
 
     def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
