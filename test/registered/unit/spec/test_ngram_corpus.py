@@ -733,6 +733,74 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.assertEqual(ids.tolist(), [3, 20])
 
 
+class TestNgramCorpusExternalSamDrafts(CustomTestCase):
+    """Pin what the external SAM drafts, so changes to how it is stored cannot
+    silently change draft order or content."""
+
+    DOCUMENTS = [
+        [1, 2, 3, 10, 11, 12],
+        [1, 2, 3, 20, 21],
+        [1, 2, 3, 20, 22],
+        [5, 2, 3, 30, 31],
+        [1, 2, 3, 40],
+        [7, 8, 9],
+    ]
+    # After "2 3", 20 is the most frequent continuation and 40 the most recent.
+    # After "20", 21 and 22 are tied on frequency and 22 is more recent.
+    # "9 2 3" is not in the corpus, so it matches through its suffix "2 3".
+    # "12" is only followed by a document separator, which is never drafted.
+    QUERIES = [[1, 2, 3], [9, 2, 3], [3], [20], [12], [99]]
+
+    def _first_drafts(self, match_type):
+        corpus = _make_corpus(
+            match_type,
+            draft_token_num=2,
+            max_bfs_breadth=1,
+            external_sam_budget=1,
+            external_corpus_documents=self.DOCUMENTS,
+        )
+        ids, _ = _batch_get(corpus, self.QUERIES)
+        return ids.reshape(-1, 2)[:, 1].tolist()
+
+    def test_bfs_drafts_most_recent_continuation(self):
+        self.assertEqual(self._first_drafts("BFS"), [40, 40, 40, 22, 0, 0])
+
+    def test_prob_drafts_most_frequent_continuation(self):
+        # The frequency tie between 21 and 22 goes to the smaller token id.
+        self.assertEqual(self._first_drafts("PROB"), [20, 20, 20, 21, 0, 0])
+
+    def test_full_draft_tree(self):
+        expected = [
+            [[10, 11, 12], [20, 21], [20, 22], [40]],
+            [[10], [20, 21], [20, 22], [30, 31], [40]],
+            [[10], [20, 21], [20, 22], [30, 31], [40]],
+            [[21], [22]],
+            [],
+            [],
+        ]
+        draft = 8
+        for match_type in ("BFS", "PROB"):
+            corpus = _make_corpus(
+                match_type,
+                draft_token_num=draft,
+                external_sam_budget=draft - 1,
+                external_corpus_documents=self.DOCUMENTS,
+            )
+            ids, masks = _batch_get(corpus, self.QUERIES)
+            ids = ids.reshape(-1, draft)
+            masks = masks.reshape(-1, draft, draft)
+            for query, row_ids, row_mask, expected_paths in zip(
+                self.QUERIES, ids, masks, expected
+            ):
+                with self.subTest(match_type=match_type, query=query):
+                    leaf_paths = corpus.leaf_paths_from_mask(
+                        row_ids.tolist(), row_mask.tolist()
+                    )
+                    # Drop the root token and the zero padding.
+                    drafted = sorted(path[1:] for path in leaf_paths if path[1:] != [0])
+                    self.assertEqual(drafted, expected_paths)
+
+
 class TestNgramCorpusMultiSam(CustomTestCase):
     """Verify multi-SAM add/remove/list and budget splitting."""
 
