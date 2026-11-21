@@ -8,8 +8,9 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn.utils import weight_norm
+from torch.nn.utils import remove_weight_norm, weight_norm
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -188,6 +189,7 @@ class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
                 _cfg(config, "dec_c_mults", default=[1, 2, 4, 8, 16])
             ),
         )
+        self.register_load_state_dict_post_hook(_fold_weight_norm)
 
     @property
     def temporal_compression_factor(self) -> int:
@@ -218,6 +220,33 @@ class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
         z = self._denormalize_latent(latent.to(decoder_device)).to(decoder_dtype)
         audio = self.decoder(z).clamp(-1.0, 1.0).to(latent.dtype)
         return audio.squeeze(0) if squeeze else audio
+
+
+def _fold_weight_norm(module: nn.Module, incompatible_keys: Any) -> None:
+    """Fold each weight norm into its convolution once the checkpoint is loaded.
+
+    The weight norm hook recomputes the weight at every forward and keeps it
+    on the module beside weight_g and weight_v, so decode held a second copy
+    of every weight on the device. Folding on the device that runs decode
+    computes exactly the weights the hook did, and writing them into the
+    weight_v storage keeps the parameter layout the load created.
+    """
+    device = get_local_torch_device()
+    for m in module.modules():
+        if not hasattr(m, "weight_g"):
+            continue
+        storage = m.weight_v.detach()
+        requires_grad = m.weight_v.requires_grad
+        home = storage.device
+        m.to(device)
+        remove_weight_norm(m)
+        with torch.no_grad():
+            storage.copy_(m.weight)
+        m.weight = nn.Parameter(storage, requires_grad=requires_grad)
+        m.to(home)
+    if device.type != "cpu":
+        # Release the fold's temporaries so the device keeps only the weights.
+        torch.get_device_module(device).empty_cache()
 
 
 EntryClass = Cosmos3AVAEAudioTokenizer
