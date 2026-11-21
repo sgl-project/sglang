@@ -50,6 +50,28 @@ def _parse_attrs(attrs: str) -> dict:
     return {m["k"]: _unescape_attr(m["v"]) for m in _ATTR_RE.finditer(attrs)}
 
 
+def _skippable_len(text: str, opener: str, stops: tuple[str, ...]) -> int:
+    """How much of ``text`` to skip before the next element can start.
+
+    The next element is an ``opener`` header (the tag, then whitespace) or one
+    of ``stops``. Stray text and a header without whitespace after its tag are
+    skipped, as the non-streaming ``finditer`` skips them. Returns 0 when
+    ``text`` starts with a stop or may still grow into an element.
+    """
+    markers = (opener, *stops)
+    if (
+        text.startswith(stops)
+        or any(marker.startswith(text) for marker in markers)
+        or re.match(re.escape(opener) + r"\s", text)
+    ):
+        return 0
+    starts = [i for marker in markers if (i := text.find(marker, 1)) >= 0]
+    if starts:
+        return min(starts)
+    # Keep a marker the next chunk may complete.
+    return len(text) - partial_suffix_len(text, list(markers))
+
+
 class KimiK3Detector(BaseFormatDetector):
     """Detector for the Kimi K3 XTML tool-call format.
 
@@ -285,7 +307,14 @@ class KimiK3Detector(BaseFormatDetector):
                 re.DOTALL,
             )
             if header is None:
-                break  # Incomplete header, tools close, or malformed XTML.
+                # Skip what cannot start the next element, as the non-streaming
+                # decoder does; wait on an incomplete header or the tools close.
+                stops = (call_close, TOOLS_CLOSE) if self._in_call else (TOOLS_CLOSE,)
+                skip = _skippable_len(remaining, f"<|open|>{tag}", stops)
+                if not skip:
+                    break
+                self._tool_pos += skip
+                continue
             attrs = _parse_attrs(header["attrs"])
             if not self._in_call:
                 name = attrs.get("tool", "")
