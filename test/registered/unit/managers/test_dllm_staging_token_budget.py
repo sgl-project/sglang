@@ -1,0 +1,1161 @@
+"""Regression tests for the dLLM staging token-budget fallback.
+
+Bug 1: ``PrefillAdder._get_dllm_remain_tokens`` falls back to
+``rem_dllm_tokens`` when ``rem_total_tokens`` is exhausted (it charges
+``max_new_tokens`` upfront per staging row every round, so long-output
+workloads drive it negative long before the KV pool fills). Uncapped, the
+fallback can grant a staging row more than ``block_size`` tokens, producing a
+variable-length row that crashes the denoise algorithms' uniform-block reshape
+(``view(B, block_size)``).
+
+Bug 2: the fallback must only override an exhausted ``rem_total_tokens``, not
+real pool exhaustion. A fresh block still charges
+``ceil_paged(block_size) + per_req_token_overhead`` against ``cur_rem_tokens``
+(``_update_prefill_budget`` reserves the page-ceiled extend plus the
+per-request allocation rounding through ``PrefillBudget.reserve``), so
+granting one at zero current capacity drives the budget negative and
+``alloc_for_extend`` raises on the real allocation. Rows reusing retained
+FDFO KV (``reuses_kv=True``) allocate zero fresh tokens and must stay
+admittable regardless of current capacity.
+
+Hardenings on top:
+
+- The reuse exemption mirrors ``alloc_for_extend``'s ``reuse_kv`` predicate
+  (``kv.holds_kv and bool(dllm_incomplete_ids)``): a row with incomplete ids
+  but a freed req slot re-allocates a full fresh block, so it must NOT bypass
+  the capacity gate.
+- The reuse grant is uniform across budget regimes (only the dLLM concurrency
+  budget applies), fixing an inversion where a reuse row was refused at
+  small-positive ``rem_total_tokens`` yet admitted at negative.
+- ``process_dllm_staging_reqs`` treats NO_TOKEN as a per-row refusal: a
+  fresh-needing row at the head no longer starves zero-cost reuse rows behind
+  it, and one budget-exhausting admission per round no longer serializes the
+  rest of the queue.
+- ``_maybe_break_dllm_staging_stall`` breaks the livelock the capacity gate
+  can otherwise create: retained rows that all need a fresh block can hold the
+  whole pool, so every round refuses every row, admits nothing, and nothing
+  ever resolves or frees KV. A zero-admission round with a capacity refusal
+  (and no in-flight batch) retracts one retained row — picked by the standard
+  decode-retraction order — to fund the next round. A sole holder that stalls
+  again without committed progress can never fit and is aborted instead of
+  thrashing through retract/re-prefill forever.
+
+The capped fallback and whole-block rounding only apply to the classic dLLM
+staging path; separate-context-encoding models keep upstream's fallback, whose
+``cur_rem_tokens - page_size`` cap already protects the pool.
+"""
+
+import unittest
+from array import array
+from types import SimpleNamespace
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    _leave_owner_list,
+)
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def _make_adder(
+    *,
+    rem_dllm_tokens: int,
+    dllm_block_size: int,
+    available_tokens: int,
+    rem_total_token_offset: int = 0,
+    page_size: int = 1,
+) -> PrefillAdder:
+    """Build a PrefillAdder with only the state `_get_dllm_remain_tokens` reads.
+
+    `rem_total_tokens` and `cur_rem_tokens` are properties over the same
+    allocator/tree-cache sizes minus the memory_budget's respective offsets.
+    Mirror the real __init__ invariant (`total_offset >= current_offset`, since
+    the total additionally accrues max_new_tokens and the running-batch
+    reservation): keep `current_offset` at 0, drive `cur_rem_tokens` via
+    `available_tokens` and `rem_total_tokens` via `rem_total_token_offset`.
+    Use the real `PrefillBudget` so the tests exercise the production offset
+    arithmetic, not a re-implementation of it.
+    """
+    adder = PrefillAdder.__new__(PrefillAdder)
+    adder.rem_dllm_tokens = rem_dllm_tokens
+    adder.dllm_block_size = dllm_block_size
+    adder.page_size = page_size
+    # No CP sharding and no KV sharding in these tests: the logical page is
+    # the page, and the per-request allocation-rounding overhead is one
+    # logical page (see PrefillAdder.__init__).
+    adder.logical_page_size = page_size
+    adder.per_req_token_overhead = page_size
+    adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=False)
+    adder.token_to_kv_pool_allocator = SimpleNamespace(
+        available_size=lambda: available_tokens, page_size=page_size
+    )
+    adder.tree_cache = SimpleNamespace(
+        evictable_size=lambda: 0, supports_mamba=lambda: False
+    )
+    adder.memory_budget = PrefillBudget(
+        adder.token_to_kv_pool_allocator, adder.tree_cache
+    )
+    adder.memory_budget.total_offset = rem_total_token_offset
+    return adder
+
+
+class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
+    BLOCK_SIZE = 32
+
+    def test_fallback_refuses_a_sub_block_dllm_budget(self):
+        # A partial grant is as unusable as an oversized one: the denoise
+        # reshape needs whole block_size rows, so a budget below one block
+        # must yield 0 (NO_TOKEN) rather than a ragged row.
+        adder = _make_adder(
+            rem_dllm_tokens=16,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=4096,
+            rem_total_token_offset=4196,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
+
+    def test_fallback_grants_exactly_one_block_at_the_boundary(self):
+        # Exactly one block of dLLM budget: grant it whole, don't round down.
+        adder = _make_adder(
+            rem_dllm_tokens=self.BLOCK_SIZE,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=4096,
+            rem_total_token_offset=4196,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
+
+    def test_fallback_page_rounds_an_unaligned_block(self):
+        # The full-charge boundary: _update_prefill_budget debits
+        # ceil_paged(extend) plus one per_req_token_overhead (one logical page
+        # without KV sharding), so with block_size not a page multiple the
+        # gate is ceil_paged(24) + 16 == 48 at page_size 16, not 24 + 16. One
+        # token below refuses; the boundary grants exactly one block.
+        block, page = 24, 16
+        for available, expected in ((47, 0), (48, block)):
+            adder = _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=block,
+                available_tokens=available,
+                rem_total_token_offset=available + 100,
+                page_size=page,
+            )
+            self.assertEqual(adder._get_dllm_remain_tokens(), expected)
+
+    def test_fallback_reuse_rows_bypass_the_current_capacity_gate(self):
+        # Retained incomplete-block rows take the reuse_kv path in
+        # alloc_for_extend and allocate zero fresh tokens: they must stay
+        # admittable at zero (or negative) current capacity, or their
+        # retained KV is stranded. The only case that grants a reuse row at
+        # NEGATIVE pool headroom — exactly the state the exemption exists
+        # for; the other reuse cases run with pool headroom to spare.
+        adder = _make_adder(
+            rem_dllm_tokens=4096,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=-100,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(reuses_kv=True), self.BLOCK_SIZE)
+        # The same state refuses a fresh-KV row.
+        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
+
+    def test_normal_path_grants_one_full_block(self):
+        # Positive rem_total_tokens at or above one block: grant exactly one
+        # block (the min already caps at block_size). No cur_rem_tokens gate
+        # needed: cur_rem_tokens >= rem_total_tokens by construction. The
+        # only case where a genuine positive budget GRANTS through the normal
+        # path; every other case reaches it just to refuse.
+        adder = _make_adder(
+            rem_dllm_tokens=4096,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=100,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
+
+    def test_reuse_rows_get_a_block_at_small_positive_rem_total(self):
+        # Monotonicity: a reuse row allocates zero fresh tokens, so a genuine
+        # small-positive rem_total_tokens must not refuse it. Previously it
+        # was refused here (sub-block budget rounds to 0 on the normal path)
+        # yet admitted at NEGATIVE rem_total via the fallback exemption — a
+        # logical inversion.
+        adder = _make_adder(
+            rem_dllm_tokens=4096,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=20,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(reuses_kv=True), self.BLOCK_SIZE)
+        # The same state still rounds a fresh row to zero.
+        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
+
+    def test_reuse_rows_still_respect_the_dllm_budget(self):
+        # The reuse exemption only bypasses the token budgets; the dLLM
+        # concurrency budget still applies. A healthy pool makes the refusal
+        # attributable to the dLLM budget alone (the exemption ignores the
+        # token budgets outright, so exercising more budget regimes here
+        # walks the same line).
+        adder = _make_adder(
+            rem_dllm_tokens=16,  # < block
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=4096,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(reuses_kv=True), 0)
+        # Inclusive: a budget of exactly one block grants it.
+        at_boundary = _make_adder(
+            rem_dllm_tokens=self.BLOCK_SIZE,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=4096,
+        )
+        self.assertEqual(
+            at_boundary._get_dllm_remain_tokens(reuses_kv=True), self.BLOCK_SIZE
+        )
+
+
+class _StubReq:
+    """Just enough of Req for `add_dllm_staging_req`."""
+
+    def __init__(self, *, rid, fill_len, incomplete_len, req_pool_idx, prefix_len=0):
+        self.rid = rid
+        self.full_untruncated_fill_ids = list(range(fill_len))
+        self.prefix_len = prefix_len
+        self.lock = None
+        self.last_node = SimpleNamespace()
+        self.dllm_incomplete_ids = list(range(incomplete_len))
+        # holds_kv mirrors ReqKvInfo's property (req_pool_idx is not None);
+        # holds_mamba is irrelevant here (the plain PrefillBudget has no
+        # state slots).
+        self.kv = SimpleNamespace(
+            req_pool_idx=req_pool_idx,
+            holds_kv=req_pool_idx is not None,
+            holds_mamba=True,
+        )
+        self.retracted_stain = False
+        self.sampling_params = SimpleNamespace(max_new_tokens=64)
+        self.extend_end = None
+
+    def is_dllm_prefill(self):
+        return False
+
+    @property
+    def extend_len(self):
+        return self.extend_end - self.prefix_len
+
+
+def _arm_admission(adder: PrefillAdder) -> PrefillAdder:
+    """Add the state `add_dllm_staging_req` needs beyond the budget getter."""
+    adder.can_run_list = []
+    adder.exact_chunk_fill = False
+    adder.rem_input_tokens = 1 << 30
+    adder.rem_chunk_tokens = None
+    adder.log_hit_tokens = 0
+    adder.log_input_tokens = 0
+    adder.log_replay_tokens = 0
+    adder.reprocessed_log_hit_tokens = 0
+    adder.reprocessed_log_input_tokens = 0
+    return adder
+
+
+class TestDllmStagingReuseExemptionPredicate(CustomTestCase):
+    """`add_dllm_staging_req` must mirror `alloc_for_extend`'s reuse_kv
+    predicate: exempt iff kv.holds_kv AND incomplete ids exist."""
+
+    BLOCK_SIZE = 32
+
+    def _exhausted_adder(self):
+        # Real pool exhaustion: cur_rem_tokens == 0, rem_total_tokens < 0.
+        return _arm_admission(
+            _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=0,
+                rem_total_token_offset=100,
+            )
+        )
+
+    def test_incomplete_ids_with_a_freed_slot_is_not_exempt(self):
+        # incomplete ids but req_pool_idx None: alloc_for_extend computes
+        # reuse_kv=False and allocates a full fresh block, so the gate must
+        # treat the row as fresh and refuse it at pool exhaustion.
+        adder = self._exhausted_adder()
+        req = _StubReq(rid="freed", fill_len=8, incomplete_len=8, req_pool_idx=None)
+        self.assertEqual(adder.add_dllm_staging_req(req), AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_retained_slot_with_incomplete_ids_is_exempt(self):
+        # Both predicate halves hold: the true reuse row is admitted at pool
+        # exhaustion. The tail recheck may return NO_TOKEN (no budget for a
+        # NEXT row), but this row is already in can_run_list.
+        adder = self._exhausted_adder()
+        req = _StubReq(rid="reuse", fill_len=8, incomplete_len=8, req_pool_idx=7)
+        adder.add_dllm_staging_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+
+    def test_retained_slot_without_incomplete_ids_is_not_exempt(self):
+        adder = self._exhausted_adder()
+        req = _StubReq(rid="fresh", fill_len=8, incomplete_len=0, req_pool_idx=7)
+        self.assertEqual(adder.add_dllm_staging_req(req), AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+
+
+class TestDllmStagingGateChargeEqualsDebit(CustomTestCase):
+    """The fallback gate's block_charge must equal what the admission really
+    debits from cur_rem_tokens (`_update_prefill_budget` through the real
+    `PrefillBudget.reserve`): admitted at a pool of exactly block_charge, a
+    fresh row must leave cur_rem_tokens at exactly 0 — over-charging would
+    refuse rows that fit, under-charging admits rows alloc_for_extend
+    cannot serve."""
+
+    def test_admission_at_the_gate_boundary_drains_the_pool_exactly(self):
+        for block, page in ((32, 1), (32, 16), (24, 16)):
+            charge = -(-block // page) * page + page
+            adder = _arm_admission(
+                _make_adder(
+                    rem_dllm_tokens=4096,
+                    dllm_block_size=block,
+                    available_tokens=charge,
+                    rem_total_token_offset=charge + 100,
+                    page_size=page,
+                )
+            )
+            req = _StubReq(
+                rid="fresh", fill_len=block, incomplete_len=0, req_pool_idx=7
+            )
+            adder.add_dllm_staging_req(req)
+            self.assertEqual(adder.can_run_list, [req], (block, page))
+            self.assertEqual(int(adder.cur_rem_tokens), 0, (block, page))
+
+
+class _ScriptedAdder:
+    """Adder stub replaying fixed per-rid results for the staging loop."""
+
+    def __init__(self, results):
+        self.results = dict(results)
+        self.calls = []
+
+    def add_dllm_staging_req(self, req):
+        self.calls.append(req.rid)
+        return self.results[req.rid]
+
+
+class TestProcessDllmStagingReqsPerRowRefusal(CustomTestCase):
+    """NO_TOKEN must refuse one row, not abort the round: rows behind a
+    refused fresh-needing head (e.g. zero-cost reuse rows) still get their own
+    admission check. A post-admission NO_TOKEN (the tail recheck in
+    `add_dllm_staging_req`) is the same return value to this loop, so the
+    refused-head case covers it. `process_dllm_staging_reqs` never touches
+    `self`, so call it unbound."""
+
+    @staticmethod
+    def _run(adder, rids):
+        # Rows holding their KV: the loop's non-holder re-match (covered by
+        # TestProcessDllmStagingReqsRematch) must leave them alone.
+        reqs = [
+            SimpleNamespace(rid=rid, kv=SimpleNamespace(holds_kv=True), prefix_len=0)
+            for rid in rids
+        ]
+        scheduler = SimpleNamespace(tree_cache=object())
+        return SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, reqs)
+
+    def test_refused_head_does_not_starve_rows_behind_it(self):
+        adder = _ScriptedAdder(
+            {
+                "fresh-head": AddReqResult.NO_TOKEN,
+                "reuse-1": AddReqResult.CONTINUE,
+                "reuse-2": AddReqResult.CONTINUE,
+            }
+        )
+        result = self._run(adder, ["fresh-head", "reuse-1", "reuse-2"])
+        self.assertEqual(adder.calls, ["fresh-head", "reuse-1", "reuse-2"])
+        # Any refusal still reports NO_TOKEN so incoming reqs don't jump
+        # ahead of starved staging rows (_process_batch_by_phase).
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def test_all_admitted_returns_continue(self):
+        adder = _ScriptedAdder({"a": AddReqResult.CONTINUE, "b": AddReqResult.CONTINUE})
+        result = self._run(adder, ["a", "b"])
+        self.assertEqual(result, AddReqResult.CONTINUE)
+
+    def test_batch_by_phase_propagates_the_staging_refusal(self):
+        # The refusal signal feeds the stall breaker: a refused staging pass
+        # must come back as NO_TOKEN from _process_batch_by_phase (and skip
+        # the incoming reqs, which would jump ahead of starved staging rows).
+        incoming_calls = []
+        stub = SimpleNamespace(
+            process_dllm_staging_reqs=lambda adder, reqs: AddReqResult.NO_TOKEN,
+            process_dllm_incoming_reqs=lambda *a, **k: incoming_calls.append(a),
+        )
+        staged = SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_DECODE)
+        incoming = SimpleNamespace(dllm_phase=DllmReqPhase.INCOMING_DECODE)
+        result = SchedulerDllmMixin._process_batch_by_phase(
+            stub,
+            None,
+            [staged, incoming],
+            DllmReqPhase.STAGING_DECODE,
+            DllmReqPhase.INCOMING_DECODE,
+            running_batch=None,
+        )
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(incoming_calls, [])
+
+    def test_batch_by_phase_propagates_an_incoming_refusal(self):
+        # Retained rows can also starve incoming rows (the pool they hold
+        # refuses every admission while this branch keeps winning the
+        # prefill-over-decode priority), so an incoming NO_TOKEN must reach
+        # the stall breaker too.
+        stub = SimpleNamespace(
+            process_dllm_staging_reqs=lambda adder, reqs: AddReqResult.CONTINUE,
+            process_dllm_incoming_reqs=(
+                lambda adder, reqs, running_batch: AddReqResult.NO_TOKEN
+            ),
+        )
+        staged = SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_DECODE)
+        incoming = SimpleNamespace(dllm_phase=DllmReqPhase.INCOMING_DECODE)
+        result = SchedulerDllmMixin._process_batch_by_phase(
+            stub,
+            None,
+            [staged, incoming],
+            DllmReqPhase.STAGING_DECODE,
+            DllmReqPhase.INCOMING_DECODE,
+            running_batch=None,
+        )
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def _process_dllm_batches(self, prefill_reqs, decode_reqs):
+        # _process_dllm_batches must hand the refusal on to its caller (the
+        # breaker reads it there); testing _process_batch_by_phase alone
+        # leaves that hop unpinned.
+        stub = SimpleNamespace(
+            dllm_manager=SimpleNamespace(
+                get_prefill_requests=lambda: prefill_reqs,
+                get_decode_requests=lambda: decode_reqs,
+            ),
+            dllm_config=SimpleNamespace(requires_separate_context_encoding=False),
+            _process_batch_by_phase=lambda *a, **k: AddReqResult.NO_TOKEN,
+        )
+        return SchedulerDllmMixin._process_dllm_batches(stub, None, running_batch=None)
+
+    def test_dllm_batches_pass_the_refusal_on_from_the_prefill_branch(self):
+        _, result = self._process_dllm_batches([SimpleNamespace()], [])
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+    def test_dllm_batches_pass_the_refusal_on_from_the_decode_branch(self):
+        _, result = self._process_dllm_batches([], [SimpleNamespace()])
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+
+class TestGetNewBatchDllmCallsTheStallBreaker(CustomTestCase):
+    """The breaker only helps if the round loop calls it: a zero-admission
+    round must hand its refusal signal to the breaker, and a round that
+    admitted rows must not."""
+
+    def _run(self, can_run_list):
+        calls, reached = [], []
+        adder = SimpleNamespace(can_run_list=can_run_list)
+
+        def process_dllm_batches(adder, running_batch):
+            reached.append(True)
+            return None, AddReqResult.NO_TOKEN
+
+        stub = SimpleNamespace(
+            enable_priority_preemption=False,
+            _should_skip_prefill=lambda running_batch: False,
+            _ack_waiting_health_checks=lambda: None,
+            waiting_queue=SimpleNamespace(reorder=lambda order: None),
+            policy=SimpleNamespace(calc_priority=lambda queue: None),
+            _create_dllm_prefill_adder=lambda running_bs, running_batch: adder,
+            _fetch_waiting_reqs=lambda: None,
+            _process_dllm_batches=process_dllm_batches,
+            _maybe_break_dllm_staging_stall=lambda result, running_batch: calls.append(
+                result
+            ),
+        )
+        running_batch = SimpleNamespace(reqs=[], batch_is_full=False)
+        out = None
+        try:
+            out = SchedulerDllmMixin.get_new_batch_dllm(stub, running_batch, [])
+        except AttributeError:
+            # Past the breaker call, the admitted path needs a real scheduler;
+            # only whether the breaker ran matters here.
+            pass
+        self.assertEqual(reached, [True])
+        return calls, out
+
+    def test_zero_admission_round_calls_the_breaker_with_its_signal(self):
+        calls, out = self._run([])
+        self.assertEqual(calls, [AddReqResult.NO_TOKEN])
+        self.assertIsNone(out)
+
+    def test_round_that_admitted_rows_does_not_call_the_breaker(self):
+        calls, _ = self._run([SimpleNamespace()])
+        self.assertEqual(calls, [])
+
+
+class _StubStallReq:
+    """Just enough of Req for `_maybe_break_dllm_staging_stall`."""
+
+    owner_list = None
+
+    def __init__(self, *, rid, holds_kv, origin_len=64, output_len=0, priority=None):
+        self.rid = rid
+        self.kv = SimpleNamespace(holds_kv=holds_kv)
+        self.origin_input_ids = list(range(origin_len))
+        self.output_ids = list(range(output_len))
+        self.priority = priority
+        self.dllm_config = SimpleNamespace(
+            requires_separate_context_encoding=False, block_size=32
+        )
+        self.dllm_incomplete_ids = array("q", [7] * 4)
+        self.dllm_algo_state = object()
+        self.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.dllm_stall_retract_committed = None
+        self.reset_calls = 0
+        self.to_finish = None
+
+    def reset_for_retract(self):
+        # Req.reset_for_retract ends by resetting the dLLM progress.
+        self.reset_calls += 1
+        ReqDllmMixin.reset_dllm_progress(self)
+
+    def request_finish(self, reason):
+        self.to_finish = reason
+
+
+def _dllm_waiting_queue(reqs):
+    queue = IndexedReqList(ListKind.DLLM)
+    move(reqs, queue)
+    return queue
+
+
+class _StubRetirer:
+    def __init__(self, *, resumable):
+        self.resumable = resumable
+        self.retracted = []
+        self.aborted = []
+
+    def retract(self, req, *, offload_kv):
+        self.retracted.append(req)
+        return self.resumable
+
+    def abort_retracted(self, req, *, reason):
+        # The real retirer takes the request out of the list it is in.
+        _leave_owner_list(req)
+        self.aborted.append((req, reason))
+
+
+class TestDllmStagingStallBreaker(CustomTestCase):
+    """The capacity gate can livelock a small pool: retained rows that all
+    need a fresh block hold every KV slot, every round refuses every row, and
+    with nothing admitted nothing ever resolves or frees KV. A zero-admission
+    round with a capacity refusal must retract one retained row. The method
+    only reads scheduler attributes, so call it unbound on a stub."""
+
+    BLOCK_SIZE = 32
+
+    def setUp(self):
+        from sglang.srt.runtime_context import get_context
+
+        # Victim selection reads get_schedule().retraction_policy and the
+        # unresumable branch words its abort by disaggregation mode.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    @staticmethod
+    def _scheduler(reqs, *, resumable=True):
+        return SimpleNamespace(
+            dllm_manager=SimpleNamespace(waiting_queue=_dllm_waiting_queue(reqs)),
+            tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: False),
+            request_retirer=_StubRetirer(resumable=resumable),
+            dllm_config=SimpleNamespace(
+                requires_separate_context_encoding=False, block_size=32
+            ),
+        )
+
+    @staticmethod
+    def _fire(scheduler, *, staging_result=AddReqResult.NO_TOKEN, running_reqs=()):
+        SchedulerDllmMixin._maybe_break_dllm_staging_stall(
+            scheduler, staging_result, SimpleNamespace(reqs=list(running_reqs))
+        )
+
+    def test_stuck_round_retracts_the_newest_retained_row_on_ties(self):
+        # Oldest first in the waiting queue; the fresh row holds no KV and is
+        # not a candidate. With equal committed work the retraction order is
+        # stable, so the tie falls to the newest retained row.
+        old = _StubStallReq(rid="old", holds_kv=True)
+        new = _StubStallReq(rid="new", holds_kv=True)
+        fresh = _StubStallReq(rid="fresh", holds_kv=False)
+        scheduler = self._scheduler([old, fresh, new])
+
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [new])
+        self.assertEqual(new.reset_calls, 1)
+        # The unresolved block cannot survive without its retained KV.
+        self.assertEqual(len(new.dllm_incomplete_ids), 0)
+        self.assertIsNone(new.dllm_algo_state)
+        # The victim rejoins as incoming and stays queued for re-prefill.
+        self.assertEqual(new.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+        self.assertIn(new, list(scheduler.dllm_manager.waiting_queue))
+        # No one else was touched.
+        self.assertEqual(old.reset_calls, 0)
+        self.assertEqual(fresh.reset_calls, 0)
+
+    def test_victim_is_the_least_committed_retained_row(self):
+        # The breaker reuses ScheduleBatch._get_decode_retraction_order: the
+        # default length policy retracts the fewest committed output tokens
+        # first (the least work to recompute), not simply the newest row.
+        old_bare = _StubStallReq(rid="old-bare", holds_kv=True, output_len=0)
+        new_rich = _StubStallReq(rid="new-rich", holds_kv=True, output_len=16)
+        scheduler = self._scheduler([old_bare, new_rich])
+
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [old_bare])
+        self.assertEqual(new_rich.reset_calls, 0)
+
+    def test_priority_retraction_policy_picks_the_lowest_priority_victim(self):
+        from sglang.srt.runtime_context import get_context
+
+        # Under retraction_policy="priority" the shared order ranks by
+        # request priority before committed length, so the breaker cannot
+        # invert priority scheduling by retracting a high-priority row.
+        override = get_context().override_server_args(
+            enable_priority_scheduling=True, retraction_policy="priority"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        important = _StubStallReq(
+            rid="important", holds_kv=True, output_len=0, priority=10
+        )
+        expendable = _StubStallReq(
+            rid="expendable", holds_kv=True, output_len=16, priority=1
+        )
+        scheduler = self._scheduler([important, expendable])
+
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [expendable])
+        self.assertEqual(important.reset_calls, 0)
+
+    def test_short_prompt_victim_rejoins_as_incoming_decode(self):
+        # Mirrors Req.reset_dllm_progress: a committed length shorter than one
+        # block restarts in the decode phase on the classic path.
+        victim = _StubStallReq(rid="short", holds_kv=True, origin_len=8)
+        scheduler = self._scheduler([victim])
+        self._fire(scheduler)
+        self.assertEqual(victim.dllm_phase, DllmReqPhase.INCOMING_DECODE)
+
+    def test_no_fire_without_a_capacity_refusal(self):
+        # A round can admit nothing simply because nothing was staged or the
+        # batch was full (OTHER); only a NO_TOKEN refusal means the gate is
+        # starving rows.
+        retained = _StubStallReq(rid="retained", holds_kv=True)
+        for result in (AddReqResult.CONTINUE, AddReqResult.OTHER):
+            scheduler = self._scheduler([retained])
+            self._fire(scheduler, staging_result=result)
+            self.assertEqual(scheduler.request_retirer.retracted, [], result)
+
+    def test_no_fire_while_a_running_batch_is_in_flight(self):
+        # In-flight work can still finish and free KV, so the stall is not
+        # proven; never retract while progress is possible.
+        retained = _StubStallReq(rid="retained", holds_kv=True)
+        scheduler = self._scheduler([retained])
+        self._fire(scheduler, running_reqs=[object()])
+        self.assertEqual(scheduler.request_retirer.retracted, [])
+
+    def test_no_fire_without_a_retained_row(self):
+        # Nothing to free: the refusal is not caused by retained staging KV.
+        scheduler = self._scheduler([_StubStallReq(rid="fresh", holds_kv=False)])
+        self._fire(scheduler)
+        self.assertEqual(scheduler.request_retirer.retracted, [])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+    def test_unresumable_victim_is_aborted_and_dequeued(self):
+        victim = _StubStallReq(rid="unresumable", holds_kv=True)
+        scheduler = self._scheduler([victim], resumable=False)
+
+        self._fire(scheduler)
+
+        self.assertIsNotNone(victim.to_finish)
+        self.assertEqual(
+            scheduler.request_retirer.aborted, [(victim, victim.to_finish)]
+        )
+        self.assertNotIn(victim, list(scheduler.dllm_manager.waiting_queue))
+
+    def test_sole_holder_aborts_after_a_no_progress_repeat_stall(self):
+        from http import HTTPStatus
+
+        # A sole holder that stalls again with no committed progress since its
+        # previous stall retraction can never fit (the admission budgets
+        # already count evictable cache), so the second firing aborts it
+        # instead of looping retract/re-prefill forever.
+        victim = _StubStallReq(rid="oversized", holds_kv=True, output_len=4)
+        scheduler = self._scheduler([victim])
+
+        self._fire(scheduler)
+        self.assertEqual(scheduler.request_retirer.retracted, [victim])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+        # Re-admitted, re-prefilled to the same point, stalled again.
+        victim.kv.holds_kv = True
+        self._fire(scheduler)
+
+        self.assertIsNotNone(victim.to_finish)
+        self.assertEqual(victim.to_finish.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            scheduler.request_retirer.aborted, [(victim, victim.to_finish)]
+        )
+        self.assertNotIn(victim, list(scheduler.dllm_manager.waiting_queue))
+
+    def test_sole_holder_with_progress_is_retracted_again(self):
+        # Committed progress between the two stalls proves the loop
+        # terminates (each resolved block commits tokens until max_new_tokens
+        # or finish), so the breaker keeps retracting instead of aborting.
+        victim = _StubStallReq(rid="slow", holds_kv=True, output_len=4)
+        scheduler = self._scheduler([victim])
+
+        self._fire(scheduler)
+        victim.kv.holds_kv = True
+        victim.output_ids.extend(range(8))
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [victim, victim])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+    def test_repeat_stall_keeps_retracting_while_other_holders_remain(self):
+        # With more than one holder the stall is not self-inflicted: freeing
+        # the other rows can still unstick the victim, so an unchanged
+        # committed length is no proof it cannot fit.
+        victim = _StubStallReq(rid="small", holds_kv=True, output_len=0)
+        other = _StubStallReq(rid="big", holds_kv=True, output_len=16)
+        scheduler = self._scheduler([victim, other])
+
+        self._fire(scheduler)
+        victim.kv.holds_kv = True
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [victim, victim])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+    def test_retraction_funds_the_next_rounds_admission(self):
+        # The loop the breaker exists to close, at unit scope: the stalled
+        # round's gate refuses a fresh block at zero pool headroom; the
+        # breaker retracts the retained row; with that row's tokens back in
+        # the pool the same gate grants, so the next round can admit.
+        block_charge = self.BLOCK_SIZE + 1  # ceil_paged(block) + overhead, page 1
+        pool = {"free": 0}
+
+        def gate():
+            adder = _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=pool["free"],
+                rem_total_token_offset=pool["free"] + 100,
+            )
+            return adder._get_dllm_remain_tokens()
+
+        self.assertEqual(gate(), 0)
+
+        victim = _StubStallReq(rid="held", holds_kv=True)
+        scheduler = self._scheduler([victim])
+        retirer = scheduler.request_retirer
+        real_retract = retirer.retract
+
+        def retract_frees_the_row(req, *, offload_kv):
+            pool["free"] += block_charge
+            return real_retract(req, offload_kv=offload_kv)
+
+        retirer.retract = retract_frees_the_row
+        self._fire(scheduler)
+
+        self.assertEqual(retirer.retracted, [victim])
+        self.assertEqual(gate(), self.BLOCK_SIZE)
+
+
+class TestProcessDllmStagingReqsRematch(CustomTestCase):
+    """A staged row that holds no KV rides a tree prefix match nothing pins
+    (a capacity-refused admission flipped it to STAGING_*, or a stall
+    retraction's requeue was refused the same way), so the staging loop must
+    re-match it against the tree before every admission attempt, exactly as
+    the incoming path does. Rows that hold their KV keep their prefix in
+    their own row and must not be re-matched mid-generation; rows with no
+    matched prefix have nothing to refresh."""
+
+    @staticmethod
+    def _staged(rid, *, holds_kv, prefix_len):
+        req = SimpleNamespace(
+            rid=rid,
+            kv=SimpleNamespace(holds_kv=holds_kv),
+            prefix_len=prefix_len,
+            rematches=[],
+        )
+        req.init_next_round_input = req.rematches.append
+        return req
+
+    def _run(self, reqs):
+        tree_cache = object()
+        scheduler = SimpleNamespace(tree_cache=tree_cache)
+        adder = _ScriptedAdder({req.rid: AddReqResult.CONTINUE for req in reqs})
+        SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, reqs)
+        return tree_cache, adder
+
+    def test_non_holder_with_a_prefix_is_rematched_before_admission(self):
+        req = self._staged("riding", holds_kv=False, prefix_len=64)
+        tree_cache, adder = self._run([req])
+        self.assertEqual(req.rematches, [tree_cache])
+        self.assertEqual(adder.calls, ["riding"])
+
+    def test_holders_and_prefixless_rows_are_not_rematched(self):
+        retained = self._staged("retained", holds_kv=True, prefix_len=64)
+        fresh = self._staged("fresh", holds_kv=False, prefix_len=0)
+        self._run([retained, fresh])
+        self.assertEqual(retained.rematches, [])
+        self.assertEqual(fresh.rematches, [])
+
+
+class TestDllmStagingAdmissionLock(CustomTestCase):
+    """Admitting a staged row whose prefix lives on the tree (no KV row of
+    its own) must pin the matched path, mirroring _commit_prefill_admission:
+    between admission and alloc_for_extend another row's allocation can evict
+    the unlocked match and free the KV under it. Rows that hold their KV need
+    no pin — their prefix is in their own row."""
+
+    BLOCK_SIZE = 32
+
+    def _adder(self):
+        adder = _arm_admission(
+            _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=4096,
+            )
+        )
+        adder.tree_cache.lock = lambda node: ("locked", node)
+        adder.tree_cache.unlock = lambda lock: None
+        return adder
+
+    def test_admitted_tree_riding_row_takes_the_tree_lock(self):
+        adder = self._adder()
+        req = _StubReq(
+            rid="riding",
+            fill_len=96,
+            incomplete_len=0,
+            req_pool_idx=None,
+            prefix_len=64,
+        )
+        adder.add_dllm_staging_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.lock, ("locked", req.last_node))
+
+    def test_holder_and_prefixless_rows_take_no_lock(self):
+        adder = self._adder()
+        holder = _StubReq(
+            rid="holder",
+            fill_len=96,
+            incomplete_len=0,
+            req_pool_idx=7,
+            prefix_len=64,
+        )
+        fresh = _StubReq(rid="fresh", fill_len=32, incomplete_len=0, req_pool_idx=None)
+        adder.add_dllm_staging_req(holder)
+        adder.add_dllm_staging_req(fresh)
+        self.assertIn(holder, adder.can_run_list)
+        self.assertIn(fresh, adder.can_run_list)
+        self.assertIsNone(holder.lock)
+        self.assertIsNone(fresh.lock)
+
+
+class _PinningTreeCache:
+    """Tree-cache stub whose evictable size drops while a node is locked,
+    like the real cache: locking moves the path from evictable to protected."""
+
+    def __init__(self, *, evictable, prefix):
+        self._evictable = evictable
+        self._prefix = prefix
+        self.locked = 0
+
+    def evictable_size(self):
+        return self._evictable - (self._prefix if self.locked else 0)
+
+    def supports_mamba(self):
+        return False
+
+    def lock(self, node):
+        self.locked += 1
+        return ("locked", node)
+
+    def unlock(self, lock):
+        if lock is not None:
+            self.locked -= 1
+
+    def inc_host_lock_ref(self, node):  # pragma: no cover - lock_host unused
+        raise AssertionError("host lock not expected")
+
+
+class TestDllmStagingGatePinsOwnPrefix(CustomTestCase):
+    """The capacity gate must not count the row's OWN matched prefix as
+    evictable headroom: the extend it grants builds on that prefix, so a pool
+    that only fits by evicting it over-admits. Unpinned, alloc_for_extend then
+    either evicts the matched prefix under the batch (the token-accounting
+    corruption: tree slots re-inserted after being freed, evictable > total at
+    idle) or — with the admission lock — fails loudly with Prefill OOM. The
+    temporary pin mirrors add_one_req's selection pin."""
+
+    BLOCK_SIZE = 32
+
+    def _adder(self, *, available, evictable, prefix):
+        adder = _arm_admission(
+            _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=available,
+                # Drive rem_total_tokens negative (the upfront max_new charge)
+                # so the gate takes the whole-block fallback, whose
+                # cur_rem_tokens check reads available + evictable.
+                rem_total_token_offset=1000,
+            )
+        )
+        tree = _PinningTreeCache(evictable=evictable, prefix=prefix)
+        adder.tree_cache = tree
+        adder.memory_budget = PrefillBudget(adder.token_to_kv_pool_allocator, tree)
+        adder.memory_budget.total_offset = 1000
+        return adder, tree
+
+    def _riding_req(self, prefix):
+        return _StubReq(
+            rid="riding",
+            fill_len=prefix + self.BLOCK_SIZE,
+            incomplete_len=0,
+            req_pool_idx=None,
+            prefix_len=prefix,
+        )
+
+    def test_gate_refuses_when_only_the_rows_own_prefix_would_fund_it(self):
+        # block_charge = block + per_req_token_overhead = 33 (page 1).
+        # Unpinned the gate would see 20 + 20 = 40 >= 33 and admit; pinned it
+        # sees 20 and refuses. The pin is released on refusal.
+        adder, tree = self._adder(available=20, evictable=20, prefix=20)
+        req = self._riding_req(prefix=20)
+        self.assertEqual(adder.add_dllm_staging_req(req), AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.lock)
+        self.assertEqual(tree.locked, 0)
+
+    def test_gate_admits_on_real_headroom_and_keeps_one_lock(self):
+        # available alone covers the block charge: admitted, and the only
+        # lock left standing is the admission lock on the matched path.
+        adder, tree = self._adder(available=40, evictable=20, prefix=20)
+        req = self._riding_req(prefix=20)
+        adder.add_dllm_staging_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.lock, ("locked", req.last_node))
+        self.assertEqual(tree.locked, 1)
+
+
+class _ResolveReq:
+    """Just enough of Req for the FDFO branch of process_batch_result_dllm."""
+
+    def __init__(self, *, origin_len, output, extend_end, block_size):
+        self.rid = "resolve"
+        self.origin_input_ids = array("q", range(1000, 1000 + origin_len))
+        self.output_ids = array("q", output)
+        self.full_untruncated_fill_ids = array(
+            "q", list(self.origin_input_ids) + list(output)
+        )
+        self.full_untruncated_fill_ids.extend(
+            [0] * (extend_end - len(self.full_untruncated_fill_ids) + block_size)
+        )
+        self.extend_end = extend_end
+        self.dllm_incomplete_ids = array("q", [7] * block_size)
+        self.dllm_algo_state = object()
+        self.accepted_lens = []
+
+    def update_finish_state(self, new_accepted_len=0):
+        self.accepted_lens.append(new_accepted_len)
+
+    def finished(self):
+        return False
+
+
+class TestFdfoResolveOutputBoundary(CustomTestCase):
+    """A resolved block must extend output_ids only with tokens past the
+    COMMITTED length (prompt + output), not past the prompt. Trimming against
+    the prompt alone re-appends committed output tokens whenever an extend
+    crosses them — a stall retraction's re-prefill boundary chunk does — and
+    the duplicated tokens shift every later fill rebuild: the next checkpoint
+    re-keys the row's suffix, the radix walk diverges inside the protected
+    span, and the insert creates a sibling node claiming the same KV slots
+    (live repro: evictable+protected grew past the 1024-token pool)."""
+
+    BLOCK_SIZE = 4
+
+    def _run(self, req, resolved_ids):
+        from unittest.mock import Mock
+
+        scheduler = SimpleNamespace(
+            dllm_config=SimpleNamespace(
+                requires_separate_context_encoding=False,
+                first_done_first_out_mode=True,
+                block_size=self.BLOCK_SIZE,
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=Mock(), free_group_end=Mock()
+            ),
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0, report_prefill_stats=Mock()
+            ),
+            output_streamer=SimpleNamespace(stream_output=Mock()),
+            _finish_dllm_request_if_needed=lambda r: None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            batch_size=lambda: 1,
+            return_logprob=False,
+            prefill_stats=object(),
+            dp_cooperation_info=None,
+            forward_mode=SimpleNamespace(is_dllm_extend=lambda: True),
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            next_token_ids=[list(resolved_ids)],
+            accept_length_per_req_cpu=[1],
+            dllm_algo_state=None,
+            can_run_cuda_graph=False,
+        )
+        SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, result)
+        return scheduler
+
+    def test_reencode_chunk_within_committed_appends_nothing(self):
+        # A re-prefill boundary chunk: every position is already committed
+        # (origin 6 + output 6 = 12 >= extend_end 8+4). Before the fix this
+        # appended resolved_ids[-2:] again (trim against origin alone).
+        req = _ResolveReq(
+            origin_len=6,
+            output=[21, 22, 23, 24, 25, 26],
+            extend_end=8,
+            block_size=self.BLOCK_SIZE,
+        )
+        scheduler = self._run(req, [1005, 21, 22, 23])
+        self.assertEqual(list(req.output_ids), [21, 22, 23, 24, 25, 26])
+        self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 0)
+        self.assertEqual(req.accepted_lens, [])
+
+    def test_boundary_block_appends_only_new_positions(self):
+        # committed = 6 + 2 = 8; the block covers [6, 10): positions 8 and 9
+        # are new.
+        req = _ResolveReq(
+            origin_len=6,
+            output=[21, 22],
+            extend_end=10,
+            block_size=self.BLOCK_SIZE,
+        )
+        scheduler = self._run(req, [21, 22, 31, 32])
+        self.assertEqual(list(req.output_ids), [21, 22, 31, 32])
+        self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 2)
+        self.assertEqual(req.accepted_lens, [2])
+
+    def test_fresh_block_appends_all_tokens(self):
+        # committed = 6 + 2 = 8 = extend_end - block: the whole block is new.
+        req = _ResolveReq(
+            origin_len=6,
+            output=[21, 22],
+            extend_end=12,
+            block_size=self.BLOCK_SIZE,
+        )
+        scheduler = self._run(req, [31, 32, 33, 34])
+        self.assertEqual(list(req.output_ids), [21, 22, 31, 32, 33, 34])
+        self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 4)
+        self.assertEqual(req.accepted_lens, [4])
+
+
+class _InflightStubReq:
+    owner_list = None
+
+    def __init__(self, rid, *, holds_kv):
+        self.rid = rid
+        self.kv = SimpleNamespace(holds_kv=holds_kv)
+
+
+class TestDllmManagerInflightReqs(CustomTestCase):
+    """`any_inflight_reqs` is the idle gate's view of the dLLM manager: the
+    retained FDFO holders parked in its waiting queue. A stalled round returns
+    None, so `last_batch` (which counts the rows a round ran) is empty while
+    the holders' rows are live — the exact state that tripped the idle pool
+    leak check (StateCheckError) on a stalled live run."""
+
+    @staticmethod
+    def _manager():
+        return DllmManager(
+            dllm_config=SimpleNamespace(max_running_requests=4),
+            abort=lambda req: None,
+        )
+
+    def test_retained_holder_counts(self):
+        manager = self._manager()
+        manager.add_waiting_reqs([_InflightStubReq("holder", holds_kv=True)])
+        self.assertTrue(manager.any_inflight_reqs())
+
+    def test_released_waiting_rows_do_not_count(self):
+        manager = self._manager()
+        manager.add_waiting_reqs([_InflightStubReq("released", holds_kv=False)])
+        self.assertFalse(manager.any_inflight_reqs())
+
+    def test_disabled_dllm_reports_nothing(self):
+        manager = DllmManager(dllm_config=None, abort=lambda req: None)
+        self.assertFalse(manager.any_inflight_reqs())
+
+
+class TestSchedulerIdleGateWithRetainedHolder(CustomTestCase):
+    """`Scheduler.is_fully_idle` must stay busy while a retained dLLM row
+    holds its KV between rounds: the idle path runs the pool leak checks, and
+    a holder's live row reads as a leak there. The method only reads
+    scheduler attributes, so call it unbound on a stub."""
+
+    @staticmethod
+    def _scheduler(manager):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        stub = SimpleNamespace(
+            running_batch=SimpleNamespace(is_empty=lambda: True),
+            dllm_config=manager.dllm_config,
+            dllm_manager=manager,
+            # A stalled round ran no batch.
+            last_batch=None,
+            enable_overlap=False,
+            _pp_microbatches_drained=lambda: True,
+            # The real lists, so the DLLM list's exclusion from busy_lists
+            # (upstream counts only the rows a round ran) is exercised too.
+            request_lists=lambda: {ListKind.DLLM: manager.waiting_queue},
+            request_receiver=SimpleNamespace(has_pending=lambda: False),
+            uocr_runtime=None,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            enable_lmcache=False,
+            enable_unified_cache_external_linker=False,
+        )
+        return lambda **kwargs: Scheduler.is_fully_idle(stub, **kwargs)
+
+    def test_stalled_round_with_a_retained_holder_is_not_idle(self):
+        manager = TestDllmManagerInflightReqs._manager()
+        manager.add_waiting_reqs([_InflightStubReq("holder", holds_kv=True)])
+        self.assertFalse(self._scheduler(manager)())
+
+    def test_released_queue_is_idle(self):
+        manager = TestDllmManagerInflightReqs._manager()
+        manager.add_waiting_reqs([_InflightStubReq("released", holds_kv=False)])
+        self.assertTrue(self._scheduler(manager)())
+
+
+if __name__ == "__main__":
+    unittest.main()

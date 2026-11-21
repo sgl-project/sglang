@@ -22,6 +22,10 @@ class ReqDllmMixin:
         self.dllm_config = dllm_config
         self.dllm_block_offset = 0
         self.dllm_has_literal_mask = False
+        # Committed length (prompt + output) at the stall breaker's last
+        # retraction of this request; None until it is first retracted there.
+        # Not progress: it must survive the retraction's reset below.
+        self.dllm_stall_retract_committed: Optional[int] = None
         self.reset_dllm_progress()
 
     def reset_dllm_progress(self: Req):
