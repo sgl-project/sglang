@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.srt.utils.device import async_h2d
+
 from ..batch_layout import num_prefill_rows
 from ..config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
@@ -38,46 +40,6 @@ class GumbelRows(msgspec.Struct, frozen=True):
 
     def __repr__(self) -> str:
         return f"GumbelRows(rows={len(self.candidates_host)!r})"
-
-    def filter(
-        self, keep_indices: list[int], keep_indices_device: torch.Tensor
-    ) -> Optional[GumbelRows]:
-        candidates_host = [self.candidates_host[index] for index in keep_indices]
-        if not any(candidates_host):
-            return None
-        return GumbelRows(
-            keys=self.keys[keep_indices_device],
-            context_windows=self.context_windows[keep_indices_device],
-            enabled=self.enabled[keep_indices_device],
-            candidates_host=candidates_host,
-        )
-
-    def concat(
-        self, other: Optional[GumbelRows], self_len: int, other_len: int
-    ) -> GumbelRows:
-        if other is None:
-            other = _off_rows(other_len, self.keys.device)
-        return GumbelRows(
-            keys=torch.cat([self.keys, other.keys]),
-            context_windows=torch.cat([self.context_windows, other.context_windows]),
-            enabled=torch.cat([self.enabled, other.enabled]),
-            candidates_host=self.candidates_host + other.candidates_host,
-        )
-
-    def prepend_off(self, num_rows: int) -> GumbelRows:
-        return _off_rows(num_rows, self.keys.device).concat(
-            self, num_rows, len(self.candidates_host)
-        )
-
-
-def _off_rows(num_rows: int, device: torch.device) -> GumbelRows:
-    # Disabled rows are never forced, so their key and window are never used.
-    return GumbelRows(
-        keys=torch.zeros(num_rows, dtype=torch.int64, device=device),
-        context_windows=torch.ones(num_rows, dtype=torch.int32, device=device),
-        enabled=torch.zeros(num_rows, dtype=torch.bool, device=device),
-        candidates_host=[False] * num_rows,
-    )
 
 
 def resolve_watermark_request(
@@ -163,9 +125,9 @@ def build_rows(
     if not any(candidates):
         return None
     return GumbelRows(
-        keys=torch.tensor(keys, dtype=torch.int64, device=device),
-        context_windows=torch.tensor(context_windows, dtype=torch.int32, device=device),
-        enabled=torch.tensor(enabled, dtype=torch.bool, device=device),
+        keys=async_h2d(keys, dtype=torch.int64, device=device),
+        context_windows=async_h2d(context_windows, dtype=torch.int32, device=device),
+        enabled=async_h2d(enabled, dtype=torch.bool, device=device),
         candidates_host=candidates,
     )
 
