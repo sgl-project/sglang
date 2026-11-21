@@ -297,6 +297,16 @@ def apply_dflash_verify_logits_adjustments(
         get_logits_3d().add_(logit_bias[:, None, :])
 
 
+def verify_logits_unadjusted(sampling_info) -> bool:
+    return not (
+        sampling_info.has_custom_logit_processor
+        or sampling_info.step_penalties is not None
+        or sampling_info.grammar_mask is not None
+        or sampling_info.logit_bias is not None
+        or sampling_info.sampling_mask_batch_indices is not None
+    )
+
+
 def commit_block_accept_tokens_to_penalties(
     sampling_info: SamplingBatchInfo,
     out_tokens: torch.Tensor,

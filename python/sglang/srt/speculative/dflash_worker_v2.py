@@ -38,6 +38,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import assign_req_to_token_pool_func
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.memory_pool import (
@@ -60,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_memory,
     get_parallel,
@@ -82,6 +84,10 @@ from sglang.srt.speculative.dflash_draft_ring import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_prompt_lookup import (
+    DFlashPromptLookup,
+    PromptLookupConfig,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -93,6 +99,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    verify_logits_unadjusted,
 )
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
@@ -161,6 +168,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.utils.device import is_confidential_compute
 
 _is_npu = is_npu()
 
@@ -301,16 +309,6 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
-
-
-def _verify_logits_unadjusted(sampling_info) -> bool:
-    return not (
-        sampling_info.has_custom_logit_processor
-        or sampling_info.step_penalties is not None
-        or sampling_info.grammar_mask is not None
-        or sampling_info.logit_bias is not None
-        or sampling_info.sampling_mask_batch_indices is not None
-    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -549,6 +547,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
+        self._prompt_lookup: Optional[DFlashPromptLookup] = None
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -815,6 +814,57 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
         self._init_verify_planner()
+        self._prompt_lookup = self._init_prompt_lookup()
+
+    def _init_prompt_lookup(self) -> Optional[DFlashPromptLookup]:
+        """SGLANG_ENABLE_DFLASH_PROMPT_LOOKUP (speculative/dflash_prompt_lookup.py)."""
+        if not envs.SGLANG_ENABLE_DFLASH_PROMPT_LOOKUP.get():
+            return None
+        if get_disagg().disaggregation_mode == "prefill":
+            # A prefill server never decodes, so one setting serves both PD roles.
+            return None
+        reason = self._prompt_lookup_unsupported_reason()
+        if reason is not None:
+            raise ValueError(f"SGLANG_ENABLE_DFLASH_PROMPT_LOOKUP=1, but {reason}.")
+        model_config = self.model_runner.model_config
+        # Built before the KV pools are sized, so the token table comes out of the
+        # KV budget; its rows span the req_to_token width.
+        return DFlashPromptLookup(
+            config=PromptLookupConfig(),
+            vocab_size=int(model_config.vocab_size),
+            max_rows=get_schedule().max_running_requests,
+            positions=model_config.context_len + get_req_to_token_extra_context_len(),
+            device=torch.device(self.device),
+            log_rank=get_parallel().tp_rank == 0,
+        )
+
+    def _prompt_lookup_unsupported_reason(self) -> Optional[str]:
+        parallel = get_parallel()
+        if not is_cuda():
+            return "prompt lookup needs CUDA"
+        if is_confidential_compute():
+            # Host staging is pageable there, which makes the per-step
+            # device-to-host read of the lookup results blocking.
+            return "Confidential Computing is on"
+        if parallel.attn_dp_enabled or parallel.pp_size > 1:
+            return "attention DP and pipeline parallelism are not supported"
+        if self._is_domino or self.lilicorr is not None:
+            return "Domino and LiLiCorr drafts are not supported"
+        if self._block_verification:
+            return "block verification is not supported"
+        if self._verify_planner is not None:
+            # The planner schedules each request's verify length from the
+            # drafter's confidence in its own block.
+            return "confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE) is on"
+        if self._runtime is not None:
+            return "a bound DFLASH runtime runs the decode round"
+        if mambaish_config(self.model_runner.model_config) is not None:
+            return "hybrid Mamba targets are not supported"
+        if SIMULATE_ACC_LEN > 0:
+            return "SGLANG_SIMULATE_ACC_LEN overrides the accept"
+        if self.block_size < 2:
+            return "the verify block has no draft tokens"
+        return None
 
     def _init_verify_planner(self) -> None:
         """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
@@ -927,7 +977,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return False
         if sampling_info is None:
             return self._selector_sample is None
-        if not _verify_logits_unadjusted(sampling_info):
+        if not verify_logits_unadjusted(sampling_info):
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
@@ -3544,6 +3594,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_tokens[:, 0].copy_(block_ids[:, 0])
             draft_tokens[:, 1:].copy_(draft_next)
+        if self._prompt_lookup is not None:
+            self._selector_sample = self._prompt_lookup.propose(
+                batch=batch,
+                draft_input=draft_input,
+                draft_tokens=draft_tokens,
+                selector_sample=self._selector_sample,
+                req_generation=self.model_runner.req_to_token_pool.req_generation,
+            )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -3695,6 +3753,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
+        if self._prompt_lookup is not None:
+            self._prompt_lookup.record(prefix_lens=prefix_lens, out_tokens=out_tokens)
         commit_block_accept_tokens_to_penalties(
             batch.sampling_info, out_tokens, commit_lens
         )
