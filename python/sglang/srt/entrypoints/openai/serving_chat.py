@@ -112,6 +112,9 @@ from sglang.srt.function_call.utils import (
     without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+    normalize_effort_hint,
+)
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
@@ -139,6 +142,7 @@ from sglang.srt.parser.response_template import (
     tool_close_tokens,
 )
 from sglang.srt.parser.template_detection import detect_inline_system_support
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
@@ -1339,6 +1343,7 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
             require_reasoning=processed_messages.require_reasoning,
+            reasoning_effort_hint=self._kv_budget_effort(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -1378,6 +1383,48 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
         return adapted_request, request
+
+    def _kv_budget_effort(self, request: ChatCompletionRequest) -> Optional[str]:
+        """Pass the rendered request's explicit effort as admission metadata.
+
+        Rendering has already resolved request/default template kwargs. An
+        unknown model default is left unset rather than guessed from a parser.
+        """
+        if get_schedule().reasoning_effort_kv_budget == "off":
+            return None
+        kwargs = request.chat_template_kwargs or {}
+        if self.chat_encoding_spec is not None:
+            disabled = not self._thinking_requested(request)
+        elif self.is_gpt_oss:
+            disabled = False  # Harmony takes its effort from the top-level field.
+        elif self.is_minimax_m3:
+            disabled = kwargs.get("thinking_mode") == "disabled"
+        else:
+            config = self.template_manager.reasoning_config
+            toggle = config.toggle_param if config is not None else "enable_thinking"
+            disabled = toggle is not None and kwargs.get(toggle) is False
+        if disabled:
+            return "none"
+        effort = request.reasoning_effort
+        if self.chat_encoding_spec not in ("dsv4", "dsv41") and not self.is_gpt_oss:
+            # Jinja's final kwargs override the top-level effort. DeepSeek and
+            # Harmony instead consume the normalized top-level field directly.
+            effort = kwargs.get(
+                "thinking_effort", kwargs.get("reasoning_effort", effort)
+            )
+        if effort is None and self.chat_encoding_spec in ("dsv4", "dsv41"):
+            effort = (
+                envs.SGLANG_DSV41_REASONING_EFFORT.get()
+                if self.chat_encoding_spec == "dsv41"
+                else envs.SGLANG_DSV4_REASONING_EFFORT.get()
+            )
+            if isinstance(effort, str):
+                effort = effort.strip()
+                try:
+                    effort = int(effort) if effort.isdigit() else float(effort)
+                except ValueError:
+                    pass  # Named tier, or an unrecognized default.
+        return normalize_effort_hint(effort)
 
     def _set_response_parser_context(
         self,

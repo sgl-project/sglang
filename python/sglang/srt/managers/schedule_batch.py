@@ -550,6 +550,9 @@ class Req(ReqDllmMixin):
 
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
+        self.reasoning_effort_hint: Optional[str] = None
+        self.reasoning_budget_weight_version: Optional[str] = None
+        self.reasoning_budget_observed = False
 
         # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
         self._is_reasoning_over = False

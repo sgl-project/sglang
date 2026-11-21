@@ -250,6 +250,7 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -315,6 +316,9 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 )
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
+)
+from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+    ReasoningEffortBudget,
 )
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
@@ -528,6 +532,8 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # Optional collaborator; also absent before scheduling-policy initialization.
+    reasoning_effort_budget: Optional[ReasoningEffortBudget] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
@@ -1601,6 +1607,16 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+        self.reasoning_effort_budget = (
+            ReasoningEffortBudget(
+                get_schedule().reasoning_effort_kv_budget,
+                initial=self.new_token_ratio_tracker.init,
+                minimum=self.new_token_ratio_tracker.min,
+                estimation_cap=CLIP_MAX_NEW_TOKENS,
+            )
+            if get_schedule().reasoning_effort_kv_budget != "off"
+            else None
+        )
 
     def feed_watchdog(self) -> None:
         """Tell the watchdogs the scheduler is alive while it waits on the host
@@ -3012,6 +3028,11 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
+            observe_finished=(
+                self.reasoning_effort_budget.observe
+                if self.reasoning_effort_budget is not None
+                else None
+            ),
         )
 
     def maybe_wire_uniboost_gamma_ada(self) -> None:
@@ -3352,7 +3373,14 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
-        return Req(*args, **kwargs)
+        req = Req(*args, **kwargs)
+        req.reasoning_effort_hint = recv_req.reasoning_effort_hint
+        if (
+            self.reasoning_effort_budget is not None
+            and req.reasoning_effort_hint is not None
+        ):
+            req.reasoning_budget_weight_version = get_serving().weight_version
+        return req
 
     def handle_generate_request(
         self,
@@ -4702,6 +4730,11 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
+            reasoning_effort_budget=(
+                self.reasoning_effort_budget
+                if get_schedule().reasoning_effort_kv_budget != "off"
+                else None
+            ),
         )
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.

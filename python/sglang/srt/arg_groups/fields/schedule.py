@@ -159,6 +159,19 @@ class Schedule(msgspec.Struct):
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
     ] = 1.0
+    reasoning_effort_kv_budget: A[
+        str,
+        Arg(
+            help=(
+                "Experimental reasoning-effort-aware KV admission budget: "
+                "off preserves the existing policy; scaled adjusts reservation "
+                "and decay by effort tier; adaptive uses recent completed output "
+                "lengths per tier to adjust decay. Does not change generation "
+                "limits. Supported by colocated Python serving."
+            ),
+            choices=["off", "scaled", "adaptive"],
+        ),
+    ] = "off"
     page_size: A[
         Optional[int], Arg(help="The number of tokens in a page.", resolvable=True)
     ] = None

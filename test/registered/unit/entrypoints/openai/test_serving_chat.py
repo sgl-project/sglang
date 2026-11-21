@@ -2262,6 +2262,60 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(kwargs["reasoning_effort"], "medium")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
 
+    def test_kv_budget_hint_follows_resolved_effort_without_changing_prompt(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        for effort, kwargs, defaults, expected in (
+            ("high", {}, {}, "high"),
+            ("high", {"reasoning_effort": "low"}, {}, "low"),
+            (None, {}, {"reasoning_effort": "medium"}, "medium"),
+            ("high", {}, {"reasoning_effort": "medium"}, "medium"),
+            (0.75, {}, {}, "high"),
+            (None, {"reasoning_effort": 75}, {}, "high"),
+            ("max", {"enable_thinking": False}, {}, "none"),
+        ):
+            with self.subTest(effort=effort, kwargs=kwargs):
+                self.chat.default_chat_template_kwargs = defaults
+                outputs = []
+                for mode in ("off", "scaled", "adaptive"):
+                    get_context().override("test", reasoning_effort_kv_budget=mode)
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi"}],
+                        reasoning_effort=effort,
+                        chat_template_kwargs=dict(kwargs),
+                        max_completion_tokens=100,
+                    )
+                    adapted, _ = self.chat._convert_to_internal_request(req)
+                    self.assertEqual(
+                        adapted.reasoning_effort_hint,
+                        None if mode == "off" else expected,
+                    )
+                    outputs.append(
+                        (adapted.text, adapted.input_ids, adapted.sampling_params)
+                    )
+                self.assertEqual(outputs[0], outputs[1])
+                self.assertEqual(outputs[1], outputs[2])
+
+    def test_deepseek_budget_hint_uses_its_own_thinking_toggle_and_env_default(self):
+        get_context().override("test", reasoning_effort_kv_budget="scaled")
+        self.chat.chat_encoding_spec = "dsv41"
+        for default in (" max ", "100", "0.99"):
+            with (
+                self.subTest(default=default),
+                envs.SGLANG_DSV41_REASONING_EFFORT.override(default),
+            ):
+                # DeepSeek reads thinking; enable_thinking belongs to other templates.
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "hi"}],
+                    chat_template_kwargs={"thinking": True, "enable_thinking": False},
+                )
+                self.assertEqual(self.chat._kv_budget_effort(req), "max")
+                req.chat_template_kwargs["thinking"] = False
+                self.assertEqual(self.chat._kv_budget_effort(req), "none")
+
     def test_k2_selected_terminator_reaches_sampling_params(self):
         self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
         self.chat = OpenAIServingChat(self.tm, self.template_manager)

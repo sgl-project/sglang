@@ -84,6 +84,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+        ReasoningEffortBudget,
+    )
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -1027,6 +1030,7 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
+        reasoning_effort_budget: Optional[ReasoningEffortBudget] = None,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -1047,6 +1051,7 @@ class PrefillAdder:
         # Finished prefills hold KV until decode pulls it (PD prefill).
         self.kv_awaiting_transfer = kv_awaiting_transfer
         self.new_token_ratio = new_token_ratio
+        self.reasoning_effort_budget = reasoning_effort_budget
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
@@ -1173,7 +1178,7 @@ class PrefillAdder:
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         # Fixed-length requests cannot benefit from the early-EOS estimate.
-        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
+        ratio = self._get_new_token_ratio(req)
         return beam_decode_budget(
             req,
             min(
@@ -1182,6 +1187,13 @@ class PrefillAdder:
             )
             * ratio,
         )
+
+    def _get_new_token_ratio(self, req: Req) -> float:
+        if req.sampling_params.ignore_eos:
+            return 1.0
+        if self.reasoning_effort_budget is not None:
+            return self.reasoning_effort_budget.ratio_for(req, self.new_token_ratio)
+        return self.new_token_ratio
 
     @property
     def rem_total_tokens(self):
@@ -1868,12 +1880,19 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                r.output_ids
-            )
+            new_token_ratio = self._get_new_token_ratio(r)
+            if (
+                self.reasoning_effort_budget is not None
+                and r.reasoning_effort_hint is not None
+            ):
+                tokens_left = (
+                    max(0, r.sampling_params.max_new_tokens - len(r.output_ids))
+                    * new_token_ratio
+                )
+            else:
+                tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                    r.output_ids
+                )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
             if tokens_left <= 0:

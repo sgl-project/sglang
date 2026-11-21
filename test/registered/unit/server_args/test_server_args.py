@@ -149,6 +149,36 @@ _mock_device = patch(
 _mock_device.start()
 
 
+class TestReasoningEffortKVArguments(CustomTestCase):
+    def test_mode_is_opt_in_and_unsupported_serving_is_rejected(self):
+        self.assertEqual(
+            ServerArgs(model_path="dummy").reasoning_effort_kv_budget, "off"
+        )
+        for mode in ("scaled", "adaptive"):
+            for rust, disagg in (
+                (False, "null"),
+                (False, "prefill"),
+                (False, "decode"),
+                (True, "null"),
+            ):
+                with (
+                    self.subTest(mode=mode, rust=rust, disagg=disagg),
+                    envs.SGLANG_RUST_SERVER.override(rust),
+                ):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        served_model_name="dummy",
+                        reasoning_effort_kv_budget=mode,
+                        disaggregation_mode=disagg,
+                        chunked_prefill_size=-1,
+                    )
+                    if rust or disagg != "null":
+                        with self.assertRaisesRegex(ValueError, "colocated Python"):
+                            args.check_server_args()
+                    else:
+                        args.check_server_args()
+
+
 class TestServerArgsPositionalOrder(CustomTestCase):
     def test_new_parallel_flag_preserves_existing_positional_slots(self):
         """New options must not reinterpret existing positional constructor calls."""

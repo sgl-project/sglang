@@ -79,6 +79,38 @@ def _req(finished_reason, calls):
 
 
 class TestRelease(CustomTestCase):
+    def test_release_calls_both_completion_observers(self):
+        calls = []
+        retirer = release_only_retirer(MagicMock())
+        retirer.observe_finished = lambda req: calls.append(("budget", req))
+        retirer.release_observer = lambda req: calls.append(("latency", req))
+        req = _req(FINISH_LENGTH(1), [])
+        req.kv.holds_kv = False
+        with patch.object(request_retirer, "discard_kv_cache_backup"):
+            retirer.release(req, checkpoint=False)
+        self.assertEqual(calls, [("budget", req), ("latency", req)])
+
+    def test_release_observes_completed_output_but_not_aborts(self):
+        from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+            ReasoningEffortBudget,
+        )
+
+        policy = ReasoningEffortBudget("adaptive", initial=0.7, minimum=0.098)
+        retirer = release_only_retirer(MagicMock())
+        retirer.observe_finished = policy.observe
+        for reason in (FINISH_LENGTH(100), FINISH_ABORT()):
+            req = _req(reason, [])
+            req.reasoning_effort_hint = "low"
+            req.reasoning_budget_observed = False
+            req.reasoning_budget_weight_version = "v1"
+            req.lora_id = None
+            req.output_ids = [1] * 100
+            req.sampling_params = SimpleNamespace(ignore_eos=False)
+            with patch.object(request_retirer, "release_kv_cache"):
+                retirer.release(req, checkpoint=False)
+        history = next(iter(policy.histories.values()))
+        self.assertEqual(list(history.lengths), [100])
+
     def _release(self, req, calls, checkpoint=False, verb="release"):
         tree_cache = MagicMock()
         tree_cache.finish.side_effect = lambda handle, outcome: calls.append(outcome)
