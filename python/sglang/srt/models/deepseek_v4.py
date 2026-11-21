@@ -940,8 +940,7 @@ def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
         forward_batch.forward_mode.is_extend()
         and is_in_breakable_cuda_graph()
         and (
-            is_cp_active(forward_batch)
-            or not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            not getattr(attn_backend, "low_ratio_prefill_graph", False)
             or in_replay_tail_graph()
         )
     )
