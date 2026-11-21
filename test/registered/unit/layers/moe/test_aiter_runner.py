@@ -128,14 +128,11 @@ def test_aiter_runner_shows_its_staged_route_sort_consumer_its_fused_moe_call(
     consumer = runner.route_sort_consumer()
     calls = []
     consumer.observe = calls.append
-    # clear() drops the sort no fused_moe consumed through AITER's registrar.
+    # The scope drops the sort no fused_moe consumed through AITER's registrar.
     monkeypatch.setattr(aiter_route_sort, "_registrar", lambda: lambda sort: None)
     for staged in (consumer, aiter_route_sort.AiterRouteSortConsumer()):
-        route_sort.stage(staged)
-        try:
+        with route_sort.scope(staged):
             runner.run(_runner_input(), _quant_info(), {})
-        finally:
-            route_sort.clear(staged)
     # Shown its own layer's call only, not another staged layer's.
     assert len(calls) == 1 and calls[0].keys() == captured[0].keys()
     assert all(calls[0][name] is value for name, value in captured[0].items())

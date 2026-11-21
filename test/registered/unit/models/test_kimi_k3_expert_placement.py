@@ -1,6 +1,8 @@
 """Kimi text and multimodal models expose the same initial expert layout, and a
 K3 MoE layer leaves no routing state behind for the next one."""
 
+import contextlib
+import threading
 import unittest
 from types import MethodType, SimpleNamespace
 from typing import Optional
@@ -18,7 +20,12 @@ from sglang.srt.models.kimi_k3 import (
     KimiK3MoE,
 )
 from sglang.srt.models.kimi_k3_amd import moe as kimi_k3_amd_moe
-from sglang.srt.runtime_context import get_context, get_exec
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_forward,
+    reset_context,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,6 +89,15 @@ def _unfused_moe(
     return moe
 
 
+@contextlib.contextmanager
+def _radix4_on_rocm():
+    with (
+        patch.object(kimi_k3_amd_moe, "_is_hip", True),
+        envs.SGLANG_K3_RADIX4_TOPK.override(True),
+    ):
+        yield
+
+
 class _MoeOnRunner(kimi_k3_amd_moe.KimiK3MoEHipMixin):
     """A MoE layer whose route-sort consumer comes from the mixin's own lookup."""
 
@@ -112,35 +128,30 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
         shared slots), and otherwise carries its padding row count."""
         non_padded = torch.tensor(3)
         consumer = MagicMock()
-        try:
-            route_sort.stage(consumer)
+        with route_sort.scope(consumer):
             route_sort.bind_select_experts(non_padded, fused_routing_ok=False)
             self.assertIsNone(route_sort._take()[0])
-            route_sort.stage(consumer)
+        with route_sort.scope(consumer):
             route_sort.bind_select_experts(non_padded, fused_routing_ok=True)
             self.assertEqual(route_sort._take(), (consumer, non_padded))
-            # Consumed once; the runner still sees the consumer until clear().
+            # Consumed once; the runner still sees the consumer until the scope exits.
             self.assertIsNone(route_sort._take()[0])
             self.assertIs(route_sort.staged(), consumer)
-        finally:
-            route_sort.clear(consumer)
-        consumer.drop.assert_called_once_with()
+        self.assertEqual(consumer.drop.call_count, 2)
 
     def test_route_sort_and_route_quant_stashes_clear_independently(self):
         """The routed-quant handoff is staged and cleared inside the layer's
         route-sort scope, so neither may clear the other's request."""
         consumer, x = MagicMock(), torch.zeros(2, 4)
         try:
-            route_sort.stage(consumer)
-            route_quant_handoff.stage(x)
-            route_quant_handoff.clear()
-            self.assertIs(route_sort.staged(), consumer)
-            route_quant_handoff.stage(x)
-            route_sort.clear(consumer)
+            with route_sort.scope(consumer):
+                route_quant_handoff.stage(x)
+                route_quant_handoff.clear()
+                self.assertIs(route_sort.staged(), consumer)
+                route_quant_handoff.stage(x)
             self.assertIs(route_quant_handoff._handoff.request_x, x)
         finally:
             route_quant_handoff.clear()
-            route_sort.clear(consumer)
 
     def test_layer_off_rocm_neither_reads_the_switch_nor_asks_its_runner(self):
         """Off ROCm the radix-4 router writes no MoE sort: the layer's scope is a
@@ -175,6 +186,66 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
                 self.assertIsNone(route_sort.staged())
         runner.route_sort_consumer.assert_called_once_with()
         self.assertEqual(consumer.drop.call_count, 2)
+
+    def test_nested_layer_scope_restores_the_outer_request(self):
+        """The SP pass re-enters the layer's forward inside its own scope: the
+        inner scope's routing consumes only its own request, and its exit hands
+        the outer scope its request back, still unconsumed."""
+        runner = MagicMock()
+        consumer = runner.route_sort_consumer.return_value
+        moe = _MoeOnRunner(runner)
+        with _radix4_on_rocm(), moe._route_sort_scope():
+            with moe._route_sort_scope():
+                route_sort.bind_select_experts(None, fused_routing_ok=True)
+                self.assertIs(route_sort._take()[0], consumer)
+            self.assertIs(route_sort.staged(), consumer)
+            route_sort.bind_select_experts(None, fused_routing_ok=True)
+            self.assertIs(route_sort._take()[0], consumer)
+        self.assertIsNone(route_sort.staged())
+        self.assertEqual(consumer.drop.call_count, 2)
+
+    def test_scope_clears_and_restores_the_request_on_an_exception(self):
+        """A layer that raises leaves no request behind, still drops the sort no
+        experts call consumed, and a nested raise restores the outer request."""
+        runner = MagicMock()
+        consumer = runner.route_sort_consumer.return_value
+        moe = _MoeOnRunner(runner)
+        with _radix4_on_rocm():
+            with self.assertRaises(RuntimeError), moe._route_sort_scope():
+                raise RuntimeError("layer failed")
+            self.assertIsNone(route_sort.staged())
+            consumer.drop.assert_called_once_with()
+            with moe._route_sort_scope():
+                with self.assertRaises(RuntimeError), moe._route_sort_scope():
+                    route_sort.bind_select_experts(None, fused_routing_ok=True)
+                    route_sort._take()
+                    raise RuntimeError("inner pass failed")
+                self.assertIs(route_sort.staged(), consumer)
+                route_sort.bind_select_experts(None, fused_routing_ok=True)
+                self.assertIs(route_sort._take()[0], consumer)
+            self.assertIsNone(route_sort.staged())
+        self.assertEqual(consumer.drop.call_count, 3)
+
+    def test_request_lives_on_the_per_forward_tier(self):
+        """The request is per-forward state: a fresh tier from reset_context()
+        and another thread see none, and a scoped override of the flag hides it."""
+        consumer = MagicMock()
+        self.addCleanup(reset_context)
+        with route_sort.scope(consumer):
+            self.assertIs(get_forward().route_sort_handoff.consumer, consumer)
+            with get_forward().scoped(route_sort_handoff=None):
+                route_sort.bind_select_experts(None, fused_routing_ok=True)
+                self.assertEqual(route_sort._take(), (None, None))
+            self.assertIs(route_sort.staged(), consumer)
+            seen = []
+            thread = threading.Thread(target=lambda: seen.append(route_sort.staged()))
+            thread.start()
+            thread.join()
+            self.assertEqual(seen, [None])
+            reset_context()
+            self.assertIsNone(get_forward().route_sort_handoff)
+            self.assertIsNone(route_sort.staged())
+        consumer.drop.assert_called_once_with()
 
     def test_layer_without_route_sort_never_probes_aiter(self):
         """CUDA, non-AITER runners and EP layers cannot consume a router-written

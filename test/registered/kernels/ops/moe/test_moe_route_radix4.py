@@ -11,6 +11,7 @@ included; anything less and a token's routing would depend on the batch size.
 Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
+import contextlib
 import inspect
 import sys
 from collections import defaultdict
@@ -308,20 +309,14 @@ def test_select_experts_sorts_only_for_a_staged_layer(staged):
         envs.SGLANG_K3_RADIX4_TOPK.override(True),
         patch.object(aiter_route_sort, "_registrar", return_value=registrations.append),
         patch.object(consumer, "takes_sort", return_value=True),
+        route_sort.scope(consumer) if staged else contextlib.nullcontext(),
     ):
-        if staged:
-            route_sort.stage(consumer)
-        try:
-            _, ids, _ = select_experts(
-                torch.zeros((m, 8), device="cuda"), scores, config
-            )
-        finally:
-            route_sort.clear(consumer)
+        _, ids, _ = select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
     if staged:
         assert len(registrations) == 2 and registrations[1] is None
         assert registrations[0]["topk_ids_ptr"] == ids.data_ptr()
     else:
-        assert registrations == [None]
+        assert registrations == []
 
 
 @requires_aiter
@@ -886,12 +881,9 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
             patch.object(
                 aiter_route_sort, "_registrar", return_value=registrations.append
             ),
+            route_sort.scope(consumer),
         ):
-            route_sort.stage(consumer)
-            try:
-                select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
-            finally:
-                route_sort.clear(consumer)
+            select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
         registered[m] = len(registrations) == 2
     assert registered == expected
 

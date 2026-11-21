@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import contextlib
 from functools import cache, cached_property
-from typing import TYPE_CHECKING, Callable, ContextManager, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, ContextManager, Optional
 
 import msgspec
 import torch
@@ -76,16 +76,6 @@ class NextAttnRead(msgspec.Struct, frozen=True):
     comm: LLComm
     # the largest batch the column tail takes
     max_tokens: int
-
-
-@contextlib.contextmanager
-def _staged_route_sort(consumer: RouteSortConsumer) -> Iterator[None]:
-    route_sort.stage(consumer)
-    try:
-        yield
-    finally:
-        # A sort that no experts call consumed must not outlive this layer.
-        route_sort.clear(consumer)
 
 
 @cache
@@ -177,7 +167,8 @@ class KimiK3MoEHipMixin:
         consumer = self._route_sort_consumer
         if consumer is None:
             return contextlib.nullcontext()
-        return _staged_route_sort(consumer)
+        # A sort that no experts call consumed must not outlive this layer.
+        return route_sort.scope(consumer)
 
     def _select_prefill_up_proj_columns(self) -> None:
         """Prefill-sized batches compute only this rank's 1/tp columns of the

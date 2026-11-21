@@ -117,19 +117,16 @@ def _route(consumer, m, registrations):
         patch.object(
             route_sort.moe_route_radix4, "route_radix4_with_sort", route_with_sort
         ),
+        route_sort.scope(consumer),
     ):
-        route_sort.stage(consumer)
-        try:
-            route_sort.bind_select_experts(None, fused_routing_ok=True)
-            hit = route_sort.try_route_sort_fused(
-                torch.zeros((m, NUM_EXPERTS)),
-                torch.zeros(NUM_EXPERTS),
-                topk=TOPK,
-                renormalize=True,
-                routed_scaling_factor=2.5,
-            )
-        finally:
-            route_sort.clear(consumer)
+        route_sort.bind_select_experts(None, fused_routing_ok=True)
+        hit = route_sort.try_route_sort_fused(
+            torch.zeros((m, NUM_EXPERTS)),
+            torch.zeros(NUM_EXPERTS),
+            topk=TOPK,
+            renormalize=True,
+            routed_scaling_factor=2.5,
+        )
     return hit, route_with_sort.call_count
 
 
