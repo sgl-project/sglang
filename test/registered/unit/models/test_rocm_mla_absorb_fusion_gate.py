@@ -16,15 +16,20 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
+from sglang.srt.models.kimi_k3_amd import mla as k3_mla
+from sglang.srt.models.kimi_k3_amd.mla import KimiK3RocmMlaQCacheWriter
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -123,6 +128,301 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+
+class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
+    """The K3 writer replaces the split chain only where attention never reads its k,
+    and the cache holds the bytes the split chain would have written."""
+
+    def setUp(self):
+        self.writer = KimiK3RocmMlaQCacheWriter(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            fused_cat_and_cache=mock.Mock(side_effect=AssertionError),
+        )
+        self.fused_q = torch.zeros(2, 12, 576, dtype=torch.bfloat16)
+        # The kernel is the boundary; the gate in front of it is under test.
+        self.writer._write_fused = lambda **_: self.fused_q
+
+    def _write(
+        self,
+        *,
+        attention_backend,
+        is_target_verify,
+        k_scale_float=1.0,
+        get_fp8_q_out=None,
+    ):
+        return self.writer.write(
+            q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
+            q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
+            k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
+            k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
+            slot_mapping=torch.arange(2, dtype=torch.int64),
+            kv_cache=torch.zeros(4, 1, 576, dtype=torch.bfloat16),
+            k_scale_float=k_scale_float,
+            attention_backend=attention_backend,
+            is_target_verify=is_target_verify,
+            get_fp8_q_out=get_fp8_q_out,
+        )
+
+    def test_triton_target_verify_keeps_the_split_chain(self):
+        """Triton target-verify runs the extend kernel, which reads k;
+        fusing it would feed that kernel the uninitialized k placeholder."""
+        self.assertIsNone(
+            self._write(attention_backend="triton", is_target_verify=True)
+        )
+
+    def test_fused_routes(self):
+        for backend, verify in (("aiter", False), ("aiter", True), ("triton", False)):
+            with self.subTest(backend=backend, verify=verify):
+                fused = self._write(attention_backend=backend, is_target_verify=verify)
+                self.assertIs(fused[0], self.fused_q)
+                self.assertEqual(tuple(fused[1].shape), (2, 1, 576))
+
+    def test_non_unit_kv_scale_keeps_the_split_chain(self):
+        """The split chain's AITER cache write casts without the KV scale,
+        while the fused kernels divide by it; their bytes differ unless it is 1."""
+        for k_scale_float in (None, 1.0):
+            with self.subTest(k_scale_float=k_scale_float):
+                self.assertIsNotNone(
+                    self._write(
+                        attention_backend="aiter",
+                        is_target_verify=False,
+                        k_scale_float=k_scale_float,
+                    )
+                )
+        self.assertIsNone(
+            self._write(
+                attention_backend="aiter", is_target_verify=False, k_scale_float=2.0
+            )
+        )
+
+    def test_cache_the_op_cannot_write_keeps_the_split_chain(self):
+        """A paged 4D or e5m2 cache is not the op's [slots, 1, 576] BF16/e4m3fn
+        pool; it must reach the split chain, not the kernel's asserts."""
+        for kv_cache in (
+            torch.zeros(4, 1, 1, 576, dtype=torch.bfloat16),
+            torch.zeros(4, 1, 576, dtype=torch.float8_e5m2),
+        ):
+            with self.subTest(shape=tuple(kv_cache.shape), dtype=kv_cache.dtype):
+                self.assertIsNone(
+                    self.writer.write(
+                        q_nope=torch.zeros(2, 12, 512, dtype=torch.bfloat16),
+                        q_pe=torch.zeros(2, 12, 64, dtype=torch.bfloat16),
+                        k_nope=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
+                        k_pe=torch.zeros(2, 1, 64, dtype=torch.bfloat16),
+                        slot_mapping=torch.arange(2, dtype=torch.int64),
+                        kv_cache=kv_cache,
+                        k_scale_float=1.0,
+                        attention_backend="aiter",
+                        is_target_verify=False,
+                    )
+                )
+
+    def test_no_writer_without_the_fused_kernel(self):
+        """Where the kernel does not run (not gfx950, SGLANG_USE_AITER=0), no writer
+        is installed, so every layer keeps the split chain without per-step checks."""
+        with mock.patch.object(k3_mla, "fused_q_cache_available", lambda: False):
+            self.assertIsNone(
+                k3_mla.create_q_cache_writer(kv_lora_rank=512, qk_rope_head_dim=64)
+            )
+
+    def test_no_writer_on_a_non_hip_build(self):
+        """kimi_k3 asks create_q_cache_writer on every platform, so a CUDA build
+        must get None from the writer module itself."""
+        with (
+            envs.SGLANG_USE_AITER.override(True),
+            mock.patch.object(k3_mla.torch.version, "hip", None),
+            mock.patch.object(k3_mla.torch.cuda, "is_available", lambda: True),
+        ):
+            self.assertIsNone(
+                k3_mla.create_q_cache_writer(kv_lora_rank=512, qk_rope_head_dim=64)
+            )
+
+    def test_fused_write_is_available_on_gfx950_with_aiter_only(self):
+        """The fused write was validated on gfx950; every other HIP target,
+        including gfx942 and gfx1250, and SGLANG_USE_AITER=0 keep the split chain."""
+        for gcn_arch, use_aiter, expected in (
+            ("gfx950", True, True),
+            ("gfx950", False, False),
+            ("gfx942", True, False),
+            ("gfx90a", True, False),
+            ("gfx1250", True, False),
+        ):
+            with (
+                self.subTest(gcn_arch=gcn_arch, use_aiter=use_aiter),
+                envs.SGLANG_USE_AITER.override(use_aiter),
+                mock.patch.object(k3_mla.torch.version, "hip", "7.0"),
+                mock.patch.object(k3_mla.torch.cuda, "is_available", lambda: True),
+                mock.patch.object(
+                    k3_mla,
+                    "current_arch",
+                    lambda: SimpleNamespace(hip=SimpleNamespace(gcn_arch=gcn_arch)),
+                ),
+            ):
+                self.assertIs(k3_mla.fused_q_cache_available(), expected)
+
+    def test_other_backends_keep_the_split_chain(self):
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                self.assertIsNone(
+                    self._write(attention_backend="dsa", is_target_verify=verify)
+                )
+
+    def _use_kernel(self):
+        """Run the real _write_fused against a recording kernel stub."""
+        del self.writer._write_fused
+        kernel = mock.Mock(side_effect=lambda *a, **kw: (kw["q_out"], None, None, None))
+        self.writer._fused_cat_and_cache = kernel
+        return kernel
+
+    def test_declined_write_requests_no_fp8_query_buffer(self):
+        """The backend allocates and logs its FP8 query buffer on the first request,
+        so a write that falls back to the split chain must not make one."""
+        get_fp8_q_out = mock.Mock()
+        self.assertIsNone(
+            self._write(
+                attention_backend="aiter",
+                is_target_verify=True,
+                k_scale_float=2.0,
+                get_fp8_q_out=get_fp8_q_out,
+            )
+        )
+        get_fp8_q_out.assert_not_called()
+
+    def test_fp8_query_buffer_takes_q_in_its_first_heads(self):
+        """With the backend's padded FP8 buffer, the launch writes q into its first
+        12 heads (the pad heads stay zero) and that buffer is returned as q."""
+        kernel = self._use_kernel()
+        buf = torch.zeros(2, 16, 576, dtype=torch.float8_e4m3fn)
+        fused = self._write(
+            attention_backend="aiter",
+            is_target_verify=True,
+            get_fp8_q_out=lambda: buf,
+        )
+        self.assertIs(fused[0], buf)
+        q_out = kernel.call_args.kwargs["q_out"]
+        self.assertEqual(tuple(q_out.shape), (2, 12, 576))
+        self.assertEqual(q_out.data_ptr(), buf.data_ptr())
+        self.assertEqual(q_out.stride(), buf.stride())
+
+    def test_without_an_fp8_query_buffer_q_stays_bf16(self):
+        kernel = self._use_kernel()
+        kernel.side_effect = lambda *a, **kw: (self.fused_q, None, None, None)
+        fused = self._write(
+            attention_backend="aiter",
+            is_target_verify=True,
+            get_fp8_q_out=lambda: None,
+        )
+        self.assertIs(fused[0], self.fused_q)
+        self.assertIsNone(kernel.call_args.kwargs["q_out"])
+        self.assertEqual(kernel.call_args.kwargs["q_out_dtype"], torch.bfloat16)
+        # K3's KV scale is 1: the NoPE launch must skip the scale, not load one.
+        self.assertIsNone(kernel.call_args.kwargs["k_scale"])
+        self.assertIs(kernel.call_args.kwargs["apply_scale"], False)
+
+    def test_malformed_fp8_query_buffer_raises(self):
+        """A buffer the launch cannot fill as the asm verify reads it is a backend
+        bug; it must fail before anything is written."""
+        kernel = self._use_kernel()
+        for buf in (
+            torch.zeros(2, 16, 576, dtype=torch.bfloat16),
+            torch.zeros(3, 16, 576, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 8, 576, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 16, 512, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 1, 576, dtype=torch.float8_e4m3fn).expand(2, 16, 576),
+        ):
+            with self.subTest(shape=tuple(buf.shape), dtype=buf.dtype):
+                with self.assertRaises(ValueError):
+                    self._write(
+                        attention_backend="aiter",
+                        is_target_verify=True,
+                        get_fp8_q_out=lambda buf=buf: buf,
+                    )
+        kernel.assert_not_called()
+
+
+class TestMlaQCacheWriterCallSite(CustomTestCase):
+    """forward_absorb_rocm_core consults the writer only for non-DCP decode
+    and target-verify; every other step keeps the split chain."""
+
+    # The backend's fp8 query buffer, which the writer must receive unchanged.
+    fp8_q_out = object()
+
+    def _call(self, *, mode, dcp_enabled=False, owner=True, out_cache_loc=None):
+        writer = mock.Mock()
+        kv_layer = SimpleNamespace(owner=owner, key=lambda: None)
+        attn = SimpleNamespace(
+            mla_q_cache_writer=writer,
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale_float=1.0),
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            current_attention_backend="aiter",
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: mode == "decode",
+                is_target_verify=lambda: mode == "target_verify",
+            ),
+            out_cache_loc=torch.arange(2) if out_cache_loc is None else out_cache_loc,
+        )
+        backend = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                layer_router=SimpleNamespace(read=lambda _: kv_layer)
+            ),
+            mla_fp8_q_out=lambda **_: self.fp8_q_out,
+        )
+        with (
+            get_parallel().override(dcp_enabled=dcp_enabled),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            result = forward_mla_rocm.DeepseekMLARocmForwardMixin._maybe_fused_q_cache(
+                attn,
+                q_nope_out=torch.zeros(2, 12, 512),
+                q_pe=None,
+                k_nope=None,
+                k_pe=None,
+                forward_batch=forward_batch,
+            )
+        return result, writer.write
+
+    def test_decode_and_target_verify_use_the_writer(self):
+        for mode in ("decode", "target_verify"):
+            with self.subTest(mode=mode):
+                result, write = self._call(mode=mode)
+                write.assert_called_once()
+                self.assertIs(result, write.return_value)
+                self.assertEqual(
+                    write.call_args.kwargs["is_target_verify"], mode == "target_verify"
+                )
+                self.assertIs(write.call_args.kwargs["get_fp8_q_out"](), self.fp8_q_out)
+
+    def test_dcp_and_extend_keep_the_split_chain(self):
+        """DCP decode all-gathers q from the split chain, and extend is not covered."""
+        for mode, dcp_enabled in (("decode", True), ("extend", False)):
+            with self.subTest(mode=mode, dcp_enabled=dcp_enabled):
+                result, write = self._call(mode=mode, dcp_enabled=dcp_enabled)
+                self.assertIsNone(result)
+                write.assert_not_called()
+
+    def test_strided_out_cache_loc_reaches_the_writer_contiguous(self):
+        """AITER reads slot_mapping at stride 1; a strided out_cache_loc passed
+        through as is would land tokens in the wrong slots."""
+        loc = torch.arange(8)[::2]
+        _, write = self._call(mode="decode", out_cache_loc=loc)
+        slot_mapping = write.call_args.kwargs["slot_mapping"]
+        self.assertTrue(slot_mapping.is_contiguous())
+        self.assertTrue(torch.equal(slot_mapping, loc))
+
+    def test_non_owner_sub_pool_keeps_the_split_chain(self):
+        """The writer scatters at out_cache_loc, but a non-owner sub-pool's layer
+        is written at the batch's swa_loc; fusing it would write the wrong rows."""
+        with mock.patch.object(forward_mla_rocm, "_mla_cache_slot_mapping") as slots:
+            result, write = self._call(mode="decode", owner=False)
+        self.assertIsNone(result)
+        write.assert_not_called()
+        # Declining must not pay the HiSparse translation or contiguous copy.
+        slots.assert_not_called()
 
 
 _ROPE_HEAD_DIM = 64

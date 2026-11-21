@@ -9,6 +9,7 @@ The BMM absorb steps stay module level to keep ROCm kernel selection localized.
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -53,6 +54,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
     get_kv_layers,
     get_token_to_kv_pool,
 )
@@ -86,7 +88,9 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+    from sglang.srt.models.kimi_k3_amd.mla import KimiK3RocmMlaQCacheWriter
 
 if _use_aiter:
     # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
@@ -453,6 +457,17 @@ def rocm_absorb_v_bmm(
     return attn_bmm_output
 
 
+def _mla_cache_slot_mapping(
+    *, kv_pool: KVCache, out_cache_loc: torch.Tensor
+) -> torch.Tensor:
+    """out_cache_loc as the slot_mapping a fused AITER MLA cache write takes."""
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
+        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
+    # AITER reads slot_mapping with stride 1, including on the resident path.
+    return out_cache_loc.contiguous()
+
+
 def _fused_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope_out: torch.Tensor,
@@ -486,11 +501,9 @@ def _fused_rope_cat_and_cache(
     else:
         cos, sin = attn.rotary_emb.cos_cache, attn.rotary_emb.sin_cache
     kv_pool = get_token_to_kv_pool()
-    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
-        # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
-        out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
-    # AITER reads slot_mapping with stride 1, including on the resident path.
-    out_cache_loc = out_cache_loc.contiguous()
+    out_cache_loc = _mla_cache_slot_mapping(
+        kv_pool=kv_pool, out_cache_loc=out_cache_loc
+    )
     return fused_qk_rope_cat_and_cache_mla(
         q_nope_out,
         q_pe,
@@ -584,6 +597,10 @@ class DeepseekMLARocmForwardMixin:
     mixin's forward methods to support MLA_ROCM. ROCm dense MHA preparation
     does dispatch ``run_mla_indexer``.
     """
+
+    # Model-installed writer for the absorbed decode Q and latent KV cache;
+    # None keeps the split rope/concat/cache chain.
+    mla_q_cache_writer: Optional[KimiK3RocmMlaQCacheWriter] = None
 
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
@@ -1110,8 +1127,19 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla() or self._fuse_rope_for_gfx1250_mla(
-                forward_batch
+            fused_q_cache = self._maybe_fused_q_cache(
+                q_nope_out=q_nope_out,
+                q_pe=q_pe,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                forward_batch=forward_batch,
+            )
+            if fused_q_cache is not None:
+                q, k = fused_q_cache
+                save_kv_cache = False
+            elif (
+                self._skip_rope_for_aiter_fused_mla()
+                or self._fuse_rope_for_gfx1250_mla(forward_batch)
             ):
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
@@ -1252,6 +1280,51 @@ class DeepseekMLARocmForwardMixin:
             return output, None
         else:
             return output, topk_indices
+
+    def _maybe_fused_q_cache(
+        self: DeepseekV2AttentionMLA,
+        *,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        mode = forward_batch.forward_mode
+        if (
+            self.mla_q_cache_writer is None
+            or get_parallel().dcp_enabled
+            or not (mode.is_decode() or mode.is_target_verify())
+        ):
+            return None
+        kv_pool = get_token_to_kv_pool()
+        kv_layer = kv_pool.layer_router.read(self.attn_mqa.layer_id)
+        # The writer scatters at out_cache_loc; KVLayer.store writes there only for
+        # the owner sub-pool, and at the batch's swa_loc for any other.
+        if not kv_layer.owner:
+            return None
+        # The writer calls this only once its launch will run, after its backend,
+        # scale and cache checks, so a write it declines allocates no fp8 buffer.
+        get_fp8_q_out = functools.partial(
+            get_attn_backend().mla_fp8_q_out,
+            forward_batch=forward_batch,
+            num_tokens=q_nope_out.shape[0],
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        return self.mla_q_cache_writer.write(
+            q_nope=q_nope_out,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            slot_mapping=_mla_cache_slot_mapping(
+                kv_pool=kv_pool, out_cache_loc=forward_batch.out_cache_loc
+            ),
+            kv_cache=kv_layer.key(),
+            k_scale_float=self.attn_mqa.k_scale_float,
+            attention_backend=self.current_attention_backend,
+            is_target_verify=mode.is_target_verify(),
+            get_fp8_q_out=get_fp8_q_out,
+        )
 
     def _dcp_q_gather_dtype(self: DeepseekV2AttentionMLA) -> Optional[torch.dtype]:
         """FP8 KV dtype to gather q in, or None to gather it as computed.
