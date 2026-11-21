@@ -42,6 +42,7 @@ def _decode_req(origin_input_ids=PROMPT, output_ids=(), **fields):
         lora_name=None,
         input_embeds=None,
         positional_embed_overrides=None,
+        multimodal_inputs=None,
     )
     req.__dict__.update(fields)
     return req
@@ -56,6 +57,7 @@ def _prefill_req(origin_input_ids=PROMPT, **fields):
         lora_name=None,
         input_embeds=None,
         positional_embed_overrides=None,
+        multimodal_inputs=None,
     )
     req.__dict__.update(fields)
     return req
@@ -147,6 +149,26 @@ class TestEmbeddingsInFingerprint(CustomTestCase):
         decode_fp, prefill_fp = _fingerprints(
             _decode_req(positional_embed_overrides=override()),
             _prefill_req(positional_embed_overrides=override()),
+        )
+        self.assertEqual(decode_fp, prefill_fp)
+
+
+class TestMultimodalInFingerprint(CustomTestCase):
+    def test_unpadded_ids_agree_when_pad_values_differ(self):
+        # Pad values come from each server's media identity, which can differ, for
+        # example under SGLANG_MM_SKIP_COMPUTE_HASH; the unpadded ids do not.
+        unpadded = array("q", [11, 151655, 151655, 14])
+        decode_fp, prefill_fp = _fingerprints(
+            _decode_req(
+                [11, 900001, 900001, 14],
+                origin_input_ids_unpadded=unpadded,
+                multimodal_inputs=object(),
+            ),
+            _prefill_req(
+                [11, 800001, 800001, 14],
+                origin_input_ids_unpadded=unpadded,
+                multimodal_inputs=object(),
+            ),
         )
         self.assertEqual(decode_fp, prefill_fp)
 

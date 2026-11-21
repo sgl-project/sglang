@@ -337,6 +337,15 @@ def pre_alloc_fill_len(req: Req) -> int:
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
 
+def kv_transfer_prompt_ids(req: Req) -> Sequence[int]:
+    """The prompt ids both servers fingerprint. Multimodal pad values depend on
+    how each server identified the media, so those requests use their unpadded
+    ids; the others use origin_input_ids, which auto-truncation shortens."""
+    if req.multimodal_inputs is not None:
+        return req.origin_input_ids_unpadded
+    return req.origin_input_ids
+
+
 def _update_with_float_rows(digest, rows) -> None:
     """Feed embedding rows to the digest as float32, one row at a time."""
     if isinstance(rows, torch.Tensor):
