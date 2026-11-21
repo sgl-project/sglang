@@ -1667,6 +1667,18 @@ class TestHicacheMambaSize(CustomTestCase):
                 (122, 70),
             )
 
+    def test_pinned_split_of_a_stage_without_kv_bytes_gives_kv_nothing(self):
+        """A PP stage with no KV layers has no KV bytes to weigh; the pin must not divide by them."""
+        self.assertEqual(
+            self._split(
+                hicache_size=192,
+                mamba_size=70,
+                kv_pools=(self._pool(0),),
+                mamba_pools=(self._pool(6 << 30),),
+            ),
+            (0.0, 70),
+        )
+
     def test_unset_keeps_proportional_split(self):
         self.assertEqual(
             self._split(

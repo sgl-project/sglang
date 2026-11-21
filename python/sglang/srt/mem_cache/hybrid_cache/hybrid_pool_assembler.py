@@ -232,6 +232,9 @@ def _split_hicache_size(
             sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
         )
     total_device_pool_size = sum(device_pool_sizes)
+    if total_device_pool_size == 0:
+        # A PP stage with no KV layers has nothing to split.
+        return (0.0,) * len(device_pool_sizes)
     return tuple(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
@@ -1179,16 +1182,15 @@ def _mamba_entry(
 ) -> PoolEntry:
     drafts = params.mtp_draft_mamba_pools
     allocator = params.token_to_kv_pool_allocator.state_slots
-    host_pool = build_mamba_host_pool(
-        mamba_pool,
-        info,
-        host_size=host_size,
-        layout=_state_host_layout(),
-        mtp_draft_device_pools=drafts,
-    )
     return build_pool_entry(
         name=PoolName.MAMBA,
-        host_pool=host_pool,
+        host_pool=build_mamba_host_pool(
+            mamba_pool,
+            info,
+            host_size=host_size,
+            layout=_state_host_layout(),
+            mtp_draft_device_pools=drafts,
+        ),
         device_pool=mamba_pool,
         layer_mapping=with_packed_draft_layer_mapping(
             layer_mapping,
