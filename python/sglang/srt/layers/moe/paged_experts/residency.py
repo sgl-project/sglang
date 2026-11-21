@@ -81,6 +81,8 @@ class DeviceResidency:
         self.dst = torch.zeros(num_slots, **i32)
         self.count = torch.zeros(1, **i32)
         self._step = 0  # the step the last ``load_into`` read
+        # An event after a pre-copy into this layer (``precopy``), which its next step waits for.
+        self.precopy_join = None
 
     def load_into(self, policy: LRUPolicy, counts: torch.Tensor) -> List[int]:
         """Make ``policy`` hold this state: the same residents, least recently used first. The

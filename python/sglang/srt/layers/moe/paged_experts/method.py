@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadFormat
-from sglang.srt.layers.moe.paged_experts import expert_cache
+from sglang.srt.layers.moe.paged_experts import expert_cache, precopy
 from sglang.srt.layers.moe.paged_experts.disk_tier import (
     TieredExpertStore,
     fill_file,
@@ -351,6 +351,11 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 
         # Decided from shapes alone, so a captured graph always takes the same path.
         topk_output = dispatch_output.topk_output
+        if (
+            self.device_executor is not None
+            and self.device_executor.precopy_next is not None
+        ):
+            precopy.maybe_log()  # the pre-copy counters, from eager steps
         if (
             self.device_executor is not None
             and topk_output.topk_ids.numel() <= self.num_resident

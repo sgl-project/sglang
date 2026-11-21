@@ -148,12 +148,19 @@ class HostExpertStore:
         if device_planned:
             self.bind_device_gather(layer)
 
-    def gather(self, src: torch.Tensor, dst: torch.Tensor, count: torch.Tensor) -> None:
+    def gather(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        count: torch.Tensor,
+        blocks: int = 256,
+    ) -> None:
         """Copy expert ``src[i]`` into GPU slot ``dst[i]`` for ``i < count[0]``, with every
-        index read on the GPU (a device-planned step): capturable in a CUDA graph."""
+        index read on the GPU (a device-planned step): capturable in a CUDA graph. ``blocks``:
+        the copy's grid (narrow beside compute)."""
         from sglang.kernels.ops.moe.paged_experts import paged_experts_gather
 
-        paged_experts_gather(*self._gather_args, src, dst, count)
+        paged_experts_gather(*self._gather_args, src, dst, count, blocks=blocks)
 
     def resolve_pending(self) -> None:
         """Finish what the last ``gather`` left to the host."""

@@ -13,6 +13,9 @@
 // planned expert from its row into its slot; the row keeps it (inclusive rows: nothing is written
 // back). Experts only on disk are flagged for the host, which reads them while the captured step
 // waits for them (await_rows), or after the step.
+// precopy_plan: from the next layer's router logits on this layer's
+// input, the next layer's predicted experts that are in none of its slots, given that layer's least
+// recently used slots ahead of its decide; the gather (at a narrow grid, on a side stream) copies them.
 
 #pragma once
 
@@ -21,9 +24,12 @@
 
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <climits>
+#include <cmath>
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace {
@@ -157,6 +163,161 @@ __global__ void paged_experts_decide_kernel(
   }
   for (int i = tid; i < K; i += blockDim.x)
     slot_lastuse[i] = s_lastuse[i];
+}
+
+// Pre-copy: one block, one thread per expert (E <= 1024), on a side stream after this layer's
+// gather. ``logits`` [E] (bf16): the next layer's softmax router on this layer's input. Its top_k + 1
+// best (selection as the router's top-k, ties to the lower id), each one's margin in softmax
+// probability over the (top_k + 1)-th; then, best first, each predicted expert whose margin beats ``margin`` and that
+// sits in none of the next layer's slots, at most ``max_copies``, gets the least recently used slot holding no
+// predicted expert (any margin) and not picked already, lowest slot on ties. The next layer's residency
+// moves as its decide would move it, the slot stamped with its step counter as it is (its last
+// decide's, so the decide that runs next sees the slot as used before this step). The plan goes to
+// ``src`` / ``dst`` / ``count`` for ``paged_experts_gather``. ``last`` [K] (the experts the previous plan copied, -1:
+// none) with ``last_stamp`` [1] and
+// ``counts`` [4] (planned, used, wasted, predicted but below the margin or resident: cumulative) tally
+// the previous plan first: a copied expert is used if its slot was stamped after the copy.
+__global__ void paged_experts_precopy_plan_kernel(
+    const __nv_bfloat16* logits,
+    int top_k,
+    float margin,
+    int max_copies,
+    int E,
+    int K,
+    const int32_t* step,
+    int32_t* slot_expert,
+    int32_t* expert_slot,
+    int32_t* slot_lastuse,
+    int32_t* src,
+    int32_t* dst,
+    int32_t* count,
+    int32_t* last,
+    int32_t* last_stamp,
+    int32_t* counts) {
+  // The plan runs on a side stream beside compute; every global read is issued once, by all
+  // threads in parallel, so the kernel is a few round trips long (a serial loop over K slots
+  // measured 45 us per call on Qwen3-Next, K=101).
+  __shared__ float warp_val[32];
+  __shared__ int warp_idx[32];
+  __shared__ float best_val[33];
+  __shared__ int best_idx[33];
+  __shared__ float pred_margin[32];
+  __shared__ int pred_slot[32];
+  __shared__ float denom;
+  __shared__ int s_lastuse[1024];
+  __shared__ unsigned char s_keep[1024];
+  __shared__ int tally[2];
+  const int i = threadIdx.x, lane = i % 32, warp = i / 32, warps = (blockDim.x + 31) / 32;
+  const int now = *step;
+  const int then = *last_stamp;
+  if (i < 2) tally[i] = 0;
+  for (int t = i; t < K; t += blockDim.x) {
+    s_lastuse[t] = slot_lastuse[t];
+    s_keep[t] = 0;
+  }
+  __syncthreads();
+  // Tally the previous plan (the next layer's decide ran since: used ones were stamped after it).
+  for (int t = i; t < K; t += blockDim.x) {
+    const int e = last[t];
+    if (e < 0) continue;
+    const int sl = (e < E) ? expert_slot[e] : -1;
+    atomicAdd(&tally[(sl >= 0 && s_lastuse[sl] > then) ? 0 : 1], 1);
+    last[t] = -1;
+  }
+  const float x = i < E ? __bfloat162float(logits[i]) : -INFINITY;
+  float v = x;
+  int idx = i < E ? i : INT_MAX;
+  for (int r = 0; r <= top_k; ++r) {
+    float bv = v;
+    int bi = idx;
+    for (int o = 16; o > 0; o /= 2) {
+      const float ov = __shfl_xor_sync(0xffffffff, bv, o);
+      const int oi = __shfl_xor_sync(0xffffffff, bi, o);
+      if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    }
+    if (lane == 0) warp_val[warp] = bv, warp_idx[warp] = bi;
+    __syncthreads();
+    if (i == 0) {
+      for (int w = 1; w < warps; ++w)
+        if (warp_val[w] > bv || (warp_val[w] == bv && warp_idx[w] < bi)) bv = warp_val[w], bi = warp_idx[w];
+      best_val[r] = bv;
+      best_idx[r] = bi;
+    }
+    __syncthreads();
+    if (idx == best_idx[r]) v = -INFINITY, idx = INT_MAX;  // taken
+  }
+  {  // softmax: the denominator over every expert
+    const float sum = sglang::device::warp::reduce_sum(i < E ? expf(x - best_val[0]) : 0.f);
+    if (lane == 0) warp_val[warp] = sum;
+    __syncthreads();
+    if (i == 0) {
+      float t = 0.f;
+      for (int w = 0; w < warps; ++w)
+        t += warp_val[w];
+      denom = t;
+    }
+    __syncthreads();
+  }
+  if (i < top_k) {
+    const float a = best_val[i], b = best_val[top_k];
+    pred_margin[i] = (expf(a - best_val[0]) - expf(b - best_val[0])) / denom;
+    const int e = best_idx[i];
+    const int sl = (e >= 0 && e < E) ? expert_slot[e] : -1;
+    pred_slot[i] = sl;
+    if (sl >= 0) s_keep[sl] = 1;  // a predicted expert's slot is never a victim
+  }
+  __syncthreads();
+  if (warp != 0) return;
+  int n = 0, skipped = 0;
+  for (int j = 0; j < top_k && n < max_copies; ++j) {
+    const int e = best_idx[j];
+    if (e < 0 || e >= E) continue;
+    if (!(pred_margin[j] > margin) || pred_slot[j] >= 0) {  // the same for every lane
+      ++skipped;
+      continue;
+    }
+    // Victim: the least recently used slot holding no predicted expert and not picked already.
+    int oldest = INT_MAX, victim = K;
+    for (int sl = lane; sl < K; sl += 32) {
+      const int lastuse = s_lastuse[sl];
+      if (!s_keep[sl] && lastuse < oldest) {
+        oldest = lastuse;
+        victim = sl;
+      }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      const int other_oldest = __shfl_down_sync(0xffffffff, oldest, offset);
+      const int other_victim = __shfl_down_sync(0xffffffff, victim, offset);
+      if (other_oldest < oldest || (other_oldest == oldest && other_victim < victim)) {
+        oldest = other_oldest;
+        victim = other_victim;
+      }
+    }
+    victim = __shfl_sync(0xffffffff, victim, 0);
+    if (victim == K) break;  // every slot holds a predicted expert
+    if (lane == 0) {
+      const int old = slot_expert[victim];
+      if (old >= 0) expert_slot[old] = -1;
+      slot_expert[victim] = e;
+      expert_slot[e] = victim;
+      slot_lastuse[victim] = now;
+      s_lastuse[victim] = now;
+      last[n] = e;
+      s_keep[victim] = 1;
+      src[n] = e;
+      dst[n] = victim;
+    }
+    ++n;
+    __syncwarp();  // the next search reads this pick
+  }
+  if (lane == 0) {
+    *count = n;
+    *last_stamp = now;
+    counts[0] += n;
+    counts[1] += tally[0];
+    counts[2] += tally[1];
+    counts[3] += skipped;
+  }
 }
 
 // Calls ``op(host, gpu, row)`` with each paged tensor's rows typed by the widest load their size
@@ -404,7 +565,8 @@ void paged_experts_gather(
     tvm::ffi::TensorView row_bytes,
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
-    tvm::ffi::TensorView count) {
+    tvm::ffi::TensorView count,
+    int64_t blocks) {
   using namespace sglang::host;
   using sglang::kDLGPU;
 
@@ -415,11 +577,12 @@ void paged_experts_gather(
   TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(src).verify(dst);
   TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(count);
 
-  // Decode pages few experts per step, so launch cost beats link saturation: 2048x512 measured 5%
-  // slower end to end (Qwen3-30B, K=90).
-  constexpr int kGatherBlocks = 256;
-  constexpr int kGatherThreads = 256;
-  LaunchKernel(kGatherBlocks, kGatherThreads, device_.unwrap())(
+  // Decode pages few experts per step, so launch cost matters more than link saturation: a
+  // 2048x512 grid saturates the link better but measured 5% slower end to end (Qwen3-30B, K=90, RTX 5070 Ti).
+  // An empty plan exits at once. A copy beside compute (pre-copy) takes a narrow grid: 32 blocks
+  // overlap a layer's compute 0.88-0.95 at -1.6 % bandwidth, 256 blocks 0.32 (RTX 5070 Ti).
+  RuntimeCheck(blocks >= 1 && blocks <= 4096, "paged_experts_gather: blocks out of range: ", blocks);
+  LaunchKernel(static_cast<int>(blocks), 256, device_.unwrap())(
       paged_experts_gather_kernel,
       static_cast<const int64_t*>(hosts.data_ptr()),
       static_cast<const int64_t*>(gpus.data_ptr()),
@@ -537,6 +700,66 @@ void paged_experts_await_rows(
       static_cast<int32_t*>(plan.data_ptr()),
       k,
       static_cast<long long>(timeout_ns));
+}
+
+void paged_experts_precopy_plan(
+    tvm::ffi::TensorView logits,
+    int64_t top_k,
+    double margin,
+    int64_t max_copies,
+    tvm::ffi::TensorView step,
+    tvm::ffi::TensorView slot_expert,
+    tvm::ffi::TensorView expert_slot,
+    tvm::ffi::TensorView slot_lastuse,
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView count,
+    tvm::ffi::TensorView last,
+    tvm::ffi::TensorView last_stamp,
+    tvm::ffi::TensorView counts) {
+  using namespace sglang::host;
+  using sglang::kDLGPU;
+
+  SymbolicSize E = {"num_experts"}, K = {"num_slots"}, One = {"one"}, Four = {"four"};
+  SymbolicDevice device_;
+  device_.set_options<kDLGPU>();
+  TensorMatcher({E}).with_dtype<sglang::bf16_t>().with_device<kDLGPU>(device_).verify(logits);
+  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(expert_slot);
+  TensorMatcher({K})
+      .with_dtype<int32_t>()
+      .with_device<kDLGPU>(device_)
+      .verify(slot_expert)
+      .verify(slot_lastuse)
+      .verify(src)
+      .verify(dst)
+      .verify(last);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(step).verify(count).verify(last_stamp);
+  TensorMatcher({Four}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(counts);
+  RuntimeCheck(Four.unwrap() == 4, "paged experts pre-copy: counts holds 4 counters");
+  const int64_t e = E.unwrap(), k = K.unwrap();
+  RuntimeCheck(e >= 1 && e <= 1024, "paged experts pre-copy: at most 1024 experts, got ", e);
+  RuntimeCheck(top_k >= 1 && top_k <= 32 && top_k < e, "paged experts pre-copy: top_k out of range: ", top_k);
+  RuntimeCheck(max_copies >= 0 && max_copies <= k, "paged experts pre-copy: max_copies out of range: ", max_copies);
+  RuntimeCheck(k <= 1024, "paged experts pre-copy: at most 1024 slots, got ", k);
+  const int threads = static_cast<int>((e + 31) / 32 * 32);
+  LaunchKernel(1, threads, device_.unwrap())(
+      paged_experts_precopy_plan_kernel,
+      static_cast<const __nv_bfloat16*>(logits.data_ptr()),
+      static_cast<int>(top_k),
+      static_cast<float>(margin),
+      static_cast<int>(max_copies),
+      static_cast<int>(e),
+      static_cast<int>(k),
+      static_cast<const int32_t*>(step.data_ptr()),
+      static_cast<int32_t*>(slot_expert.data_ptr()),
+      static_cast<int32_t*>(expert_slot.data_ptr()),
+      static_cast<int32_t*>(slot_lastuse.data_ptr()),
+      static_cast<int32_t*>(src.data_ptr()),
+      static_cast<int32_t*>(dst.data_ptr()),
+      static_cast<int32_t*>(count.data_ptr()),
+      static_cast<int32_t*>(last.data_ptr()),
+      static_cast<int32_t*>(last_stamp.data_ptr()),
+      static_cast<int32_t*>(counts.data_ptr()));
 }
 
 int64_t paged_experts_host_device_pointer(tvm::ffi::TensorView pinned) {
