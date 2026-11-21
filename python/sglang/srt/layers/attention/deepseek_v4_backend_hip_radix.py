@@ -3501,9 +3501,9 @@ class DeepseekV4HipRadixBackend(
         Takes ``index_q`` because the borrowed ``forward_low_ratio_sources`` always
         passes it, but HIP has no DeepGEMM decode path to project queries ahead, so
         ``low_ratio_decode_index_positions`` returns None here and nothing is sent."""
-        assert (
-            index_q is None
-        ), "HIP paged top-k scores its own queries; index_q has no HIP path"
+        assert index_q is None, (
+            "HIP paged top-k scores its own queries; index_q has no HIP path"
+        )
         # every body below rewrites the ratio's page indices in place
         self.forward_metadata.core_metadata.drop_folded_sparse_indices(
             layer.compress_ratio
