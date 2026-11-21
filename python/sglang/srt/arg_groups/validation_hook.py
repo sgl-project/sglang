@@ -535,6 +535,14 @@ def check_server_args(server_args: Any):
             )
     if cfg.gc_freeze_on_idle_secs < 0:
         raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
+    if cfg.gc_freeze_after_batches < 0 or cfg.gc_freeze_every_batches < 0:
+        raise ValueError(
+            "--gc-freeze-after-batches and --gc-freeze-every-batches must be >= 0."
+        )
+    if cfg.gc_freeze_every_batches > 0 and cfg.gc_freeze_after_batches == 0:
+        raise ValueError(
+            "--gc-freeze-every-batches requires --gc-freeze-after-batches > 0."
+        )
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(

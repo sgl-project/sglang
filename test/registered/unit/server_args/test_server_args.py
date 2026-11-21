@@ -575,6 +575,23 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    def test_gc_freeze_batch_trigger_rejects_invalid_values(self):
+        for kwargs, message in (
+            (dict(gc_freeze_after_batches=-1), "must be >= 0"),
+            (dict(gc_freeze_every_batches=-1), "must be >= 0"),
+            (dict(gc_freeze_every_batches=70), "requires --gc-freeze-after-batches"),
+        ):
+            with (
+                self.subTest(**kwargs),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    served_model_name="dummy",
+                    chunked_prefill_size=-1,
+                    **kwargs,
+                ).check_server_args()
+
     def test_disable_multimodal_rejects_enable_multimodal(self):
         with self.assertRaisesRegex(
             ValueError, "--disable-multimodal cannot be combined"
