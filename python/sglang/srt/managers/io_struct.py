@@ -1133,6 +1133,9 @@ class GenerateReqInput:
             return_flat_raw_sampling_mask_b64=self.return_flat_raw_sampling_mask_b64,
             stream=self.stream,
             log_metrics=self.log_metrics,
+            background=self.background,
+            use_audio_in_video=self.use_audio_in_video,
+            routing_key=self.routing_key,
             return_hidden_states=(
                 self.return_hidden_states[i]
                 if isinstance(self.return_hidden_states, list)
