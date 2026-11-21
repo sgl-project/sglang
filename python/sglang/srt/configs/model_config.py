@@ -2665,6 +2665,7 @@ multimodal_model_archs = [
     "Lfm3AudioForConditionalGeneration",
     "Lfm3OmniForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    "RadioMBartPrefixForCausalLM",
     *MIMO_V2_MULTIMODAL_ARCHS,
     "MiMoV2ASRForCausalLM",
     "MiniCPMO",

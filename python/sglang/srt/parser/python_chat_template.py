@@ -20,6 +20,9 @@ from sglang.srt.parser.glm53_chat_template import (
     render_glm53_flash_segments,
     render_glm53_segments,
 )
+from sglang.srt.parser.nemotron_parse_chat_template import (
+    render_nemotron_parse_segments,
+)
 from sglang.srt.parser.template_detection import (
     ReasoningToggleConfig,
     is_glm53_template,
@@ -68,8 +71,17 @@ GLM53_FLASH = PythonChatTemplate(
     **_GLM53_FEATURES,
 )
 
+NEMOTRON_PARSE = PythonChatTemplate(
+    name="nemotron-parse",
+    render_segments=render_nemotron_parse_segments,
+    content_format="openai",
+    reasoning_config=None,
+    may_reorder_tool_results=False,
+    supports_inline_system=False,
+)
+
 PYTHON_CHAT_TEMPLATES: Dict[str, PythonChatTemplate] = {
-    template.name: template for template in (GLM53, GLM53_FLASH)
+    template.name: template for template in (GLM53, GLM53_FLASH, NEMOTRON_PARSE)
 }
 
 _GLM53_TEMPLATES_BY_ARCH = {
@@ -84,11 +96,7 @@ def get_python_chat_template(name: str) -> Optional[PythonChatTemplate]:
 
 
 def may_replace_jinja_template(hf_chat_template: Optional[str]) -> bool:
-    """Whether a built-in Python template can replace this Jinja template.
-
-    Only the checkpoint's template is inspected, so callers can skip loading
-    the model config for every other template.
-    """
+    """Whether GLM-5.3 auto-parser detection needs a model-config lookup."""
     return isinstance(hf_chat_template, str) and is_glm53_template(hf_chat_template)
 
 
@@ -101,10 +109,19 @@ def resolve_python_chat_template(
     ship different templates, so the architecture alone does not decide: the
     checkpoint's template must be a GLM-5.3 one, and its multimodal block must
     match the architecture (GLM-5.3 is text-only, GLM-5.3-Flash multimodal).
+    Parse has a dedicated architecture and needs image-preserving content.
     """
     architectures = getattr(hf_config, "architectures", None) or []
     template = _GLM53_TEMPLATES_BY_ARCH.get(architectures[0] if architectures else "")
-    if template is None or not may_replace_jinja_template(hf_chat_template):
+    if template is None:
+        if (
+            architectures == ["RadioMBartPrefixForCausalLM"]
+            and hf_config.model_type == "nemotron_parse"
+        ):
+            # The published text-only template otherwise drops image attachments.
+            return NEMOTRON_PARSE
+        return None
+    if not may_replace_jinja_template(hf_chat_template):
         return None
     multimodal = "<|begin_of_image|>" in hf_chat_template
     if multimodal != (template is GLM53_FLASH):
