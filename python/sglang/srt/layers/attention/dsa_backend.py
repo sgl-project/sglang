@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -131,6 +131,11 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import (
@@ -1615,6 +1620,17 @@ class DeepseekSparseAttnBackend(
             else self.dsa_prefill_impl
         )
         use_flashmla_kv = (not self.use_mha) and dsa_impl_for_batch == "flashmla_kv"
+        # Packed prefill builds its own schedule. Defer the unpacked schedule
+        # in ordinary eager prefill; graph replay and overlapping batches
+        # keep their existing metadata lifetimes.
+        defer_unpacked_flashmla = (
+            use_flashmla_kv
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and self.flashmla_prefill_token_packing
+            and not self.requires_eager_metadata
+            and not get_exec().overlap.enable_two_batch_overlap
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+        )
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
@@ -1887,7 +1903,7 @@ class DeepseekSparseAttnBackend(
                         else None
                     ),
                 )
-                if use_flashmla_kv and not _is_xpu
+                if use_flashmla_kv and not _is_xpu and not defer_unpacked_flashmla
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
@@ -3062,6 +3078,22 @@ class DeepseekSparseAttnBackend(
                 )
                 if packed_out is not None:
                     return packed_out
+            if metadata.flashmla_metadata is None:
+                # The packer can reject a layer; build the original unpacked
+                # schedule once and share it with subsequent layers.
+                assert (
+                    self.flashmla_prefill_token_packing
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                )
+                metadata = replace(
+                    metadata,
+                    flashmla_metadata=self._compute_flashmla_metadata(
+                        cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                        seq_len_q=1,
+                        num_heads_q=self.flashmla_kv_num_q_heads_prefill,
+                    ),
+                )
+                self.forward_metadata = metadata
             if q_rope is not None:
                 q_all = self._flashmla_kv_q(q_nope, q_rope)
             return self._forward_flashmla_kv(
