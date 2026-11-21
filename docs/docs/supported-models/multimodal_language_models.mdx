@@ -238,6 +238,14 @@ in the GitHub search bar.
 
 The Apertus v1.5 model repositories require you to accept their access terms on Hugging Face before downloading the weights. Set HF_TOKEN to a Hugging Face token associated with an account that has accepted those terms.
 
+Apertus 1.5 requires a model-specific Transformers revision. Install it and the compatible tokenizer before launching the server:
+
+```bash
+python3 -m pip install \
+  "transformers[torch,vision,audio] @ git+https://github.com/swiss-ai/transformers.git@3797303dda74844e3d1f8977ff5518bb91f818b4" \
+  tokenizers==0.22.2
+```
+
 ### Serve on NVIDIA CUDA
 
 ```bash
