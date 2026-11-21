@@ -241,7 +241,9 @@ class Parallel(msgspec.Struct):
         Optional[int],
         "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
         "backend. Must divide attention TP size, or attention TP x CP size "
-        "with interleave prefill CP; never crosses attention DP replicas. Overrides "
+        "with interleave prefill CP. Under attention DP with attention TP 1 and "
+        "CP 1 it may instead equal TP size: the group then spans every attention-DP "
+        "rank, whose rows take the DP gather around the shared experts. Overrides "
         "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
     ] = None
     enable_dense_mlp_attn_tp: A[
@@ -360,6 +362,13 @@ class Parallel(msgspec.Struct):
         fn="sglang.srt.runtime_context.attn_tp_size_of",
         doc="Attention tensor-parallel width: `tp_size` divided by the "
         "attention-DP and attention-CP dimensions.",
+    )
+    shared_experts_tp_width = Derived(
+        fn="sglang.srt.runtime_context.shared_experts_tp_width_of",
+        doc="Shared-expert tensor-parallel width: `shared_experts_tp_size`, "
+        "else `attn_tp_size` under `enable_shared_experts_attn_tp`. `None` "
+        "means no separate width: replicated under an EP all-to-all backend, "
+        "following MoE TP otherwise.",
     )
     attn_dp_enabled = Derived(
         fn="sglang.srt.runtime_context.attn_dp_enabled_of",

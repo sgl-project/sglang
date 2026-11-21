@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import logging
 from functools import cache
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.communication import k3_ar_fusion
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-_SUPPORTED_WORLD_SIZES = (4, 8, 16)
+_SUPPORTED_WORLD_SIZES = (2, 4, 8, 16)
 
 # Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
 # must resolve the same (buffer, offset) for these, which a per-forward
@@ -49,17 +49,32 @@ class _State:
         return self.lease.request.push_slot_bytes
 
 
-_STATE: Optional[_State] = None
-_INITIALIZED = False
 _O_PROJ_RESULT_BUFFERS: dict[int, torch.Tensor] = {}
 
 
-def _init_state() -> Optional[_State]:
-    global _STATE, _INITIALIZED
-    if _INITIALIZED:
-        return _STATE
-    _INITIALIZED = True
+def _group_state(
+    group: GroupCoordinator, buffer_names: Callable[[], Sequence[str]]
+) -> Optional[_State]:
+    """The push/pull state over ``group``, created once per group with its named
+    buffers; None when NCCL runs instead."""
+    return get_buffer(
+        f"k3_sp_collective:{group.unique_name}",
+        lambda: [_create_state(group, buffer_names())],
+    )[0]
 
+
+def _sp_buffer_names() -> Sequence[str]:
+    names = [_O_PROJ, _ALL_GATHER]
+    if envs.SGLANG_K3_SP_ATTN_RES.get():
+        names.append(_ATTN_RES_AG)
+    return names
+
+
+def _init_state() -> Optional[_State]:
+    return _group_state(get_parallel().attn_tp_group, _sp_buffer_names)
+
+
+def _create_state(group: GroupCoordinator, buffers: Sequence[str]) -> Optional[_State]:
     explicit = envs.SGLANG_K3_SP_COLLECTIVE.is_set()
     if explicit and not envs.SGLANG_K3_SP_COLLECTIVE.get():
         return None
@@ -72,7 +87,6 @@ def _init_state() -> Optional[_State]:
     from sglang.srt.utils.device import get_device_sm
 
     a2a = get_exec().moe.moe_a2a_backend
-    group = get_parallel().attn_tp_group
     device_sm = get_device_sm()
     lease = None
     if (
@@ -90,10 +104,11 @@ def _init_state() -> Optional[_State]:
     has_multicast = lease is not None and lease.has_multicast
     if not has_multicast:
         message = (
-            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "K3 SP collective requires SM100/SM103, TP2/TP4/TP8/TP16, "
             "MegaMoE/DeepEP, and a multicast symmetric workspace; using NCCL "
-            "(sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
+            "(group=%s, sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
             % (
+                group.unique_name,
                 device_sm,
                 group.world_size,
                 a2a,
@@ -127,32 +142,58 @@ def _init_state() -> Optional[_State]:
     attn_res_collective.register_comm(
         lease.get_communicator, world_size=lease.world_size
     )
-    _STATE = _State(group, lease)
+    state = _State(group, lease)
     logger.info(
-        "K3 SP collective enabled (TP%d, fused RS residual + AG)",
+        "K3 SP collective enabled (%s, TP%d, fused RS residual + AG)",
+        group.unique_name,
         group.world_size,
     )
-    if envs.SGLANG_K3_SP_ATTN_RES.get():
+    if _ATTN_RES_AG in buffers:
         logger.info(
             "K3 SP attention-residual carry enabled "
             "(local agg/bank write + normalized AG)"
         )
-    _create_sp_symm_buffers(_STATE)
-    return _STATE
-
-
-def _create_sp_symm_buffers(state: _State) -> None:
     # Rendezvous (a collective) runs here on every rank, not on a buffer's first
     # use inside a forward or CUDA graph capture.
-    names = [_O_PROJ, _ALL_GATHER]
-    if envs.SGLANG_K3_SP_ATTN_RES.get():
-        names.append(_ATTN_RES_AG)
-    for name in names:
+    for name in buffers:
         _symm_buffer(state, name, 1, _HIDDEN_SIZE, torch.bfloat16)
+    return state
 
 
 def enabled() -> bool:
     return _init_state() is not None
+
+
+class GroupCollective:
+    """K3 push/pull all-gather and reduce-scatter of equal row blocks over
+    ``group``; each returns None when the caller's own collective should run."""
+
+    def __init__(self, group: GroupCoordinator, all_gather_buffer: str):
+        self._world_size = group.world_size
+        self._all_gather_buffer = all_gather_buffer
+        # Created at init so the KV pool sizing accounts for it.
+        self._state = _group_state(group, lambda: [all_gather_buffer])
+
+    def _state_for(self, total_rows: int) -> Optional[_State]:
+        # The symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
+        if total_rows == 0 or total_rows > k3_ar_fusion._max_buffer_rows():
+            return None
+        return self._state
+
+    def all_gather(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        state = self._state_for(x.shape[0] * self._world_size)
+        if state is None:
+            return None
+        return all_gather(x, state=state, buffer_name=self._all_gather_buffer)
+
+    def reduce_scatter(self, y: torch.Tensor) -> Optional[torch.Tensor]:
+        state = self._state_for(y.shape[0])
+        # The pull strategy reads y through a multicast alias, which only symmetric storage has.
+        if state is None or requires_symmetric_rs(
+            y.shape[0], y.device, y.element_size(), state=state, fused=False
+        ):
+            return None
+        return reduce_scatter_res(y, None, state=state)
 
 
 def _symm_buffer(
@@ -165,10 +206,14 @@ def _symm_buffer(
 
 
 def requires_symmetric_rs(
-    num_tokens: int, device: torch.device, element_size: int
+    num_tokens: int,
+    device: torch.device,
+    element_size: int,
+    state: Optional[_State] = None,
+    fused: bool = True,
 ) -> bool:
     """Whether standalone or fused RS reads o_proj through its NVLS alias."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None:
         return False
     from sglang.kernels.ops.communication import sp_collective
@@ -184,7 +229,7 @@ def requires_symmetric_rs(
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
-    if not envs.SGLANG_K3_SP_ATTN_RES.get():
+    if not fused or not envs.SGLANG_K3_SP_ATTN_RES.get():
         return False
     fusion = sp_collective.get_fusion_dispatch(
         "reduce_scatter_attn_res",
@@ -261,10 +306,12 @@ def _eligible(
 
 
 def reduce_scatter_res(
-    tensor: torch.Tensor, residual: Optional[torch.Tensor]
+    tensor: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    state: Optional[_State] = None,
 ) -> Optional[torch.Tensor]:
     """Return a fused local shard, or None when the NCCL fallback should run."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None or not _eligible(state, tensor, residual):
         return None
     from sglang.kernels.ops.communication import sp_collective
@@ -372,9 +419,13 @@ def reduce_scatter_attn_res(
     return normed, prefix
 
 
-def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+def all_gather(
+    tensor: torch.Tensor,
+    state: Optional[_State] = None,
+    buffer_name: str = _ALL_GATHER,
+) -> Optional[torch.Tensor]:
     """Return the reassembled full batch, or None for the NCCL fallback."""
-    state = _init_state()
+    state = state or _init_state()
     if state is None:
         return None
     global_tokens = tensor.shape[0] * state.group.world_size
@@ -410,7 +461,7 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         )
     if dispatch.strategy == "direct":
         output = _symm_buffer(
-            state, _ALL_GATHER, global_tokens, tensor.shape[1], tensor.dtype
+            state, buffer_name, global_tokens, tensor.shape[1], tensor.dtype
         )
         return sp_collective.all_gather_direct(
             state.group.world_size,
@@ -497,7 +548,7 @@ _SP_BLOCK_SIZE = 1024
 def _sp_multicast() -> bool:
     ready = (
         k3_ar_fusion.enabled()
-        and get_parallel().tp_group.world_size in _SUPPORTED_WORLD_SIZES
+        and get_parallel().tp_group.world_size in (4, 8, 16)
         and k3_ar_fusion.register_sp_collective_comm()
     )
     logger.info(

@@ -197,14 +197,13 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    # Shared experts can gather token rows across CP as well as attention TP,
-    # then reduce-scatter to the original shards. A subgroup must still fit
-    # inside one attention-DP replica / PP stage.
     replica_size = attn_tp_size * view.attn_cp_size
-    if size < 1 or replica_size % size != 0:
+    spans_dp = replica_size == 1 and size == cfg.tp_size
+    if size < 1 or not (replica_size % size == 0 or spans_dp):
         raise ValueError(
-            f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention replica size ({replica_size}, attention TP x CP)."
+            f"--shared-experts-tp-size ({size}) must divide attention TP x CP "
+            f"({replica_size}), or equal TP size ({cfg.tp_size}) under attention "
+            "DP with attention TP 1 and CP 1."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(

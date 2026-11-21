@@ -2617,9 +2617,9 @@ def initialize_model_parallel(
             the KV cache across GPUs within each tensor-parallel group during
             decoding. Must be a divisor of `tp_size` and is currently only
             supported on the AMD HIP platform.
-        shared_experts_tp_size: optional shared-expert TP width. May span
-            interleave prefill CP within one attention replica; the validated
-            width divides attention TP x CP and never crosses DP or PP.
+        shared_experts_tp_width: optional shared-expert TP width, dividing
+            attention TP x CP within one attention replica, or the TP group
+            itself under attention DP with attention TP1 and CP1.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2664,7 +2664,7 @@ def initialize_model_parallel(
     attention_context_model_parallel_size = parallel.attn_cp_size
     moe_data_model_parallel_size = parallel.moe_dp_size
     decode_context_parallel_size = parallel.attn_dcp_size
-    shared_experts_tensor_parallel_size = parallel.shared_experts_tp_size
+    shared_experts_tensor_parallel_size = parallel.shared_experts_tp_width
 
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
@@ -2847,6 +2847,8 @@ def initialize_model_parallel(
     ):
         if shared_experts_tensor_parallel_size == attn_tp_size:
             _SHARED_EXPERTS_TP = _ATTN_TP
+        elif shared_experts_tensor_parallel_size == tensor_model_parallel_size:
+            _SHARED_EXPERTS_TP = _TP
         else:
             # Rank layout is [PP, attention DP, CP, attention TP]. The
             # validated width divides attention TP x CP, so contiguous groups
