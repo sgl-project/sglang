@@ -149,6 +149,9 @@ def _gate_row_masks(moe, num_tokens, bound, image_input_ids, device, forward_bat
         num_tokens,
         id(bound) if bound is not None else None,
         id(image_input_ids) if image_input_ids is not None else None,
+        # A graph captured inside a forward (decoder replay tail) builds its own
+        # masks; ones from its eager warm-up runs would not be rebuilt on replay.
+        isinstance(cache, dict) and torch.cuda.is_current_stream_capturing(),
     )
     if isinstance(cache, dict):
         hit = cache.get(key)
