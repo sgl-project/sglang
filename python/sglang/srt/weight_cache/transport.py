@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
@@ -125,6 +126,44 @@ def _prefix_offsets(sizes: Sequence[int]) -> List[int]:
         offsets.append(total)
         total += size
     return offsets
+
+
+def _weak_storage_refs(state_tensors, plan) -> List[List[Tuple[Any, Any]]]:
+    """A weak reference to every distinct non-empty storage behind
+    ``state_tensors``, with its slot, grouped by the allocation the slot is
+    packed into.
+
+    This covers every storage, not only the ones a slot copies: two storages
+    can start at the same address, and either can keep the memory alive. It
+    adds no strong reference to any storage beyond the plan's own.
+    """
+    slot_at = {
+        (slot.alloc_index, slot.offset, slot.nbytes): slot
+        for slot in plan.slots
+        if slot.nbytes
+    }
+    refs = [[] for _ in plan.alloc_sizes]
+    seen = set()
+    for name, (tensor, _) in state_tensors.items():
+        storage = tensor.untyped_storage()
+        if storage.nbytes() and storage._cdata not in seen:
+            seen.add(storage._cdata)
+            entry = plan.entries[name]
+            slot = slot_at[
+                (entry["alloc_index"], entry["offset"], entry["storage_nbytes"])
+            ]
+            refs[slot.alloc_index].append((StorageWeakRef(storage), slot))
+    return refs
+
+
+def _distinct_slots(records) -> list:
+    """The slots of ``(weak storage ref, slot)`` records, each once, in order."""
+    slots, seen = [], set()
+    for _, slot in records:
+        if id(slot) not in seen:
+            seen.add(id(slot))
+            slots.append(slot)
+    return slots
 
 
 class WeightCacheTransportBackend(ABC):
@@ -328,8 +367,10 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
 
         Consumes the source mapping; each slot retains its source storages until
         copied. The caller releases the model and other source owners first so
-        copied originals can be reclaimed before the next allocation. Partial
-        packing failures leave the daemon unusable and it exits.
+        copied originals can be reclaimed before the next allocation. Copied
+        originals that something else still references are reported as soon as
+        their allocation is filled. Partial packing failures leave the daemon
+        unusable and it exits.
         """
         from sglang.srt.utils.cuda_vmm_utils import VmmReservation, tensor_from_pointer
 
@@ -342,6 +383,12 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             granularity=self._granularity,
             max_alloc_bytes=self._max_alloc_bytes,
         )
+        # A copied original that is still referenced from somewhere else (a
+        # module-level cache, a leftover view) is not freed, so packing holds it
+        # next to its copy. Weak references to every input storage show which
+        # ones as soon as their allocation is filled, instead of when device
+        # memory runs out.
+        storage_refs = _weak_storage_refs(state_tensors, plan)
         state_tensors.clear()
         if not plan.alloc_sizes:
             return plan.entries
@@ -361,6 +408,7 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         slots_by_alloc = [[] for _ in plan.alloc_sizes]
         for slot in plan.slots:
             slots_by_alloc[slot.alloc_index].append(slot)
+        retained = []
         for alloc_index, size in enumerate(plan.alloc_sizes):
             self._handles.append(
                 self._reservation.map(offsets[alloc_index], size, retain_handle=True)
@@ -377,6 +425,24 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
             # the driver so that they can back the next allocation.
             torch.cuda.synchronize(self._device)
             torch.cuda.empty_cache()
+            alive = [
+                record
+                for record in storage_refs[alloc_index]
+                if not record[0].expired()
+            ]
+            storage_refs[alloc_index] = []
+            if alive and not retained:
+                self._warn_retained(
+                    plan,
+                    _distinct_slots(alive),
+                    f"after filling allocation {alloc_index + 1} of "
+                    f"{len(plan.alloc_sizes)}",
+                )
+            retained.extend(alive)
+        # An owner can also let go while later allocations are filled.
+        retained = [record for record in retained if not record[0].expired()]
+        if retained:
+            self._warn_retained(plan, _distinct_slots(retained), "after packing")
 
         self._alloc_sizes = list(plan.alloc_sizes)
         self._alloc_offsets = offsets
@@ -434,6 +500,28 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
                 free_bytes,
                 largest_alloc,
             )
+
+    @staticmethod
+    def _warn_retained(plan, slots, when: str) -> None:
+        """Warn that ``slots`` were copied but still have source storages that
+        something else references. This tracks storage ownership; memory held
+        some other way is not seen."""
+        names = {}
+        for name, entry in plan.entries.items():
+            key = (entry["alloc_index"], entry["offset"], entry["storage_nbytes"])
+            names.setdefault(key, name)
+        examples = [
+            names[(slot.alloc_index, slot.offset, slot.nbytes)] for slot in slots[:3]
+        ]
+        logger.warning(
+            "[weight_cache] vmm_fd: %s, %d copied slot(s) (%d packed bytes) still "
+            "have source storages referenced elsewhere, e.g. %s; their memory may "
+            "stay allocated next to the packed copies.",
+            when,
+            len(slots),
+            sum(slot.nbytes for slot in slots),
+            ", ".join(examples),
+        )
 
     def _export_fds(self) -> List[int]:
         """Export a fresh POSIX fd per allocation; the caller closes them."""
