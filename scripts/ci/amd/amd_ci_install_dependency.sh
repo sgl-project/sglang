@@ -456,6 +456,7 @@ if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SK
     AITER_NAMESPACE="${GITHUB_EVENT_NAME:-local}:${GITHUB_REF:-local}"
     if [[ -n "$AITER_CACHE_HOST" ]] && command -v flock >/dev/null 2>&1; then
         AITER_ENVIRONMENT=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
+        AITER_PACKAGES=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" packages 2>/dev/null || true)
         AITER_CACHE_KEY=$(python3 scripts/ci/amd/aiter_wheel_cache.py key \
             --commit "$REPO_AITER_COMMIT" --image "$AITER_IMAGE" --arch "$IMAGE_GFX" \
             --namespace "$AITER_NAMESPACE" --abi "$AITER_ENVIRONMENT" \
@@ -586,6 +587,9 @@ PY
             AITER_BUILT_ENVIRONMENT=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
             if [[ "$AITER_BUILT_ENVIRONMENT" != "$AITER_ENVIRONMENT" ]]; then
                 echo "[CI-AITER-CHECK] Build changed dependency ABI; not caching this wheel"
+            elif [[ -z "$AITER_PACKAGES" || "$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" packages 2>/dev/null || true)" != "$AITER_PACKAGES" ]]; then
+                # A cache hit installs only the wheel, so the rebuild must not have needed other packages.
+                echo "[CI-AITER-CHECK] Build installed other packages; not caching this wheel"
             elif docker exec "$CI_CONTAINER_NAME" bash -c '
                 python3 '"$AITER_CACHE_TOOL"' publish --root '"$AITER_CACHE_ROOT"' \
                     --key '"$AITER_CACHE_KEY"' --wheel /tmp/aiter-wheel/*.whl

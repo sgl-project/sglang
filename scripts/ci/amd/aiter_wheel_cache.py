@@ -56,6 +56,17 @@ def build_environment():
     )
 
 
+def installed_packages():
+    """Every installed distribution except AITER: a rebuild that installs one is not reproducible from the wheel."""
+    return json.dumps(
+        sorted(
+            f"{distribution.metadata['Name'].lower()}=={distribution.version}"
+            for distribution in importlib.metadata.distributions()
+            if distribution.metadata["Name"].lower() not in ("amd-aiter", "amd_aiter")
+        )
+    )
+
+
 def cache_key(*, commit, image, arch, namespace, inputs, abi):
     if len(commit) != 40 or any(
         character not in "0123456789abcdef" for character in commit
@@ -137,6 +148,7 @@ def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("environment")
+    commands.add_parser("packages")
     mount_parser = commands.add_parser("check-mount")
     mount_parser.add_argument("--host-root", required=True)
     mount_parser.add_argument("--container", required=True)
@@ -160,6 +172,8 @@ def main():
         raise SystemExit(0 if visible else 1)
     elif args.command == "environment":
         print(build_environment())
+    elif args.command == "packages":
+        print(installed_packages())
     elif args.command == "key":
         print(
             cache_key(

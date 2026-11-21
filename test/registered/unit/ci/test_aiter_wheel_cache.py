@@ -115,7 +115,51 @@ echo "[$AITER_CACHE_KEY]"
             with self.assertRaises(ValueError):
                 cache.cached_wheel(directory=root / "key", key="key")
 
+    def test_package_snapshot_excludes_only_aiter(self):
+        """A rebuild that installs any package but AITER must change the snapshot that gates publication."""
+
+        def distributions(*names):
+            return [
+                SimpleNamespace(metadata={"Name": name}, version=version)
+                for name, version in names
+            ]
+
+        before = [("torch", "2"), ("amd-aiter", "1"), ("Requests", "3")]
+        after = [("torch", "2"), ("amd-aiter", "2"), ("Requests", "3")]
+        added = [*after, ("tqdm", "4")]
+        upgraded = [("torch", "2"), ("amd-aiter", "2"), ("Requests", "4")]
+        snapshots = []
+        for installed in (before, after, added, upgraded):
+            with patch.object(
+                cache.importlib.metadata,
+                "distributions",
+                return_value=distributions(*installed),
+            ):
+                snapshots.append(cache.installed_packages())
+        self.assertEqual(snapshots[0], snapshots[1])
+        self.assertNotIn("amd-aiter", snapshots[0])
+        self.assertNotEqual(snapshots[1], snapshots[2])
+        self.assertNotEqual(snapshots[1], snapshots[3])
+
+    def test_entry_is_invisible_until_publication_completes(self):
+        """A job that looks up the key while another copies its wheel must see a miss, not a partial entry."""
+        with tempfile.TemporaryDirectory() as directory:
+            wheel = self._make_wheel(directory)
+            root = Path(directory) / "cache"
+            visible_while_copying = []
+            real_copyfile = cache.shutil.copyfile
+
+            def copyfile(source, destination):
+                visible_while_copying.append((root / "key").exists())
+                return real_copyfile(source, destination)
+
+            with patch.object(cache.shutil, "copyfile", copyfile):
+                cache.publish(wheel=wheel, root=root, key="key")
+            self.assertEqual(visible_while_copying, [False])
+            self.assertTrue((root / "key").is_dir())
+
     def test_wheel_without_runtime_assets_is_not_published(self):
+        """Wheels without runtime files must be rejected before a cache entry is published."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "cache"
             with self.assertRaises(ValueError):
