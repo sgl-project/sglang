@@ -168,12 +168,12 @@ def extend(
         output_final_state=True,
     )
     written = torch.where(valid, final.to(ssm_states.dtype), current)
-    # Padded rows are redirected onto a live row's slot and value (or onto their own unchanged
-    # slot 0 when none is live), so a duplicate write never clobbers a live row, even at slot 0.
-    live = valid.flatten().int().argmax()
+    # Redirect padded rows onto a live row's slot and value (or unchanged slot 0 when none is live),
+    # so duplicate writes never clobber a live row, even at slot 0.
+    live = valid.flatten().int().argmax(dim=0, keepdim=True)
     ssm_states.index_copy_(
         0,
-        torch.where(valid.flatten(), slots, slots[live]),
-        torch.where(valid, written, written[live]),
+        torch.where(valid.flatten(), slots, slots.index_select(0, live)),
+        torch.where(valid, written, written.index_select(0, live)),
     )
     return out

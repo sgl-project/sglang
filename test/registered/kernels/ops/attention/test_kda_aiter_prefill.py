@@ -165,30 +165,38 @@ class TestAiterKDAPrefill(CustomTestCase):
 
     @torch.inference_mode()
     def test_padded_slot_does_not_clobber_live_slot_zero(self):
-        for padded in ((1,), (0,), (0, 2)):
-            with self.subTest(padded=padded):
+        """Padded rows leave non-live pool rows alone, even beside live slot 0, with no host sync."""
+        for slots in ([0, -1, 6], [-1, 0, 6], [-1, 5, -1], [-1, -1, -1]):
+            with self.subTest(slots=slots):
                 inputs = _inputs((64, 96, 33), torch.bfloat16)
-                inputs["cache_indices"][:] = torch.tensor(
-                    [0, 5, 6], dtype=torch.int32, device="cuda"
+                inputs["cache_indices"] = torch.tensor(
+                    slots, dtype=torch.int32, device="cuda"
                 )
-                for row in padded:
-                    inputs["cache_indices"][row] = -1
-                live = [i for i in range(3) if i not in padded]
                 actual_inputs, expected_inputs = _clone(inputs), _clone(inputs)
                 expected = _reference(expected_inputs)
-                kda_aiter_prefill.extend(
-                    *_args(actual_inputs), **_kwargs(actual_inputs)
-                )
-                rows = inputs["cache_indices"][live].long()
-                self.assertLess(
-                    _rms_ratio(
-                        actual_inputs["ssm_states"][rows],
-                        expected_inputs["ssm_states"][rows],
-                    ),
-                    1e-2,
-                )
+                # Warm the per-forward metadata cache, which syncs once, outside the check.
+                warm = _clone(inputs)
+                warm["query_start_loc"] = actual_inputs["query_start_loc"]
+                kda_aiter_prefill.extend(*_args(warm), **_kwargs(warm))
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    actual = kda_aiter_prefill.extend(
+                        *_args(actual_inputs), **_kwargs(actual_inputs)
+                    )
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                self.assertLess(_rms_ratio(actual, expected), 1e-2)
+                rows = inputs["cache_indices"][inputs["cache_indices"] >= 0].long()
                 untouched = torch.ones(SLOTS, dtype=torch.bool, device="cuda")
                 untouched[rows] = False
+                if rows.numel():
+                    self.assertLess(
+                        _rms_ratio(
+                            actual_inputs["ssm_states"][rows],
+                            expected_inputs["ssm_states"][rows],
+                        ),
+                        1e-2,
+                    )
                 self.assertTrue(
                     torch.equal(
                         actual_inputs["ssm_states"][untouched],
