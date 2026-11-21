@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    TransferBackend,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_qsa_pending_state_indices,
@@ -131,7 +132,10 @@ class TestBatchStagingReservations(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
         )
         req = SimpleNamespace(
-            bootstrap_room=7, extend_end=33, disagg_decode_prefix_len=0
+            bootstrap_room=7,
+            extend_end=33,
+            disagg_decode_prefix_len=0,
+            pending_bootstrap=False,
         )
         batch = SimpleNamespace(reqs=[req])
         run = SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch
@@ -162,13 +166,18 @@ class TestBatchStagingReservations(CustomTestCase):
         manager.decode_kv_args_table = {"decode-0": SimpleNamespace(decode_tp_size=2)}
         manager.attn_tp_size = 1
         manager.disaggregation_mode = DisaggregationMode.PREFILL
-        manager.request_status = {7: KVPoll.Transferring}
+        manager.request_status = {7: KVPoll.Bootstrapping}
         manager.transfer_queues = [FastQueue()]
         scheduler = SimpleNamespace(
-            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
+            disagg_prefill_bootstrap_queue=SimpleNamespace(
+                kv_manager=manager, transfer_backend=TransferBackend.NIXL
+            )
         )
         req = SimpleNamespace(
-            bootstrap_room=7, extend_end=160, disagg_decode_prefix_len=128
+            bootstrap_room=7,
+            extend_end=160,
+            disagg_decode_prefix_len=0,
+            pending_bootstrap=True,
         )
         batch = SimpleNamespace(reqs=[req])
         socket = Mock()
@@ -181,7 +190,10 @@ class TestBatchStagingReservations(CustomTestCase):
             SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
                 scheduler, batch
             )
-            self.assertEqual(socket.send_multipart.call_count, 1)
+            socket.send_multipart.assert_not_called()
+            manager.request_status[7] = KVPoll.Transferring
+            req.pending_bootstrap = False
+            req.disagg_decode_prefix_len = 128
             manager.add_transfer_request(7, np.array([0, 1]), slice(0, 2), False)
             self.assertEqual(socket.send_multipart.call_count, 1)
             req.extend_end = 161
