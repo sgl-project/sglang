@@ -11,7 +11,11 @@ from sglang.kernels.ops.attention.deep_select import (
     is_deep_select_supported,
     topk_page_transform,
 )
-from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+    FP4_INDEXER_DENSE_LEN,
+    FP4_INDEXER_MAX_SPAN,
+    fp4_indexer_topk,
+)
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -42,7 +46,18 @@ def _lite_topk_wins(num_rows: int, max_len: int) -> bool:
     """Whether LiteTopK beats the dense path on a chunk of ``num_rows`` query rows scored by this rank."""
     # LiteTopK needs rows x keys to fill the GPU: with few rows a CTA per 4 rows scans the whole key range and the
     # dense path wins. Rows of at most 6144 keys make every block dense (no sampling), where LiteTopK wins at any size.
-    return (num_rows >= 512 and num_rows * max_len >= 1 << 26) or max_len <= 6144
+    return (
+        num_rows >= 512 and num_rows * max_len >= 1 << 26
+    ) or max_len <= FP4_INDEXER_DENSE_LEN
+
+
+def _lite_topk_fits(data: DeepGEMMPrefillData) -> bool:
+    """Whether every block's strided sample covers its rows: no block samples, or the gathered K fits the span."""
+    # A block spans at most k_slots keys; past FP4_INDEXER_MAX_SPAN its last rows would get no sample.
+    return (
+        max(data.lens_per_request) <= FP4_INDEXER_DENSE_LEN
+        or data.k_slots.shape[0] <= FP4_INDEXER_MAX_SPAN[data.q_sf.shape[1]]
+    )
 
 
 class FullTopKIndexer:
@@ -83,9 +98,13 @@ class FullTopKIndexer:
             return
         out = inputs.out_raw_indices[: data.num_rows]
         shard = inputs.row_shard
-        if self.use_prefill_lite_topk and _lite_topk_wins(
-            data.num_rows if shard is None else shard.rows_per_rank(data.num_rows),
-            max(data.lens_per_request),
+        if (
+            self.use_prefill_lite_topk
+            and _lite_topk_wins(
+                data.num_rows if shard is None else shard.rows_per_rank(data.num_rows),
+                max(data.lens_per_request),
+            )
+            and _lite_topk_fits(data)
         ):
             if shard is None:
                 self._prefill_lite_topk(inputs, data, out)
