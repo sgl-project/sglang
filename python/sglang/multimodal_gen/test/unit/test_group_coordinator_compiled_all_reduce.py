@@ -1,4 +1,4 @@
-"""A compiled TP all-reduce must not graph-break on the custom all-reduce."""
+"""TP all-reduce: compiled path stays one graph; custom all-reduce gating."""
 
 import unittest
 import weakref
@@ -86,6 +86,28 @@ class TestCompiledAllReduce(CustomTestCase):
 
         torch.testing.assert_close(out, torch.full((4,), 3.0))
         torch.testing.assert_close(x, torch.ones(4))
+
+
+def _custom_ar_supported(*, rocm: bool, gfx1250: bool) -> bool:
+    platform = SimpleNamespace(is_rocm=lambda: rocm, is_cuda_alike=lambda: True)
+    with (
+        patch.object(group_coordinator, "current_platform", platform),
+        patch.object(group_coordinator, "is_gfx1250_supported", lambda: gfx1250),
+    ):
+        return group_coordinator._srt_custom_allreduce_supported()
+
+
+class TestCustomAllReduceGate(CustomTestCase):
+    def test_gfx1250_reduces_over_rccl(self):
+        """The ROCm custom all-reduce returns wrong sums on gfx1250 (MI450),
+        which corrupted TP2 FLUX.2 text-encoder outputs; it must stay off there."""
+        self.assertFalse(_custom_ar_supported(rocm=True, gfx1250=True))
+
+    def test_other_rocm_archs_keep_custom_all_reduce(self):
+        self.assertTrue(_custom_ar_supported(rocm=True, gfx1250=False))
+
+    def test_cuda_keeps_custom_all_reduce(self):
+        self.assertTrue(_custom_ar_supported(rocm=False, gfx1250=False))
 
 
 if __name__ == "__main__":

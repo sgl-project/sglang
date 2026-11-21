@@ -30,7 +30,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
 )
-from sglang.srt.utils import is_shm_available
+from sglang.srt.utils import is_gfx1250_supported, is_shm_available
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = init_logger(__name__)
@@ -43,6 +43,14 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # the tuned CUDA kernel instead of falling back to NCCL at the default 16 MiB
 # workspace limit.
 _DIFFUSION_CUSTOM_AR_MAX_SIZE = 32 * 1024 * 1024
+
+
+def _srt_custom_allreduce_supported() -> bool:
+    # The ROCm custom all-reduce returns wrong sums on gfx1250 (MI450), which
+    # corrupts TP text-encoder outputs; RCCL is used there until it is fixed.
+    if current_platform.is_rocm() and is_gfx1250_supported():
+        return False
+    return current_platform.is_cuda_alike()
 
 
 _group_name_counter: dict[str, int] = {}
@@ -257,7 +265,7 @@ class GroupCoordinator:
         self.srt_custom_allreduce = None
         if (
             use_srt_custom_allreduce
-            and current_platform.is_cuda_alike()
+            and _srt_custom_allreduce_supported()
             and self.world_size > 1
         ):
             # srt owns topology, dtype, contiguity, and size dispatch for custom ar
