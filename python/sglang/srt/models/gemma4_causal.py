@@ -988,9 +988,13 @@ class Gemma4TextModel(PreTrainedModel):
         self.post_init()
 
     # Block-FP8 linears that take the fused site's pre-quantized (fp8, scales)
-    # input (see compressed_tensors_w8a8_fp8.apply_weights).
+    # input (see compressed_tensors_w8a8_fp8.apply_weights). The FlashInfer hybrid
+    # qualifies because it hands a pre-quantized (input_scale != None) call back to
+    # DeepGEMM, so on H20 -- where ``auto`` resolves to it -- enabling this fusion
+    # still works instead of being dropped.
     _AR_FUSION_LINEARS = (
         "deepgemm_w8a8_block_fp8_linear_with_fallback",
+        "flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback",
         "triton_w8a8_block_fp8_linear",
     )
 
@@ -1003,14 +1007,21 @@ class Gemma4TextModel(PreTrainedModel):
                 ("qkv_proj", layer.self_attn.qkv_proj),
                 ("gate_up_proj", layer.mlp.gate_up_proj),
             ):
-                linear = getattr(
-                    getattr(proj, "scheme", None), "w8a8_block_fp8_linear", None
-                )
+                scheme = getattr(proj, "scheme", None)
+                linear = getattr(scheme, "w8a8_block_fp8_linear", None)
                 linear_name = getattr(getattr(linear, "func", linear), "__name__", "")
                 if linear_name not in cls._AR_FUSION_LINEARS:
                     return (
                         f"layer {i} {name}: block-FP8 linear "
                         f"{linear_name or 'missing'} takes no pre-quantized input"
+                    )
+                # The fused site emits per-token-group scales, one per K/128
+                # columns; a [*, 32] weight layout would read them as K/32.
+                block = getattr(scheme, "weight_block_size", None)
+                if block is not None and list(block)[1] != 128:
+                    return (
+                        f"layer {i} {name}: weight scales are K/{list(block)[1]}, "
+                        f"the fused site produces K/128"
                     )
         return None
 

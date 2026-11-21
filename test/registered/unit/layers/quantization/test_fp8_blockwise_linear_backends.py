@@ -249,8 +249,13 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
         weight_scale = torch.ones(1, 1, device="cuda")
         q, scale = fp8_utils.sglang_per_token_group_quant_fp8(x, 128, scale_ue8m0=True)
         ref = (q.float() * scale).to(torch.bfloat16)
+        # The H20 default is pinned by test_auto_takes_swapab_on_h20_only; this
+        # test is about ue8m0 activation scales, which stay on DeepGEMM there.
         for backend in (Fp8GemmRunnerBackend.AUTO, Fp8GemmRunnerBackend.DEEP_GEMM):
-            with mock.patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", backend):
+            with (
+                mock.patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", backend),
+                mock.patch.object(fp8_utils, "_is_h20", return_value=False),
+            ):
                 self.assertIs(
                     fp8_utils.dispatch_w8a8_block_fp8_linear([128, 128]),
                     fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -274,6 +279,68 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
 
     def test_cutlass(self):
         self._run("cutlass")
+
+    @unittest.skipUnless(
+        get_device_sm() == 90 and fp8_utils._HAS_FLASHINFER_SM90_SWAPAB,
+        "the swapAB half of flashinfer's SM90 block-FP8 GEMM is SM90-only",
+    )
+    def test_auto_takes_swapab_on_h20_only(self):
+        """`auto` takes the swapAB hybrid on H20 and plain DeepGEMM elsewhere."""
+
+        def _auto():
+            with mock.patch.object(
+                fp8_utils,
+                "get_fp8_gemm_runner_backend",
+                return_value=Fp8GemmRunnerBackend.AUTO,
+            ):
+                return fp8_utils.dispatch_w8a8_block_fp8_linear(
+                    weight_block_size=[128, 128]
+                )
+
+        with mock.patch.object(fp8_utils, "_is_h20", return_value=True):
+            self.assertIs(
+                _auto(),
+                fp8_utils.flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback,
+            )
+        with mock.patch.object(fp8_utils, "_is_h20", return_value=False):
+            self.assertIs(
+                _auto(), fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+            )
+
+    @unittest.skipUnless(
+        get_device_sm() == 90 and fp8_utils._HAS_FLASHINFER_SM90_SWAPAB,
+        "the swapAB half of flashinfer's SM90 block-FP8 GEMM is SM90-only",
+    )
+    def test_h20_opt_out_keeps_deep_gemm(self):
+        """A feature that needs one kernel for every M keeps DeepGEMM on H20."""
+        with (
+            mock.patch.object(fp8_utils, "_is_h20", return_value=True),
+            mock.patch.object(fp8_utils, "_h20_swapab_opt_out", return_value=True),
+            mock.patch.object(
+                fp8_utils,
+                "get_fp8_gemm_runner_backend",
+                return_value=Fp8GemmRunnerBackend.AUTO,
+            ),
+        ):
+            fn = fp8_utils.dispatch_w8a8_block_fp8_linear(weight_block_size=[128, 128])
+        self.assertIs(fn, fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback)
+
+    @unittest.skipUnless(
+        get_device_sm() == 90 and fp8_utils._HAS_FLASHINFER_SM90_SWAPAB,
+        "the swapAB half of flashinfer's SM90 block-FP8 GEMM is SM90-only",
+    )
+    def test_explicit_deep_gemm_wins_over_h20(self):
+        """An explicit backend flag is not overridden by the H20 default."""
+        with mock.patch.object(
+            fp8_utils,
+            "get_fp8_gemm_runner_backend",
+            return_value=Fp8GemmRunnerBackend.DEEP_GEMM,
+        ):
+            with mock.patch.object(fp8_utils, "_is_h20", return_value=True):
+                fn = fp8_utils.dispatch_w8a8_block_fp8_linear(
+                    weight_block_size=[128, 128]
+                )
+        self.assertIs(fn, fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
