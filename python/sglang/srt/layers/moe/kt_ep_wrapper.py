@@ -133,6 +133,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         method = KTEPWrapperMethod(gpu_method, kt_config)
     """
 
+    # KT consumes the routing weights exactly as given: the CPU experts never
+    # apply the routed scale and the merged GPU result is unscaled too, so the
+    # MoE epilogue owes the scale on every device whenever the top-k did not
+    # fold `routed_scaling_factor` into the weights. Declared as a class
+    # attribute so callers can duck-type it like `fuse_routed_scaling_factor_in_topk`
+    # instead of importing this class for isinstance checks.
+    applies_routing_weights_as_given = True
+
     def __init__(
         self,
         gpu_method: FusedMoEMethodBase,
