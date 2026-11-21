@@ -20,8 +20,10 @@ import platform
 import shutil
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import AbstractSet, Dict, List, Optional, Sequence, Tuple
+from uuid import UUID
 
 import numpy as np
 import torch
@@ -63,6 +65,7 @@ class ModelContext:
         # estimate, and what the layers pinned so far (layers of other formats can be larger).
         self.fits_bytes: Optional[int] = None
         self.pinned_bytes = 0
+        self.local_tp_size: Optional[int] = None
         self.token_routed = 0  # leading layers that keep every expert in host memory
         self.space_checked = False
         self.device_state = None
@@ -75,11 +78,43 @@ def current_model() -> ModelContext:
     return _MODEL
 
 
+def _host_boot_id() -> Optional[str]:
+    """Identify the Linux kernel independently of the container's hostname or IPC."""
+    try:
+        return str(UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+    except (OSError, ValueError):
+        return None
+
+
+def _local_tp_size() -> int:
+    """TP ranks sharing this host's RAM, measured once before allocating host stores."""
+    from sglang.srt.runtime_context import get_parallel
+
+    model = current_model()
+    if model.local_tp_size is None:
+        parallel = get_parallel()
+        if parallel.tp_size == 1:
+            model.local_tp_size = 1
+        else:
+            group = parallel.tp_group
+            # Ray can place TP ranks on different hosts even with nnodes=1.
+            # Everyone gathers a result, even when the local proc file cannot be read.
+            host_ids = group.all_gather_object(_host_boot_id())
+            if None in host_ids:
+                raise RuntimeError(
+                    "Paged experts: cannot determine the host-memory budget because a TP "
+                    "rank could not read its Linux kernel boot ID from "
+                    "/proc/sys/kernel/random/boot_id"
+                )
+            model.local_tp_size = host_ids.count(host_ids[group.rank_in_group])
+    return model.local_tp_size
+
+
 def host_memory_budget_bytes(need_bytes: int) -> Optional[int]:
-    """Pinned host memory for all expert stores, which need ``need_bytes`` to hold every
-    expert: ``--paged-experts-host-memory-gb``; unset, None (every expert pinned, as without
-    the disk tier) while they fit what is available now within the container's memory limit,
-    else that less the reserve HiCache also leaves."""
+    """This rank's share of the per-host pinned budget; its stores need ``need_bytes``.
+    ``--paged-experts-host-memory-gb`` is divided among TP ranks sharing the host. Unset,
+    None (every expert pinned) while they fit what is available within the container's
+    memory limit, else that less the reserve HiCache also leaves."""
     from sglang.srt.mem_cache.pool_host.base import (
         HICACHE_HOST_MEMORY_RESERVE_BYTES,
         host_memory_budget_plain_hugetlb,
@@ -88,8 +123,9 @@ def host_memory_budget_bytes(need_bytes: int) -> Optional[int]:
     from sglang.srt.runtime_context import get_exec
 
     gb = get_exec().moe.paged_experts_host_memory_gb
+    local_tp_size = _local_tp_size()
     if gb is not None:
-        return int(gb * _GIB)
+        return int(gb * _GIB) // local_tp_size
     try:
         # Plain RAM: pinned host rows are not hugetlb pages.
         budget, _ = host_memory_budget_plain_hugetlb(
@@ -100,10 +136,11 @@ def host_memory_budget_bytes(need_bytes: int) -> Optional[int]:
             "Paged experts: cannot read the container's memory limit to size the host "
             "budget for the disk tier; set --paged-experts-host-memory-gb"
         ) from e
-    if need_bytes <= budget + HICACHE_HOST_MEMORY_RESERVE_BYTES:
-        current_model().fits_bytes = budget + HICACHE_HOST_MEMORY_RESERVE_BYTES
+    available = (budget + HICACHE_HOST_MEMORY_RESERVE_BYTES) // local_tp_size
+    if need_bytes <= available:
+        current_model().fits_bytes = available
         return None
-    return max(0, budget)
+    return max(0, budget // local_tp_size)
 
 
 def get_exec_moe():
@@ -175,6 +212,14 @@ def host_rows(
         return rows
     budget = model.budget_bytes / _GIB
     if not enabled:
+        local_tp_size = model.local_tp_size or 1
+        if local_tp_size > 1:
+            raise RuntimeError(
+                f"Paged experts: the {local_tp_size} TP ranks on this host need about "
+                f"{need * local_tp_size / _GIB:.1f} GiB of pinned host memory in total, "
+                f"but --paged-experts-host-memory-gb is {budget * local_tp_size:.1f} GiB "
+                "per host; raise --paged-experts-host-memory-gb if the host has the memory"
+            )
         raise RuntimeError(
             f"Paged experts: the experts need about {need / _GIB:.1f} GiB of pinned host "
             f"memory, --paged-experts-host-memory-gb is {budget:.1f} GiB; set "

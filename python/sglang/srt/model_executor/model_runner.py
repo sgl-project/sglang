@@ -1044,6 +1044,10 @@ class ModelRunner:
         )
         if expert_slots is not None:
             expert_slots.size(result.max_total_num_tokens)
+        if get_exec().moe.enable_paged_experts:
+            from sglang.srt.layers.moe.paged_experts.sizing import check_tp_sizing
+
+            check_tp_sizing(self.model)
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool

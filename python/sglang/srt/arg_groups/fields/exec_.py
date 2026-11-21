@@ -1140,8 +1140,10 @@ class ExecMoe(msgspec.Struct):
     enable_paged_experts: A[
         bool,
         "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
-        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
-        "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
+        "page the rest from pinned host memory on demand. TP is supported for unquantized BF16 "
+        "experts on the triton runner (other supported configurations: see the Paged Experts "
+        "docs); requires --ep-size, --pp-size, --dp-size, --attn-dp-size and --attn-cp-size 1, and "
+        "--tp-size 1 with --paged-experts-enable-disk. "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",
     ] = False
@@ -1166,7 +1168,8 @@ class ExecMoe(msgspec.Struct):
     ] = False
     paged_experts_host_memory_gb: A[
         Optional[float],
-        "Pinned host memory (GiB) for the experts of all MoE layers with --enable-paged-experts. "
+        "Pinned host memory (GiB) per host for the experts of all MoE layers with "
+        "--enable-paged-experts, shared equally by the TP ranks on that host. "
         "When not every expert fits, each layer keeps only some experts in pinned memory and "
         "reads the others from its file under $SGLANG_CACHE_DIR/paged_experts, which needs "
         "--paged-experts-enable-disk. Unset: every expert is pinned; with "

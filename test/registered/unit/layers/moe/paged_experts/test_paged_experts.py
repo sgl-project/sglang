@@ -65,6 +65,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -207,7 +208,7 @@ def _exec(enable_disk=False):
     )
 
 
-def _load(method, layer, disk=False, router_top_k=K):
+def _load(method, layer, disk=False, router_top_k=K, tp_size=1):
     """The post-load step, with the host store on the CPU, the expert cache as ``disk`` says
     and the model's router top-k ``router_top_k`` (for a layer without one)."""
     model_config = SimpleNamespace(
@@ -217,6 +218,7 @@ def _load(method, layer, disk=False, router_top_k=K):
         patch.object(formats, "HostExpertStore", _CpuStore),
         patch(_EXPERT_CACHE + "HostExpertStore", _CpuStore),
         patch(_METHOD + "get_exec", return_value=_exec(disk)),
+        patch(_METHOD + "get_parallel", return_value=SimpleNamespace(tp_size=tp_size)),
         patch(_METHOD + "process_model_config", return_value=model_config),
     ):
         method.process_weights_after_loading(layer)
@@ -1171,12 +1173,22 @@ class TestFormats(CustomTestCase):
 
 class TestCompat(CustomTestCase):
     def _check(
-        self, num_resident=K, speculative_algorithm=None, load_format="auto", **flags
+        self,
+        num_resident=K,
+        speculative_algorithm=None,
+        load_format="auto",
+        tp_size=1,
+        params_dtype=torch.bfloat16,
+        enable_disk=False,
+        expert_format=None,
+        parallel_sizes=None,
+        **flags,
     ):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
             paged_experts_num_resident=num_resident,
+            paged_experts_enable_disk=enable_disk,
             enable_fused_moe_sum_all_reduce=False,
         )
         features = SimpleNamespace(
@@ -1186,14 +1198,21 @@ class TestCompat(CustomTestCase):
             enable_nvidia_megakernel=flags.get("enable_nvidia_megakernel", False)
         )
         lora = SimpleNamespace(enable_lora=flags.get("enable_lora", False))
-        layer = SimpleNamespace(top_k=TOP_K, num_fused_shared_experts=0)
+        layer = SimpleNamespace(
+            top_k=TOP_K, num_fused_shared_experts=0, params_dtype=params_dtype
+        )
+        parallel = SimpleNamespace(
+            tp_size=tp_size,
+            ep_size=1,
+            pp_size=1,
+            dp_size=1,
+            attn_dp_size=1,
+            attn_cp_size=1,
+        )
+        for name, size in (parallel_sizes or {}).items():
+            setattr(parallel, name, size)
         with (
-            patch(
-                method + "get_parallel",
-                return_value=SimpleNamespace(
-                    tp_size=1, ep_size=1, pp_size=1, dp_size=1
-                ),
-            ),
+            patch(method + "get_parallel", return_value=parallel),
             patch(
                 method + "get_exec",
                 return_value=SimpleNamespace(moe=moe, features=features, kernel=kernel),
@@ -1211,10 +1230,45 @@ class TestCompat(CustomTestCase):
             ),
             patch(method + "check_cuda_graph_backend", return_value=True),
         ):
-            check_paged_experts_compat(layer=layer, expert_format=object())
+            check_paged_experts_compat(
+                layer=layer, expert_format=expert_format or UnquantizedFormat()
+            )
 
     def test_accepts_a_supported_config(self):
         self._check()
+
+    def test_tp_supports_only_bf16_in_memory(self):
+        """TP must keep rank-specific shard bytes out of the rank-unaware disk cache and must
+        not silently enable quantized or FP16 layouts tested only at TP1."""
+        self._check(tp_size=2)
+        for name, kwargs in {
+            "disk cache": {"enable_disk": True},
+            "fp16": {"params_dtype": torch.float16},
+            "quantized": {"expert_format": formats.Fp8BlockFormat()},
+        }.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(RuntimeError, "--tp-size|unquantized BF16"):
+                    self._check(tp_size=2, **kwargs)
+        self._check(params_dtype=torch.float16)
+        self._check(expert_format=formats.Fp8BlockFormat())
+
+    def test_tp_keeps_other_parallel_modes_rejected(self):
+        for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size", "attn_cp_size"):
+            with self.subTest(name):
+                with self.assertRaisesRegex(
+                    RuntimeError, f"--{name.replace('_', '-')}"
+                ):
+                    self._check(tp_size=2, parallel_sizes={name: 2})
+
+    def test_tp_does_not_suggest_the_disabled_disk_cache(self):
+        for tp_size in (1, 2):
+            with (
+                self.subTest(tp_size=tp_size),
+                patch(_EXPERT_CACHE + "hint_disk") as hint,
+            ):
+                method, layer, _ = _paged_layer(load=False)
+                _load(method, layer, tp_size=tp_size)
+            self.assertEqual(hint.called, tp_size == 1)
 
     def test_only_loaders_that_fill_through_load_weights_are_accepted(self):
         """The loaders that fill the experts through model.load_weights and then run the
@@ -1381,6 +1435,60 @@ class TestSizing(CustomTestCase):
         self.assertEqual(grow([2, 2], [8, 32], [100, 100], 3000), [8, 26])
         self.assertEqual(grow([2, 2], [32, 32], [100, 100], 199), [2, 2])
 
+    def test_tp_budget_uses_the_minimum_free_memory(self):
+        """When only one rank can fit another slot per layer, both ranks must stop growing.
+        Otherwise they can capture different decode graphs containing TP collectives."""
+        tp_group = SimpleNamespace(world_size=2, cpu_group=object())
+        kvc = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+
+        def free_memory(*, device, gpu_id, distributed, cpu_group):
+            self.assertEqual(device, "cuda")
+            self.assertIs(cpu_group, tp_group.cpu_group)
+            return min(9, 6) if distributed else (9, 6)[gpu_id]
+
+        with (
+            self._patched(mem_fraction_static=0.75),
+            patch(
+                self._SIZING + "get_mm",
+                return_value=SimpleNamespace(mm_feature_transport=None),
+            ),
+            get_parallel().override(tp_group=tp_group),
+            patch(
+                "sglang.srt.utils.device.get_available_gpu_memory",
+                side_effect=free_memory,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.mm_runtime_reservation_gb",
+                return_value=0,
+            ),
+        ):
+            budgets = []
+            for rank in range(2):
+                kvc.gpu_id = rank
+                budgets.append(sizing.static_budget_bytes(kvc, pre_model_load_memory=0))
+
+        self.assertEqual(budgets, [6 * sizing._GIB] * 2)
+        for budget in budgets:
+            self.assertEqual(
+                sizing.ExpertSlotSizing._grow(
+                    [TOP_K, TOP_K],
+                    [E, E],
+                    [sizing._GIB, sizing._GIB],
+                    budget,
+                ),
+                [5, 5],
+            )
+        self.assertEqual(
+            sizing.ExpertSlotSizing._grow(
+                [TOP_K, TOP_K], [E, E], [sizing._GIB, sizing._GIB], 9 * sizing._GIB
+            ),
+            [6, 6],
+        )
+
     def _sized(
         self,
         budget_slots,
@@ -1429,6 +1537,52 @@ class TestSizing(CustomTestCase):
             ):
                 ks = slots.size(kv_tokens)
         return ks, built, caps, overrides
+
+    def test_tp_startup_rejects_different_final_slot_and_capture_plans(self):
+        # Equal free-memory measurements cannot guard against other sizing inputs:
+        # reserve two slots for prefill on one rank, and none on the other.
+        plans = []
+        models = []
+        for reserve in (0, 2):
+            ks, built, caps, _ = self._sized(budget_slots=4, reserve_slots=reserve)
+            plans.append((ks, [caps[0]], caps[0]))
+            models.append(torch.nn.ModuleList([layer for _, layer, _ in built]))
+        self.assertEqual([p[0] for p in plans], [[4, 4], [3, 3]])
+        # Also cover unequal list lengths: a tensor all-reduce without a length
+        # check would hang rather than report either of these mismatches.
+        for peer in (plans[0], plans[1], ([4, 4], [1, 2], 2), ([4], [2], 2)):
+            gathered = [plans[0], peer]
+            for rank in range(2):
+                local = gathered[rank]
+                decode = SimpleNamespace(bs=local[1], max_bs=local[2])
+                model = models[1] if local[0] == [3, 3] else models[0]
+                if len(local[0]) == 1:
+                    model = torch.nn.ModuleList([model[0]])
+
+                def gather(plan):
+                    self.assertEqual(plan, local)
+                    return gathered
+
+                group = SimpleNamespace(all_gather_object=gather)
+                with (
+                    self.subTest(peer=peer, rank=rank),
+                    get_parallel().override(tp_size=2, tp_group=group),
+                    patch(
+                        self._SIZING + "get_exec",
+                        return_value=SimpleNamespace(
+                            graph=SimpleNamespace(
+                                cuda_graph_config=SimpleNamespace(decode=decode)
+                            )
+                        ),
+                    ),
+                ):
+                    if peer == plans[0]:
+                        sizing.check_tp_sizing(model)
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "differ across TP ranks"
+                        ):
+                            sizing.check_tp_sizing(model)
 
     @staticmethod
     def _kvc():
@@ -2198,6 +2352,15 @@ class TestDiskTier(CustomTestCase):
 
 
 class TestDiskTierGuards(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        parallel = patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(tp_size=1),
+        )
+        parallel.start()
+        self.addCleanup(parallel.stop)
+
     def _rows(
         self,
         budget_rows,
@@ -2565,6 +2728,89 @@ class TestDiskTierGuards(CustomTestCase):
                 rows = method_module._host_rows({"w": ((H, H), torch.float32)}, E, K, 0)
             self.assertEqual(rows, E)
             self.assertEqual(budget.called, measured)
+
+
+class TestTpHostBudget(CustomTestCase):
+    def _rows(self, hosts, rank, budget_gb, num_resident=K, *, nnodes=None):
+        from sglang.srt.layers.moe.paged_experts import method as method_module
+
+        def gather(boot_id):
+            self.assertEqual(boot_id, hosts[rank])
+            return hosts
+
+        group = SimpleNamespace(rank_in_group=rank, all_gather_object=gather)
+        nnodes = len(set(hosts)) if nnodes is None else nnodes
+        exec_ctx = SimpleNamespace(
+            moe=SimpleNamespace(
+                paged_experts_host_memory_gb=budget_gb, paged_experts_enable_disk=False
+            )
+        )
+        with (
+            patch.object(disk_tier, "_MODEL", disk_tier.ModelContext()),
+            patch.object(method_module, "get_exec", return_value=exec_ctx),
+            patch("sglang.srt.runtime_context.get_exec", return_value=exec_ctx),
+            get_parallel().override(tp_size=len(hosts), nnodes=nnodes, tp_group=group),
+            patch(
+                "sglang.srt.runtime_context.process_model_config",
+                return_value=SimpleNamespace(num_hidden_layers=2),
+            ),
+            patch.object(disk_tier, "_host_boot_id", return_value=hosts[rank]),
+        ):
+            # Layout only: 2 GiB per rank across two layers, without allocating it.
+            return method_module._host_rows(
+                {"w": ((1 << 26,), torch.uint8)}, E, num_resident, 0
+            )
+
+    def test_tp_ranks_share_one_host_budget(self):
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([0, 0], rank, budget_gb=2)
+                self.assertEqual(self._rows([0, 0], rank, budget_gb=4), E)
+
+    def test_only_ranks_on_this_host_share_its_budget(self):
+        # TP4 across two hosts needs 4 GiB on each, rather than 8 GiB per host.
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                self.assertEqual(self._rows([0, 0, 1, 1], rank, budget_gb=4), E)
+        # Unequal host populations must also use their actual local rank counts.
+        for rank in range(3):
+            with self.assertRaisesRegex(RuntimeError, "3 TP ranks.*in total"):
+                self._rows([0, 0, 0, 1], rank, budget_gb=4)
+        self.assertEqual(self._rows([0, 0, 0, 1], 3, budget_gb=4), E)
+
+    def test_ranks_in_separate_launch_nodes_on_one_kernel_share_the_budget(self):
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([0, 0], rank, budget_gb=2, nnodes=2)
+                self.assertEqual(self._rows([0, 0], rank, budget_gb=4, nnodes=2), E)
+
+    def test_one_logical_node_can_span_multiple_physical_hosts(self):
+        # A custom Ray placement group can put each TP rank on a different
+        # host while the logical launcher configuration still has nnodes=1.
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                self.assertEqual(self._rows([0, 1], rank, budget_gb=2, nnodes=1), E)
+
+    def test_missing_host_boot_id_fails_on_all_ranks(self):
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                with self.assertRaisesRegex(
+                    RuntimeError, "could not read its Linux kernel boot ID"
+                ):
+                    self._rows([0, None], rank, budget_gb=4, nnodes=2)
+
+    def test_tp1_and_fully_resident_experts_obey_the_budget(self):
+        for num_resident in (K, E):
+            with self.subTest(num_resident=num_resident):
+                self.assertEqual(self._rows([0], 0, 2, num_resident), E)
+                with self.assertRaisesRegex(
+                    RuntimeError, "--paged-experts-host-memory-gb"
+                ):
+                    self._rows([0], 0, 1, num_resident)
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([0, 0], 0, 2, num_resident)
 
 
 class TestHostMemoryFlag(CustomTestCase):
