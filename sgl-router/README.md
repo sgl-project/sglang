@@ -115,6 +115,7 @@ every flag.
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
+| `POST`/`GET /workers`, `GET`/`PUT`/`DELETE /workers/{id}` | Asynchronous runtime Worker management and inspection |
 | `POST /flush_cache` | Fan out a cache flush to every worker, with the caller's `timeout` |
 | `GET /server_info` | Answered by one healthy worker (a decode worker under P/D, which reports decode's state); `/get_server_info` is an alias |
 | `GET /model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_model_info` is an alias |
@@ -124,6 +125,28 @@ every flag.
 Endpoints for features the router does not provide yet (the stored-response
 routes under `/v1/responses/`, the Conversations API, `/v1/loads`) answer
 `501` with error code `unsupported_endpoint`.
+
+Worker mutations require `--worker-management-api-key` and a matching
+`Authorization: Bearer <key>` header; without the flag they are unavailable.
+A missing or wrong key returns `401` with `worker_management_unauthorized`.
+They return `202`. `GET /workers/{id}` exposes the operation and runtime state,
+including discovery IDs that contain `/`. `PUT` and `DELETE` require the current
+revision in `If-Match`. This revision is the Worker control record's version,
+not an HTTP entity tag; read it from the JSON response. A missing or invalid
+revision returns `400`; a non-current revision returns `409` with
+`stale_revision`. Workers created by static or Kubernetes discovery are
+read-only.
+
+Worker control state is local to one Router process. It is not persisted or
+replicated, so a Router restart loses API-created records and each Router
+replica has independent state. Follow-up `GET`, `PUT`, and `DELETE` requests
+must reach the same replica; an ordinary load-balanced Service cannot guarantee
+that without a per-replica endpoint or sticky routing.
+
+A failed create remains queryable under its assigned ID and keeps its URL
+reserved. Retry it with `PUT` using the same ID, URL, and current revision, or
+delete it before creating a new record. If discovery has restored a worker for
+that URL, retry and create requests conflict until discovery releases it.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -378,6 +401,9 @@ unset fields inherit the CLI flags. See
   [request body size](REFERENCE.md#request-body-size).
 - **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
   see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
+- **Worker management API key**: `--worker-management-api-key` enables and
+  authenticates `POST`, `PUT`, and `DELETE` under `/workers`; it is independent
+  from the engine API key.
 - **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
   parameters fleet-wide; `--sampling-param-conflict reject|allow` decides what
   happens to requests that differ. See
