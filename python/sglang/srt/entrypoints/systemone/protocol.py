@@ -2,7 +2,8 @@
 
 Follows the published System One OpenAPI 0.2.0 request and response shapes:
 a state, a map of noul, choice, and score questions keyed by caller ids, and
-one answer per question id.
+one answer per question id. Nemotron also has a checkpoint-specific body for
+`/v1/decisions`, with limits checked against the served checkpoint.
 """
 
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
@@ -19,8 +20,13 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 
 from sglang.srt.entrypoints.openai.protocol import (
+    DecisionChoiceQuestion,
     DecisionImage,
+    DecisionOption,
+    DecisionRequest,
+    DecisionScoreQuestion,
     DecisionText,
+    DecisionYesNoQuestion,
     RequiredDecisionText,
     check_option_names,
     is_blank_decision_text,
@@ -100,6 +106,10 @@ class SystemOneRequest(BaseModel):
     # SGLang extension, for chat templates whose reasoning toggle needs a kwarg.
     chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
 
+    # Captured so model-specific serving can reject unsupported execution modes.
+    packing: SkipJsonSchema[Any] = None
+    long_mode: SkipJsonSchema[Any] = None
+
     # /v1/decisions fields, which would change the answers if honored or ignored.
     # Declared only to refuse them by name, and hidden from the schema.
     temperature: SkipJsonSchema[Any] = None
@@ -114,6 +124,59 @@ class SystemOneRequest(BaseModel):
                 f"{info.field_name} is not part of this API, use /v1/decisions for it"
             )
         return value
+
+
+class NemotronDecisionChoiceQuestion(SystemOneChoiceQuestion):
+    instructions: Any = Field(...)
+    criteria: Dict[str, Any] = Field(min_length=2)
+
+
+class NemotronDecisionScoreQuestion(SystemOneScoreQuestion):
+    instructions: Any = Field(...)
+    criteria: List[Any] = Field(min_length=2)
+
+
+class NemotronDecisionNoulQuestion(SystemOneNoulQuestion):
+    instructions: Any = Field(...)
+
+
+class NemotronDecisionRequest(SystemOneRequest):
+    model_config = ConfigDict(extra="forbid")
+    state: Any
+    # Sidecar limits are checked against the served model before tokenization.
+    questions: Dict[
+        str,
+        Annotated[
+            Union[
+                NemotronDecisionNoulQuestion,
+                NemotronDecisionChoiceQuestion,
+                NemotronDecisionScoreQuestion,
+            ],
+            Field(discriminator="type"),
+        ],
+    ] = Field(min_length=1)
+
+
+class NemotronDecisionsChoiceQuestion(DecisionChoiceQuestion):
+    options: List[DecisionOption] = Field(min_length=2)
+
+
+class NemotronDecisionsScoreQuestion(DecisionScoreQuestion):
+    levels: List[RequiredDecisionText] = Field(min_length=2)
+
+
+class NemotronDecisionsRequest(DecisionRequest):
+    input: Any
+    questions: List[
+        Annotated[
+            Union[
+                NemotronDecisionsChoiceQuestion,
+                NemotronDecisionsScoreQuestion,
+                DecisionYesNoQuestion,
+            ],
+            Field(discriminator="type"),
+        ]
+    ] = Field(min_length=1)
 
 
 class SystemOneNoulAnswer(BaseModel):

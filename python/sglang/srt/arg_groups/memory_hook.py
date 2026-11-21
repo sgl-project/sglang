@@ -68,6 +68,8 @@ def handle_gpu_memory_settings(server_args: Any):
       We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
       and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
 
+      Model-specific estimates can replace the generic activation reserve.
+
       The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
     """
     from sglang.srt.arg_groups.cuda_graph_hook import (
@@ -293,6 +295,12 @@ def handle_gpu_memory_settings(server_args: Any):
 
     if cfg.mem_fraction_static is None:
         model_config = model_config_of(server_args)
+        from sglang.srt.arg_groups.model_overrides.nemotron_decision import (
+            apply_nemotron_decision_prefill_defaults,
+            nemotron_decision_activation_reserve_mb,
+        )
+
+        apply_nemotron_decision_prefill_defaults(server_args, model_config)
         is_vlm = (
             model_config.is_multimodal
             and not cfg.language_only
@@ -320,7 +328,14 @@ def handle_gpu_memory_settings(server_args: Any):
                 activation_tokens = max(cfg.max_prefill_tokens, 2048)
             # Constant meta data (e.g., from attention backend) + activation slack.
             reserved_mem = 512
-            reserved_mem += activation_tokens * 1.5
+            decision_reserve = nemotron_decision_activation_reserve_mb(
+                model_config, activation_tokens, gpu_mem
+            )
+            reserved_mem += (
+                activation_tokens * 1.5
+                if decision_reserve is None
+                else decision_reserve
+            )
             # Some adjustments for large parallel size
             reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
             reserved_mem += reserve_for_graph_mb(server_args)
