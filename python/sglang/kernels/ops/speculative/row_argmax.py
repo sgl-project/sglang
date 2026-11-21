@@ -13,6 +13,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 
 @triton.jit
 def _argmax_pair(av, ai, bv, bi):
@@ -86,6 +90,12 @@ def div_argmax(
         and divisor.device == x.device
         and divisor.stride(1) == 1
     )
+    if _is_npu:
+        from sgl_kernel_npu.operators.sample import div_argmax as npu_div_argmax
+
+        return npu_div_argmax(
+            x, divisor, divisor_min=divisor_min, ignore_nan=ignore_nan
+        )
     return _medium_row_argmax(
         x, divisor, divisor_min=divisor_min, ignore_nan=ignore_nan
     )

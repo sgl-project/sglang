@@ -17,7 +17,12 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x"],
+  supportedHardware: ["h200", "b200", "b300", "gb300", "mi355x", "rtx6000"],
+
+  // RTX PRO 6000 (SM120, Blackwell workstation) is not in the shared catalog.
+  hardware: [
+    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+  ],
 
   variants: [
     { id: "flash", label: "DeepSeek-V4.1-Flash" },
@@ -52,13 +57,13 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   dockerImages: {
-    // DeepSeek-V4.1 support has not shipped in a CUDA release yet; the ROCm
-    // images carry it from v0.5.21.
-    h200:  "lmsysorg/sglang:dev-dsv41",
-    b200:  "lmsysorg/sglang:dev-dsv41",
-    b300:  "lmsysorg/sglang:dev-dsv41",
-    gb300: "lmsysorg/sglang:dev-dsv41",
+    h200:  "lmsysorg/sglang:latest",
+    b200:  "lmsysorg/sglang:latest",
+    b300:  "lmsysorg/sglang:latest",
+    gb300: "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111",
+    // First nightly with #45261, which SM120 needs to start this model.
+    rtx6000: "lmsysorg/sglang:nightly-dev-20261119-6b374a55",
   },
 
   github: {
@@ -159,7 +164,8 @@ export const config = {
         options: [
           { id: "off", label: "Off (default)" },
           { id: "on", label: "On (larger KV pool)",
-            env: ["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1"] },
+            stripPrefixes: ["--engram-config"],
+            flags: ["--engram-config '{\"placement\": \"cpu\"}'"] },
         ],
       },
       {
@@ -349,8 +355,6 @@ export const config = {
       nnodes: 1,
       verified: true,
       env: [
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
@@ -375,6 +379,7 @@ export const config = {
         // fits and keeps 64-request decode batches on the graph.
         "--cuda-graph-max-bs-decode 64",
         "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -386,8 +391,6 @@ export const config = {
       nnodes: 1,
       verified: true,
       env: [
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
@@ -411,6 +414,7 @@ export const config = {
         "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 128",
         "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -579,8 +583,6 @@ export const config = {
       nnodes: 1,
       verified: false,
       env: [
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
@@ -604,6 +606,7 @@ export const config = {
         "--cuda-graph-max-bs-decode 64",
         "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
@@ -615,8 +618,6 @@ export const config = {
       nnodes: 1,
       verified: false,
       env: [
-        "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
-        "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
@@ -637,6 +638,44 @@ export const config = {
         "--max-running-requests 128",
         "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-backend-prefill disabled",
+        "--engram-config '{\"placement\": \"cpu\"}'",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ---------- RTX PRO 6000: 8x RTX PRO 6000 Blackwell Server Edition (SM120,
+    // 96 GB, PCIe only), TP8 + EP8. Verified on the 1017 checkpoint only.
+    {
+      match: { hw: "rtx6000", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      nnodes: 1,
+      verified: true,
+      env: [
+        // No NVLink: let NCCL use PCIe peer-to-peer across the CPU sockets.
+        "NCCL_P2P_LEVEL=SYS",
+        "NCCL_MIN_NCHANNELS=16",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep-size 8",
+        // One host copy of the engram tables per node; the freed HBM goes to KV.
+        "--engram-config '{\"placement\": \"cpu\", \"replication\": \"per_node\"}'",
+        "--enable-deepseek-v4-fp4-indexer",
+        "--context-length 262144",
+        "--mem-fraction-static 0.70",
+        // Faster here than the automatic choice: 21-22% more output tokens/s at
+        // 32 and 128 concurrent requests, 1K in / 1K out.
+        "--fp8-gemm-backend flashinfer_cutlass",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 128",
+        "--chunked-prefill-size 8192",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",

@@ -29,7 +29,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
-    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -39,6 +38,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -92,7 +92,15 @@ def should_run_flashinfer_autotune(
         # Tuned configs are per problem shape, so the reduction order would follow
         # the batch shape.
         return False
+    return _kernels_take_flashinfer_tactics(
+        mr, for_speculative_draft=for_speculative_draft
+    )
 
+
+def _kernels_take_flashinfer_tactics(
+    model_runner: ModelRunner, *, for_speculative_draft: bool
+) -> bool:
+    mr = model_runner
     if for_speculative_draft:
         backend_str = (
             get_spec().speculative_moe_runner_backend
@@ -166,6 +174,23 @@ def should_run_flashinfer_autotune(
         return mr.is_draft_worker if for_speculative_draft else not mr.is_draft_worker
 
     return True
+
+
+def flashinfer_tactics_cache_for_persistence(
+    model_runner: ModelRunner,
+) -> Optional[str]:
+    """Tactics file Foundry archives on SAVE and replaces with the archived one on LOAD;
+    None without persistence or FlashInfer-tuned kernels."""
+    mr = model_runner
+    if (
+        not get_foundry_adapter().enabled
+        or mr.device != "cuda"
+        or not _kernels_take_flashinfer_tactics(
+            mr, for_speculative_draft=mr.is_draft_worker
+        )
+    ):
+        return None
+    return str(flashinfer_autotune_cache_path(mr))
 
 
 def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
@@ -445,6 +470,15 @@ def maybe_flashinfer_autotune_speculative_draft(
     tuned_phases.add(phase_key)
 
 
+def _even_split_batch_size(*, num_tokens: int, max_batch_size: int) -> int:
+    """Most sequences, up to max_batch_size, that split num_tokens evenly."""
+    return max(
+        size
+        for size in range(1, min(num_tokens, max_batch_size) + 1)
+        if num_tokens % size == 0
+    )
+
+
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
@@ -478,29 +512,27 @@ def maybe_flashinfer_autotune_extend(
 
     if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
         return
-    is_pd_prefill_target = (
-        get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
-    )
-    if not mr.is_generation or (
-        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
-    ):
-        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
-        # have no draft-side state and preserve the requested EXTEND mode.
+    if not mr.is_generation or mr.is_draft_worker:
+        # Speculative targets prefill with plain EXTEND forwards; drafts tune
+        # their own phases in maybe_flashinfer_autotune_speculative_draft.
         return
     # Multimodal generation wrappers can still run this text-only EXTEND dummy;
     # an incompatible model should fail the explicit opt-in visibly.
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
-        pool_size = mr.req_to_token_pool.size
-        num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
+        # Split the ceiling evenly: rounding up would exceed what serving ever
+        # dispatches per rank, which fixed-capacity A2A workspaces reject.
+        batch_size = _even_split_batch_size(
+            num_tokens=num_tokens, max_batch_size=mr.req_to_token_pool.size
+        )
+        num_tokens_per_req = per_req = num_tokens // batch_size
     else:
         # Packed dummies tune measurably worse tactics for the same token
         # bucket, so pack only where the backend would otherwise crash. None
         # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
         num_tokens_per_req = None
-    per_req = num_tokens_per_req or 1
-    batch_size = (num_tokens + per_req - 1) // per_req
-    num_tokens = batch_size * per_req
+        per_req = 1
+        batch_size = num_tokens
 
     buffers = runner._alloc_dummy_decode_buffers(
         batch_size,

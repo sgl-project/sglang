@@ -10,13 +10,13 @@ is reproduced exactly.
 
 import asyncio
 import base64
-import hashlib
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import blake3
 import msgspec
 import numpy as np
 
@@ -123,11 +123,11 @@ class TestQwenE2eParity(CustomTestCase):
                     {"image_grid_thw": list(grids[index])},
                 )
             )
-            digest = hashlib.sha256(b"sglang-rust-mm-output-v1")
+            digest = blake3.blake3(b"sglang-rust-mm-output-v2")
             digest.update(len(metadata).to_bytes(8, "big"))
             digest.update(metadata)
             digest.update(feature.nbytes.to_bytes(8, "big"))
-            digest.update(memoryview(feature).cast("B"))
+            digest.update(blake3.blake3(memoryview(feature).cast("B")).digest())
             meta["items"][index]["identity"] = list(digest.digest())
             row += n
         buffers["mm.meta"] = np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8)
@@ -180,7 +180,7 @@ class TestQwenE2eParity(CustomTestCase):
 
 
 class TestQwenE2eParityPil(TestQwenE2eParity):
-    """The PIL backend (`--disable-fast-image-processor`): the same parity
+    """The PIL backend (`--image-processor-backend pil`): the same parity
     suite, plus the transport-invariance check — a property of the native path
     alone, so running it under one backend is enough."""
 

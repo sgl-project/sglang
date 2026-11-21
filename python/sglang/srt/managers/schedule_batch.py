@@ -105,6 +105,7 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
+    TokenIdRows,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -231,6 +232,11 @@ def split_cached_prefix_by_tier(
 class ReqLogprob:
     top_logprobs_num: int
     token_ids_logprob: Optional[List[int]]
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
+    # Chooses the top_logprobs_num candidates of each input position in place
+    # of top-k (InputLogprobProcessor.select_input_candidates); set by a
+    # _create_generation_req override. Output positions keep top-k.
+    input_candidate_selector: Optional[Any] = None
     input_token_logprobs_val: Optional[List[float]] = None
     input_token_logprobs_idx: Optional[List[int]] = None
     input_top_logprobs_val: Optional[List[List[float]]] = None
@@ -241,6 +247,9 @@ class ReqLogprob:
     input_top_logprobs_val_flat: Optional[np.ndarray] = None
     input_top_logprobs_idx_flat: Optional[np.ndarray] = None
     input_top_logprobs_flat_null_prefix: Optional[int] = None
+    # float32 [rows, k] weights of an input candidate selector's candidates:
+    # one row per non-null entry of input_top_logprobs_val.
+    input_top_logprobs_weights: Optional[np.ndarray] = None
     input_token_ids_logprobs_val: Optional[List[List[float]]] = None
     input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
     output_token_logprobs_val: Optional[list] = None
@@ -252,6 +261,13 @@ class ReqLogprob:
         None
     )
     output_token_ids_logprobs_idx: Optional[list] = None
+
+    @property
+    def scores_input_token_ids(self) -> bool:
+        return (
+            self.token_ids_logprob is not None
+            or self.token_ids_logprob_rows is not None
+        )
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -493,6 +509,8 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Leading output_ids already fed to the batch's penalizers.
+        self.penalty_cumulated_len = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
         # extend_end, never mutates this array's length.
@@ -584,6 +602,8 @@ class Req(ReqDllmMixin):
         self.finished_reason: Optional[BaseFinishReason] = None
         # finished position (in output_ids), used when checking stop conditions with speculative decoding
         self.finished_len = None
+        # With ignore_eos: the finished_len its first stop token would have set. Reported, never trimmed.
+        self.ignored_stop_token_len: Optional[int] = None
         # Whether this request has finished output
         self.finished_output = None
         # Set by exit_ledger (CI only).
@@ -631,6 +651,8 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # gamma-Ada step clock when a sort pass first saw it (tp or pp > 1); kept on retraction.
+        self.uniboost_first_seen_step: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
@@ -700,6 +722,7 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs: Optional[List[Tuple[int]]] = None
         self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None
         self.temp_input_top_logprobs_idx: Optional[List[int]] = None
+        self.temp_input_top_logprobs_weights: Optional[List] = None
         self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
@@ -1288,7 +1311,7 @@ class Req(ReqDllmMixin):
         return False
 
     def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
-        if self.sampling_params.ignore_eos:
+        if self.sampling_params.ignore_eos and self.ignored_stop_token_len is not None:
             return False
 
         # Check stop token ids
@@ -1304,8 +1327,12 @@ class Req(ReqDllmMixin):
                 if self.tokenizer.additional_stop_token_ids:
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                if self.sampling_params.ignore_eos:
+                    if matched_pos + 1 <= self.sampling_params.max_new_tokens:
+                        self.ignored_stop_token_len = matched_pos + 1
+                    return False
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 self.finished_len = matched_pos + 1
                 return True
 
@@ -1433,7 +1460,10 @@ class Req(ReqDllmMixin):
         """
         max_new_tokens = self.sampling_params.max_new_tokens
         if self.finished_len is not None and self.finished_len > max_new_tokens:
-            self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
+            self.finished_reason = FINISH_LENGTH(
+                length=max_new_tokens,
+                ignored_stop_position=self.ignored_stop_token_len,
+            )
             self.finished_len = max_new_tokens
 
     def request_finish(self, reason: BaseFinishReason) -> None:
@@ -1487,7 +1517,8 @@ class Req(ReqDllmMixin):
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
-                length=self.sampling_params.max_new_tokens
+                length=self.sampling_params.max_new_tokens,
+                ignored_stop_position=self.ignored_stop_token_len,
             )
             self.finished_len = self.sampling_params.max_new_tokens
             return
@@ -1515,10 +1546,13 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
+        self.temp_input_top_logprobs_weights = None
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
+        # The re-prefill batch starts the penalizers from zero.
+        self.penalty_cumulated_len = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
@@ -1531,6 +1565,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.ignored_stop_token_len = None
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
@@ -1874,6 +1909,24 @@ def retract_all(
     return reqs_to_abort
 
 
+def token_id_rows_for_extend(
+    rows: List[List[int]],
+    *,
+    logprob_start_len: int,
+    first_scored_pos: int,
+    num_scored: int,
+) -> TokenIdRows:
+    """The rows one extend scores: position q predicts token q + 1, so it reads
+    ``rows[q - logprob_start_len]``, and the last input position an empty row."""
+    first = first_scored_pos - logprob_start_len
+    last = first + num_scored
+    assert num_scored == 0 or (first >= 0 and last <= len(rows) + 1), (
+        f"extend scores rows [{first}, {last}) of {len(rows)} token id rows"
+    )
+    picked = rows[first:last]
+    return TokenIdRows(picked + [[]] * (num_scored - len(picked)))
+
+
 def compute_extend_logprob_start_len(
     *,
     logprob_start_len: int,
@@ -2121,7 +2174,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For processing logprobs
     top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For encoder-decoder architectures
     encoder_cached: Optional[List[bool]] = None
@@ -2187,7 +2240,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
-                model_config.vocab_size,
+                model_config.token_id_vocab_size,
             ),
             dllm_config=dllm_config,
         )
@@ -2594,7 +2647,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
+            self.token_ids_logprobs = [
+                (
+                    r.logprob.token_ids_logprob
+                    if r.logprob.token_ids_logprob_rows is None
+                    else token_id_rows_for_extend(
+                        r.logprob.token_ids_logprob_rows,
+                        logprob_start_len=r.logprob_start_len,
+                        first_scored_pos=prefix_lens[i] + extend_logprob_start_lens[i],
+                        num_scored=extend_lens[i] - extend_logprob_start_lens[i],
+                    )
+                )
+                for i, r in enumerate(reqs)
+            ]
 
         self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
@@ -3213,24 +3278,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
     def cumulate_penalty_output_tokens(self):
-        # Under overlap batch.input_ids is just a placeholder here -- the
-        # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
-        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
-        # pin_memory (matching the prefill-path tensors) keeps the copy async;
-        # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
+        # Feed every output token since the last call: one per request in a
+        # decode step, a variable number after a speculative verify round. Under
+        # overlap, the step in flight is not in output_ids yet and is fed on the
+        # next call.
+        output_ids, req_indices = [], []
+        for i, req in enumerate(self.reqs):
+            new_tokens = req.output_ids[req.penalty_cumulated_len :]
+            output_ids.extend(new_tokens)
+            req_indices.extend([i] * len(new_tokens))
+            req.penalty_cumulated_len = len(req.output_ids)
+        if not output_ids:
+            return
+        output_ids, req_indices = torch.tensor(
+            [output_ids, req_indices],
             dtype=torch.int64,
             pin_memory=is_pin_memory_available(self.device),
         ).to(self.device, non_blocking=True)
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
+            output_ids, req_indices
         )
 
     def prepare_for_decode(self):
@@ -3251,6 +3317,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        if self.sampling_info.penalizer_orchestrator.is_required:
+            self.cumulate_penalty_output_tokens()
+
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
@@ -3265,9 +3334,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # tensors before allocation so alloc_for_decode covers them too.
         strip_beam_tail(self)
         append_beam_tail(self)
-
-        if self.sampling_info.penalizer_orchestrator.is_required:
-            self.cumulate_penalty_output_tokens()
 
         # input_ids is set at end of previous run_batch (placeholder for
         # overlap; next_token_ids cast for non-overlap).

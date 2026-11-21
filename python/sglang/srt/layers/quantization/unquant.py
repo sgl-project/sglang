@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -85,13 +87,37 @@ _is_gfx115 = _is_hip and is_gfx115_supported()
 # unquantized layers then skip AITER.
 _skip_aiter_unquant = False
 
+
+def _gfx1250_try_gfx95() -> bool:
+    if os.environ.get("SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95", "1") != "1" or not _is_hip:
+        return False
+    try:
+        return "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+# gfx1250: the row-major small-M GEMM with its gfx1250 ROW_MAJOR table (tiled / FP8 copies stay gfx950-only).
+_rowmajor_ok = _is_gfx95 or _gfx1250_try_gfx95()
+
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
 
-if _is_gfx95:
+    from sglang.srt.layers.quantization.unquant_hip import (
+        a16w16_into,
+        prefer_hipblaslt,
+    )
+
+_use_tlx_gemm = _is_gfx95 and envs.SGLANG_USE_TLX_GEMM.get()
+if _use_tlx_gemm:
+    from sglang.kernels.ops.gemm import tlx as tlx_gemm
+
+if _rowmajor_ok:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        flydsl_gemm,
+        flydsl_gemm_applies,
         prepare_tiled_weight,
         rowmajor_gemm,
         rowmajor_gemm_applies,
@@ -101,6 +127,21 @@ if _is_gfx95:
     from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
         quantize_weight as quantize_fp8w_weight,
     )
+
+# gfx1250 (Muse Spark TP8): at verify widths of 129..512 rows hipBLASLt beats the untuned
+# default of aiter's tgemm on QKV [2304, 8192], attention O [8192, 1024], DFlash draft QKV
+# [1280, 8192], conv [2048, 8192], gate/up [7168, 8192] and down [8192, 3584].
+# At 128 rows tgemm is as fast or faster.
+_GFX1250_HIPBLASLT_WEIGHTS = frozenset(
+    {(2304, 8192), (8192, 1024), (1280, 8192), (2048, 8192), (7168, 8192), (8192, 3584)}
+)
+_GFX1250_HIPBLASLT_ROWS = range(129, 513)
+try:
+    _is_gfx1250 = (
+        _is_hip and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+except Exception:
+    _is_gfx1250 = False
 
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
@@ -947,6 +988,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             _amx_process_weight_after_loading(layer, ["weight"])
         else:
             layer.weight.data = maybe_pad_weight_for_gfx115(layer.weight.data)
+        # gfx950 only: the tiled launches are tuned there.
         if (
             _is_gfx95
             and _gfx950_tiled_weight_shapes
@@ -957,7 +999,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             # Remade on every weight load, from the loaded values.
             layer.small_m_tiled_weight = prepare_tiled_weight(layer.weight.data)
         layer.small_m_rowmajor = (
-            _is_gfx95
+            _rowmajor_ok
             and envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
             and type(layer.weight.data) is torch.Tensor
             and tuple(layer.weight.shape) in _gfx950_rowmajor_weight_shapes
@@ -978,6 +1020,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # _skip_aiter_unquant marks deterministic mode; the TLX plan also varies with M.
+        if (
+            _use_tlx_gemm
+            and bias is None
+            and not _skip_aiter_unquant
+            and type(layer.weight.data) is torch.Tensor
+            and tlx_gemm.mm_supported(x, layer.weight)
+        ):
+            return tlx_gemm.linear(x, layer.weight)
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
@@ -1003,11 +1054,30 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             _use_aiter
+            and x.is_cuda
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
+            # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
+            and x.is_cuda
         ):
-            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+            if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
+                return F.linear(x, layer.weight, bias)
+            if (
+                _rowmajor_ok
+                and _is_gfx1250
+                and bias is None
+                and flydsl_gemm_applies(x, layer.weight, x.dtype)
+            ):
+                return flydsl_gemm(x, layer.weight)
+            if _rowmajor_ok and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
+            if (
+                _is_gfx1250
+                and x.dim() == 2
+                and x.shape[0] in _GFX1250_HIPBLASLT_ROWS
+                and tuple(layer.weight.shape) in _GFX1250_HIPBLASLT_WEIGHTS
+            ):
+                return F.linear(x, layer.weight, bias)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
@@ -1113,6 +1183,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 f"linear output has shape {output.shape}, expected "
                 f"{(x.shape[0], layer.weight.shape[0])}"
             )
+        if _use_aiter and bias is None and a16w16_into(x, layer.weight, output):
+            return output
         torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)

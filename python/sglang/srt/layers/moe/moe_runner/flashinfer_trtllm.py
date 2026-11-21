@@ -2022,18 +2022,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 "or the logits-based bypassed TopK input"
             )
 
-    symm_output = None
     num_tokens = hs_fp4.shape[0]
     hidden_size = (
         hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
     )
     if defer_finalize:
-        if use_routed_topk:
-            # Workaround for flashinfer-ai/flashinfer#6077: the ignored buffer's shape
-            # keeps the autotune lookup on the tuned entry; drop once fixed upstream.
-            symm_output = torch.empty(
-                num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
-            )
+        # Workaround for flashinfer-ai/flashinfer#6077: the ignored buffer's shape
+        # keeps the autotune lookup on the tuned entry; drop once fixed upstream.
+        symm_output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+        )
     else:
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
@@ -2100,8 +2098,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
-        if symm_output is not None:
-            moe_kwargs["output"] = symm_output
+        moe_kwargs["output"] = symm_output
         result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(
@@ -2158,8 +2155,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
-        if not defer_finalize:
-            moe_kwargs["output"] = symm_output
+        moe_kwargs["output"] = symm_output
 
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:

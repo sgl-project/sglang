@@ -39,7 +39,9 @@ def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.watermark_config is None:
         return
-    config = load_watermark_config(cfg.watermark_config)
+    config = load_watermark_config(
+        cfg.watermark_config, algorithm=cfg.watermark_algorithm
+    )
     resolved = {
         f"watermark_{field}": getattr(config, field)
         for field in config.__struct_fields__
@@ -263,110 +265,13 @@ def handle_debug_utils(server_args: Any):
         )
 
 
-def handle_deprecated_args(server_args: Any):
+def handle_grpc_args(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.disable_fast_image_processor:
-        if cfg.image_processor_backend not in {"auto", "pil"}:
-            raise ValueError(
-                "--disable-fast-image-processor conflicts with "
-                f"--image-processor-backend={cfg.image_processor_backend}."
-            )
-        logger.warning(
-            "--disable-fast-image-processor is deprecated; use "
-            "--image-processor-backend=pil instead."
-        )
-        declare_resolution(
-            server_args, "_handle_deprecated_args", image_processor_backend="pil"
-        )
-
-    # Handle deprecated tool call parsers
-    deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
-    if cfg.tool_call_parser in deprecated_tool_call_parsers:
-        logger.warning(
-            f"The tool_call_parser '{cfg.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[cfg.tool_call_parser]}' instead."
-        )
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_args",
-            tool_call_parser=deprecated_tool_call_parsers[cfg.tool_call_parser],
-        )
-
-    # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
-    if (
-        cfg.enable_flashinfer_allreduce_fusion
-        and cfg.flashinfer_allreduce_fusion_backend is None
-    ):
-        logger.warning(
-            "--enable-flashinfer-allreduce-fusion is deprecated. "
-            "Please use --flashinfer-allreduce-fusion-backend=auto instead."
-        )
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_args",
-            flashinfer_allreduce_fusion_backend="auto",
-        )
-    declare_resolution(
-        server_args,
-        "_handle_deprecated_args",
-        enable_flashinfer_allreduce_fusion=False,
-    )
-    # Deprecated attention-backend aliases.
-    aliases = {"tokenspeed_mla": "cutedsl_mla"}
-    renamed = {}
-    for attr in (
-        "attention_backend",
-        "decode_attention_backend",
-        "prefill_attention_backend",
-        "speculative_draft_attention_backend",
-    ):
-        old = getattr(server_args, attr, None)
-        if old in aliases:
-            logger.warning(
-                "--%s=%s is deprecated; use '%s' instead.",
-                attr.replace("_", "-"),
-                old,
-                aliases[old],
-            )
-            renamed[attr] = aliases[old]
-    if renamed.get("prefill_attention_backend") == "cutedsl_mla":
-        # cutedsl_mla is decode-only.
-        renamed["prefill_attention_backend"] = "trtllm_mla"
-    if "tokenspeed_mla" in (cfg.attention_backend, cfg.decode_attention_backend):
-        # Keep what tokenspeed_mla implied: FP8 KV, verify on the decode kernel.
-        if cfg.kv_cache_dtype != "fp8_e4m3":
-            logger.warning(
-                "tokenspeed_mla required FP8 KV; setting --kv-cache-dtype=fp8_e4m3."
-            )
-            renamed["kv_cache_dtype"] = "fp8_e4m3"
-        if (
-            cfg.speculative_algorithm is not None
-            and cfg.speculative_attention_mode == "prefill"
-        ):
-            renamed["speculative_attention_mode"] = "decode"
-    if renamed:
-        declare_resolution(server_args, "_handle_deprecated_args", **renamed)
-
-    # Deprecated MoE A2A backend alias.
-    renamed = {}
-    for attr, value in (
-        ("moe_a2a_backend", cfg.moe_a2a_backend),
-        ("speculative_moe_a2a_backend", cfg.speculative_moe_a2a_backend),
-    ):
-        if value == "flashinfer":
-            logger.warning(
-                "--%s=flashinfer is deprecated; use 'flashinfer_nvlink_one_sided' "
-                "instead.",
-                attr.replace("_", "-"),
-            )
-            renamed[attr] = "flashinfer_nvlink_one_sided"
-    if renamed:
-        declare_resolution(server_args, "_handle_deprecated_args", **renamed)
-
     # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
     # native server, falling back to SGLANG_GRPC_PORT.
     declare_resolution(
         server_args,
-        "_handle_deprecated_args",
+        "_handle_grpc_args",
         grpc_worker_threads=envs.SGLANG_GRPC_WORKER_THREADS.get(),
     )
 
@@ -374,7 +279,7 @@ def handle_deprecated_args(server_args: Any):
     if cfg.grpc_port is None and grpc_port_env is not None:
         declare_resolution(
             server_args,
-            "_handle_deprecated_args",
+            "_handle_grpc_args",
             grpc_port=grpc_port_env,
         )
 
@@ -422,7 +327,9 @@ def handle_deprecated_args(server_args: Any):
                 "--grpc-port is not supported with --encoder-only: "
                 "encoder disaggregation uses its own server."
             )
-        if cfg.tokenizer_worker_num > 1:
+        # The Rust server serves gRPC itself and sizes its tokenizer thread
+        # pool from --tokenizer-worker-num; only the Python bridge is limited.
+        if cfg.tokenizer_worker_num > 1 and not envs.SGLANG_RUST_SERVER.get():
             raise ValueError(
                 "Native gRPC does not yet support --tokenizer-worker-num > 1. "
                 "Unset --grpc-port or set --tokenizer-worker-num 1."
@@ -471,6 +378,8 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
+    if cfg.enable_dsa_fp4_indexer and not is_gfx95_supported():
+        raise ValueError("--enable-dsa-fp4-indexer requires gfx950 GPUs.")
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0
     # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
@@ -733,27 +642,6 @@ def handle_return_hidden_states_mode(server_args: Any):
         )
 
 
-def handle_prefill_delayer_env_compat(server_args: Any):
-    if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
-        declare_resolution(
-            server_args,
-            "_handle_prefill_delayer_env_compat",
-            enable_prefill_delayer=True,
-        )
-    if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
-        declare_resolution(
-            server_args,
-            "_handle_prefill_delayer_env_compat",
-            prefill_delayer_max_delay_passes=x,
-        )
-    if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
-        declare_resolution(
-            server_args,
-            "_handle_prefill_delayer_env_compat",
-            prefill_delayer_token_usage_low_watermark=x,
-        )
-
-
 def handle_tokenizer_batching(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.enable_tokenizer_batch_encode and cfg.enable_dynamic_batch_tokenizer:
@@ -805,24 +693,14 @@ def handle_multimodal_feature_transport(server_args: Any):
 
     CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
     memory left for model/KV-cache allocations. Multi-node MNNVL deployments
-    may still auto-select CUDA VMM. The legacy CUDA IPC environment variable
-    remains supported so existing deployments map to this policy.
+    may still auto-select CUDA VMM.
     """
 
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
-    legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
-    legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 
     if requested_transport is None:
-        if legacy_ipc_is_set:
-            requested_transport = "cuda_ipc" if legacy_ipc_enabled else "cpu"
-            logger.warning(
-                "SGLANG_USE_CUDA_IPC_TRANSPORT is deprecated; use "
-                "--mm-feature-transport=%s instead.",
-                requested_transport,
-            )
-        elif cfg.encoder_only:
+        if cfg.encoder_only:
             requested_transport = "cpu"
             logger.info(
                 "Multimodal feature transport auto-resolved to cpu for "
@@ -872,15 +750,6 @@ def handle_multimodal_feature_transport(server_args: Any):
                     )
         else:
             requested_transport = "cpu"
-    elif legacy_ipc_is_set and legacy_ipc_enabled != (
-        requested_transport == "cuda_ipc"
-    ):
-        logger.warning(
-            "--mm-feature-transport=%s overrides the conflicting legacy "
-            "SGLANG_USE_CUDA_IPC_TRANSPORT=%s setting.",
-            requested_transport,
-            int(legacy_ipc_enabled),
-        )
 
     if cfg.encoder_only and requested_transport in ("cuda_ipc", "cuda_vmm"):
         logger.warning(
@@ -939,9 +808,6 @@ def handle_multimodal_feature_transport(server_args: Any):
         server_args,
         "_handle_multimodal_feature_transport",
         mm_feature_transport=requested_transport,
-    )
-    envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
-        "1" if requested_transport == "cuda_ipc" else "0"
     )
 
 

@@ -423,6 +423,8 @@ def test_b64_response_publishes_only_successful_outputs(
         assert "b64_json" not in response.text
         return
     assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/json"
+    image_api.ImageResponse.model_validate_json(response.content)
     (item,) = response.json()["data"]
     assert base64.b64decode(item["b64_json"]) == png
     assert captured["return_image_bytes"] is True

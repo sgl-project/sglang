@@ -37,10 +37,36 @@ static ROUTE_LEVELS: LazyLock<HashMap<String, AuthLevel>> = LazyLock::new(|| {
     .expect("auth_levels.json")
 });
 
-/// The level of a served `path`. A served admin route takes no path
-/// parameters (`declared_route` checks), so an exact match finds it.
+/// The level of a served `path`: its exact entry, else the declared template
+/// it matches (`{name}` takes one segment, `{name:path}` the rest), as
+/// FastAPI's route match gives Python; `NORMAL` when nothing declares it.
 fn level(path: &str) -> AuthLevel {
-    ROUTE_LEVELS.get(path).copied().unwrap_or(AuthLevel::Normal)
+    if let Some(level) = ROUTE_LEVELS.get(path) {
+        return *level;
+    }
+    ROUTE_LEVELS
+        .iter()
+        .find(|(route, _)| route.contains('{') && template_matches(route, path))
+        .map_or(AuthLevel::Normal, |(_, level)| *level)
+}
+
+/// Whether the declared `template` serves `path`.
+fn template_matches(template: &str, path: &str) -> bool {
+    let mut segments = path.split('/');
+    for pattern in template.split('/') {
+        if pattern.starts_with('{') && pattern.ends_with(":path}") {
+            return segments.next().is_some();
+        }
+        let matched = match segments.next() {
+            Some(segment) if pattern.starts_with('{') => !segment.is_empty(),
+            Some(segment) => segment == pattern,
+            None => false,
+        };
+        if !matched {
+            return false;
+        }
+    }
+    segments.next().is_none()
 }
 
 pub(super) fn is_admin_force(path: &str) -> bool {
@@ -85,13 +111,9 @@ pub(super) trait DeclaredRoute<S> {
 
 impl<S: Clone + Send + Sync + 'static> DeclaredRoute<S> for Router<S> {
     fn declared_route(self, path: &str, method_router: MethodRouter<S>) -> Self {
-        let level = declared_level(path).unwrap_or_else(|| {
+        declared_level(path).unwrap_or_else(|| {
             panic!("route {path} has no auth level in python/sglang/srt/utils/auth_levels.json")
         });
-        assert!(
-            level == AuthLevel::Normal || !path.contains('{'),
-            "admin route {path} takes a path parameter, which `level` cannot match"
-        );
         self.route(path, method_router)
     }
 }
@@ -209,11 +231,15 @@ fn bearer_matches(authorization: Option<&str>, key: &str) -> bool {
     let Some((scheme, token)) = authorization.and_then(|value| value.split_once(' ')) else {
         return false;
     };
-    scheme.eq_ignore_ascii_case("bearer")
-        && token.len() == key.len()
-        && token
-            .bytes()
-            .zip(key.bytes())
+    scheme.eq_ignore_ascii_case("bearer") && secret_matches(token.as_bytes(), key)
+}
+
+/// Whether `presented` is `secret`, compared in constant time.
+pub(super) fn secret_matches(presented: &[u8], secret: &str) -> bool {
+    presented.len() == secret.len()
+        && presented
+            .iter()
+            .zip(secret.bytes())
             .fold(0u8, |diff, (a, b)| diff | (a ^ b))
             == 0
 }
@@ -289,6 +315,11 @@ mod tests {
             AuthLevel::AdminOptional
         );
         assert_eq!(level("/nope"), AuthLevel::Normal);
+        // A declared template serves its parameterized paths at its level.
+        assert_eq!(level("/dumper/status"), AuthLevel::AdminForce);
+        assert_eq!(level("/dumper/a/b"), AuthLevel::Normal);
+        assert_eq!(level("/v1/models/org/model"), AuthLevel::Normal);
+        assert_eq!(level("/metrics/a/b"), AuthLevel::Normal);
         // axum's parameter syntax finds FastAPI's.
         assert_eq!(
             declared_level("/v1/models/{model}"),
@@ -327,6 +358,7 @@ mod tests {
             rust_server_endpoints: vec![RustServerEndpoint {
                 dp_rank: 1,
                 endpoint: url,
+                peer_token: None,
             }],
             ..Default::default()
         };

@@ -75,7 +75,8 @@ def test_srt_falls_back_to_torch_npu_on_wheels_without_the_provider():
     source = Path(layernorm_module.__file__).read_text(encoding="utf-8")
     guarded_import = re.search(
         r"try:\s*\n"
-        r"\s*from sgl_kernel_npu\.norm\.gemma_rmsnorm import npu_gemma_rms_norm\s*\n"
+        r"\s*from sgl_kernel_npu\.operators\.norm import gemma_rmsnorm"
+        r" as npu_gemma_rms_norm\s*\n"
         r"\s*except ImportError:\s*\n"
         r"(?:\s*#.*\n)*"
         r"\s*npu_gemma_rms_norm = torch_npu\.npu_gemma_rms_norm\s*\n",

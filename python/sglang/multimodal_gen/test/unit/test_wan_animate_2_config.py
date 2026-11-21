@@ -1080,7 +1080,6 @@ def _request_state_for_clip_tests(frames, schedule, clip_len):
     )
     return WanAnimate2RequestState(
         device=torch.device("cpu"),
-        sp_size=1,
         generator=torch.Generator().manual_seed(0),
         inputs=inputs,
         letterbox_info=LetterboxInfo(pad_axis="width", padding=0, content_len=width),
@@ -1909,12 +1908,9 @@ def test_before_denoising_stage_populates_the_standard_denoising_inputs(
     set_global_server_args(server_args)
     stage = _before_denoising_stage(server_args.pipeline_config)
 
-    with (
-        patch(f"{_BEFORE_DENOISING}.get_sp_world_size", return_value=1),
-        patch(
-            f"{_BEFORE_DENOISING}.get_local_torch_device",
-            return_value=torch.device("cpu"),
-        ),
+    with patch(
+        f"{_BEFORE_DENOISING}.get_local_torch_device",
+        return_value=torch.device("cpu"),
     ):
         batch = stage(req, server_args)
 

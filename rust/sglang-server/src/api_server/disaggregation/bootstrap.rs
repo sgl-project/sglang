@@ -453,8 +453,8 @@ async fn query_dp_ranks(
     Json(result).into_response()
 }
 
-/// No `/health` here: the merged api router already serves it (same 200 "OK"
-/// the standalone Python bootstrap server answered, so probes are unchanged).
+/// No `/health` here: the merged api router serves it, answering the decode
+/// heartbeat without a generation probe like the standalone Python bootstrap server.
 fn router(state: Arc<Registry>) -> Router {
     Router::new()
         // Unmatched methods on a routed path get axum's built-in 405, matching

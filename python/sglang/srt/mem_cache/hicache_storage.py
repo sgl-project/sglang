@@ -100,6 +100,23 @@ class HiCacheStorageExtraInfo:
     # Page hashes preceding the call's keys, from the sequence start;
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
+    # Free-form per-call metadata. If the backend's consumes_kv_hints() is True,
+    # lookups (batch_exists, batch_exists_v2) and reads (batch_get_v1,
+    # batch_get_v2) for a request whose kv_hints has actions also carry:
+    #   "kv_hints": the request's KvHintsEnvelope (a msgspec Struct). It is
+    #       caller-supplied and unauthenticated; validate it before acting on it.
+    #   "storage_key_to_event_hash": only for a request with cache_salt or
+    #       extra_key. Maps each storage key to its KV event block ID, as
+    #       unsigned 64-bit (events carry the same value as signed int64), in
+    #       this rank's event format whether or not it publishes events. An
+    #       empty map means the prefix could not be verified, so treat those
+    #       pages as unbound. Without the map, the ID is int(storage_key[:16], 16).
+    # Legacy batch_get() takes no extra_info, so a "dynamic" backend needs
+    # extra_config interface_v1=1 for its primary KV reads to carry hints.
+    # With --hicache-host-memory-mode buffer_only and PP > 1, prefetch reads use
+    # PP0's entries, kept only where the local backend also opts in. Lookups
+    # and other prefetches decide on each rank.
+    # Decode-side lookups carry request_id "__storage_hit_query__".
     extra_info: Optional[dict] = None
 
 
@@ -110,6 +127,8 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    # the ue8m0 exponents of FP4 index keys, beside INDEXER's e2m1 bytes
+    INDEXER_SCALE = "indexer_scale"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C1 = "deepseek_v4_c1"
@@ -380,6 +399,17 @@ class HiCacheStorage(ABC):
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    def consumes_kv_hints(self) -> bool:
+        """Whether lookups and reads should carry request kv_hints in extra_info.
+
+        Off by default: binding storage keys to event IDs rehashes the
+        request's prefix on the scheduler. Legacy batch_get() never carries
+        them; see HiCacheStorageExtraInfo.extra_info. Keep the answer the
+        same on every PP rank: buffer_only PP prefetch tickets carry PP0's
+        hint metadata, so a later stage that opts in alone gets none there.
+        """
+        return False
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -660,6 +690,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
                 logger.debug(f"Inject failure in {func_name}")
                 return True
         return False
+
+    def consumes_kv_hints(self) -> bool:
+        return self._backend.consumes_kv_hints()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)

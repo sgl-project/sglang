@@ -860,14 +860,14 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         super().__init__(config=config, hf_config=hf_config or {})
         arch = config.arch_config
 
-        patch_size = getattr(arch, "patch_size", 1)
-        in_channels = getattr(arch, "in_channels", 64)
-        num_layers = getattr(arch, "num_layers", 19)
-        num_single_layers = getattr(arch, "num_single_layers", 38)
-        attention_head_dim = getattr(arch, "attention_head_dim", 128)
-        num_attention_heads = getattr(arch, "num_attention_heads", 24)
-        joint_attention_dim = getattr(arch, "joint_attention_dim", 3584)
-        axes_dims_rope = getattr(arch, "axes_dims_rope", [16, 56, 56])
+        patch_size = arch.patch_size
+        in_channels = arch.in_channels
+        num_layers = arch.num_layers
+        num_single_layers = arch.num_single_layers
+        attention_head_dim = arch.attention_head_dim
+        num_attention_heads = arch.num_attention_heads
+        joint_attention_dim = arch.joint_attention_dim
+        axes_dims_rope = arch.axes_dims_rope
 
         self.config = config
         self.out_channels = in_channels

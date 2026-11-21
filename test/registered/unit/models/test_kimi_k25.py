@@ -653,9 +653,7 @@ def test_kimi_k25_fingerprint_includes_gpu_preprocessing_options():
             mean,
             [0.5, 0.5, 0.5],
         )
-        with get_context().override_server_args(
-            revision=None, disable_fast_image_processor=False, mm_process_config={}
-        ):
+        with get_context().override_server_args(revision=None, mm_process_config={}):
             fingerprints.append(
                 build_processor_fingerprint(
                     wrapper, SimpleNamespace(to_dict=lambda: {})
@@ -685,7 +683,6 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         mm_process_config={},
         allowed_media_domains=[],
         image_processor_backend="auto",
-        disable_fast_image_processor=False,
         skip_tokenizer_init=False,
         mm_io_worker_num=0,
         mm_processor_worker_num=0,

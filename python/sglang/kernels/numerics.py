@@ -63,10 +63,34 @@ def cuda_rsqrtf(x):
     return tl.where(is_subnormal, result * 4096.0, result)
 
 
+@triton.jit
+def silu_approx_f32(x):
+    """Match the CUDA fast-math SiLU ``__fdividef(x, 1 + __expf(-x))``."""
+    # __expf(-x) == ex2.approx(x * -log2(e)); folding the negation into
+    # the constant (0fBFB8AA3B == -log2(e)) flips the sign exactly.
+    exp_neg = tl.inline_asm_elementwise(
+        asm="{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
+        constraints="=f,f",
+        args=[x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    return tl.inline_asm_elementwise(
+        asm="div.approx.ftz.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[x, 1.0 + exp_neg],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
 __all__ = [
     "cuda_rsqrtf",
     "div_rn_f32",
     "mul_rn_f32",
     "round_bf16_to_fp32",
     "rsqrt_approx_f32",
+    "silu_approx_f32",
 ]

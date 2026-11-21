@@ -22,8 +22,8 @@ pub(crate) use error::{CoreError, CoreErrorKind, STREAM_INVALID_REQUEST_ERROR};
 pub(crate) use frame::frame_metadata_case;
 pub(crate) use frame::{CoreEvent, CoreOutput, HealthStatus};
 pub use metrics::{ExtensionCounter, ExtensionHistogram};
-pub(crate) use metrics::{FLUSH_INTERVAL, FrontendMetrics, RequestMetrics};
-pub(crate) use peer::{FORWARD_PEER_PATH, peer_endpoints};
+pub(crate) use metrics::{FLUSH_INTERVAL, FrontendMetrics, RequestMetrics, queue_len};
+pub(crate) use peer::{FORWARD_PEER_PATH, PEER_TOKEN_HEADER, own_peer_token, peer_endpoints};
 pub(crate) use request_log::{
     BodySnapshot, LoggedHeaders, OpenAiRequest, RawBody, ReceivedAs, RequestLog, RequestRecord,
     flush_request_log,

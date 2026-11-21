@@ -383,10 +383,6 @@ class SubBlockSparseAttentionBackend(AttentionBackend):
         return SubBlockSparseAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type[SubBlockSparseAttentionMetadata]:
-        return SubBlockSparseAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type[SubBlockSparseAttentionMetadataBuilder]:
         return SubBlockSparseAttentionMetadataBuilder
 

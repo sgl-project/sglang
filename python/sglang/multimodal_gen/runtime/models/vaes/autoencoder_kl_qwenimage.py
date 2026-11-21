@@ -516,8 +516,6 @@ class QwenImageMidBlock(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         # First residual block
         x = self.resnets[0](x, feat_cache, feat_idx)
@@ -603,8 +601,6 @@ class QwenImageEncoder3d(nn.Module):
         # output blocks
         self.norm_out = QwenImageRMS_norm(out_dim, images=False)
         self.conv_out = QwenImageCausalConv3d(out_dim, z_dim, 3, padding=1)
-
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         if feat_cache is not None:
@@ -697,8 +693,6 @@ class QwenImageUpBlock(nn.Module):
                     )
                 ]
             )
-
-        self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         """
@@ -838,8 +832,6 @@ class QwenImageDecoder3d(nn.Module):
         self.norm_out = QwenImageRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, input_channels, 3, padding=1)
 
-        self.gradient_checkpointing = False
-
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         expected_height = None
         if self.use_parallel_decode and self.world_size > 1:
@@ -883,8 +875,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
     This model inherits from [`ModelMixin`]. Check the superclass documentation for it's generic methods implemented
     for all models (such as downloading or saving).
     """
-
-    _supports_gradient_checkpointing = False
 
     # fmt: off
     def __init__(
@@ -1307,28 +1297,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         if not return_dict:
             return (dec,)
         return DecoderOutput(sample=dec)
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        """
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z, return_dict=return_dict)
-        return dec
 
 
 EntryClass = AutoencoderKLQwenImage

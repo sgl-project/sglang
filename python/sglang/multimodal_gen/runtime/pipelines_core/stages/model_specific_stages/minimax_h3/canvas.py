@@ -97,6 +97,33 @@ def minimax_h3_stretch_keyframe_canvas(
     return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
 
+def minimax_h3_center_crop_keyframe_canvas(
+    image: Any,
+    *,
+    target_width: int,
+    target_height: int,
+) -> Any:
+    """Center-crop to the canvas aspect at source resolution, then resize."""
+
+    from PIL import Image
+
+    image = image.convert("RGB")
+    if image.size == (target_width, target_height):
+        return image
+    aspect = target_width / target_height
+    source_width, source_height = image.size
+    if source_width / source_height > aspect:
+        crop_height = source_height
+        crop_width = max(1, min(source_width, round(source_height * aspect)))
+    else:
+        crop_width = source_width
+        crop_height = max(1, min(source_height, round(source_width / aspect)))
+    left = (source_width - crop_width) // 2
+    top = (source_height - crop_height) // 2
+    cropped = image.crop((left, top, left + crop_width, top + crop_height))
+    return cropped.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+
 def _keyframe_materials(plan: Any) -> list[Any]:
     return [m for m in plan.materials if m.material_chain == "image.target_canvas"]
 
@@ -139,7 +166,9 @@ def _validate_keyframe_materials(plan: Any, keyframes: list[Any]) -> tuple[int, 
     return semantic_indices
 
 
-def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
+def minimax_h3_prepared_keyframes(
+    batch: Any, plan: Any, *, keyframe_fit: str = "stretch"
+) -> dict[str, Any]:
     """Resolve + prepare one or two first/last keyframes once per request.
 
     The target canvas is shared across keyframes and must already be frozen by
@@ -148,6 +177,8 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
     first-keyframe payload for compatibility; per-keyframe entries live under
     ``images``.
     """
+    if keyframe_fit not in ("stretch", "source_crop"):
+        raise ValueError(f"unknown keyframe_fit {keyframe_fit!r}")
     keyframes = _keyframe_materials(plan)
     semantic_indices = _validate_keyframe_materials(plan, keyframes)
     cached = batch.extra.get(MINIMAX_H3_PREPARED_KEYFRAMES_EXTRA_KEY)
@@ -214,20 +245,25 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
         # A request's first semantic keyframe is its geometry anchor, including
         # the single-image last-frame-only signature [-1]. Only the second image in the
         # two-keyframe FL extension is a follower and receives cover-crop.
-        prepared_image = (
-            minimax_h3_stretch_keyframe_canvas(
+        if keyframe_fit == "source_crop":
+            prepared_image = minimax_h3_center_crop_keyframe_canvas(
                 image,
                 target_width=canvas_w,
                 target_height=canvas_h,
             )
-            if keyframe_index == 0
-            else minimax_h3_prepare_keyframe_canvas(
+        elif keyframe_index == 0:
+            prepared_image = minimax_h3_stretch_keyframe_canvas(
+                image,
+                target_width=canvas_w,
+                target_height=canvas_h,
+            )
+        else:
+            prepared_image = minimax_h3_prepare_keyframe_canvas(
                 image,
                 target_width=canvas_w,
                 target_height=canvas_h,
                 allow_upscale=True,
             )
-        )
         entries.append(
             {
                 "image": prepared_image,
@@ -273,6 +309,7 @@ def minimax_h3_prepared_keyframes(batch: Any, plan: Any) -> dict[str, Any]:
 __all__ = [
     "MINIMAX_H3_CANVAS_MULTIPLE",
     "MINIMAX_H3_PREPARED_KEYFRAMES_EXTRA_KEY",
+    "minimax_h3_center_crop_keyframe_canvas",
     "minimax_h3_cover_crop_plan",
     "minimax_h3_prepare_keyframe_canvas",
     "minimax_h3_prepared_keyframes",

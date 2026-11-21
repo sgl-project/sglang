@@ -51,6 +51,9 @@ impl SchedulerlessServer {
                     .map(|(rank, addr)| RustServerEndpoint {
                         dp_rank: rank as u32,
                         endpoint: format!("http://{addr}"),
+                        // Every listener of the test deployment derives the
+                        // same table, so the tokens must not be random.
+                        peer_token: Some(format!("test-peer-token-{rank}")),
                     })
                     .collect(),
                 ..Default::default()

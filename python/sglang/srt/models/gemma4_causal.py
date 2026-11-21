@@ -206,7 +206,7 @@ class Gemma4Router(nn.Module):
             self.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
         )
         self._scale_fused = False
@@ -1050,7 +1050,7 @@ class Gemma4TextModel(PreTrainedModel):
     ) -> bool:
         mode = forward_batch.forward_mode
         return (
-            (mode == ForwardMode.EXTEND or mode.is_mixed())
+            (mode in (ForwardMode.DECODE, ForwardMode.EXTEND) or mode.is_mixed())
             and self._ar_fusion.applies(num_tokens)
             and per_layer_inputs is None
             and pp_proxy_tensors is None
@@ -1071,10 +1071,12 @@ class Gemma4TextModel(PreTrainedModel):
         and scales.
         """
         fusion = self._ar_fusion
-        if not fusion.used:
-            fusion.used = True
+        kind = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        if kind not in fusion.used:
+            fusion.used.add(kind)
             logger.info(
-                "gemma4 all-reduce fusion: first fused forward (%d tokens)",
+                "gemma4 all-reduce fusion: first fused %s forward (%d tokens)",
+                kind,
                 input_embeds.shape[0],
             )
         num_tokens = input_embeds.shape[0]

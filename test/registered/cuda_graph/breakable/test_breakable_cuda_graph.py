@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 import weakref
 from types import SimpleNamespace
@@ -144,6 +145,49 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
+
+    def test_segment_capture_wraps_every_segment(self):
+        """Memory saver mode captures through segment_capture; a segment that
+        bypasses it would keep pool memory the saver cannot pause."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+        entered = []
+
+        @contextlib.contextmanager
+        def segment_capture(*, cuda_graph, pool, stream, capture_error_mode):
+            entered.append(cuda_graph)
+            with torch.cuda.graph(
+                cuda_graph,
+                pool=pool,
+                stream=stream,
+                capture_error_mode=capture_error_mode,
+            ):
+                yield
+
+        @self.eager_on_graph(enable=True)
+        def add_one(src, out):
+            out.copy_(src + 1.0)
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(
+            graph,
+            pool=torch.cuda.graph_pool_handle(),
+            stream=stream,
+            segment_capture=segment_capture,
+        ):
+            t1 = x + 1.0
+            t2 = torch.empty_like(t1)
+            add_one(t1, t2)
+            y.copy_(t2 * 2.0)
+
+        self.assertEqual(len(entered), 2)
+        self.assertTrue(all(a is b for a, b in zip(entered, graph._segments)))
+        # Replay: x=5 -> +1=6 -> add_one=7 -> *2=14
+        x.fill_(5.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 14.0, device=self.device)))
 
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""

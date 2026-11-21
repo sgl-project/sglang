@@ -169,6 +169,13 @@ pub enum DpRankPolicy {
     /// The worker's ranks in turn.
     #[value(name = "round_robin")]
     RoundRobin,
+    /// The rank expected to hold the fewest KV tokens by the engine's
+    /// `--load-publish-endpoint` feed: tokens in use plus queued, with every
+    /// request the rank holds charged a typical request's KV. Ties,
+    /// and a worker without a fresh reading for every rank, fall back to
+    /// `least_in_flight`.
+    #[value(name = "least_tokens")]
+    LeastTokens,
 }
 
 /// Role served by a static bucket.
@@ -312,6 +319,8 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// `Authorization` required by Worker management mutation endpoints.
+    pub worker_management_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -343,6 +352,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            worker_management_auth: None,
         }
     }
 }
@@ -397,8 +407,12 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
-    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it.
+    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it;
+    /// in PD mode, the prefill rank.
     pub dp_rank_policy: DpRankPolicy,
+    /// Rank choice under `dp_aware` for the PD decode rank, which no routing key
+    /// or cached prefix ever decides; `None` follows `dp_rank_policy`.
+    pub decode_dp_rank_policy: Option<DpRankPolicy>,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
@@ -422,6 +436,13 @@ pub struct ModelConfig {
     pub sampling_overrides: SamplingOverrides,
     /// Worker `--default-chat-template-kwargs`, applied when rendering.
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
+}
+
+impl ModelConfig {
+    /// The PD decode rank policy: `--decode-dp-rank-policy`, else `--dp-rank-policy`.
+    pub fn decode_dp_rank_policy(&self) -> DpRankPolicy {
+        self.decode_dp_rank_policy.unwrap_or(self.dp_rank_policy)
+    }
 }
 
 impl ModelConfig {
@@ -540,6 +561,8 @@ pub struct CacheAwareConfig {
     /// Max requests one pending stake may attract before later requests fall
     /// through to the confirmed tree and the load policy; 0 = unlimited.
     pub pending_prefix_max_followers: u64,
+    /// `--cache-media-affinity-ttl-ms`; 0 disables media affinity.
+    pub media_affinity_ttl_ms: u64,
     /// Confirmed-first mode when set: consult and stake pending prefixes only
     /// where a stake is strictly deeper than the confirmed match and while that
     /// match covers less than this share of the prompt. `None` keeps the
@@ -557,6 +580,7 @@ impl Default for CacheAwareConfig {
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
+            media_affinity_ttl_ms: 0,
             pending_prefix_consult_below: None,
         }
     }

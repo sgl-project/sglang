@@ -139,6 +139,7 @@ def maybe_dump_performance(
             reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
             peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
             peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
+            peak_host_anon_mb=snapshot_dict.get("peak_host_anon_mb", 0.0),
         )
         metrics.memory_snapshots[checkpoint_name] = snapshot
 
@@ -204,6 +205,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     )
     try:
         results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        if results is None:
+            raise RuntimeError("Generation produced no results. See the errors above.")
 
         prompt = sampling_params_kwargs.get("prompt")
         maybe_dump_performance(args, server_args, prompt, results)

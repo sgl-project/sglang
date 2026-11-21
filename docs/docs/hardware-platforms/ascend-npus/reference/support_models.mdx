@@ -1,7 +1,7 @@
 ---
 title: "Supported Models"
 metatags:
-  description: "Documentation for Support Models on Ascend NPU"
+  description: "Documentation for Supported Models on Ascend NPU"
 ---
 This section describes the models supported on the Ascend NPU, including Large Language Models, Multimodal Language
 Models, Diffusion Language Models, Embedding Models, Reward Models and Rerank Models. Mainstream DeepSeek/Qwen/GLM series are included.
@@ -363,7 +363,7 @@ You are welcome to enable various models based on your business requirements.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>eigen-ai-labs/gpt-oss-120b-bf16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GPTOSS</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GPT-OSS</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
     </tr>

@@ -53,6 +53,7 @@ def _rms_norm_gate_fwd_kernel(
     H,  # number of heads (for mapping kernel row to g indices)
     stride_g0,  # stride between gate tokens
     stride_g1,  # stride between gate groups
+    SRC_ROWS,  # with SRC_WORLD: rows per source block of X
     HEADS_PER_GROUP: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
@@ -60,8 +61,11 @@ def _rms_norm_gate_fwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_NORM: tl.constexpr,
     HAS_GATE: tl.constexpr,
+    SRC_WORLD: tl.constexpr,
 ):
     # BLOCK_M (token, head) rows per program; fp32 RMS reduction over head_dim.
+    # SRC_WORLD > 0: X is [SRC_WORLD, SRC_ROWS] token blocks and output token t = r * SRC_WORLD + w reads X token
+    # w * SRC_ROWS + r (the Ulysses head-major result written token-major).
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < N
@@ -69,7 +73,11 @@ def _rms_norm_gate_fwd_kernel(
     col_mask = cols < D
     mask = row_mask[:, None] & col_mask[None, :]
 
-    x = tl.load(X + rows[:, None] * D + cols[None, :], mask=mask, other=0.0).to(
+    x_rows = rows
+    if SRC_WORLD > 0:
+        token = rows // H
+        x_rows = ((token % SRC_WORLD) * SRC_ROWS + token // SRC_WORLD) * H + rows % H
+    x = tl.load(X + x_rows[:, None] * D + cols[None, :], mask=mask, other=0.0).to(
         tl.float32
     )
 
@@ -211,10 +219,22 @@ class FusedRMSNormGate(BaseFusedOp):
             x = g.sigmoid() * x
         return x.reshape(output_shape)
 
+    def forward_token_major(self, heads: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Norm-gate of the Ulysses output all-to-all result ``heads`` [world, rows, H * D] with its gate ``g``
+        [rows, world, H * D] (may be strided over tokens), written token-major as [rows, world * H * D]."""
+        world, rows = heads.shape[0], heads.shape[1]
+        y = self.forward_triton(
+            heads.view(world * rows, -1),
+            g.reshape(world * rows, 1, -1),
+            src_world=world,
+        )
+        return y.view(rows, -1)
+
     def forward_triton(
         self,
         x: torch.Tensor,
         g: torch.Tensor = None,
+        src_world: int = 0,
     ) -> torch.Tensor:
         """Triton kernel: fused RMS norm + sigmoid gate in a single pass.
 
@@ -278,6 +298,8 @@ class FusedRMSNormGate(BaseFusedOp):
             HAS_WEIGHT=has_weight,
             HAS_NORM=self._use_o_norm,
             HAS_GATE=self._use_o_gate,
+            SRC_ROWS=N // H // src_world if src_world else 0,
+            SRC_WORLD=src_world,
             num_warps=num_warps,
             **extra,
         )

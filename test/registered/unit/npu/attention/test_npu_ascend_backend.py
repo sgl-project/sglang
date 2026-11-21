@@ -615,7 +615,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                         global_lens = (
                             local_lens
                             if size == 1
-                            else ([9, 3] if local_lens == [5, 3] else [8, 8])
+                            else ([9, 5] if local_lens == [5, 3] else [8, 8])
                         )
                         backend.forward_metadata = ForwardMetadata(
                             prefix_lens=torch.tensor(global_lens),
@@ -683,7 +683,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
                                 backend.forward_metadata.prefix_lens,
                             )
                             self.assertEqual(
-                                gather.call_args.kwargs, {"interleave_size": page}
+                                gather.call_args.kwargs.get("interleave_size", 1), 1
                             )
                             torch.testing.assert_close(
                                 torch.cat((result_k, result_pe), -1),
@@ -747,7 +747,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             values = values + request * 10000
             full.append(values)
             positions = torch.arange(length)
-            local.append(values[(positions // page_size) % size == rank])
+            local.append(values[positions % size == rank])
         expected_local = torch.cat(local)
         expected_full = torch.cat(full)
         needs_compaction = any(len(values) % page_size for values in local)
@@ -788,11 +788,11 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
             get_value_buffer=lambda _: rope,
         )
 
-        def gather(kv, pe, global_lens, *, interleave_size):
+        def gather(kv, pe, global_lens, *, interleave_size=1):
             torch.testing.assert_close(kv, expected_local[..., :32], atol=0, rtol=0)
             torch.testing.assert_close(pe, expected_local[..., 32:], atol=0, rtol=0)
             self.assertEqual(global_lens.tolist(), lengths)
-            self.assertEqual(interleave_size, page_size)
+            self.assertEqual(interleave_size, 1)
             return expected_full
 
         with (

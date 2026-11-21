@@ -4,7 +4,6 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.gemm.inkling2_nvfp4 import swizzle_block_scales
 from sglang.kernels.ops.moe.inkling2_moe import (
     _sm_count,
     mxfp8_quantize,
@@ -158,13 +157,3 @@ def routed_swiglu_expert_matmul(
     return _routed_matmul(
         values, x_scales, gate_up.shape[0], tokens, weight, scales, metadata, None, 1
     )
-
-
-def cutlass_weight_scales(scales: torch.Tensor, out: torch.Tensor | None = None):
-    """(experts, n, k // 32) scales in the Blackwell block-scaled layout, written
-    into out when given (in place, for CUDA-graph-held buffers)."""
-    experts, n, groups = scales.shape
-    size = triton.cdiv(n, 128) * 128 * triton.cdiv(groups * 32, 128) * 4
-    if out is None:
-        out = torch.zeros((experts, size), dtype=torch.uint8, device=scales.device)
-    return swizzle_block_scales(scales, out)

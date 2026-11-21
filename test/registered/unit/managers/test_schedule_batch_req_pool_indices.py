@@ -41,7 +41,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = None
         scheduler.tree_cache = None
         scheduler.model_config = types.SimpleNamespace(
-            is_encoder_decoder=False, vocab_size=32
+            is_encoder_decoder=False, vocab_size=32, token_id_vocab_size=32
         )
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)

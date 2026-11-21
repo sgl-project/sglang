@@ -20,6 +20,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_kimi_k31,
+    is_q8_raw_fp8_nope_layout,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
@@ -142,6 +143,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
+if _IS_GFX95:
+    from sglang.srt.layers.attention.dsa import dsa_backend_hip
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -598,6 +601,7 @@ def _validate_flashmla_sparse_q8_backend(
     kv_cache_store_fp8: bool,
     qk_rope_head_dim: int,
     device_sm_major: int,
+    kv_lora_rank: int,
     hisparse_enabled: bool = False,
 ) -> None:
     # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be
@@ -618,15 +622,23 @@ def _validate_flashmla_sparse_q8_backend(
                 "fp8_e4m3 KV cache for NoPE MLA models (qk_rope_head_dim=0) yet; use "
                 "--kv-cache-dtype bfloat16."
             )
-        # An fp8 dtype that is NOT stored packed leaves the pool in the raw
-        # 576-dim layout, which the bf16 prefix gather cannot read; without this
-        # the failure is a message-less assert on the first prefix extend.
-        if kv_cache_dtype == torch.float8_e4m3fn and not kv_cache_store_fp8:
+        # Raw fp8 is supported only for the NoPE layout shared with TileLang.
+        # Keep other unpacked layouts (e.g. TRTLLM's 576-dim rows) rejected.
+        if (
+            kv_cache_dtype == torch.float8_e4m3fn
+            and not kv_cache_store_fp8
+            and not is_q8_raw_fp8_nope_layout(
+                prefill_backend=prefill_impl,
+                decode_backend=decode_impl,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+            )
+        ):
             raise ValueError(
                 "--dsa-prefill-backend flashmla_sparse_q8 requires either a "
-                "bfloat16 KV cache or the packed fp8_e4m3 pool; got an unpacked "
-                "fp8_e4m3 pool (a trtllm backend keeps the raw layout). Use "
-                "--kv-cache-dtype bfloat16."
+                "bfloat16 KV cache, a packed fp8_e4m3 pool, or raw 512-dim NoPE "
+                "fp8 KV with TileLang decode; got an unsupported unpacked pool. "
+                "Use --kv-cache-dtype bfloat16."
             )
         if device_sm_major != 9:
             raise ValueError(
@@ -1019,7 +1031,8 @@ class DeepseekSparseAttnBackend(
             assert not get_exec().features.enable_return_indexer_topk
             if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
+            # gfx950's DCP top-k takes the fused top-k's place
+            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get() or _IS_GFX95:
                 init_dcp_fused_topk(
                     max_rows,
                     self.dsa_index_topk,
@@ -1049,6 +1062,7 @@ class DeepseekSparseAttnBackend(
             kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
             qk_rope_head_dim=self.qk_rope_head_dim,
             device_sm_major=self.device_sm_major,
+            kv_lora_rank=self.kv_lora_rank,
             hisparse_enabled=self.hisparse_coordinator is not None,
         )
         _validate_unified_pool_backend(
@@ -1468,6 +1482,10 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
+        if _IS_GFX95:
+            return dsa_backend_hip.dcp_gather_kv_cache(
+                self, kv_cache, forward_batch, metadata
+            )
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
             rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
@@ -1839,6 +1857,14 @@ class DeepseekSparseAttnBackend(
             # require SPLIT_KV = 256; this is independent of the cache page size.
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
+            )
+        elif _IS_GFX95:
+            paged_mqa_ctx_lens_2d = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self,
+                forward_batch.forward_mode,
+                cache_seqlens_int32,
+                seqlens_expanded,
+                forward_batch.batch_size,
             )
 
         metadata = DSAMetadata(
@@ -2244,6 +2270,10 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
             )
+        elif _IS_GFX95:
+            paged_mqa_ctx_lens_2d = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self, forward_mode, cache_seqlens_int32, seqlens_expanded, bs
+            )
 
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
@@ -2555,6 +2585,12 @@ class DeepseekSparseAttnBackend(
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        elif _IS_GFX95:
+            lens = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self, forward_mode, metadata.cache_seqlens_int32, seqlens_expanded, bs
+            )
+            if lens is not None:
+                metadata.paged_mqa_ctx_lens_2d.copy_(lens)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -2645,6 +2681,16 @@ class DeepseekSparseAttnBackend(
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:
                 metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        elif _IS_GFX95:
+            lens = dsa_backend_hip.sharded_index_k_ctx_lens(
+                self,
+                forward_mode,
+                metadata.cache_seqlens_int32,
+                metadata.dsa_seqlens_expanded,
+                bs,
+            )
+            if lens is not None:
+                metadata.paged_mqa_ctx_lens_2d.copy_(lens)
 
         self._update_kpool_metadata_from_precomputed(
             metadata, precomputed, forward_mode
@@ -2862,6 +2908,15 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                )
+            # the dcp_partial of _forward_flashmla_kv on gfx950's sharded index-K
+            if (
+                _IS_GFX95
+                and self.dsa_shards_index_k
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                return dsa_backend_hip.forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -3236,6 +3291,10 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
+            if _IS_GFX95 and self.dsa_shards_index_k:
+                return dsa_backend_hip.forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
+                )
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -3421,6 +3480,12 @@ class DeepseekSparseAttnBackend(
             # helpers keep them aligned); fall back to full-width compute if
             # they ever diverge.
             topk_length = None
+        if (
+            topk_length is not None
+            and self.dsa_index_topk is not None
+            and page_table_1.shape[-1] < self.dsa_index_topk
+        ):
+            topk_length = topk_length.clamp(max=page_table_1.shape[-1])
 
         if use_small_heads:
             o, _, _ = self._call_flash_mla_sparse_fwd_small_heads(
@@ -3614,8 +3679,9 @@ class DeepseekSparseAttnBackend(
             scales + rope_bf16): ``gather_dequant_requant_fp8_paged_dsa`` gathers,
             dequantizes per group and requantizes to per-tensor fp8 in one
             fused Triton kernel.
-          * prefix extend on a bf16 pool: ``gather_cast_kv_fp8_pad_paged``
-            gathers the rows and store-casts them to fp8.
+          * prefix extend on a bf16 or raw NoPE fp8 pool:
+            ``gather_cast_kv_fp8_pad_paged`` gathers only the referenced rows,
+            store-casting bf16 or copying raw fp8 without scale conversion.
         The top-k width is -1 padded to a multiple of 128 before the pad band
         is sized (kpool rows are index_topk + index_kpool - 1 wide).
         """
@@ -4779,7 +4845,14 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.attn_dcp_size > 1 and (not self.dsa_shards_index_k or dcp_partial):
+        if dcp_partial:
+            # The sharded indexer already returns this rank's compacted slots and
+            # their counts; remapping them as global slots selects the wrong KV.
+            seq_lens = metadata.dcp_topk_length[: page_table_1.shape[0]]
+            pad = page_table_1.shape[0] - seq_lens.shape[0]
+            if pad > 0:  # padded rows (DP / attention-TP padding) select nothing
+                seq_lens = torch.nn.functional.pad(seq_lens, (0, pad))
+        elif replicated_dcp:
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,

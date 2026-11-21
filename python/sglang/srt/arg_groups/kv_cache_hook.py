@@ -626,17 +626,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"transfer backends: {', '.join(sorted(supported_backends))}; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
+        if cfg.disaggregation_transfer_backend == "nixl":
+            assert (
+                get_platform().is_cuda
+                and envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get() == "UCX"
+            ), "NIXL unified-memory PD currently requires CUDA and UCX"
         assert cfg.pp_size == 1, (
             "--enable-unified-memory with PD disaggregation does not support "
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
         )
-        assert not (
-            cfg.disaggregation_transfer_backend == "mooncake"
-            and cfg.speculative_algorithm is not None
-        ), (
+        assert cfg.speculative_algorithm is None, (
             "--enable-unified-memory with PD disaggregation does not support "
-            "speculative decoding with the Mooncake transfer backend."
+            "speculative decoding."
         )
         # This flag also selects decode's non-blocking metadata readback, which
         # records a receive as in flight before its destination is published.

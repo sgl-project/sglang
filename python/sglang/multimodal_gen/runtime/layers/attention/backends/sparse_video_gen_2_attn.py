@@ -55,10 +55,6 @@ class SparseVideoGen2AttentionBackend(AttentionBackend):
         return SparseVideoGen2AttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["SparseVideoGen2AttentionMetadata"]:
-        return SparseVideoGen2AttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["SparseVideoGen2AttentionMetadataBuilder"]:
         return SparseVideoGen2AttentionMetadataBuilder
 

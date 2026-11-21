@@ -46,10 +46,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
 
-    from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
+    from sglang.srt.arg_groups.validation_hook import validate_removed_options
 
-    # Before any handler reads the DP layout.
-    run_hook(handle_deprecated_dp_attention, server_args)
+    run_hook(validate_removed_options, server_args)
 
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
@@ -67,22 +66,21 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_asr_validation,
         handle_crash_dump_env,
         handle_debug_utils,
-        handle_deprecated_args,
         handle_environment_variables,
         handle_grammar_backend,
+        handle_grpc_args,
         handle_load_balance_method,
         handle_media_url_security,
         handle_missing_default_values,
         handle_multimodal,
         handle_other_validations,
-        handle_prefill_delayer_env_compat,
         handle_return_hidden_states_mode,
         handle_ssl_validation,
         handle_tokenizer_batching,
         handle_watermark_config,
     )
 
-    # Before any hook reads admin_api_key (the gRPC check in handle_deprecated_args).
+    # Before any hook reads admin_api_key (the gRPC check in handle_grpc_args).
     run_hook(handle_admin_api_key_env, server_args)
     run_hook(handle_return_hidden_states_mode, server_args)
     run_hook(handle_media_url_security, server_args)
@@ -139,9 +137,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
 
-    run_hook(handle_deprecated_args, server_args)
-
-    run_hook(handle_prefill_delayer_env_compat, server_args)
+    run_hook(handle_grpc_args, server_args)
 
     run_hook(handle_missing_default_values, server_args)
 
@@ -186,6 +182,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
+        handle_kda_dwdp,
         handle_shared_experts_tp,
     )
 
@@ -203,8 +200,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
+        handle_cuda_graph_persistence,
+        validate_cuda_graph_persistence,
     )
 
+    run_hook(handle_cuda_graph_persistence, server_args)
     run_hook(apply_inkling_prefill_cuda_graph_default, server_args)
     run_hook(apply_muse_glimmer_prefill_cuda_graph_max_bs_default, server_args)
     run_hook(apply_unlimited_ocr_v2_cuda_graph_default, server_args)
@@ -323,6 +323,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
+    run_hook(handle_kda_dwdp, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)
@@ -377,6 +378,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_debug_utils, server_args)
 
     run_hook(handle_other_validations, server_args)
+    run_hook(validate_cuda_graph_persistence, server_args)
 
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)

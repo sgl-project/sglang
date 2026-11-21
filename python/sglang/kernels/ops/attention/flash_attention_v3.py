@@ -138,7 +138,8 @@ def flash_attn_with_kvcache(
 ):
     if not _is_fa3_supported():
         raise NotImplementedError(
-            "flash_attn at sgl-kernel is only supported on sm90 and above"
+            "FlashAttention v3 is only supported on SM8x / SM9x with CUDA >= 12.3, "
+            "and on MUSA"
         )
 
     # When only_qv=True the caller may pass k_cache=None (synthetic K is
@@ -217,8 +218,8 @@ def flash_attn_varlen_func(
 ):
 
     if not _is_fa3_supported():
-        # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
-        # (e.g. ROCm, or CUDA < sm90)
+        # Fall back to flash_attn package (FA2) on platforms without FA3
+        # (e.g. ROCm, or CUDA outside SM8x / SM9x)
         if cu_seqlens_q is not None:
             from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
 

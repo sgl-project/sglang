@@ -47,6 +47,8 @@ from infra import model_pool  # noqa: E402  (needs the sys.path entry above)
 from infra.router import router_binary_path  # noqa: E402
 
 MODEL = "Qwen/Qwen3-0.6B"
+# Cards the e2e job holds in CI (`runs-on` in pr-test-sgl-router.yml).
+CI_GPU_ALLOTMENT = 4
 SGLANG_PORT = 30000
 ROUTER_PORT = 8090
 
@@ -376,4 +378,9 @@ def gpu_allocator() -> Iterator[GPUAllocator]:
     n = _detect_gpu_count()
     if n == 0:
         pytest.skip("no GPUs available to this process; tests/e2e/ is GPU-only")
+    # `acquire` skips, not fails, past the allotment; CI must not lose tests that way.
+    if os.environ.get("GITHUB_ACTIONS") and n < CI_GPU_ALLOTMENT:
+        pytest.fail(
+            f"CI runner exposes {n} GPU(s), the e2e job needs {CI_GPU_ALLOTMENT}"
+        )
     yield GPUAllocator(n)

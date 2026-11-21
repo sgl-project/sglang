@@ -1,7 +1,10 @@
+import importlib
+import pkgutil
 from dataclasses import fields
 
 import torch
 
+from sglang.multimodal_gen.configs.models import dits as dit_configs
 from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
     MOVADualTowerArchConfig,
 )
@@ -36,12 +39,34 @@ def test_dit_runtime_keeps_architecture_and_component_config_separate():
     assert model._spectrum_supports_cfg_cache
 
 
-def test_dit_arch_config_excludes_runtime_capabilities():
-    field_names = {field.name for field in fields(DiTArchConfig)}
+def test_teacache_and_spectrum_resolve_cfg_support_from_their_own_prefix_sets():
+    """A DiT inherits both cache mixins; each one must decide CFG branch
+    separation from its own model list, not from the other mixin's."""
+    zimage = _TestDiT(config=DiTConfig(prefix="zimage"), hf_config={})
+    sd3 = _TestDiT(config=DiTConfig(prefix="SD3"), hf_config={})
 
-    assert "_fsdp_shard_conditions" not in field_names
-    assert "_compile_conditions" not in field_names
-    assert "_supported_attention_backends" not in field_names
+    assert zimage._supports_cfg_cache
+    assert not zimage._spectrum_supports_cfg_cache
+    assert not sd3._supports_cfg_cache
+    assert sd3._spectrum_supports_cfg_cache
+
+
+def test_dit_arch_configs_exclude_runtime_capabilities():
+    for module in pkgutil.iter_modules(dit_configs.__path__):
+        importlib.import_module(f"{dit_configs.__name__}.{module.name}")
+    arch_configs, pending = [], [DiTArchConfig]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.__subclasses__())
+        if cls.__module__.startswith(dit_configs.__name__):
+            arch_configs.append(cls)
+    assert len(arch_configs) > 1
+
+    for cls in arch_configs:
+        field_names = {field.name for field in fields(cls)}
+        assert "_fsdp_shard_conditions" not in field_names, cls
+        assert "_compile_conditions" not in field_names, cls
+        assert "_supported_attention_backends" not in field_names, cls
 
 
 def test_mova_bridge_declares_runtime_capabilities_on_model_class():

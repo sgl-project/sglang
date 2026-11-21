@@ -191,6 +191,25 @@ class TestAscendHybridPpDispatch(CustomTestCase):
         self.assertEqual(manager.generic_call["src_layer_ids"], [31, 35, 31, 35])
         self.assertEqual(manager.generic_call["dst_layer_ids"], dst_layer_ids)
 
+    def test_send_kvcache_accepts_transfer_worker_keywords(self):
+        manager = _RecordingAscendManager()
+        rc = AscendKVManager.send_kvcache(
+            manager,
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([1], dtype=np.int32),
+            dst_kv_ptrs=list(range(8)),
+            dst_kv_indices=np.array([2], dtype=np.int32),
+            executor=None,
+            dst_layer_ids=[3, 7, 31, 35, 3, 7, 31, 35],
+            dst_device_kv_indices=None,
+            dst_kv_item_len=16,
+            dst_attn_tp_size=1,
+            dst_num_draft_entries=None,
+        )
+
+        self.assertEqual(rc, 7)
+        self.assertIsNotNone(manager.generic_call)
+
 
 class TestMambaSlotTransfer(CustomTestCase):
     def test_stage1_uses_paired_slot_sizes_and_offsets(self):

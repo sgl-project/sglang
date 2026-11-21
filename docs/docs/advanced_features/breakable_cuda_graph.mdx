@@ -174,7 +174,7 @@ Some models fork work onto secondary CUDA streams (e.g., for overlapped computat
 
 - **CUDA and ROCm/HIP.** Breakable CUDA graph runs on both NVIDIA and AMD GPUs. Other platforms (NPU, CPU, MPS, XPU) are unsupported; there `--debug-cuda-graph` is automatically disabled with a warning.
 - **Requires `cuda-python` on NVIDIA.** Stream-capture-status queries use the CUDA runtime via `cuda.bindings` (`pip install cuda-python`); the portable `torch.cuda.is_current_stream_capturing()` has proven unreliable on CUDA. On ROCm/HIP — where `cuda-python` is unavailable — the portable `torch.cuda` API (which maps to the HIP runtime) is used instead.
-- **Not compatible with memory saver mode.** Cannot be used together with `SGLANG_MEMORY_SAVER_CUDA_GRAPH`.
+- **Memory saver mode.** With `--enable-memory-saver` and `SGLANG_MEMORY_SAVER_CUDA_GRAPH=1`, every graph segment is captured through `torch_memory_saver`'s pauseable capture under the `cuda_graph` tag with CPU backup, as full CUDA graphs are, so releasing and resuming that tag keeps breakable graphs replayable. XPU and NPU reject this combination at startup.
 
 ## Performance
 

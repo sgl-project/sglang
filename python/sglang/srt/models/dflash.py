@@ -84,10 +84,27 @@ from sglang.srt.utils.device import get_compiler_backend
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
-if _is_gfx95:
+
+
+def _gfx1250_try_gfx95():
+    import os as _os
+
+    if _os.environ.get("SGLANG_ROCM_MUSE_GFX1250_TRY_GFX95", "1") != "1":
+        return False
+    try:
+        import torch as _t
+
+        return "gfx1250" in _t.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+_muse_gfx95_like = _is_gfx95 or (is_hip() and _gfx1250_try_gfx95())
+if _muse_gfx95_like:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
+        rowmajor_gemm,
         rowmajor_gemm_applies,
         rowmajor_gemm_partials,
     )
@@ -136,16 +153,27 @@ def _project_candidate_logits(
     """Project draft hiddens through the target head, restricted to the org vocab."""
     if not use_quant_head:
         weight = lm_head.weight
-        hidden = hidden.to(weight.dtype)
+        h = hidden.to(weight.dtype)
+        if _muse_gfx95_like and not _is_gfx95 and h.dim() == 2:
+            # gfx1250: hipBLASLt is slow at these widths; the split-K head GEMM
+            # (BF16 out) is bandwidth-bound.
+            from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import (
+                applies,
+                lmhead_fp32,
+            )
+
+            w = weight[:num_org]
+            if applies(h.contiguous(), w):
+                return lmhead_fp32(h.contiguous(), w, out_dtype=weight.dtype)
         # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
         backend = get_bf16_gemm_backend()
         if (
             (backend.is_cutedsl() or backend.is_gemv())
-            and hidden.is_cuda
+            and h.is_cuda
             and weight.dtype == torch.bfloat16
         ):
-            return bf16_gemm_dispatch(hidden, weight[:num_org], None)
-        return torch.matmul(hidden, weight[:num_org].T)
+            return bf16_gemm_dispatch(h, weight[:num_org], None)
+        return torch.matmul(h, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k only reads dense rows (a crop view would be
     # copied), so mask the padded tail out of the top-k instead.
@@ -473,6 +501,8 @@ class DFlashAttention(nn.Module):
             attn_type=self.attn_type,
             quant_config=quant_config,
         )
+        # Whether the draft block's K/V are also written to the draft KV cache.
+        self.save_kv_cache = True
 
     def _build_qkv_proj(self, bias: bool, quant_config, prefix: str) -> nn.Module:
         return QKVParallelLinear(
@@ -527,6 +557,14 @@ class DFlashAttention(nn.Module):
                 table_qk_norm_rope_,
             )
 
+            # ROCm Muse path: K and V land in their own contiguous rows, which the
+            # attention backend would otherwise copy them into.
+            kv_out = None
+            if _muse_gfx95_like:
+                kv_out = (
+                    qkv.new_empty((qkv.shape[0], self.kv_size)),
+                    qkv.new_empty((qkv.shape[0], self.kv_size)),
+                )
             table_qk_norm_rope_(
                 qkv,
                 positions,
@@ -537,8 +575,13 @@ class DFlashAttention(nn.Module):
                 self.num_kv_heads,
                 self.head_dim,
                 self.q_norm.variance_epsilon,
+                kv_out=kv_out,
             )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if kv_out is None:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            else:
+                q = qkv[:, : self.q_size]
+                k, v = kv_out
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             # In-place QK kernels use weight directly; Gemma requires 1 + weight.
@@ -553,11 +596,13 @@ class DFlashAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
+        # save_kv_cache is passed only when off, so the default call stays as before.
+        kwargs = {} if self.save_kv_cache else {"save_kv_cache": False}
         if self.attention_sink_bias is None:
-            attn_output = self.attn(q, k, v, forward_batch)
+            attn_output = self.attn(q, k, v, forward_batch, **kwargs)
         else:
             attn_output = self.attn(
-                q, k, v, forward_batch, sinks=self.attention_sink_bias
+                q, k, v, forward_batch, sinks=self.attention_sink_bias, **kwargs
             )
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
@@ -833,6 +878,8 @@ class DFlashMLP(nn.Module):
                 f"Unsupported DFlash activation: {hidden_act}. "
                 "Supported activations are silu and swigluoai."
             )
+        # gfx950 only: on gfx1250 the row-major kernel beats hipBLASLt for [14336, 8192]
+        # at 33..128 rows.
         self.gate_up_on_hipblaslt = (
             _is_gfx95
             and envs.SGLANG_ROCM_MUSE_DFLASH_DENSE.get()
@@ -910,7 +957,7 @@ class DFlashGroupedConv(nn.Module):
         )
         # MI355X (SGLANG_ROCM_MUSE_DFLASH_FUSED_CONV): the projection's row-major split-K partials are summed inside the
         # input convolution kernel, and the output convolution runs inside the next residual add + RMSNorm.
-        self.fused = _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CONV.get()
+        self.fused = _muse_gfx95_like and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CONV.get()
 
     def _fused_applies(self, hidden_states: torch.Tensor) -> bool:
         return self.fused and conv_applies(
@@ -949,11 +996,10 @@ class DFlashGroupedConv(nn.Module):
     def prepare(self, hidden_states: torch.Tensor):
         if self._fused_applies(hidden_states):
             weight = self.kernel_projection.weight
-            projection = (
-                rowmajor_gemm_partials(hidden_states, weight)
-                if rowmajor_gemm_applies(hidden_states, weight)
-                else self.kernel_projection(hidden_states)[0]
-            )
+            if rowmajor_gemm_applies(hidden_states, weight):
+                projection = rowmajor_gemm_partials(hidden_states, weight)
+            else:
+                projection = self.kernel_projection(hidden_states)[0]
             return conv_prepare(
                 projection,
                 hidden_states,
@@ -1106,6 +1152,9 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
+    # project_target_hidden may split the plain (unquantized) fc over the TP ranks, which
+    # then all run it together (no DP attention).
+    shards_context_fc = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
     own_quant_config = staticmethod(keeps_no_quant_config)
@@ -1152,7 +1201,7 @@ class DFlashDraftModel(nn.Module):
                 prefix=embed_prefix,
             )
 
-        if _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_DENSE.get():
+        if _muse_gfx95_like and envs.SGLANG_ROCM_MUSE_DFLASH_DENSE.get():
             register_gfx950_unquantized_gemm_shapes(
                 rowmajor_weights=_GFX950_ROWMAJOR_WEIGHTS
             )
@@ -1300,11 +1349,20 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
         if self.quantizable:
-            projected = projected[0]
+            projected = self.fc(target_hidden)[0]
         elif self.fc_tp_columns is not None:
-            projected = self._gather_fc_columns(projected)
+            projected = self._gather_fc_columns(self.fc(target_hidden))
+        elif (
+            self.shards_context_fc
+            and _muse_gfx95_like
+            and get_parallel().tp_size > 1
+            and not get_parallel().attn_dp_enabled
+            and self.fc.out_features % get_parallel().tp_size == 0
+        ):
+            projected = self._project_target_hidden_tp(target_hidden)
+        else:
+            projected = self.fc(target_hidden)
         return self.hidden_norm(projected)
 
     def _resolve_fc_tp_columns(self) -> Optional[Tuple[int, int]]:
@@ -1331,6 +1389,20 @@ class DFlashDraftModel(nn.Module):
         full = local.new_zeros(local.shape[0], int(self.config.hidden_size))
         full[:, start:end] = local
         return get_parallel().tp_group.all_reduce(full)
+
+    def _project_target_hidden_tp(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """``fc(target_hidden)`` with each TP rank projecting its contiguous slice of the
+        output features and an all-gather of the slices: the replicated fc weight is the
+        draft's largest read (Muse Spark: [8192, 5 x 8192] BF16, 671 MB per step per rank)."""
+        weight = self.fc.weight
+        parallel = get_parallel()
+        rows = weight.shape[0] // parallel.tp_size
+        shard = weight[parallel.tp_rank * rows : (parallel.tp_rank + 1) * rows]
+        if _muse_gfx95_like and rowmajor_gemm_applies(target_hidden, shard):
+            y = rowmajor_gemm(target_hidden, shard)
+        else:
+            y = F.linear(target_hidden, shard)
+        return parallel.tp_group.all_gather(y, dim=-1)
 
     @torch.no_grad()
     def forward(
@@ -1585,6 +1657,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 
     decoder_layer_cls = DFlashLagunaDecoderLayer
     supports_fused_context_kv = False
+    shards_context_fc = False
     # Its own `project_target_hidden` reads the whole `fc` output.
     supports_fc_tp_split = False
 
@@ -1814,6 +1887,13 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        # On the ROCm Muse attention path the block attends to its own K/V directly, and the
+        # worker rewrites the block's committed cache rows from the target's hidden states
+        # after verify; no later step reads the rest. So the block's K/V never need to reach
+        # the cache there. Other backends read the block's K/V from the cache.
+        if _muse_gfx95_like:
+            for layer in self.layers:
+                layer.self_attn.save_kv_cache = False
         draft_config = self.draft_config
         if not draft_config.selector_rank:
             raise ValueError(
@@ -1832,7 +1912,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         # travel in one all-gather and one kernel merges them and applies the transform.
         # The head's shard count is checked per call: the head is attached later.
         self.merge_candidates_fused = (
-            _is_gfx95
+            _muse_gfx95_like
             and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES.get()
             and int(config.vocab_size) < MAX_PACKED_ID
         )

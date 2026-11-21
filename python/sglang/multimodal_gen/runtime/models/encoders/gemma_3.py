@@ -762,7 +762,6 @@ class Gemma3ForConditionalGeneration(
 
         # Separate weights
         language_model_weights: list[tuple[str, torch.Tensor]] = []
-        other_weights: list[tuple[str, torch.Tensor]] = []
 
         for name, loaded_weight in weights:
             # Handle prefix mapping if needed
@@ -898,27 +897,11 @@ class Gemma3ForConditionalGeneration(
 
                 language_model_weights.append((suffix, loaded_weight))
 
-            else:
-                # Fallback for other weights (maybe direct lm_head if not nested?)
-                other_weights.append((name, loaded_weight))
-
         if language_model_weights:
             lm_loaded = self.language_model.load_weights(language_model_weights)
             loaded_params.update({f"language_model.{n}" for n in lm_loaded})
 
         return loaded_params
-
-    def get_attention_sliding_window_size(self):
-        if self.text_config is not None and hasattr(
-            self.text_config, "get_attention_sliding_window_size"
-        ):
-            return self.text_config.get_attention_sliding_window_size()
-        sliding_window = getattr(self.text_config, "sliding_window", None)
-        if sliding_window is None:
-            sliding_window = getattr(self.config, "sliding_window", None)
-        if sliding_window is None:
-            return None
-        return int(sliding_window) - 1
 
 
 EntryClass = Gemma3ForConditionalGeneration

@@ -911,8 +911,6 @@ class WanMidBlock(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return mid_block_forward(self, x)
 
@@ -1164,7 +1162,6 @@ class WanEncoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1282,8 +1279,6 @@ class WanResidualUpBlock(nn.Module):
         else:
             self.upsampler = None
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return residual_up_block_forward(self, x)
 
@@ -1333,8 +1328,6 @@ class WanUpBlock(nn.Module):
         self.upsamplers = None
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList([resample_cls(out_dim, mode=upsample_mode)])
-
-        self.gradient_checkpointing = False
 
     def forward(self, x):
         return up_block_forward(self, x)
@@ -1498,7 +1491,6 @@ class WanDecoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1592,8 +1584,111 @@ class AutoencoderKLWan(ParallelTiledVAE):
     Introduced in [Wan 2.1].
     """
 
-    _supports_gradient_checkpointing = False
     supports_decode_on_frames = True
+
+    # Official Wan2.1_VAE.pth key -> module key. No caller here; the Wan2.2-S2V
+    # overlay's _overlay/materialize.py uses it to convert the official VAE file.
+    @staticmethod
+    def _remap_official_state_key(key: str) -> str:
+        if key == "encoder.conv1.weight":
+            return "encoder.conv_in.weight"
+        if key == "encoder.conv1.bias":
+            return "encoder.conv_in.bias"
+        if key == "decoder.conv1.weight":
+            return "decoder.conv_in.weight"
+        if key == "decoder.conv1.bias":
+            return "decoder.conv_in.bias"
+        if key == "conv1.weight":
+            return "quant_conv.weight"
+        if key == "conv1.bias":
+            return "quant_conv.bias"
+        if key == "conv2.weight":
+            return "post_quant_conv.weight"
+        if key == "conv2.bias":
+            return "post_quant_conv.bias"
+
+        if key.startswith("encoder.downsamples."):
+            key = key.replace("encoder.downsamples.", "encoder.down_blocks.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("encoder.middle.0."):
+            key = key.replace("encoder.middle.0.", "encoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.middle.1."):
+            return key.replace(
+                "encoder.middle.1.", "encoder.mid_block.attentions.0.", 1
+            )
+
+        if key.startswith("encoder.middle.2."):
+            key = key.replace("encoder.middle.2.", "encoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.head.0.gamma"):
+            return key.replace("encoder.head.0.gamma", "encoder.norm_out.gamma", 1)
+        if key.startswith("encoder.head.2."):
+            return key.replace("encoder.head.2.", "encoder.conv_out.", 1)
+
+        if key.startswith("decoder.middle.0."):
+            key = key.replace("decoder.middle.0.", "decoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.middle.1."):
+            return key.replace(
+                "decoder.middle.1.", "decoder.mid_block.attentions.0.", 1
+            )
+
+        if key.startswith("decoder.middle.2."):
+            key = key.replace("decoder.middle.2.", "decoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.upsamples."):
+            parts = key.split(".")
+            flat_idx = int(parts[2])
+            block_idx = flat_idx // 4
+            block_offset = flat_idx % 4
+            if block_idx == 3:
+                block_offset = flat_idx - 12
+            prefix = f"decoder.up_blocks.{block_idx}."
+            suffix = ".".join(parts[3:])
+            if block_idx < 3 and block_offset == 3:
+                return prefix + "upsamplers.0." + suffix
+            res_idx = block_offset
+            key = prefix + f"resnets.{res_idx}." + suffix
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("decoder.head.0.gamma"):
+            return key.replace("decoder.head.0.gamma", "decoder.norm_out.gamma", 1)
+        if key.startswith("decoder.head.2."):
+            return key.replace("decoder.head.2.", "decoder.conv_out.", 1)
+
+        return key
 
     def __init__(
         self,
@@ -1751,6 +1846,26 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
         return enc
 
+    def encode_video(self, x: torch.Tensor) -> torch.Tensor:
+        self.clear_cache()
+        if self.config.patch_size is not None:
+            x = patchify(x, patch_size=self.config.patch_size)
+        with forward_context(
+            feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+        ):
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            for i in range(iter_):
+                feat_idx.set(0)
+                if i == 0:
+                    out = self.encoder(x[:, :, :1, :, :])
+                else:
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
+                    out = torch.cat([out, out_], 2)
+        enc = self.quant_conv(out)
+        self.clear_cache()
+        return enc[:, : self.z_dim]
+
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
         with forward_context(first_frame_arg=first_frame):
             out = self.encoder(x)
@@ -1860,27 +1975,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
         dec = ParallelTiledVAE.parallel_tiled_decode(self, z)
         start_frame_idx = self.temporal_compression_ratio - 1
         dec = dec[:, :, start_frame_idx:]
-        return dec
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
         return dec
 
 

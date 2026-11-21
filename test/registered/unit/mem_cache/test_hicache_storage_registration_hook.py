@@ -22,6 +22,7 @@ sidecars) arrive through v2 alone and do not re-fire the hook.
     python3 -m pytest test/registered/unit/mem_cache/test_hicache_storage_registration_hook.py -v
 """
 
+import contextlib
 import threading
 import unittest
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from typing import Any, List, Optional
 from unittest import mock
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.cpp_utils.native_hash import _load_native_hash_module
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -46,10 +48,16 @@ PAGE = 16
 class RecordingBackend:
     """A backend that records the registration calls it receives."""
 
-    def __init__(self, order: List[str], fail_on_complete: bool = False):
+    def __init__(
+        self,
+        order: List[str],
+        fail_on_complete: bool = False,
+        consumes_kv_hints: bool = False,
+    ):
         self.order = order
         self.fail_on_complete = fail_on_complete
         self.closed = False
+        self._consumes_kv_hints = consumes_kv_hints
 
     def register_mem_pool_host(self, mem_pool_host: Any) -> None:
         self.order.append("v1")
@@ -64,6 +72,9 @@ class RecordingBackend:
 
     def close(self) -> None:
         self.closed = True
+
+    def consumes_kv_hints(self) -> bool:
+        return self._consumes_kv_hints
 
 
 def _fake_pool(name: str) -> SimpleNamespace:
@@ -123,15 +134,35 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     return controller
 
 
+@contextlib.contextmanager
+def _native_hash(build_error: Optional[Exception]):
+    if build_error is None:
+        # Skip the JIT C++ build; TestNativeHashPrecondition drives the real load path.
+        with mock.patch("sglang.srt.managers.cache_controller.ensure_native_hash"):
+            yield
+        return
+    _load_native_hash_module.cache_clear()
+    try:
+        with mock.patch(
+            "sglang.srt.utils.cpp_extension_loader.load_extension_with_recovery",
+            side_effect=build_error,
+        ):
+            yield
+    finally:
+        _load_native_hash_module.cache_clear()
+
+
 def _attach(
     controller: Any,
     backend: RecordingBackend,
     order: List[str],
     host_pools: Optional[List[PoolEntry]] = None,
+    extra_config: Optional[dict] = None,
+    native_hash_build_error: Optional[Exception] = None,
 ) -> None:
     """Run ``attach_storage_backend`` with the heavy pieces stubbed out."""
     storage_config = SimpleNamespace(
-        is_mla_model=False, extra_config={}, unified_suffixes=None
+        is_mla_model=False, extra_config=extra_config or {}, unified_suffixes=None
     )
     # Only the hybrid attach accepts host_pools; the base attach's burst is
     # the anchor pool alone.
@@ -156,11 +187,31 @@ def _attach(
             "_start_storage_threads",
             side_effect=lambda: order.append("threads"),
         ),
+        _native_hash(native_hash_build_error),
     ):
         controller.attach_storage_backend(storage_backend="dynamic", **kwargs)
 
 
 class TestRegistrationBurstOrder(CustomTestCase):
+    def test_hint_consumer_on_legacy_reads_is_warned(self):
+        """A dynamic backend without interface_v1 reads through batch_get()."""
+        for extra_config, warns in (({}, True), ({"interface_v1": 1}, False)):
+            with self.subTest(extra_config=extra_config):
+                order: List[str] = []
+                group = _group()
+                controller = _controller(
+                    HybridCacheController, group.anchor_entry.host_pool, group
+                )
+                backend = RecordingBackend(order, consumes_kv_hints=True)
+                logger = HybridCacheController.__module__
+                if warns:
+                    with self.assertLogs(logger, "WARNING") as logs:
+                        _attach(controller, backend, order, group.entries, extra_config)
+                    self.assertIn("interface_v1=1", logs.output[0])
+                else:
+                    with self.assertNoLogs(logger, "WARNING"):
+                        _attach(controller, backend, order, group.entries, extra_config)
+
     def test_hybrid_hook_fires_after_its_v2_burst(self):
         # super() completes (threads included, as before), then the hybrid
         # burst continues and the hook fires at its end -- once.
@@ -234,6 +285,26 @@ class TestRegistrationBurstOrder(CustomTestCase):
             order,
             ["v1", "threads", "v2:kv", "v2:mamba", "complete", "v2:swa"],
         )
+
+
+class TestNativeHashPrecondition(CustomTestCase):
+    def test_attach_fails_before_the_backend_when_native_hash_cannot_build(self):
+        """Without the native hash extension, every storage lookup fails while backups
+        keep writing pages, so attach must fail before a backend exists."""
+        order: List[str] = []
+        pool = _fake_pool("kv")
+        controller = _controller(HiCacheController, pool, pool)
+
+        with self.assertRaisesRegex(RuntimeError, "libssl-dev"):
+            _attach(
+                controller,
+                RecordingBackend(order),
+                order,
+                native_hash_build_error=OSError("openssl/sha.h: No such file"),
+            )
+
+        self.assertEqual(order, [])
+        self.assertFalse(controller.enable_storage)
 
 
 if __name__ == "__main__":
