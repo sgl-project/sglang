@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
@@ -1600,6 +1601,36 @@ class TestL2TransferRecordStream(CustomTestCase):
         )
 
         self.assertEqual(device.recorded, [])
+
+
+class TestDirectBackendMetadataWarning(CustomTestCase):
+    """The direct backend warns about copy-engine queueing on CUDA, which ROCm no longer does."""
+
+    def _construct(self, *, hip, fill=False, io_backend="direct", engines=1):
+        transfer_module._warn_direct_without_metadata_kernels.cache_clear()
+        with (
+            mock.patch.object(transfer_module, "device_module", torch.cuda),
+            mock.patch.object(torch.cuda, "Stream"),
+            # create=True: the module only imports is_hip once this check exists.
+            mock.patch.object(transfer_module, "is_hip", return_value=hip, create=True),
+            envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.override(fill),
+        ):
+            for _ in range(engines):
+                L2TransferEngine(io_backend)
+
+    def test_warns_once_on_cuda(self):
+        with self.assertLogs(transfer_module.logger, level="WARNING") as logs:
+            self._construct(hip=False, engines=2)
+        self.assertEqual(len(logs.records), 1)
+
+    def test_silent_on_rocm(self):
+        with self.assertNoLogs(transfer_module.logger, level="WARNING"):
+            self._construct(hip=True)
+
+    def test_silent_with_metadata_kernels_or_other_backend(self):
+        with self.assertNoLogs(transfer_module.logger, level="WARNING"):
+            self._construct(hip=False, fill=True)
+            self._construct(hip=False, io_backend="kernel")
 
 
 if __name__ == "__main__":
