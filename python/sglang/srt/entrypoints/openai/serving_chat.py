@@ -2371,7 +2371,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> StreamingResponse | ErrorResponse:
+    ) -> StreamingResponse | ErrorResponse | ORJSONResponse:
         """Handle streaming chat completion request"""
         wire_response = self.chat_wire.new_response(request, created=int(time.time()))
         generator = self._generate_chat_stream(
@@ -2385,6 +2385,9 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        if error_response := self.maybe_convert_pre_stream_bad_request(first_chunk):
+            await generator.aclose()
+            return error_response
 
         async def prepend_first_chunk():
             try:
