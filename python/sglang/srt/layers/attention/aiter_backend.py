@@ -2614,7 +2614,7 @@ class AiterAttnBackend(AttentionBackend):
                 raise RuntimeError(
                     "aiter mla_decode_fwd(return_lse=True) returned no LSE"
                 )
-            return out, lse.view(bs, num_heads)
+            return self._zero_dcp_rows_without_kv(out, lse, bs, num_heads)
 
         out, lse = mla_gluon_decode(
             q=q.view(bs, num_heads, layer.qk_head_dim),
@@ -2627,11 +2627,14 @@ class AiterAttnBackend(AttentionBackend):
             min_kv_seq_len=1,
             return_lse=True,
         )
-        # mla_gluon writes nothing for a row with no KV on this rank; the cross-rank merge reads it.
+        return self._zero_dcp_rows_without_kv(out, lse, bs, num_heads)
+
+    def _zero_dcp_rows_without_kv(self, out, lse, bs, num_heads):
+        # The asm and Gluon decode kernels write nothing for a row with no KV on this rank; the merge reads it.
+        fm = self.forward_metadata
         empty = fm.kv_indptr[1 : bs + 1] == fm.kv_indptr[:bs]
         out.masked_fill_(empty[:, None, None], 0.0)
-        lse = lse.view(bs, num_heads).masked_fill_(empty[:, None], -1e30)
-        return out, lse
+        return out, lse.view(bs, num_heads).masked_fill_(empty[:, None], -1e30)
 
     def _forward_verify_asm_cprr(self, q, layer, k_descale, n_rows):
         """DCP target verify on the asm cp round-robin kernel: one masked pass."""
