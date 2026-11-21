@@ -15,8 +15,8 @@
 and the moves they block, the transfer-done event waits, load-back admission,
 and the write-policy switch check.
 
-The pools are real CPU tensors. CUDA stream waits are recorded by a stand-in
-for `torch.cuda.current_stream()` rather than executed.
+The pools are real CPU tensors. Stream waits are recorded by a stand-in for
+the pool device module's `current_stream()` rather than executed.
 
     python -m pytest test/registered/unit/mem_cache/test_unified_hicache_transfer_lifecycle.py -v
 """
@@ -68,6 +68,9 @@ from sglang.test.unified_allocator_fixtures import (
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+# Device of the test pools; stream waits are recorded on its device module.
+_DEVICE = "cpu"
+
 PAGE = 4
 FULL = ComponentType.FULL
 
@@ -90,7 +93,7 @@ def _rust_inspector(params, _components):
 
 def _unified_swa_bundle(*, tokens: int = 64, swa_layers: int = 1):
     return build_test_unified_pools(
-        device="cpu",
+        device=_DEVICE,
         kv_cache_dtype=torch.float16,
         head_num=1,
         head_dim=8,
@@ -157,7 +160,7 @@ class _Rows:
 
 
 class _Stream:
-    """Stands in for `torch.cuda.current_stream()` and records what it waits on."""
+    """Stands in for the pool device's `current_stream()`; records what it waits on."""
 
     def __init__(self, log: list):
         self.log = log
@@ -179,8 +182,11 @@ class _Copy:
 @contextlib.contextmanager
 def _recorded_stream():
     log = []
+    # Bands wait on their device module's stream.
     with mock.patch.object(
-        torch.cuda, "current_stream", lambda *args, **kwargs: _Stream(log)
+        torch.get_device_module(_DEVICE),
+        "current_stream",
+        lambda *args, **kwargs: _Stream(log),
     ):
         yield log
 
@@ -491,7 +497,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
         self.allocator = bundle.token_to_kv_pool_allocator
         self.rows = _Rows(bundle)
         self.req_to_token_pool = ReqToTokenPool(
-            size=4, max_context_len=tokens, device="cpu", enable_memory_saver=False
+            size=4, max_context_len=tokens, device=_DEVICE, enable_memory_saver=False
         )
         params = CacheInitParams(
             req_to_token_pool=self.req_to_token_pool,

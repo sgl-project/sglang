@@ -11,7 +11,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_xpu, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -154,16 +154,26 @@ class TestUnifiedMemoryHiCacheGDN(UnifiedMemoryHiCacheBase):
     """MHA full attention with envelope-strided gated-delta-net state."""
 
     model = "yujiepan/qwen3.5-tiny-random"
-    extra_args = _SMALL_POOL + [
-        "--linear-attn-backend",
-        "triton",
-        "--mamba-backend",
-        "triton",
-        "--max-mamba-cache-size",
-        "8",
-        "--mem-fraction-static",
-        "0.6",
-    ]
+    extra_args = (
+        _SMALL_POOL
+        + [
+            "--linear-attn-backend",
+            "triton",
+            "--mamba-backend",
+            "triton",
+            "--max-mamba-cache-size",
+            "8",
+            "--mem-fraction-static",
+            "0.6",
+        ]
+        + (
+            # intel_xpu attention has no page-major KV layout, and XPU flash-attn
+            # rejects the tiny vision tower's head size of 32.
+            ["--attention-backend", "triton", "--mm-attention-backend", "sdpa"]
+            if is_xpu()
+            else []
+        )
+    )
 
 
 class TestUnifiedMemoryHiCacheSWA(UnifiedMemoryHiCacheBase):
