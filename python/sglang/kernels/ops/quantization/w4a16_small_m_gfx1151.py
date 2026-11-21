@@ -323,7 +323,8 @@ def _stage(x, x_sm, xs_sm):
     xs_sm.store(gl.sum(x.to(gl.float32), axis=1) * 136.0)
 
 
-@gluon.jit
+# M stays a runtime value: Triton would otherwise compile a separate (much slower) M == 1 variant.
+@gluon.jit(do_not_specialize=["M"])
 def _gl_w4a16_small_m_kernel(
     x_ptr,
     w_ptr,
