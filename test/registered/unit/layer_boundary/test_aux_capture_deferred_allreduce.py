@@ -299,6 +299,12 @@ class TestAuxCaptureDeferredAllreduce(CustomTestCase):
                             "sglang.srt.models.glm5_next.get_parallel",
                             return_value=SimpleNamespace(attn_tp_group=group),
                         ),
+                        # The stub plans carry no rows; these rows are split.
+                        patch.object(
+                            Glm5NextModel,
+                            "_captures_attn_tp_slices",
+                            staticmethod(lambda layer, forward_batch: True),
+                        ),
                     ):
                         _, snapshots = model(
                             None, None, batch, input_embeds=inputs.clone()
