@@ -126,6 +126,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_musa = current_platform.is_musa()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 # `SGLANG_AITER_KV_CACHE_LAYOUT` is only meaningful on the ROCm AITER backend
@@ -178,7 +179,9 @@ def _set_kv_buffer_impl(
     v_row_dim = row_dim if v_row_dim is None else v_row_dim
     row_bytes = row_dim * store_dtype.itemsize
     v_row_bytes = v_row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and can_use_store_cache(row_bytes, v_row_bytes):
+    if (_is_cuda or _is_hip or _is_musa) and can_use_store_cache(
+        row_bytes, v_row_bytes
+    ):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, v_row_dim),
