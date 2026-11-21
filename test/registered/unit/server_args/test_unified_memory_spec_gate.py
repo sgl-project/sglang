@@ -30,6 +30,7 @@ import msgspec
 import sglang.srt.configs.hybrid_arch as hybrid_arch
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -164,6 +165,42 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
         for algorithm in ("DSPARK", "EAGLE"):
             for topk in (2, 4):
                 self.assertFalse(_accepts(algorithm, topk=topk), f"{algorithm} {topk}")
+
+    def test_pd_speculative_decoding_over_mooncake_is_dflash_on_cuda(self):
+        """Both PD roles admit a speculative draft over Mooncake only for DFLASH
+        on CUDA; each refused algorithm is accepted without PD."""
+        for mode in ("prefill", "decode"):
+            for algorithm in ("DFLASH", "DSPARK", "EAGLE", "EAGLE3", None):
+                for is_cuda in (True, False):
+                    with self.subTest(mode=mode, algorithm=algorithm, cuda=is_cuda):
+                        with override_platform(is_cuda=is_cuda):
+                            accepted = _accepts(
+                                algorithm,
+                                draft_backend="trtllm_mha",
+                                disaggregation_mode=mode,
+                                disaggregation_transfer_backend="mooncake",
+                                pp_size=1,
+                            )
+                            accepted_without_pd = _accepts(
+                                algorithm, draft_backend="trtllm_mha"
+                            )
+                        self.assertTrue(accepted_without_pd)
+                        self.assertEqual(
+                            accepted,
+                            algorithm is None or (is_cuda and algorithm == "DFLASH"),
+                        )
+
+    def test_pd_speculative_decoding_over_nixl_is_refused(self):
+        """NIXL unified-memory PD refuses a DFLASH draft that Mooncake admits."""
+        fields = dict(
+            draft_backend="trtllm_mha",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="nixl",
+            pp_size=1,
+        )
+        with override_platform(is_cuda=True):
+            self.assertTrue(_accepts(None, **fields))
+            self.assertFalse(_accepts("DFLASH", **fields))
 
     def test_buffer_only_hicache_refused_under_pipeline_parallelism(self):
         """Unified memory with more than one pipeline stage refuses buffer_only

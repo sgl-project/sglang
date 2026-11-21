@@ -636,9 +636,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
         )
-        assert cfg.speculative_algorithm is None, (
-            "--enable-unified-memory with PD disaggregation does not support "
-            "speculative decoding."
+        assert cfg.speculative_algorithm is None or (
+            cfg.disaggregation_transfer_backend == "mooncake"
+            and get_platform().is_cuda
+            and cfg.speculative_algorithm == "DFLASH"
+        ), (
+            "--enable-unified-memory with PD disaggregation supports speculative "
+            "decoding only for DFLASH on CUDA with the Mooncake transfer backend."
         )
         # This flag also selects decode's non-blocking metadata readback, which
         # records a receive as in flight before its destination is published.

@@ -751,6 +751,9 @@ class TestFusedDraftDecision(CustomTestCase):
         draft_cls=None,
         draft_quant_config=_LIKE_HOST,
         quant_config_reads=None,
+        draft_window_size=None,
+        platform=None,
+        draft_overrides=None,
     ):
         """``draft_quant_config`` is the quant config the draft model keeps
         once built; by default one declaring an FP8 KV cache exactly when the
@@ -813,6 +816,8 @@ class TestFusedDraftDecision(CustomTestCase):
                 attention_arch=AttentionArch.MLA if draft_mla else AttentionArch.MHA,
                 kv_lora_rank=8,
                 qk_rope_head_dim=4,
+                num_hidden_layers=1,
+                disable_hybrid_swa_memory=False,
                 hf_config=draft_hf_config
                 or SimpleNamespace(
                     architectures=["BailingMoeForCausalLMNextN"],
@@ -827,7 +832,10 @@ class TestFusedDraftDecision(CustomTestCase):
             speculative_num_steps=1,
             speculative_draft_kv_cache_dtype=draft_kv_dtype,
             speculative_draft_attention_backend=draft_backend,
+            speculative_draft_window_size=draft_window_size,
         )
+        for name, value in (draft_overrides or {}).items():
+            setattr(cfg.spec_aux_config.draft_model_config, name, value)
         if draft_quant_config is _LIKE_HOST:
             draft_quant_config = (
                 SimpleNamespace(kv_cache_quant_algo="FP8")
@@ -870,7 +878,7 @@ class TestFusedDraftDecision(CustomTestCase):
             ),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
             get_parallel().override(attn_dcp_size=dcp_size),
-            override_platform(is_xpu=False, is_hip=False),
+            override_platform(is_xpu=False, is_hip=False, **(platform or {})),
             patch(
                 "sglang.srt.model_loader.utils.get_model_architecture",
                 return_value=(draft_cls or _RawWindowDraft, "Draft"),
@@ -907,6 +915,55 @@ class TestFusedDraftDecision(CustomTestCase):
                     self.assertEqual(
                         placement.new_bands[band].window, int(band.split("_")[1])
                     )
+
+    def _all_window_dflash(self, *, sliding_window=128, layer_types=None, **kwargs):
+        options = dict(
+            algorithm="DFLASH",
+            draft_backend="trtllm_mha",
+            resolved_window=127,
+            draft_hf_config=SimpleNamespace(
+                architectures=["DFlashDraftModel"],
+                layer_types=layer_types or ["sliding_attention"],
+                sliding_window=sliding_window,
+            ),
+            draft_cls=_MinusOneWindowDraft,
+            platform={"is_cuda": True},
+        )
+        options.update(kwargs)
+        return self._decide(**options).placement
+
+    def test_an_all_window_dflash_draft_is_placed_on_a_window_band(self):
+        placement = self._all_window_dflash()
+        self.assertEqual(placement.hosts(), ("window_127",))
+        self.assertEqual(placement.new_bands, {})
+        placement = self._all_window_dflash(sliding_window=65)
+        self.assertEqual(set(placement.new_bands), {"window_64"})
+
+    def test_an_all_window_dflash_draft_stays_full_unless_eligible(self):
+        """A one-token window resolves to zero and cannot use a window band."""
+        for name, kwargs in (
+            ("window of one token", dict(sliding_window=1)),
+            ("not CUDA", dict(platform={"is_cuda": False})),
+            ("EAGLE", dict(algorithm="EAGLE")),
+            ("no window index path", dict(draft_backend="triton")),
+            ("a full-attention layer", dict(layer_types=["full_attention"])),
+            ("explicit draft window", dict(draft_window_size=64)),
+            ("block-scaled KV", dict(kv_cache_dtype_flag="mxfp8")),
+            ("MLA draft", dict(draft_mla=True)),
+            ("attention DP", dict(tp_size=2, attn_dp_size=2)),
+            ("attention CP", dict(tp_size=2, attn_cp_size=2)),
+            ("decode CP", dict(dcp_size=2)),
+            (
+                "draft window memory off",
+                dict(draft_overrides={"disable_hybrid_swa_memory": True}),
+            ),
+            ("block-scaled draft KV", dict(draft_kv_dtype="mxfp8")),
+        ):
+            with self.subTest(name):
+                placement = self._all_window_dflash(**kwargs)
+                self.assertIsNotNone(placement)
+                self.assertEqual(placement.hosts(), ("full",))
+                self.assertEqual(placement.new_bands, {})
 
     def test_a_draft_window_known_only_once_built_is_refused(self):
         with self.assertRaisesRegex(ValueError, "sliding_layer_window_size"):
