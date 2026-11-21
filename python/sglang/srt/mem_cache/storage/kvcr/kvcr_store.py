@@ -89,6 +89,8 @@ _HICACHE_GENERIC_KEYS = frozenset(
         "prefetch_timeout_base",
         "prefetch_timeout_per_ki_token",
         "hicache_storage_pass_prefix_keys",
+        # Read by the controller when KVCR is loaded as a "dynamic" backend.
+        "interface_v1",
         "tp_lcm_size",
         "file_storage_path",
     }
@@ -174,6 +176,7 @@ class KVCRStore(HiCacheStorage):
         self.mem_pool_host = mem_pool_host
         self.registered_pools = {}
         self._layouts = {}
+        self._pools_attached = False
         self._runner = None
         self._maps = []
         # Serializes every KVCR call: its API allows one caller at a time, but it
@@ -338,23 +341,44 @@ class KVCRStore(HiCacheStorage):
             if self._cache_owner_id is not None:
                 # The advertised owner names the namespace of these pools.
                 raise ValueError("KVCR host pools must be registered before discovery")
-            self._layouts[name] = describe_pool(name, host_pool)
+            layout = describe_pool(name, host_pool)
+            if self._pools_attached:
+                # A late sidecar shrinks every pool's share: fail its
+                # registration, not the first IO.
+                self._pool_pages({**self._layouts, name: layout})
+            self._layouts[name] = layout
             self.registered_pools[name] = host_pool
 
     def on_host_pools_registered(self) -> None:
         # Fail the attach if the budget cannot give a registered pool one page.
         if self._layouts:
             self._pool_pages()
+        self._pools_attached = True
 
-    def _pool_pages(self) -> dict:
-        """KVCR DRAM pages per registered physical pool."""
+    def _warn_unmatched_pool_pages(self) -> None:
+        """Report local_dram_pool_pages names once registration has closed.
+
+        Draft sidecar pools register after the attach, so this runs at start.
+        """
+        unmatched = sorted(set(self._pages_by_pool) - set(self._layouts))
+        if unmatched:
+            logger.warning(
+                "KVCR local_dram_pool_pages names no registered pool: %s "
+                "(registered: %s)",
+                unmatched,
+                sorted(self._layouts),
+            )
+
+    def _pool_pages(self, layouts=None) -> dict:
+        """KVCR DRAM pages per physical pool (the registered ones by default)."""
+        layouts = self._layouts if layouts is None else layouts
         total = sum(
             component.size * component.count
-            for layout in self._layouts.values()
+            for layout in layouts.values()
             for component in layout.components
         )
         pages_by_pool = {}
-        for name, layout in self._layouts.items():
+        for name, layout in layouts.items():
             pages = self._pages_by_pool.get(
                 name, self._budget * layout.components[0].count // total
             )
@@ -374,6 +398,7 @@ class KVCRStore(HiCacheStorage):
 
         if not self._layouts:
             raise ValueError("KVCR has no registered physical host pools")
+        self._warn_unmatched_pool_pages()
         self._namespace = storage_namespace(self.config, self._layouts)
         if self._inventory is not None:
             self._inventory.configure(

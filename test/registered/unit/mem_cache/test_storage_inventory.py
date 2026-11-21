@@ -244,6 +244,10 @@ class TestStorageEventMetadata(CustomTestCase):
                 tail = _Tokens([3, 4], extra_key=extra, cache_salt=salt)
                 suffix = recorder.prefetch_storage_metadata(tail, [1, 2], hashes[0])
                 self.assertEqual(suffix, {hashes[1]: complete[hashes[1]]})
+                # The prefetch hit query reuses these keys as its storage chain.
+                self.assertEqual(
+                    list(suffix), get_storage_hash_str(tail, hashes[0], page_size=2)
+                )
                 if extra is not None:
                     # Namespaced event IDs need the prefix replayed and verified.
                     self.assertEqual(

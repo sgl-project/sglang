@@ -704,6 +704,39 @@ class TestKVCRStorage(CustomTestCase):
         self.addCleanup(tiny.close)
         with self.assertRaisesRegex(ValueError, "cannot hold one page"):
             tiny.on_host_pools_registered()
+        # A pool registered after the attach (a draft sidecar) is checked
+        # against the shrunken split when it registers, not at the first IO.
+        late = KVCRStore(
+            dataclasses.replace(
+                self.config,
+                # 88 host bytes per pool: 12 bytes give the KV pool one page
+                # alone, and no pool a page once a second one joins.
+                extra_config={"local_dram_bytes": 12},
+            ),
+            self.pool,
+        )
+        self.addCleanup(late.close)
+        late.on_host_pools_registered()
+        with self.assertRaisesRegex(ValueError, "cannot hold one page"):
+            late.register_mem_host_pool_v2(_HostPool(), "draft_kv")
+        self.assertNotIn("draft_kv", late._layouts)
+        # A pool name that matches nothing is reported once registration has
+        # closed, so a draft pool registering after the attach is not flagged.
+        module = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"
+        named = KVCRStore(
+            dataclasses.replace(
+                self.config,
+                extra_config={"local_dram_pool_pages": {"draft": 4, "kv_typo": 4}},
+            ),
+            self.pool,
+        )
+        self.addCleanup(named.close)
+        with self.assertNoLogs(module, "WARNING"):
+            named.on_host_pools_registered()
+        named.register_mem_host_pool_v2(_HostPool(), "draft")
+        with self.assertLogs(module, "WARNING") as logs:
+            named._warn_unmatched_pool_pages()
+        self.assertIn("['kv_typo']", logs.output[0])
         # Native startup (registration, binds) still waits for the first IO.
         backend = KVCRStore(self.config, self.pool)
         self.addCleanup(backend.close)
@@ -753,8 +786,10 @@ class TestKVCRStorage(CustomTestCase):
             "operation_timeout_ms": 1000,
             "abandon_timeout_ms": 2000,
             "startup_timeout_seconds": 60,
-            # A generic HiCache key that decode offload passes through.
+            # Generic HiCache keys: decode offload passes this one through,
+            # and the controller reads interface_v1 for a "dynamic" backend.
             "prefetch_threshold": 256,
+            "interface_v1": 1,
         }
         with self.assertNoLogs(module, "WARNING"):
             KVCRStore(

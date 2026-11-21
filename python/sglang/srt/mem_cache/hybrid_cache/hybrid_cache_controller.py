@@ -1715,9 +1715,13 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        hash_value = get_storage_hash_str(
-            operation.token_ids, operation.last_hash, page_size=self.page_size
-        )
+        # A publishing backend's metadata is keyed by this same chain, already
+        # hashed on the scheduler thread; reuse it when it covers every page.
+        hash_value = list(getattr(operation, "kv_event_metadata", None) or ())
+        if len(hash_value) != len(operation.token_ids) // self.page_size:
+            hash_value = get_storage_hash_str(
+                operation.token_ids, operation.last_hash, page_size=self.page_size
+            )
         operation.all_hash_values = hash_value
 
         if operation.assume_stored:

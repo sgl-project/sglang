@@ -63,6 +63,12 @@ class _StorageEventSpan(msgspec.Struct):
     event_hash_value: Optional[list[str]] = None
 
 
+# Root of the placeholder chain that links a prefetched span to last_hash.
+# Never read or mutated; built from the first span's key to avoid importing
+# RadixKey here.
+_PLACEHOLDER_ROOT: Optional[_StorageEventSpan] = None
+
+
 class LoRANameTable:
     """Find the LoRA adapter name from the lora_id at the end of extra_key.
 
@@ -554,8 +560,13 @@ class KVCacheEventRecorder:
                 # _parent_block_hash treats a parent whose own parent is None as
                 # the root, so a placeholder grandparent links the first page to
                 # last_hash. The placeholder keys are never read.
+                global _PLACEHOLDER_ROOT
+                if _PLACEHOLDER_ROOT is None:
+                    _PLACEHOLDER_ROOT = _StorageEventSpan(key[:0])
                 anchor = _StorageEventSpan(
-                    key[:0], parent=_StorageEventSpan(key[:0]), hash_value=[last_hash]
+                    _PLACEHOLDER_ROOT.key,
+                    parent=_PLACEHOLDER_ROOT,
+                    hash_value=[last_hash],
                 )
             return self.storage_metadata(
                 _StorageEventSpan(
