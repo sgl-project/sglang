@@ -408,12 +408,18 @@ class AnthropicServing:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
 
-        # sgl-router's /v1/messages (protocol/anthropic/request.rs) places
-        # inline system text the same way; keep the two in step.
+        # On the merge path, system messages before the first user or
+        # assistant message join the leading system message, and later ones
+        # stay where they arrive (``_attach_inline_system``), so a new one does
+        # not change how earlier turns render. sgl-router's /v1/messages
+        # (protocol/anthropic/request.rs) places inline system text the same
+        # way; keep the two in step.
+        leading_system = 0
         if self._merge_inline_system:
             for msg in anthropic_request.messages:
                 if msg.role != "system":
-                    continue
+                    break
+                leading_system += 1
                 text = _extract_system_text(msg.content)
                 if text:
                     system_parts.append(text)
@@ -439,9 +445,34 @@ class AnthropicServing:
                 openai_messages.append({"role": "user", "content": list(parts)})
             parts.clear()
 
+        def _attach_inline_system(text: Optional[str]) -> None:
+            """Place a system message that arrives mid-conversation where it is.
+
+            The chat template cannot render a system message after the first
+            (that is why this is the merge path), so the text goes at the end
+            of the preceding user or tool message, or in a user message of its
+            own after an assistant message. Earlier turns then render the same
+            from request to request, and the prefix cache keeps matching them.
+            """
+            if not text:
+                return
+            note = f"<system>{text}</system>"
+            prev = openai_messages[-1] if openai_messages else None
+            if prev is not None and prev.get("role") in ("user", "tool"):
+                content = prev.get("content")
+                if isinstance(content, str):
+                    prev["content"] = f"{content}\n\n{note}" if content else note
+                    return
+                if isinstance(content, list):
+                    content.append({"type": "text", "text": note})
+                    return
+            openai_messages.append({"role": "user", "content": note})
+
         # Convert messages
-        for msg in anthropic_request.messages:
+        for index, msg in enumerate(anthropic_request.messages):
             if msg.role == "system" and self._merge_inline_system:
+                if index >= leading_system:
+                    _attach_inline_system(_extract_system_text(msg.content))
                 continue
             if isinstance(msg.content, str):
                 openai_messages.append({"role": msg.role, "content": msg.content})
