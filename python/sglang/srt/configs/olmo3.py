@@ -58,11 +58,13 @@ class Olmo3Config(PretrainedConfig):
     ):
         # This model uses Olmo3ForCausalLM in transformers but Olmo2ForCausalLM
         # in sglang.
-        if "architectures" not in kwargs:
+        if "architectures" not in kwargs or kwargs["architectures"] is None:
             kwargs["architectures"] = ["Olmo2ForCausalLM"]
         elif "Olmo3ForCausalLM" in kwargs["architectures"]:
-            kwargs["architectures"].remove("Olmo3ForCausalLM")
-            kwargs["architectures"].append("Olmo2ForCausalLM")
+            kwargs["architectures"] = [
+                "Olmo2ForCausalLM" if arch == "Olmo3ForCausalLM" else arch
+                for arch in kwargs["architectures"]
+            ]
 
         super().__init__(
             pad_token_id=pad_token_id,
