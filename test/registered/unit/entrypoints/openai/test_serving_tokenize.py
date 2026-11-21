@@ -129,6 +129,21 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         self.assertEqual(status, 400)
         self.assertIn("continue_final_message", message)
 
+    def test_tokenize_chat_messages_returns_stop_and_stop_token_ids(self):
+        chatml = self._serving(chat_template="chatml")
+        req = TokenizeRequest(model="test-model", messages=HISTORY)
+        res = asyncio.run(chatml._handle_non_streaming_request(req, req, None))
+        self.assertIsInstance(res, TokenizeResponse)
+        self.assertEqual(res.stop, ["<|endoftext|>", "<|im_end|>"])
+
+    def test_tokenize_plain_prompt_leaves_stops_none(self):
+        chatml = self._serving(chat_template="chatml")
+        req = TokenizeRequest(model="test-model", prompt="Hello world")
+        res = asyncio.run(chatml._handle_non_streaming_request(req, req, None))
+        self.assertIsInstance(res, TokenizeResponse)
+        self.assertIsNone(res.stop)
+        self.assertIsNone(res.stop_token_ids)
+
 
 class TestDetokenize(CustomTestCase):
     def test_out_of_vocab_ids_are_rejected(self):
