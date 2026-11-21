@@ -1013,8 +1013,8 @@ class ExecMoe(msgspec.Struct):
         "batches of 2048 tokens or more (lossy weight and activation quantization). "
         "The copies take about 2.34 GiB per GPU out of the KV cache budget, so "
         "recheck the token capacity and --mem-fraction-static. Raises with "
-        "quantized latent projections, --moe-a2a-backend or "
-        "--enable-deterministic-inference.",
+        "quantized latent projections, --moe-a2a-backend, "
+        "--enable-deterministic-inference or CP-TP group sharing.",
     ] = False
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],

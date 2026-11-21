@@ -305,11 +305,16 @@ class TestLatentMXFP4Runtime(CustomTestCase):
             projections.up(x=torch.ones(1, 3584))
 
     def test_builder_raises_where_the_flag_cannot_apply(self):
-        """SGLANG_USE_AITER=0, quantized latent projections, an MoE a2a backend and
+        """SGLANG_USE_AITER=0, quantized latent projections, an MoE a2a backend,
         deterministic inference (the token-count switch to lossy MXFP4 would make
-        outputs batch dependent) each fail the explicit opt-in loudly."""
+        outputs batch dependent) and CP-TP group sharing (its CP shard path keeps
+        the BF16 projections) each fail the explicit opt-in loudly."""
         ok = dict(
-            use_aiter=True, latent_quantized=False, moe_a2a=False, deterministic=False
+            use_aiter=True,
+            latent_quantized=False,
+            moe_a2a=False,
+            deterministic=False,
+            cp_tp_group_sharing=False,
         )
         with (
             mock.patch.object(latent_mxfp4_aiter_hip, "available", return_value=True),

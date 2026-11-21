@@ -21,6 +21,7 @@ def build_latent_mxfp4_projections(
     latent_quantized: bool,
     moe_a2a: bool,
     deterministic: bool,
+    cp_tp_group_sharing: bool,
 ) -> "LatentMXFP4Projections":
     """The per-layer holder of the MXFP4 copies. Raises where the flag cannot apply,
     since the user asked for it explicitly."""
@@ -29,6 +30,11 @@ def build_latent_mxfp4_projections(
         raise ValueError(
             "--enable-kimi-k3-latent-mxfp4 is incompatible with "
             "--enable-deterministic-inference"
+        )
+    if cp_tp_group_sharing:
+        # KimiK3MoE._forward_cp_shard_rows keeps the BF16 projections.
+        raise ValueError(
+            "--enable-kimi-k3-latent-mxfp4 does not support CP-TP group sharing"
         )
     if latent_quantized or moe_a2a:
         raise ValueError(

@@ -841,6 +841,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     latent_quantized=latent_quant_config is not None,
                     moe_a2a=not get_moe_a2a_backend().is_none(),
                     deterministic=get_exec().deterministic.enable_deterministic_inference,
+                    cp_tp_group_sharing=get_parallel().enable_cp_tp_group_sharing,
                 )
         else:
             self.routed_expert_down_proj = None
