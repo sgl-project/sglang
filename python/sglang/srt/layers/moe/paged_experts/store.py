@@ -88,6 +88,7 @@ class HostExpertStore:
     """
 
     def __init__(self, rows: RowsLike, num_experts: int):
+        self._copy_engine = None
         self.host: Dict[str, torch.Tensor] = {
             name: self._alloc((num_experts, *shape), dtype)
             for name, (shape, dtype) in rows.items()
@@ -148,12 +149,24 @@ class HostExpertStore:
         if device_planned:
             self.bind_device_gather(layer)
 
+    def bind_copy_engine(self, layer, capacity: int) -> None:
+        from sglang.srt.layers.moe.paged_experts.copy_engine import CopyEngineTransfer
+
+        self._copy_engine = CopyEngineTransfer(
+            list(self.host.values()),
+            [getattr(layer, name).data for name in self.host],
+            capacity,
+        )
+
     def gather(self, src: torch.Tensor, dst: torch.Tensor, count: torch.Tensor) -> None:
         """Copy expert ``src[i]`` into GPU slot ``dst[i]`` for ``i < count[0]``, with every
         index read on the GPU (a device-planned step): capturable in a CUDA graph."""
         from sglang.kernels.ops.moe.paged_experts import paged_experts_gather
 
-        paged_experts_gather(*self._gather_args, src, dst, count)
+        if self._copy_engine is None:
+            paged_experts_gather(*self._gather_args, src, dst, count)
+        else:
+            self._copy_engine.gather(src, dst, count)
 
     def resolve_pending(self) -> None:
         """Finish what the last ``gather`` left to the host."""
