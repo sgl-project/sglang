@@ -18,6 +18,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import IntEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -103,6 +104,28 @@ def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool
         and hidden_states.dim() == 2
         and hidden_states.dtype == weight.dtype == torch.bfloat16
     )
+
+
+# Ascend crossover for keeping the lm_head dtype. Other backends stay on the
+# fp32 path until their own crossover is measured.
+_NPU_KEEP_LOGITS_DTYPE_MIN_ROWS = 512
+
+
+@lru_cache(maxsize=1)
+def _keep_logits_dtype_min_rows() -> Optional[int]:
+    """Rows above which dLLM logits stay in lm_head dtype, or None to never do
+    so. Cached so the decision -- and its log line -- happen once."""
+    configured = envs.SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS.get()
+    if configured is not None:
+        return configured
+    if not _is_npu:
+        return None
+    logger.info(
+        "dLLM logits keep lm_head dtype above %d rows (Ascend default). "
+        "Override with SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS.",
+        _NPU_KEEP_LOGITS_DTYPE_MIN_ROWS,
+    )
+    return _NPU_KEEP_LOGITS_DTYPE_MIN_ROWS
 
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
@@ -1200,6 +1223,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -1300,17 +1324,31 @@ class LogitsProcessor(nn.Module):
                 "dp_logits_scatter_returned", logits_shape=tuple(logits.shape)
             )
 
-        fuse_cast_softcap = (
-            self.final_logit_softcapping
-            and logits.is_cuda
-            and logits.dtype in (torch.float16, torch.bfloat16)
-        )
-        logits = self._copy_logits_to_buffer(
-            logits,
-            logits_metadata,
-            use_buffer=use_logits_buffer,
-            softcap=self.final_logit_softcapping if fuse_cast_softcap else None,
-        )
+        if keep_lm_head_dtype:
+            # Skip the fp32 buffer copy: the [tokens, vocab] fp32 materialization
+            # is what OOMs large dLLM batches. Callers here consume the
+            # lm_head-dtype logits via reductions that never build another one.
+            #
+            # _copy_logits_to_buffer does two things; only the padding trim is
+            # reproduced here. Its other job -- publishing into
+            # next_token_logits_buffer, the graph-captured static buffer -- has
+            # no counterpart on this path: it returns full_logits with
+            # next_token_logits left None, so nothing ever reads that buffer.
+            fuse_cast_softcap = False
+            if logits.shape[-1] > self.vocab_size:
+                logits = logits[:, : self.vocab_size]
+        else:
+            fuse_cast_softcap = (
+                self.final_logit_softcapping
+                and logits.is_cuda
+                and logits.dtype in (torch.float16, torch.bfloat16)
+            )
+            logits = self._copy_logits_to_buffer(
+                logits,
+                logits_metadata,
+                use_buffer=use_logits_buffer,
+                softcap=self.final_logit_softcapping if fuse_cast_softcap else None,
+            )
 
         if self.final_logit_softcapping and not fuse_cast_softcap:
             if not (_is_npu or _is_cpu):
@@ -1675,7 +1713,21 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
         assert self.return_full_logits
-        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        # Above the crossover, keep the lm_head dtype: the denoise algorithms
+        # only reduce, so the fp32 [tokens, vocab] copy buys nothing and OOMs
+        # wide batches. See SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS.
+        min_rows = _keep_logits_dtype_min_rows()
+        keep_lm_head_dtype = (
+            min_rows is not None
+            and min_rows >= 0
+            and hidden_states.shape[0] >= min_rows
+        )
+        full_logits = self._get_logits(
+            hidden_states,
+            lm_head,
+            logits_metadata,
+            keep_lm_head_dtype=keep_lm_head_dtype,
+        )
         return LogitsProcessorOutput(
             full_logits=full_logits,
             next_token_logits=None,
