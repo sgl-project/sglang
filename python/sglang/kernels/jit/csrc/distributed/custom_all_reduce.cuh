@@ -483,7 +483,12 @@ struct AllReduceKernel {
         // the unrolled kernel gives every peer a warp; smaller grids take the per-vector kernel
         const bool enough_warps = push.default_blocks * (kTwoShotPushThreads / device::kWarpThreads) >= kWorldSize - 1;
         if (two_shot && is_gfx1250() && enough_warps && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
-          LaunchKernel(push.default_blocks, kTwoShotPushThreads, stream)  //
+          // single node: one block per CU for the large two-shot push: fewer blocks leave a late rank exposed, and
+          // more than one co-resident block per CU is not guaranteed (the Lamport polls would hang)
+          const auto num_blocks = kWorldSize <= 8
+                                      ? std::max(push.default_blocks, runtime::get_sm_count(in.device().device_id))
+                                      : push.default_blocks;
+          LaunchKernel(num_blocks, kTwoShotPushThreads, stream)  //
               .enable_pdl(kUsePDL)(all_reduce_2shot_push_unrolled_kernel<T, kWorldSize, kUsePDL, PushParams>, params);
           return out;
         }

@@ -3,12 +3,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import operator
+import random
 from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-import sglang.srt.sampling.penaltylib as penaltylib
+import sglang.srt.sampling.penalties as penalties
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
@@ -21,13 +22,17 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
+from sglang.srt.sampling.watermarking.interface import (
+    WatermarkRows,
+    merge_watermark_rows,
+)
+from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
@@ -43,6 +48,73 @@ def _rows_to_device_indices(
     return torch.tensor(rows, dtype=torch.long, pin_memory=pin).to(
         device, non_blocking=True
     )
+
+
+def _rows_with_seed(
+    reqs: List[Req], *, enable_deterministic: bool
+) -> Optional[List[bool]]:
+    """Which rows sample with their request's own seed, outside deterministic mode.
+
+    None when no row does, in deterministic mode (which seeds every row), and under
+    speculative decoding, whose draft graphs have seed buffers only in deterministic
+    mode. A greedy row never draws, so its seed does not count.
+    """
+    if enable_deterministic:
+        return None
+    rows = [
+        r.sampling_params.sampling_seed is not None and r.sampling_params.top_k > 1
+        for r in reqs
+    ]
+    if not any(rows):
+        return None
+    if get_spec().speculative_algorithm is not None:
+        print_warning_once(
+            "sampling_seed is ignored with speculative decoding unless "
+            "--enable-deterministic-inference is set."
+        )
+        return None
+    return rows
+
+
+# TP ranks sample independently, so their filler seeds must match. Every rank builds
+# the same batches, but other code (e.g. tracing) may draw from the global `random`
+# on one rank and not another, which would put the ranks' sequences out of step.
+_FILLER_SEED_RNG = random.Random(0)  # Any constant works; it must match across ranks.
+
+
+def _filler_seed() -> int:
+    # The seeded samplers hash each seed as uint64; any int64 works.
+    return _FILLER_SEED_RNG.getrandbits(63)
+
+
+def _filler_seeds(n: int, device: str) -> torch.Tensor:
+    return torch.tensor([_filler_seed() for _ in range(n)], dtype=torch.int64).to(
+        device, non_blocking=True
+    )
+
+
+def has_acc_penalties(info) -> bool:
+    """Whether `info` (a SamplingBatchInfo or a view with the same acc_* fields)
+    carries accumulated penalties."""
+    return (
+        info.acc_additive_penalties is not None
+        or info.acc_scaling_penalties is not None
+    )
+
+
+def apply_acc_penalties(logits: torch.Tensor, info, rows_per_request: int = 1):
+    """Apply `info`'s accumulated penalties to `logits` in place: additive, then
+    scaling. `logits` holds `rows_per_request` consecutive rows per request (the
+    verify rows in speculative decoding), which share that request's penalties."""
+    if not has_acc_penalties(info):
+        return
+    by_request = logits.view(-1, rows_per_request, logits.shape[-1])
+    if info.acc_additive_penalties is not None:
+        by_request.add_(info.acc_additive_penalties[:, None, :])
+    if info.acc_scaling_penalties is not None:
+        penalties.apply_scaling_penalties(
+            by_request, info.acc_scaling_penalties[:, None, :]
+        )
 
 
 @dataclasses.dataclass
@@ -84,7 +156,7 @@ class SamplingBatchInfo:
     grammar_mask: Optional[GrammarMask] = None
 
     # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+    penalizer_orchestrator: Optional[penalties.BatchedPenalizerOrchestrator] = None
     acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
@@ -97,8 +169,10 @@ class SamplingBatchInfo:
     # Custom logit processor
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
-    # Used for deterministic sampling
+    # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
+    # Outside deterministic mode, which rows sample with their own seed; None if none do.
+    rows_with_seed: Optional[List[bool]] = None
 
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
@@ -109,11 +183,8 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
-    watermark_keys: Optional[torch.Tensor] = None
-    watermark_context_windows: Optional[torch.Tensor] = None
-    watermark_enabled: Optional[torch.Tensor] = None
-    watermark_candidates_host: Optional[List[bool]] = None
-    has_watermark_candidates: bool = False
+    # Per-row watermark policy; None unless some row is a watermark candidate.
+    watermark: Optional[WatermarkRows] = None
 
     # Device
     device: str = "cuda"
@@ -162,22 +233,21 @@ class SamplingBatchInfo:
             dtype=torch.float,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
-        sampling_seed = (
-            torch.tensor(
-                [
-                    (
-                        r.sampling_params.sampling_seed
-                        if r.sampling_params.sampling_seed is not None
-                        else 42
-                    )
-                    for r in reqs
-                ],
-                dtype=torch.int64,
-                pin_memory=_pin,
-            ).to(device, non_blocking=True)
-            if enable_deterministic
-            else None
+        rows_with_seed = _rows_with_seed(
+            reqs, enable_deterministic=enable_deterministic
         )
+        sampling_seed = None
+        if enable_deterministic or rows_with_seed is not None:
+            seeds = []
+            for r in reqs:
+                seed = r.sampling_params.sampling_seed
+                if seed is None:
+                    # A deterministic run defaults to 42; otherwise the row stays random.
+                    seed = 42 if enable_deterministic else _filler_seed()
+                seeds.append(seed)
+            sampling_seed = torch.tensor(seeds, dtype=torch.int64, pin_memory=_pin).to(
+                device, non_blocking=True
+            )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
@@ -223,27 +293,11 @@ class SamplingBatchInfo:
         )
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
-        features = get_exec().features
-        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
-            watermark_config = build_watermark_batch_config(
-                reqs,
-                default_key=features.watermark_key,
-                default_context_window=features.watermark_context_window,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
-                device=device,
-            )
-            watermark_keys = watermark_config.keys
-            watermark_context_windows = watermark_config.context_windows
-            watermark_enabled = watermark_config.enabled
-            watermark_candidates_host = watermark_config.candidates_host
-            has_watermark_candidates = watermark_config.has_candidates
-        else:
-            watermark_keys = None
-            watermark_context_windows = None
-            watermark_enabled = None
-            watermark_candidates_host = None
-            has_watermark_candidates = False
+        watermark = (
+            build_watermark_rows(reqs, device)
+            if isinstance(batch, ScheduleBatch)
+            else None
+        )
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -286,14 +340,14 @@ class SamplingBatchInfo:
         # While we can choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge_batch()} cases as well.
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+        penalizer_orchestrator = penalties.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
             penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
+                penalties.BatchedFrequencyPenalizer,
+                penalties.BatchedMinNewTokensPenalizer,
+                penalties.BatchedPresencePenalizer,
+                penalties.BatchedRepetitionPenalizer,
             },
         )
 
@@ -303,6 +357,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
+            rows_with_seed=rows_with_seed,
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             **_top_k_flags([r.sampling_params.top_k for r in reqs]),
@@ -316,11 +371,7 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
-            watermark_keys=watermark_keys,
-            watermark_context_windows=watermark_context_windows,
-            watermark_enabled=watermark_enabled,
-            watermark_candidates_host=watermark_candidates_host,
-            has_watermark_candidates=has_watermark_candidates,
+            watermark=watermark,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -427,13 +478,8 @@ class SamplingBatchInfo:
             self.acc_scaling_penalties = None
 
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        if self.acc_additive_penalties is not None:
-            # Used in the overlap mode
-            logits.add_(self.acc_additive_penalties)
-
-        if self.acc_scaling_penalties is not None:
-            # Used in the overlap mode
-            apply_scaling_penalties(logits, self.acc_scaling_penalties)
+        # Used in the overlap mode
+        apply_acc_penalties(logits, self)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
@@ -472,25 +518,26 @@ class SamplingBatchInfo:
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
 
+        if self.rows_with_seed is not None:
+            self.rows_with_seed = [self.rows_with_seed[i] for i in keep_indices]
+            if not any(self.rows_with_seed):
+                # The last seeded row left; go back to the unseeded samplers.
+                self.rows_with_seed = None
+                self.sampling_seed = None
+
         for item in [
             "temperatures",
             "top_ps",
             "top_ks",
             "min_ps",
             "sampling_seed",
-            "watermark_keys",
-            "watermark_context_windows",
-            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
-        if self.watermark_candidates_host is not None:
-            self.watermark_candidates_host = [
-                self.watermark_candidates_host[index] for index in keep_indices
-            ]
-            self.has_watermark_candidates = any(self.watermark_candidates_host)
+        if self.watermark is not None:
+            self.watermark = self.watermark.filter(keep_indices, keep_indices_device)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -608,6 +655,16 @@ class SamplingBatchInfo:
                 self.sampling_mask_top_ks or [1] * self_len
             ) + (other.sampling_mask_top_ks or [1] * other_len)
 
+        if self.rows_with_seed is not None or other.rows_with_seed is not None:
+            self.rows_with_seed = (self.rows_with_seed or [False] * self_len) + (
+                other.rows_with_seed or [False] * other_len
+            )
+            # Rows of an unseeded side sample with random seeds, as in from_schedule_batch.
+            if self.sampling_seed is None:
+                self.sampling_seed = _filler_seeds(self_len, self.device)
+            if other.sampling_seed is None:
+                other.sampling_seed = _filler_seeds(other_len, self.device)
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -617,21 +674,15 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
-            "watermark_keys",
-            "watermark_context_windows",
-            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
 
-        if (
-            self.watermark_candidates_host is not None
-            and other.watermark_candidates_host is not None
-        ):
-            self.watermark_candidates_host.extend(other.watermark_candidates_host)
-            self.has_watermark_candidates = any(self.watermark_candidates_host)
+        self.watermark = merge_watermark_rows(
+            self.watermark, other.watermark, self_len, other_len
+        )
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy

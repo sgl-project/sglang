@@ -7,8 +7,9 @@ use super::nonempty_header;
 use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
+use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::policies::dp_rank::select_dp_rank;
+use crate::policies::dp_rank::{expected_rank_tokens, select_dp_rank};
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
@@ -18,6 +19,7 @@ use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MediaCounts, MetricsRegistry, RequestLogContext,
     RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::state::kv_events::prefix_provider::RankDepths;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
@@ -253,7 +255,7 @@ async fn dispatch<T: Transport>(
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
-        prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
+        prefill_rank.map(|rank| rank_guard(&prefill, rank, ctx.config.model.dp_rank_policy)),
     );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -296,8 +298,12 @@ async fn dispatch<T: Transport>(
                 .await?;
                 abort.disarm();
             }
+            let decode_policy = ctx.config.model.decode_dp_rank_policy();
             let decode_rank = dp_aware
-                .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
+                .then(|| {
+                    let rank_tokens = rank_tokens(ctx, &decode, decode_policy);
+                    select_dp_rank(&decode, None, &[], None, &rank_tokens, decode_policy)
+                })
                 .flatten();
             let decode_load_guards = (
                 decode_load,
@@ -308,7 +314,7 @@ async fn dispatch<T: Transport>(
                     1,
                     request_started_at.elapsed(),
                 ),
-                decode_rank.map(|rank| decode.dp_rank_guard(rank)),
+                decode_rank.map(|rank| rank_guard(&decode, rank, decode_policy)),
             );
             let decode_leg = Leg::new(
                 dp_aware,
@@ -744,13 +750,51 @@ fn prompt_dp_rank(
         .into_iter()
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
-    let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
+    let placement = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
         (None, Some(provider), Some(tokens)) => {
             provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
         }
-        _ => Vec::new(),
+        _ => RankDepths::default(),
     };
-    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)
+    let rank_tokens = rank_tokens(ctx, worker, model.dp_rank_policy);
+    let rank = select_dp_rank(
+        worker,
+        key,
+        &placement.depths,
+        placement.preferred,
+        &rank_tokens,
+        model.dp_rank_policy,
+    );
+    if let (Some(rank), Some(provider), Some(tokens)) =
+        (rank, &ctx.dp_rank_prefix_provider, &request.tokens)
+    {
+        provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+    }
+    rank
+}
+
+/// KV tokens per rank of `worker` when `policy` is `least_tokens`: what each
+/// rank is expected to hold, from the engine's fresh readings and this
+/// router's dispatches since them.
+/// Empty under any other policy, and while any rank lacks a fresh reading,
+/// which makes the selector fall back to its in-flight count.
+fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(u32, u64)> {
+    if policy != DpRankPolicy::LeastTokens || worker.dp_ranks() <= 1 {
+        return Vec::new();
+    }
+    ctx.engine_reported_load
+        .fresh_rank_loads(&worker.url, Instant::now())
+        .map_or_else(Vec::new, |loads| expected_rank_tokens(worker, &loads))
+}
+
+/// Holds the rank slot; stamped under `least_tokens` so later selections can
+/// count it against the engine's last reading.
+fn rank_guard(worker: &Worker, rank: u32, policy: DpRankPolicy) -> DpRankGuard {
+    if policy == DpRankPolicy::LeastTokens {
+        worker.dp_rank_timestamped_guard(rank)
+    } else {
+        worker.dp_rank_guard(rank)
+    }
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and

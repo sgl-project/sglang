@@ -538,6 +538,11 @@ export const Qwen35Deployment = () => {
       if (amdFp4) {
         amdEnv += "ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \\\n";
       }
+      // 397B FP8 HiCache agentic recipe: aiter scales an explicit --mem-fraction-static
+      // by 0.85 above 8k context; honor the 0.8 below as-is (KV pool +45%).
+      if (model === '397b' && hardware === 'mi355x' && quantization === 'fp8' && kvOffload === 'hicache') {
+        amdEnv += "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1 \\\n";
+      }
       cmd = amdEnv + cmd;
       cmd += " \\\n  --attention-backend aiter";
       cmd += " \\\n  --page-size 16";
