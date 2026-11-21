@@ -24,7 +24,7 @@ _MIN_BLOCK_K = 128
 
 
 def k_tail_in_unfilled_stage(block_k: int, k: int, num_stages: int) -> bool:
-    """Whether ``k`` FP4 elements leave a masked K-tail block in an LDS stage that no full K block filled."""
+    # True when ``k`` FP4 elements leave a masked K-tail block in an LDS stage no full K block filled.
     # The pipeline cycles K blocks through num_stages LDS buffers (Triton 3.7.0 TTGIR). With more K blocks
     # than stages, the tail's stale lanes hold an earlier block's finite scales over zero-filled data;
     # otherwise they hold what the previous kernel left: every NaN of an MI355X sweep (N=7168, K <= 8192).
@@ -34,7 +34,7 @@ def k_tail_in_unfilled_stage(block_k: int, k: int, num_stages: int) -> bool:
 def k_tail_safe_tiling(
     block_k: int, k: int, num_stages: int
 ) -> Optional[tuple[int, int]]:
-    """Halve BLOCK_SIZE_K at the given num_stages; lower num_stages only at the minimum block."""
+    # Halve BLOCK_SIZE_K at the given num_stages; lower num_stages only at the minimum block.
     # gemm_afp4wfp4 shrinks a block wider than K to K's next power of two, then raises it to the minimum.
     block_k = max(min(block_k, 1 << (k - 1).bit_length()), _MIN_BLOCK_K)
     while k_tail_in_unfilled_stage(block_k=block_k, k=k, num_stages=num_stages):
@@ -67,7 +67,7 @@ def _warn_no_k_tail_safe_tiling(k: int) -> None:
 
 @functools.lru_cache(maxsize=1024)
 def k_tail_safe_config(m: int, n: int, k_packed: int) -> Optional[dict]:
-    """aiter's config for this shape with a K-tail-safe tiling; None keeps aiter's own selection."""
+    # aiter's config for this shape with a K-tail-safe tiling; None keeps aiter's own selection.
     # Gated on the gfx950 the bug and its fix were measured on (MI355X); another gfx95x needs its own sweep.
     hip = current_arch().hip
     if hip is None or hip.gcn_arch != "gfx950":

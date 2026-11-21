@@ -121,6 +121,8 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
                     self.lds_fill(0xFF)
                     run(y)
                     err = (y.float() - ref).abs().nan_to_num(float("inf"))
+                    # BF16 output rounds at 2**-8 of max|ref|; measured error is 0.2-0.3% of it, and a stale-LDS
+                    # NaN is inf here, so 2% separates the two.
                     self.assertLessEqual(
                         err.max().item(), 0.02 * ref.abs().max().item()
                     )
