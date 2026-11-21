@@ -1,17 +1,19 @@
-"""AITER backend on CPU: decode workspace, unified-verify metadata, DCP verify shard."""
+"""AITER CPU metadata: decode workspace, unified verify, DCP head padding and shards."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -131,6 +133,234 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
             backend,
             lambda fb: backend.init_forward_metadata_out_graph(fb, in_capture=False),
         )
+
+
+_CPRR_QUERY = dict(
+    cp_world_size=8, fast_mode=True, intra_batch_mode=False, v_head_dim=512
+)
+
+
+def _cprr_kernel_heads(*, gathered_heads, q_len):
+    return aiter_backend._asm_cprr_kernel_heads(
+        gathered_heads=gathered_heads,
+        supports=lambda heads: aiter_backend._asm_cprr_shape_verdict(
+            heads=heads, q_len=q_len, ask_aiter=True, **_CPRR_QUERY
+        )[0],
+    )
+
+
+class _ShapeSupport:
+    """aiter's get_mla_decode_shape_support, answering from a fixed verdict table."""
+
+    def __init__(self, native_shapes, supported=True, arch="gfx950", reasons=()):
+        self.native_shapes, self.supported, self.calls = native_shapes, supported, []
+        self.arch, self.reasons = arch, reasons
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        native = (kwargs["num_heads"], kwargs["max_seqlen_qo"]) in self.native_shapes
+        return SimpleNamespace(
+            arch=self.arch,
+            native=native,
+            fold_factor=1 if native else 6,
+            seqlen_fold=1,
+            supported=self.supported,
+            reasons=self.reasons,
+        )
+
+
+def _rejecting_query(**_kwargs):
+    # An aiter whose get_mla_decode_shape_support does not take a keyword sglang passes.
+    raise TypeError("unexpected keyword argument 'intra_batch_mode'")
+
+
+def _failing_query(**_kwargs):
+    raise RuntimeError("module_mla_metadata failed to build")
+
+
+def _dcp_backend(*, use_mla=True, dcp_world_size=8, num_draft_tokens=8, verify="asm"):
+    # Kimi-K3 at TP8: 12 heads a rank, v_head_dim 128, kv_lora_rank 512.
+    backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+    backend.use_mla = use_mla
+    backend.dcp_world_size = dcp_world_size
+    backend.num_head = 12
+    backend.num_draft_tokens = num_draft_tokens
+    backend.mla_verify_backend = verify
+    backend.kv_cache_dtype = aiter_backend.fp8_dtype
+    backend.cprr_fast_mode = True
+    backend.cprr_intra_batch_mode = False
+    backend._init_cprr_verify(kv_lora_rank=512 if use_mla else 0)
+    return backend
+
+
+class TestAiterCprrKernelHeads(CustomTestCase):
+    """The DCP verify pads its gathered heads only where aiter would fold them."""
+
+    def setUp(self):
+        patcher = patch.object(aiter_backend, "_use_mla_ps_kernel", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _query(self, query):
+        patcher = patch.object(aiter_backend, "get_mla_decode_shape_support", query)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return query
+
+    def test_aiter_verdict_decides_the_padding(self):
+        # Kimi-K3 at DCP8 gathers 96 heads and verifies 8 tokens a request.
+        for native_shapes, expected in (({(96, 8), (128, 8)}, 96), ({(128, 8)}, 128)):
+            support = _ShapeSupport(native_shapes)
+            with patch.object(aiter_backend, "get_mla_decode_shape_support", support):
+                self.assertEqual(
+                    _cprr_kernel_heads(gathered_heads=96, q_len=8), expected
+                )
+            # The query describes the call the verify makes: fp8, LSE, round robin.
+            self.assertLessEqual(
+                {
+                    "q_dtype": aiter_backend.fp8_dtype,
+                    "kv_dtype": aiter_backend.fp8_dtype,
+                    "return_lse": True,
+                    "cp_round_robin": True,
+                    **_CPRR_QUERY,
+                }.items(),
+                support.calls[0].items(),
+            )
+
+    def test_init_asks_with_the_latent_width_and_verify_length(self):
+        # The absorbed verify writes the 512-wide latent, not the 128-wide
+        # v_head_dim, and aiter's asm route only exists for 512.
+        support = self._query(_ShapeSupport({(96, 8), (128, 8), (96, 1)}))
+        backend = _dcp_backend(num_draft_tokens=8)
+        self.assertEqual(backend.cprr_kernel_heads, 96)
+        self.assertEqual(support.calls[0]["v_head_dim"], 512)
+        self.assertEqual(support.calls[0]["max_seqlen_qo"], 8)
+        # Target verify asks on every step; aiter is asked once.
+        for _ in range(2):
+            self.assertTrue(backend._asm_cprr_supports_verify_shape(8))
+        self.assertEqual(len(support.calls), 1)
+        # Without speculative decoding the verify window is one token.
+        self.assertEqual(_dcp_backend(num_draft_tokens=None).cprr_kernel_heads, 96)
+        self.assertEqual(support.calls[-1]["max_seqlen_qo"], 1)
+
+    def test_constructor_asks_with_the_latent_width(self):
+        """The verify query must carry the 512-wide latent; with the 128-wide value
+        width aiter has no asm route and native 96 is lost."""
+        support = self._query(_ShapeSupport({(96, 8), (128, 8)}))
+        runner = Mock(
+            kv_cache_dtype=aiter_backend.fp8_dtype,
+            device="cpu",
+            decode_attention_backend_str="aiter",
+        )
+        runner.req_to_token_pool.size = 4
+        runner.model_config = Mock(
+            dtype=torch.bfloat16,
+            is_multimodal=False,
+            attention_arch=AttentionArch.MLA,
+            num_attention_heads=96,
+            head_dim=192,
+            v_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            context_len=4096,
+        )
+        runner.model_config.get_num_kv_heads.return_value = 1
+        with (
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override("asm"),
+            get_context().override_server_args(
+                page_size=1,
+                speculative_algorithm="EAGLE",
+                speculative_num_draft_tokens=8,
+                speculative_num_steps=7,
+                speculative_attention_mode="decode",
+            ),
+            get_parallel().override(
+                tp_size=8, attn_tp_size=8, moe_tp_size=8, attn_dcp_size=8
+            ),
+            patch.object(aiter_backend, "resolve_window_kv_pool", return_value=None),
+            patch.object(aiter_backend, "resolve_window_id_space", return_value=None),
+            patch.object(
+                aiter_backend, "_kv_cache_is_vectorized_5d", return_value=False
+            ),
+            patch.object(aiter_backend, "_require_untranslated_storage"),
+            patch.object(aiter_backend, "fast_mode", False),
+            patch.object(aiter_backend, "intra_batch_mode", True),
+        ):
+            backend = aiter_backend.AiterAttnBackend(runner, skip_prefill=True)
+        self.assertEqual(backend.cprr_kernel_heads, 96)
+        self.assertEqual(support.calls[0]["v_head_dim"], 512)
+        self.assertEqual(backend.v_head_dim, 128)
+
+    def test_init_asks_aiter_only_on_the_asm_verify_route(self):
+        support = self._query(_ShapeSupport({(96, 8), (128, 8)}))
+        for use_mla, dcp_world_size in ((True, 1), (False, 8)):
+            backend = _dcp_backend(use_mla=use_mla, dcp_world_size=dcp_world_size)
+            self.assertEqual(backend.cprr_kernel_heads, 0)
+        # A Gluon verify keeps the copied table, which has no 96-head 8-token row.
+        self.assertEqual(_dcp_backend(verify="gluon").cprr_kernel_heads, 128)
+        self.assertEqual(support.calls, [])
+
+    def test_rejected_query_falls_back_to_the_table(self):
+        self._query(_rejecting_query)
+        with self.assertLogs(aiter_backend.logger, "WARNING"):
+            self.assertEqual(_dcp_backend(num_draft_tokens=6).cprr_kernel_heads, 96)
+        self.assertEqual(_dcp_backend(num_draft_tokens=8).cprr_kernel_heads, 128)
+
+    def test_broken_aiter_raises(self):
+        # Only the documented argument errors fall back; a broken aiter build stops startup.
+        self._query(_failing_query)
+        with self.assertRaises(RuntimeError):
+            _dcp_backend(num_draft_tokens=8)
+
+    def test_ask_aiter_does_not_follow_the_persist_flag(self):
+        # __init__'s persist block runs after _init_cprr_verify and may turn
+        # _use_mla_ps_kernel off from these answers; the ask decision must not
+        # depend on the order, and the cached answers must not go stale.
+        support = self._query(_ShapeSupport({(96, 8), (128, 8)}))
+        with patch.object(aiter_backend, "_use_mla_ps_kernel", False):
+            backend = _dcp_backend(num_draft_tokens=8)
+            self.assertFalse(backend._asm_cprr_verify_enabled())
+            self.assertFalse(backend._asm_cprr_supports_verify_shape(8))
+        self.assertTrue(backend._cprr_ask_aiter)
+        self.assertEqual(backend.cprr_kernel_heads, 96)
+        self.assertEqual(len(support.calls), 1)
+        # Persist on (the module default): the same backend now runs the asm verify.
+        self.assertTrue(backend._asm_cprr_supports_verify_shape(8))
+
+    def test_table_decides_where_aiter_cannot(self):
+        # aiter cannot confirm a kernel on gfx950 (supported=None), or has no query.
+        unknown = _ShapeSupport({(96, 6), (96, 8), (128, 6), (128, 8)}, supported=None)
+        for query in (unknown, None):
+            with patch.object(aiter_backend, "get_mla_decode_shape_support", query):
+                self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 96)
+                self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
+
+    def test_unconfirmed_kernel_off_gfx950_is_not_native(self):
+        # The copied table describes gfx950 kernels only.
+        unknown = _ShapeSupport(
+            {(96, 6), (96, 8), (128, 6), (128, 8)}, supported=None, arch="gfx1250"
+        )
+        with patch.object(aiter_backend, "get_mla_decode_shape_support", unknown):
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 0)
+
+    def test_table_never_overrides_a_fold(self):
+        # The table says 96 heads are native at q_len 6, but aiter's planner folds
+        # them: running 96 unpadded would fold on one side only.
+        folds_96 = _ShapeSupport({(128, 6)}, supported=None)
+        with patch.object(aiter_backend, "get_mla_decode_shape_support", folds_96):
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 128)
+
+    def test_unsupported_shape_stays_on_gluon_with_aiter_reason(self):
+        reason = "asm no_kernel on gfx950: q=fp8 kv=fp8 heads=96 qlen=8"
+        self._query(
+            _ShapeSupport({(96, 8), (128, 8)}, supported=False, reasons=(reason,))
+        )
+        backend = _dcp_backend(num_draft_tokens=8)
+        self.assertEqual(backend.cprr_kernel_heads, 0)
+        with self.assertLogs(aiter_backend.logger, "INFO") as logs:
+            self.assertFalse(backend._asm_ps_supports_decode_and_verify())
+        self.assertIn(reason, logs.output[0])
 
 
 _DCP_SIZE = 8
