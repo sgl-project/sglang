@@ -23,9 +23,11 @@ probes.
       "kv_capacity_tokens": 456,
       "kv_usage_mean": 0.81,
       "kv_usage_max": 0.94,
-      "waiting_uncached_tokens": null,
-      "est_prefill_queue_ms_min": null,
-      "est_prefill_queue_ms_max": null
+      "waiting_uncached_tokens": 0,
+      "est_prefill_queue_ms_min": 0.0,
+      "est_prefill_queue_ms_max": 0.0,
+      "max_running_reqs": 384,
+      "running_frac_max": 0.92
     }
   }
 }
@@ -49,10 +51,31 @@ probes.
 - `kv_usage_mean` / `kv_usage_max`: mean and max of each reporting worker's
   `kv_used_tokens / kv_capacity_tokens`, over workers with a known (non-zero)
   capacity; `null` when there are none.
-- `waiting_uncached_tokens`, `est_prefill_queue_ms_min` / `_max`: always
-  `null` on this router. Its engine load (`LoadStat` on the load socket,
-  `GET /v1/loads?include=core` with `--load-monitor`) carries no uncached-token
-  or prefill-throughput fields.
+- The fields below come from the extended load newer engines send: five
+  fields appended to `LoadStat` after `attn_dp_rank`
+  (`num_waiting_uncached_tokens, num_total_tokens, max_running_requests,
+  total_prefill_uncached_tokens, total_prefill_busy_us`), the same names in
+  `GET /v1/loads?include=core`. A worker counts only when every DP rank's
+  latest report has all five; older engines leave them `null`. Reading them
+  changes nothing about routing.
+- `waiting_uncached_tokens`: uncached prompt tokens waiting for prefill,
+  summed over those workers.
+- `est_prefill_queue_ms_min` / `_max`: min / max over those workers of the
+  expected wait before a request sent now starts prefill: the worker's
+  uncached tokens waiting ÷ its prefill throughput (summed over DP ranks).
+  Throughput is uncached tokens per second of prefill *busy* time (from the
+  cumulative counters), as a moving average over the last ~10 busy seconds;
+  idle time does not age it. Warm-up: the first report seeds it with the
+  engine's lifetime average, and a rank that has prefilled less than 1 busy
+  second in total has no rate yet. A worker with nothing waiting reads 0 ms
+  even without a rate; one with tokens waiting and no rate (any rank cold)
+  gives no estimate, so it can never read as idle. An engine restart
+  (counters going backwards) restarts the average.
+- `max_running_reqs`: sum of the engines' `max_running_requests` over DP ranks
+  and over those workers that report a non-zero limit. `running_frac_max`:
+  max over the same workers of `running / max_running_requests`, each summed
+  over the worker's DP ranks (can pass 1 by the engine's own accounting).
+  Both `null` when no worker reports a limit.
 - Load comes from the engines' load socket (engines that advertise a load
   port) and, with `--load-monitor`, from pulls. With neither, every role
   reports `workers_reporting: 0`, zero sums and `null` usage.

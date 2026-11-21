@@ -46,6 +46,28 @@ pub struct LoadStat {
     pub num_tokens: u64,
     /// KV-cache token capacity; 0 when unknown.
     pub max_total_num_tokens: u64,
+    /// The extended tail newer engines append (`None` on older ones). Read
+    /// only by `/internal/member_load`; routing never looks at it.
+    pub native: Option<NativeLoad>,
+}
+
+/// The five fields newer SGLang engines append to `LoadStat` after
+/// `attn_dp_rank` (same order on the wire), also present in
+/// `GET /v1/loads?include=core`. All-or-nothing: a frame with a partial tail
+/// decodes with `native: None` (the four counts still count), so a truncated
+/// tail can never read as an idle queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeLoad {
+    /// Uncached prompt tokens of the requests waiting for prefill.
+    pub num_waiting_uncached_tokens: u64,
+    /// KV tokens in use plus queued request tokens.
+    pub num_total_tokens: u64,
+    /// The scheduler's running-request limit (per DP rank); 0 when unknown.
+    pub max_running_requests: u64,
+    /// Cumulative uncached tokens prefilled since engine start.
+    pub total_prefill_uncached_tokens: u64,
+    /// Cumulative prefill step time since engine start, in microseconds.
+    pub total_prefill_busy_us: u64,
 }
 
 impl<'de> Deserialize<'de> for LoadStat {
@@ -75,18 +97,37 @@ impl<'de> Deserialize<'de> for LoadStat {
                     )));
                 }
                 // Counts are always emitted (no Python defaults), but default
-                // missing fields to 0 and drain trailing fields (attn_dp_rank,
-                // future additions) for forward-compatibility.
+                // missing fields to 0 and drain trailing fields (future
+                // additions) for forward-compatibility.
                 let num_running_reqs: u64 = seq.next_element()?.unwrap_or(0);
                 let num_waiting_reqs: u64 = seq.next_element()?.unwrap_or(0);
                 let num_tokens: u64 = seq.next_element()?.unwrap_or(0);
                 let max_total_num_tokens: u64 = seq.next_element()?.unwrap_or(0);
+                // attn_dp_rank: null or an int, informational only.
+                let _attn_dp_rank: Option<IgnoredAny> = seq.next_element()?;
+                // The NativeLoad tail. A null or missing element anywhere in
+                // it drops the whole tail, not the frame.
+                let mut tail = [None::<u64>; 5];
+                for slot in &mut tail {
+                    *slot = seq.next_element::<Option<u64>>()?.flatten();
+                }
+                let native = match tail {
+                    [Some(a), Some(b), Some(c), Some(d), Some(e)] => Some(NativeLoad {
+                        num_waiting_uncached_tokens: a,
+                        num_total_tokens: b,
+                        max_running_requests: c,
+                        total_prefill_uncached_tokens: d,
+                        total_prefill_busy_us: e,
+                    }),
+                    _ => None,
+                };
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(LoadStat {
                     num_running_reqs,
                     num_waiting_reqs,
                     num_tokens,
                     max_total_num_tokens,
+                    native,
                 })
             }
         }
@@ -109,6 +150,120 @@ const DEFAULT_FRESHNESS: Duration = Duration::from_secs(5);
 struct LoadEntry {
     load: LoadStat,
     at: Instant,
+    /// Carried across this rank's gauges while they keep a [`NativeLoad`].
+    prefill_rate: Option<PrefillRate>,
+}
+
+/// Busy-time horizon of the prefill throughput average: each busy second
+/// observed weighs `exp(-1/τ)` less than the next, so the estimate follows
+/// the last ~τ seconds of actual prefill work. Idle time does not age it: an
+/// idle engine keeps its last measured speed.
+const PREFILL_RATE_TAU_S: f64 = 10.0;
+
+/// Busy seconds the average must cover before it is reported. Below this the
+/// rate rests on a step or two and a queue estimate from it would swing.
+pub const PREFILL_RATE_WARMUP_S: f64 = 1.0;
+
+/// One DP rank's prefill throughput: uncached tokens per second of prefill
+/// step time, from the engine's cumulative counters, as a busy-time weighted
+/// moving average (decayed token and busy-time sums; their ratio is the
+/// rate). Dividing by busy time, not wall time, measures capacity rather than
+/// demand: a half-idle engine is not half as fast.
+///
+/// Warm-up: the first gauge seeds the sums with the engine's lifetime average
+/// (capped to one horizon), so a router that restarts next to a long-running
+/// engine has a rate at once; an engine that has prefilled less than
+/// [`PREFILL_RATE_WARMUP_S`] has none until it has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrefillRate {
+    tokens: f64,
+    busy_s: f64,
+    /// Undecayed busy seconds behind the average, for the warm-up gate.
+    seen_busy_s: f64,
+    last_tokens: u64,
+    last_busy_us: u64,
+}
+
+impl PrefillRate {
+    pub fn start(n: &NativeLoad) -> Self {
+        let tokens = n.total_prefill_uncached_tokens as f64;
+        let busy_s = n.total_prefill_busy_us as f64 / 1e6;
+        let scale = if busy_s > PREFILL_RATE_TAU_S {
+            PREFILL_RATE_TAU_S / busy_s
+        } else {
+            1.0
+        };
+        Self {
+            tokens: tokens * scale,
+            busy_s: busy_s * scale,
+            seen_busy_s: busy_s,
+            last_tokens: n.total_prefill_uncached_tokens,
+            last_busy_us: n.total_prefill_busy_us,
+        }
+    }
+
+    /// Fold in the next gauge. A counter that went backwards means the
+    /// engine restarted: start over from its new lifetime totals.
+    pub fn observe(self, n: &NativeLoad) -> Self {
+        if n.total_prefill_uncached_tokens < self.last_tokens
+            || n.total_prefill_busy_us < self.last_busy_us
+        {
+            return Self::start(n);
+        }
+        let d_busy_us = n.total_prefill_busy_us - self.last_busy_us;
+        let mut next = Self {
+            last_tokens: n.total_prefill_uncached_tokens,
+            last_busy_us: n.total_prefill_busy_us,
+            ..self
+        };
+        // Tokens with no busy time to divide by teach nothing; skip them.
+        if d_busy_us > 0 {
+            let d_busy_s = d_busy_us as f64 / 1e6;
+            let decay = (-d_busy_s / PREFILL_RATE_TAU_S).exp();
+            next.tokens =
+                self.tokens * decay + (n.total_prefill_uncached_tokens - self.last_tokens) as f64;
+            next.busy_s = self.busy_s * decay + d_busy_s;
+            next.seen_busy_s = self.seen_busy_s + d_busy_s;
+        }
+        next
+    }
+
+    /// Uncached tokens per busy second, once warm and positive.
+    pub fn tokens_per_s(&self) -> Option<f64> {
+        let rate = self.tokens / self.busy_s;
+        (self.seen_busy_s >= PREFILL_RATE_WARMUP_S && rate.is_finite() && rate > 0.0)
+            .then_some(rate)
+    }
+}
+
+/// One worker's extended load, summed over its DP ranks. See
+/// [`EngineLoadTable::worker_native`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkerNativeLoad {
+    pub num_running_requests: u64,
+    pub num_waiting_uncached_tokens: u64,
+    pub max_running_requests: u64,
+    /// Sum of the ranks' prefill rates; `None` unless every rank is warm.
+    pub prefill_tokens_per_s: Option<f64>,
+}
+
+impl WorkerNativeLoad {
+    /// Expected wait before a request sent now starts prefill: uncached
+    /// tokens queued ÷ prefill throughput. Nothing waiting is a 0 ms queue
+    /// even without a rate (a cold engine has had nothing to measure);
+    /// tokens waiting with no rate is unknown, never 0.
+    pub fn est_prefill_queue_ms(&self) -> Option<f64> {
+        match self.prefill_tokens_per_s {
+            Some(rate) => Some(1000.0 * self.num_waiting_uncached_tokens as f64 / rate),
+            None => (self.num_waiting_uncached_tokens == 0).then_some(0.0),
+        }
+    }
+
+    /// `running / max_running`; `None` when the limit is unknown (0).
+    pub fn running_frac(&self) -> Option<f64> {
+        (self.max_running_requests > 0)
+            .then(|| self.num_running_requests as f64 / self.max_running_requests as f64)
+    }
 }
 
 /// One worker's engine-reported load, summed across its dp ranks.
@@ -333,10 +488,65 @@ impl EngineLoadTable {
         oldest.map(|at| (agg, at))
     }
 
-    /// Record the latest load for one `(worker_url, dp_rank)`.
+    /// Record the latest load for one `(worker_url, dp_rank)`, advancing the
+    /// rank's prefill rate when the gauge carries a [`NativeLoad`].
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
-        self.by_rank
-            .insert((url.to_string(), dp_rank), LoadEntry { load, at });
+        let mut slot = self
+            .by_rank
+            .entry((url.to_string(), dp_rank))
+            .or_insert_with(|| LoadEntry {
+                load: load.clone(),
+                at,
+                prefill_rate: None,
+            });
+        let prefill_rate = load.native.as_ref().map(|n| match slot.prefill_rate {
+            Some(r) => r.observe(n),
+            None => PrefillRate::start(n),
+        });
+        *slot = LoadEntry {
+            load,
+            at,
+            prefill_rate,
+        };
+    }
+
+    /// One worker's extended load, summed over its ranks. `None` when no rank
+    /// has reported or any rank's latest gauge lacks the [`NativeLoad`] tail
+    /// (a partial sum would understate the queue). Freshness is the caller's
+    /// check ([`Self::worker_freshness`]).
+    pub fn worker_native(&self, url: &str) -> Option<WorkerNativeLoad> {
+        let mut out = WorkerNativeLoad {
+            num_running_requests: 0,
+            num_waiting_uncached_tokens: 0,
+            max_running_requests: 0,
+            prefill_tokens_per_s: Some(0.0),
+        };
+        let mut seen = false;
+        for entry in self.by_rank.iter() {
+            if entry.key().0 != url {
+                continue;
+            }
+            let e = entry.value();
+            let n = e.load.native.as_ref()?;
+            seen = true;
+            out.num_running_requests = out
+                .num_running_requests
+                .saturating_add(e.load.num_running_reqs);
+            out.num_waiting_uncached_tokens = out
+                .num_waiting_uncached_tokens
+                .saturating_add(n.num_waiting_uncached_tokens);
+            out.max_running_requests = out
+                .max_running_requests
+                .saturating_add(n.max_running_requests);
+            out.prefill_tokens_per_s = match (
+                out.prefill_tokens_per_s,
+                e.prefill_rate.and_then(|r| r.tokens_per_s()),
+            ) {
+                (Some(sum), Some(rate)) => Some(sum + rate),
+                _ => None,
+            };
+        }
+        seen.then_some(out)
     }
 
     /// Mark a worker as expected to publish load (it advertised a load topic).
@@ -535,6 +745,7 @@ mod tests {
             num_waiting_reqs: waiting,
             num_tokens: 0,
             max_total_num_tokens: 0,
+            native: None,
         }
     }
 
@@ -640,6 +851,243 @@ mod tests {
         assert!(state.contains_key("http://fresh:30000"));
         assert!(!depths.contains_key("http://mixed:30000"));
         assert!(!state.contains_key("http://mixed:30000"));
+    }
+
+    fn native(waiting_uncached: u64, max_running: u64, tokens: u64, busy_us: u64) -> NativeLoad {
+        NativeLoad {
+            num_waiting_uncached_tokens: waiting_uncached,
+            num_total_tokens: 0,
+            max_running_requests: max_running,
+            total_prefill_uncached_tokens: tokens,
+            total_prefill_busy_us: busy_us,
+        }
+    }
+
+    fn native_load(running: u64, n: NativeLoad) -> LoadStat {
+        LoadStat {
+            native: Some(n),
+            ..load(running, 0)
+        }
+    }
+
+    #[test]
+    fn decodes_the_native_tail() {
+        let frame = rmp_serde::to_vec(&(
+            "LoadStat",
+            3u64,
+            2u64,
+            100u64,
+            1000u64,
+            Some(1u32),
+            7u64,
+            9u64,
+            64u64,
+            5000u64,
+            2_000_000u64,
+        ))
+        .unwrap();
+        let l = decode_load_stat(&frame).unwrap();
+        assert_eq!((l.num_running_reqs, l.num_waiting_reqs), (3, 2));
+        assert_eq!((l.num_tokens, l.max_total_num_tokens), (100, 1000));
+        assert_eq!(
+            l.native,
+            Some(NativeLoad {
+                num_waiting_uncached_tokens: 7,
+                num_total_tokens: 9,
+                max_running_requests: 64,
+                total_prefill_uncached_tokens: 5000,
+                total_prefill_busy_us: 2_000_000,
+            })
+        );
+        // A null attn_dp_rank and fields after the tail are fine.
+        let frame = rmp_serde::to_vec(&(
+            "LoadStat",
+            1u64,
+            0u64,
+            0u64,
+            0u64,
+            None::<u32>,
+            0u64,
+            0u64,
+            8u64,
+            0u64,
+            0u64,
+            "future",
+        ))
+        .unwrap();
+        assert_eq!(
+            decode_load_stat(&frame)
+                .unwrap()
+                .native
+                .map(|n| n.max_running_requests),
+            Some(8)
+        );
+    }
+
+    /// Older engines (four counts, maybe attn_dp_rank) and a partial or null
+    /// tail decode with the counts and no native load.
+    #[test]
+    fn short_or_partial_tail_is_no_native_load() {
+        let four = rmp_serde::to_vec(&("LoadStat", 3u64, 2u64, 1u64, 9u64)).unwrap();
+        let l = decode_load_stat(&four).unwrap();
+        assert_eq!((l.num_running_reqs, l.native), (3, None));
+        let five = rmp_serde::to_vec(&("LoadStat", 3u64, 2u64, 1u64, 9u64, 0u32)).unwrap();
+        assert_eq!(decode_load_stat(&five).unwrap().native, None);
+        let partial =
+            rmp_serde::to_vec(&("LoadStat", 3u64, 2u64, 1u64, 9u64, 0u32, 7u64, 9u64)).unwrap();
+        let l = decode_load_stat(&partial).unwrap();
+        assert_eq!((l.num_waiting_reqs, l.native), (2, None));
+        let null_in_tail = rmp_serde::to_vec(&(
+            "LoadStat",
+            3u64,
+            2u64,
+            1u64,
+            9u64,
+            0u32,
+            7u64,
+            None::<u64>,
+            64u64,
+            1u64,
+            1u64,
+        ))
+        .unwrap();
+        assert_eq!(decode_load_stat(&null_in_tail).unwrap().native, None);
+    }
+
+    /// Warm-up: no rate until the engine has prefilled for
+    /// PREFILL_RATE_WARMUP_S of busy time, counted from its lifetime totals.
+    #[test]
+    fn prefill_rate_warms_up_on_busy_time() {
+        let cold = PrefillRate::start(&native(0, 0, 0, 0));
+        assert_eq!(cold.tokens_per_s(), None);
+        // 0.5 s busy at 10k tok/s: still cold.
+        let r = cold.observe(&native(0, 0, 5_000, 500_000));
+        assert_eq!(r.tokens_per_s(), None);
+        // Another 0.5 s: warm, and the rate is what was measured.
+        let r = r.observe(&native(0, 0, 10_000, 1_000_000));
+        let rate = r.tokens_per_s().unwrap();
+        assert!((rate - 10_000.0).abs() < 1e-6, "{rate}");
+        // Idle gauges (no new busy time) keep the rate.
+        let idle = r.observe(&native(0, 0, 10_000, 1_000_000));
+        assert_eq!(idle.tokens_per_s(), Some(rate));
+        // An engine that already ran for an hour is warm at once.
+        let seeded = PrefillRate::start(&native(0, 0, 36_000_000, 3_600_000_000));
+        assert!((seeded.tokens_per_s().unwrap() - 10_000.0).abs() < 1e-6);
+    }
+
+    /// The average follows recent busy time: the lifetime seed weighs one
+    /// horizon, so after a few horizons at a new speed it reads the new speed.
+    #[test]
+    fn prefill_rate_tracks_a_change_in_speed() {
+        // Lifetime: 1 h at 10k tok/s.
+        let mut r = PrefillRate::start(&native(0, 0, 36_000_000, 3_600_000_000));
+        let (mut tokens, mut busy_us) = (36_000_000u64, 3_600_000_000u64);
+        // One horizon at 20k tok/s, in 1 s steps: between the two.
+        for _ in 0..10 {
+            tokens += 20_000;
+            busy_us += 1_000_000;
+            r = r.observe(&native(0, 0, tokens, busy_us));
+        }
+        let mid = r.tokens_per_s().unwrap();
+        assert!(mid > 14_000.0 && mid < 18_000.0, "{mid}");
+        for _ in 0..50 {
+            tokens += 20_000;
+            busy_us += 1_000_000;
+            r = r.observe(&native(0, 0, tokens, busy_us));
+        }
+        let late = r.tokens_per_s().unwrap();
+        assert!((late - 20_000.0).abs() < 200.0, "{late}");
+        // Tokens without busy time are skipped, not divided by zero.
+        let r2 = r.observe(&native(0, 0, tokens + 1_000_000, busy_us));
+        assert_eq!(r2.tokens_per_s(), Some(late));
+    }
+
+    /// A counter that goes backwards is an engine restart: start over.
+    #[test]
+    fn prefill_rate_restarts_with_the_engine() {
+        let r = PrefillRate::start(&native(0, 0, 36_000_000, 3_600_000_000));
+        let r = r.observe(&native(0, 0, 1_000, 100_000));
+        assert_eq!(r, PrefillRate::start(&native(0, 0, 1_000, 100_000)));
+        assert_eq!(r.tokens_per_s(), None);
+    }
+
+    /// The table carries each rank's rate across gauges, sums the ranks, and
+    /// drops the native view when any rank's latest gauge lacks the tail.
+    #[test]
+    fn worker_native_sums_ranks_and_needs_every_rank() {
+        let t = EngineLoadTable::new();
+        let now = Instant::now();
+        let url = "http://p:30000";
+        assert_eq!(t.worker_native(url), None);
+        // Rank 0 warm at 10k tok/s, rank 1 cold.
+        t.set(
+            url,
+            0,
+            native_load(2, native(3_000, 64, 36_000_000, 3_600_000_000)),
+            now,
+        );
+        t.set(url, 1, native_load(1, native(1_000, 64, 0, 0)), now);
+        let n = t.worker_native(url).unwrap();
+        assert_eq!(
+            (
+                n.num_running_requests,
+                n.num_waiting_uncached_tokens,
+                n.max_running_requests
+            ),
+            (3, 4_000, 128)
+        );
+        assert_eq!(
+            n.prefill_tokens_per_s, None,
+            "a cold rank leaves the sum unknown"
+        );
+        assert_eq!(n.est_prefill_queue_ms(), None, "tokens waiting, no rate");
+        // Rank 1 prefills 2 s at 5k tok/s: warm, and its rate came from the
+        // carried state, not this gauge alone.
+        t.set(
+            url,
+            1,
+            native_load(1, native(1_000, 64, 10_000, 2_000_000)),
+            now,
+        );
+        let n = t.worker_native(url).unwrap();
+        let rate = n.prefill_tokens_per_s.unwrap();
+        assert!((rate - 15_000.0).abs() < 1e-6, "{rate}");
+        let ms = n.est_prefill_queue_ms().unwrap();
+        assert!((ms - 4_000.0 / 15.0).abs() < 1e-6, "{ms}");
+        assert!((n.running_frac().unwrap() - 3.0 / 128.0).abs() < 1e-12);
+        // An older gauge without the tail on one rank: no native view.
+        t.set(url, 1, load(1, 0), now);
+        assert_eq!(t.worker_native(url), None);
+        // And the rank's rate starts over when the tail comes back.
+        t.set(
+            url,
+            1,
+            native_load(1, native(0, 64, 10_000, 2_000_000)),
+            now,
+        );
+        assert_eq!(
+            t.worker_native(url)
+                .unwrap()
+                .prefill_tokens_per_s
+                .map(|r| r > 0.0),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn worker_native_idle_and_unknown_limits() {
+        let idle = WorkerNativeLoad {
+            num_running_requests: 0,
+            num_waiting_uncached_tokens: 0,
+            max_running_requests: 0,
+            prefill_tokens_per_s: None,
+        };
+        assert_eq!(
+            idle.est_prefill_queue_ms(),
+            Some(0.0),
+            "nothing waiting is 0 ms"
+        );
+        assert_eq!(idle.running_frac(), None, "no limit, no fraction");
     }
 
     #[test]

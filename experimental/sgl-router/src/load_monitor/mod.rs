@@ -29,7 +29,7 @@
 //!   early-boot zero-capacity snapshot reads `stale`.
 
 use crate::policies::engine_load::{
-    EngineLoadTable, Freshness, LoadStat, PullStatus, WorkerAggregate,
+    EngineLoadTable, Freshness, LoadStat, NativeLoad, PullStatus, WorkerAggregate,
 };
 use crate::server::metrics::{LoadPullOutcome, MetricsRegistry, ReportedLoadKind};
 use dashmap::DashMap;
@@ -378,6 +378,15 @@ struct LoadsRankJson {
     max_total_num_tokens: i64,
     #[serde(default)]
     max_running_requests: i64,
+    /// The [`NativeLoad`] fields; absent on older engines.
+    #[serde(default)]
+    num_waiting_uncached_tokens: Option<i64>,
+    #[serde(default)]
+    num_total_tokens: Option<i64>,
+    #[serde(default)]
+    total_prefill_uncached_tokens: Option<i64>,
+    #[serde(default)]
+    total_prefill_busy_us: Option<i64>,
 }
 
 /// Validate one `/v1/loads` body and convert its DP ranks to [`LoadStat`]s.
@@ -411,6 +420,24 @@ pub fn parse_loads_response(body: &[u8]) -> Result<PulledReport, String> {
         if rank.max_total_num_tokens == 0 || rank.max_running_requests == 0 {
             positive_capacity = false;
         }
+        // All-or-nothing like the push tail; a negative extended field
+        // drops the tail, not the report.
+        let ext = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+        let native = match (
+            ext(rank.num_waiting_uncached_tokens),
+            ext(rank.num_total_tokens),
+            ext(rank.total_prefill_uncached_tokens),
+            ext(rank.total_prefill_busy_us),
+        ) {
+            (Some(a), Some(b), Some(d), Some(e)) => Some(NativeLoad {
+                num_waiting_uncached_tokens: a,
+                num_total_tokens: b,
+                max_running_requests: rank.max_running_requests as u64,
+                total_prefill_uncached_tokens: d,
+                total_prefill_busy_us: e,
+            }),
+            _ => None,
+        };
         ranks.push((
             dp_rank,
             LoadStat {
@@ -418,6 +445,7 @@ pub fn parse_loads_response(body: &[u8]) -> Result<PulledReport, String> {
                 num_waiting_reqs: rank.num_waiting_reqs as u64,
                 num_tokens: rank.num_used_tokens as u64,
                 max_total_num_tokens: rank.max_total_num_tokens as u64,
+                native,
             },
         ));
     }
@@ -459,6 +487,38 @@ mod tests {
         assert_eq!(r.ranks[0].1.num_tokens, 100);
         assert_eq!(r.ranks[0].1.max_total_num_tokens, 1000);
         assert_eq!(r.ranks[1].1.num_running_reqs, 3);
+    }
+
+    #[test]
+    fn parse_reads_the_native_fields_when_present() {
+        let mut r0 = rank(0, 2, 1);
+        r0["num_waiting_uncached_tokens"] = json!(700);
+        r0["total_prefill_uncached_tokens"] = json!(5000);
+        r0["total_prefill_busy_us"] = json!(1_000_000);
+        // rank(...) has num_total_tokens; a rank missing one field has none.
+        let mut r1 = r0.clone();
+        r1["dp_rank"] = json!(1);
+        r1.as_object_mut().unwrap().remove("total_prefill_busy_us");
+        let body = json!({"loads": [r0, r1]});
+        let r = parse_loads_response(body.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            r.ranks[0].1.native,
+            Some(NativeLoad {
+                num_waiting_uncached_tokens: 700,
+                num_total_tokens: 150,
+                max_running_requests: 16,
+                total_prefill_uncached_tokens: 5000,
+                total_prefill_busy_us: 1_000_000,
+            })
+        );
+        assert_eq!(r.ranks[1].1.native, None);
+        // An older engine: no native load, counts as before.
+        let old = json!({"loads": [rank(0, 2, 1)]});
+        let r = parse_loads_response(old.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            (r.ranks[0].1.num_running_reqs, r.ranks[0].1.native),
+            (2, None)
+        );
     }
 
     #[test]

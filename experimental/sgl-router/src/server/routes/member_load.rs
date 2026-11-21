@@ -14,11 +14,14 @@
 //! Load source on this tree: the [`EngineLoadTable`] fed by the engines'
 //! `LoadStat` load socket (push) and, with `--load-monitor`, by
 //! `GET /v1/loads` (pull). It carries running / waiting requests and KV
-//! used / capacity tokens per DP rank, and nothing about uncached tokens or
-//! prefill-queue estimates, so those fields are always `null` here.
+//! used / capacity tokens per DP rank and, from engines new enough to send
+//! the [`NativeLoad`](crate::policies::engine_load::NativeLoad) tail, uncached
+//! tokens waiting, `max_running_requests` and the cumulative prefill counters
+//! the prefill-queue estimate is built from. Without that tail those fields
+//! are `null`.
 
 use crate::discovery::WorkerMode;
-use crate::policies::engine_load::{EngineLoadTable, Freshness};
+use crate::policies::engine_load::{EngineLoadTable, Freshness, WorkerNativeLoad};
 use crate::server::app_context::AppContext;
 use crate::workers::Worker;
 use axum::extract::State;
@@ -76,12 +79,23 @@ pub struct RoleLoad {
     /// workers with a known (non-zero) capacity; `null` when there are none.
     pub kv_usage_mean: Option<f64>,
     pub kv_usage_max: Option<f64>,
-    /// Always `null` on this tree: the engine load it holds (`LoadStat`,
-    /// `/v1/loads?include=core`) has no uncached-token or prefill-throughput
-    /// fields to derive them from.
+    /// Uncached prompt tokens waiting for prefill, summed over reporting
+    /// workers that send the extended load; `null` when none does.
     pub waiting_uncached_tokens: Option<u64>,
+    /// Min / max over those workers of the expected wait before a request
+    /// sent now starts prefill: its uncached tokens waiting ÷ its measured
+    /// prefill throughput (see [`WorkerNativeLoad::est_prefill_queue_ms`]).
+    /// A worker with tokens waiting but no warm throughput yet gives no
+    /// estimate; `null` when no worker gives one.
     pub est_prefill_queue_ms_min: Option<f64>,
     pub est_prefill_queue_ms_max: Option<f64>,
+    /// Sum of the engines' `max_running_requests` (over DP ranks, then over
+    /// reporting workers that send a non-zero limit); `null` when none does.
+    pub max_running_reqs: Option<u64>,
+    /// Max over those workers of `running / max_running_requests` (each
+    /// summed over the worker's DP ranks); `null` when none sends a limit.
+    /// Can pass 1 by the engine's own accounting.
+    pub running_frac_max: Option<f64>,
 }
 
 /// Wire label of a worker role, as the consumer expects it.
@@ -177,6 +191,9 @@ pub fn aggregate_roles(
             a.kv_usage_n += 1;
             r.kv_usage_max = Some(r.kv_usage_max.map_or(usage, |m| m.max(usage)));
         }
+        if let Some(native) = table.and_then(|t| t.worker_native(&w.url)) {
+            add_native(r, &native);
+        }
     }
     acc.into_iter()
         .map(|(role, mut a)| {
@@ -192,9 +209,36 @@ pub fn aggregate_roles(
             ] {
                 *count = (*count).min(MAX_WIRE_COUNT);
             }
+            for count in [&mut r.waiting_uncached_tokens, &mut r.max_running_reqs]
+                .into_iter()
+                .flatten()
+            {
+                *count = (*count).min(MAX_WIRE_COUNT);
+            }
             (role, a.load)
         })
         .collect()
+}
+
+/// Fold one reporting worker's extended load into its role.
+fn add_native(r: &mut RoleLoad, n: &WorkerNativeLoad) {
+    r.waiting_uncached_tokens = Some(
+        r.waiting_uncached_tokens
+            .unwrap_or(0)
+            .saturating_add(n.num_waiting_uncached_tokens),
+    );
+    if let Some(ms) = n.est_prefill_queue_ms() {
+        r.est_prefill_queue_ms_min = Some(r.est_prefill_queue_ms_min.map_or(ms, |m| m.min(ms)));
+        r.est_prefill_queue_ms_max = Some(r.est_prefill_queue_ms_max.map_or(ms, |m| m.max(ms)));
+    }
+    if let Some(frac) = n.running_frac() {
+        r.max_running_reqs = Some(
+            r.max_running_reqs
+                .unwrap_or(0)
+                .saturating_add(n.max_running_requests),
+        );
+        r.running_frac_max = Some(r.running_frac_max.map_or(frac, |m| m.max(frac)));
+    }
 }
 
 pub async fn member_load(State(ctx): State<Arc<AppContext>>) -> Json<MemberLoadReport> {
@@ -206,7 +250,7 @@ mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerSpec};
     use crate::health::circuit_breaker::CircuitBreakerConfig;
-    use crate::policies::engine_load::{LoadStat, PullStatus};
+    use crate::policies::engine_load::{LoadStat, NativeLoad, PullStatus};
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -214,7 +258,7 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    const ROLE_FIELDS: [&str; 12] = [
+    const ROLE_FIELDS: [&str; 14] = [
         "workers_total",
         "workers_ready",
         "workers_reporting",
@@ -227,6 +271,8 @@ mod tests {
         "waiting_uncached_tokens",
         "est_prefill_queue_ms_min",
         "est_prefill_queue_ms_max",
+        "max_running_reqs",
+        "running_frac_max",
     ];
 
     fn url(id: &str) -> String {
@@ -259,6 +305,7 @@ mod tests {
             num_waiting_reqs: waiting,
             num_tokens: used,
             max_total_num_tokens: cap,
+            native: None,
         }
     }
 
@@ -290,9 +337,37 @@ mod tests {
                     "{name}.{f}"
                 );
             }
-            for f in &ROLE_FIELDS[9..] {
-                assert!(role[*f].is_null(), "{name}.{f} must be null on this tree");
+            for f in ["waiting_uncached_tokens", "max_running_reqs"] {
+                let v = &role[f];
+                assert!(
+                    v.is_null() || v.as_i64().is_some_and(|x| x >= 0),
+                    "{name}.{f}"
+                );
             }
+            for f in [
+                "est_prefill_queue_ms_min",
+                "est_prefill_queue_ms_max",
+                "running_frac_max",
+            ] {
+                let v = &role[f];
+                assert!(
+                    v.is_null() || v.as_f64().is_some_and(|x| x >= 0.0),
+                    "{name}.{f}"
+                );
+            }
+            let (lo, hi) = (
+                &role["est_prefill_queue_ms_min"],
+                &role["est_prefill_queue_ms_max"],
+            );
+            assert_eq!(lo.is_null(), hi.is_null(), "{name}");
+            if !lo.is_null() {
+                assert!(lo.as_f64() <= hi.as_f64(), "{name}");
+            }
+            assert_eq!(
+                role["max_running_reqs"].is_null(),
+                role["running_frac_max"].is_null(),
+                "{name}"
+            );
         }
     }
 
@@ -387,6 +462,15 @@ mod tests {
         );
         assert!((d.kv_usage_mean.unwrap() - 0.6).abs() < 1e-9);
         assert_eq!(d.kv_usage_max, Some(0.9));
+        // Engines without the extended load: those fields stay null.
+        for r in [p, d] {
+            assert_eq!(r.waiting_uncached_tokens, None);
+            assert_eq!(
+                (r.est_prefill_queue_ms_min, r.est_prefill_queue_ms_max),
+                (None, None)
+            );
+            assert_eq!((r.max_running_reqs, r.running_frac_max), (None, None));
+        }
 
         let doc = serde_json::json!({
             "contract": CONTRACT,
@@ -409,6 +493,130 @@ mod tests {
         assert_eq!(doc["workers_reporting"], 0);
         assert_eq!(doc["running_reqs"], 0);
         assert!(doc["kv_usage_mean"].is_null() && doc["kv_usage_max"].is_null());
+    }
+
+    fn native_stat(
+        running: u64,
+        waiting_uncached: u64,
+        max_running: u64,
+        tok: u64,
+        busy_us: u64,
+    ) -> LoadStat {
+        LoadStat {
+            native: Some(NativeLoad {
+                num_waiting_uncached_tokens: waiting_uncached,
+                num_total_tokens: 0,
+                max_running_requests: max_running,
+                total_prefill_uncached_tokens: tok,
+                total_prefill_busy_us: busy_us,
+            }),
+            ..stat(running, 0, 0, 1000)
+        }
+    }
+
+    /// The prefill queue estimate and the decode running fraction, from the
+    /// engines' extended load: warm, cold, idle, old-engine and stale workers.
+    #[test]
+    fn member_load_native_signals() {
+        let ctx = AppContext::stub();
+        for id in ["p1", "p2", "p3", "p4"] {
+            add(&ctx, id, WorkerMode::Prefill, true);
+        }
+        for id in ["d1", "d2", "d3", "d4", "d5"] {
+            add(&ctx, id, WorkerMode::Decode, true);
+        }
+        let table = EngineLoadTable::with_freshness(Duration::from_secs(5));
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(10);
+        // p1: two warm ranks at 10k + 20k tok/s, 6k tokens waiting -> 200 ms.
+        table.set(
+            &url("p1"),
+            0,
+            native_stat(1, 2_000, 64, 36_000_000, 3_600_000_000),
+            now,
+        );
+        table.set(
+            &url("p1"),
+            1,
+            native_stat(1, 4_000, 64, 72_000_000, 3_600_000_000),
+            now,
+        );
+        // p2: warm at 10k tok/s, 30k waiting -> 3000 ms.
+        table.set(
+            &url("p2"),
+            0,
+            native_stat(1, 30_000, 64, 36_000_000, 3_600_000_000),
+            now,
+        );
+        // p3: cold (never prefilled), nothing waiting -> 0 ms.
+        table.set(&url("p3"), 0, native_stat(0, 0, 64, 0, 0), now);
+        // p4: cold with 5k waiting: counted in the tokens, no estimate.
+        table.set(&url("p4"), 0, native_stat(0, 5_000, 64, 100, 1_000), now);
+        // d1: 2 ranks, 96 / 128 running. d2: 16 / 64.
+        table.set(&url("d1"), 0, native_stat(40, 0, 64, 0, 0), now);
+        table.set(&url("d1"), 1, native_stat(56, 0, 64, 0, 0), now);
+        table.set(&url("d2"), 0, native_stat(16, 0, 64, 0, 0), now);
+        // d3: older engine, no tail: in the counts, not the fraction.
+        table.set(&url("d3"), 0, stat(60, 0, 0, 1000), now);
+        // d4: limit unknown (0): no fraction, no limit.
+        table.set(&url("d4"), 0, native_stat(60, 0, 0, 0, 0), now);
+        // d5: stale: left out of everything.
+        table.set(&url("d5"), 0, native_stat(64, 0, 64, 0, 0), t0);
+
+        let roles = aggregate_roles(&ctx.registry.all(), Some(&table), false, now);
+        let p = &roles["prefill"];
+        assert_eq!(p.workers_reporting, 4);
+        assert_eq!(p.waiting_uncached_tokens, Some(41_000));
+        let (lo, hi) = (
+            p.est_prefill_queue_ms_min.unwrap(),
+            p.est_prefill_queue_ms_max.unwrap(),
+        );
+        assert_eq!(lo, 0.0, "the idle cold worker");
+        assert!((hi - 3_000.0).abs() < 1e-6, "{hi}");
+        assert_eq!(p.max_running_reqs, Some(64 * 5));
+
+        let d = &roles["decode"];
+        assert_eq!((d.workers_total, d.workers_reporting), (5, 4));
+        assert_eq!(d.running_reqs, 40 + 56 + 16 + 60 + 60);
+        assert_eq!(d.max_running_reqs, Some(128 + 64));
+        assert_eq!(d.running_frac_max, Some(0.75));
+        assert_eq!(d.waiting_uncached_tokens, Some(0));
+        // Decode never prefills: nothing waiting reads 0 ms.
+        assert_eq!(d.est_prefill_queue_ms_max, Some(0.0));
+
+        let doc = serde_json::json!({
+            "contract": CONTRACT,
+            "observed_at_ms": 1,
+            "roles": serde_json::to_value(&roles).unwrap(),
+        });
+        assert_contract(&doc);
+    }
+
+    /// One prefill warm with a long queue and the only other one cold with
+    /// tokens waiting: the estimate is the warm one alone, never 0.
+    #[test]
+    fn member_load_cold_worker_does_not_read_idle() {
+        let ctx = AppContext::stub();
+        add(&ctx, "p1", WorkerMode::Prefill, true);
+        let table = EngineLoadTable::new();
+        let now = Instant::now();
+        table.set(&url("p1"), 0, native_stat(0, 5_000, 64, 0, 0), now);
+        let p = &aggregate_roles(&ctx.registry.all(), Some(&table), false, now)["prefill"];
+        assert_eq!(p.waiting_uncached_tokens, Some(5_000));
+        assert_eq!(
+            (p.est_prefill_queue_ms_min, p.est_prefill_queue_ms_max),
+            (None, None)
+        );
+        // Warm-up: 1 s of prefill at 10k tok/s, then the estimate appears.
+        table.set(
+            &url("p1"),
+            0,
+            native_stat(0, 5_000, 64, 10_000, 1_000_000),
+            now,
+        );
+        let p = &aggregate_roles(&ctx.registry.all(), Some(&table), false, now)["prefill"];
+        let ms = p.est_prefill_queue_ms_max.unwrap();
+        assert!((ms - 500.0).abs() < 1e-6, "{ms}");
     }
 
     /// A worker whose breaker is open is not ready, but its load still
@@ -496,6 +704,42 @@ mod tests {
         assert_eq!(plain["kv_capacity_tokens"], 100);
         assert_eq!(plain["kv_usage_mean"], 0.4);
         assert_eq!(plain["kv_usage_max"], 0.4);
+        assert!(plain["waiting_uncached_tokens"].is_null());
+        assert!(plain["max_running_reqs"].is_null());
+        assert!(plain["running_frac_max"].is_null());
+    }
+
+    /// The route serves the extended fields when the engine sends them.
+    #[tokio::test]
+    async fn member_load_route_serves_native_fields() {
+        let ctx = AppContext::stub();
+        add(&ctx, "w1", WorkerMode::Plain, true);
+        let index = crate::policies::kv_events::KvEventIndex::new();
+        index.engine_load().set(
+            &url("w1"),
+            0,
+            native_stat(32, 20_000, 64, 36_000_000, 3_600_000_000),
+            Instant::now(),
+        );
+        ctx.attach_kv_index(index);
+        let res = crate::server::app::build_router(Arc::new(ctx))
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/member_load")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_contract(&doc);
+        let plain = &doc["roles"]["plain"];
+        assert_eq!(plain["waiting_uncached_tokens"], 20_000);
+        assert_eq!(plain["est_prefill_queue_ms_min"], 2_000.0);
+        assert_eq!(plain["est_prefill_queue_ms_max"], 2_000.0);
+        assert_eq!(plain["max_running_reqs"], 64);
+        assert_eq!(plain["running_frac_max"], 0.5);
     }
 
     #[test]
