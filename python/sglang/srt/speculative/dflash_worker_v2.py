@@ -234,9 +234,6 @@ class _DflashDraftSampler:
             self.best_rank = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
             )
-            self.selected_ids = torch.empty(
-                (1, max_tokens), dtype=torch.int64, device=device
-            )
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
@@ -249,10 +246,10 @@ class _DflashDraftSampler:
         n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.tp_size == 1:
-            tokens = torch.argmax(logits, dim=-1).to(torch.long)
+            out = self.out[:n]
+            torch.argmax(logits, dim=-1, out=out)
             if self.org_vocab_start:
-                tokens += self.org_vocab_start
-            self.out[:n].copy_(tokens)
+                out.add_(self.org_vocab_start)
             return
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
@@ -265,9 +262,12 @@ class _DflashDraftSampler:
         self.tp_group.all_gather_into_tensor(gathered_ids, local_arg)
         best_rank = self.best_rank[:, :n]
         torch.argmax(gathered_max.view(self.tp_size, n), dim=0, out=best_rank[0])
-        selected = self.selected_ids[:, :n]
-        torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
-        self.out[:n].copy_(selected.view(-1))
+        torch.gather(
+            gathered_ids.view(self.tp_size, n),
+            0,
+            best_rank,
+            out=self.out[:n].view(1, n),
+        )
 
 
 def _commit_accept(candidates, accept_len, bonus_tokens):
