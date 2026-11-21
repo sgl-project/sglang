@@ -615,6 +615,17 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+            # Beam n counts returned sequences; ordinary n requires fan-out.
+            # A batch has only one parallel_sample_num for both modes.
+            is_beam = self._sampling_params_beam_width() > 1
+            if (self.parallel_sample_num or 1) > 1 and any(
+                ((params.get("beam_width") or 1) > 1) != is_beam
+                for params in self.sampling_params
+            ):
+                raise ValueError(
+                    "Beam search and ordinary sampling with n > 1 must be sent "
+                    "in separate batches."
+                )
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 

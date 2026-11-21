@@ -2879,6 +2879,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Abort the request if the client is disconnected.
         async def abort_request():
             await asyncio.sleep(2)
+            # Request normalization can fail before allocating request IDs.
+            if obj.rid is None:
+                return
             rids = [obj.rid] if obj.is_single else obj.rid
             for rid in rids:
                 if rid in self.rid_to_state:

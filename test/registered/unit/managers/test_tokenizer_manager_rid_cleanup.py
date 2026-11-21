@@ -1176,6 +1176,68 @@ def _make_generate_obj(rid, is_single):
     return obj
 
 
+class TestStreamAdmissionCleanup(CustomTestCase):
+    def test_rejected_mixed_batch_finishes_background_cleanup(self):
+        """Rejecting mixed n>1 streams before RID allocation must not crash cleanup."""
+
+        async def drive(params, rid):
+            tm = _make_tm_for_generate(self)
+            tm._dispatch_to_scheduler = Mock()
+            obj = GenerateReqInput(
+                text=["first", "second"],
+                sampling_params=params,
+                stream=True,
+                rid=rid,
+            )
+            background = tm.create_abort_task(obj)
+            with self.assertRaisesRegex(ValueError, "separate batches"):
+                await tm.generate_request(obj).__anext__()
+            self.assertEqual(obj.rid, rid)
+            self.assertFalse(tm.rid_to_state)
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep", new=AsyncMock()
+            ):
+                await background()
+            self.assertFalse(tm.rid_to_state)
+            tm._dispatch_to_scheduler.assert_not_called()
+
+        params = [{"n": 2, "beam_width": 2}, {"n": 2}]
+        for ordered in (params, params[::-1]):
+            for rid in (None, ["first", "second"]):
+                with self.subTest(params=ordered, rid=rid):
+                    asyncio.run(drive(ordered, rid))
+
+    def test_background_cleanup_aborts_ids_assigned_after_task_creation(self):
+        """Creating cleanup before normalization must still abort admitted requests."""
+
+        async def drive(text):
+            tm = _make_tokenizer_manager(self)
+            tm._dispatch_to_scheduler = Mock()
+            obj = GenerateReqInput(text=text, stream=True)
+            background = tm.create_abort_task(obj)
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+            rids = [obj.rid] if obj.is_single else obj.rid
+            for rid in rids:
+                tm.rid_to_state[rid].dispatched = True
+            unrelated = _make_req_state("unrelated")
+            tm.rid_to_state["unrelated"] = unrelated
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep", new=AsyncMock()
+            ):
+                await background()
+            self.assertTrue(all(tm.rid_to_state[rid].abort_sent for rid in rids))
+            self.assertFalse(unrelated.abort_sent)
+            sent = [call.args[0] for call in tm._dispatch_to_scheduler.call_args_list]
+            self.assertEqual([req.rid for req in sent], rids)
+            self.assertTrue(all(isinstance(req, AbortReq) for req in sent))
+            self.assertFalse(any(req.abort_all for req in sent))
+
+        for text in ("single", ["first", "second"]):
+            with self.subTest(text=text):
+                asyncio.run(drive(text))
+
+
 class TestReleaseReqStatesOnFailure(CustomTestCase):
     """Direct tests for _release_req_states_on_failure."""
 
