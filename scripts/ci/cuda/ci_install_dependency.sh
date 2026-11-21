@@ -220,6 +220,10 @@ install_apt_packages() {
         libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        # gpu worker NUMA discovery needs the numactl executable, not just libnuma
+        CI_APT_PACKAGES+=(numactl)
+    fi
 
     # The images bake these in, so the usual run pays apt-get update's round
     # trips to install nothing. Skipping it costs no currency either: apt-get
