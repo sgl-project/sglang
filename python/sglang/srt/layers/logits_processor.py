@@ -34,6 +34,12 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_to_float32_logits,
 )
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    maybe_skinny_gemm as _maybe_skinny_gemm,
+)
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    sm121_skinny_enabled as _sm121_skinny_enabled,
+)
 from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
@@ -1495,10 +1501,18 @@ class LogitsProcessor(nn.Module):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
-                if out is not None and out.dtype == lm_head.weight.dtype:
-                    logits = torch.matmul(lhs, lm_head.weight.T, out=out)
-                else:
-                    logits = torch.matmul(lhs, lm_head.weight.T)
+                out_ok = out is not None and out.dtype == lm_head.weight.dtype
+                logits = None
+                # `out` already matches the logits shape (checked above).
+                if _sm121_skinny_enabled() and (
+                    out is None or (out_ok and out.is_contiguous())
+                ):
+                    logits = _maybe_skinny_gemm(lhs, lm_head.weight, out=out)
+                if logits is None:
+                    if out_ok:
+                        logits = torch.matmul(lhs, lm_head.weight.T, out=out)
+                    else:
+                        logits = torch.matmul(lhs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
