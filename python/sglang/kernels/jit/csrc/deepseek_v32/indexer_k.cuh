@@ -243,11 +243,20 @@ struct FusedKIndexerNormRopeStoreParams {
   int64_t k_input_stride_batch;
   // Bytes between consecutive pages of `cache`.
   int64_t cache_page_stride;
+  int64_t dcp_size;
+  int64_t dcp_rank;
   uint32_t batch_size;
   float eps;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, int32_t kPageBits, bool kHadamard, bool kNeoxStyle>
+template <
+    typename DType,
+    typename PosT,
+    bool kUsePDL,
+    int32_t kPageBits,
+    bool kHadamard,
+    bool kNeoxStyle,
+    bool kApplyRope>
 K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ FusedKIndexerNormRopeStoreParams params) {
   using namespace device;
 
@@ -271,10 +280,18 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   if (work_id >= params.batch_size) return;
 
   const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
-  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
-  const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
-
   PDLWaitPrimary<kUsePDL>();
+  auto index = static_cast<const int64_t*>(params.indices)[work_id];
+  if constexpr (!kApplyRope) {
+    // DCP indices are widened slots; skip rows belonging to another rank.
+    if (params.dcp_size > 1) {
+      index = (index >= 0 && index % params.dcp_size == params.dcp_rank) ? index / params.dcp_size : -1;
+    }
+    if (index < 0) {
+      PDLTriggerSecondary<kUsePDL>();
+      return;
+    }
+  }
   Float4 data, freq, freq_sin, gamma, beta;
 
   // part 1: LayerNorm
@@ -283,11 +300,15 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     input_vec.load(input_ptr, lane_id);
     gamma.load(params.weight, lane_id);
     beta.load(params.bias, lane_id);
-    if (is_rope_lane) {
-      if constexpr (kNeoxStyle) {
-        dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
-      } else {
-        freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+    if constexpr (kApplyRope) {
+      if (is_rope_lane) {
+        const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
+        const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
+        if constexpr (kNeoxStyle) {
+          dsa_indexer::load_neox_cos_sin<kRopeDim>(cos_sin_cache, lane_id, freq, freq_sin);
+        } else {
+          freq = load_rope_first_cos_sin<kRopeDim>(cos_sin_cache, lane_id);
+        }
       }
     }
 
@@ -297,7 +318,9 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
       data[i] = cast<float>(input_vec[i]);
       sum += data[i];
     }
-    const float mean = warp::reduce_sum(sum) / kHeadDim;
+    // The non-RoPE path replaces FlashInfer's CuTe LayerNorm, whose butterfly
+    // visits lanes in ascending XOR order. Preserve that reduction order.
+    const float mean = (kApplyRope ? warp::reduce_sum(sum) : warp::reduce_sum<1, kWarpThreads>(sum)) / kHeadDim;
 
     float var = 0.0f;
 #pragma unroll
@@ -305,7 +328,8 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
       const float centered = data[i] - mean;
       var += centered * centered;
     }
-    const float inv_std = math::rsqrt(warp::reduce_sum(var) / kHeadDim + params.eps);
+    const float sum_var = kApplyRope ? warp::reduce_sum(var) : warp::reduce_sum<1, kWarpThreads>(var);
+    const float inv_std = math::rsqrt(sum_var / kHeadDim + params.eps);
 
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i) {
@@ -314,21 +338,23 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   }
 
   // part 2: rope
-  if constexpr (kNeoxStyle) {
-    dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
-  } else if (is_rope_lane) {
-    const auto x_real = data[0];
-    const auto x_imag = data[1];
-    const auto y_real = data[2];
-    const auto y_imag = data[3];
-    const auto fxr = freq[0];
-    const auto fxi = freq[1];
-    const auto fyr = freq[2];
-    const auto fyi = freq[3];
-    data[0] = x_real * fxr - x_imag * fxi;
-    data[1] = x_real * fxi + x_imag * fxr;
-    data[2] = y_real * fyr - y_imag * fyi;
-    data[3] = y_real * fyi + y_imag * fyr;
+  if constexpr (kApplyRope) {
+    if constexpr (kNeoxStyle) {
+      dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
+    } else if (is_rope_lane) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto y_real = data[2];
+      const auto y_imag = data[3];
+      const auto fxr = freq[0];
+      const auto fxi = freq[1];
+      const auto fyr = freq[2];
+      const auto fyi = freq[3];
+      data[0] = x_real * fxr - x_imag * fxi;
+      data[1] = x_real * fxi + x_imag * fxr;
+      data[2] = y_real * fyr - y_imag * fyi;
+      data[3] = y_real * fyi + y_imag * fyr;
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -348,7 +374,6 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
   const auto inv_scale = 1.0f / scale;
 
-  const auto index = static_cast<const int64_t*>(params.indices)[work_id];
   const int32_t page = static_cast<int32_t>(index >> kPageBits);
   const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
   const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * params.cache_page_stride;
@@ -362,7 +387,13 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   if (lane_id == 0) *reinterpret_cast<float*>(scale_ptr) = scale;
 }
 
-template <typename DType, bool kUsePDL, uint32_t kPageSize, bool kHadamard = false, bool kNeoxStyle = false>
+template <
+    typename DType,
+    bool kUsePDL,
+    uint32_t kPageSize,
+    bool kHadamard = false,
+    bool kNeoxStyle = false,
+    bool kApplyRope = true>
 struct FusedKIndexerNormRopeStoreKernel {
   static constexpr int32_t kPageBits = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132ll * kPageSize;
@@ -370,7 +401,7 @@ struct FusedKIndexerNormRopeStoreKernel {
 
   template <typename PosT>
   static constexpr auto kernel =
-      fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kHadamard, kNeoxStyle>;
+      fused_k_indexer_norm_rope_store<DType, PosT, kUsePDL, kPageBits, kHadamard, kNeoxStyle, kApplyRope>;
 
   static void forward(
       const tvm::ffi::TensorView k_input,
@@ -381,6 +412,35 @@ struct FusedKIndexerNormRopeStoreKernel {
       const tvm::ffi::TensorView cos_sin_cache,
       const tvm::ffi::TensorView positions,
       double eps) {
+    static_assert(kApplyRope);
+    launch(k_input, cache, indices, weight, bias, &cos_sin_cache, &positions, eps, 1, 0);
+  }
+
+  static void forward_no_rope(
+      const tvm::ffi::TensorView k_input,
+      const tvm::ffi::TensorView cache,
+      const tvm::ffi::TensorView indices,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView bias,
+      double eps,
+      int64_t dcp_size,
+      int64_t dcp_rank) {
+    static_assert(!kApplyRope && !kHadamard);
+    launch(k_input, cache, indices, weight, bias, nullptr, nullptr, eps, dcp_size, dcp_rank);
+  }
+
+ private:
+  static void launch(
+      const tvm::ffi::TensorView k_input,
+      const tvm::ffi::TensorView cache,
+      const tvm::ffi::TensorView indices,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView bias,
+      const tvm::ffi::TensorView* cos_sin_cache,
+      const tvm::ffi::TensorView* positions,
+      double eps,
+      int64_t dcp_size,
+      int64_t dcp_rank) {
     using namespace host;
     constexpr int64_t kHeadDim = 128;
     constexpr int64_t kRopeDim = 64;
@@ -413,15 +473,28 @@ struct FusedKIndexerNormRopeStoreKernel {
         .with_dtype<float>()
         .with_device(device_)
         .verify(bias);
-    TensorMatcher({-1, kRopeDim})  //
-        .with_dtype<float>()
-        .with_device(device_)
-        .verify(cos_sin_cache);
     auto pos_dtype = SymbolicDType{};
-    TensorMatcher({B})  //
-        .with_dtype<int32_t, int64_t>(pos_dtype)
-        .with_device(device_)
-        .verify(positions);
+    if constexpr (kApplyRope) {
+      TensorMatcher({-1, kRopeDim})  //
+          .with_dtype<float>()
+          .with_device(device_)
+          .verify(*cos_sin_cache);
+      TensorMatcher({B})  //
+          .with_dtype<int32_t, int64_t>(pos_dtype)
+          .with_device(device_)
+          .verify(*positions);
+    } else {
+      RuntimeCheck(
+          dcp_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_size,
+          "invalid dcp_size/dcp_rank: ",
+          dcp_size,
+          ", ",
+          dcp_rank);
+      RuntimeCheck(
+          (B.unwrap() <= 1 || k_input.stride(0) % 4 == 0) &&
+              reinterpret_cast<uintptr_t>(k_input.data_ptr()) % (4 * sizeof(DType)) == 0,
+          "unaligned index-K input");
+    }
 
     // A single-page view may report any row stride (DLPack normalizes it).
     const int64_t cache_page_stride = num_pages.unwrap() > 1 ? page_stride.unwrap() : kPageBytes;
@@ -440,17 +513,19 @@ struct FusedKIndexerNormRopeStoreKernel {
         .indices = indices.data_ptr(),
         .weight = static_cast<const float*>(weight.data_ptr()),
         .bias = static_cast<const float*>(bias.data_ptr()),
-        .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
-        .positions = positions.data_ptr(),
+        .cos_sin_cache = kApplyRope ? static_cast<const float*>(cos_sin_cache->data_ptr()) : nullptr,
+        .positions = kApplyRope ? positions->data_ptr() : nullptr,
         .k_input_stride_batch = k_input.stride(0),
         .cache_page_stride = cache_page_stride,
+        .dcp_size = dcp_size,
+        .dcp_rank = dcp_rank,
         .batch_size = batch_size,
         .eps = static_cast<float>(eps),
     };
     const auto num_blocks = div_ceil(batch_size, kFusedKIndexerNumWarps);
     const auto k_int32 = kernel<int32_t>;
     const auto k_int64 = kernel<int64_t>;
-    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    const auto k = !kApplyRope || pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(num_blocks, kFusedKIndexerBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }

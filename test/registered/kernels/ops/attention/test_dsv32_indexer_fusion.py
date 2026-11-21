@@ -18,8 +18,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsa.indexer_k import (
+    can_use_fused_k_indexer_norm_store,
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
+    fused_k_indexer_norm_store,
 )
 from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
@@ -142,6 +144,73 @@ def test_k_store_matches_unfused(strided):
     torch.cuda.synchronize()
 
     assert torch.equal(buf_ref, buf_fused)
+
+
+@pytest.mark.parametrize(
+    "rows,dcp_size,dcp_rank", [(1, 1, 0), (32768, 1, 0), (1024, 4, 3)]
+)
+def test_k_no_rope_norm_store_matches_unfused(rows, dcp_size, dcp_rank):
+    _skip_if_unavailable()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 no-RoPE indexer dispatch")
+    from flashinfer import norm
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    if norm._use_cuda_norm(device):
+        pytest.skip("Requires the CuTe LayerNorm reduction")
+    assert can_use_fused_k_indexer_norm_store(PAGE_SIZE, device)
+    assert can_use_dsa_fused_store(torch.bfloat16, torch.int64, PAGE_SIZE)
+
+    # Kimi-K3.1's merged [wk | head gate] projection has 32 gate columns.
+    torch.manual_seed(20261122)
+    key = torch.randn(rows, HEAD_DIM + 32, dtype=torch.bfloat16, device=device)[
+        :, :HEAD_DIM
+    ]
+    # A singleton row's stride may be normalized to one by DLPack. It
+    # is never used to reach a second row; the data pointer stays aligned.
+    ref_key = key
+    if rows == 1:
+        key = key.as_strided((1, HEAD_DIM), (1, 1))
+        assert key.stride(0) == 1
+    weight = 1 + 0.15 * torch.randn(HEAD_DIM, device=device)
+    bias = 0.05 * torch.randn(HEAD_DIM, device=device)
+    loc = torch.arange(rows, dtype=torch.int64, device=device)
+    if dcp_size > 1:
+        loc[::19] = -1
+
+    # Compare full allocations, including unwritten slots and page padding.
+    page_bytes = BYTES_PER_TOKEN * PAGE_SIZE
+    pages = (rows + PAGE_SIZE * dcp_size - 1) // (PAGE_SIZE * dcp_size) + 1
+    ref = torch.full((pages, page_bytes + 32), 165, dtype=torch.uint8, device=device)
+    fused = ref.clone()
+    normed = norm.layernorm(ref_key, weight, bias, 1e-5)
+    fused_store_index_k_cache(
+        normed, ref[:, :page_bytes], loc, PAGE_SIZE, dcp_size, dcp_rank
+    )
+
+    def run():
+        fused_k_indexer_norm_store(
+            key,
+            fused[:, :page_bytes],
+            loc,
+            weight,
+            bias,
+            1e-5,
+            PAGE_SIZE,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    assert torch.equal(fused, ref)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    fused.fill_(165)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(fused, ref)
 
 
 # ----------------------------------------------------------------------------

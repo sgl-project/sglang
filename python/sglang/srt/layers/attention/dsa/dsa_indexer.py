@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, 
 import torch
 from einops import rearrange
 
-from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
 from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     aiter_fused_fp8_qk_write,
     aiter_fused_fp8_writer_available,
@@ -75,7 +75,11 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
-from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
+from sglang.srt.layers.layernorm import (
+    LayerNorm,
+    RMSNorm,
+    _flashinfer_layernorm_available,
+)
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -217,8 +221,10 @@ if _is_cuda or _is_hip:
 
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa.indexer_k import (
+        can_use_fused_k_indexer_norm_store,
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
+        fused_k_indexer_norm_store,
     )
     from sglang.kernels.ops.attention.dsa.indexer_q import (
         fused_q_indexer_rope_first_quant,
@@ -1202,6 +1208,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         if self.skip_rope:
+            if self._try_fused_k_norm_store(key_raw, layer_id, out_cache_loc):
+                return
             self._store_index_k_cache(
                 forward_batch=forward_batch,
                 layer_id=layer_id,
@@ -1256,6 +1264,75 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             act_quant=act_quant,
             out_cache_loc=out_cache_loc,
         )
+
+    def _try_fused_k_norm_store(
+        self, key_raw: torch.Tensor, layer_id: int, out_cache_loc: torch.Tensor
+    ) -> bool:
+        # Kimi-K3.1 uses no indexer RoPE/Hadamard and FP32 LayerNorm parameters.
+        # Keep the existing path for unvalidated architectures and norm formats.
+        if not (
+            _is_cuda
+            and get_platform().is_sm120
+            and not _is_fp8_fnuz
+            and not self.fp4_index_k
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and get_fused_op_backend() is None
+            and _flashinfer_layernorm_available
+            and self.skip_rope
+            and not self.apply_hadamard
+            and self.block_size == self.head_dim == 128
+            and isinstance(self.k_norm, LayerNorm)
+            and self.k_norm.elementwise_affine
+            and self.k_norm.use_bias
+            and self.k_norm.dtype == torch.float32
+            and self.k_norm.weight.dtype == self.k_norm.bias.dtype == torch.float32
+            and self.k_norm.weight.is_contiguous()
+            and self.k_norm.bias.is_contiguous()
+            and key_raw.dtype == torch.bfloat16
+            and key_raw.ndim == 2
+            and key_raw.shape[-1] == 128
+            and key_raw.stride(-1) == 1
+            and (key_raw.shape[0] <= 1 or key_raw.stride(0) % 4 == 0)
+            and key_raw.storage_offset() % 4 == 0
+            and out_cache_loc is not None
+            and out_cache_loc.dtype == torch.int64
+        ):
+            return False
+        pool = get_token_to_kv_pool()
+        page_size = pool.index_page_size
+        if page_size != 64 or not can_use_fused_k_indexer_norm_store(
+            page_size, key_raw.device
+        ):
+            return False
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return True
+
+        dcp_size, dcp_rank = _index_k_dcp()
+        if dcp_size > 1:
+            targets = (
+                (
+                    pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                    out_cache_loc,
+                    None,
+                ),
+            )
+        else:
+            targets = _index_k_write_targets(pool, layer_id, out_cache_loc)
+        for buf, loc, rows in targets:
+            fused_k_indexer_norm_store(
+                key_raw if rows is None else key_raw.index_select(0, rows),
+                buf,
+                loc,
+                self.k_norm.weight,
+                self.k_norm.bias,
+                self.k_norm.variance_epsilon,
+                page_size,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+            )
+        return True
 
     def _quantize_query(
         self, query: torch.Tensor, act_quant
