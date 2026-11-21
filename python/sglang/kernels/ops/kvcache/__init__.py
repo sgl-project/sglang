@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -49,6 +49,16 @@ def reshape_and_cache_flash(
 
 
 __all__ = ["reshape_and_cache_flash"]
+
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.dsv41_int8_decode_pages",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.dsv41_int8_pages:decode_pages",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
 
 
 # Other Triton kernels migrated into this group (from attention/mem_cache

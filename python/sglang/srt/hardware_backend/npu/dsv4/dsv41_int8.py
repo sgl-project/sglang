@@ -134,7 +134,7 @@ def decode_int8(
     return ((values.float() * selected) * factor).clamp(-limit, limit).bfloat16()
 
 
-def physical_page_map(block_table, page_size, lengths, *, fixed_shape):
+def physical_page_map(block_table, page_size, lengths, *, fixed_shape, pool_pages=None):
     """Return referenced physical IDs and their page table for the operator."""
     page_pos = torch.arange(
         block_table.shape[1], device=block_table.device, dtype=torch.int32
@@ -142,6 +142,15 @@ def physical_page_map(block_table, page_size, lengths, *, fixed_shape):
     valid = (page_pos * page_size < lengths.reshape(-1, 1)) & (block_table > 0)
     ids = torch.where(valid, block_table, 0).flatten()
     ids = torch.cat((ids.new_zeros(1), ids))
+    if fixed_shape and pool_pages is not None and ids.numel() > pool_pages:
+        # A padded batch may address more logical slots than exist in the
+        # physical pool. Keep a single workspace row for each physical page.
+        live = ids.new_zeros(pool_pages)
+        live.index_fill_(0, ids.long(), 1)
+        physical = torch.arange(pool_pages, dtype=torch.int32, device=ids.device)
+        physical = torch.where(live != 0, physical, 0)
+        table = torch.where(valid, block_table, block_table.clamp_max(0))
+        return physical, table.int().contiguous()
     if fixed_shape:
         # Graph replay can change physical page IDs and live sequence lengths.
         # Keep one scratch page per table entry so the allocation shape is static.
