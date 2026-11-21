@@ -322,6 +322,33 @@ class TestMMPadding(CustomTestCase):
                 self.assertIs(pad(input_ids, mm_inputs), input_ids)
                 self.assertEqual(mm_inputs.data_offsets, [])
 
+    def test_token_pairs_with_optional_none_pair(self):
+        # minicpmo passes a (None, None) pair when a tokenizer lacks the
+        # optional audio start/end tokens (see models/minicpmo.py); the
+        # combined-scan's numpy id arrays must drop None rather than crash
+        # building them, and must still match only the real pairs.
+        pairs = [(10, 11), (None, None)]
+        mm_inputs = MultimodalInputs(
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE, pad_value=1000)]
+        )
+        input_ids = array("q", [1, 10, 0, 11, 2])
+        expected = array("q", [1, 10, 1000, 11, 2])
+        self.assertEqual(
+            pad_mm_token_pairs(input_ids, mm_inputs, data_token_pairs=pairs), expected
+        )
+        self.assertEqual(mm_inputs.data_offsets, [1])
+
+    def test_token_pairs_empty_input(self):
+        mm_inputs = MultimodalInputs(
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE, pad_value=1000)]
+        )
+        input_ids = array("q")
+        self.assertEqual(
+            pad_mm_token_pairs(input_ids, mm_inputs, data_token_pairs=[(10, 11)]),
+            array("q"),
+        )
+        self.assertEqual(mm_inputs.data_offsets, [])
+
     def test_legacy_configuration_remains_mutable_without_warnings(self):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
