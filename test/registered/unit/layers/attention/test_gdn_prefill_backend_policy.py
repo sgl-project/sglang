@@ -4,7 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
 
 import torch
+from transformers import PretrainedConfig
 
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
@@ -29,7 +33,8 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     set_external_prefill_body,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -540,6 +545,85 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
+
+
+class TestFlashInferGDNFP32DecodePolicy(unittest.TestCase):
+    def resolve(self, args, config, capability=(12, 0)):
+        with (
+            patch(
+                "sglang.srt.arg_groups.attention_hook.model_config_of",
+                return_value=SimpleNamespace(hf_config=config),
+            ),
+            patch("torch.cuda.get_device_capability", return_value=capability),
+            override_platform(is_cuda=True, is_sm100=capability[0] == 10),
+        ):
+            handle_linear_attn_backend(args)
+
+    def test_explicit_fp32_decode_uses_triton_verify(self):
+        for verify in (None, "triton"):
+            with self.subTest(verify=verify):
+                args = ServerArgs(
+                    model_path="dummy",
+                    mamba_ssm_dtype="float32",
+                    linear_attn_decode_backend="flashinfer",
+                    linear_attn_verify_backend=verify,
+                )
+                self.resolve(args, Qwen3NextConfig())
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_decode_backend"), "flashinfer"
+                )
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_verify_backend"), "triton"
+                )
+                self.assertIsNone(
+                    resolution_result(args, "linear_attn_prefill_backend")
+                )
+
+    def test_fp32_default_and_explicit_verify_are_unchanged(self):
+        args = ServerArgs(model_path="dummy", mamba_ssm_dtype="float32")
+        self.resolve(args, Qwen3NextConfig())
+        self.assertIsNone(resolution_result(args, "linear_attn_decode_backend"))
+
+        args = ServerArgs(
+            model_path="dummy",
+            mamba_ssm_dtype="float32",
+            linear_attn_decode_backend="flashinfer",
+            linear_attn_verify_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "verify-backend flashinfer.*requires"):
+            self.resolve(args, Qwen3NextConfig())
+
+    def test_other_geometries_architectures_and_inherited_decode_stay_gated(self):
+        cases = (
+            (Qwen3NextConfig(linear_key_head_dim=64), (12, 0), "triton", "flashinfer"),
+            (
+                Qwen3NextConfig(linear_value_head_dim=64),
+                (12, 0),
+                "triton",
+                "flashinfer",
+            ),
+            (PretrainedConfig(), (12, 0), "triton", "flashinfer"),
+            (Qwen3NextConfig(), (10, 0), "triton", "flashinfer"),
+            (Qwen3NextConfig(), (12, 1), "triton", "flashinfer"),
+            (Qwen3NextConfig(), (12, 0), "flashinfer", None),
+        )
+        for config, capability, base, decode in cases:
+            with self.subTest(
+                config=type(config).__name__,
+                capability=capability,
+                base=base,
+                decode=decode,
+            ):
+                args = ServerArgs(
+                    model_path="dummy",
+                    mamba_ssm_dtype="float32",
+                    linear_attn_backend=base,
+                    linear_attn_decode_backend=decode,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "decode-backend flashinfer.*requires"
+                ):
+                    self.resolve(args, config, capability)
 
 
 if __name__ == "__main__":

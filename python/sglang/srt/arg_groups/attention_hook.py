@@ -294,7 +294,7 @@ def handle_linear_attn_backend(server_args: Any):
 
     # SM100+: default to FlashInfer GDN decode (and MTP verify, via pool API)
     # when the user hasn't explicitly chosen a decode backend and
-    # mamba-ssm-dtype is bf16 (required by FlashInfer GDN on SM100+).
+    # mamba-ssm-dtype is bf16.
     # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
     if (
         cfg.linear_attn_decode_backend is None
@@ -316,7 +316,6 @@ def handle_linear_attn_backend(server_args: Any):
             "defaulting --linear-attn-decode-backend to flashinfer."
         )
 
-    # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
 
     # FlashKDA is a prefill-only KDA kernel (no decode kernel) but shares the
@@ -342,21 +341,51 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # FlashInfer's single-token indexed FP32 state path works on SM120 for
+    # 128-dimensional GDN key/value heads. Keep this an explicit decode-only
+    # opt-in; the BF16 defaults, KDA, and other architectures are unchanged.
+    fp32_sm120_gdn_decode = False
+    if (
+        cfg.linear_attn_decode_backend == "flashinfer"
+        and cfg.mamba_ssm_dtype == "float32"
+        and get_platform().is_cuda
+        and torch.cuda.get_device_capability() == (12, 0)
+    ):
+        from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+        gdn_config = hybrid_gdn_config(model_config_of(server_args))
+        fp32_sm120_gdn_decode = (
+            getattr(gdn_config, "linear_key_head_dim", None) == 128
+            and getattr(gdn_config, "linear_value_head_dim", None) == 128
+        )
+
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
+        and not fp32_sm120_gdn_decode
     ):
         raise ValueError(
             "--linear-attn-decode-backend flashinfer on SM100+ requires "
-            "--mamba-ssm-dtype bfloat16, "
+            "--mamba-ssm-dtype bfloat16 except for explicit SM120 GDN FP32 "
+            "decode with 128-dimensional key/value heads; "
             f"got {cfg.mamba_ssm_dtype!r}"
         )
 
     verify = cfg.linear_attn_verify_backend
     if verify is None and decode == "flashinfer":
-        verify = "flashinfer"
+        if fp32_sm120_gdn_decode:
+            # FlashInfer GDN target verification is not supported on SM120.
+            declare_resolution(
+                server_args,
+                "_handle_linear_attn_backend",
+                linear_attn_verify_backend="triton",
+            )
+            verify = "triton"
+            logger.info("SM120 FP32 GDN FlashInfer decode uses Triton target verify.")
+        else:
+            verify = "flashinfer"
     if (
         pp_spec_stable_rows_enabled()
         and verify == "flashinfer"
