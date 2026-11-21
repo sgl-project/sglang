@@ -89,11 +89,7 @@ class TestMlaDcpDecodeEmptyRowsGfx950(CustomTestCase):
 
     @unittest.skipUnless(_gluon_fn() is not None, "needs Triton with Gluon cga_layout")
     def test_gluon_rows_without_local_kv_return_a_zero_partial_with_no_weight(self):
-        """A DCP rank whose shard of a short request is empty must not hand the merge stale memory.
-
-        With this many requests the kernel runs a single KV split and, for an empty row, stores nothing
-        into its uninitialized out/lse buffers.
-        """
+        """A DCP rank whose shard of a short request is empty must not hand the merge stale memory."""
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
         device = get_device()
