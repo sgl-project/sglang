@@ -167,12 +167,12 @@ class KdaTpStaging:
                 still.append((event, stages))
         self._draining = still
 
-    def has_room(self, allocator, req_pool=None) -> bool:
+    def has_room(self, req_to_token_pool) -> bool:
         self._reclaim()
         if len(self._free) <= self._reserved and self._stage_of:
             # Reclaim stages leaked by requests freed outside free_mamba_cache (one sync).
-            free_slots = set(allocator.free_slots.tolist())
-            free_rows = set(req_pool.free_slots) if req_pool is not None else set()
+            free_slots = set(req_to_token_pool.mamba_allocator.free_slots.tolist())
+            free_rows = set(req_to_token_pool.free_slots)
             stale = [
                 s
                 for s in self._stage_of
@@ -208,6 +208,7 @@ class KdaTpStaging:
         self._stage_of[slot] = self._stage_of.pop(key)
 
     def assign(self, slot: int, reserved: bool = False) -> int:
+        self._reclaim()
         if slot in self._stage_of:
             # The slot was freed and reallocated without release_slot.
             self.release_slot(slot)
@@ -318,9 +319,6 @@ class KdaTpStaging:
         ):
             req.kda_tp_lazy_mamba = True
 
-    def has_prealloc_room(self, req_to_token_pool) -> bool:
-        return self.has_room(req_to_token_pool.mamba_allocator, req_to_token_pool)
-
     def reserve_for(self, req) -> None:
         # Deferred publish assigns the stage later; hold it so has_room counts it.
         self.reserve()
@@ -348,6 +346,28 @@ class KdaTpStaging:
             if getattr(req, "kda_tp_staged_slot", None) is not None:
                 self.queue_import(req.kda_tp_staged_slot)
                 req.kda_tp_staged_slot = None
+
+
+def maybe_run_imports(model_runner, forward_batch) -> None:
+    """Import PD-received KDA states before anything in this forward reads them."""
+    if (
+        forward_batch.kda_tp_state_imports
+        and forward_batch.dp_kda_tp_state_imports is None
+    ):
+        raise RuntimeError(
+            "KDA TP: this rank has PD state imports but no DP import counts "
+            "(the scheduler's DP all-gather did not run)"
+        )
+    if (
+        forward_batch.dp_kda_tp_state_imports is None
+        or model_runner.is_draft_worker
+    ):
+        return
+    mamba_pool = model_runner.req_to_token_pool.mamba_pool
+    if mamba_pool.pd_staging is not None:
+        mamba_pool.pd_staging.run_imports(mamba_pool, forward_batch)
+    elif any(forward_batch.dp_kda_tp_state_imports):
+        raise RuntimeError("KDA TP: state imports advertised without PD staging")
 
 
 def mirror_deferred_state_ops(model_runner, forward_batch) -> None:

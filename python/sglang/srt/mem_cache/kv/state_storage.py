@@ -201,7 +201,7 @@ class StateStorage:
             if mids is not None and len(needing) == len(reqs)
             else torch.stack(
                 [
-                    # The padding slot until _admit_lazy_mamba_slot binds a real one.
+                    # The padding slot until KdaTpStaging.admit binds a real one.
                     torch.zeros((), dtype=torch.int32, device=table.device)
                     if is_lazy
                     else req.kv.mamba_pool_idx.to(torch.int32)

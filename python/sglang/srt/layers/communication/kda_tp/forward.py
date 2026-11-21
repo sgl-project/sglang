@@ -33,7 +33,24 @@ class Context(msgspec.Struct):
     mode: Any  # ForwardMode shared by every rank (fast path) or None (general path)
     batch: Any  # the forward batch the KDA backend sees on the fast path
     metadata: Any = None  # fast path: every rank's metadata, installed per layer
+    verify_rows: Optional[torch.Tensor] = None  # fast path: verify scratch rows
     sources: Optional[List[Source]] = None  # general path
+
+
+def _dp_max_rows(local_rows: int, counts: Optional[List[int]] = None) -> int:
+    """Rows per rank of a TP-group collective over every attention-DP rank's rows."""
+    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+
+    if counts is None:
+        counts = get_dp_global_num_tokens()
+    if not counts:
+        raise RuntimeError("KDA TP: rows need the DP global token counts")
+    rows = max(counts)
+    if local_rows > rows:
+        raise RuntimeError(
+            f"KDA TP: {local_rows} local rows exceed the DP maximum {rows}"
+        )
+    return rows
 
 
 def source_tokens(src: Source) -> int:
@@ -130,8 +147,10 @@ class KdaTp:
         self.ctx: Optional[Context] = None
         # Never freed or rebound: CUDA-graph captures record their addresses.
         self._buffers: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
-        # Collective workspace request: every rank, before graph capture.
-        k3_sp_collective.tp_group_state()
+        # Pre-create workspace and symmetric buffers at init, before KV pool sizing and graph capture.
+        self._comm = k3_sp_collective.GroupCollective(
+            group(), "kda_tp_all_gather", with_o_proj=True, require_a2a=False
+        )
 
     def context(self) -> Context:
         if self.ctx is None:
@@ -144,35 +163,15 @@ class KdaTp:
         # May return a persistent buffer that the next KDA TP all-gather overwrites.
         # A prefill graph holding this replays only when every DP rank runs its recorded bucket.
         _note_dp_gather_in_prefill_graph()
-        g = group()
-        return k3_sp_collective.all_gather_rows(
-            x,
-            rows,
-            g,
-            k3_sp_collective.tp_rows_state(g.world_size * rows),
-            "kda_tp_all_gather",
-        )
+        return self._comm.all_gather_rows(x, rows)
 
     def o_proj_output(
         self, total_rows: int, width: int, dtype: torch.dtype
     ) -> Optional[torch.Tensor]:
-        state = k3_sp_collective.tp_rows_state(total_rows)
-        if state is None or not k3_sp_collective.requires_symmetric_rs(
-            total_rows,
-            torch.device("cuda"),
-            torch.empty((), dtype=dtype).element_size(),
-            state=state,
-            fused=False,
-        ):
-            return None
-        return k3_sp_collective.get_o_proj_output_buffer(
-            total_rows, dtype, width, state=state
-        )
+        return self._comm.o_proj_output(total_rows, width, dtype)
 
     def reduce_scatter_rows(self, y: torch.Tensor, local_rows: int) -> torch.Tensor:
-        return k3_sp_collective.reduce_scatter_rows(
-            y, local_rows, group(), k3_sp_collective.tp_rows_state(y.shape[0])
-        )
+        return self._comm.reduce_scatter_rows(y, local_rows)
 
     def _buffer(self, name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
         buf = self._buffers.get((name, dtype))
@@ -207,7 +206,7 @@ class KdaTp:
         counts: Optional[List[int]] = None,
     ) -> None:
         # A collective: idle DP ranks call it too.
-        R = k3_sp_collective.dp_max_rows(local_rows, counts)
+        R = _dp_max_rows(local_rows, counts)
         kinds = _global_kinds(forward_batch)
         active = {k for k in kinds if k != "idle"}
         if len(active) <= 1 and active <= {"decode", "verify"}:
@@ -313,12 +312,12 @@ class KdaTp:
         qsl.copy_(
             torch.arange(0, W * bs * D + 1, D, dtype=torch.int32, device=slots.device)
         )
+        verify_rows = None
         if kind == "verify":
             # Request i of DP rank j uses verify scratch row j * n + i (n: per-rank capacity).
             pos = torch.arange(W * bs, dtype=torch.int64, device=slots.device)
-            rows = self._buffer("verify_rows", W * cap, torch.int32)[: W * bs]
-            rows.copy_(_scratch_rows(backend, (pos // bs) * cap + pos % bs))
-            backend.verify_intermediate_state_indices = rows
+            verify_rows = self._buffer("verify_rows", W * cap, torch.int32)[: W * bs]
+            verify_rows.copy_(_scratch_rows(backend, (pos // bs) * cap + pos % bs))
         gathered = dataclasses.replace(
             fm,
             query_start_loc=qsl,
@@ -341,7 +340,12 @@ class KdaTp:
             mamba_track_mask=track_mask,
         )
         return Context(
-            local_rows=local_rows, R=R, mode=mode, batch=batch, metadata=gathered
+            local_rows=local_rows,
+            R=R,
+            mode=mode,
+            batch=batch,
+            metadata=gathered,
+            verify_rows=verify_rows,
         )
 
     def _general_context(self, forward_batch, backend, local_rows, R) -> Context:
@@ -362,6 +366,9 @@ class KdaTp:
             for f in dataclasses.fields(fm):
                 v = getattr(fm, f.name)
                 if isinstance(v, torch.Tensor):
+                    assert not v.is_floating_point(), (
+                        f"KDA TP: float metadata tensor {f.name} cannot pack into int64"
+                    )
                     tensors[f.name] = v
                 else:
                     scalars[f.name] = v

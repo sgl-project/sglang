@@ -2653,6 +2653,38 @@ class KimiK3DeltaAttention(nn.Module):
             return partial
         return self.o_proj(core_attn_out)[0]
 
+    def _run_kda_tp_core(
+        self,
+        backend,
+        batch,
+        metadata,
+        mixed_qkv: torch.Tensor,
+        forget_gate: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        verify_rows: Optional[torch.Tensor] = None,
+        defer_f_b: bool = False,
+    ) -> torch.Tensor:
+        if not batch.forward_mode.is_decode() and not defer_f_b:
+            forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim)).unsqueeze(0)
+        linear = backend.linear_attn_backend
+        own_metadata = linear.forward_metadata
+        own_rows = linear.verify_intermediate_state_indices
+        linear.forward_metadata = metadata
+        if verify_rows is not None:
+            linear.verify_intermediate_state_indices = verify_rows
+        try:
+            return backend.forward(
+                layer=self.attn,
+                forward_batch=batch,
+                mixed_qkv=mixed_qkv,
+                a=forget_gate,
+                b=beta.unsqueeze(0),
+            )
+        finally:
+            linear.forward_metadata = own_metadata
+            linear.verify_intermediate_state_indices = own_rows
+
     def forward_kda_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -2666,9 +2698,6 @@ class KimiK3DeltaAttention(nn.Module):
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 x, defer_f_b=defer_f_b
             )
-            if not mode.is_decode() and not defer_f_b:
-                forget_gate = forget_gate.unflatten(-1, (-1, D)).unsqueeze(0)
-            beta = beta.unsqueeze(0)
             fused_onorm = (self._kda_fused_decode_ready or defer_f_b) and (
                 mode.is_decode() or mode.is_target_verify()
             )
@@ -2677,24 +2706,23 @@ class KimiK3DeltaAttention(nn.Module):
                 self.attn._k3_onorm_consumed = False
             if defer_f_b:
                 self.attn._k3_deferred_f_b = True
-            linear = backend.linear_attn_backend
-            own_metadata = linear.forward_metadata
-            linear.forward_metadata = ctx.metadata
             try:
-                core = backend.forward(
-                    layer=self.attn,
-                    forward_batch=ctx.batch,
-                    mixed_qkv=mixed_qkv,
-                    a=forget_gate,
-                    b=beta,
+                core = self._run_kda_tp_core(
+                    backend,
+                    ctx.batch,
+                    ctx.metadata,
+                    mixed_qkv,
+                    forget_gate,
+                    beta,
+                    verify_rows=ctx.verify_rows,
+                    defer_f_b=defer_f_b,
                 )
             finally:
-                linear.forward_metadata = own_metadata
-            if fused_onorm:
-                self.attn._k3_onorm_gate = None
-                fused_onorm = self.attn._k3_onorm_consumed
-            if defer_f_b:
-                self.attn._k3_deferred_f_b = False
+                if fused_onorm:
+                    self.attn._k3_onorm_gate = None
+                    fused_onorm = self.attn._k3_onorm_consumed
+                if defer_f_b:
+                    self.attn._k3_deferred_f_b = False
             core = core.reshape(-1, H, D)
         else:
             # General path (eager, some DP rank in extend): one core call per source rank.
@@ -2704,31 +2732,24 @@ class KimiK3DeltaAttention(nn.Module):
             )
             core = x.new_zeros((x.shape[0], H, D))
             linear = backend.linear_attn_backend
-            own_metadata = linear.forward_metadata
-            own_rows = linear.verify_intermediate_state_indices
-            try:
-                for src in ctx.sources:
-                    start = src.rank * ctx.R
-                    rows = slice(start, start + source_tokens(src))
-                    linear.forward_metadata = src.metadata
-                    if src.batch.forward_mode.is_target_verify():
-                        linear.verify_intermediate_state_indices = source_scratch_rows(
-                            linear, src
-                        )
-                    a = forget_gate[rows]
-                    if not src.batch.forward_mode.is_decode():
-                        a = a.unflatten(-1, (-1, D)).unsqueeze(0)
-                    out = backend.forward(
-                        layer=self.attn,
-                        forward_batch=src.batch,
-                        mixed_qkv=mixed_qkv[rows],
-                        a=a,
-                        b=beta[rows].unsqueeze(0),
-                    )
-                    core[rows] = out.reshape(-1, H, D)
-            finally:
-                linear.forward_metadata = own_metadata
-                linear.verify_intermediate_state_indices = own_rows
+            for src in ctx.sources:
+                start = src.rank * ctx.R
+                rows = slice(start, start + source_tokens(src))
+                verify_rows = (
+                    source_scratch_rows(linear, src)
+                    if src.batch.forward_mode.is_target_verify()
+                    else None
+                )
+                out = self._run_kda_tp_core(
+                    backend,
+                    src.batch,
+                    src.metadata,
+                    mixed_qkv[rows],
+                    forget_gate[rows],
+                    beta[rows],
+                    verify_rows=verify_rows,
+                )
+                core[rows] = out.reshape(-1, H, D)
         return self._kda_tp_output(
             core, g_proj_states, hidden_states.shape[0], fused_onorm=fused_onorm
         )

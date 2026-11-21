@@ -1825,7 +1825,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 break
 
-            if kda_tp_staging is not None and not kda_tp_staging.has_prealloc_room(
+            if kda_tp_staging is not None and not kda_tp_staging.has_room(
                 self.req_to_token_pool
             ):
                 break

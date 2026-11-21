@@ -2164,26 +2164,11 @@ class ModelRunner:
                 )
 
             if get_flags().dp.kda_tp:
-                if (
-                    forward_batch.kda_tp_state_imports
-                    and forward_batch.dp_kda_tp_state_imports is None
-                ):
-                    raise RuntimeError(
-                        "KDA TP: this rank has PD state imports but no DP import counts "
-                        "(the scheduler's DP all-gather did not run)"
-                    )
-                if (
-                    forward_batch.dp_kda_tp_state_imports is not None
-                    and not self.is_draft_worker
-                ):
-                    mamba_pool = self.req_to_token_pool.mamba_pool
-                    if mamba_pool.pd_staging is not None:
-                        # KDA TP PD decode: import received states before anything reads them.
-                        mamba_pool.pd_staging.run_imports(mamba_pool, forward_batch)
-                    elif any(forward_batch.dp_kda_tp_state_imports):
-                        raise RuntimeError(
-                            "KDA TP: state imports advertised without PD staging"
-                        )
+                from sglang.srt.layers.communication.kda_tp.staging import (
+                    maybe_run_imports,
+                )
+
+                maybe_run_imports(self, forward_batch)
 
             # Replay cuda graph if applicable
             if can_run_graph:
