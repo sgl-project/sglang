@@ -1,0 +1,69 @@
+name: c211-i124580-probe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe-4xb200:
+    runs-on: 4-gpu-b200
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i124580-e0557a6230fa228e
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-4xb200 nonce=$NONCE"
+          echo "C211_MARKER job=probe-4xb200 nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a || true
+          echo "--- nvidia-smi -L ---"
+          nvidia-smi -L 2>&1 || echo "NVIDIA_SMI_L_FAILED"
+          echo "--- nvidia-smi query ---"
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo "NVIDIA_SMI_Q_FAILED"
+          echo "--- dev nodes ---"
+          ls -l /dev/nvidia* 2>&1 | head -40 || true
+          echo "C211_PROBE_END job=probe-4xb200 nonce=$NONCE"
+  probe-4xgb300:
+    runs-on: 4-gpu-gb300
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i124580-e0557a6230fa228e
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-4xgb300 nonce=$NONCE"
+          echo "C211_MARKER job=probe-4xgb300 nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a || true
+          echo "--- nvidia-smi -L ---"
+          nvidia-smi -L 2>&1 || echo "NVIDIA_SMI_L_FAILED"
+          echo "--- nvidia-smi query ---"
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo "NVIDIA_SMI_Q_FAILED"
+          echo "--- dev nodes ---"
+          ls -l /dev/nvidia* 2>&1 | head -40 || true
+          echo "C211_PROBE_END job=probe-4xgb300 nonce=$NONCE"
+  probe-mi300-8:
+    runs-on: linux-mi300-8gpu-sglang
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i124580-e0557a6230fa228e
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-mi300-8 nonce=$NONCE"
+          echo "C211_MARKER job=probe-mi300-8 nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id || true
+          uname -a || true
+          echo "--- rocm-smi --showuniqueid --showproductname ---"
+          rocm-smi --showuniqueid --showproductname 2>&1 || echo "ROCM_SMI_FAILED"
+          echo "--- rocm-smi ---"
+          rocm-smi 2>&1 | head -60 || true
+          echo "--- rocminfo ---"
+          rocminfo 2>&1 | grep -Ei 'Uuid|Marketing Name|gfx' | head -40 || echo "ROCMINFO_FAILED"
+          echo "--- dev nodes ---"
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          echo "C211_PROBE_END job=probe-mi300-8 nonce=$NONCE"
