@@ -498,7 +498,13 @@ def _chunk_scan_fwd_kernel(
         # So we don't need masking wrt seq_idx here.
         cb *= tl.exp(dA_cs_m[:, None] - dA_cs_k[None, :])
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
-        cb *= dt_k
+        if HAS_SEQ_IDX:
+            # cb is exactly 0 for another request's token k, but 0 * inf is nan, so
+            # a non-finite dt_k would reach this request's rows. Only scale the
+            # entries that are not already masked out.
+            cb = tl.where(cb != 0.0, cb * dt_k, cb)
+        else:
+            cb *= dt_k
         if IS_CAUSAL:
             mask = offs_m[:, None] >= k + offs_k[None, :]
             cb = tl.where(mask, cb, 0.0)
