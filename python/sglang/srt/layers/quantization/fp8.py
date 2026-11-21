@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
+    _use_aiter_gfx942,
     aiter_mxfp8_gfx1250_block_fp8_linear,
     apply_fp8_linear,
     block_fp8_scale_to_e8m0_128,
@@ -953,13 +954,22 @@ class Fp8LinearMethod(LinearMethodBase):
         # read directly by the model (DeepSeek-V4 wo_a, whose absorb GEMM takes
         # .weight/.weight_scale_inv and runs its own batched kernel) sets
         # keep_plain_weight_layout and keeps the plain row-major layout.
+        # gfx942 preshuffles with the CK path (SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK);
+        # the CK bpreshuffle instances need N % 64 == 0.
+        bpreshuffle_gfx942 = (
+            _use_aiter_gfx942 and envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()
+        )
         if (
-            _use_aiter_bpreshuffle_gfx95
+            (_use_aiter_bpreshuffle_gfx95 or bpreshuffle_gfx942)
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
             and not getattr(layer, "keep_plain_weight_layout", False)
         ):
             n, k = layer.weight.shape
-            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+            if (
+                not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
+                if _use_aiter_bpreshuffle_gfx95
+                else use_aiter_bpreshuffle_gemm(n)
+            ):
                 # TODO(1am9trash), to deal with case that this branch chance
                 # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
                 t = shuffle_weight(layer.weight, (16, 16))
