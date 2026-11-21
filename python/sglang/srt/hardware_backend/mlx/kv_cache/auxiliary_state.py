@@ -15,11 +15,14 @@ from typing import Any, Iterable, Iterator, Optional
 import mlx.core as mx
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    InsertResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
-from sglang.srt.mem_cache.kv.state_storage import StateStorage
+from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted, StateStorage
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
@@ -243,6 +246,10 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
     """Req-to-token pool with MLX auxiliary-state slot bookkeeping. It never
     frees auxiliary slots: ``MlxAuxiliaryStateComponent`` owns their release."""
 
+    # The admission preflight (ensure_mamba_capacity) and the base
+    # MambaComponent gate on this capability, not on a concrete pool type.
+    holds_state_slots = True
+
     def __init__(
         self,
         *,
@@ -281,18 +288,36 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         )
 
     def alloc(self, reqs):
+        # Reserve the auxiliary slots before binding rows: a shortfall must
+        # surface before any request row is consumed. acquire_rows rolls back
+        # only a StateSlotsExhausted raised after the rows were bound, and a
+        # plain assert here would leak the row it already handed out.
+        needing = [req for req in reqs if not req.kv.holds_mamba]
+        reserved = None
+        if needing:
+            reserved = self.auxiliary_state_pool.alloc(len(needing))
+            if reserved is None:
+                raise StateSlotsExhausted(
+                    "Not enough MLX auxiliary state slots, try to increase "
+                    "--max-mamba-cache-size. "
+                    f"{self.auxiliary_state_pool.size=}, "
+                    f"{self.auxiliary_state_pool.available_size()=}, "
+                    f"{len(needing)=}"
+                )
         select_index = super().alloc(reqs)
         if select_index is None:
+            if reserved is not None:
+                self.auxiliary_state_pool.free(reserved)
             return None
 
         auxiliary_state_indices = []
+        offset = 0
         for req in reqs:
             if req.kv.holds_mamba:
                 mid = req.kv.mamba_pool_idx
             else:
-                allocated = self.auxiliary_state_pool.alloc(1)
-                assert allocated is not None, "Not enough MLX auxiliary state slots"
-                mid = allocated[0]
+                mid = reserved[offset]
+                offset += 1
                 req.kv.mamba_pool_idx = mid
             auxiliary_state_indices.append(mid.to(dtype=torch.int32))
         self.req_index_to_auxiliary_state_index_mapping[select_index] = torch.stack(
@@ -349,9 +374,34 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 "MlxAuxiliaryStateComponent requires MlxAuxiliaryStatePool, "
                 f"got {type(pool)}"
             )
-        TreeComponent.__init__(self, cache, params, slot)
+        # Inherit the base config fields (mamba_cache_chunk_size,
+        # mamba_checkpoint_grid, mamba_max_states_per_path, checkpoints_level,
+        # host_only_checkpoint): the inherited match/insert helpers read them.
+        # The base gate is capability-based (holds_state_slots), which the
+        # MLX request table declares.
+        super().__init__(cache, params, slot)
         self.enable_mamba_extra_buffer = False
-        self._mamba_pool_host = None
+
+    def finalize_match_result_in_cache(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
+        result = super().finalize_match_result_in_cache(params, result)
+        req = params.req
+        if (
+            params.cow_mamba
+            and req is not None
+            and req.kv.holds_mamba
+            and req.kv.mamba_cow_src_index is not None
+        ):
+            # The MLX runner has no deferred CoW apply pass (the static pools
+            # never share memory, so the scheduler never defers the slot):
+            # copy the matched snapshot into the request slot now, or every
+            # prefix hit would silently recompute the full prompt.
+            self.cache.req_to_token_pool.auxiliary_state_pool.copy_from(
+                req.kv.mamba_cow_src_index, req.kv.mamba_pool_idx.unsqueeze(0)
+            )
+            req.kv.mamba_cow_src_index = None
+        return result
 
     @staticmethod
     def _tracked_value(req) -> tuple[object | None, bool]:
