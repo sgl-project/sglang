@@ -231,9 +231,8 @@ def apply_dflash_verify_logits_adjustments(
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    `verify_tokens` [bs, draft_token_num] are the block's input tokens: the
-    anchor, then the drafts each row's penalties count up to its own position.
-    Only penalties read them; they may be None when the step has none.
+    `verify_tokens` [bs, draft_token_num]: the anchor, then the drafts. Only
+    penalties read them; None when the step has none.
     """
     if sampling_info is None:
         return

@@ -53,17 +53,7 @@ __global__ void accumulate_penalty_counts_kernel(const __grid_constant__ Accumul
   atomicAdd(&p.lens[penalty_index], 1);
 }
 
-/**
- * \brief Count each penalized request's accepted in-vocab tokens into its
- * history row.
- *
- * \param counts          `[num_rows, vocab]` int32 per-token history counts
- * \param lens            `[num_rows]` int32 history lengths
- * \param batch_indices   `[n]` int64 batch position of each penalized request
- * \param penalty_indices `[n]` int64 history row of each penalized request
- * \param token_ids       `[bs, k]` int32 or int64 sampled or verify tokens
- * \param accept_mask     `[bs, k]` bool marking the tokens that count, or absent
- */
+/// Count accepted in-vocab tokens into each penalized request's history row; see `penalty_counts.py`.
 inline void accumulate_penalty_counts(
     tvm::ffi::TensorView counts,
     tvm::ffi::TensorView lens,

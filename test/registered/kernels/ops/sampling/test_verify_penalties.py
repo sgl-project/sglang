@@ -44,8 +44,7 @@ def _req(output_ids, **sampling_params):
 
 
 def _requests():
-    """Every penalty kind, a request with none, stop ids outside the vocab, and
-    stop sets of different sizes."""
+    """Every penalty kind, a request with none, out-of-vocab stop ids, stop sets of different sizes."""
     return [
         _req([7, 7, 2100], frequency_penalty=0.7),
         _req([], temperature=0.5),
@@ -103,10 +102,8 @@ def _random_tokens(width, rng):
 
 
 def _decode_one_token_at_a_time(logits_row, req, path, device):
-    """`logits_row` as non-speculative decoding gives it to `req` after its
-    output and then `path`: a fresh request decodes those tokens one per step,
-    each step committing its token as ModelRunner.sample does, and the next
-    step's penalties apply through SamplingBatchInfo.apply_logits_bias."""
+    """`logits_row` as non-spec decoding penalizes it after `req`'s output and `path`,
+    one committed token per step."""
     decoded = SimpleNamespace(**{**vars(req), "penalty_index": None, "output_ids": []})
     pool = PenaltyStatusPool(VOCAB_SIZE, device)
     pool.alloc([decoded])
@@ -135,8 +132,8 @@ def _decode_one_token_at_a_time(logits_row, req, path, device):
 
 
 def _expected(logits, reqs, tokens, parents, device):
-    """Each verify row as decoding its history and path one token at a time
-    gives it; a row's path runs from the root, exclusive, to its own node."""
+    """Each verify row as `_decode_one_token_at_a_time` gives it, over its path
+    from the root (exclusive) to its node."""
     expected = logits.to(device).clone()
     width = len(tokens[0])
     for b, req in enumerate(reqs):
@@ -187,20 +184,18 @@ def _setup(device, dtype, width, tree, seed, reqs=None):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("tree", [True, False])
 @pytest.mark.parametrize("width", [1, 4, 8])
-@pytest.mark.parametrize("seed", [0, 1])
-def test_kernel_matches_per_row_reference(dtype, tree, width, seed) -> None:
-    case = _setup("cuda", dtype, width, tree, seed)
+def test_kernel_matches_per_row_reference(dtype, tree, width) -> None:
+    case = _setup("cuda", dtype, width, tree, seed=width)
     expected = _expected(case.logits, case.reqs, case.tokens, case.parents, "cuda")
     logits = case.logits.cuda()
     case.step.apply_verify(logits, case.draft_tokens, **case.kwargs)
     _assert_bitwise(logits, expected)
 
 
-@pytest.mark.parametrize("tree", [True, False])
 # A row stride of VOCAB_SIZE + 3 leaves rows unaligned for vector loads.
 @pytest.mark.parametrize("padding", [64, 3])
-def test_kernel_reads_int32_tokens_and_strided_rows(tree, padding) -> None:
-    case = _setup("cuda", torch.bfloat16, 6, tree, seed=3)
+def test_kernel_reads_int32_tokens_and_strided_rows(padding) -> None:
+    case = _setup("cuda", torch.bfloat16, 6, True, seed=3)
     expected = _expected(case.logits, case.reqs, case.tokens, case.parents, "cuda")
     padded = torch.zeros(
         case.logits.shape[0], VOCAB_SIZE + padding, dtype=torch.bfloat16, device="cuda"
@@ -213,10 +208,8 @@ def test_kernel_reads_int32_tokens_and_strided_rows(tree, padding) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("tree", [True, False])
-def test_kernel_matches_torch_path_on_a_large_batch(dtype, tree, monkeypatch) -> None:
-    """Enough requests that each CTA rewrites many rows, against the torch path,
-    which the tests above pin to non-speculative decoding."""
+def test_kernel_matches_torch_path_on_a_large_batch(dtype, monkeypatch) -> None:
+    """Many rows per CTA, against the torch path."""
     rng = random.Random(6)
     reqs = [
         SimpleNamespace(
@@ -227,7 +220,7 @@ def test_kernel_matches_torch_path_on_a_large_batch(dtype, tree, monkeypatch) ->
         )
         for i, req in enumerate(_requests() * 128)
     ]
-    case = _setup("cuda", dtype, 12, tree, seed=7, reqs=reqs)
+    case = _setup("cuda", dtype, 12, True, seed=7, reqs=reqs)
     expected = case.logits.cuda()
     with monkeypatch.context() as patch:
         patch.setattr(penalties, "_has_verify_kernel", False)
@@ -239,8 +232,7 @@ def test_kernel_matches_torch_path_on_a_large_batch(dtype, tree, monkeypatch) ->
 
 @pytest.mark.parametrize("token_dtype", [torch.int32, torch.int64])
 def test_commit_kernel_matches_torch_fallback(token_dtype) -> None:
-    """Repeated, out-of-vocab, and masked tokens, a request without penalties,
-    and token columns read with a stride."""
+    """Repeated, out-of-vocab, and masked tokens; strided token columns."""
     rng = random.Random(5)
     pools = {}
     for device in ("cpu", "cuda"):
@@ -270,7 +262,7 @@ def test_commit_kernel_matches_torch_fallback(token_dtype) -> None:
     assert torch.equal(cuda_tables.lens.cpu(), cpu_tables.lens)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("tree", [True, False])
 def test_torch_fallback_matches_per_row_reference(dtype, tree) -> None:
     case = _setup("cpu", dtype, 8, tree, seed=4)

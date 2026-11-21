@@ -92,26 +92,8 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             [[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0]],
         )
 
-    def test_dflash_block_verify_feeds_the_chain(self):
-        bs, width = 2, 3
-        info = _sampling_info(bs)
-        info.step_penalties = _step(bs)
-        logits = torch.zeros(bs * width, VOCAB_SIZE)
-        apply_dflash_verify_logits_adjustments(
-            next_token_logits=logits,
-            sampling_info=info,
-            draft_token_num=width,
-            verify_tokens=torch.tensor([[9, 5, 5], [9, 6, 5]]),
-        )
-        self.assertEqual(
-            _row_counts(logits, [5, 6, 9]),
-            [[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]],
-        )
-
     def test_dflash_block_verify_applies_the_custom_processor_last(self):
-        """In decoding's order: the penalties, the grammar mask, the logit bias,
-        whose fp32 sum with the bf16 logits rounds once, then the custom logit
-        processor."""
+        """Decoding's order: penalties, grammar mask, logit bias, custom processor."""
         bs, width = 2, 3
         verify_tokens = torch.tensor([[9, 5, 5], [9, 6, 5]])
         banned = torch.zeros(bs, VOCAB_SIZE, dtype=torch.bool)

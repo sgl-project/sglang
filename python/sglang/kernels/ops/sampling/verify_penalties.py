@@ -39,19 +39,16 @@ def apply_verify_penalties(
     min_new_tokens: Optional[torch.Tensor],
     stop_token_ids: Optional[torch.Tensor],
 ) -> None:
-    """Apply each speculative verify row's own sampling penalties to ``logits`` in place.
+    """Apply each verify row's own sampling penalties to ``logits`` in place, bit for
+    bit as non-speculative decoding would.
 
-    ``logits`` holds ``width = draft_tokens.shape[1]`` consecutive verify rows per
-    request, and ``draft_tokens`` their input tokens, column 0 the tree root.
-    Penalized request ``i`` sits at batch position ``batch_indices[i]`` and keeps
-    its history in row ``penalty_indices[i]`` of ``counts`` and ``lens``. A verify
-    row counts that history plus the in-vocab tokens from the root, exclusive, to
-    its own node, inclusive, and gets the logits non-speculative decoding gives
-    for that history, bit for bit.
-    The tree is ``next_child`` and ``next_sibling`` (``[bs, width]``, -1 for none),
-    or a chain when both are None. The penalty parameters are
-    ``PenaltyStatusPool``'s per-row tables, each None when no request of the
-    step uses that penalty; the launcher checks every shape.
+    ``logits`` holds ``width = draft_tokens.shape[1]`` rows per request; column 0
+    of ``draft_tokens`` is the tree root. Request ``i`` sits at batch position
+    ``batch_indices[i]`` with its history in row ``penalty_indices[i]`` of
+    ``counts`` and ``lens``. A row counts that history plus the in-vocab tokens
+    from the root (exclusive) to its node (inclusive). ``next_child`` and
+    ``next_sibling`` (``[bs, width]``, -1 for none) give the tree; both None is a
+    chain. Penalty tables are None when no request of the step uses that penalty.
     """
     _jit_verify_penalties_module(logits.dtype).apply_verify_penalties(
         logits,

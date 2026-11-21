@@ -7,20 +7,17 @@ from transformers import AutoTokenizer
 
 
 class PenalizedEOSMixin:
-    """Greedy requests with sampling penalties, min_new_tokens and a +100 logit
-    bias on the end-of-sequence token. The bias makes the end-of-sequence token
-    the greedy choice as soon as min_new_tokens allows it, so each request must
-    stop one token after its minimum, which needs no reference server. A
-    verifier that bans the token at every draft position of a block that
-    starts below the minimum stops later."""
+    """A +100 bias makes the end-of-sequence token the greedy choice as soon as
+    min_new_tokens allows it, so each request must stop one token after its
+    minimum. A verifier that bans the token at every draft position of a block
+    starting below the minimum stops later."""
 
     def test_penalized_eos_after_minimum(self):
         eos = AutoTokenizer.from_pretrained(self.model).eos_token_id
 
         def generate(i: int) -> None:
             minimum = (4, 17, 32)[i % 3]
-            # Prompts of different lengths keep earlier requests decoding while
-            # later ones prefill.
+            # Different prompt lengths mix decode with prefill.
             prompt = "Count from one to ten. " + "one two three four. " * (i * 20)
             response = requests.post(
                 self.base_url + "/generate",

@@ -1,18 +1,17 @@
-"""Sampling-penalty state: output-token counts and lengths plus the request's
-penalty parameters, one table row per penalized request, addressed by the
-request's penalty index.
+"""Sampling-penalty state: per-token output counts and lengths plus the
+request's penalty parameters, one table row per penalized request, addressed by
+its penalty index.
 
 - Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only queue
   writes; the tables are written, grown, and read on the sampling stream.
-- A request takes an index at its first extend admission, which queues its
-  parameters; every extend admission resets its history and replays
-  `output_ids`. A retraction keeps the index; `RequestRetirer` frees it at exit.
+- A request takes an index at its first extend admission; every extend admission
+  resets its history and replays `output_ids`. A retraction keeps the index;
+  `RequestRetirer` frees it at exit.
 - A step reads and commits the indices it was built with. No request is admitted
   between a step's build and its sampling, so none of them is reused before then.
-- Freeing the last live index drops the tables at once. That is safe because they
-  were allocated on the sampling stream, so their memory goes only to later
-  allocations there. A step whose indices were all freed sees no live index:
-  it applies no penalty and commits nothing.
+- Freeing the last live index drops the tables at once; their memory is from the
+  sampling stream, so it goes only to later allocations there. A step whose
+  indices were all freed applies no penalty and commits nothing.
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ _is_cuda = is_cuda()
 _has_verify_kernel = _is_cuda and get_device_sm() >= 80
 _is_npu = is_npu()
 
-# Bits of a penalty-kind mask.
 _FREQUENCY = 1
 _PRESENCE = 2
 _REPETITION = 4
@@ -103,7 +101,6 @@ class PenaltyStatusPool:
         self.device = device
         self.num_indices = 0
         self.free_indices: List[int] = []
-        # Penalty-kind mask of each index's request, for StepPenalties.build.
         self.kinds: List[int] = []
         self.pending_params: Dict[int, _RequestParams] = {}
         self.pending_init: Dict[int, List[int]] = {}
@@ -258,8 +255,7 @@ class PenaltyStatusPool:
             )
 
     def live_tables(self) -> Optional[PenaltyTables]:
-        """The tables with every queued write applied, or None when no index
-        is live."""
+        """The tables with queued writes applied, or None when no index is live."""
         self._flush()
         if self.num_indices == 0:
             return None
@@ -272,8 +268,7 @@ class PenaltyStatusPool:
         token_ids: torch.Tensor,
         accept_mask: Optional[torch.Tensor],
     ) -> None:
-        """Count row `batch_indices[i]` of `token_ids` [batch, k] into index
-        `indices[i]`; `accept_mask` [batch, k] marks the tokens that count."""
+        """Count row `batch_indices[i]` of `token_ids` into index `indices[i]`."""
         tables = self.live_tables()
         if tables is None:
             return
@@ -299,7 +294,7 @@ class PenaltyStatusPool:
         weights = counted.to(torch.int32)
         token_ids = token_ids.clamp(0, self.vocab_size - 1)
         if token_ids.shape[1] == 1:
-            # Indices are distinct, so no (index, token) pair repeats: a plain add is exact.
+            # Indices are distinct, so a plain add is exact.
             tables.counts[indices, token_ids.view(-1)] += weights.view(-1)
         else:
             tables.counts.index_put_(
@@ -314,8 +309,7 @@ class PenaltyStatusPool:
 
 
 class _StepParams(NamedTuple):
-    """Penalty parameters of a step's requests, each None when none of them
-    uses that penalty."""
+    """Each None when no request of the step uses that penalty."""
 
     frequency: Optional[torch.Tensor]
     presence: Optional[torch.Tensor]
@@ -337,10 +331,8 @@ class _StepParams(NamedTuple):
 class StepPenalties:
     pool: PenaltyStatusPool
     batch_size: int
-    # [n] batch positions and penalty indices of the n penalized requests.
     batch_indices: torch.Tensor
     penalty_indices: torch.Tensor
-    # Penalty-kind mask of the penalties any of them uses.
     kinds: int
     _logit_penalties: Optional[
         Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]
@@ -365,7 +357,6 @@ class StepPenalties:
         )
 
     def _params(self, tables: PenaltyTables) -> _StepParams:
-        """The pool's parameter tables the step's requests use."""
         uses_min_new_tokens = bool(self.kinds & _MIN_NEW_TOKENS)
         return _StepParams(
             frequency=tables.frequency if self.kinds & _FREQUENCY else None,
@@ -376,8 +367,8 @@ class StepPenalties:
         )
 
     def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """(additive, scaling) [batch_size, vocab] penalties, each None if unused;
-        built on the first call, which must run on the sampling stream."""
+        """(additive, scaling) [batch_size, vocab], built on the first call, which
+        must run on the sampling stream."""
         if self._logit_penalties is None:
             self._logit_penalties = self._build_logit_penalties()
         return self._logit_penalties
@@ -387,7 +378,7 @@ class StepPenalties:
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         tables = self.pool.live_tables()
         if tables is None:
-            # Every request of the step has exited; nothing reads these rows.
+            # Every request of the step has exited.
             return None, None
         params = self._params(tables).gather(self.penalty_indices)
         additive, scaling = _compute_logit_penalties(
@@ -424,18 +415,15 @@ class StepPenalties:
         next_child: Optional[torch.Tensor] = None,
         next_sibling: Optional[torch.Tensor] = None,
     ) -> None:
-        """Apply each speculative verify row's own penalties to `logits` in place.
+        """Apply each verify row's own penalties to `logits` in place.
 
-        `logits` holds `width` consecutive verify rows per request and
-        `draft_tokens` [batch_size, width] their input tokens, column 0 the
-        root, which the history already counts. A row's history adds the tokens
-        from the root, exclusive, to its own node, inclusive: along the tree
-        given by `next_child` and `next_sibling` ([batch_size, width], -1 for
-        none), or along the columns when they are None.
+        A row's history adds the tokens from the root (exclusive; the history
+        already counts it) to its node (inclusive), along the tree, or along the
+        columns when `next_child` and `next_sibling` are None.
         """
         tables = self.pool.live_tables()
         if tables is None:
-            # Every request of the step has exited; nothing reads these rows.
+            # Every request of the step has exited.
             return
         params = self._params(tables)
         if _has_verify_kernel and logits.is_cuda:
@@ -487,8 +475,8 @@ class StepPenalties:
         in_vocab = (tokens >= 0) & (tokens < vocab_size)
         tokens = tokens.clamp(0, vocab_size - 1)
 
-        # Every row walks up its path at once, one node per step; a node counts
-        # while it has a parent, so the root never does.
+        # Every row walks up its path one node per step; the root has no parent
+        # and never counts.
         row_counts = tables.counts[self.penalty_indices].repeat_interleave(width, dim=0)
         row_lens = tables.lens[self.penalty_indices].repeat_interleave(width)
         rows = torch.arange(num_requests * width, device=device)

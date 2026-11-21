@@ -33,29 +33,26 @@ struct VerifyPenaltiesParams {
   const int64_t* __restrict__ penalty_indices;
   const int32_t* __restrict__ counts;
   const int32_t* __restrict__ lens;
-  // Per history row, read at the request's penalty index; each null when no
-  // request of the step uses that penalty.
+  // Null when no request of the step uses that penalty.
   const float* __restrict__ frequency;
   const float* __restrict__ presence;
   const float* __restrict__ repetition;
   const int32_t* __restrict__ min_new_tokens;
-  const int64_t* __restrict__ stop_token_ids;  // set with min_new_tokens
+  const int64_t* __restrict__ stop_token_ids;
   int64_t num_stop_tokens;
   int32_t width;
   int32_t vocab_size;
   int32_t rows_per_cta;
-  // Logits rows and counts rows start 16-byte aligned, so whole vectors load.
+  // Logits and counts rows are 16-byte aligned.
   bool vectorized;
 };
 
 constexpr uint32_t kVerifyPenaltiesThreads = 128;
-// Rows of a CTA whose loads are in flight together.
 constexpr int32_t kVerifyPenaltiesRowsInFlight = 4;
 constexpr uint32_t kVerifyPenaltiesVectorBytes = 16;
 
 template <typename T>
 struct VerifyPenaltiesLayout {
-  // Each thread owns kVec consecutive vocab entries of the CTA's chunk.
   static constexpr uint32_t kVec = kVerifyPenaltiesVectorBytes / sizeof(T);
   static constexpr uint32_t kChunk = kVerifyPenaltiesThreads * kVec;
   static constexpr uint32_t kChunkWords = kChunk / 32;
@@ -78,8 +75,7 @@ SGL_DEVICE void verify_penalties_commit_copies() {
   asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
-/// The division of torch.compile's Triton code for `apply_scaling_penalties`,
-/// which is not IEEE-rounded.
+/// The division of torch.compile's `apply_scaling_penalties`, which is not IEEE-rounded.
 SGL_DEVICE float verify_penalties_div(float x, float y) {
   float result;
   asm("div.full.f32 %0, %1, %2;" : "=f"(result) : "f"(x), "f"(y));
@@ -97,9 +93,8 @@ struct VerifyPenaltyCoefficients {
   float repetition;
 };
 
-/// The penalties of one vocab entry seen `count` times, as the eager tables of
-/// `_compute_logit_penalties` hold them; the _rn intrinsics keep the compiler from
-/// contracting them into an FMA.
+/// The _rn intrinsics keep the compiler from contracting these into an FMA, to
+/// match the eager tables of `_compute_logit_penalties`.
 SGL_DEVICE VerifyPenalty
 verify_penalty(const VerifyPenaltiesParams& p, const VerifyPenaltyCoefficients& c, int32_t count, bool blocked) {
   float additive = 0.0f;
@@ -123,8 +118,7 @@ SGL_DEVICE T verify_penalize(T logit, VerifyPenalty penalty, bool has_additive, 
   return device::cast<T>(x);
 }
 
-/// `verify_penalize` of two adjacent logits, converted as a pair; bit i of
-/// `scaled` says whether logit i is scaled.
+/// `verify_penalize` of two logits converted as a pair; bit i of `scaled` marks logit i scaled.
 template <typename T>
 SGL_DEVICE packed_t<T> verify_penalize_pair(
     packed_t<T> logits, VerifyPenalty first, VerifyPenalty second, bool has_additive, uint32_t scaled) {
@@ -141,14 +135,11 @@ SGL_DEVICE packed_t<T> verify_penalize_pair(
   return logits;
 }
 
-/// \brief One CTA per (vocab chunk, penalized request, group of `rows_per_cta`
-/// verify rows); it rewrites that chunk of the group's rows.
-///
-/// A row counts its request's history plus the in-vocab tokens of its path: the
-/// nodes from the root, exclusive, to the row's node, inclusive. Every vocab
-/// entry off all paths and outside the stop set gets the history's penalty in
-/// every row, so it is computed once per entry and applied to whole vectors;
-/// a bitmap marks the rest, which the CTA then gives their own row's penalty.
+/// One CTA per (vocab chunk, penalized request, group of `rows_per_cta` rows).
+/// A row counts its request's history plus the in-vocab tokens on its path (root
+/// exclusive, the row's node inclusive). Entries off every path and outside the
+/// stop set take the history's penalty in all rows, applied as whole vectors; a
+/// bitmap marks the rest, which are then penalized per row.
 template <typename T>
 __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesParams p) {
   using Layout = VerifyPenaltiesLayout<T>;
@@ -164,7 +155,6 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
   int32_t* sibling = depth + p.width;  // [width], next sibling, -1 for none
   __shared__ uint32_t path_bits[Layout::kChunkWords];
   __shared__ uint32_t stop_bits[Layout::kChunkWords];
-  // Chunk-local indices of the entries on some path or in the stop set.
   __shared__ uint32_t own_entries[kChunk];
   __shared__ uint32_t num_own_entries;
 
@@ -181,8 +171,7 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
   const int32_t v0 = chunk_begin + local;
   const bool whole_vector = p.vectorized && v0 + static_cast<int32_t>(kVec) <= vocab_size;
 
-  // The loads that need no tree go first, so their latency overlaps the walk:
-  // the history counts, the request's parameters, and the first logits rows.
+  // Loads that need no tree go first, to overlap the tree walk.
   const int32_t* counts = p.counts + penalty_index * vocab_size;
   int32_t history_count[kVec];
   if (whole_vector) {
@@ -208,7 +197,6 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
   const int32_t history_len = p.lens[penalty_index];
 
   T* rows = static_cast<T*>(p.logits) + batch_index * width * p.logits_stride + v0;
-  // A thread whose entries cannot move as one vector moves them one by one.
   const auto load_row_elements = [&](LogitVec& x, int32_t j) {
     const T* row = rows + j * p.logits_stride;
     T* elements = reinterpret_cast<T*>(&x);
@@ -229,10 +217,8 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
       }
     }
   };
-  // Slot r of a thread's staging holds the rows j with j - row_begin = r modulo
-  // the slot count: whole vectors arrive by cp.async, one commit group per row,
-  // so loads stay in flight without registers. Once a row is penalized, its
-  // slot loads the row that many rows ahead.
+  // Slot r stages rows j with (j - row_begin) % slots == r: one cp.async commit
+  // group per row, refilled with the row `slots` ahead once penalized.
   __shared__ LogitVec staging[kVerifyPenaltiesRowsInFlight][kVerifyPenaltiesThreads];
   const auto stage_row = [&](int32_t r, int32_t j) {
     if (whole_vector && j < row_end) {
@@ -251,8 +237,7 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
     stop_bits[i] = 0;
   }
   if (tid == 0) num_own_entries = 0;
-  // Every load of the tree and of the stop ids is issued before the first
-  // barrier; depth[a] holds node a's first child until the tree is linked.
+  // depth[a] holds node a's first child until the tree is linked.
   const int64_t tokens_offset = batch_index * p.draft_tokens_stride;
   const int64_t tree_offset = batch_index * p.tree_stride;
   for (int32_t a = tid; a < width; a += kVerifyPenaltiesThreads) {
@@ -312,8 +297,6 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
   }
   const bool has_additive = p.frequency != nullptr || p.presence != nullptr || p.min_new_tokens != nullptr;
   const bool has_repetition = p.repetition != nullptr;
-  // The history's penalty of each entry: its additive part, and its scaling,
-  // which is the request's repetition penalty for the entries seen before.
   float history_additive[kVec];
   uint32_t seen = 0;
   // After the additive step, whose sum also makes any NaN canonical, a scaling
@@ -330,7 +313,7 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
     return {history_additive[e], (seen >> e) & 1u ? coefficients.repetition : 1.0f};
   };
 
-  // Row j, with the entries that have a penalty of their own left as they are.
+  // Entries with a penalty of their own are left for the per-row pass.
   const auto penalize_row = [&](const LogitVec& x) {
     LogitVec y;
 #pragma unroll
@@ -347,8 +330,7 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
     return y;
   };
 
-  // One copy of the loop body, the slot picked at run time, keeps the kernel's
-  // code and registers small.
+  // Not unrolled: the slot is picked at run time to keep code and registers small.
   if (v0 < vocab_size) {
 #pragma unroll 1
     for (int32_t j = row_begin; j < row_end; ++j) {
@@ -367,8 +349,7 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
     }
   }
 
-  // The entries with a penalty of their own, every (entry, row) pair spread
-  // over the CTA; the barrier makes the vector pass's stores visible.
+  // The barrier makes the vector pass's stores visible.
   __syncthreads();
   const int32_t num_entries = num_own_entries;
   const int32_t num_pairs = num_entries * (row_end - row_begin);
@@ -391,26 +372,9 @@ __global__ void verify_penalties_kernel(const __grid_constant__ VerifyPenaltiesP
   }
 }
 
-/**
- * \brief Apply each verify row's own sampling penalties to `logits` in place.
- *
- * Rows of requests outside `batch_indices` are left as they are.
- *
- * \tparam T             Logits dtype: fp32_t | fp16_t | bf16_t
- * \param logits         `[bs * width, vocab]`, `width` consecutive verify rows per request
- * \param draft_tokens   `[bs, width]` int32 or int64 verify input tokens, column 0 the root
- * \param next_child     `[bs, width]` int64 first child per node, -1 for none; absent for a chain
- * \param next_sibling   `[bs, width]` int64 next sibling per node, -1 for none; set with next_child
- * \param batch_indices  `[n]` int64 batch position of each penalized request
- * \param penalty_indices `[n]` int64 history row of each penalized request
- * \param counts         `[num_rows, vocab]` int32 per-token history counts
- * \param lens           `[num_rows]` int32 history lengths
- * \param frequency      `[num_rows]` fp32, or absent
- * \param presence       `[num_rows]` fp32, or absent
- * \param repetition     `[num_rows]` fp32, or absent
- * \param min_new_tokens `[num_rows]` int32, or absent
- * \param stop_token_ids `[num_rows, k]` int64 padded with `vocab`; given with min_new_tokens
- */
+/// Apply each verify row's own sampling penalties to `logits` (`[bs * width, vocab]`)
+/// in place; rows of requests outside `batch_indices` are untouched. Shapes: see
+/// `verify_penalties.py`.
 template <typename T>
 void apply_verify_penalties(
     tvm::ffi::TensorView logits,
@@ -514,9 +478,8 @@ void apply_verify_penalties(
   const bool vectorized = is_aligned(logits.data_ptr()) && logits_stride.unwrap() % Layout::kVec == 0 &&
                           is_aligned(counts.data_ptr()) && vocab_size % 4 == 0;
 
-  // Rows are split over grid.z as far as one wave of CTAs holds; every split
-  // rereads the chunk's history counts. Registers bound the residency at any
-  // width verify uses, so the tree's shared memory is left out of it.
+  // Rows split over grid.z up to one wave of CTAs; each split rereads the history
+  // counts. Registers bound residency, so the tree's shared memory is ignored.
   const int32_t device_id = device.unwrap().device_id;
   static runtime::DeviceCacheMap<uint32_t, 0> blocks_per_sm;
   const int64_t wave = int64_t{runtime::get_sm_count(device_id)} * blocks_per_sm.get_cached(device_id, [](int32_t) {
