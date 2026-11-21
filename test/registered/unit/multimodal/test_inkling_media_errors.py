@@ -55,6 +55,14 @@ def _broken_chunk_png_bytes() -> bytes:
     return bytes(broken)
 
 
+def _decompression_bomb_png_bytes() -> bytes:
+    # 15000 x 15000 exceeds 2 * Image.MAX_IMAGE_PIXELS, so Image.open raises
+    # DecompressionBombError; as a 1-bit PNG it is only ~27 KB.
+    buf = io.BytesIO()
+    Image.new("1", (15000, 15000)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 class TestResolveMediaItemIsClientError(CustomTestCase):
     """_resolve_media_item() -- empty/unreachable media URL (image or audio)."""
 
@@ -186,6 +194,13 @@ class TestEncodeImageBytesIsClientError(CustomTestCase):
             self._encode(_broken_chunk_png_bytes())
         self.assertIsInstance(ctx.exception.__cause__, SyntaxError)
 
+    def test_decompression_bomb_raises_value_error(self):
+        # DecompressionBombError subclasses Exception, not OSError; a small
+        # crafted image must still be a client error, not a server error.
+        with self.assertRaises(ValueError) as ctx:
+            self._encode(_decompression_bomb_png_bytes())
+        self.assertIsInstance(ctx.exception.__cause__, Image.DecompressionBombError)
+
     def test_valid_image_still_decodes(self):
         # Regression guard: the try/except must not change behavior for valid input.
         result = self._encode(_png_bytes())
@@ -205,6 +220,11 @@ class TestPilDecodeIsClientError(CustomTestCase):
         with self.assertRaises(ValueError) as ctx:
             _pil_decode(_broken_chunk_png_bytes())
         self.assertIsInstance(ctx.exception.__cause__, SyntaxError)
+
+    def test_decompression_bomb_raises_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            _pil_decode(_decompression_bomb_png_bytes())
+        self.assertIsInstance(ctx.exception.__cause__, Image.DecompressionBombError)
 
     def test_valid_image_still_decodes(self):
         result = _pil_decode(_png_bytes())

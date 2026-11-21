@@ -36,7 +36,7 @@ _pil_pool = ThreadPoolExecutor(max_workers=8)
 def _pil_decode(raw: bytes) -> np.ndarray:
     try:
         image = Image.open(io.BytesIO(raw)).convert("RGB")
-    except (OSError, SyntaxError) as e:
+    except (OSError, SyntaxError, Image.DecompressionBombError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return np.ascontiguousarray(np.array(image))
 
