@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -23,6 +23,19 @@ class GptOssDetector(BaseFormatDetector):
     Handles tool calls in the format:
     <|channel|>commentary to={namespace.function}<|constrain|>json<|message|>{args}<|call|>
     """
+
+    # Structural markers of the Harmony protocol. Text is only withheld from the
+    # client while it could still turn out to be the start of one of these.
+    _HARMONY_MARKERS = (
+        "<|start|>",
+        "<|channel|>",
+        "<|message|>",
+        "<|constrain|>",
+        "<|end|>",
+        "<|call|>",
+        "<|return|>",
+        "assistantfinal",
+    )
 
     def __init__(self):
         super().__init__()
@@ -73,70 +86,69 @@ class GptOssDetector(BaseFormatDetector):
         normal_text = " ".join(normal_parts).strip()
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
+    def _has_harmony_marker(self, text: str) -> bool:
+        return any(marker in text for marker in self._HARMONY_MARKERS)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text held back when the stream ended.
+
+        ``parse_streaming_increment`` withholds a trailing fragment only while it
+        can still complete into a structural marker. Once the stream is over it
+        cannot, so what is left is ordinary content and is emitted rather than
+        dropped. A fragment that did complete into a marker is left alone: it
+        means the protocol block was truncated, and that is not user-visible text.
+        """
+        pending, self._buffer = self._buffer, ""
+        if pending and not self._has_harmony_marker(pending):
+            return StreamingParseResult(normal_text=pending, calls=[])
+        return StreamingParseResult()
+
+    def _split_at_partial_marker(self, text: str) -> Tuple[str, str]:
+        """Split ``text`` into content that is safe to stream and a tail that may
+        still complete into a structural marker."""
+        hold = max(
+            (
+                self._ends_with_partial_token(text, marker)
+                for marker in self._HARMONY_MARKERS
+            ),
+            default=0,
+        )
+        if hold:
+            return text[:-hold], text[-hold:]
+        return text, ""
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """Parse incremental streaming text for TypeScript-style function calls."""
         self._buffer += new_text
 
-        # Always use HarmonyParser for parsing to ensure proper filtering
-        events = self.harmony_parser.parse(new_text)
-
-        # If there are no parsed events and the chunk contains no Harmony structural
-        # markers, treat it as plain text and pass it through. This fixes a bug where
-        # normal content was held in the buffer when tools were provided but not used.
-        if not events:
-            has_harmony_markers = any(
-                marker in self._buffer
-                for marker in (
-                    "<|start|>",
-                    "<|channel|>",
-                    "<|message|>",
-                    "<|constrain|>",
-                    "<|end|>",
-                    "<|call|>",
-                    "<|return|>",
-                    "assistantfinal",
-                )
-            )
-            if not has_harmony_markers:
-                # Plain text with no tool markers — emit as normal content
-                out = self._buffer
-                self._buffer = ""
-                return StreamingParseResult(normal_text=out, calls=[])
-
-        # Quick check if we might have tool calls
-        if (
-            "<|channel|>commentary to=" not in self._buffer
-            and not self.current_tool_name_sent
+        if self.harmony_parser.strategy is None and not self._has_harmony_marker(
+            self._buffer
         ):
-            # No tool calls detected, check for final content
-            if (
-                "<|channel|>final" in self._buffer
-                or "assistantfinal" in self._buffer.lower()
-            ):
-                # Extract normal text from events
-                normal_text = "".join(
-                    [e.content for e in events if e.event_type == "normal"]
-                )
-                if normal_text:
-                    self._buffer = ""
-                    return StreamingParseResult(normal_text=normal_text, calls=[])
+            # HarmonyParser has not seen a structural marker yet, so it holds
+            # everything it is given and will keep holding until one arrives. Plain
+            # content has to stream anyway, so emit everything except a tail that
+            # could still complete into a marker.
+            #
+            # Only that tail stays in the buffer, and only the buffer is handed to
+            # HarmonyParser below. Giving it text that has already been streamed out
+            # is what previously made it replay that text as a second normal event
+            # once a marker finally arrived.
+            emit, self._buffer = self._split_at_partial_marker(self._buffer)
+            return StreamingParseResult(normal_text=emit, calls=[])
 
-            # For other content, extract normal text from events (with filtering applied)
+        # A marker is in play: hand over everything not interpreted yet.
+        pending, self._buffer = self._buffer, ""
+        events = self.harmony_parser.parse(pending)
+
+        if not any(event.event_type == "tool_call" for event in events):
+            # No tool call in this batch. Emit the normal content HarmonyParser
+            # produced, with its own filtering already applied.
             normal_text = "".join(
-                [e.content for e in events if e.event_type == "normal"]
+                event.content for event in events if event.event_type == "normal"
             )
-            if normal_text or events:
-                self._buffer = ""
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-            else:
-                # No events processed, continue buffering
-                return StreamingParseResult(normal_text="", calls=[])
-
-        if not events:
-            # No complete events yet
-            return StreamingParseResult(normal_text="", calls=[])
+            return StreamingParseResult(normal_text=normal_text, calls=[])
 
         # Initialize state if needed
         if not hasattr(self, "_tool_indices"):
@@ -188,9 +200,6 @@ class GptOssDetector(BaseFormatDetector):
 
             elif event.event_type == "normal":
                 normal_text += event.content
-
-        # Clear buffer since HarmonyParser handles buffering
-        self._buffer = ""
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
