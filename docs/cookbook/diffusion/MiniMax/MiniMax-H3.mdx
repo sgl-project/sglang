@@ -329,10 +329,11 @@ sglang serve --model-path Pika-Labs/Pika-H3-Flex --model-variant fl2va+ref2va --
   partition's bundled adapter to its own transformer. `--lora-path` applies an
   adapter to both; the [LoRA API](/docs/sglang-diffusion/api/openai_api#lora-management)
   addresses one with `target`: `transformer` (FL2VA) or `transformer_2` (Ref2VA).
-- **Weights.** `MiniMaxAI/MiniMax-H3` needs both partitions in the local
-  snapshot or directory: a Hub ID downloads only `FL2VA/` for this variant.
-  Pika H3 Flex materializes both. Component and weight overrides are
-  **Unverified** with this variant.
+- **Weights.** For `MiniMaxAI/MiniMax-H3` the server also downloads `Ref2VA/`
+  of the same revision. The Hub cache keeps one copy of the files the two
+  partitions share, so this adds the Ref2VA transformer (61.7 GiB). Pika H3
+  Flex materializes both. Component and weight overrides are **Unverified**
+  with this variant.
 - **Limits.** The startup warm-up request is `t2va`, so the first `ref2va`
   request also warms the Ref2VA transformer. Cache-DiT, `quality: "high"` and
   `--minimax-h3-adaln-cache-path` need a single-partition server.

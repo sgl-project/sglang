@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -194,9 +195,18 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         serves ref2va; the FL2VA one serves t2va / fl2va. Text encoder, VAEs,
         tokenizer and processor are byte-identical between the partitions and
         load once, from FL2VA."""
-        ref2va_path = os.path.join(
-            os.path.dirname(self.model_path), self.model_subfolder_for_variant("ref2va")
-        )
+        subfolder = self.model_subfolder_for_variant("ref2va")
+        ref2va_path = os.path.join(os.path.dirname(self.model_path), subfolder)
+        if not os.path.isfile(os.path.join(ref2va_path, "model_index.json")):
+            # a Hub snapshot holds the FL2VA partition only; the Hub cache keeps
+            # one copy of the files both partitions share
+            snapshot = maybe_download_model(
+                self.server_args.model_path,
+                allow_patterns=[f"{subfolder}/**"],
+                revision=self.server_args.revision,
+                model_subfolder=subfolder,
+            )
+            ref2va_path = os.path.join(snapshot, subfolder)
         ref2va = MiniMaxH3ReleaseMetadata.from_model_index(
             verify_model_config_and_directory(ref2va_path)
         )

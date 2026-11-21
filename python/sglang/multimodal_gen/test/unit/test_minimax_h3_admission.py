@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.pipelines import minimax_h3_pipeline
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
@@ -297,6 +298,8 @@ def _dual_pipeline(root):
         transformer_weights_path=None,
         component_paths={},
         lora_path=None,
+        model_path=root,
+        revision=None,
     )
     pipeline.model_path = os.path.join(root, "FL2VA")
     pipeline._required_config_modules = ["text_encoder", "transformer"]
@@ -309,9 +312,14 @@ def test_dual_variant_loads_the_ref2va_transformer_and_admits_both(tmp_path):
     model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
     _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
     pipeline = _dual_pipeline(root)
-    with patch.object(ComposedPipelineBase, "_load_config", return_value=model_index):
+    with (
+        patch.object(ComposedPipelineBase, "_load_config", return_value=model_index),
+        patch.object(minimax_h3_pipeline, "maybe_download_model") as download,
+    ):
         pipeline._load_config()
 
+    # both partitions are on disk: nothing is downloaded
+    download.assert_not_called()
     # the shared components come from FL2VA, the second transformer from Ref2VA
     assert pipeline.server_args.model_subfolder == "FL2VA"
     assert pipeline.required_config_modules == [
@@ -345,6 +353,43 @@ def test_dual_variant_loads_the_ref2va_transformer_and_admits_both(tmp_path):
         )
     with pytest.raises(ValueError):
         pipeline.release_metadata.canonical_task("t2i")
+
+
+def test_dual_variant_downloads_the_ref2va_partition_from_the_hub(tmp_path):
+    root = str(tmp_path)
+    model_index = _write_partition(root, "FL2VA", "fl2va", ["t2va", "fl2va"])
+    pipeline = _dual_pipeline(root)
+    # the base loader fetched FL2VA/** of the Hub repository into root
+    pipeline.server_args.model_path = "MiniMaxAI/MiniMax-H3"
+    pipeline.server_args.revision = "main"
+
+    def download(model_id, **kwargs):
+        _write_partition(root, "Ref2VA", "ref2va", ["ref2va"])
+        return root
+
+    with (
+        patch.object(ComposedPipelineBase, "_load_config", return_value=model_index),
+        patch.object(
+            minimax_h3_pipeline, "maybe_download_model", side_effect=download
+        ) as fetch,
+    ):
+        pipeline._load_config()
+
+    fetch.assert_called_once_with(
+        "MiniMaxAI/MiniMax-H3",
+        allow_patterns=["Ref2VA/**"],
+        revision="main",
+        model_subfolder="Ref2VA",
+    )
+    assert pipeline.server_args.component_paths == {
+        "transformer_2": os.path.join(root, "Ref2VA", "transformer")
+    }
+    assert pipeline.dual_variant_lora_adapters[1] == (
+        "ref2va",
+        "transformer_2",
+        os.path.join(root, "Ref2VA/pika/adapter.safetensors"),
+    )
+    assert pipeline.release_metadata.tasks == ("t2va", "fl2va", "ref2va")
 
 
 def test_dual_variant_needs_one_sampling_contract(tmp_path):
