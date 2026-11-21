@@ -360,6 +360,11 @@ class FlashInferAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
+    @property
+    def stores_extend_kv_before_reading_prefix(self) -> bool:
+        # The dequant workspace copies the prefix out of the pool before the store.
+        return not self.prefill_uses_dequant_workspace
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1650,6 +1655,23 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            # Store before the paged prefix read: a row's prefix may be slots
+            # another row of this batch writes (in-batch prefix sharing).
+            if save_kv_cache:
+                self.kv_layers.layer(layer.layer_id).store(
+                    layer,
+                    KVWriteLoc.for_layer(
+                        forward_batch,
+                        layer,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
+                    ),
+                    k,
+                    v,
+                    *self._kv_write_scales(layer),
+                )
+
             prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
@@ -1696,21 +1718,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
-
-            if save_kv_cache:
-                self.kv_layers.layer(layer.layer_id).store(
-                    layer,
-                    KVWriteLoc.for_layer(
-                        forward_batch,
-                        layer,
-                        window_locs=window_write_locs(
-                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
-                        ),
-                    ),
-                    k,
-                    v,
-                    *self._kv_write_scales(layer),
-                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

@@ -33,6 +33,10 @@ from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
+from sglang.srt.mem_cache.in_batch_prefix_sharing import (
+    borrowed_prefix_indices,
+    publish_prefix_shares,
+)
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -373,7 +377,13 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
+    # A follower's prefix is its leader's slots, known only after allocation.
+    # It is page-aligned, so its allocation reads no last_loc of it.
+    follower_rows = {share.follower for share in batch.prefix_shares}
+    prefix_tensors = [
+        _EMPTY_PREFIX if i in follower_rows else _prefix_kv_indices(batch, r)
+        for i, r in enumerate(batch.reqs)
+    ]
 
     reuse_kv = None
     if batch.is_dllm():
@@ -483,6 +493,15 @@ def alloc_for_extend(
             batch=batch,
         )
 
+    if batch.prefix_shares:
+        prefix_tensors = borrowed_prefix_indices(
+            prefix_indices=prefix_tensors,
+            out_cache_loc=out_cache_loc,
+            prefix_lens=batch.prefix_lens,
+            extend_lens=batch.extend_lens,
+            shares=batch.prefix_shares,
+        )
+
     # Write to req_to_token_pool
     if is_cp_sharded_padded():
         # Rollback owns physical rows; the request table and caller need cache ids.
@@ -557,6 +576,10 @@ def alloc_for_extend(
     for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
         req.kv.set_row_len(seq_len)
         batch.tree_cache.maybe_hand_to_session(req)
+    if batch.prefix_shares:
+        publish_prefix_shares(
+            tree_cache=batch.tree_cache, reqs=batch.reqs, shares=batch.prefix_shares
+        )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 

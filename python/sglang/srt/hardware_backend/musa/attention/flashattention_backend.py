@@ -212,6 +212,9 @@ def flash_attn_with_kvcache(
 
 
 class MusaFlashAttentionBackend(FlashAttentionBackend):
+    # Its own forward_extend; not audited for the store-before-read order.
+    stores_extend_kv_before_reading_prefix = False
+
     def __init__(self, model_runner: ModelRunner, **kwargs):
         super().__init__(model_runner, **kwargs)
         self.num_hidden_layers = model_runner.model_config.num_hidden_layers
