@@ -85,6 +85,9 @@ def _per_token_group_quant_8bit_v2_custom_op(
     scale_hidden_stride = output_s.stride(last)
 
     module = _jit_module(input.dtype, output_q.dtype, is_arch_support_pdl())
+    if output_q.dtype == torch.float8_e4m3fnuz:
+        # On ROCm fp8_e4m3_t is uint8_t storage, so the kernel host checks expect uint8 bytes.
+        output_q = output_q.view(torch.uint8)
     module.per_token_group_quant_8bit_v2(
         input,
         output_q,
