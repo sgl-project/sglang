@@ -1340,6 +1340,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim, use_fp4_indexer=True
         )
+        if _is_npu and any(r in (1, 2) for r in cfg.compress_ratios):
+            from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
+
+            if is_ascend_910b():
+                self.kv_bytes = self.attn_head_dim * torch.bfloat16.itemsize
+                self.low_ratio_index_bytes = (
+                    self.indexer_head_dim * torch.bfloat16.itemsize
+                )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)

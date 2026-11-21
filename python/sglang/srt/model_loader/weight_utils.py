@@ -457,7 +457,12 @@ def get_quant_config(
                 )
             )
         )
-        if not modelopt_mixed_config_incomplete:
+        # ModelSlim's HF header can contain only the exporter name. Its
+        # per-module precisions and embedding storage live in the sidecar.
+        modelslim_header_only = model_config.quantization == "modelslim" and not any(
+            key.endswith(".weight") for key in hf_quant_config
+        )
+        if not modelopt_mixed_config_incomplete and not modelslim_header_only:
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
             hf_quant_config["hf_config"] = model_config.hf_config
 
@@ -574,6 +579,8 @@ def get_quant_config(
                     for key in quant_section[exclude_key]
                 ]
         config["packed_modules_mapping"] = packed_modules_mapping
+        if model_config.quantization == "modelslim":
+            config["hf_config"] = model_config.hf_config
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path

@@ -62,6 +62,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
     rope_cos_sin,
 )
 from sglang.srt.hardware_backend.npu.utils import (
+    is_ascend_910b,
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.hf_transformers import get_rope_config
@@ -1229,7 +1230,7 @@ class MqaAttentionBase(nn.Module):
         )
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
-        if self.attn_tp_size == 1:
+        if self.attn_tp_size == 1 or (self.is_dsv41 and _is_npu and is_ascend_910b()):
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -5311,6 +5312,81 @@ class DeepseekV4ForCausalLM(
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _load_engram_gate_basis(self):
+        description = getattr(self.quant_config, "quant_description", None)
+        if description is None:
+            return
+        sidecar = (
+            description.get("optional", {})
+            .get("quarot", {})
+            .get("rotation_map", {})
+            .get("global_rotation")
+        )
+        declaration = getattr(self.config, "engram_rotation_config", None)
+        if declaration is None:
+            declaration = getattr(
+                description.get("hf_config"), "engram_rotation_config", None
+            )
+        if sidecar is None and declaration is None:
+            return
+        layers = [
+            layer.engram
+            for layer in self.model.layers
+            if getattr(layer, "engram", None) is not None
+        ]
+        if not layers:
+            return
+
+        import json
+        from pathlib import PurePosixPath
+
+        from safetensors import safe_open
+        from transformers.utils import cached_file
+
+        from sglang.srt.runtime_context import get_model
+
+        model = get_model()
+        if declaration is None:
+            # Composite checkpoints can declare the gate basis on the outer config.
+            with open(
+                cached_file(model.model_path, "config.json", revision=model.revision)
+            ) as handle:
+                declaration = json.load(handle).get("engram_rotation_config")
+        if declaration is None:
+            return
+        expected = {
+            "value_projection_rotated": True,
+            "value_basis": "quarot_global",
+            "key_and_gate_basis": "original",
+            "runtime_delta_rotation": False,
+        }
+        if not isinstance(declaration, dict) or any(
+            declaration.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(f"Unsupported Engram rotation: {declaration}")
+        if (
+            not isinstance(sidecar, str)
+            or not sidecar
+            or PurePosixPath(sidecar).is_absolute()
+            or ".." in PurePosixPath(sidecar).parts
+        ):
+            raise ValueError(
+                "ModelSlim Engram rotation requires a checkpoint-relative global_rotation file"
+            )
+        path = cached_file(model.model_path, sidecar, revision=model.revision)
+        with safe_open(path, framework="pt", device="cpu") as tensors:
+            basis = tensors.get_tensor("global_rotation")
+        dim = self.config.hidden_size
+        if (
+            basis.shape != (dim, dim)
+            or not basis.is_floating_point()
+            or not torch.isfinite(basis).all()
+        ):
+            raise ValueError(f"Invalid global_rotation in {sidecar}")
+        basis = basis.to(device=layers[0].q_weight.device, dtype=torch.float32)
+        for layer in layers:
+            layer.gate_basis = basis
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5321,6 +5397,7 @@ class DeepseekV4ForCausalLM(
 
         if is_nextn:
             return
+        self._load_engram_gate_basis()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn

@@ -150,3 +150,30 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
         custom_mem_pool_type = None
 
     return enable_custom_mem_pool, custom_mem_pool_type
+
+
+def ascend_allocation_regions(regions, segments):
+    """Return the backing allocations required by 910B HIXL device IPC.
+
+    Logical tensor pointers and transfer sizes in KVArgs stay unchanged. Host
+    tensors and buffers outside the torch allocator retain their original spans.
+    """
+    from bisect import bisect_right
+
+    ordered = sorted(segments, key=lambda entry: entry["address"])
+    starts = [entry["address"] for entry in ordered]
+    allocations = {}
+    for address, length in regions:
+        index = bisect_right(starts, address) - 1
+        if index >= 0:
+            segment = ordered[index]
+            start, size = segment["address"], segment["total_size"]
+            if address < start + size:
+                if address + length > start + size or segment.get("is_expandable"):
+                    raise ValueError(
+                        "Ascend Mooncake needs one device allocation for each tensor. "
+                        "Use PYTORCH_NPU_ALLOC_CONF=expandable_segments:False."
+                    )
+                address, length = start, size
+        allocations[(address, length)] = None
+    return list(allocations)

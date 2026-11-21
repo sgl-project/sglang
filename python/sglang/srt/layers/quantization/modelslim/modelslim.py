@@ -176,7 +176,14 @@ class ModelSlimConfig(QuantizationConfig):
         self.requested_kv_cache_dtype = "auto"
         quant_config = dict(quant_config or {})
         keys = [k for k in quant_config if isinstance(k, str)]
-        is_dsv4 = any(k.startswith("hc_head_") for k in keys)
+        # The V4.1 W4A8 exporter omits unquantized hc_head entries. Its
+        # per-expert names still follow the DeepSeek checkpoint layout.
+        model_type = getattr(quant_config.get("hf_config"), "model_type", None)
+        is_dsv4 = model_type in (
+            "deepseek_v4",
+            "deepseek_v41",
+            "deepseek_v41_text",
+        ) or any(k.startswith("hc_head_") for k in keys)
         if is_dsv4:
             from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 

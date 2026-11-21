@@ -42,6 +42,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -382,6 +383,24 @@ def mix_stats_from_state(
 
 
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    if _is_npu and hc.cfg.pre_from_prev and is_ascend_910b():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+
+        cfg = hc.cfg
+        _, post_mix, comb, pre = mhc_pre_dpskv4(
+            x,
+            hc.fn,
+            hc.scale,
+            hc.base,
+            cfg.mult,
+            cfg.sinkhorn_iters,
+            cfg.eps,
+            cfg.rms_eps,
+            return_pre=True,
+            impl="torch_native",
+        )
+        return pre, post_mix, comb
+
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -590,7 +609,7 @@ def _npu_combine_premix(
         cfg.rms_eps,
         pre_mix=apply_pre,
         return_pre=True,
-        impl="cann_recipes_infer_cann920",
+        impl="torch_native" if is_ascend_910b() else "cann_recipes_infer_cann920",
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)
@@ -668,6 +687,10 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
+        if cfg.pre_from_prev and is_ascend_910b():
+            from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+
+            return mhc_post_dpskv4(x, residual, post_mix, comb, impl="torch_native")
         if cfg.pre_from_prev:
             # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
             # the base stream, comb its res-mixing matrix, x the sublayer

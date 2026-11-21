@@ -464,14 +464,34 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def register_buffer_to_engine(self):
         regions = self._registerable_regions()
         if regions:
+            from sglang.srt.hardware_backend.npu.utils import is_ascend_910b
+
+            ascend = (
+                envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get() and is_ascend_910b()
+            )
+            if ascend:
+                from sglang.srt.disaggregation.mooncake.utils import (
+                    ascend_allocation_regions,
+                )
+
+                device = torch.npu.current_device()
+                segments = [
+                    s for s in torch.npu.memory_snapshot() if s["device"] == device
+                ]
+                regions = ascend_allocation_regions(regions, segments)
             ptrs, lens = zip(*regions)
             self.engine.batch_register(list(ptrs), list(lens))
+            if ascend:
+                self._ascend_registered_regions = regions
 
     def deregister_buffer_to_engine(self):
-        regions = self._registerable_regions()
+        regions = getattr(self, "_ascend_registered_regions", None)
+        if regions is None:
+            regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
             self.engine.batch_deregister(list(ptrs))
+            self._ascend_registered_regions = None
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
