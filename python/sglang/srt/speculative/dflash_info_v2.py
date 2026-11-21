@@ -168,6 +168,12 @@ class DFlashDraftInputV2(SpecInput):
         batch_seq_lens_cpu_t.numpy()[:] = committed_lens
         cur_kv_lens_cpu_t.numpy()[:] = cur_kv_lens
         nxt_kv_lens_cpu_t.numpy()[:] = nxt_kv_lens
+        # Host upper bound of the over-allocated KV lengths (>= committed +
+        # alloc reserve): bounds the NPU backend's mirrorless replay
+        # page-table copies without a D2H sync, mirroring
+        # eagle_utils.eagle_prepare_for_decode. Backend consumers gate on
+        # seq_lens_cpu, so leaving this set in mirror mode is a no-op.
+        batch.max_seq_len_host = int(cur_kv_lens_cpu_t.max())
         committed_seq_lens_sum = sum(committed_lens)
         nxt_kv_lens_sum = sum(nxt_kv_lens)
         max_top_k = max(top_ks)

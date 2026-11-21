@@ -74,9 +74,11 @@ pipeline does not serve the separate FLUX.3 Action robot policy.
 | [Klein Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) | undistilled | 50 | 3.5 | fine-tuning, LoRA training, research |
 
 Each repository ships its BF16 DiT with FP8 (`fp8r`) and NVFP4 variants,
-together with the text encoder and image autoencoder. Quantization and caching
-are separate fidelity/latency tradeoffs, not lossless substitutes for the
-selected checkpoint.
+together with the text encoder and image autoencoder. The default
+[conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache)
+reuses prompt encodings, including the Base model's negative prompt. It does
+not skip denoising steps or change the checkpoint. Cache-DiT, described below,
+is a separate approximation.
 
 | Task | Endpoint | Conditioning |
 | --- | --- | --- |
@@ -153,7 +155,9 @@ Explicit `guidance_scale=1` uses scale 1, not the package default;
 Each repo ships quantized DiTs under `variants/`: select one with
 `--model-variant fp8r` or `--model-variant nvfp4` and keep `--model-path`
 pointing at the repo root. Text encoder and VAE precision follow their own
-package settings; quantizing the DiT does not quantize them. The quantization
+package settings; quantizing the DiT does not quantize them. An explicit
+`--component-precisions.vae bf16` overrides the package dtype for both
+reference-image encoding and output decoding. The quantization
 comes from the variant's `hf_quant_config.json`, so do not also pass
 `--quantization`.
 
@@ -232,6 +236,10 @@ partitions weights, so it is the lower-memory starting point when offloading
 on several GPUs. Preserve headroom for the longest prompt, references and output
 size you intend to serve; a successful small request is not a capacity guarantee.
 </Note>
+
+The VAE decoder runs unsharded by default even with multiple GPUs.
+`--vae-sp true` splits decoding along the image height when a decode-parallel
+group is available; it does not shard reference-image encoding.
 
 For FP32 VAE attention above 1 MP, `quality="lossless"` can use dense-layout,
 full-context memory-efficient SDPA; `quality="exact"` retains the original path.

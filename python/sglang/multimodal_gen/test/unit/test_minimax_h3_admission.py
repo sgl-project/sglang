@@ -13,7 +13,10 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    MiniMaxH3SamplingParams,
+    PikaH3FlexSamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
@@ -392,6 +395,15 @@ def test_video_adapter_does_not_override_default_reference_resize_mode():
     )
 
     assert "reference_resize_mode" not in lowered
+
+
+def test_pika_h3_flex_defaults_to_pika_reference_resize():
+    assert MiniMaxH3SamplingParams().reference_resize_mode == "max"
+    assert PikaH3FlexSamplingParams().reference_resize_mode == "diffusers"
+    assert (
+        PikaH3FlexSamplingParams(reference_resize_mode="max").reference_resize_mode
+        == "max"
+    )
 
 
 def test_sampling_params_normalizes_reference_resize_mode():
@@ -773,6 +785,22 @@ def test_validate_server_args_requires_packed_varlen_backend():
     )
     server_args.ring_degree = 2
     with pytest.raises(ValueError, match="ring parallelism requires"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+@pytest.mark.parametrize("backend", ["fa", "aiter"])
+def test_validate_server_args_accepts_ring_on_lse_backends(backend):
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=backend,
+        ring_degree=2,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ):
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 

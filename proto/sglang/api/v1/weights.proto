@@ -1,0 +1,273 @@
+// Weight-management control APIs shared by HTTP JSON and gRPC: the
+// state-free subset (group setup, remote-instance send, parameter read).
+// The weight updates themselves follow once the frontend holds the update
+// lock on every listener.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+// `/get_weights_by_name`: read one parameter, truncated, from every DP rank.
+message GetWeightsByNameRequest {
+  string name = 1;
+  // Elements kept per dimension; Python's `truncate_size: int = 100`.
+  optional int64 truncate_size = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_i64 = 100
+  ];
+}
+
+// One parameter per DP rank in rank order, each the scheduler's
+// `List[float | List[float]]` as JSON text (a rank that found no parameter
+// contributes `null`). HTTP unwraps a single rank to the bare value, as
+// Python does.
+message GetWeightsByNameResponse {
+  repeated string parameters = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `/init_weights_update_group`: join the trainer's weight-update process group.
+message InitWeightsUpdateGroupRequest {
+  string master_address = 1;
+  int64 master_port = 2;
+  int64 rank_offset = 3;
+  int64 world_size = 4;
+  optional string group_name = 5 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_update_group"
+  ];
+  optional string backend = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "nccl"
+  ];
+}
+
+// `/destroy_weights_update_group`.
+message DestroyWeightsUpdateGroupRequest {
+  optional string group_name = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_update_group"
+  ];
+}
+
+// `/init_weights_send_group_for_remote_instance`: open the send group toward
+// another engine instance.
+message InitWeightsSendGroupForRemoteInstanceRequest {
+  string master_address = 1;
+  // One port per rank, as the comma-separated string Python takes.
+  string ports = 2;
+  int64 group_rank = 3;
+  int64 world_size = 4;
+  optional string group_name = 5 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_send_group"
+  ];
+  optional string backend = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "nccl"
+  ];
+}
+
+// `/send_weights_to_remote_instance`.
+message SendWeightsToRemoteInstanceRequest {
+  string master_address = 1;
+  string ports = 2;
+  optional string group_name = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_send_group"
+  ];
+}
+
+// `{success, message}` as Python answers every group operation; HTTP 200 on
+// success, 400 otherwise.
+message WeightGroupResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// `/remote_instance_transfer_engine_info?rank=N` (and its deprecated alias
+// `/get_remote_instance_transfer_engine_info`): the transfer-engine info a
+// rank registered with this node's engine-info bootstrap server, proxied.
+message RemoteInstanceTransferEngineInfoRequest {
+  int64 rank = 1;
+}
+
+// The bootstrap server's reply as it sent it: `{"rank": N,
+// "remote_instance_transfer_engine_info": [...]}`, passed through as JSON.
+message RemoteInstanceTransferEngineInfoResponse {
+  optional string info = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// The weight updates: each holds the frontend's update lock on every
+// listener (new generates wait, as under Python's `model_update_lock`)
+// while its message runs on the scheduler ranks.
+
+// `/update_weights_from_disk`: reload the weights from `model_path` on every
+// DP rank. Python's `UpdateWeightFromDiskReqInput`; `is_async`, `keep_pause`,
+// `token_step` and `manifest` are accepted as Python accepts them and read
+// by nothing.
+message UpdateWeightsFromDiskRequest {
+  string model_path = 1;
+  // The launch's `--load-format` when unset.
+  optional string load_format = 2;
+  bool abort_all_requests = 3;
+  optional string weight_version = 4;
+  bool is_async = 5;
+  bool torch_empty_cache = 6;
+  bool keep_pause = 7;
+  bool recapture_cuda_graph = 8;
+  int64 token_step = 9;
+  optional bool flush_cache = 10 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional string manifest = 11 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// Python's `UpdateWeightFromDiskReqOutput`, merged across DP ranks: one
+// `num_paused_requests` per rank in rank order (HTTP unwraps a single rank
+// to the bare number, as Python does).
+message UpdateWeightsFromDiskResponse {
+  bool success = 1;
+  string message = 2;
+  repeated int64 num_paused_requests = 3;
+}
+
+// `/update_weights_from_distributed`: receive the named tensors over the
+// trainer's process group, between `/begin_weight_update` and
+// `/end_weight_update`. Single-DP-rank deployments only, as in Python.
+message UpdateWeightsFromDistributedRequest {
+  repeated string names = 1;
+  repeated string dtypes = 2;
+  repeated Int64List shapes = 3;
+  optional string group_name = 4 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "weight_update_group"
+  ];
+  optional bool flush_cache = 5 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  bool abort_all_requests = 6;
+  optional string weight_version = 7;
+  optional string load_format = 8;
+  // Which model runners the update loads into: "target", "draft" or "all".
+  optional string selector = 9 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "all"
+  ];
+  bool torch_empty_cache = 10;
+}
+
+// `/update_weights_from_tensor`: load serialized tensors, one payload per TP
+// rank, between `/begin_weight_update` and `/end_weight_update`.
+message UpdateWeightsFromTensorRequest {
+  // Python's `List[bytes]`: each payload base64 text, as the JSON body
+  // carries it; decoded before it reaches the scheduler.
+  repeated string serialized_named_tensors = 1;
+  optional string load_format = 2;
+  optional bool flush_cache = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  bool abort_all_requests = 4;
+  optional string weight_version = 5;
+  // Which model runners the update loads into: "target", "draft" or "all".
+  optional string selector = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "all"
+  ];
+  bool torch_empty_cache = 7;
+}
+
+// `/update_weights_from_ipc`: load weights the checkpoint engine serves over
+// the given ZMQ handles (one per device).
+message UpdateWeightsFromIpcRequest {
+  map<string, string> zmq_handles = 1;
+  optional bool flush_cache = 2 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional string weight_version = 3;
+  bool torch_empty_cache = 4;
+}
+
+// `/begin_weight_update`: open a weight-update session on the selected
+// runners; `/end_weight_update` closes it and runs the post-load steps.
+message BeginWeightUpdateRequest {
+  // Which model runners the update loads into: "target", "draft" or "all".
+  optional string selector = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "all"
+  ];
+}
+message EndWeightUpdateRequest {}
+
+// `/plugin_weight_update`: run the platform's named weight-update handler
+// with `payload`, inside an open session.
+message PluginWeightUpdateRequest {
+  string handler = 1;
+  optional string payload = 2 [(sglang.json.v1.field_json).raw_json = true];
+  optional bool flush_cache = 3 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  bool abort_all_requests = 4;
+  optional string weight_version = 5;
+  // Which model runners the update loads into: "target", "draft" or "all".
+  optional string selector = 6 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "all"
+  ];
+  bool torch_empty_cache = 7;
+}
+
+// Python's `PluginWeightUpdateReqOutput.merged`: the counts come from the
+// first DP rank's reply, one per TP rank, and only on success.
+message PluginWeightUpdateResponse {
+  bool success = 1;
+  string message = 2;
+  repeated int64 received_tensor_counts = 3;
+}
+
+// `{success, message}` as Python answers the other weight updates; HTTP
+// 200 on success, 400 otherwise.
+message WeightUpdateResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// LoRA adapters: `/load_lora_adapter`, `/load_lora_adapter_from_tensors`,
+// `/unload_lora_adapter`. Rust-server mode refuses `--enable-lora` at
+// launch, so these answer Python's "LoRA is not enabled" refusal.
+message LoadLoraAdapterRequest {
+  string lora_name = 1;
+  string lora_path = 2;
+  bool pinned = 3;
+  optional string lora_id = 4;
+}
+
+message LoadLoraAdapterFromTensorsRequest {
+  string lora_name = 1;
+  optional string config_dict = 2 [(sglang.json.v1.field_json).raw_json = true];
+  repeated string serialized_named_tensors = 3;
+  bool pinned = 4;
+  map<string, int64> added_tokens_config = 5;
+  optional string lora_id = 6;
+  optional string load_format = 7;
+  map<string, string> expected_checksums = 8;
+}
+
+message UnloadLoraAdapterRequest {
+  string lora_name = 1;
+  optional string lora_id = 2;
+}
+
+// Python's `LoRAUpdateOutput`.
+message LoraUpdateResponse {
+  bool success = 1;
+  optional string error_message = 2;
+  // Every adapter loaded after the call, name to path.
+  map<string, string> loaded_adapters = 3;
+}

@@ -176,7 +176,7 @@ def get_kv_shard_group_info(
     return group.rank_in_group, group.world_size
 
 
-def _page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
+def page_shard_row_bytes(kvc: KVCacheConfigurator) -> int:
     model_config = kvc.model_config
     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
     if kvc.use_mla_backend:
@@ -257,7 +257,7 @@ def compute_page_shard_scratch_bytes(
     spec = make_page_shard_spec(kvc)
     if spec is None:
         return 0
-    scratch_bytes = 2 * spec.scratch_rows * _page_shard_row_bytes(kvc)
+    scratch_bytes = 2 * spec.scratch_rows * kvc.page_shard_scratch_row_bytes()
     if include_mtp:
         if (
             kvc.is_draft_worker

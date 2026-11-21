@@ -8,14 +8,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 # https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cute/arch/copy_sm90_desc.hpp#L193-L197
-EVICT_NORMAL = Int64(0x1000000000000000)
 EVICT_FIRST = Int64(0x12F0000000000000)
-EVICT_LAST = Int64(0x14F0000000000000)
-
-
-@dsl_user_op
-def recast_val(x, dtype, *, loc=None, ip=None):
-    return dtype(llvm.bitcast(dtype.mlir_type, x.ir_value(loc=loc, ip=ip)))
 
 
 def simple_tma_copy(atom, src, dst, mbar=None, cache_policy=None):
@@ -94,42 +87,3 @@ def mma_bf16(
         ip=ip,
     )
     return cute.TensorSSA(vec, 4, Float32)
-
-
-@dsl_user_op
-def _bf16x2_abs(a: Uint32, *, loc=None, ip=None) -> Uint32:
-    out = llvm.inline_asm(
-        T.i32(),
-        [a.ir_value(loc=loc, ip=ip)],
-        "abs.bf16x2 $0, $1;",
-        "=r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    return Uint32(out)
-
-
-@dsl_user_op
-def _bf16x2_max(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    out = llvm.inline_asm(
-        T.i32(),
-        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
-        "max.bf16x2 $0, $1, $2;",
-        "=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    return Uint32(out)
-
-
-@dsl_user_op
-def _bf16x2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    out = llvm.inline_asm(
-        T.i32(),
-        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
-        "mul.rn.bf16x2 $0, $1, $2;",
-        "=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    return Uint32(out)

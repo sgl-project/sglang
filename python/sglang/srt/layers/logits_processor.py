@@ -15,9 +15,10 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -58,8 +59,12 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
@@ -78,6 +83,9 @@ from sglang.srt.utils.device import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +128,27 @@ VERIFY_VOCAB_SHARDS = "vocab_shards"
 VERIFY_FULL_LOGITS = "full_logits"
 VERIFY_LOGITS_VARIANTS = (VERIFY_VOCAB_SHARDS, VERIFY_FULL_LOGITS)
 
+_GFX1250_LMHEAD = None
+
+
+def _gfx1250_lmhead_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """gfx1250: split-K Triton FP32-output lm_head for decode widths."""
+    global _GFX1250_LMHEAD
+    if _GFX1250_LMHEAD is None:
+        try:
+            _GFX1250_LMHEAD = os.environ.get(
+                "SGLANG_ROCM_MUSE_GFX1250_LMHEAD", "1"
+            ) == "1" and (
+                "gfx1250" in torch.cuda.get_device_properties(x.device).gcnArchName
+            )
+        except Exception:
+            _GFX1250_LMHEAD = False
+    if not _GFX1250_LMHEAD:
+        return False
+    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import applies, wide_applies
+
+    return applies(x, w) or wide_applies(x, w)
+
 
 class SamplingMaskStatus(IntEnum):
     """Ordered by severity so distributed MAX reaches one policy decision."""
@@ -161,71 +190,6 @@ def _trace_e2e_logits(stage: str, **fields) -> None:
         rank = "rank=unknown"
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     print(f"SGLANG_TRACE_LOGITS_E2E {rank} stage={stage} {details}", flush=True)
-
-
-def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
-    return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
-
-
-def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
-    if (
-        quant_method is None
-        or not hasattr(lm_head, "weight")
-        or not callable(getattr(quant_method, "apply", None))
-    ):
-        return False
-
-    method_name = type(quant_method).__name__
-    if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
-        return False
-
-    # A shared target lm_head can retain the draft's stale ModelOpt method; use it
-    # only when the runtime tensor layout matches that method.
-    if method_name == "ModelOptFp4LinearMethod":
-        if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        ):
-            return True
-        return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale_interleaved",
-                "alpha",
-                "input_scale_inv",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptNvFp4A16LinearMethod":
-        return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
-            lm_head,
-            (
-                "weight_scale",
-                "weight_global_scale",
-                "workspace",
-                "input_size_per_partition",
-                "output_size_per_partition",
-            ),
-        )
-    if method_name == "ModelOptFp8LinearMethod":
-        return (
-            lm_head.weight.dtype == torch.float8_e4m3fn
-            and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
-        )
-
-    return True
-
-
-# FlashInfer autotune skips the unprofiled LM-head all-gather; its
-# [batch * num_dp_ranks, vocab] output can OOM under tight DP-attention memory.
-_in_autotune_dummy_run = False
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -287,8 +251,9 @@ class LogitsProcessorOutput:
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    # A per-row list, or one [#seq, k] tensor when every row has the same k.
+    next_token_top_logprobs_val: Optional[Union[List, torch.Tensor]] = None
+    next_token_top_logprobs_idx: Optional[Union[List, torch.Tensor]] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -312,6 +277,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    # Per sequence, the [rows, k] float32 host spans of its input candidate
+    # selector's weights; None when the batch has no such request.
+    input_top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -328,6 +296,7 @@ class LogitsProcessorOutput:
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
+    beam_normalizer: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -404,10 +373,14 @@ class LogitsMetadata:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
+    # Per request, ReqLogprob.input_candidate_selector; the prefix lens give
+    # the position of a selector's first row.
+    input_candidate_selectors: Optional[List[Optional[Any]]] = None
+    extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -428,6 +401,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam_trie_levels: Optional[torch.Tensor] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -489,10 +463,15 @@ class LogitsMetadata:
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            input_candidate_selectors=forward_batch.input_candidate_selectors,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
+            beam_trie_levels=(
+                None if forward_batch.beam is None else forward_batch.beam.trie_levels
+            ),
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -538,6 +517,10 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
+    # Override point: a subclass serving input candidate selectors names its
+    # InputLogprobProcessor subclass here.
+    input_logprob_processor_cls = InputLogprobProcessor
+
     def __init__(
         self,
         config,
@@ -573,6 +556,7 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        self.defer_plain_gather = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
         self._sharded_verify_eligible = (
             _runtime_optimized_vocab_shards_enabled()
             and self.do_tensor_parallel_all_gather
@@ -610,6 +594,7 @@ class LogitsProcessor(nn.Module):
         )
         self._aux_hidden_states_checked = False
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.beam_trie_output_head: Optional[BeamTrieOutputHead] = None
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -629,7 +614,7 @@ class LogitsProcessor(nn.Module):
                 parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
             )
             chunking_group = group.cpu_group
-        self.input_logprob_processor = InputLogprobProcessor(
+        self.input_logprob_processor = self.input_logprob_processor_cls(
             self.vocab_size, chunking_group=chunking_group
         )
 
@@ -660,7 +645,7 @@ class LogitsProcessor(nn.Module):
 
         return (
             not (info.grammars and any(g is not None for g in info.grammars))
-            and not info.has_watermark_candidates
+            and info.watermark is None
             and sampling_allows_vocab_shards(
                 info,
                 return_logprob=forward_batch.return_logprob,
@@ -686,6 +671,19 @@ class LogitsProcessor(nn.Module):
                 and get_capture_logits_variant() == VERIFY_VOCAB_SHARDS
             )
         return self.verify_uses_vocab_shards(forward_batch)
+
+    @property
+    def logits_gatherer_pending(self) -> bool:
+        return self._logits_gatherer.prebuild_pending
+
+    def prebuild_logits_gatherer(self, *, shard_width: int, dtype: torch.dtype) -> bool:
+        """Build the TP logits all-gather state; True when built.
+        ``dtype`` is the lm_head output dtype unless _compute_lm_head forces one."""
+        if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
+            dtype = torch.float32
+        elif self.rl_on_policy_target is not None:
+            dtype = torch.bfloat16
+        return self._logits_gatherer.prebuild(hidden_size=shard_width, dtype=dtype)
 
     def forward(
         self,
@@ -724,6 +722,15 @@ class LogitsProcessor(nn.Module):
         if self.expected_aux_hidden_states is not None:
             self._check_aux_hidden_states(
                 aux_hidden_states, hidden_states, logits_metadata
+            )
+
+        if logits_metadata.input_candidate_selectors is not None and (
+            token_indices_to_pool is not None
+            or multi_item_delimiter_indices is not None
+        ):
+            # The two scoring paths below read top_logprobs_nums only.
+            raise NotImplementedError(
+                "Position scoring serves no input candidate selector"
             )
 
         # Setwise scoring (CausalLM): read label-token logprobs AT each anchor
@@ -795,7 +802,15 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            beam_normalizer = None
+            if self.beam_trie_output_head is None:
+                logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            else:
+                from sglang.srt.beam_search.trie_output_head import beam_trie_logits
+
+                logits, beam_normalizer = beam_trie_logits(
+                    self, pruned_states, lm_head, logits_metadata
+                )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -806,6 +821,7 @@ class LogitsProcessor(nn.Module):
                 hidden_states=hidden_states_to_store,
                 last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                beam_normalizer=beam_normalizer,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(
@@ -1246,6 +1262,14 @@ class LogitsProcessor(nn.Module):
             return self._gather_softcap_fused(
                 logits, logits_metadata, use_logits_buffer
             )
+        if (
+            self.defer_verify_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and self._can_defer_plain_gather(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        ):
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
@@ -1320,24 +1344,45 @@ class LogitsProcessor(nn.Module):
             )
         )
 
+    def _can_defer_plain_gather(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        return (
+            self.defer_plain_gather
+            and not self.final_logit_softcapping
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and logits.is_cuda
+            and not (_is_npu or _is_cpu)
+            and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and logits.dim() == 2
+            and logits.is_contiguous()
+            and not self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
     def is_deferred_shard(self, logits: torch.Tensor) -> bool:
         return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
 
     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
-        """Full softcapped logits from a target-verify vocab shard."""
-        return self._gather_softcap_fused(logits, None, use_buffer=False)
+        if self.final_logit_softcapping:
+            return self._gather_softcap_fused(logits, None, use_buffer=False)
+        # The undeferred gather; its symmetric buffer is sized by the first eager
+        # full-width call (the prefill logits).
+        return self._logits_gatherer(logits)[:, : self.vocab_size].float()
 
     def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        """``argmax`` of the full softcapped logits from a target-verify vocab
-        shard, gathering only each rank's row maxima. Ties resolve to the lowest
-        vocab index, as ``torch.argmax`` over the gathered row does."""
+        """Full-logits ``argmax`` from a target-verify vocab shard; ties resolve to
+        the lowest vocab index, as ``torch.argmax`` over the gathered row does."""
         group = get_parallel().tp_group
-        num_tokens, shard_width = logits.shape
-        col_offset = group.rank_in_group * shard_width
-        valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
-        local = softcap_row_argmax(
-            logits, self.final_logit_softcapping, valid_width, col_offset
-        )
+        num_tokens = logits.shape[0]
+        local = self.deferred_local_argmax(logits)
         gathered = torch.empty(
             (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
         )
@@ -1346,6 +1391,17 @@ class LogitsProcessor(nn.Module):
             return merge_row_argmax_shards(gathered)
         best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
         return gathered[..., 1].gather(0, best_rank).squeeze(0).long()
+
+    def deferred_local_argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """This rank's row maxima of a target-verify vocab shard: fp32 [num_tokens, 2]
+        (the (softcapped) max, its global vocab index)."""
+        group = get_parallel().tp_group
+        shard_width = logits.shape[1]
+        col_offset = group.rank_in_group * shard_width
+        valid_width = max(0, min(shard_width, self.vocab_size - col_offset))
+        return softcap_row_argmax(
+            logits, self.final_logit_softcapping, valid_width, col_offset
+        )
 
     def _gather_softcap_fused(
         self,
@@ -1401,12 +1457,23 @@ class LogitsProcessor(nn.Module):
             if use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
-                logits = torch.mm(
-                    hidden_states,
-                    lm_head.weight.T,
-                    out_dtype=torch.float32,
-                    out=out,
-                )
+                if out is None and _gfx1250_lmhead_applies(
+                    hidden_states, lm_head.weight
+                ):
+                    # gfx1250: hipBLASLt's FP32-output pick is slow at decode
+                    # widths; split-K Triton head instead.
+                    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import (
+                        lmhead_fp32,
+                    )
+
+                    logits = lmhead_fp32(hidden_states, lm_head.weight)
+                else:
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                        out=out,
+                    )
             elif self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32),
@@ -1894,3 +1961,28 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def prebuild_logits_gatherers(model: nn.Module, *, dtype: torch.dtype) -> int:
+    """Returns how many LogitsProcessors got their state;
+    logits dtype is known only at forward, so ``dtype`` is the model (lm_head) dtype."""
+    processors = [
+        module
+        for module in model.modules()
+        if isinstance(module, LogitsProcessor) and module.logits_gatherer_pending
+    ]
+    heads = [module for module in model.modules() if isinstance(module, ParallelLMHead)]
+    if not heads:
+        # Tied word embeddings project through the input embedding.
+        heads = [
+            module
+            for module in model.modules()
+            if isinstance(module, VocabParallelEmbedding)
+        ]
+    if not processors or not heads:
+        return 0
+    shard_width = max(head.num_embeddings_per_partition for head in heads)
+    return sum(
+        processor.prebuild_logits_gatherer(shard_width=shard_width, dtype=dtype)
+        for processor in processors
+    )

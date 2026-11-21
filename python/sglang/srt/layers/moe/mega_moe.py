@@ -169,8 +169,33 @@ def _get_mega_moe_symm_buffer(
             # Only the SM100 kernels read the SM locality map.
             # Cache it and stop the MLOPart MPS helper, which blocks cuda-checkpoint.
             if is_sm100_supported():
-                deep_gemm.destroy_localizer()
+                _destroy_mega_moe_localizer()
     return buf
+
+
+def _destroy_mega_moe_localizer() -> None:
+    """Stop DeepGEMM's MLOPart helper and wait for its MPS daemon and server to exit;
+    `deep_gemm.destroy_localizer` returns before the server frees its device memory."""
+    import deep_gemm
+    import psutil
+
+    mps = []
+    try:
+        from deep_gemm.utils import mlopart
+
+        helper = mlopart._mlopart
+        if helper is not None:
+            mps = psutil.Process(helper.client.pid).children(recursive=True)
+    except (ImportError, AttributeError, psutil.Error):
+        pass
+    deep_gemm.destroy_localizer()
+    # On B300 a 5 s pause was enough for the MPS server to free its memory;
+    # not tuned further.
+    _, alive = psutil.wait_procs(mps, timeout=5)
+    if alive:
+        logger.warning(
+            f"MLOPart MPS processes still running after 5 s: {[p.pid for p in alive]}"
+        )
 
 
 def is_mega_moe_experts_ready(experts) -> bool:
@@ -326,6 +351,10 @@ def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
             f"{len(buffers)}, "
             f"{sum(b.buffer.nbytes for b in buffers.values()) / (1 << 30):.2f} GB"
         )
+    if _is_mega_moe_localization_enabled():
+        # Localization (re)started the MLOPart helper. The stop on buffer creation
+        # misses a reused buffer (MTP draft) and one created at the first forward.
+        _destroy_mega_moe_localizer()
 
 
 MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
@@ -682,7 +711,7 @@ def run_mega_routed_experts(
 
 def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
     counts = get_dp_global_num_tokens()
-    if not counts or len(counts) != buf.group.size():
+    if not counts or buf.group.size() % len(counts) != 0:
         return None
     if get_is_capture_mode() or is_dsa_enable_prefill_cp():
         return None
@@ -849,7 +878,11 @@ def build_mega_moe_shared_weights(
 
 
 def _is_mega_moe_localization_enabled() -> bool:
-    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm in [
+        100,
+        103,
+        107,
+    ]
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:

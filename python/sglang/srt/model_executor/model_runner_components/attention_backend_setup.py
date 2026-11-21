@@ -7,6 +7,7 @@ import msgspec
 
 from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import configure_megakernel_aux
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
@@ -74,6 +75,8 @@ def configure_aux_hidden_state_capture(
                 "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
                 "one of which is required for DFLASH/DSPARK."
             )
+    if dflash_use_aux_hidden_state:
+        configure_megakernel_aux(model, dflash_target_layer_ids)
 
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
@@ -98,8 +101,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
             prefill_attention_backend_str="mamba2",
             decode_attention_backend_str="mamba2",
         )
-
-    server_args = model_runner.server_args
 
     # Already resolved and stamped on the runner before this call.
     resolved = ResolvedAttentionBackendStr(
