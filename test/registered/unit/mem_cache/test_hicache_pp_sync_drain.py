@@ -1,9 +1,14 @@
 """Unit tests for HiCache PP synchronization."""
 
 import socket
+import tempfile
+import threading
 import time
 import unittest
+from array import array
 from collections import deque
+from datetime import timedelta
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,7 +18,15 @@ import torch.distributed
 import torch.multiprocessing
 
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -109,6 +122,206 @@ def _gloo_pp_rank(rank: int, port: int, result: dict) -> None:
     torch.distributed.destroy_process_group()
     if rank == 0:
         result.update(elapsed)
+
+
+def _write_allocation_miss_rank(rank, store, failed_stage):
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=store,
+        timeout=timedelta(seconds=15),
+    )
+    try:
+        cache = TestUnifiedPPSyncBatching()._make_cache(rank, [], [])
+        del cache._all_reduce, cache.writing_check
+        cache.attn_tp_group = cache.attn_cp_group = None
+        cache.tp_world_size = 1
+        cache.pp_group = dist.group.WORLD
+        cache.metrics_collector = None
+        cache._build_backup_sidecar = MagicMock(return_value=[])
+        cache.dec_lock_ref = MagicMock()
+        cache.tree_core.build_backup_kv_action = lambda node: BackupKV(node_ids=[node])
+        cache.tree_core.collect_path_info = lambda nodes: [
+            [SimpleNamespace(node_id=node, parent_id=0, path_start=0, path_end=1)]
+            for node in nodes
+        ]
+        cache.tree_core.build_backup_spec = lambda node: (torch.tensor([node]), {})
+        cache.tree_core.rotation_phase_of = lambda node: None
+        published = {}
+        cache.tree_core.commit_backup = lambda node, slots, _: published.update(
+            {node: slots}
+        )
+        cache.evict_host = lambda needed: 0
+        cache.inc_lock_ref = MagicMock()
+        cache._track_write_through_node = MagicMock()
+        completed = []
+        cache._finish_write_through_ack = completed.append
+
+        cc = cache.cache_controller
+        # Exercise the real free list and double-free checks without a device mirror.
+        pool = object.__new__(MLATokenToKVPoolHost)
+        pool.size, pool.page_size, pool.device = 3, 1, "cpu"
+        pool.layout, pool.can_use_write_back_jit = "layer_first", False
+        pool.lock = threading.Lock()
+        pool.clear()
+        cc.mem_pool_host = HostPoolGroup(
+            [PoolEntry("kv", pool, device_pool=None, layer_mapper=lambda i: i)]
+        )
+        pool.shared_allocation_domain = object() if rank == failed_stage else None
+        assert not cache.enable_pp_write_admission(lambda: None)
+        assert cache._pp_pending_writes is None
+        pool.shared_allocation_domain = None
+        assert cache.enable_pp_write_admission(lambda: None)
+        cc.write_queue = []
+        cc.write = HybridCacheController.write.__get__(cc)
+        cc.allocate_host_transfers = (
+            HybridCacheController.allocate_host_transfers.__get__(cc)
+        )
+        cc._uses_shared_host_domain = (
+            HybridCacheController._uses_shared_host_domain.__get__(cc)
+        )
+
+        def flush():
+            if cc.write_queue:
+                ids = [node for op in cc.write_queue for node in op.node_ids]
+                cc.ack_write_queue.append(
+                    SimpleNamespace(node_ids=ids, finish_event=MagicMock())
+                )
+                cc.write_queue.clear()
+
+        cc.start_writing = flush
+        occupied = pool.alloc(2) if rank == failed_stage else None
+        offset = rank * 100
+        for token in (10, 20, 30):
+            if token == 30 and occupied is not None:
+                pool.free(occupied)
+            cache._apply_cache_actions(
+                [BackupKV(node_ids=[token + offset])], RadixKey(array("q", [token]))
+            )
+            for _ in range(cache.pp_sync_window + 2):
+                cache.check_hicache_events()
+        # Each rank has one slot left. Equally sized, differently named
+        # prefixes must not consume it or displace the next shared prefix.
+        for token in (40 + rank, 50):
+            cache._apply_cache_actions(
+                [BackupKV(node_ids=[token + offset])], RadixKey(array("q", [token]))
+            )
+            for _ in range(cache.pp_sync_window + 2):
+                cache.check_hicache_events()
+        assert pool.available_size() == 0
+        assert [node - offset for node in completed] == [10, 30, 50]
+
+        def reclaim(needed):
+            assert needed == 1
+            return pool.free(published.pop(10 + offset))
+
+        cache.evict_host = reclaim
+        cache._apply_cache_actions(
+            [BackupKV(node_ids=[60 + offset])], RadixKey(array("q", [60]))
+        )
+        for _ in range(cache.pp_sync_window + 2):
+            cache.check_hicache_events()
+        # A miss on one stage must leave the following backup usable everywhere.
+        assert [node - offset for node in completed] == [10, 30, 50, 60]
+        assert not cache.cache_controller.ack_write_queue
+        assert [node - offset for node in published] == [30, 50, 60]
+        for slots in published.values():
+            pool.free(slots)
+        assert pool.available_size() == pool.size
+
+        # A rank can acquire all its side pools while a peer's last pool is
+        # full. Return both the anchor and newly allocated side slots, keeping
+        # any storage supplied by the caller.
+        side = object.__new__(MLATokenToKVPoolHost)
+        side.size, side.page_size, side.device = 3, 1, "cpu"
+        side.layout, side.can_use_write_back_jit = "layer_first", False
+        side.lock = threading.Lock()
+        side.clear()
+        cc.mem_pool_host = HostPoolGroup(
+            [
+                PoolEntry("kv", pool, device_pool=None, layer_mapper=lambda i: i),
+                PoolEntry("swa", side, device_pool=None, layer_mapper=lambda i: i),
+            ]
+        )
+        borrowed = side.alloc(1)
+        occupied = side.alloc(2) if rank == failed_stage else None
+        cache._build_backup_sidecar = lambda device, _: [
+            PoolTransfer(name="swa", device_indices=device, host_indices=borrowed),
+            PoolTransfer(name="swa", device_indices=device),
+        ]
+        cache._apply_cache_actions(
+            [BackupKV(node_ids=[70 + offset])], RadixKey(array("q", [70]))
+        )
+        for _ in range(cache.pp_sync_window + 2):
+            cache.check_hicache_events()
+        assert len(completed) == 4 and pool.available_size() == pool.size
+        if occupied is not None:
+            side.free(occupied)
+        assert side.available_size() == side.size - 1
+        side.free(borrowed)
+        assert side.available_size() == side.size
+        # Independent leaves in one flush share a bounded number of round
+        # trips even though each has a separate host allocation.
+        pool.size = 128
+        pool.clear()
+        cache._build_backup_sidecar = lambda *_: []
+        votes = []
+        reduce = cache._pp_write_min
+
+        def count_vote(values):
+            votes.append(len(values))
+            return reduce(values)
+
+        cache._pp_write_min = count_vote
+        for token in range(1000, 1128):
+            cache._apply_cache_actions(
+                [BackupKV(node_ids=[token + offset])], RadixKey(array("q", [token]))
+            )
+        for _ in range(cache.pp_sync_window + 2):
+            cache.check_hicache_events()
+        assert [node - offset for node in completed[-128:]] == list(range(1000, 1128))
+        assert len(votes) <= 4 and pool.available_size() == 0
+        for node in completed[-128:]:
+            pool.free(published.pop(node))
+        assert pool.available_size() == pool.size
+        votes.clear()
+        before = len(completed)
+        occupied = pool.alloc(1) if rank == failed_stage else None
+        for token in range(2000, 2128):
+            cache._apply_cache_actions(
+                [BackupKV(node_ids=[token + offset])], RadixKey(array("q", [token]))
+            )
+        for _ in range(cache.pp_sync_window + 2):
+            cache.check_hicache_events()
+        assert [node - offset for node in completed[before:]] == list(range(2000, 2127))
+        assert len(votes) <= 7
+        for node in completed[before:]:
+            pool.free(published.pop(node))
+        if occupied is not None:
+            pool.free(occupied)
+        assert pool.available_size() == pool.size
+        for work_round in cache.work_rounds:
+            for work in work_round:
+                work.wait()
+    finally:
+        dist.destroy_process_group()
+
+
+class TestOrdinaryPPWriteThrough(CustomTestCase):
+    def test_one_stage_cannot_reserve_host_slots(self):
+        """A full host pool on either stage skips the same backup everywhere."""
+        for failed_stage in (0, 1):
+            with (
+                self.subTest(failed_stage=failed_stage),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                torch.multiprocessing.spawn(
+                    _write_allocation_miss_rank,
+                    args=((Path(tmp) / "store").as_uri(), failed_stage),
+                    nprocs=2,
+                )
 
 
 class TestPPSyncWindowGloo(CustomTestCase):
