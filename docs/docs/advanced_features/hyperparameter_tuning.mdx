@@ -30,6 +30,16 @@ On the other hand, if you see `token usage` very high and you frequently see war
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
 If you see `KV cache pool is full. Retract requests.` occasionally but not frequently (~1 time per minute), it is okay.
 
+You can change `schedule_conservativeness` on a running server without a restart. The endpoint requires `--admin-api-key`:
+
+```bash
+curl -s -X POST http://localhost:30000/set_internal_state \
+  -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
+  -d '{"server_args": {"schedule_conservativeness": 1.3}}'
+```
+
+The value must be a finite number greater than 0. With DP attention, a live value is scaled by 0.3, as the startup value is. A more conservative value takes effect on the next step. A less conservative value takes effect as the running `new_token_ratio` decays, down to the new minimum. `/server_info` reports the effective value under `internal_states`; with DP attention this is the scaled value, so send the unscaled value when you set it again.
+
 ### Tune `--mem-fraction-static` to increase KV cache pool capacity
 SGLang allocates memory as follows:
 

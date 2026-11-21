@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
+from sglang.srt.constants import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import (
@@ -378,7 +379,9 @@ def handle_data_parallelism(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_data_parallelism",
-            schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
+            schedule_conservativeness=(
+                cfg.schedule_conservativeness * DP_ATTENTION_CONSERVATIVENESS_SCALE
+            ),
         )
         if envs.SGLANG_RUST_SERVER.get():
             declare_resolution(
