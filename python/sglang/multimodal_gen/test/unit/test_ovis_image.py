@@ -4,13 +4,22 @@
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
+from diffusers import AutoencoderKL as ReferenceVAE
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.transformers.transformer_ovis_image import (
     OvisImageTransformer2DModel as ReferenceDiT,
 )
+from diffusers.pipelines.ovis_image.pipeline_ovis_image import (
+    OvisImagePipeline as ReferencePipeline,
+)
 
 from sglang.multimodal_gen.configs.models.dits.ovis_image import OvisImageConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ovis_image import (
+    OvisImagePipelineConfig,
+    ovis_image_text_output,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     maybe_init_distributed_environment_and_model_parallel,
@@ -20,6 +29,8 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.dits.ovis_image import (
     OvisImageTransformer2DModel,
 )
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
+from sglang.multimodal_gen.runtime.pipelines.ovis_image import prepare_mu
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
@@ -27,6 +38,121 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 from sglang.test.test_utils import CustomTestCase
 
 
+class TestOvisImageConditioning(CustomTestCase):
+    def test_mask_before_crop_keeps_fixed_length_attention(self):
+        hidden = torch.arange(2 * 33 * 4).reshape(2, 33, 4).float()
+        mask = torch.ones(2, 33, dtype=torch.long)
+        mask[0, 30:] = 0
+        mask[1, 28:] = 0
+        result = ovis_image_text_output(
+            SimpleNamespace(last_hidden_state=hidden),
+            SimpleNamespace(attention_mask=mask),
+        )
+        torch.testing.assert_close(
+            result.prompt_embeds, (hidden * mask.unsqueeze(-1))[:, 28:]
+        )
+        self.assertEqual(result.prompt_seq_lens, [5, 5])
+        self.assertTrue(result.prompt_embeds_mask.all())
+
+    def test_pack_unpack_matches_official_layout(self):
+        config = OvisImagePipelineConfig()
+        batch = SimpleNamespace(height=80, width=112)
+        latent = torch.arange(4 * 16 * 10 * 14).reshape(4, 16, 10, 14).float()
+        packed = config.maybe_pack_latents(latent, 4, batch)
+        expected = ReferencePipeline._pack_latents(latent, 4, 16, 10, 14)
+        torch.testing.assert_close(packed, expected, atol=0, rtol=0)
+        restored = config.post_denoising_loop(packed, batch)
+        torch.testing.assert_close(restored, latent, atol=0, rtol=0)
+
+    def test_dynamic_schedule_matches_official_defaults(self):
+        config = OvisImagePipelineConfig()
+        for size, mu in ((80, 0.4608984375), (512, 0.63), (1024, 1.15)):
+            with self.subTest(size=size):
+                scheduler = FlowMatchEulerDiscreteScheduler(
+                    use_dynamic_shifting=True,
+                    base_image_seq_len=256,
+                    max_image_seq_len=4096,
+                    base_shift=0.5,
+                    max_shift=1.15,
+                )
+                batch = SimpleNamespace(height=size, width=size, scheduler=scheduler)
+                _, actual_mu = prepare_mu(
+                    batch, SimpleNamespace(pipeline_config=config)
+                )
+                self.assertAlmostEqual(actual_mu, mu)
+                sigmas = config.prepare_sigmas(None, 5)
+                np.testing.assert_array_equal(sigmas, np.linspace(1, 1 / 5, 5))
+                scheduler.set_timesteps(sigmas=sigmas, mu=actual_mu)
+                expected = FlowMatchEulerDiscreteScheduler.from_config(scheduler.config)
+                expected.set_timesteps(sigmas=np.linspace(1, 1 / 5, 5), mu=mu)
+                torch.testing.assert_close(scheduler.timesteps, expected.timesteps)
+
+    def test_native_scheduler_steps_match_official(self):
+        """Fixed model outputs stay within tolerance across the native Euler path."""
+        from diffusers.pipelines.ovis_image.pipeline_ovis_image import calculate_shift
+
+        from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+            FlowMatchEulerDiscreteScheduler as NativeEulerScheduler,
+        )
+
+        scheduler_kwargs = dict(
+            num_train_timesteps=1000,
+            shift=3.0,
+            use_dynamic_shifting=True,
+            base_image_seq_len=256,
+            max_image_seq_len=4096,
+            base_shift=0.5,
+            max_shift=1.15,
+        )
+        config = OvisImagePipelineConfig()
+        generator = torch.Generator("cpu").manual_seed(42)
+        initial = torch.randn(2, 25, 64, generator=generator)
+        prediction = torch.randn(2, 25, 64, generator=generator)
+        for size in (512, 1024):
+            for steps in (20, 50):
+                for dtype in (torch.float32, torch.bfloat16):
+                    with self.subTest(size=size, steps=steps, dtype=dtype):
+                        native = NativeEulerScheduler(**scheduler_kwargs)
+                        reference = FlowMatchEulerDiscreteScheduler(**scheduler_kwargs)
+                        batch = SimpleNamespace(
+                            height=size, width=size, scheduler=native
+                        )
+                        _, native_mu = prepare_mu(
+                            batch, SimpleNamespace(pipeline_config=config)
+                        )
+                        reference_mu = calculate_shift((size // 16) ** 2)
+                        native.set_timesteps(
+                            sigmas=config.prepare_sigmas(None, steps), mu=native_mu
+                        )
+                        reference.set_timesteps(
+                            sigmas=np.linspace(1, 1 / steps, steps), mu=reference_mu
+                        )
+                        native.set_begin_index(0)
+                        reference.set_begin_index(0)
+                        actual = initial.to(dtype).clone()
+                        expected = actual.clone()
+                        fixed_prediction = prediction.to(dtype)
+                        atol, rtol = (
+                            (1e-4, 1e-4) if dtype == torch.float32 else (0.05, 0.02)
+                        )
+                        for actual_t, expected_t in zip(
+                            native.timesteps, reference.timesteps
+                        ):
+                            actual = native.step(
+                                fixed_prediction, actual_t, actual, return_dict=False
+                            )[0]
+                            expected = reference.step(
+                                fixed_prediction,
+                                expected_t,
+                                expected,
+                                return_dict=False,
+                            )[0]
+                            torch.testing.assert_close(
+                                actual, expected, atol=atol, rtol=rtol
+                            )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for native attention")
 class TestOvisImageNumerics(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -56,7 +182,7 @@ class TestOvisImageNumerics(CustomTestCase):
         cls.config.update_model_arch(cls.kwargs)
         cls.server_args = ServerArgs(
             model_path="ATH-MaaS/Ovis-Image-7B",
-            pipeline_config=ImagePipelineConfig(dit_config=cls.config),
+            pipeline_config=OvisImagePipelineConfig(dit_config=cls.config),
             num_gpus=1,
             attention_backend="torch_sdpa",
             performance_mode="manual",
@@ -516,6 +642,37 @@ class TestOvisImageNumerics(CustomTestCase):
                         torch.testing.assert_close(
                             actual, expected, atol=0.05, rtol=0.02
                         )
+
+    @torch.no_grad()
+    def test_native_vae_decode_matches_diffusers(self):
+        kwargs = dict(
+            block_out_channels=(16, 32),
+            down_block_types=("DownEncoderBlock2D",) * 2,
+            up_block_types=("UpDecoderBlock2D",) * 2,
+            layers_per_block=1,
+            latent_channels=16,
+            norm_num_groups=8,
+            sample_size=32,
+            use_quant_conv=False,
+            use_post_quant_conv=False,
+            scaling_factor=0.3611,
+            shift_factor=0.1159,
+        )
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(19)
+                reference = ReferenceVAE(**kwargs).cuda().to(dtype).eval()
+                config = OvisImagePipelineConfig()
+                config.vae_config.update_model_arch(dict(reference.config))
+                native = AutoencoderKL(config.vae_config).cuda().to(dtype).eval()
+                native.load_state_dict(reference.state_dict(), strict=True)
+                latent = torch.randn(2, 16, 8, 8, device="cuda", dtype=dtype)
+                scale, shift = config.get_decode_scale_and_shift("cuda", dtype, native)
+                decoded_latent = latent / scale + shift
+                actual = native.decode(decoded_latent)
+                expected = reference.decode(latent / 0.3611 + 0.1159).sample
+                atol, rtol = (1e-4, 1e-4) if dtype == torch.float32 else (0.05, 0.02)
+                torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
 class TestOvisImageWeightShards(CustomTestCase):
