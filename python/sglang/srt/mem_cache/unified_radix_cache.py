@@ -373,6 +373,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # since a gloo send only completes once the next rank posts its recv.
         self.pp_sync_window = max(1, params.pp_size + params.pp_async_batch_depth)
         self.work_rounds: deque[list[torch.distributed.Work]] = deque([[]])
+        self.enable_cache_mode_storage_hit_pending = self.pp_size == 1 and not any(
+            group is not None and torch.distributed.get_world_size(group=group) > 1
+            for group in (
+                self.tp_group,
+                self.attn_cp_group,
+                self.attn_tp_group,
+                self.pp_group,
+            )
+        )
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -388,6 +397,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
+        self.storage_prefetch_host_capacity_wait_ms = 0.0
+        self.storage_prefetch_retry_max_attempts = 8
         self.hicache_storage_pass_prefix_keys = False
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
@@ -521,6 +532,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
+        self.pending_storage_hits: dict[CacheRequestHandle, PrefetchOperation] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
@@ -659,6 +671,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self.storage_prefetch_host_capacity_wait_ms = (
+            get_memory().hicache_storage_prefetch_host_capacity_wait_ms
+        )
+        if not 0 <= self.storage_prefetch_host_capacity_wait_ms < float("inf"):
+            raise ValueError(
+                "HiCache host capacity wait must be finite and nonnegative"
+            )
+        self.storage_prefetch_retry_max_attempts = (
+            get_memory().hicache_storage_prefetch_retry_max_attempts
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -3752,6 +3774,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return info, hit_tokens - trim_tokens, original_hit_tokens
 
     def revoke_pending_prefetch(self, request: CacheRequestHandle) -> None:
+        pending = getattr(self, "pending_storage_hits", None)
+        if pending is not None:
+            pending.pop(request, None)
         self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
         info = self.ongoing_prefetch.get(request)
         if info is None:
@@ -3799,21 +3824,29 @@ class UnifiedRadixCache(BasePrefixCache):
                     yield item
 
         buffer_mode = self.host_memory_mode == "buffer_only"
+        wait_full = (
+            not buffer_mode
+            and getattr(self, "enable_cache_mode_storage_hit_pending", False)
+            and getattr(self, "storage_prefetch_host_capacity_wait_ms", 0) > 0
+        )
 
         def _try_alloc_storage_hit(operation) -> bool:
             """Allocate the hit-sized bounce and launch the transfer.
             Returns False when staging pressure defers the allocation
-            (buffer mode parks and retries; cache mode revokes)."""
+            (cache mode retries only within the opt-in capacity wait)."""
             request = operation.handle
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
-            if info is None:
+            if info is None or info.operation is not operation:
                 return True  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
                 if operation.deadline_expired:
                     # Cut by the tick vote while parked: same reason as the poll.
                     self._finish_storage_prefetch(request, 0, reason="deadline")
                 self.revoke_pending_prefetch(request)
+                return True
+            if not buffer_mode and info.host_indices is not None:
+                # A queued transfer already owns its staging; never allocate twice.
                 return True
 
             if buffer_mode and cc.prefetch_rate_limited():
@@ -3873,15 +3906,42 @@ class UnifiedRadixCache(BasePrefixCache):
             # Hybrid pools (SWA / Mamba) are trailing-window aligned, so a
             # shortened recovery boundary may be invalid in storage; only
             # full-only models may truncate the prefix to fit host capacity.
-            allow_partial = not info.comp_xfers
-            host_indices, alloc_len = cc.allocate_storage_hit(
-                operation,
-                hit_tokens,
-                allow_partial=allow_partial,
-                min_tokens=self.prefetch_threshold if allow_partial else hit_tokens,
-                evict_host=self.evict_host,
+            allow_partial = not info.comp_xfers and not wait_full
+            now = time.monotonic()
+            deadline = getattr(operation, "host_capacity_deadline", None)
+            expired = wait_full and deadline is not None and now >= deadline
+            if (
+                wait_full
+                and not expired
+                and now < getattr(operation, "host_capacity_next_retry", 0)
+            ):
+                return False
+            host_indices, alloc_len = (
+                (None, hit_tokens)
+                if expired
+                else cc.allocate_storage_hit(
+                    operation,
+                    hit_tokens,
+                    allow_partial=allow_partial,
+                    min_tokens=self.prefetch_threshold if allow_partial else hit_tokens,
+                    evict_host=self.evict_host,
+                )
             )
             if host_indices is None:
+                retries = getattr(operation, "host_capacity_retries", 0)
+                if (
+                    wait_full
+                    and not expired
+                    and retries < self.storage_prefetch_retry_max_attempts
+                ):
+                    wait_seconds = self.storage_prefetch_host_capacity_wait_ms / 1000
+                    if deadline is None:
+                        operation.host_capacity_deadline = now + wait_seconds
+                    operation.host_capacity_retries = retries + 1
+                    operation.host_capacity_next_retry = now + (
+                        wait_seconds / (self.storage_prefetch_retry_max_attempts + 1)
+                    )
+                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -3926,6 +3986,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     if not _try_alloc_storage_hit(parked[0]):
                         break
                     parked.popleft()
+            else:
+                pending = getattr(self, "pending_storage_hits", {})
+                # Snapshot identities, not the queue object: revoke may remove the
+                # current or a later request. A deferred large hit does not stop
+                # smaller hits that fit from making progress in this pass.
+                for request, operation in tuple(pending.items()):
+                    if pending.get(request) is not operation:
+                        continue
+                    if _try_alloc_storage_hit(operation):
+                        if pending.get(request) is operation:
+                            pending.pop(request)
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
@@ -3934,6 +4005,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 if info is None:
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
+                    continue
+                if info.operation is not operation:
+                    # A late query from a revoked attempt must not retire or
+                    # change the accounting of its replacement.
                     continue
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
@@ -3971,9 +4046,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.buffer_pipeline.pending_hit_allocs
                 )
                 if parked_ahead or not _try_alloc_storage_hit(operation):
-                    # Counted once at first parking, not per retry tick.
-                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
-                    self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    if buffer_mode:
+                        # Counted once at first parking, not per retry tick.
+                        self._prefetch_outcome_stats["declined_rate_limited"] += 1
+                        self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    else:
+                        self._log_storage_prefetch_deferred(hit_tokens, "host_capacity")
+                        self.pending_storage_hits[request] = operation
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
