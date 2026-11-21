@@ -16,8 +16,9 @@ from unittest.mock import MagicMock
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.separate_buffer_allocator_double import (
     separate_buffer_allocator_double,
@@ -41,6 +42,26 @@ def _make_model_runner(**attrs):
 
 
 class TestMaxTokenPoolSize(CustomTestCase):
+    def test_logical_capacity_uses_host_pool_and_respects_aux_capacity(self):
+        instance = _make_model_runner(
+            enable_hisparse=True,
+            token_to_kv_pool_allocator=SimpleNamespace(size_full=4096),
+            is_hybrid_swa=False,
+            max_total_num_tokens=1024,
+        )
+        instance.kv_cache_configurator.is_hybrid_swa = False
+        instance.kv_cache_configurator.is_draft_worker = False
+        instance.req_to_token_pool = ReqToTokenPool.__new__(ReqToTokenPool)
+        instance.req_to_token_pool._aux_cache = None
+        with get_parallel().override(attn_dcp_size=1):
+            self.assertEqual(instance.logical_max_total_num_tokens, 4096)
+            self.assertEqual(instance.effective_logical_max_total_num_tokens, 4096)
+            instance.req_to_token_pool._aux_cache = SimpleNamespace(dense_capacity=2048)
+            self.assertEqual(instance.logical_max_total_num_tokens, 2048)
+            instance.enable_hisparse = False
+            instance.req_to_token_pool._aux_cache = None
+            self.assertEqual(instance.logical_max_total_num_tokens, 1024)
+
     def test_hisparse_returns_allocator_size_full(self):
         """When HiSparse is enabled and the allocator exposes `size_full`, the
         host-backed logical capacity (device_pool * host_to_device_ratio) wins
