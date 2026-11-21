@@ -313,6 +313,9 @@ from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.scheduler_components.prefill_admission_trace import (
+    PrefillAdmissionTrace,
+)
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -532,6 +535,9 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+
+    _dp_admission_scan_seq = 0
+    dp_round_trace = False
 
     def __init__(
         self,
@@ -1427,6 +1433,7 @@ class Scheduler(
         ] = deque()
         self.enable_continuous_input_polling = False
         self.enable_skip_finishing_decode = False
+        self.dp_round_trace = envs.SGLANG_DP_ROUND_TRACE.get()
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -4514,10 +4521,17 @@ class Scheduler(
                 self.prefill_delayer, token_usage=max_pool_usage
             )
 
+        trace = None
+        if self.dp_round_trace:
+            self._dp_admission_scan_seq += 1
+            trace = PrefillAdmissionTrace(self._dp_admission_scan_seq)
         ret, running_batch = self._get_new_batch_prefill_raw(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
+            trace=trace,
         )
+        if trace is not None:
+            trace.finish(self.forward_ct, ret)
 
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
@@ -4587,6 +4601,7 @@ class Scheduler(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
+        trace: Optional[PrefillAdmissionTrace] = None,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
         self.prefill_admission_no_token = False
         # Check if the grammar is ready in the grammar queue
@@ -4603,9 +4618,17 @@ class Scheduler(
             # request clears the flag elsewhere, so admission would stay shut.
             running_batch.batch_is_full = False
 
+        if trace is not None:
+            trace.queued = len(self.waiting_queue)
+            if trace.queued:
+                trace.observe_head(self.waiting_queue[0])
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            if trace is not None:
+                trace.stop = (
+                    "batch_full" if running_batch.batch_is_full else "queue_empty"
+                )
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4620,6 +4643,8 @@ class Scheduler(
                 ),
             )
         ):
+            if trace is not None:
+                trace.stop = "slot_delay"
             return None, running_batch
 
         num_allocatable_reqs = self.get_num_allocatable_reqs(
@@ -4642,6 +4667,8 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            if trace is not None:
+                trace.stop = "no_req_slot"
             return None, running_batch
 
         # After the early returns, so a full-batch pass does not scan the queue.
@@ -4665,6 +4692,8 @@ class Scheduler(
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            if trace is not None:
+                trace.stop = "test_retract"
             return None, running_batch
 
         # Determine chunked_prefill_size for this batch
@@ -4763,6 +4792,8 @@ class Scheduler(
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
+        if trace is not None:
+            resumed = len(adder.can_run_list)
         bounded_active = self.policy._bounded_active
         candidates = (
             self.policy.admission_candidates(self.waiting_queue)
@@ -4771,14 +4802,24 @@ class Scheduler(
         )
         for req in candidates:
             if bounded_active and not self.policy.allows_admission(req):
+                if trace is not None:
+                    trace.stop = "policy_budget"
                 break
+            if trace is not None:
+                if trace.visited == 0:
+                    trace.observe_head(req)
+                trace.visited += 1
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
+                if trace is not None:
+                    trace.stop = "pass_budget"
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 if bounded_active:
                     self.policy.mark_admission_skipped(req)
+                if trace is not None:
+                    trace.skips["lora"] += 1
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4790,6 +4831,8 @@ class Scheduler(
             ):
                 if bounded_active:
                     self.policy.mark_admission_skipped(req)
+                if trace is not None:
+                    trace.skips["pooling_mode"] += 1
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4810,6 +4853,8 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    if trace is not None:
+                        trace.stop = "batch_full"
                     break
 
             if (
@@ -4825,6 +4870,8 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
+                    if trace is not None:
+                        trace.skips["prefetch"] += 1
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4846,6 +4893,8 @@ class Scheduler(
             if adder.should_defer(req):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
+                if trace is not None:
+                    trace.stop = "deferred_head"
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
@@ -4854,6 +4903,8 @@ class Scheduler(
                     self._drop_unadmitted_match(req)
                 if bounded_active:
                     self.policy.mark_admission_skipped(req)
+                if trace is not None:
+                    trace.skips["prefetch_reissue"] += 1
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4863,6 +4914,8 @@ class Scheduler(
                         self._drop_unadmitted_match(req)
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
+                    if trace is not None:
+                        trace.skips["staging"] += 1
                     continue
             res = adder.add_one_req(
                 req,
@@ -4874,6 +4927,10 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                if trace is not None:
+                    trace.stop = (
+                        "kv_no_token" if res == AddReqResult.NO_TOKEN else "adder_limit"
+                    )
                 if res == AddReqResult.NO_TOKEN:
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
@@ -4912,6 +4969,8 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if trace is not None:
+            trace.admitted = len(can_run_list) - resumed
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
@@ -5117,6 +5176,24 @@ class Scheduler(
             or req in self.chunked_reqs
         )
 
+    def _trace_dp_round(self, batch: ScheduleBatch) -> None:
+        stats = batch.dp_balance_stats
+        logger.info(
+            "DP_ROUND fct=%d mode=%s bs=%d new=%d scan=%s local_tokens=%s max_tokens=%s gather_ms=%s local_pairs=%s max_pairs=%s",
+            batch.forward_iter,
+            batch.forward_mode.name.lower(),
+            batch.batch_size(),
+            batch.extend_num_tokens or 0,
+            batch.prefill_admission_scan_id,
+            stats.local_tokens if stats is not None else None,
+            stats.max_tokens if stats is not None else None,
+            round(stats.sync_wait_seconds * 1000, 1) if stats is not None else None,
+            stats.local_attention_pairs if stats is not None else None,
+            stats.max_attention_pairs if stats is not None else None,
+        )
+        # Running batches may be reused on a later decode or idle step.
+        batch.prefill_admission_scan_id = None
+
     def _on_step_launch(self, batch: ScheduleBatch) -> Optional[ForwardLaunch]:
         """The bookkeeping of every step launch, before its forward is issued.
         Returns the unified pool's launch record, which the step's result
@@ -5124,6 +5201,8 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
+        if self.dp_round_trace:
+            self._trace_dp_round(batch)
         batch.launch_ts = time.monotonic()
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
