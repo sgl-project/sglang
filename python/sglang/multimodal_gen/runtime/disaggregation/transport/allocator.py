@@ -34,13 +34,13 @@ class BuddyAllocator:
 
         # Free lists indexed by order: order 0 = min_block_size, order 1 = 2*min_block_size, ...
         self._max_order = self._size_to_order(self._pool_size)
-        self._free_lists: list[list[int]] = [[] for _ in range(self._max_order + 1)]
+        self._free_lists: list[dict[int, None]] = [{} for _ in range(self._max_order + 1)]
 
         self._blocks: dict[int, Block] = {}
 
         root = Block(offset=0, size=self._pool_size)
         self._blocks[0] = root
-        self._free_lists[self._max_order].append(0)
+        self._free_lists[self._max_order][0] = None
 
         self._allocated_bytes = 0
         self._num_allocations = 0
@@ -105,7 +105,8 @@ class BuddyAllocator:
         if found_order < 0:
             return None
 
-        offset = self._free_lists[found_order].pop(0)
+        offset = next(iter(self._free_lists[found_order]))
+        del self._free_lists[found_order][offset]
         block = self._blocks[offset]
 
         # Split down to target_order
@@ -116,7 +117,7 @@ class BuddyAllocator:
 
             buddy = Block(offset=buddy_offset, size=buddy_size)
             self._blocks[buddy_offset] = buddy
-            self._free_lists[found_order].append(buddy_offset)
+            self._free_lists[found_order][buddy_offset] = None
 
             block.size = buddy_size
 
@@ -150,7 +151,7 @@ class BuddyAllocator:
                 break
 
             order = self._size_to_order(buddy.size)
-            self._free_lists[order].remove(buddy_offset)
+            self._free_lists[order].pop(buddy_offset)
 
             if buddy_offset < block.offset:
                 del self._blocks[block.offset]
@@ -161,7 +162,7 @@ class BuddyAllocator:
                 block.size *= 2
 
         order = self._size_to_order(block.size)
-        self._free_lists[order].append(block.offset)
+        self._free_lists[order][block.offset] = None
 
     def _size_to_order(self, size: int) -> int:
         order = 0
