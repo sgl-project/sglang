@@ -270,7 +270,6 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
                 )
 
     def _use_kernel(self):
-        """Run the real _write_fused against a recording kernel stub."""
         del self.writer._write_fused
         kernel = mock.Mock(side_effect=lambda *a, **kw: (kw["q_out"], None, None, None))
         self.writer._fused_cat_and_cache = kernel

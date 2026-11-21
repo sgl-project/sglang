@@ -39,7 +39,7 @@ _ROPE_HEAD_DIM = 64
 # FP8) and asserts on anything else.
 _CACHE_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 
-# With save_kv_cache=False, these backends read only the BF16 Q and the KV cache;
+# With save_kv_cache=False, these backends read only Q and the KV cache;
 # Triton target-verify runs its extend kernel, which also reads k.
 _DECODE_BACKENDS = frozenset({"aiter", "triton"})
 _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
@@ -140,9 +140,8 @@ class KimiK3RocmMlaQCacheWriter:
         is_target_verify: bool,
         get_fp8_q_out: Optional[Callable[[], Optional[torch.Tensor]]] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        # Returns (q, k placeholder), or None to leave both to the split chain.
-        # get_fp8_q_out is the backend's mla_fp8_q_out, called only once the launch
-        # will run; a buffer it returns takes q in FP8 and is returned as q.
+        # Returns (q, k placeholder), or None for the split chain; get_fp8_q_out
+        # (the backend's mla_fp8_q_out) is called only once the launch will run.
         backends = _TARGET_VERIFY_BACKENDS if is_target_verify else _DECODE_BACKENDS
         if (
             # An idle rank has nothing to write.

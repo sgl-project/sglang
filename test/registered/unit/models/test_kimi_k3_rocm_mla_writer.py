@@ -45,7 +45,6 @@ def _write(writer, values):
 
 
 def _split_chain(values):
-    """The split chain: Q is the BF16 concat, the cache a plain cast at scale 1."""
     q = torch.cat((values["q_nope"], values["q_pe"]), dim=-1)
     k = torch.cat((values["k_nope"], values["k_pe"]), dim=-1)
     return q, k.to(values["kv_cache"].dtype)
@@ -60,9 +59,8 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
             self.writer = create_q_cache_writer(kv_lora_rank=512, qk_rope_head_dim=64)
 
     def test_writer_matches_split_chain_bytes(self):
-        """K3's KV scale is 1, so the fused write must store the split chain's bytes,
-        also for -0.0, inf and NaN lanes (inf and NaN in k: BF16 cache only).
-        A slot < 0 token skips only its cache write; its Q row is still written."""
+        """At KV scale 1 the fused write stores the split chain's bytes, -0.0/inf/NaN
+        lanes included; a slot < 0 token skips only its cache write."""
         for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for tokens in (1, 33, 256):
                 with self.subTest(cache_dtype=cache_dtype, tokens=tokens):
@@ -71,9 +69,8 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
     def _check_split_chain_bytes(self, cache_dtype, tokens):
         values = _inputs(tokens, cache_dtype=cache_dtype, cache_rows=tokens + 8)
         if tokens >= 4:
-            # The PE halves are copied, not rotated (the NeoX partner of lane i is lane
-            # i + 32): an inf lane must not turn its partner into NaN, and a -0.0 lane
-            # must keep its sign whatever its partner's.
+            # PE halves are copied unrotated (NeoX partner of lane i is i + 32):
+            # inf must not turn its partner into NaN, and -0.0 keeps its sign.
             values["q_pe"][0, 0, 0] = float("inf")
             values["q_pe"][1, 0, (0, 33)] = -0.0
             values["q_pe"][1, 0, (1, 32)] = -3.0
@@ -101,10 +98,8 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
         self.assertEqual(torch.count_nonzero(cache[untouched]).item(), 0)
 
     def test_writer_fp8_q_out_matches_quant_then_pad(self):
-        """With the backend's FP8 query buffer, the writer must store the bytes the asm
-        verify built for itself before: the static FP8 quant at its unit q scale of
-        cat(q_nope, q_pe), saturating at +-448, in a zeroed 16-head buffer. The cache
-        keeps the split chain's bytes."""
+        """An FP8 query buffer gets the static unit-scale quant of cat(q_nope, q_pe),
+        saturating at +-448, in zeroed pad heads; the cache keeps the split chain's bytes."""
         for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for tokens in (1, 8, 33):
                 with self.subTest(cache_dtype=cache_dtype, tokens=tokens):
