@@ -128,7 +128,7 @@ class Mm(msgspec.Struct):
         Arg(
             help=(
                 "CPU memory budget for content-addressed multimodal preprocessing "
-                "artifacts. Unset selects a model-specific default (256 MiB for "
+                "artifacts. Unset selects a model-specific default (16 GiB for "
                 "Kimi-K3); 0 disables the cache. The budget is divided across "
                 "tokenizer workers and does not reserve GPU memory."
             ),

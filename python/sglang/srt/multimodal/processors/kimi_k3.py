@@ -507,7 +507,9 @@ class KimiK3ImageProcessor(
     precompute_hash_before_cpu_transfer = True
     auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
-    auto_mm_preprocess_cache_size_mb = 256
+    # Multi-turn clients resend every earlier image each turn; the budget is split
+    # across tokenizer workers and must hold each worker's active sessions.
+    auto_mm_preprocess_cache_size_mb = 16384
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
     uses_wide_image_identity = True
