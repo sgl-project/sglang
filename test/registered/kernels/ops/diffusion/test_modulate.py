@@ -82,10 +82,8 @@ def test_modulate_scale_shift_matches_eager(shape, dtype):
     scale = torch.randn((shape[0], shape[-1]), device=DEVICE, dtype=dtype)
     shift = torch.randn_like(scale)
     ref = _eager_modulate(x, scale, shift)
-    if torch.version.hip is None:
-        assert torch.equal(modulate_scale_shift_cuda(x, scale, shift), ref)
-    else:
-        assert not can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert torch.equal(modulate_scale_shift_cuda(x, scale, shift), ref)
     assert torch.equal(modulate_scale_shift(x, scale, shift), ref)
 
 
@@ -95,11 +93,8 @@ def test_modulate_scale_shift_accepts_adaln_chunk_views():
     emb = torch.randn((1, 6 * 3072), device=DEVICE, dtype=torch.bfloat16)
     shift, scale = emb.chunk(6, dim=1)[:2]
     ref = _eager_modulate(x, scale, shift)
-    if torch.version.hip is None:
-        assert can_use_modulate_scale_shift_cuda(x, scale, shift)
-        assert torch.equal(modulate_scale_shift_cuda(x, scale, shift), ref)
-    else:
-        assert not can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert can_use_modulate_scale_shift_cuda(x, scale, shift)
+    assert torch.equal(modulate_scale_shift_cuda(x, scale, shift), ref)
     assert torch.equal(modulate_scale_shift(x, scale, shift), ref)
 
 
