@@ -19,11 +19,11 @@ class NewTokenRatioTracker:
 
     @classmethod
     def from_config(cls) -> NewTokenRatioTracker:
-        init = min(
-            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
-            * get_schedule().schedule_conservativeness,
-            1.0,
-        )
+        return cls.from_conservativeness(get_schedule().schedule_conservativeness)
+
+    @classmethod
+    def from_conservativeness(cls, conservativeness: float) -> NewTokenRatioTracker:
+        init = min(envs.SGLANG_INIT_NEW_TOKEN_RATIO.get() * conservativeness, 1.0)
         min_ratio = min(
             init * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
             1.0,
