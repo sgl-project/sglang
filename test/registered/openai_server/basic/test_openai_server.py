@@ -17,7 +17,6 @@ import requests
 
 from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.anthropic_messages_kit import AnthropicMessagesMixin
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
@@ -29,13 +28,16 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=280, suite="base-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=294, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=224, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -48,11 +50,13 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1"
+        cls.score_url = cls.base_url + "/score"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_ignore_eos(self):
         """ignore_eos=True must keep generating past EOS up to max_tokens."""
@@ -545,77 +549,6 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         with self.assertRaises(openai.NotFoundError):
             client.models.retrieve("non-existent-model")
 
-
-@unittest.skipUnless(
-    is_rust_server_built(),
-    "embedded rust server extension not built",
-)
-class TestOpenAICompletionWithRust(CustomTestCase):
-    """Run the existing Completion matrix unchanged through the Rust frontend."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            env={"SGLANG_RUST_SERVER": "1"},
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    # Reuse the reference test methods directly so Python and Rust coverage
-    # cannot drift into separate matrices.
-    run_completion = TestOpenAIServer.run_completion
-    run_completion_stream = TestOpenAIServer.run_completion_stream
-    test_completion = TestOpenAIServer.test_completion
-    test_completion_stream = TestOpenAIServer.test_completion_stream
-
-
-@unittest.skipUnless(
-    is_rust_server_built(),
-    "embedded rust server extension not built",
-)
-class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
-    """Run the existing Chat matrix unchanged through the Rust frontend."""
-
-    run_chat_completion = TestOpenAIServer.run_chat_completion
-    run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
-    test_chat_completion = TestOpenAIServer.test_chat_completion
-    test_chat_completion_stream = TestOpenAIServer.test_chat_completion_stream
-
-    # This class is a Chat gate; Completion already has its own Rust matrix.
-    test_completion = None
-    test_completion_stream = None
-
-
-class TestOpenAIServerv1Responses(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
     def run_response(
         self,
         input_text: str = "The capital of France is",
@@ -758,25 +691,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             final_usage_ok,
         )
 
-    def run_chat_completion_stream(self, logprobs=None, parallel_sample_num=1):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        generator = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "What is the capital of France?"},
-            ],
-            temperature=0,
-            logprobs=logprobs is not None and logprobs > 0,
-            top_logprobs=logprobs,
-            stream=True,
-            stream_options={"include_usage": True},
-            n=parallel_sample_num,
-        )
-        for _ in generator:
-            pass
-
-    # ---- tests ----
     def test_response(self):
         resp = self.run_response(temperature=0, max_output_tokens=32)
         assert resp.id
@@ -836,36 +750,6 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_completed
         assert final_usage_ok or True  # final_usage's stats are not done for now
 
-    def test_regex(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        regex = (
-            r"""\{\n"""
-            + r"""   "name": "[\w]+",\n"""
-            + r"""   "population": [\d]+\n"""
-            + r"""\}"""
-        )
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "Introduce the capital of France."},
-            ],
-            temperature=0,
-            max_tokens=128,
-            extra_body={"regex": regex},
-        )
-        text = response.choices[0].message.content
-
-        try:
-            js_obj = json.loads(text)
-        except (TypeError, json.decoder.JSONDecodeError):
-            print("JSONDecodeError", text)
-            raise
-        assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
-
     def test_error(self):
         url = f"{self.base_url}/responses"
         headers = {
@@ -885,7 +769,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("type", body["error"])
         self.assertIn("code", body["error"])
 
-    def test_penalty(self):
+    def test_response_penalty(self):
         url = f"{self.base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -909,229 +793,11 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("output_tokens", body["usage"])
         self.assertIn("total_tokens", body["usage"])
 
-    def test_response_prefill(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        response = client.chat.completions.create(
-            model="meta-llama/Llama-3.1-8B-Instruct",
-            messages=[
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {
-                    "role": "user",
-                    "content": """
-Extract the name, size, price, and color from this product description as a JSON object:
-
-<description>
-The SmartHome Mini is a compact smart home assistant available in black or white for only $49.99. At just 5 inches wide, it lets you control lights, thermostats, and other connected devices via voice or app—no matter where you place it in your home. This affordable little hub brings convenient hands-free control to your smart devices.
-</description>
-""",
-                },
-                {
-                    "role": "assistant",
-                    "content": "{\n",
-                },
-            ],
-            temperature=0,
-            extra_body={"continue_final_message": True},
-        )
-
-        assert (
-            response.choices[0]
-            .message.content.strip()
-            .startswith('"name": "SmartHome Mini",')
-        )
-
-    def test_model_list(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        models = list(client.models.list())
-        assert len(models) == 1
-        assert isinstance(getattr(models[0], "max_model_len", None), int)
-
-
-class TestOpenAIV1Rerank(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.score_tolerance = 1e-2
-
-        # Configure embedding-specific args
-        other_args = [
-            "--is-embedding",
-            "--enable-metrics",
-            "--disable-radix-cache",
-            "--chunked-prefill-size",
-            "-1",
-            "--attention-backend",
-            "torch_native",
-        ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=other_args,
-        )
-        cls.base_url += "/v1/rerank"
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def run_rerank(self, query, docs):
-        response = requests.post(
-            self.base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"query": query, "documents": docs},
-        )
-
-        return response.json()
-
-    def test_rerank_single(self):
-        """Test single rerank request"""
-        query = TEST_RERANK_QUERY_DOCS[0]["query"]
-        docs = TEST_RERANK_QUERY_DOCS[0]["documents"]
-
-        response = self.run_rerank(query, docs)
-
-        self.assertEqual(len(response), 1)
-        self.assertTrue(isinstance(response[0]["score"], float))
-        self.assertTrue(isinstance(response[0]["document"], str))
-        self.assertTrue(isinstance(response[0]["index"], int))
-
-    def test_rerank_batch(self):
-        """Test batch rerank request"""
-        query = TEST_RERANK_QUERY_DOCS[1]["query"]
-        docs = TEST_RERANK_QUERY_DOCS[1]["documents"]
-
-        response = self.run_rerank(query, docs)
-
-        self.assertEqual(len(response), 2)
-        self.assertTrue(isinstance(response[0]["score"], float))
-        self.assertTrue(isinstance(response[1]["score"], float))
-        self.assertTrue(isinstance(response[0]["document"], str))
-        self.assertTrue(isinstance(response[1]["document"], str))
-        self.assertTrue(isinstance(response[0]["index"], int))
-        self.assertTrue(isinstance(response[1]["index"], int))
-
-
-class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=["--enable-custom-logit-processor"],
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        kill_process_tree(cls.process.pid)
-
-    def run_custom_logit_processor(self, target_token_id: Optional[int] = None) -> None:
-        """
-        Test custom logit processor with custom params.
-
-        If target_token_id is None, the custom logit processor won't be passed in.
-        """
-
-        class DeterministicLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits to always sample the given token id."""
-
-            CUSTOM_PARAM_KEY = "token_id"
-
-            def __call__(self, logits, custom_param_list):
-                assert logits.shape[0] == len(custom_param_list)
-
-                for i, param_dict in enumerate(custom_param_list):
-                    # Mask all other tokens
-                    logits[i, :] = -float("inf")
-                    # Assign highest probability to the specified token
-                    logits[i, param_dict[self.CUSTOM_PARAM_KEY]] = 0.0
-
-                return logits
-
-        extra_body = {}
-
-        if target_token_id is not None:
-            extra_body["custom_logit_processor"] = (
-                DeterministicLogitProcessor().to_str()
-            )
-            extra_body["custom_params"] = {
-                "token_id": target_token_id,
-            }
-
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        max_tokens = 200
-
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": "Question: Is Paris the Capital of France?",
-                },
-            ],
-            temperature=0.0,
-            max_tokens=max_tokens,
-            extra_body=extra_body,
-        )
-
-        if target_token_id is not None:
-            target_text = self.tokenizer.decode([target_token_id] * max_tokens)
-            self.assertTrue(
-                target_text == response.choices[0].message.content,
-                f"{target_token_id=}\n{target_text=}\n{response.model_dump(mode='json')}",
-            )
-
-    def test_custom_logit_processor(self) -> None:
-        """Test custom logit processor with a single request."""
-        self.run_custom_logit_processor(target_token_id=5)
-
-    def test_custom_logit_processor_batch_mixed(self) -> None:
-        """Test a batch of requests mixed of requests with and without custom logit processor."""
-        target_token_ids = list(range(32)) + [None] * 16
-        random.shuffle(target_token_ids)
-        with ThreadPoolExecutor(len(target_token_ids)) as executor:
-            list(executor.map(self.run_custom_logit_processor, target_token_ids))
-
-
-class TestOpenAIV1Score(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1/score"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
     def run_score(
         self, query, items, label_token_ids, apply_softmax=False, item_first=False
     ):
         response = requests.post(
-            self.base_url,
+            self.score_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -1275,7 +941,7 @@ class TestOpenAIV1Score(CustomTestCase):
 
         # Test with invalid token ID
         response = requests.post(
-            self.base_url,
+            self.score_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -1292,6 +958,228 @@ class TestOpenAIV1Score(CustomTestCase):
         error_response = response.json()
         self.assertEqual(error_response["type"], "BadRequestError")
         self.assertIn("Token ID 999999 is out of vocabulary", error_response["message"])
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAICompletionWithRust(CustomTestCase):
+    """Run the existing Completion matrix unchanged through the Rust frontend."""
+
+    process = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            env={"SGLANG_RUST_SERVER": "1"},
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    # Reuse the reference test methods directly so Python and Rust coverage
+    # cannot drift into separate matrices.
+    run_completion = TestOpenAIServer.run_completion
+    run_completion_stream = TestOpenAIServer.run_completion_stream
+    test_completion = TestOpenAIServer.test_completion
+    test_completion_stream = TestOpenAIServer.test_completion_stream
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
+    """Run the existing Chat matrix unchanged through the Rust frontend."""
+
+    # Own slot: a failed setUpClass must not tear down the parent class's reaped server.
+    process = None
+
+    run_chat_completion = TestOpenAIServer.run_chat_completion
+    run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
+    test_chat_completion = TestOpenAIServer.test_chat_completion
+    test_chat_completion_stream = TestOpenAIServer.test_chat_completion_stream
+
+    # This class is a Chat gate; Completion already has its own Rust matrix.
+    test_completion = None
+    test_completion_stream = None
+
+
+class TestOpenAIV1Rerank(CustomTestCase):
+    process = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.score_tolerance = 1e-2
+
+        # Configure embedding-specific args
+        other_args = [
+            "--is-embedding",
+            "--enable-metrics",
+            "--disable-radix-cache",
+            "--chunked-prefill-size",
+            "-1",
+            "--attention-backend",
+            "torch_native",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=other_args,
+        )
+        cls.base_url += "/v1/rerank"
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def run_rerank(self, query, docs):
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "documents": docs},
+        )
+
+        return response.json()
+
+    def test_rerank_single(self):
+        """Test single rerank request"""
+        query = TEST_RERANK_QUERY_DOCS[0]["query"]
+        docs = TEST_RERANK_QUERY_DOCS[0]["documents"]
+
+        response = self.run_rerank(query, docs)
+
+        self.assertEqual(len(response), 1)
+        self.assertTrue(isinstance(response[0]["score"], float))
+        self.assertTrue(isinstance(response[0]["document"], str))
+        self.assertTrue(isinstance(response[0]["index"], int))
+
+    def test_rerank_batch(self):
+        """Test batch rerank request"""
+        query = TEST_RERANK_QUERY_DOCS[1]["query"]
+        docs = TEST_RERANK_QUERY_DOCS[1]["documents"]
+
+        response = self.run_rerank(query, docs)
+
+        self.assertEqual(len(response), 2)
+        self.assertTrue(isinstance(response[0]["score"], float))
+        self.assertTrue(isinstance(response[1]["score"], float))
+        self.assertTrue(isinstance(response[0]["document"], str))
+        self.assertTrue(isinstance(response[1]["document"], str))
+        self.assertTrue(isinstance(response[0]["index"], int))
+        self.assertTrue(isinstance(response[1]["index"], int))
+
+
+class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
+    process = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=["--enable-custom-logit-processor"],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def run_custom_logit_processor(self, target_token_id: Optional[int] = None) -> None:
+        """
+        Test custom logit processor with custom params.
+
+        If target_token_id is None, the custom logit processor won't be passed in.
+        """
+
+        class DeterministicLogitProcessor(CustomLogitProcessor):
+            """A dummy logit processor that changes the logits to always sample the given token id."""
+
+            CUSTOM_PARAM_KEY = "token_id"
+
+            def __call__(self, logits, custom_param_list):
+                assert logits.shape[0] == len(custom_param_list)
+
+                for i, param_dict in enumerate(custom_param_list):
+                    # Mask all other tokens
+                    logits[i, :] = -float("inf")
+                    # Assign highest probability to the specified token
+                    logits[i, param_dict[self.CUSTOM_PARAM_KEY]] = 0.0
+
+                return logits
+
+        extra_body = {}
+
+        if target_token_id is not None:
+            extra_body["custom_logit_processor"] = (
+                DeterministicLogitProcessor().to_str()
+            )
+            extra_body["custom_params"] = {
+                "token_id": target_token_id,
+            }
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        max_tokens = 200
+
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Question: Is Paris the Capital of France?",
+                },
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+        )
+
+        if target_token_id is not None:
+            target_text = self.tokenizer.decode([target_token_id] * max_tokens)
+            self.assertTrue(
+                target_text == response.choices[0].message.content,
+                f"{target_token_id=}\n{target_text=}\n{response.model_dump(mode='json')}",
+            )
+
+    def test_custom_logit_processor(self) -> None:
+        """Test custom logit processor with a single request."""
+        self.run_custom_logit_processor(target_token_id=5)
+
+    def test_custom_logit_processor_batch_mixed(self) -> None:
+        """Test a batch of requests mixed of requests with and without custom logit processor."""
+        target_token_ids = list(range(32)) + [None] * 16
+        random.shuffle(target_token_ids)
+        with ThreadPoolExecutor(len(target_token_ids)) as executor:
+            list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
 
 if __name__ == "__main__":
