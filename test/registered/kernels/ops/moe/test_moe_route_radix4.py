@@ -11,7 +11,11 @@ included; anything less and a token's routing would depend on the batch size.
 Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
+import contextlib
+import inspect
 import sys
+from collections import defaultdict
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -271,6 +275,50 @@ def test_select_experts_preserves_offset_fp32_bias(
     torch.testing.assert_close(weights, torch.full_like(weights, 2.5 / topk))
 
 
+@pytest.mark.parametrize("staged", [False, True])
+@requires_aiter
+def test_select_experts_sorts_only_for_a_staged_layer(staged):
+    """Only an AITER fused_moe without an expert mask takes the router's sort;
+    for any other consumer (EP, another runner) the fused sort is pure overhead,
+    so the router emits and registers it only when the layer staged a request."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import route_sort
+    from sglang.srt.layers.moe import topk as topk_module
+    from sglang.srt.layers.moe.moe_runner import aiter_route_sort
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+    from sglang.srt.runtime_context import get_context
+
+    if not topk_module._use_aiter:
+        pytest.skip("Requires SGLANG_USE_AITER=1 before importing the router.")
+
+    m = 4
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    config = TopKConfig(
+        top_k=TOPK,
+        use_grouped_topk=True,
+        num_expert_group=1,
+        topk_group=1,
+        correction_bias=torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda"),
+        routed_scaling_factor=2.5,
+    )
+    registrations = []
+    consumer = aiter_route_sort.AiterRouteSortConsumer()
+    with (
+        get_context().override_server_args(),
+        envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+        envs.SGLANG_K3_RADIX4_TOPK.override(True),
+        patch.object(aiter_route_sort, "_registrar", return_value=registrations.append),
+        patch.object(consumer, "takes_sort", return_value=True),
+        route_sort.scope(consumer) if staged else contextlib.nullcontext(),
+    ):
+        _, ids, _ = select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
+    if staged:
+        assert len(registrations) == 2 and registrations[1] is None
+        assert registrations[0]["topk_ids_ptr"] == ids.data_ptr()
+    else:
+        assert registrations == []
+
+
 @requires_aiter
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("renormalize", [False, True])
@@ -355,6 +403,489 @@ def test_route_radix4_coverage():
     assert not moe_route_radix4.covered(
         scores.new_empty((1536, NUM_EXPERTS)), bias, TOPK, 1, 1
     )
+
+
+# ===== Fused BM=16 sort (route_radix4_with_sort) =====
+
+BM = 16
+MODEL_DIM = 3584
+
+
+def _sort_ws():
+    return moe_route_radix4.new_sort_workspace(torch.device("cuda"))
+
+
+def _payload_from_route(ids, weights):
+    bag = defaultdict(list)
+    m = ids.shape[0]
+    for token in range(m):
+        for slot in range(TOPK):
+            bag[int(ids[token, slot])].append(
+                (token, slot, float(weights[token, slot]))
+            )
+    for expert in bag:
+        bag[expert].sort()
+    return bag
+
+
+def _payload_from_sorted(
+    sorted_token_ids, sorted_weights, sorted_expert_ids, n_blocks, m
+):
+    bag = defaultdict(list)
+    for block in range(n_blocks):
+        expert = int(sorted_expert_ids[block])
+        start = block * BM
+        live = []
+        for row in range(BM):
+            packed = int(sorted_token_ids[start + row])
+            token = packed & 0x00FFFFFF
+            slot = (packed >> 24) & 0xFF
+            weight = float(sorted_weights[start + row])
+            if token == m:
+                assert weight == 0.0
+                continue
+            live.append((token, slot, weight))
+        if live:
+            bag[expert].extend(live)
+    for expert in bag:
+        bag[expert].sort()
+    return bag
+
+
+# 1 is the grid that skips the arrival handshake and 2..64 sort in the last CTA.
+# Past 64 the last ceil(M / 16) CTAs share the sort: 65 is the smallest such
+# tail (5 CTAs, a short last chunk), 300 has a short last chunk too, and 1024 is
+# the router's largest batch (64 tail CTAs).
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 16, 32, 64, 65, 80, 128, 300, 512, 1024])
+def test_fused_sort_matches_route_and_layout(m):
+    generator = torch.Generator(device="cuda").manual_seed(7 + m)
+    scores = torch.randn(
+        (m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    bias = torch.randn(
+        NUM_EXPERTS, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    moe_buf = torch.ones((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
+
+    ref_w, ref_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
+    )
+
+    assert torch.equal(ids, ref_ids)
+    torch.testing.assert_close(w, ref_w, rtol=0, atol=0)
+    assert torch.count_nonzero(moe_buf).item() == 0
+    assert int(aux["num_valid_ids"][1]) == m
+
+    expected = _payload_from_route(ref_ids.cpu(), ref_w.cpu())
+    got = _payload_from_sorted(
+        aux["sorted_token_ids"].cpu(),
+        aux["sorted_weights"].cpu(),
+        aux["sorted_expert_ids"].cpu(),
+        int(aux["num_valid_ids"][0]) // BM,
+        m,
+    )
+    assert got.keys() == expected.keys()
+    for expert in expected:
+        assert got[expert] == expected[expert]
+
+    used = int(aux["num_valid_ids"][0])
+    m_indices = aux["m_indices"].cpu()[:used]
+    packed = aux["sorted_token_ids"].cpu()[:used]
+    for i in range(used):
+        token = int(packed[i]) & 0x00FFFFFF
+        assert int(m_indices[i]) == token
+
+    reverse = aux["reverse_sorted"].cpu()
+    for token in range(m):
+        for slot in range(TOPK):
+            pos = int(reverse[token * TOPK + slot])
+            packed_i = int(packed[pos])
+            assert (packed_i & 0x00FFFFFF) == token
+            assert ((packed_i >> 24) & 0xFF) == slot
+
+
+# (12, 7) sorts in the last CTA. Past 64 tokens every padding row sends all 16
+# routes to expert 0, which the tail's one-route-per-token ranking cannot see, so
+# they are placed separately: none, one, a whole tail chunk, and all but one.
+# A negative count is every row padded.
+@pytest.mark.parametrize(
+    "m, n_real",
+    [(12, 7), (80, 80), (80, 79), (80, 61), (300, 1), (300, 0), (80, -1000), (300, -1)],
+)
+def test_fused_sort_routes_padded_rows_like_the_mask(m, n_real):
+    """select_experts masks CUDA-graph padding rows to expert 0 and weight 0 in
+    place after routing. AITER matches the registered sort by tensor address,
+    so the sort has to describe the masked rows, not the routed ones, and give
+    each of their routes a slot of its own."""
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    non_padded = torch.tensor(n_real, dtype=torch.int32, device="cuda")
+
+    ref_w, ref_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+    ref_ids[max(n_real, 0) :] = 0
+    ref_w[max(n_real, 0) :] = 0.0
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores,
+        bias,
+        TOPK,
+        True,
+        2.5,
+        sort_ws=_sort_ws(),
+        num_token_non_padded=non_padded,
+    )
+
+    assert torch.equal(ids, ref_ids)
+    torch.testing.assert_close(w, ref_w, rtol=0, atol=0)
+    expected = _payload_from_route(ref_ids.cpu(), ref_w.cpu())
+    got = _payload_from_sorted(
+        aux["sorted_token_ids"].cpu(),
+        aux["sorted_weights"].cpu(),
+        aux["sorted_expert_ids"].cpu(),
+        int(aux["num_valid_ids"][0]) // BM,
+        m,
+    )
+    assert got == expected
+    reverse = aux["reverse_sorted"].cpu()
+    assert len(set(reverse.tolist())) == m * TOPK
+
+
+@pytest.mark.parametrize("m", [65, 300])
+def test_fused_sort_tail_is_stable(m):
+    """Past 64 tokens each expert's routes come out in token order, as AITER's
+    default moe_sorting writes them, and the same on every launch."""
+    generator = torch.Generator(device="cuda").manual_seed(m)
+    scores = torch.randn(
+        (m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    bias = torch.randn(
+        NUM_EXPERTS, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    sort_ws = _sort_ws()
+    _, _, first = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=sort_ws
+    )
+    _, _, again = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=sort_ws
+    )
+    used = int(first["num_valid_ids"][0])
+    for key in ("sorted_token_ids", "sorted_weights", "m_indices"):
+        assert torch.equal(first[key][:used], again[key][:used]), key
+    assert torch.equal(first["reverse_sorted"], again["reverse_sorted"])
+
+    packed = first["sorted_token_ids"][:used].cpu()
+    experts = first["sorted_expert_ids"][: used // BM].cpu().repeat_interleave(BM)
+    live = (packed & 0x00FFFFFF) < m
+    for expert in experts[live].unique().tolist():
+        tokens = packed[live & (experts == expert)] & 0x00FFFFFF
+        assert torch.all(tokens[1:] > tokens[:-1]), expert
+
+
+def test_fused_sort_graph_replay():
+    """Each launch has to leave the stream's arrival counters ready for the next
+    one: the last CTA's sort resets its counter, and the tail sort's counters
+    alternate, each launch clearing the one before. A counter left behind would
+    elect no sorter, or every CTA, in the launches after it. Mixes the two sorts
+    and an odd number of tail launches per replay, so replays alternate too."""
+    sizes = [80, 300, 12, 80]
+    inputs = [
+        (
+            torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda"),
+            torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda"),
+            torch.ones((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda"),
+        )
+        for m in sizes
+    ]
+    stream = torch.cuda.Stream()
+    # The graph's arrival counters, allocated and zeroed outside the capture.
+    sort_ws = _sort_ws()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outs = [
+            moe_route_radix4.route_radix4_with_sort(
+                scores, bias, TOPK, True, 2.5, sort_ws=sort_ws, moe_buf=moe_buf
+            )
+            for scores, bias, moe_buf in inputs
+        ]
+    expected = []
+    for scores, bias, _ in inputs:
+        ref_w, ref_ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)
+        expected.append((ref_ids, _payload_from_route(ref_ids.cpu(), ref_w.cpu())))
+    for _ in range(3):
+        for (_, _, moe_buf), (_, _, aux) in zip(inputs, outs):
+            aux["sorted_token_ids"].fill_(-1)
+            moe_buf.fill_(1.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        for m, (_, _, moe_buf), (_, ids, aux), (ref_ids, payload) in zip(
+            sizes, inputs, outs, expected
+        ):
+            assert torch.equal(ids, ref_ids)
+            assert torch.count_nonzero(moe_buf).item() == 0
+            got = _payload_from_sorted(
+                aux["sorted_token_ids"].cpu(),
+                aux["sorted_weights"].cpu(),
+                aux["sorted_expert_ids"].cpu(),
+                int(aux["num_valid_ids"][0]) // BM,
+                m,
+            )
+            assert got == payload, m
+
+
+def test_fused_sort_rejects_a_moe_buf_it_cannot_zero():
+    """aux tells AITER the buffer was zeroed, so a buffer with the wrong row
+    count has to fail rather than be skipped."""
+    m = 4
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    moe_buf = torch.ones((m + 1, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(Exception):
+        moe_route_radix4.route_radix4_with_sort(
+            scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
+        )
+
+
+def test_fused_sort_rejects_an_empty_batch():
+    """An empty batch would leave num_valid_ids unset, so it has to fail."""
+    scores = torch.empty((0, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(Exception):
+        moe_route_radix4.route_radix4_with_sort(
+            scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+        )
+
+
+def test_fused_sort_aux_pins_the_addresses_it_matches_on():
+    """AITER pairs a registered sort with fused_moe by the topk and output
+    addresses, so while aux lives no other tensor may be handed those addresses;
+    otherwise a later topk_ids reusing one would be served this stale sort."""
+    m = 12
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    moe_buf = torch.ones((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda")
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws(), moe_buf=moe_buf
+    )
+    assert aux["topk_ids"] is ids and aux["topk_weights"] is w
+    assert aux["moe_buf"] is moe_buf
+    assert aux["topk_ids_ptr"] == ids.data_ptr()
+    assert aux["topk_weights_ptr"] == w.data_ptr()
+    assert aux["moe_buf_ptr"] == moe_buf.data_ptr()
+    del w, ids, moe_buf
+    later = [
+        torch.empty((m, TOPK), dtype=torch.int32, device="cuda"),
+        torch.empty((m, TOPK), dtype=torch.float32, device="cuda"),
+        torch.empty((m, MODEL_DIM), dtype=torch.bfloat16, device="cuda"),
+    ]
+    pinned = {aux["topk_ids_ptr"], aux["topk_weights_ptr"], aux["moe_buf_ptr"]}
+    assert pinned.isdisjoint(t.data_ptr() for t in later)
+
+
+@pytest.mark.parametrize("m", [1, 12, 64, 80, 512])
+def test_aiter_accepts_fused_sort(m):
+    """AITER drops a registered sort whose aux lacks a key it matches on, such as
+    topk_weights_ptr, logs it once and sorts again, so a missing key only shows
+    up as a lost speedup."""
+    try:
+        from aiter.presorted_moe import match_presorted_moe
+    except ImportError:
+        pytest.skip("AITER without register_presorted_moe (ROCm/aiter#6484)")
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+    )
+    assert (
+        match_presorted_moe(aux, ids, w, block_m=BM, num_experts=NUM_EXPERTS, topk=TOPK)
+        is aux
+    )
+
+
+def test_aiter_ignores_fused_sort_for_another_moe_call():
+    """A non-K3 fused_moe that runs between the router and the K3 experts (an MTP
+    draft MoE, say) consumes the registration, so it must not match a sort made
+    for other topk tensors; the K3 experts then run AITER's own sort."""
+    try:
+        from aiter.presorted_moe import match_presorted_moe
+    except ImportError:
+        pytest.skip("AITER without register_presorted_moe (ROCm/aiter#6484)")
+    m = 12
+    scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    w, ids, aux = moe_route_radix4.route_radix4_with_sort(
+        scores, bias, TOPK, True, 2.5, sort_ws=_sort_ws()
+    )
+    other_w, other_ids = w.clone(), ids.clone()
+    assert (
+        match_presorted_moe(
+            aux, other_ids, other_w, block_m=BM, num_experts=NUM_EXPERTS, topk=TOPK
+        )
+        is None
+    )
+
+
+# The K3 activation modes AITER's SiTUv2 MoE runs (aiter.fused_moe's
+# resolve_activation_dtype reads these at every call).
+_SITU_MODES = {
+    "a16w4": {"AITER_SITUV2_A8W4": "0", "AITER_SITUV2_A4W4": "0"},
+    "a8w4": {"AITER_SITUV2_A8W4": "1", "AITER_SITUV2_A4W4": "0"},
+    "a4w4": {"AITER_SITUV2_A8W4": "0", "AITER_SITUV2_A4W4": "1"},
+}
+
+
+def _assert_activation_dtype(q_dtype_a, mode):
+    from aiter import dtypes
+
+    if mode == "a8w4":
+        assert q_dtype_a == dtypes.fp8
+    elif mode == "a4w4":
+        assert q_dtype_a == dtypes.fp4x2
+    else:
+        assert q_dtype_a not in (dtypes.fp8, dtypes.fp4x2)
+
+
+def _requires_route_sort_aiter():
+    from sglang.srt.layers.moe.moe_runner import aiter_route_sort
+
+    if not aiter_route_sort.available():
+        pytest.skip("AITER without register_presorted_moe (ROCm/aiter#6484)")
+    return aiter_route_sort
+
+
+def _k3_fused_moe_call(m, mode, device, num_experts, model_dim, inter_dim):
+    """The fused_moe keyword arguments the AITER runner passes a K3 layer:
+    preshuffled MXFP4 weights, SiTUv2, gate/up interleaved for A8W4."""
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    w1 = torch.empty(
+        (num_experts, 2 * inter_dim, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    w2 = torch.empty(
+        (num_experts, model_dim, inter_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    w1.is_shuffled = w2.is_shuffled = True
+    gate_mode = GateMode.SEPARATED
+    if mode == "a8w4":
+        w1.gate_up_interleave = True
+        gate_mode = GateMode.INTERLEAVE
+    return dict(
+        hidden_states=torch.zeros((m, model_dim), dtype=torch.bfloat16, device=device),
+        w1=w1,
+        w2=w2,
+        topk_weight=torch.zeros((m, TOPK), dtype=torch.float32, device=device),
+        topk_ids=torch.zeros((m, TOPK), dtype=torch.int32, device=device),
+        quant_type=QuantType.per_1x32,
+        activation=ActivationType.Situv2,
+        w1_scale=None,
+        w2_scale=None,
+        a1_scale=None,
+        a2_scale=None,
+        bias1=None,
+        bias2=None,
+        expert_mask=None,
+        doweight_stage1=False,
+        hidden_pad=0,
+        intermediate_pad=0,
+        gate_mode=gate_mode.value,
+        moe_sorting_dispatch_policy=0,
+    )
+
+
+class _LookupReached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("mode", list(_SITU_MODES))
+@pytest.mark.parametrize("m", [1, 100, 512])
+def test_aiter_route_sort_asks_aiter_what_fused_moe_asks(mode, m, monkeypatch):
+    """The consumer mirrors how _fused_moe_impl derives its get_2stage_cfgs call, so
+    the call fused_moe itself makes is the reference: any drift on AITER's side
+    fails here instead of silently registering sorts AITER drops."""
+    aiter_route_sort = _requires_route_sort_aiter()
+    import aiter.fused_moe as aiter_fused_moe
+
+    for name, value in _SITU_MODES[mode].items():
+        monkeypatch.setenv(name, value)
+    call = _k3_fused_moe_call(
+        m, mode, "cuda", num_experts=8, model_dim=256, inter_dim=256
+    )
+    signature = inspect.signature(aiter_fused_moe.get_2stage_cfgs)
+    seen = []
+
+    def lookup(*args, **kwargs):
+        seen.append(signature.bind(*args, **kwargs))
+        raise _LookupReached
+
+    with patch.object(aiter_fused_moe, "get_2stage_cfgs", lookup):
+        with pytest.raises(_LookupReached):
+            aiter_fused_moe.fused_moe(**call)
+    consumer = aiter_route_sort.AiterRouteSortConsumer()
+    consumer.observe(call)
+    ours = signature.bind(**consumer.cfg_args(m))
+    seen[0].apply_defaults()
+    ours.apply_defaults()
+    assert ours.arguments == seen[0].arguments
+    _assert_activation_dtype(ours.arguments["q_dtype_a"], mode)
+
+
+@pytest.mark.parametrize("mode", list(_SITU_MODES))
+def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
+    """On AITER's own tables for the K3 MoE shapes (TP8, non-EP), the router
+    registers its sort exactly on the batch sizes whose config is the BM=16
+    aux-sort pipeline; elsewhere (e.g. stock A4W4's BM=32 rows at 65-256
+    tokens) AITER would sort again, so the router skips it."""
+    aiter_route_sort = _requires_route_sort_aiter()
+    from aiter.fused_moe import get_2stage_cfgs
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import route_sort
+    from sglang.srt.layers.moe import topk as topk_module
+    from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+    from sglang.srt.runtime_context import get_context
+
+    if not topk_module._use_aiter:
+        pytest.skip("Requires SGLANG_USE_AITER=1 before importing the router.")
+    for name, value in _SITU_MODES[mode].items():
+        monkeypatch.setenv(name, value)
+    consumer = aiter_route_sort.AiterRouteSortConsumer()
+    # The lookup needs the weights' shapes and tags only.
+    consumer.observe(
+        _k3_fused_moe_call(
+            1, mode, "meta", num_experts=NUM_EXPERTS, model_dim=MODEL_DIM, inter_dim=384
+        )
+    )
+    _assert_activation_dtype(consumer.cfg_args(1)["q_dtype_a"], mode)
+    config = TopKConfig(
+        top_k=TOPK,
+        use_grouped_topk=True,
+        num_expert_group=1,
+        topk_group=1,
+        correction_bias=torch.zeros(NUM_EXPERTS, dtype=torch.float32, device="cuda"),
+        routed_scaling_factor=2.5,
+    )
+    sizes = [1, 16, 64, 65, 128, 256, 512]
+    expected = {}
+    for m in sizes:
+        metadata = get_2stage_cfgs(**consumer.cfg_args(m))
+        expected[m] = bool(metadata.output_aux) and int(metadata.block_m) == BM
+    registered = {}
+    for m in sizes:
+        registrations = []
+        scores = torch.randn((m, NUM_EXPERTS), dtype=torch.bfloat16, device="cuda")
+        with (
+            get_context().override_server_args(),
+            envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+            envs.SGLANG_K3_RADIX4_TOPK.override(True),
+            patch.object(
+                aiter_route_sort, "_registrar", return_value=registrations.append
+            ),
+            route_sort.scope(consumer),
+        ):
+            select_experts(torch.zeros((m, 8), device="cuda"), scores, config)
+        registered[m] = len(registrations) == 2
+    assert registered == expected
 
 
 if __name__ == "__main__":

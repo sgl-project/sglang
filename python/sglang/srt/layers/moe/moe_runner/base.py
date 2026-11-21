@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         TritonRunnerInput,
         TritonRunnerOutput,
     )
+    from sglang.srt.layers.moe.route_sort import RouteSortConsumer
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         CombineInputFormat,
@@ -147,6 +148,11 @@ class MoeRunnerCore(ABC):
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
+
+    def route_sort_consumer(self) -> Optional[RouteSortConsumer]:
+        """A consumer for the MoE sort the router can write (route_sort), for
+        the layer to stage, or None when this runner always sorts on its own."""
+        return None
 
     def runner_backend_is_triton(self) -> TypeGuard[TritonRunnerCore]:
         return self.runner_backend == MoeRunnerBackend.TRITON
