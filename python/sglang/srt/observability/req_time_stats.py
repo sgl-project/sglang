@@ -750,9 +750,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     _storage_prefetch_wait: Optional[PollTimer] = None
     _storage_staging_wait: Optional[PollTimer] = None
 
-    def to_output_time_stats(self) -> Optional[SchedulerOutputTimeStats]:
-        if not self.enable_metrics:
-            return None
+    def to_output_time_stats(self) -> SchedulerOutputTimeStats:
+        # Scheduler timestamps are recorded for every request, so the output
+        # stats are meaningful even when Prometheus metrics are off. Callers
+        # that must not report them (e.g. embedding outputs) gate on their
+        # own request kind instead of on enable_metrics.
         return SchedulerOutputTimeStats(
             queue_time=self.get_queueing_time(),
             forward_entry_time=_stamped_realtime(self.forward_entry_time),
