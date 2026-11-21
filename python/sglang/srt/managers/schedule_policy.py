@@ -533,6 +533,7 @@ class PrefillAdder:
         admitted_chunk_limit: Optional[int] = None,
         cached_tokens: Optional[int] = None,
         reuses_kv: bool = False,
+        commit_unfinished: bool = False,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -580,6 +581,7 @@ class PrefillAdder:
             # prefix before the chunk cached (``prefix_len`` by default).
             admitted_chunk_limit=admitted_chunk_limit,
             cached_tokens=prefix_len if cached_tokens is None else cached_tokens,
+            commit_unfinished=commit_unfinished,
         )
         self.rem_input_tokens -= compute_charge
 
@@ -988,6 +990,9 @@ class PrefillAdder:
                 else 0
             ),
             admitted_chunk_limit=_rem_tokens,
+            # Under a chunk cap, requests are admitted after a chunk cut short;
+            # holding its rest and decode keeps them off the KV later passes need.
+            commit_unfinished=truncated and self.chunked_req_limit is not None,
         )
 
         # Return if chunked prefill not finished
@@ -1169,10 +1174,12 @@ class PrefillAdder:
                 return tile_stop
 
             # Reserve after the tile gate so rejected requests consume no scratch.
-            if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
+            # A streaming session lends its prefix even with the radix cache disabled.
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=req.prefix_len, extend_len=trunc_len
+            ):
                 return AddReqResult.OTHER
 
-            assert req.prefix_len == 0
             req.extend_end = req.prefix_len + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -1192,6 +1199,7 @@ class PrefillAdder:
                     req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                 ),
                 admitted_chunk_limit=chunk_limit,
+                cached_tokens=req.prefix_len,
             )
 
         return self.budget_state()

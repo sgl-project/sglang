@@ -46,6 +46,8 @@
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_openai_route_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
+//! | `sgl_router_worker_control_operations_total` | Counter | `action`, `outcome` |
+//! | `sgl_router_worker_control_operation_duration_seconds` | Histogram | `action`, `outcome` |
 //! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
 //!
 //! The tokenizer series are rendered by [`crate::tokenizer::stats::TokenizerStats`].
@@ -516,6 +518,8 @@ pub struct MetricsRegistry {
     input_ids_forwarding_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     openai_route_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    worker_control_operations_total: Mutex<HashMap<WorkerControlKey, Arc<AtomicU64>>>,
+    worker_control_operation_duration: Mutex<HashMap<WorkerControlKey, Histogram>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -592,6 +596,12 @@ struct ModelOutcomeKey {
     outcome: &'static str,
 }
 
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Ord, PartialOrd)]
+struct WorkerControlKey {
+    action: &'static str,
+    outcome: &'static str,
+}
+
 #[derive(Debug)]
 struct Histogram {
     /// Bucket upper bounds this histogram observes against. Held per-instance
@@ -640,6 +650,30 @@ impl Histogram {
 impl MetricsRegistry {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn record_worker_control(
+        &self,
+        action: crate::workers::control::WorkerControlKind,
+        succeeded: bool,
+        duration: std::time::Duration,
+    ) {
+        let key = WorkerControlKey {
+            action: action.as_str(),
+            outcome: if succeeded { "succeeded" } else { "failed" },
+        };
+        let counter = self
+            .worker_control_operations_total
+            .lock()
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.worker_control_operation_duration
+            .lock()
+            .entry(key)
+            .or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS))
+            .observe(duration.as_secs_f64());
     }
 
     /// Bump the edge intake counter `requests_total{route,method}`. Called at the
@@ -1479,6 +1513,42 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        out.push_str(
+            "# HELP sgl_router_worker_control_operations_total Worker control operations by action and outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_control_operations_total counter\n");
+        let guard = self.worker_control_operations_total.lock();
+        let mut entries: Vec<_> = guard
+            .iter()
+            .map(|(key, value)| (key, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|(key, _)| (*key).clone());
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_worker_control_operations_total{{action=\"{}\",outcome=\"{}\"}} {}\n",
+                key.action, key.outcome, value,
+            ));
+        }
+        drop(guard);
+
+        out.push_str(
+            "# HELP sgl_router_worker_control_operation_duration_seconds Worker control operation latency.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_control_operation_duration_seconds histogram\n");
+        let guard = self.worker_control_operation_duration.lock();
+        let mut entries: Vec<_> = guard.iter().collect();
+        entries.sort_by_key(|(key, _)| (*key).clone());
+        for (key, histogram) in entries {
+            let labels = format!("action=\"{}\",outcome=\"{}\"", key.action, key.outcome);
+            render_histogram(
+                &mut out,
+                "sgl_router_worker_control_operation_duration_seconds",
+                &labels,
+                histogram,
+            );
+        }
+        drop(guard);
+
         out
     }
 }
@@ -1547,12 +1617,41 @@ pub(crate) fn escape_label(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workers::control::WorkerControlKind;
 
     fn assert_metric_line(output: &str, expected: &str) {
         assert!(
             output.lines().any(|line| line == expected),
             "missing metric line `{expected}`; got:\n{output}"
         );
+    }
+
+    #[test]
+    fn worker_control_metrics_use_bounded_action_and_outcome_labels() {
+        let metrics = MetricsRegistry::new();
+        metrics.record_worker_control(
+            WorkerControlKind::Create,
+            true,
+            std::time::Duration::from_millis(25),
+        );
+        metrics.record_worker_control(
+            WorkerControlKind::Remove,
+            false,
+            std::time::Duration::from_millis(50),
+        );
+
+        let output = metrics.render();
+        assert_metric_line(
+            &output,
+            r#"sgl_router_worker_control_operations_total{action="create",outcome="succeeded"} 1"#,
+        );
+        assert_metric_line(
+            &output,
+            r#"sgl_router_worker_control_operations_total{action="remove",outcome="failed"} 1"#,
+        );
+        assert!(output.contains(
+            r#"sgl_router_worker_control_operation_duration_seconds_count{action="create",outcome="succeeded"} 1"#
+        ));
     }
 
     #[test]
