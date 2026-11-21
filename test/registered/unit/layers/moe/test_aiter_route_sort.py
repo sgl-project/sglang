@@ -234,6 +234,24 @@ class TestSortTailResidency(CustomTestCase):
         with self._device_with(32):
             self.assertTrue(radix4.sort_tail_fits(1024, cpu))
 
+    def test_a_failed_mask_probe_is_unknown_not_the_whole_device(self):
+        radix4 = route_sort.moe_route_radix4
+        hip = MagicMock()
+        hip.hipExtStreamGetCUMask.return_value = 1
+        stream = SimpleNamespace(cuda_stream=7)
+        with (
+            patch.object(radix4, "_hip_runtime", return_value=hip),
+            patch.object(
+                radix4, "current_arch", return_value=SimpleNamespace(num_sms=256)
+            ),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            self.assertIsNone(radix4._enabled_cus(torch.device("cuda", 0)))
+            self.assertFalse(radix4.sort_tail_fits(256, torch.device("cuda", 0)))
+        with patch.object(radix4, "_hip_runtime", return_value=None):
+            self.assertIsNone(radix4._enabled_cus(torch.device("cuda", 0)))
+
     def test_direct_launch_refuses_a_tail_whose_stream_mask_is_unknown(self):
         """A capture on a stream whose CU mask was never read must not launch a tail sort."""
         radix4 = route_sort.moe_route_radix4
