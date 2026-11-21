@@ -138,8 +138,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.tool_close_token_ids = tool_close_token_ids(
             get_serving().tool_call_parser, self.tokenizer
         )
-        self.is_tool_call_parser_apertus2509 = (
-            get_serving().tool_call_parser == "apertus2509"
+        self.apertus_tools_suffix_token_id = (
+            self.tokenizer.get_vocab().get("<|tools_suffix|>")
+            if self.tokenizer is not None
+            else None
         )
 
         self.soft_watchdog = Watchdog.create(
@@ -200,7 +202,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 return output
             # These tool-call delimiters are also EOS tokens and must reach their parsers.
             if (output[-1] == 200012 and self.is_tool_call_parser_gpt_oss) or (
-                output[-1] == 72 and self.is_tool_call_parser_apertus2509
+                output[-1] == self.apertus_tools_suffix_token_id
             ):
                 return output
             if output[-1] in self.tool_close_token_ids:
