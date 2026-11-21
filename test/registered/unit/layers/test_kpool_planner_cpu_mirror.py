@@ -51,7 +51,91 @@ def _expected_plan():
     )
 
 
+def _replay_extend(prefix_lens, extend_lens, kpool, tail_size, pools, tails):
+    """Run one extend's kpool plan over token positions, indexing the tail and
+    the chunk as the assemble and tail-scatter kernels do."""
+    slots = list(range(len(extend_lens)))
+    seq_lens = [p + n for p, n in zip(prefix_lens, extend_lens)]
+    plan = kpool_plan._kpool_cpu_plan(_batch(extend_lens, seq_lens, slots), kpool, 64)
+    chunk = [
+        (req, pos)
+        for req, p, n in zip(slots, prefix_lens, extend_lens)
+        for pos in range(p, p + n)
+    ]
+    for req, pool_id, n_tail, src, base in zip(
+        plan.pool_req,
+        plan.pool_pool_id,
+        plan.pool_n_from_tail,
+        plan.pool_chunk_src,
+        plan.pool_tail_logical_base,
+    ):
+        group = [tails[req].get((base + s) % tail_size) for s in range(n_tail)]
+        for s in range(n_tail, kpool):
+            chunk_req, pos = chunk[src + s - n_tail]
+            assert chunk_req == req
+            group.append(pos)
+        pools[(req, pool_id)] = group
+    for req, dst, src, n in zip(
+        plan.tail_req,
+        plan.tail_dst_logical_start,
+        plan.tail_chunk_src,
+        plan.tail_n_write,
+    ):
+        for s in range(n):
+            assert chunk[src + s][0] == req
+            tails[req][(dst + s) % tail_size] = chunk[src + s][1]
+
+
 class TestKPoolPlannerCpuMirror(unittest.TestCase):
+    def test_extend_split_before_its_last_token_pools_the_same_tokens(self):
+        """A prefill draft extend may run as every token but the last, then the
+        last token alone; each pooled group must read the same positions and
+        the tail must end the same as with one extend."""
+        prefix_lens = [0, 0, 0, 0, 3, 5, 6, 2]
+        extend_lens = [2, 4, 5, 9, 2, 7, 6, 2]
+        for tail_size in (4, 10):
+            with self.subTest(tail_size=tail_size):
+
+                def history():
+                    # Tails already hold the prefix's open group.
+                    tails = [
+                        {pos % tail_size: pos for pos in range(p - p % 4, p)}
+                        for p in prefix_lens
+                    ]
+                    return {}, tails
+
+                pools, tails = history()
+                _replay_extend(prefix_lens, extend_lens, 4, tail_size, pools, tails)
+                split_pools, split_tails = history()
+                _replay_extend(
+                    prefix_lens,
+                    [n - 1 for n in extend_lens],
+                    4,
+                    tail_size,
+                    split_pools,
+                    split_tails,
+                )
+                _replay_extend(
+                    [p + n - 1 for p, n in zip(prefix_lens, extend_lens)],
+                    [1] * len(extend_lens),
+                    4,
+                    tail_size,
+                    split_pools,
+                    split_tails,
+                )
+                self.assertEqual(split_pools, pools)
+                for (req, pool_id), group in pools.items():
+                    self.assertEqual(group, list(range(4 * pool_id, 4 * pool_id + 4)))
+                # Only the open group's slots are read later; closed ones may
+                # keep stale entries on either path.
+                for req, (p, n) in enumerate(zip(prefix_lens, extend_lens)):
+                    open_group = range(p + n - (p + n) % 4, p + n)
+                    for split_view in (tails, split_tails):
+                        self.assertEqual(
+                            [split_view[req][pos % tail_size] for pos in open_group],
+                            list(open_group),
+                        )
+
     def test_mirror_avoids_device_read_and_preserves_compression_rows(self):
         for tensor_lengths in (False, True):
             with self.subTest(tensor_lengths=tensor_lengths):
