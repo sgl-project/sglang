@@ -1365,7 +1365,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         shared_output = None
         shared_event = None
         shared_compute_event = None
-        # The side stream's output, held until every current-stream reader is queued.
         shared_alt_output = None
 
         def issue_shared():
@@ -1388,8 +1387,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 shared_input = hidden_states
                 if self._shared_experts_tp_comm:
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
-                # No record_stream: it keeps the block reserved until the GPU catches
-                # up with the host. shared_input lives until after the join instead.
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
@@ -1460,12 +1457,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     shared_output, hidden_states
                 )
                 if shared_output is not shared_alt_output:
-                    # The reduce-scatter was the alt-owned output's last reader.
                     release_shared_output()
 
         def release_shared_output():
-            # Freeing an alt_stream block is ordered on alt_stream only, so make it
-            # wait for the queued current-stream readers first.
             nonlocal shared_alt_output
             if shared_alt_output is not None:
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
