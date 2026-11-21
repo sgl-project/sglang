@@ -9,7 +9,7 @@ from triton.experimental.gluon import language as gl
 
 from .common import _add, _encode_groups, _word_bytes
 
-_artifact_next_power_of_2 = triton.constexpr_function(triton.next_power_of_2)
+_artifact_next_power_of_2 = triton.next_power_of_2
 
 @gluon.jit
 def _quantize_input(X, Q, QS, M: gl.constexpr, H: gl.constexpr, SX: gl.constexpr, GROUPS: gl.constexpr, CTA_OFFSET: gl.constexpr=0, WARPS: gl.constexpr=1):

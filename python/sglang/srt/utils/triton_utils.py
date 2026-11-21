@@ -46,7 +46,10 @@ def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if hasattr(triton, "constexpr_function"):
+    setattr(triton, "next_power_of_2", triton.constexpr_function(next_power_of_2))
+else:
+    setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 class CachedKernel:
