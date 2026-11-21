@@ -201,8 +201,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if no_stop_trim:
                 return output
             # These tool-call delimiters are also EOS tokens and must reach their parsers.
+            # Lightweight detokenizer test doubles may not initialize optional token IDs.
             if (output[-1] == 200012 and self.is_tool_call_parser_gpt_oss) or (
-                output[-1] == self.apertus_tools_suffix_token_id
+                output[-1] == getattr(self, "apertus_tools_suffix_token_id", None)
             ):
                 return output
             if output[-1] in self.tool_close_token_ids:
