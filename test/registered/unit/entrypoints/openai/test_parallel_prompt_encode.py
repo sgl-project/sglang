@@ -446,6 +446,9 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
             "wrapped encode": _WrappedTokenizer(
                 tokenizer_object=Tokenizer.from_str(_safe_backend_json())
             ),
+            "post-processor lacks num_special_tokens_to_add": _tokenizer(
+                lambda b: setattr(b, "post_processor", object())
+            ),
             "slow tokenizer": _SlowWordTokenizer(),
         }
         for name, tokenizer in cases.items():
