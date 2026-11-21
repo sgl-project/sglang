@@ -387,8 +387,10 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
     def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
+        if self.is_cross_attention:
+            return False, None
         params = get_request_skip_softmax_params()
-        if params is None or self.is_cross_attention:
+        if params is None:
             return False, None
         current_step = get_forward_context().current_timestep
         if not isinstance(current_step, Integral):
