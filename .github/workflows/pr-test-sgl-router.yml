@@ -144,6 +144,13 @@ jobs:
         # which the step above does not fetch.
         run: cargo test --locked --release --workspace -- --skip chat_render_parity_matrix
 
+      # Run separately so a hung fuzz test is stopped by the CI step timeout.
+      - name: HTTP chat fuzz smoke
+        timeout-minutes: 3
+        working-directory: sgl-router
+        run: |
+          cargo test --locked --release --test proxy chat_routing::fuzz_smoke:: -- --ignored
+
       # Fails when the committed fixture is stale against the script, which
       # mirrors mem_cache/utils.py::get_hash_str; cargo test checks the Rust port.
       - name: kv_events hash parity fixture (drift check)
