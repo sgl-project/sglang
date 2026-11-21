@@ -1048,6 +1048,8 @@ def test_sort_tail_declines_on_a_cu_masked_stream():
         assert moe_route_radix4.sort_tail_fits(256, scores.device)
     finally:
         hip.hipStreamDestroy(handle)
+        # A later stream may reuse the destroyed stream's handle.
+        moe_route_radix4._enabled_cus_by_stream.pop((0, handle.value), None)
 
 
 if __name__ == "__main__":
