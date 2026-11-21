@@ -117,6 +117,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed.communication_op import control_request_all_gather_object
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
     close_custom_all_reduce,
@@ -331,14 +332,17 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
+    RPC_METHODS,
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    get_preserve_last_token_id,
     is_health_check_generate_req,
     is_war_barrier_enabled,
     make_abort_req,
@@ -394,6 +398,7 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
+from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -698,6 +703,7 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+        self.init_penalty_status_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -1056,6 +1062,10 @@ class Scheduler(
                     )
                 ]
 
+        self._embedding_preserve_last_token_id = get_preserve_last_token_id(
+            tokenizer=self.tokenizer, is_generation=self.is_generation
+        )
+
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
             initialize_mamba_selective_state_update_backend(self.server_args)
@@ -1390,6 +1400,12 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+    def init_penalty_status_pool(self) -> None:
+        self.penalty_status_pool = PenaltyStatusPool(
+            vocab_size=self.model_config.vocab_size,
+            device=self.req_to_token_pool.device,
+        )
+
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
         # Set by a runtime PD role switch to break out of the current event loop.
@@ -1559,6 +1575,13 @@ class Scheduler(
             uniboost_rank_invariant=get_parallel().tp_size > 1
             or get_parallel().pp_size > 1,
             uniboost_step_clock=lambda: self.forward_ct,
+            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
+                chunked_prefill_size=self.chunked_prefill_size,
+                halving_chunks=get_schedule().shortest_prefill_boundary_halving_chunks,
+                decay_start_chunks=get_schedule().shortest_prefill_boundary_decay_start_chunks,
+                budget_min_ratio=get_schedule().shortest_prefill_budget_min_ratio,
+                budget_doubling_chunks=get_schedule().shortest_prefill_budget_doubling_chunks,
+            ),
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -2405,10 +2428,10 @@ class Scheduler(
                 output = self._rust_control_ack(recv_req)
             if output is not None:
                 if get_parallel().pp_size > 1 and isinstance(
-                    output, ReleaseMemoryOccupationReqOutput
+                    output, (ReleaseMemoryOccupationReqOutput, RpcReqOutput)
                 ):
-                    # Answered by the first stage once every stage has released.
-                    self._pp_pass_release_verdict(output, recv_req)
+                    # Answered by the first stage once every stage has run it.
+                    self._pp_pass_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 
@@ -3008,6 +3031,7 @@ class Scheduler(
             beam_coordinator=self.beam_coordinator,
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
+            penalty_status_pool=self.penalty_status_pool,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
         )
@@ -3551,7 +3575,12 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                bound_runtime=isinstance(self.draft_worker, BaseSpecWorker)
+                and self.draft_worker.has_bound_runtime,
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3564,6 +3593,12 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
+                return
+
+        if self.uocr_runtime is not None:
+            error_msg = self.uocr_runtime.validate_request(req)
+            if error_msg is not None:
+                self._reject_bad_request(req, error_msg)
                 return
 
         if (
@@ -3677,6 +3712,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -4192,6 +4228,7 @@ class Scheduler(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
+            self._embedding_preserve_last_token_id,
         )
         if error_msg:
             self._add_request_to_queue(req)
@@ -4656,6 +4693,7 @@ class Scheduler(
                     if self.disagg_prefill_bootstrap_queue is not None
                     else []
                 ),
+                chunked_req=self.chunked_req,
             )
         )
 
@@ -4672,6 +4710,16 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        max_prefill_tokens = self.max_prefill_tokens
+        num_mixed_decode_tokens = running_bs if self.is_mixed_chunk else 0
+        token_budget = self.policy.prefill_token_budget(
+            page_size=self.page_size, align=self.truncation_align_size
+        )
+        if token_budget is not None:
+            # The budget counts prefill tokens; the adder takes the decode rows out.
+            token_budget += num_mixed_decode_tokens
+            chunked_prefill_size = min(chunked_prefill_size, token_budget)
+            max_prefill_tokens = min(max_prefill_tokens, token_budget)
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4687,9 +4735,9 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             running_batch,
             self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
+            max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            num_mixed_decode_tokens,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4773,6 +4821,13 @@ class Scheduler(
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
+                break
+            # Beside a continuing chunk, admission stops at the first request the
+            # shortest-prefill class boundary orders by arrival.
+            if (
+                self.chunked_req is not None
+                and not self.policy.can_join_continuing_chunk(req)
+            ):
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 if bounded_active:
@@ -4974,6 +5029,8 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        self.penalty_status_pool.alloc(new_batch.reqs)
+        self.penalty_status_pool.reset_history(new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5311,9 +5368,8 @@ class Scheduler(
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
            only need sampling_info restored - V1 carries spec_info forward as
            next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy (orchestrator=None,
-           shares the pre-accumulated penalty buffer) so V2's multiple init_new
-           calls don't double-accumulate penalties.
+        2. Substitute sampling_info with a forward-only copy that carries this
+           step's logit penalties, built on the forward stream.
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
@@ -5414,6 +5470,9 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            batch.sampling_info.step_penalties = StepPenalties.build(
+                batch.reqs, self.penalty_status_pool
+            )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -6495,44 +6554,24 @@ class Scheduler(
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
 
-    def save_remote_model(self, **kwargs):
-        self.weight_updater.save_remote_model(kwargs)
-
-    def save_sharded_model(self, **kwargs):
-        self.weight_updater.save_sharded_model(kwargs)
-
     def handle_rpc_request(self, recv_req: RpcReqInput):
-        # Handle RPC requests
         logger.info(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
 
         error = None
         try:
-            func = getattr(self, recv_req.method)
-            if recv_req.parameters is not None:
-                func(**recv_req.parameters)
-            else:
-                func()
+            if recv_req.method not in RPC_METHODS:
+                raise ValueError(
+                    f"{recv_req.method!r} is not an RPC method; allowed: "
+                    f"{', '.join(RPC_METHODS)}"
+                )
+            getattr(self.weight_updater, recv_req.method)(recv_req.parameters or {})
         except Exception as e:
             error = str(e)
             logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        # Gather over the ranks that ran this request in the same step: the DP
-        # shard under DP attention, where shards may reach it in different steps.
-        parallel = get_parallel()
-        if parallel.attn_dp_enabled:
-            groups = [parallel.attn_tp_group, parallel.attn_cp_group]
-        else:
-            groups = [parallel.tp_group]
-        errors = [error]
-        for group in groups:
-            if group.world_size > 1:
-                gathered = [None] * group.world_size
-                torch.distributed.all_gather_object(
-                    gathered, errors, group=group.cpu_group
-                )
-                errors = [e for rank_errors in gathered for e in rank_errors]
+        errors = control_request_all_gather_object(error)
         errors = [e for e in dict.fromkeys(errors) if e is not None]
         return RpcReqOutput(success=not errors, message="; ".join(errors))
 

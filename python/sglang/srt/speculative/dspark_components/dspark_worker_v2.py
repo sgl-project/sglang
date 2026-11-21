@@ -32,6 +32,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.bench_drafter import ENV_NAME as BENCH_DRAFTER_ENV
 from sglang.srt.speculative.bench_drafter import bench_drafter_temperature
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_utils import commit_block_accept_tokens_to_penalties
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
@@ -1290,6 +1291,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        commit_block_accept_tokens_to_penalties(
+            batch.sampling_info, accept.out_tokens, accept.commit_lens
+        )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
                 features=proposal.acceptance_features,

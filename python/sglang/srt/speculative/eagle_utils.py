@@ -1192,6 +1192,18 @@ def eagle_sample(
     return predict, accept_lens, accept_index
 
 
+def commit_accept_tokens_to_penalties(
+    sampling_info: SamplingBatchInfo,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+) -> None:
+    if sampling_info.step_penalties is not None:
+        # Guarded here: building the arguments launches device work.
+        sampling_info.step_penalties.commit(
+            predict[accept_index.clamp(min=0)], accept_mask=accept_index >= 0
+        )
+
+
 def _chain_accept_applies(
     *,
     verify_input: EagleVerifyInput,
@@ -1279,11 +1291,6 @@ def _verify_outputs(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
