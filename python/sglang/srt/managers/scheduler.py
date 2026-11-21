@@ -415,6 +415,7 @@ from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logging,
     configure_logger,
+    disable_transparent_hugepages,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -431,6 +432,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
+from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -1417,6 +1419,9 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # The last prefill admission pass refused a request with NO_TOKEN; the
+        # PD prefill parked-yield rule reads and clears it.
+        self.prefill_admission_no_token = False
         self.result_queue: deque[
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
@@ -3290,11 +3295,15 @@ class Scheduler(
 
     def _record_kv_event_lora_name(self, req: Req, lora_name: Optional[str]) -> None:
         # Keyed by the final extra_key, so it must run after elastic namespacing.
-        # Only a cache whose events are taken prunes the table.
+        # The default event format namespaces only named LoRA keys, so a rank
+        # that binds hinted storage keys to event IDs needs the name as well.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            and self.tree_cache.supports_prefix_sharing()
-        ):
+            or (
+                req.kv_hints is not None
+                and self.tree_cache.forwards_kv_hint_actions(req.kv_hints)
+            )
+        ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
@@ -3703,6 +3712,16 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if recv_req.token_ids_logprob_rows is not None:
+            scored = len(req.origin_input_ids) - req.logprob_start_len - 1
+            if len(recv_req.token_ids_logprob_rows) != scored:
+                req.set_finish_with_abort(
+                    f"token_ids_logprob_rows needs {scored} rows for the engine's input."
+                )
+                self._add_request_to_queue(req)
+                return
+            req.logprob.token_ids_logprob_rows = recv_req.token_ids_logprob_rows
+
         if (
             get_device().mlx_enable_sampling
             and req.return_logprob
@@ -3828,6 +3847,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):
@@ -4569,6 +4589,7 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        self.prefill_admission_no_token = False
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4733,6 +4754,13 @@ class Scheduler(
         chunk_parked = (
             self.chunked_req is not None and self.chunked_req not in adder.can_run_list
         )
+        if (
+            chunk_parked
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.has_bootstrapped_parked_chunk()
+        ):
+            # No KV for the next chunk of a bootstrapped request: refused as well.
+            self.prefill_admission_no_token = True
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
@@ -4858,6 +4886,8 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._drop_unadmitted_match(req)
+                    if res == AddReqResult.NO_TOKEN:
+                        self.prefill_admission_no_token = True
                 if res == AddReqResult.UNSCHEDULABLE and not added:
                     # Nothing holding memory will give it back: waiting would
                     # keep the request queued forever.
@@ -7127,6 +7157,8 @@ def configure_scheduler_process(
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(gpu_id)
+    if envs.SGLANG_DISABLE_THP.get():
+        disable_transparent_hugepages()
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
@@ -7147,6 +7179,8 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Foundry CUDA graph persistence (--cuda-graph-persistence) for this rank.
+    activate_foundry(server_args)
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.
@@ -7187,6 +7221,7 @@ def run_scheduler_process(
     hit_exception = False
     try:
         scheduler = Scheduler(server_args, port_args)
+        get_foundry_adapter().log_init_summary()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
