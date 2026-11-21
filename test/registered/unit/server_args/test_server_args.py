@@ -1,4 +1,5 @@
 import argparse
+import importlib.metadata
 import json
 import os
 import pickle
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import msgspec.structs
+from packaging.version import Version
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
@@ -83,6 +85,10 @@ from sglang.srt.arg_groups.parallel_hook import (
     handle_eplb_and_dispatch,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.arg_groups.platform_hook import (
+    _pip_oneccl_version,
+    handle_xpu_backends,
+)
 from sglang.srt.arg_groups.serving_hook import (
     handle_admin_api_key_env,
     handle_crash_dump_env,
@@ -632,6 +638,73 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             with self.subTest(device=device, pool=pool):
                 self._check_with_custom_mem_pool(device, pool)
+
+    @staticmethod
+    def _xpu_graph_args(device: str, tp_size: int, phase: str, backend: str):
+        args = ServerArgs(model_path="dummy", device=device, tp_size=tp_size)
+        args.cuda_graph_config = CudaGraphConfig(
+            **{phase: PhaseConfig(backend=backend)}
+        )
+        args._cuda_graph_config_locked = {(phase, "backend")}
+        return args
+
+    def test_xpu_graph_rejected_with_old_oneccl_and_tensor_parallel(self):
+        """oneCCL < 2022.1.2 skips all-reduce in XPUGraph replays, so TP > 1 would decode garbage."""
+        with patch(
+            "sglang.srt.arg_groups.platform_hook._pip_oneccl_version",
+            return_value=Version("2022.1.1"),
+        ):
+            for phase, backend in (
+                (Phase.DECODE, Backend.FULL),
+                (Phase.DECODE, Backend.BREAKABLE),
+                (Phase.PREFILL, Backend.FULL),
+            ):
+                with (
+                    self.subTest(phase=phase, backend=backend),
+                    self.assertRaisesRegex(
+                        ValueError, "skips all-reduce inside XPU graphs"
+                    ),
+                ):
+                    handle_xpu_backends(self._xpu_graph_args("xpu", 2, phase, backend))
+
+    def test_xpu_graph_allowed_when_oneccl_or_config_is_safe(self):
+        """Fixed or non-pip oneCCL, TP 1, a disabled graph and other devices keep their behaviour."""
+        for oneccl, device, tp_size, backend in (
+            (Version("2022.1.2"), "xpu", 4, Backend.FULL),
+            (None, "xpu", 4, Backend.FULL),
+            (Version("2022.1.1"), "xpu", 1, Backend.FULL),
+            (Version("2022.1.1"), "xpu", 2, Backend.DISABLED),
+            (Version("2022.1.1"), "cpu", 2, Backend.FULL),
+        ):
+            with (
+                self.subTest(
+                    oneccl=oneccl, device=device, tp_size=tp_size, backend=backend
+                ),
+                patch(
+                    "sglang.srt.arg_groups.platform_hook._pip_oneccl_version",
+                    return_value=oneccl,
+                ),
+            ):
+                handle_xpu_backends(
+                    self._xpu_graph_args(device, tp_size, Phase.DECODE, backend)
+                )
+
+    def test_pip_oneccl_version_reads_installed_distribution(self):
+        """Missing or unparsable oneCCL metadata means no pip oneCCL, not a startup crash."""
+        for metadata_version, expected in (
+            ("2022.1.1", Version("2022.1.1")),
+            ("not-a-version", None),
+        ):
+            with (
+                self.subTest(version=metadata_version),
+                patch("importlib.metadata.version", return_value=metadata_version),
+            ):
+                self.assertEqual(_pip_oneccl_version(), expected)
+        with patch(
+            "importlib.metadata.version",
+            side_effect=importlib.metadata.PackageNotFoundError("oneccl"),
+        ):
+            self.assertIsNone(_pip_oneccl_version())
 
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
