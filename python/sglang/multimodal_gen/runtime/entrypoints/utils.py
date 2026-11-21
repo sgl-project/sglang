@@ -427,7 +427,12 @@ class CudaVideoEncoder:
         x264_preset: Optional[str] = None,
         max_queued_frames: int = 0,
     ) -> "CudaVideoEncoder | None":
-        """Start ffmpeg, or return None when this output cannot use the path."""
+        """Start ffmpeg, or return None when this output cannot use the path.
+
+        ``audio`` may be a zero-argument callable, for audio still being decoded
+        elsewhere: the writer thread then calls it and starts ffmpeg once it
+        returns, and the frames written until then wait in the queue.
+        """
         if not hasattr(os, "memfd_create") or device.type != "cuda":
             return None
         if os.path.splitext(save_file_path)[1].lower() != ".mp4":
@@ -436,22 +441,27 @@ class CudaVideoEncoder:
         if not 1 <= quality <= 10:
             return None
         crf = int((1 - quality / 10.0) * 51)
-        audio_np = _normalize_audio_to_numpy(audio)
-        if audio_np is not None and scipy_wavfile is None:
+        deferred_audio = audio if callable(audio) else None
+        audio_np = None if deferred_audio else _normalize_audio_to_numpy(audio)
+        if (deferred_audio or audio_np is not None) and scipy_wavfile is None:
             return None
+
+        def write_wav(audio_np: np.ndarray) -> None:
+            selected_sr = _pick_audio_sample_rate(
+                audio_np=audio_np,
+                audio_sample_rate=audio_sample_rate,
+                fps=fps,
+                num_frames=num_frames,
+            )
+            scipy_wavfile.write(wav_path, selected_sr, audio_np)
 
         wav_path = None
         try:
-            if audio_np is not None:
-                selected_sr = _pick_audio_sample_rate(
-                    audio_np=audio_np,
-                    audio_sample_rate=audio_sample_rate,
-                    fps=fps,
-                    num_frames=num_frames,
-                )
+            if deferred_audio or audio_np is not None:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     wav_path = f.name
-                scipy_wavfile.write(wav_path, selected_sr, audio_np)
+            if audio_np is not None:
+                write_wav(audio_np)
             command = _cuda_video_ffmpeg_command(
                 save_file_path,
                 width=width,
@@ -473,6 +483,11 @@ class CudaVideoEncoder:
                 chunk_frames=chunk_frames,
                 queued_chunks=max(1, -(-max_queued_frames // chunk_frames)),
                 wav_path=wav_path,
+                write_audio=(
+                    (lambda: write_wav(_normalize_audio_to_numpy(deferred_audio())))
+                    if deferred_audio
+                    else None
+                ),
             )
         except BaseException:
             _remove_quietly(wav_path)
@@ -489,6 +504,7 @@ class CudaVideoEncoder:
         chunk_frames: int,
         queued_chunks: int,
         wav_path: Optional[str],
+        write_audio: Optional[Callable[[], None]] = None,
     ):
         self.save_file_path = save_file_path
         self._command = command
@@ -502,20 +518,27 @@ class CudaVideoEncoder:
         self._finished = False
         self._queue: queue.Queue = queue.Queue(maxsize=queued_chunks)
         self._stderr = tempfile.TemporaryFile()
-        try:
-            self._process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=self._stderr,
-            )
-        except BaseException:
-            self._stderr.close()
-            raise
+        self._process: Optional[subprocess.Popen] = None
+        # writes the WAV of deferred audio; the writer thread then starts ffmpeg
+        self._write_audio = write_audio
+        if write_audio is None:
+            try:
+                self._start_ffmpeg()
+            except BaseException:
+                self._stderr.close()
+                raise
         self._thread = threading.Thread(
             target=self._pipe_frames, name="sglang-video-encoder", daemon=True
         )
         self._thread.start()
+
+    def _start_ffmpeg(self) -> None:
+        self._process = subprocess.Popen(
+            self._command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self._stderr,
+        )
 
     def write(self, frames: torch.Tensor) -> None:
         """Queue [3, t, H, W] frames; raise once the encoder has failed."""
@@ -553,7 +576,7 @@ class CudaVideoEncoder:
             with maybe_record_function("FFMPEG_FLUSH stdin_close+wait"):
                 self._stop_thread()
                 if self._error is not None:
-                    if self._process.poll():
+                    if self._process is not None and self._process.poll():
                         raise self._ffmpeg_error() from self._error
                     raise RuntimeError("video encoder failed") from self._error
                 self._process.stdin.close()
@@ -570,14 +593,18 @@ class CudaVideoEncoder:
         if self._finished:
             return
         self._finished = True
-        if self._process.poll() is None:
+        if self._process is not None and self._process.poll() is None:
             self._process.kill()
         self._stop_thread()
-        try:
-            self._process.stdin.close()
-        except OSError:
-            pass
-        self._process.wait()
+        if self._process is not None:
+            # the writer thread may have started a deferred ffmpeg after the kill above
+            if self._process.poll() is None:
+                self._process.kill()
+            try:
+                self._process.stdin.close()
+            except OSError:
+                pass
+            self._process.wait()
         self._release()
         _remove_quietly(self.save_file_path)
 
@@ -600,6 +627,11 @@ class CudaVideoEncoder:
     def _pipe_frames(self) -> None:
         frame_bytes = self._height * self._width * 3
         try:
+            if self._write_audio is not None:
+                self._write_audio()
+                if self._finished:
+                    raise RuntimeError("video encoder aborted before ffmpeg started")
+                self._start_ffmpeg()
             stdin = self._process.stdin
             if stdin is None:
                 raise RuntimeError("ffmpeg stdin pipe was not created")
