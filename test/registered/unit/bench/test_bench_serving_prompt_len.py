@@ -88,6 +88,7 @@ class TestBenchServingPromptLen(CustomTestCase):
         outputs = out if isinstance(out, list) else [out]
         for o in outputs:
             self.assertTrue(o.success, o.error)
+            self.assertEqual(o.generated_text, "hi")
         return [o.prompt_len for o in outputs]
 
     def test_single_request(self):
@@ -107,6 +108,23 @@ class TestBenchServingPromptLen(CustomTestCase):
                     extra=extra,
                 )
                 self.assertEqual(lens, [expected])
+
+    def test_single_request_honors_stream_override(self):
+        cases = [
+            (True, {"stream": False}),
+            (False, {"stream": True, "stream_options": {"include_usage": True}}),
+        ]
+        for stream, extra in cases:
+            with self.subTest(stream=stream, extra=extra):
+                lens = self._run(
+                    async_request_openai_chat_completions,
+                    "hello",
+                    [123],
+                    stream=stream,
+                    extra=extra,
+                )
+                self.assertEqual(lens, [123])
+                self.assertEqual(self.server.bodies[0]["stream"], extra["stream"])
 
     def test_multi_turn_requests_usage_per_round(self):
         per_round = [100, 250, 400]
@@ -133,6 +151,29 @@ class TestBenchServingPromptLen(CustomTestCase):
                 self.assertEqual(
                     [b["stream_options"] for b in self.server.bodies], [sent] * 3
                 )
+
+    def test_multi_turn_usage_follows_stream_override(self):
+        multi_turn = wrap_multi_turn_request_func(
+            async_request_openai_chat_completions, backend="sglang-oai-chat"
+        )
+        per_round = [100, 250]
+        for stream in (True, False):
+            extra = {"stream": not stream}
+            with self.subTest(stream=stream):
+                lens = self._run(
+                    multi_turn,
+                    ["one", "two"],
+                    per_round,
+                    stream=stream,
+                    extra=extra,
+                )
+                self.assertEqual(lens, per_round)
+                expected_options = None if stream else {"include_usage": True}
+                self.assertEqual(
+                    [b.get("stream_options") for b in self.server.bodies],
+                    [expected_options] * 2,
+                )
+                self.assertEqual(extra, {"stream": not stream})
 
 
 if __name__ == "__main__":
