@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -24,12 +26,14 @@ from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
 )
+from sglang.srt.utils.aiter_tuned_tables import _aiter_has_flydsl
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -121,6 +125,91 @@ _arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] if _is_hip
 _is_consumer_rdna = _arch.startswith(("gfx11", "gfx120"))
 _use_triton_w4a16 = _is_consumer_rdna
 _TRITON_W4A16_NUM_WARPS = 8
+
+# AITER's FlyDSL W4A4 MoE tiles an intermediate width that is not a multiple of
+# 256 columns by 128 (pick_flydsl_stage2_tile_k), so it needs 128 columns (64
+# packed bytes) of alignment where AITER's generic one is 256; vLLM pads its
+# AITER W4A4 MoE the same way (vllm-project/vllm#55104).
+FLYDSL_MXFP4_PADDING_SIZE = 64
+
+
+@functools.cache
+def _aiter_refuses_unaligned_cktile_mxfp4() -> bool:
+    """Whether aiter refuses its CK-Tile MXFP4 stage 2 at an intermediate width
+    that is not a multiple of 256 (ROCm/aiter#5232); before, that kernel read
+    the wrong scale groups there. No capability flag exists, hence the probe;
+    an aiter whose source cannot be read keeps the generic alignment."""
+    import inspect
+
+    try:
+        import aiter.fused_moe
+
+        source = inspect.getsource(aiter.fused_moe)
+    except (ImportError, OSError, TypeError):
+        return False
+    return "requires inter_dim to be a multiple of 256" in source
+
+
+def _pads_for_flydsl_mxfp4(layer: torch.nn.Module) -> bool:
+    """Whether AITER runs this layer's MoE on its FlyDSL W4A4 kernels.
+
+    Covers plain Silu (no SwiGLU clamp), which AITER sends to FlyDSL when
+    AITER_FLYDSL_FORCE is "1", its default and its parse. The AMD monokernels
+    read these weights at the generic alignment.
+    """
+    cfg = layer.moe_runner_config
+    return (
+        _is_gfx95
+        and cfg.activation == "silu"
+        and not cfg.swiglu_limit
+        and cfg.gemm1_clamp_limit is None
+        and os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
+        and not get_exec().kernel.enable_amd_monokernel
+        and _aiter_has_flydsl()
+        and _aiter_refuses_unaligned_cktile_mxfp4()
+    )
+
+
+def _smallm_takes_only_the_generic_width(
+    layer: torch.nn.Module, hidden_size: int, intermediate_size: int
+) -> bool:
+    """Whether SGLang's gfx950 small-M MXFP4 MoE kernel serves this layer's
+    small batches at AITER's generic alignment but not at the FlyDSL one.
+
+    The FlyDSL alignment would move those batches to AITER, which runs them up
+    to 2x slower (Qwen3.5-397B-A17B at TP8, 128 columns, <= 8 rows). Asks the
+    kernel's own support check about a one-row call at each width.
+    """
+    cfg = layer.moe_runner_config
+    # Under EP the dispatcher hands AITER an expert mask, which the kernel
+    # refuses; a FusedMoE built without top_k leaves the routing width unknown.
+    if layer.moe_ep_size > 1 or cfg.top_k is None:
+        return False
+    from sglang.kernels.ops.moe.smallm_moe_gfx950 import smallm_moe_supported
+
+    meta = functools.partial(torch.empty, device="meta")
+
+    def takes(aiter_padding_size):
+        w13_up_dim, w2_down_dim, _ = get_moe_weight_sizes(
+            intermediate_size,
+            is_concat=True,
+            is_packed=True,
+            is_aiter_moe=True,
+            aiter_padding_size=aiter_padding_size,
+        )
+        return smallm_moe_supported(
+            hidden_states=meta(1, hidden_size, dtype=cfg.params_dtype),
+            w13=meta(1, w13_up_dim, hidden_size // 2, dtype=torch.uint8),
+            w2=meta(1, hidden_size, w2_down_dim, dtype=torch.uint8),
+            topk_ids=meta(1, cfg.top_k, dtype=torch.int32),
+            expert_mask=None,
+            doweight_stage1=False,
+            activation_is_silu=cfg.activation == "silu",
+            has_bias=False,
+            a1_scale=None,
+        )
+
+    return takes(None) and not takes(FLYDSL_MXFP4_PADDING_SIZE)
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -286,6 +375,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             is_aiter_moe=pad_for_aiter,
             is_concat=True,
             is_packed=True,
+            aiter_padding_size=(
+                FLYDSL_MXFP4_PADDING_SIZE
+                if pad_for_aiter
+                and self.is_checkpoint_mxfp4_serialized
+                and _pads_for_flydsl_mxfp4(layer)
+                and not _smallm_takes_only_the_generic_width(
+                    layer, hidden_size, intermediate_size_per_partition
+                )
+                else None
+            ),
         )
         layer.hidden_pad = 0
         layer.intermediate_pad = w13_up_dim // 2 - intermediate_size_per_partition
