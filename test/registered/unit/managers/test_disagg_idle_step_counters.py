@@ -218,6 +218,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             scheduler.on_idle.call_count,
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
+                        # Idle stats lines still run where transfers suppress housekeeping.
+                        self.assertEqual(
+                            scheduler.metrics_reporter.maybe_report_idle_stats.call_count,
+                            1 + (pattern == "idle_cycle") if pending_transfer else 0,
+                        )
 
     @parameterized.expand([("fresh", False), ("chained", True)])
     def test_mlx_idle_gap(self, name, chained):
@@ -518,6 +523,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.assertEqual(observed_idle_flags, [False, False, after_idle, False])
         self.assertEqual(scheduler.forward_ct, 4)
         self.assertEqual(observed_iters, [1, 2, 3, 4])
+        # Every step launch may end an idle stretch, before the model forward.
+        self.assertEqual(
+            scheduler.metrics_reporter.maybe_report_idle_end.call_count,
+            scheduler.forward_ct,
+        )
         if mode == ForwardMode.EXTEND:
             # A prefill is charged from the previous prefill's result, or from
             # its own launch when none applies -- the first one, or after a gap.
@@ -591,7 +601,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
-        scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(
+            record_scheduler_active=Mock(),
+            maybe_report_idle_stats=Mock(),
+            maybe_report_idle_end=Mock(),
+        )
         scheduler.invariant_checker = Mock()
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)

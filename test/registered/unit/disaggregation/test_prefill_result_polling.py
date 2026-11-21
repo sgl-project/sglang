@@ -234,6 +234,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
                 "log_batch_result_stats",
                 "update_device_timer",
                 "record_scheduler_active",
+                "maybe_report_idle_end",
+                "stats",
             ]
         )
         self.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -1388,7 +1390,9 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
 
     def __init__(self):
         self.scheduler_stage_metrics = None
-        self.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        self.metrics_reporter = SimpleNamespace(
+            record_scheduler_active=Mock(), maybe_report_idle_end=Mock()
+        )
         self.invariant_checker = Mock()
         self.forward_ct = 0
         self._sched_idled = False
