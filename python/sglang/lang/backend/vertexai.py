@@ -86,12 +86,12 @@ class VertexAI(BaseBackend):
         input = []
         # split with image token
         text_segs = text.split(self.chat_template.image_token)
-        for image_path, image_base64_data in images:
-            text_seg = text_segs.pop(0)
+        for idx, (image_path, image_base64_data) in enumerate(images):
+            text_seg = text_segs[idx]
             if text_seg != "":
                 input.append(text_seg)
             input.append(Image.from_bytes(image_base64_data))
-        text_seg = text_segs.pop(0)
+        text_seg = text_segs[len(images)]
         if text_seg != "":
             input.append(text_seg)
         return input
