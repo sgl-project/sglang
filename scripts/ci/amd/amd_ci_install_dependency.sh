@@ -473,8 +473,6 @@ if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" && -z "${SK
                 --directory "$AITER_CACHE_ROOT/$AITER_CACHE_KEY" --key "$AITER_CACHE_KEY" 2>/dev/null || true)
             if [[ -n "$AITER_CACHED_WHEEL" ]]; then
                 echo "[CI-AITER-CHECK] Cache hit: $AITER_CACHE_KEY"
-                # Entries are namespaced per PR ref; the mtime lets pruning drop the ones nobody reads.
-                docker exec "$CI_CONTAINER_NAME" touch "$AITER_CACHE_ROOT/$AITER_CACHE_KEY" || true
                 if docker exec "$CI_CONTAINER_NAME" pip install --no-deps --force-reinstall "$AITER_CACHED_WHEEL" \
                     && docker exec "$CI_CONTAINER_NAME" rm -rf /sgl-workspace/aiter \
                     && docker exec "$CI_CONTAINER_NAME" python3 -c 'import aiter, aiter_meta'; then
@@ -593,9 +591,6 @@ PY
                     --key '"$AITER_CACHE_KEY"' --wheel /tmp/aiter-wheel/*.whl
             '; then
                 echo "[CI-AITER-CHECK] Published cached wheel: $AITER_CACHE_KEY"
-                # /sgl-data is shared and near capacity: drop entries not published or hit for 7 days.
-                docker exec "$CI_CONTAINER_NAME" find "$AITER_CACHE_ROOT" -mindepth 1 -maxdepth 1 \
-                    ! -name '.locks' ! -name '.tmp-*' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
             else
                 echo "[CI-AITER-CHECK] Wheel cannot be cached; keeping rebuilt installation"
             fi
