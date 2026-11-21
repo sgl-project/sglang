@@ -11,7 +11,7 @@ from typing import AsyncIterator, Union
 
 import orjson
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -67,8 +67,17 @@ class OllamaServing:
 
     async def handle_chat(
         self, request: OllamaChatRequest, raw_request: Request
-    ) -> Union[OllamaChatResponse, StreamingResponse]:
+    ) -> Union[OllamaChatResponse, StreamingResponse, JSONResponse]:
         """Handle /api/chat endpoint."""
+        if any(msg.images for msg in request.messages):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Image input is not supported by the Ollama-compatible API. "
+                    "Use the OpenAI-compatible API with a vision-capable model."
+                },
+            )
+
         model_name = self.tokenizer_manager.served_model_name
 
         # Convert messages to SGLang format
@@ -173,8 +182,17 @@ class OllamaServing:
 
     async def handle_generate(
         self, request: OllamaGenerateRequest, raw_request: Request
-    ) -> Union[OllamaGenerateResponse, StreamingResponse]:
+    ) -> Union[OllamaGenerateResponse, StreamingResponse, JSONResponse]:
         """Handle /api/generate endpoint."""
+        if request.images:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Image input is not supported by the Ollama-compatible API. "
+                    "Use the OpenAI-compatible API with a vision-capable model."
+                },
+            )
+
         model_name = self.tokenizer_manager.served_model_name
 
         # Build prompt
