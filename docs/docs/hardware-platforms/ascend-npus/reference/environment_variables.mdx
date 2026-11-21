@@ -18,6 +18,16 @@ This document provides a list of commonly used environment variables and aims to
   </thead>
   <tbody>
     <tr>
+      <td><code>SGLANG_NPU_DSA_VERIFY_REQUEST_SHARD</code></td>
+      <td>Splits BF16 DSA indexer scoring by request across attention-TP ranks during fixed-width DFlash target verification in an NPU graph. Requires a captured batch size divisible by attention TP, DCP and attention CP sizes of 1, and no attention DP. The graph exchanges Top-K indices and masks padded requests before the exchange.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_OPT_DFLASH_TP_AUX_FC</code></td>
+      <td>Splits the output columns of the DFlash draft context projection across TP ranks on supported draft models, such as DFlash2. This can be enabled independently of DSA indexer request sharding.</td>
+      <td><code>false</code> on Ascend</td>
+    </tr>
+    <tr>
       <td><code>SGLANG_NPU_USE_MLAPO</code></td>
       <td>Adopts the <code>MLAPO</code> fusion operator in the attention <br/> preprocessing stage of the MLA model.</td>
       <td><code>false</code></td>
