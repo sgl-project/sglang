@@ -1854,7 +1854,7 @@ class IndexerKPool(MultiPlatformOp):
         dynamic_scale: torch.Tensor = None,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        """BF16 compression and request-level pooled-key selection on A3/A5."""
+        """BF16/INT8/MXFP8 compression and request-level pooled-key selection on A3/A5."""
 
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
         if metadata is None:
@@ -1905,7 +1905,7 @@ class IndexerKPool(MultiPlatformOp):
         # --- Read Phase ---
         # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
         weights, _ = self.weights_proj(x.float())  # [T,H]
-        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+        weights = (weights * self.n_heads**-0.5).contiguous()  # Keep FP32 here
         return _get_topk_npu(
             layer_id=layer_id,
             query=query,

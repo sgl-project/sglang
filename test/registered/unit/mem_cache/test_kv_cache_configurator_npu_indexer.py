@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache.kv_cache_dtype import (
     QUANT_MODE_TOKEN_INT8,
+    QUANT_MODE_TOKEN_MXFP8,
     resolve_indexer_quant_mode,
 )
 from sglang.srt.runtime_context import get_context
@@ -104,8 +105,12 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
             (None, torch.bfloat16, 1, 256),
             (None, torch.bfloat16, 4, 64),
             ("int8", torch.bfloat16, 1, 130),
+            ("int8", torch.bfloat16, 4, 33),
+            ("mxfp8", torch.bfloat16, 1, 132),
+            ("mxfp8", torch.bfloat16, 4, 33),
             (None, torch.float8_e4m3fn, 1, 132),
-        ]
+            (None, torch.float8_e4m3fn, 4, 33),
+        ]  # (indexer_kv_cache_dtype, kv_cache_dtype, index_kpool, expected bytes/token/layer)
         for indexer_dtype, kv_dtype, kpool, expected in cases:
             with self.subTest(
                 indexer_dtype=indexer_dtype, kv_dtype=kv_dtype, kpool=kpool
@@ -153,7 +158,12 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
     """--indexer-kv-cache-dtype=int8 may replace only the BF16 indexer cache."""
 
     def _build_pool(
-        self, dtype, kv_cache_dim=None, indexer_quant_mode=None, hierarchical=False
+        self,
+        dtype,
+        kv_cache_dim=None,
+        indexer_quant_mode=None,
+        hierarchical=False,
+        index_kpool=1,
     ):
         with (
             get_context().override_server_args(enable_hierarchical_cache=hierarchical),
@@ -163,9 +173,10 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
             ),
         ):
+            page_size = 128 * index_kpool
             return memory_pool_npu.NPUMLATokenToKVPool(
-                256,
-                page_size=128,
+                2 * page_size,
+                page_size=page_size,
                 dtype=dtype,
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
@@ -175,6 +186,9 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 index_head_dim=128,
                 kv_cache_dim=kv_cache_dim,
                 indexer_quant_mode=indexer_quant_mode,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool > 1,
+                max_running_requests=4 if index_kpool > 1 else None,
             )
 
     def test_int8_mode_rejects_hierarchical_cache_in_server_args(self):
@@ -221,6 +235,20 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 self.assertEqual(pool.index_k_buffer.dtype, key_dtype)
                 self.assertEqual(None if scale is None else scale.dtype, scale_dtype)
 
+    def test_int8_mode_with_kpool_stores_int8_pooled_keys(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            index_kpool=4,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
+        self.assertEqual(pool.index_page_size, 128)
+        self.assertEqual(
+            pool.index_k_scale_buffer.shape,
+            (*pool.index_k_buffer.shape[:-2], 1),
+        )
+
     def test_resolve_indexer_quant_mode(self):
         self.assertIsNone(resolve_indexer_quant_mode(None, torch.bfloat16))
         self.assertIsNone(resolve_indexer_quant_mode(None, torch.float8_e4m3fn))
@@ -238,6 +266,84 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
         x = torch.empty(0, 128, dtype=torch.bfloat16)
         k, scale = _quantize_npu_indexer_activation(x, None, torch.int8, torch.float16)
         self.assertEqual((k.dtype, scale.dtype), (torch.int8, torch.float16))
+
+
+class TestNPUIndexerMxfp8Cache(CustomTestCase):
+    """--indexer-kv-cache-dtype=mxfp8 is KPool-only on Ascend A5 (arch35)."""
+
+    def _build_pool(
+        self,
+        dtype,
+        kv_cache_dim=None,
+        indexer_quant_mode=None,
+        hierarchical=False,
+        index_kpool=4,
+    ):
+        with (
+            get_context().override_server_args(enable_hierarchical_cache=hierarchical),
+            patch.object(
+                memory_pool_npu,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+            ),
+        ):
+            page_size = 128 * index_kpool
+            return memory_pool_npu.NPUMLATokenToKVPool(
+                2 * page_size,
+                page_size=page_size,
+                dtype=dtype,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                index_head_dim=128,
+                kv_cache_dim=kv_cache_dim,
+                indexer_quant_mode=indexer_quant_mode,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool > 1,
+                max_running_requests=4 if index_kpool > 1 else None,
+            )
+
+    def test_mxfp8_mode_with_kpool_stores_mxfp8_pooled_keys(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_MXFP8,
+            index_kpool=4,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.float8_e4m3fn)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.uint8)
+        self.assertEqual(
+            pool.index_k_scale_buffer.shape,
+            (*pool.index_k_buffer.shape[:-1], 2, 2),
+        )
+        # KPool MXFP8 keeps keys and queries in the same unrotated basis.
+        self.assertIsNone(pool.indexer_hadamard_128)
+        self.assertEqual(pool.get_index_k_scale_buffer(0).dtype, torch.float8_e8m0fnu)
+
+    def test_mxfp8_mode_requires_kpool(self):
+        with self.assertRaisesRegex(ValueError, "LightningIndexer.*MXFP8"):
+            self._build_pool(
+                torch.bfloat16,
+                indexer_quant_mode=QUANT_MODE_TOKEN_MXFP8,
+                index_kpool=1,
+            )
+
+    def test_mxfp8_mode_rejects_hierarchical_cache_in_pool(self):
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            self._build_pool(
+                torch.bfloat16,
+                indexer_quant_mode=QUANT_MODE_TOKEN_MXFP8,
+                hierarchical=True,
+            )
+
+    def test_resolve_indexer_quant_mode_mxfp8(self):
+        self.assertEqual(
+            resolve_indexer_quant_mode("mxfp8", torch.bfloat16),
+            QUANT_MODE_TOKEN_MXFP8,
+        )
+        with self.assertRaises(ValueError):
+            resolve_indexer_quant_mode("mxfp8", torch.float8_e4m3fn)
 
 
 if __name__ == "__main__":
