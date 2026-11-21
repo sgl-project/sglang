@@ -246,13 +246,14 @@ def test_denser_tier_with_end_and_offset():
 
 @pytest.mark.parametrize("page_transform", [False, True])
 def test_multiwave_cluster_matches_reference(monkeypatch, page_transform):
-    """SGLANG_DEEP_SELECT_MULTIWAVE_CLUSTER=2: rows past the widest one-wave tier
-    run the 2-CTA cluster kernel over several waves, here on long-tailed row ends."""
+    """SGLANG_DEEP_SELECT_MULTIWAVE=1: rows past the widest one-wave tier run that
+    tier's cluster kernel over several waves, here on long-tailed row ends."""
     tiers = deep_select._cluster_tiers()
-    if 2 not in [size for _, size in tiers]:
-        pytest.skip("no 2-CTA cluster tier on this GPU")
+    if not tiers:
+        pytest.skip("no cluster tier on this GPU")
     widest = max(rows for rows, _ in tiers)
-    rows, k, width, page_size = min(2 * widest + 3, 512), 512, 300_000, 64
+    rows = min(2 * widest + 3, deep_select._MULTIWAVE_MAX_ROWS)
+    k, width, page_size = 512, 300_000, 64
     # A fresh dispatch per call, so it reads the env override below.
     precompile = deep_select._precompile.__wrapped__
     dispatches = []
@@ -271,7 +272,7 @@ def test_multiwave_cluster_matches_reference(monkeypatch, page_transform):
         .to(torch.int32)
     )
     end[0] = width
-    with envs.SGLANG_DEEP_SELECT_MULTIWAVE_CLUSTER.override(2):
+    with envs.SGLANG_DEEP_SELECT_MULTIWAVE.override(True):
         if page_transform:
             table, inverse = _random_page_table(rows, width, page_size)
             slots = topk_page_transform(
