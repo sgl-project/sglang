@@ -143,7 +143,24 @@ def fp4_gemm(
     out_features: int,
     quant_mode: str = "w4a4",
 ) -> torch.Tensor:
-    from sglang.kernels.ops.gemm import try_qwen3x_nvfp4_gemm
+    from sglang.kernels.ops.gemm import (
+        try_cutedsl_nvfp4_gemm,
+        try_qwen3x_nvfp4_gemm,
+    )
+
+    fp4_backend = get_fp4_gemm_runner_backend()
+    if quant_mode == "w4a4" and fp4_backend.supports_swiglu_fusion():
+        cutedsl_output = try_cutedsl_nvfp4_gemm(
+            input,
+            weight,
+            input_sf,
+            weight_sf,
+            alpha,
+            out_dtype,
+            out_features,
+        )
+        if cutedsl_output is not None:
+            return cutedsl_output
 
     kda_output = try_qwen3x_nvfp4_gemm(
         input,
@@ -161,7 +178,6 @@ def fp4_gemm(
         raise RuntimeError(
             "NVFP4 GEMM requires flashinfer's mm_fp4; please install flashinfer."
         )
-    fp4_backend = get_fp4_gemm_runner_backend()
     # Use the remapping logic to convert SGLang backend names to FlashInfer API names
     backend = fp4_backend.get_flashinfer_backend()
     if quant_mode == "w4a4":
