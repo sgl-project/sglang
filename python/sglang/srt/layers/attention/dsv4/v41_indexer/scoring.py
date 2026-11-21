@@ -437,8 +437,11 @@ def prefill_requests(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     candidate_blocks: Optional[torch.Tensor] = None,
     candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
+    query_rows: Optional[slice] = None,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
-    """Requests with nothing visible yet are skipped."""
+    """Requests with nothing visible yet are skipped. A row share keeps the
+    replicated projection and each request's full K width, then scores only
+    its own query rows with their original indices and causal lengths."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -474,6 +477,12 @@ def prefill_requests(
         lc = int(lens.max().item())
         if lc == 0:
             continue
+        if query_rows is not None:
+            owned = (tok >= query_rows.start) & (tok < query_rows.stop)
+            tok = tok[owned]
+            if tok.numel() == 0:
+                continue
+            lens = compress_lens[tok]
         j = torch.arange(lc, device=pos.device)
         slots = inputs.k_slots[k_starts[r] : k_starts[r] + lc]
         # Dequantize only this request's visible K rows; the table is pool-sized.

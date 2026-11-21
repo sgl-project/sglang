@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     topk_among_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import flat_selection_slots
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
@@ -28,10 +29,12 @@ from .scoring import (
     decode_scores,
     dense_prefill_topk,
     get_deep_gemm_prefill_data,
+    prefill_index_plan,
     prefill_requests,
     score_tiles,
     select_decode,
     select_prefill_block_ids,
+    sharded_dense_prefill_topk,
     topk_ragged,
     write_decode,
     write_prefill,
@@ -40,6 +43,7 @@ from .types import (
     CandidateMetadata,
     DecodeInputs,
     PrefillInputs,
+    RowShard,
     get_tail_row_indices,
 )
 
@@ -182,8 +186,12 @@ class DenseBlocksBackend:
         data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
+        # The SM90 dense candidate source uses replicated FP32 logits. Reuse
+        # the eager prefill row-shard contract; leave other backend routes as-is.
+        shard = inputs.row_shard if get_platform().is_sm90 else None
+        score_data = data.narrow(shard.local_rows(data.num_rows)) if shard else data
         selected, blocks = _publish_prefill_blocks(
-            data=data,
+            data=score_data,
             kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
                 inputs.layer_id, data.k_slots
             ),
@@ -192,6 +200,9 @@ class DenseBlocksBackend:
             block_size=self.block_size,
             fast_block_topk=self.use_sm90_deep_gemm_consume,
         )
+        if shard is not None:
+            selected = _gather_prefill_rows(selected, data.num_rows, shard)
+            blocks = _gather_prefill_rows(blocks, data.num_rows, shard)
         data.write_selection(selected, inputs)
         return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
 
@@ -224,58 +235,76 @@ class DenseBlocksBackend:
         if data is None:
             return
         blocks = published.blocks[: data.num_rows]
-        if compact:
-            selected = data.empty_selection(inputs.indexer.index_topk)
-            positions, lens = _pack_candidate_positions(
-                blocks, data.compress_lens, self.block_size
-            )
-            columns = data.request_starts[:, None] + positions
-            slots = data.k_slots[columns.clamp_max(data.k_slots.numel() - 1)]
-            kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, slots.flatten()
-            )
-            width = positions.shape[1]
-            packed = msgspec.structs.replace(
-                data,
-                request_starts=torch.arange(
-                    data.num_rows, device=positions.device, dtype=torch.int32
-                )
-                * width,
-                lens_per_request=[width],
-                compress_lens=lens,
-            )
-            for tile, logits in score_tiles(packed, kv):
-                _select_candidate_positions(
-                    logits,
-                    positions[tile],
-                    lens[tile],
-                    data.request_starts[tile],
-                    selected[tile],
-                )
-            data.write_selection(selected, inputs)
-            return
-
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
-        )
-        if max(data.lens_per_request, default=0) <= blocks.shape[1] * self.block_size:
+        shard = inputs.row_shard
+        if (
+            not compact
+            and max(data.lens_per_request, default=0)
+            <= blocks.shape[1] * self.block_size
+        ):
             # The source selected every visible block. Reuse full top-k directly.
-            dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+            kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                inputs.layer_id, data.k_slots
+            )
+            raw = inputs.out_raw_indices[: data.num_rows]
+            if shard is None:
+                dense_prefill_topk(data, kv, out=raw)
+            else:
+                sharded_dense_prefill_topk(data, kv, out=raw, shard=shard)
             data.write_page_indices(inputs)
             return
-        selected = data.empty_selection(inputs.indexer.index_topk)
-        for tile, logits in score_tiles(data, kv):
-            positions, lens = _pack_candidate_positions(
-                blocks[tile], data.compress_lens[tile], self.block_size
+
+        rows = shard.local_rows(data.num_rows) if shard else slice(None)
+        score_data = data.narrow(rows) if shard else data
+        blocks = blocks[rows]
+        selected = score_data.empty_selection(inputs.indexer.index_topk)
+        if compact:
+            # An aligned share can be empty. It still participates in the
+            # selection gather below, but has no repeated K rows to score.
+            if score_data.num_rows:
+                positions, lens = _pack_candidate_positions(
+                    blocks, score_data.compress_lens, self.block_size
+                )
+                columns = score_data.request_starts[:, None] + positions
+                slots = data.k_slots[columns.clamp_max(data.k_slots.numel() - 1)]
+                kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                    inputs.layer_id, slots.flatten()
+                )
+                width = positions.shape[1]
+                packed = msgspec.structs.replace(
+                    score_data,
+                    request_starts=torch.arange(
+                        score_data.num_rows, device=positions.device, dtype=torch.int32
+                    )
+                    * width,
+                    lens_per_request=[width],
+                    compress_lens=lens,
+                )
+                for tile, logits in score_tiles(packed, kv):
+                    _select_candidate_positions(
+                        logits,
+                        positions[tile],
+                        lens[tile],
+                        score_data.request_starts[tile],
+                        selected[tile],
+                    )
+        else:
+            kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
+                inputs.layer_id, data.k_slots
             )
-            compact_scores = logits.gather(1, positions.long())
-            _select_candidate_positions(
-                compact_scores,
-                positions,
-                lens,
-                data.request_starts[tile],
-                selected[tile],
-            )
+            for tile, logits in score_tiles(score_data, kv):
+                positions, lens = _pack_candidate_positions(
+                    blocks[tile], score_data.compress_lens[tile], self.block_size
+                )
+                compact_scores = logits.gather(1, positions.long())
+                _select_candidate_positions(
+                    compact_scores,
+                    positions,
+                    lens,
+                    score_data.request_starts[tile],
+                    selected[tile],
+                )
+        if shard is not None:
+            selected = _gather_prefill_rows(selected, data.num_rows, shard)
         data.write_selection(selected, inputs)
 
     # ---------- torch: per-request scores ----------
@@ -325,11 +354,21 @@ class DenseBlocksBackend:
         if published is None:  # a DeepGEMM publish with no visible position
             inputs.reset_outputs()
             return
+        shard = inputs.row_shard if get_platform().is_sm90 else None
+        num_rows = inputs.positions.numel()
+        rows = shard.local_rows(num_rows) if shard else None
+        if shard is not None:
+            inputs.reset_outputs()
+            # Gather request-local positions, not another rank's KV slots.
+            score_inputs = msgspec.structs.replace(inputs, out_page_indices=None)
+        else:
+            score_inputs = inputs
         for request, chunks in prefill_requests(
-            inputs=inputs,
+            inputs=score_inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             candidate_blocks=published.blocks,
             candidate_block_size=self.block_size,
+            query_rows=rows,
         ):
             for chunk in chunks:
                 if chunk.candidate_only:
@@ -348,8 +387,37 @@ class DenseBlocksBackend:
                         block_size=self.block_size,
                     )
                 write_prefill(
-                    inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
+                    score_inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
                 )
+        if shard is not None:
+            raw = inputs.out_raw_indices[:num_rows]
+            raw.copy_(_gather_prefill_rows(raw[rows], num_rows, shard))
+            if inputs.out_page_indices is not None:
+                plans = inputs.index_plans
+                plan = plans.get(inputs.compress_ratio) if plans is not None else None
+                if plan is None:
+                    plan = prefill_index_plan(inputs)
+                if plan is not None:
+                    flat_selection_slots(
+                        raw,
+                        plan.request_starts,
+                        inputs.k_slots,
+                        inputs.out_page_indices,
+                    )
+
+
+def _gather_prefill_rows(
+    local: torch.Tensor, num_rows: int, shard: RowShard
+) -> torch.Tensor:
+    """Gather logical selections (not rank-local physical KV slots)."""
+    if local.shape[1] == 0:
+        return local.new_empty((num_rows, 0))
+    per_rank = shard.rows_per_rank(num_rows)
+    if local.shape[0] != per_rank:
+        padded = local.new_full((per_rank, local.shape[1]), -1)
+        padded[: local.shape[0]].copy_(local)
+        local = padded
+    return shard.gather(local, num_rows)
 
 
 def _publish_prefill_blocks(
