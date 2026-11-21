@@ -522,6 +522,8 @@ The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 Loads one or more LoRA adapters and applies them to the model. Both static merge and dynamic execution support multiple adapters on the same target, with a separate strength for each adapter.
 
+Each adapter must have a complete LoRA A/B pair for at least one layer on its selected target. Other layers may be unmatched. If any adapter has no match, the request is rejected and the previous adapters remain active. This also applies when reusing a cached nickname on a different target.
+
 When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mode`. The default policy, `auto`, merges regular weights but uses dynamic LoRA for FSDP-sharded weights, supported quantized or AMX-packed weights that cannot merge in place, and updates estimated to lose more than 50% of their norm to merge rounding. These rules also apply to multiple adapters. Forcing `merge` fails for weights that cannot merge in place; `dynamic` leaves the base weights unchanged and adds the adapters' updates during each forward pass.
 
 **Endpoint:** `POST /v1/set_lora`

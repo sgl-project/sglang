@@ -416,13 +416,13 @@ def test_alpha_override_reloads_fused_sections(tmp_path):
         "cur_adapter_path",
         "cur_adapter_strength",
         "cur_adapter_config",
-        "lora_layers",
         "lora_layers_critic",
         "lora_layers_transformer_2",
         "is_lora_merged",
         "auto_merge_rounding_loss",
     ):
         setattr(pipeline, attr, {})
+    pipeline.lora_layers = {"attn.to_qkv": _make_layer()}
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
         patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
