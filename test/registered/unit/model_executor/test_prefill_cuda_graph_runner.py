@@ -20,7 +20,12 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    PPProxyTensors,
+    has_custom_prefill_readout,
+    has_custom_prefill_readout_reqs,
+)
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
@@ -912,6 +917,274 @@ class TestPrefillCudaGraphRunnerBodyTables(CustomTestCase):
         self.assertEqual(
             body.refill_prefill_graph.call_args_list, [call("meta", forward_batch)] * 2
         )
+
+
+class _FakeMropeSlot(_FakeGraphSlot):
+    def slice_for(self, _batch_size, num_tokens):
+        return self.buffer[:, :num_tokens]
+
+
+class _FakeMISBatchRegistry(_FakeBatchRegistry):
+    def __init__(self, max_tokens: int):
+        self.slots = {
+            "input_ids": _FakeGraphSlot(torch.zeros(max_tokens, dtype=torch.int64)),
+            "positions": _FakeGraphSlot(torch.zeros(max_tokens, dtype=torch.int64)),
+            "out_cache_loc": _FakeGraphSlot(torch.zeros(max_tokens, dtype=torch.int64)),
+            "mrope_positions": _FakeMropeSlot(
+                torch.zeros((3, max_tokens), dtype=torch.int64)
+            ),
+        }
+
+    def fill_from(self, forward_batch, *, raw_num_tokens, padded_num_tokens, **_kwargs):
+        self.slots["input_ids"].buffer[:raw_num_tokens].copy_(forward_batch.input_ids)
+        self.slots["positions"].buffer[:raw_num_tokens].copy_(forward_batch.positions)
+        self.slots["positions"].buffer[raw_num_tokens:padded_num_tokens].zero_()
+        self.slots["out_cache_loc"].buffer[:raw_num_tokens].copy_(
+            forward_batch.out_cache_loc
+        )
+        if forward_batch.mrope_positions is not None:
+            self.slots["mrope_positions"].buffer[:, :raw_num_tokens].copy_(
+                forward_batch.mrope_positions
+            )
+            self.slots["mrope_positions"].buffer[
+                :, raw_num_tokens:padded_num_tokens
+            ].zero_()
+
+
+class TestPrefillCudaGraphRunnerMISAndReadout(CustomTestCase):
+    @staticmethod
+    def _make_load_batch_runner(
+        *,
+        prefill_backend: Backend = Backend.BREAKABLE,
+        capture_return_pooled_hidden_states: bool = False,
+    ):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.capture_num_tokens = [8]
+        runner.max_context_size = None
+        runner.max_seq_len = None
+        runner._capture_chunked_prefix = False
+        runner.prefill_backend_name = prefill_backend
+        runner.buffer_registry = _FakeMISBatchRegistry(max_tokens=8)
+        runner_ids = _static_pool_translator()
+        runner.model_runner = SimpleNamespace(
+            attn_tp_sequence_sharded=lambda _: False,
+            prepare_dummy_forward_batch=lambda batch: batch,
+            runner_ids=runner_ids,
+        )
+        runner.enable_cp_bcg_capture = False
+        runner._is_full_backend = prefill_backend == Backend.FULL
+        runner.backend = SimpleNamespace()
+        runner.has_mha_companion_layers = False
+        runner._prefill_static_buffers = None
+        runner.static_draft_hidden_states = None
+        runner.capture_return_pooled_hidden_states = capture_return_pooled_hidden_states
+        runner._next_token_logits_buffer = lambda _rows: None
+        runner._prefill_logits_buffer_rows = lambda _batch: 1
+        runner._prepare_forward_metadata_for_replay = lambda *_args: None
+        return runner, runner_ids
+
+    def test_load_batch_syncs_mis_positions_and_preserves_padded_tail_zeros(self):
+        runner, runner_ids = self._make_load_batch_runner()
+        fb = _make_mis_forward_batch(
+            runner_ids=runner_ids, num_tokens=5, with_mrope=True
+        )
+        rewritten = torch.tensor([0, 1, 1, 2, 1], dtype=torch.int64)
+        rewritten_mrope = rewritten.unsqueeze(0).repeat(3, 1)
+
+        def fake_prepare(metadata_fb, _static_fb, _shape_key):
+            metadata_fb.positions.copy_(rewritten)
+            metadata_fb.mrope_positions.copy_(rewritten_mrope)
+            return None
+
+        runner._prepare_forward_metadata_for_replay = fake_prepare
+        static_fb, _ = runner.load_batch(fb)
+
+        torch.testing.assert_close(static_fb.positions[:5], rewritten, rtol=0, atol=0)
+        torch.testing.assert_close(
+            static_fb.positions[5:], torch.zeros(3, dtype=torch.int64), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            static_fb.mrope_positions[:, :5], rewritten_mrope, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            static_fb.mrope_positions[:, 5:],
+            torch.zeros((3, 3), dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        self.assertIs(static_fb.token_indices_to_pool, fb.token_indices_to_pool)
+        self.assertIs(static_fb.decision_layouts, fb.decision_layouts)
+
+    def test_load_batch_preserves_return_pooled_hidden_states_for_eager_tail(self):
+        for backend, requested, expected in (
+            (Backend.BREAKABLE, False, False),
+            (Backend.BREAKABLE, True, True),
+            (Backend.TC_PIECEWISE, False, True),
+        ):
+            with self.subTest(backend=backend, requested=requested):
+                runner, runner_ids = self._make_load_batch_runner(
+                    prefill_backend=backend,
+                    capture_return_pooled_hidden_states=True,
+                )
+                fb = _make_mis_forward_batch(
+                    runner_ids=runner_ids,
+                    num_tokens=5,
+                    with_mrope=False,
+                    return_pooled_hidden_states=requested,
+                )
+                static_fb, _ = runner.load_batch(fb)
+                self.assertEqual(static_fb.return_pooled_hidden_states, expected)
+
+    def test_has_custom_prefill_readout_helpers(self):
+        self.assertFalse(has_custom_prefill_readout(SimpleNamespace()))
+        self.assertFalse(
+            has_custom_prefill_readout(
+                SimpleNamespace(
+                    multi_item_delimiter_indices=None,
+                    token_indices_to_pool=None,
+                    decision_layouts=None,
+                )
+            )
+        )
+        for field in (
+            "multi_item_delimiter_indices",
+            "token_indices_to_pool",
+            "decision_layouts",
+        ):
+            with self.subTest(fb_field=field):
+                self.assertTrue(
+                    has_custom_prefill_readout(SimpleNamespace(**{field: [[1]]}))
+                )
+
+        self.assertFalse(has_custom_prefill_readout_reqs(()))
+        self.assertFalse(
+            has_custom_prefill_readout_reqs(
+                [
+                    SimpleNamespace(
+                        multi_item_delimiter_indices=None,
+                        token_indices_to_pool=None,
+                        decision_layout=None,
+                    )
+                ]
+            )
+        )
+        for field in (
+            "multi_item_delimiter_indices",
+            "token_indices_to_pool",
+            "decision_layout",
+        ):
+            with self.subTest(req_field=field):
+                self.assertTrue(
+                    has_custom_prefill_readout_reqs([SimpleNamespace(**{field: [1]})])
+                )
+
+    def test_custom_prefill_readout_gate_and_dp_vote(self):
+        cases = (
+            ("multi_item_delimiter_indices", "multi_item_delimiter_indices", [2, 4]),
+            ("token_indices_to_pool", "token_indices_to_pool", [1, 3]),
+            ("decision_layouts", "decision_layout", [1, 2]),
+        )
+        for fb_field, req_field, value in cases:
+            for backend in (Backend.BREAKABLE, Backend.TC_PIECEWISE):
+                with self.subTest(field=fb_field, backend=backend):
+                    runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                    runner._is_full_backend = False
+                    runner.enable_lora = False
+                    runner._capture_chunked_prefix = False
+                    runner._captured_attn_metadata_max_bs = None
+                    runner._qwen_bcg_hc_sidechannel = False
+                    runner._qwen_bcg_mtp_draft = False
+                    runner.prefill_backend_name = backend
+                    runner.has_mha_companion_layers = False
+                    runner.prefer_eager_mixed_prefill = False
+                    runner._backend_vote_prefill_cuda_graph = None
+                    runner.capture_hidden_mode = CaptureHiddenMode.NULL
+                    runner.capture_num_tokens = [4]
+                    runner.max_context_size = None
+                    runner.max_seq_len = None
+                    runner.max_num_tokens = 4
+
+                    fb = SimpleNamespace(
+                        batch_size=1,
+                        input_ids=torch.zeros(4, dtype=torch.int64),
+                        input_embeds=None,
+                        replace_embeds=None,
+                        extend_prefix_lens_cpu=[0],
+                        forward_mode=ForwardMode.EXTEND,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_logprob=False,
+                        global_num_tokens_cpu=None,
+                        contains_mm_inputs=lambda: False,
+                        **{fb_field: [value]},
+                    )
+                    req = SimpleNamespace(**{req_field: value})
+                    schedule_batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        batch_size=lambda: 1,
+                        extend_num_tokens=4,
+                        input_embeds=None,
+                        replace_embeds=None,
+                        prefix_lens=[0],
+                        return_logprob=False,
+                        multimodal_inputs=None,
+                        reqs=[req],
+                    )
+                    expected = backend == Backend.BREAKABLE
+                    self.assertEqual(runner.can_run_graph(fb), expected)
+                    self.assertEqual(
+                        _local_prefill_cuda_graph_vote(
+                            local_batch=schedule_batch,
+                            num_tokens=4,
+                            prefill_graph_runner=runner,
+                            coordinated_prefill=True,
+                            breakable_prefill=expected,
+                            spec_algorithm=None,
+                            model_config=None,
+                        ),
+                        expected,
+                    )
+
+
+def _make_mis_forward_batch(
+    *,
+    runner_ids,
+    num_tokens: int = 5,
+    with_mrope: bool = True,
+    return_pooled_hidden_states: bool = False,
+):
+    delims = [torch.tensor([2, 4], dtype=torch.int64)]
+    token_indices = [torch.tensor([1, 3], dtype=torch.int64)]
+    decision_layouts = [[1, 2]]
+    fb = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=torch.arange(num_tokens, dtype=torch.int64),
+        req_pool_indices=torch.zeros(1, dtype=torch.int64),
+        seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+        seq_lens_sum=num_tokens,
+        positions=torch.arange(num_tokens, dtype=torch.int64),
+        mrope_positions=(
+            torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+            if with_mrope
+            else None
+        ),
+        seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+        extend_start_loc=torch.zeros(1, dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
+        extend_prefix_lens_cpu=[0],
+        multi_item_delimiter_indices=delims,
+        token_indices_to_pool=token_indices,
+        decision_layouts=decision_layouts,
+        return_pooled_hidden_states=return_pooled_hidden_states,
+        mm_inputs=None,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        global_forward_mode=ForwardMode.EXTEND,
+    )
+    runner_ids.bind_own_plan(fb)
+    return fb
 
 
 if __name__ == "__main__":

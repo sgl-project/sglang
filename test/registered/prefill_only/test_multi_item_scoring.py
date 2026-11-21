@@ -15,8 +15,10 @@ bugs in tensor shape handling (e.g., 2D tensors [num_delimiters, num_label_token
 
 import asyncio
 import os
+import re
 import unittest
 
+import requests
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
@@ -25,7 +27,11 @@ from sglang.srt.server_args import _declared_default
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
+    find_available_port,
+    popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=137, stage="extra-a", runner_config="1-gpu-small")
@@ -149,6 +155,12 @@ class TestMultiItemScoringOptimization(CustomTestCase):
         for score_list in scores:
             self.assertEqual(len(score_list), len(label_token_ids))
             self.assertAlmostEqual(sum(score_list), 1.0, places=5)
+
+    def test_prefill_cuda_graph_breakable_enabled(self):
+        """MIS keeps breakable prefill CUDA graph active while disabling decode."""
+        info = self.engine.get_server_info()
+        self.assertEqual(info["cuda_graph_config"]["prefill"]["backend"], "breakable")
+        self.assertEqual(info["cuda_graph_config"]["decode"]["backend"], "disabled")
 
 
 class TestMultiItemScoringClassification(CustomTestCase):
@@ -423,6 +435,34 @@ class TestMultiItemScoringClassification(CustomTestCase):
                     msg=f"item {i} label {j}: MIS={m} vs non-MIS={n}",
                 )
 
+    def test_classification_prefill_cuda_graph_breakable_enabled(self):
+        """Classification MIS keeps breakable prefill CUDA graph active."""
+        info = self.engine.get_server_info()
+        self.assertEqual(info["cuda_graph_config"]["prefill"]["backend"], "breakable")
+        self.assertEqual(info["cuda_graph_config"]["decode"]["backend"], "disabled")
+
+    def test_classification_mis_empty_query(self):
+        """Classification MIS with empty query handles clamped delimiter-1 safely."""
+        for return_phs in (False, True):
+            with self.subTest(return_pooled_hidden_states=return_phs):
+                result = self.engine.score(
+                    query="",
+                    items=["alpha", "beta", "gamma"],
+                    apply_softmax=True,
+                    return_pooled_hidden_states=return_phs,
+                )
+                self.assertEqual(len(result.scores), 3)
+                for row in result.scores:
+                    self.assertEqual(len(row), self.NUM_LABELS)
+                    self.assertAlmostEqual(sum(row), 1.0, places=5)
+                if return_phs:
+                    self.assertIsNotNone(result.pooled_hidden_states)
+                    self.assertEqual(len(result.pooled_hidden_states), 3)
+                    for phs in result.pooled_hidden_states:
+                        self.assertTrue(torch.isfinite(phs).all())
+                else:
+                    self.assertIsNone(result.pooled_hidden_states)
+
 
 class TestMultiItemScoringParity(CustomTestCase):
     """Test that MIS produces the same results as single-item scoring."""
@@ -525,6 +565,280 @@ class TestMultiItemScoringParity(CustomTestCase):
 
     def test_parity_many_items(self):
         self._compare_scores("many_items")
+
+
+class TestMultiItemScoringPrefillCudaGraphParity(CustomTestCase):
+    """Compare MIS under breakable prefill CUDA graph against eager MIS."""
+
+    @classmethod
+    def _causallm_calls(cls):
+        tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME)
+        yes_no = [
+            tokenizer.encode(lbl, add_special_tokens=False)[0]
+            for lbl in (" good", " bad")
+        ]
+        return {
+            "bucket_small": dict(
+                query="Rate relevance:",
+                items=[f" candidate item {i}" for i in range(4)],
+                label_token_ids=yes_no,
+                apply_softmax=True,
+            ),
+            "bucket_medium": dict(
+                query="Score each document for relevance to search:",
+                items=[f" document summary number {i}" for i in range(12)],
+                label_token_ids=yes_no,
+                apply_softmax=True,
+            ),
+            "empty_query": dict(
+                query="",
+                items=[" alpha option", " beta option", " gamma option"],
+                label_token_ids=yes_no,
+                apply_softmax=True,
+            ),
+            "raw_logprobs": dict(
+                query="Is this helpful?",
+                items=[" very helpful overview", " irrelevant text"],
+                label_token_ids=yes_no,
+                apply_softmax=False,
+                return_token_logprobs=True,
+            ),
+        }
+
+    def _assert_scores_close(
+        self,
+        *,
+        actual_scores,
+        expected_scores,
+        label: str,
+        check_top1: bool = True,
+    ) -> None:
+        self.assertEqual(len(actual_scores), len(expected_scores), label)
+        for i, (act_row, exp_row) in enumerate(zip(actual_scores, expected_scores)):
+            self.assertEqual(len(act_row), len(exp_row), f"{label}[{i}]")
+            for j, (act_val, exp_val) in enumerate(zip(act_row, exp_row)):
+                self.assertAlmostEqual(
+                    act_val,
+                    exp_val,
+                    delta=1e-2,
+                    msg=f"{label}[{i}][{j}]: actual={act_val} vs expected={exp_val}",
+                )
+            if check_top1 and len(act_row) > 1:
+                act_top = max(range(len(act_row)), key=act_row.__getitem__)
+                exp_top = max(range(len(exp_row)), key=exp_row.__getitem__)
+                self.assertEqual(act_top, exp_top, f"{label}[{i}] top-1 mismatch")
+
+    def _assert_token_logprobs_close(
+        self, *, actual_tlp, expected_tlp, label: str
+    ) -> None:
+        self.assertIsNotNone(actual_tlp, f"{label}: missing actual token_logprobs")
+        self.assertIsNotNone(expected_tlp, f"{label}: missing expected token_logprobs")
+        self.assertEqual(len(actual_tlp), len(expected_tlp), label)
+        for i, (act_row, exp_row) in enumerate(zip(actual_tlp, expected_tlp)):
+            self.assertEqual(len(act_row), len(exp_row), f"{label} logprob[{i}]")
+            for j, (act_lp, exp_lp) in enumerate(zip(act_row, exp_row)):
+                self.assertAlmostEqual(
+                    act_lp,
+                    exp_lp,
+                    delta=5e-2,
+                    msg=f"{label} logprob[{i}][{j}]: actual={act_lp} vs expected={exp_lp}",
+                )
+            act_top = max(range(len(act_row)), key=act_row.__getitem__)
+            exp_top = max(range(len(exp_row)), key=exp_row.__getitem__)
+            self.assertEqual(act_top, exp_top, f"{label} logprob[{i}] top-1 mismatch")
+
+    def _assert_causallm_case_close(
+        self,
+        *,
+        name: str,
+        actual_scores,
+        actual_tlp,
+        expected_scores,
+        expected_tlp,
+        label: str,
+    ) -> None:
+        self._assert_scores_close(
+            actual_scores=actual_scores,
+            expected_scores=expected_scores,
+            label=label,
+            check_top1=(name != "raw_logprobs"),
+        )
+        if name == "raw_logprobs":
+            self._assert_token_logprobs_close(
+                actual_tlp=actual_tlp, expected_tlp=expected_tlp, label=label
+            )
+        else:
+            self.assertIsNone(actual_tlp)
+            self.assertIsNone(expected_tlp)
+
+    def test_causallm_breakable_pcg_matches_eager_mis_and_replays_graphs(self):
+        calls_map = self._causallm_calls()
+        names = list(calls_map)
+        calls = list(calls_map.values())
+
+        common = dict(
+            model_path=TEST_MODEL_NAME,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            mem_fraction_static=0.20,
+            log_level="error",
+        )
+        eager_outs = dict(
+            zip(
+                names,
+                _collect_engine_outputs(
+                    engine_kwargs=dict(common, disable_cuda_graph=True),
+                    calls=calls,
+                ),
+            )
+        )
+        graph_outs = dict(
+            zip(
+                names,
+                _collect_engine_outputs(engine_kwargs=common, calls=calls),
+            )
+        )
+
+        for name in names:
+            g_scores, _, g_tlp = graph_outs[name]
+            e_scores, _, e_tlp = eager_outs[name]
+            self._assert_causallm_case_close(
+                name=name,
+                actual_scores=g_scores,
+                actual_tlp=g_tlp,
+                expected_scores=e_scores,
+                expected_tlp=e_tlp,
+                label=name,
+            )
+
+        port = find_available_port(31000)
+        base_url = f"http://127.0.0.1:{port}"
+        proc = popen_launch_server(
+            TEST_MODEL_NAME,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-mis",
+                "--attention-backend",
+                "flashinfer",
+                "--disable-radix-cache",
+                "--chunked-prefill-size",
+                "-1",
+                "--mem-fraction-static",
+                "0.20",
+                "--enable-metrics",
+            ],
+        )
+        try:
+            info = requests.get(base_url + "/server_info", timeout=30).json()
+            self.assertEqual(
+                info["cuda_graph_config"]["prefill"]["backend"], "breakable"
+            )
+            self.assertEqual(info["cuda_graph_config"]["decode"]["backend"], "disabled")
+            before = _prefill_graph_count(base_url)
+            for name in names:
+                resp = requests.post(
+                    base_url + "/v1/score",
+                    json={"model": TEST_MODEL_NAME, **calls_map[name]},
+                    timeout=30,
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                body = resp.json()
+                e_scores, _, e_tlp = eager_outs[name]
+                self._assert_causallm_case_close(
+                    name=name,
+                    actual_scores=body["scores"],
+                    actual_tlp=body.get("token_logprobs"),
+                    expected_scores=e_scores,
+                    expected_tlp=e_tlp,
+                    label=f"http {name}",
+                )
+            after = _prefill_graph_count(base_url)
+            self.assertGreaterEqual(after - before, 4.0)
+        finally:
+            terminate_and_kill_process_tree(proc)
+            torch.cuda.empty_cache()
+
+    def test_seqcls_breakable_pcg_matches_eager_mis(self):
+        calls = [
+            dict(
+                query="Rate this option:",
+                items=[" Option A", " Option B", " Option C", " Option D"],
+                apply_softmax=True,
+                return_pooled_hidden_states=False,
+            ),
+            dict(
+                query="",
+                items=[" alpha item", " beta item"],
+                apply_softmax=True,
+                return_pooled_hidden_states=True,
+            ),
+        ]
+        common = dict(
+            model_path=TEST_CLASSIFICATION_BASE_MODEL,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            mem_fraction_static=0.20,
+            log_level="error",
+        )
+        eager_outs = _collect_engine_outputs(
+            engine_kwargs=dict(common, disable_cuda_graph=True), calls=calls
+        )
+        graph_outs = _collect_engine_outputs(engine_kwargs=common, calls=calls)
+
+        for idx, ((g_scores, g_phs, g_tlp), (e_scores, e_phs, e_tlp)) in enumerate(
+            zip(graph_outs, eager_outs)
+        ):
+            self.assertIsNone(g_tlp)
+            self.assertIsNone(e_tlp)
+            self._assert_scores_close(
+                actual_scores=g_scores,
+                expected_scores=e_scores,
+                label=f"seqcls call={idx}",
+                check_top1=False,
+            )
+            if idx == 0:
+                self.assertIsNone(g_phs)
+                self.assertIsNone(e_phs)
+            else:
+                self.assertIsNotNone(g_phs)
+                self.assertIsNotNone(e_phs)
+                for gp, ep in zip(g_phs, e_phs):
+                    torch.testing.assert_close(gp, ep, rtol=5e-2, atol=5e-2)
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
+
+
+def _collect_engine_outputs(*, engine_kwargs, calls):
+    engine = Engine(**engine_kwargs)
+    try:
+        outs = [engine.score(**call) for call in calls]
+        return [
+            (
+                o.scores,
+                [t.clone() for t in o.pooled_hidden_states]
+                if o.pooled_hidden_states is not None
+                else None,
+                o.token_logprobs,
+            )
+            for o in outs
+        ]
+    finally:
+        engine.shutdown()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

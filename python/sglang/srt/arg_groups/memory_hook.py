@@ -92,12 +92,7 @@ def handle_gpu_memory_settings(server_args: Any):
         if gpu_mem < 20 * 1024:
             # T4, 4080
             # (chunked_prefill_size 2k, max_bs 8)
-            if cfg.chunked_prefill_size is None:
-                declare_resolution(
-                    server_args,
-                    "_handle_gpu_memory_settings",
-                    chunked_prefill_size=2048,
-                )
+            default_chunked_prefill_size = 2048
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 8
         elif gpu_mem < 35 * 1024:
@@ -106,12 +101,7 @@ def handle_gpu_memory_settings(server_args: Any):
             # 32GB Blackwell (RTX 5090) can hold decode cuda graphs well past
             # bs=24; the previous cap forced eager decode at bs>=32 and
             # collapsed high-concurrency throughput vs vLLM.
-            if cfg.chunked_prefill_size is None:
-                declare_resolution(
-                    server_args,
-                    "_handle_gpu_memory_settings",
-                    chunked_prefill_size=4096,
-                )
+            default_chunked_prefill_size = 4096
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
                     decode_cuda_graph_config.max_bs = 48
@@ -122,12 +112,7 @@ def handle_gpu_memory_settings(server_args: Any):
             # (chunked_prefill_size 4k, max_bs 128 if tp < 4 else 160)
             # Measured on L40S with Qwen3 0.6B to 8B. Decode above the cap runs
             # eager, and graphs up to bs=128 cost the 8B 1% of its KV pool.
-            if cfg.chunked_prefill_size is None:
-                declare_resolution(
-                    server_args,
-                    "_handle_gpu_memory_settings",
-                    chunked_prefill_size=4096,
-                )
+            default_chunked_prefill_size = 4096
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
                     decode_cuda_graph_config.max_bs = 128
@@ -136,12 +121,7 @@ def handle_gpu_memory_settings(server_args: Any):
         elif gpu_mem < 90 * 1024:
             # H100, A100
             # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
-            if cfg.chunked_prefill_size is None:
-                declare_resolution(
-                    server_args,
-                    "_handle_gpu_memory_settings",
-                    chunked_prefill_size=8192,
-                )
+            default_chunked_prefill_size = 8192
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
                     decode_cuda_graph_config.max_bs = 256
@@ -150,12 +130,7 @@ def handle_gpu_memory_settings(server_args: Any):
         elif gpu_mem < 160 * 1024:
             # H20, H200
             # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
-            if cfg.chunked_prefill_size is None:
-                declare_resolution(
-                    server_args,
-                    "_handle_gpu_memory_settings",
-                    chunked_prefill_size=8192,
-                )
+            default_chunked_prefill_size = 8192
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
                     decode_cuda_graph_config.max_bs = 256
@@ -164,24 +139,21 @@ def handle_gpu_memory_settings(server_args: Any):
         else:
             # B200, MI300
             # (chunked_prefill_size 16k, max_bs 512)
-            if cfg.chunked_prefill_size is None:
-                declare_resolution(
-                    server_args,
-                    "_handle_gpu_memory_settings",
-                    chunked_prefill_size=16384,
-                )
+            default_chunked_prefill_size = 16384
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 512
     else:
         # Fallback defaults when gpu_mem is None
-        if cfg.chunked_prefill_size is None:
-            declare_resolution(
-                server_args,
-                "_handle_gpu_memory_settings",
-                chunked_prefill_size=4096,
-            )
+        default_chunked_prefill_size = 4096
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
+
+    if cfg.chunked_prefill_size is None:
+        declare_resolution(
+            server_args,
+            "_handle_gpu_memory_settings",
+            chunked_prefill_size=default_chunked_prefill_size,
+        )
 
     if (
         decode_max_bs_is_default
@@ -244,11 +216,18 @@ def handle_gpu_memory_settings(server_args: Any):
         decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
     if prefill_cuda_graph_config.max_bs is None:
+        # Unchunked modes (e.g. --chunked-prefill-size=-1 / --enable-mis) must
+        # still materialize positive prefill capture buckets from the GPU tier.
+        prefill_token_budget = (
+            cfg.chunked_prefill_size
+            if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0
+            else default_chunked_prefill_size
+        )
         # Default to the chunked prefill size; cap MLA capture at 8192 tokens.
         if not use_mla_backend(server_args):
-            prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
+            prefill_cuda_graph_config.max_bs = prefill_token_budget
         else:
-            prefill_cuda_graph_config.max_bs = min(8192, cfg.chunked_prefill_size)
+            prefill_cuda_graph_config.max_bs = min(8192, prefill_token_budget)
 
         # For opt-in PP breakable graphs, capture small aggregate-token
         # buckets by default and leave larger forwards on the eager path.

@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
+from sglang.srt.model_executor.forward_batch_info import has_custom_prefill_readout_reqs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
@@ -429,6 +430,9 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
         return_logprob = local_batch.return_logprob
+        has_custom_prefill_readout = has_custom_prefill_readout_reqs(
+            getattr(local_batch, "reqs", ())
+        )
     elif (
         mode.is_decode()
         # Conversion replays the breakable graphs only; full's fixed
@@ -460,6 +464,7 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds = None
         prefix_lens = None
         return_logprob = False
+        has_custom_prefill_readout = False
     else:
         return False
 
@@ -483,6 +488,7 @@ def _local_prefill_cuda_graph_vote(
         is_target_verify=mode.is_target_verify(),
         capture_hidden_mode=None,
         return_logprob=return_logprob,
+        has_custom_prefill_readout=has_custom_prefill_readout,
         contains_mm_inputs=any(
             mm_input is not None and mm_input.contains_mm_input()
             for mm_input in local_batch.multimodal_inputs or ()

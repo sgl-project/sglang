@@ -86,6 +86,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    has_custom_prefill_readout,
     prefill_graph_tolerates_sum_len,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -1485,6 +1486,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         is_mixed: bool = False,
         batch_max_context_len: Optional[int] = None,
         contains_mm_inputs: bool = False,
+        has_custom_prefill_readout: bool = False,
     ) -> bool:
         """Rank-local replay eligibility: the single source of truth for
         ``can_run_graph`` (ForwardBatch, forward time) and the dp mlp-sync
@@ -1549,7 +1551,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self.capture_hidden_mode < capture_hidden_mode
         ):
             return False
-        if return_logprob and not self._uses_eager_prefill_tail():
+        if (
+            return_logprob or has_custom_prefill_readout
+        ) and not self._uses_eager_prefill_tail():
             return False
         # Vote on both bounds so DP ranks agree on graph versus eager.
         for context_limit in (self.max_context_size, self.max_seq_len):
@@ -1608,6 +1612,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             return_logprob=forward_batch.return_logprob,
+            has_custom_prefill_readout=has_custom_prefill_readout(forward_batch),
             contains_mm_inputs=forward_batch.contains_mm_inputs(),
             lora_ineligible=self.enable_lora
             and not (
@@ -2197,6 +2202,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_candidate_selectors=forward_batch.input_candidate_selectors,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
+            token_indices_to_pool=forward_batch.token_indices_to_pool,
+            decision_layouts=forward_batch.decision_layouts,
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
@@ -2225,8 +2232,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
             return_pooled_hidden_states=(
-                self.capture_return_pooled_hidden_states
-                or forward_batch.return_pooled_hidden_states
+                forward_batch.return_pooled_hidden_states
+                if not self.capture_return_pooled_hidden_states
+                or self._uses_eager_prefill_tail()
+                else True
             ),
             max_seq_len_override=self.max_context_size,
         )
@@ -2324,6 +2333,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, shape_key
         )
+        # FlashInfer MIS rewrites positions in place inside init_forward_metadata,
+        # after buffer_registry.fill_from has already populated static buffers.
+        if (
+            forward_batch.multi_item_delimiter_indices is not None
+            and metadata_forward_batch is not static_forward_batch
+        ):
+            static_forward_batch.positions[:num_tokens].copy_(
+                forward_batch.positions[:num_tokens]
+            )
+            if (
+                static_forward_batch.mrope_positions is not None
+                and forward_batch.mrope_positions is not None
+            ):
+                static_forward_batch.mrope_positions[:, :num_tokens].copy_(
+                    forward_batch.mrope_positions[:, :num_tokens]
+                )
 
         return static_forward_batch, shared_read_ends
 

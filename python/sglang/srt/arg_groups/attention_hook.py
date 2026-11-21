@@ -543,32 +543,34 @@ def handle_linear_attn_backend(server_args: Any):
 def handle_multi_item_scoring(server_args: Any):
     """Setup and validate multi-item scoring constraints.
 
-    Auto-disables settings incompatible with MIS mechanics (CUDA graph,
-    radix cache, chunked prefill). Asserts on attention backend since
-    changing it silently could surprise users who intentionally picked
-    a non-flashinfer backend.
+    Auto-disables settings incompatible with MIS mechanics (decode CUDA graph,
+    non-breakable prefill CUDA graph backends, radix cache, chunked prefill).
+    Asserts on attention backend since changing it silently could surprise
+    users who intentionally picked a non-flashinfer backend.
     """
 
     cfg = resolving_view(server_args)
     if not cfg.enable_mis:
         return
 
-    if cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
-        logger.warning("CUDA graph is disabled because --enable-mis is set.")
-    declare_resolution(
-        server_args,
-        "_handle_multi_item_scoring",
-        cuda_graph_config=with_phase(
-            cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-        ),
-    )
-    declare_resolution(
-        server_args,
-        "_handle_multi_item_scoring",
-        cuda_graph_config=with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        ),
-    )
+    orig_cg_cfg = cfg.cuda_graph_config
+    cg_cfg = orig_cg_cfg
+    if cg_cfg.decode.backend != Backend.DISABLED:
+        logger.warning("Decode CUDA graph is disabled because --enable-mis is set.")
+        cg_cfg = with_phase(cg_cfg, Phase.DECODE, backend=Backend.DISABLED)
+    if cg_cfg.prefill.backend not in (Backend.BREAKABLE, Backend.DISABLED):
+        logger.warning(
+            "Prefill CUDA graph backend %r is disabled because --enable-mis "
+            "only supports the breakable prefill CUDA graph backend.",
+            cg_cfg.prefill.backend,
+        )
+        cg_cfg = with_phase(cg_cfg, Phase.PREFILL, backend=Backend.DISABLED)
+    if cg_cfg is not orig_cg_cfg:
+        declare_resolution(
+            server_args,
+            "_handle_multi_item_scoring",
+            cuda_graph_config=cg_cfg,
+        )
 
     if not cfg.disable_radix_cache:
         logger.warning("Radix cache is disabled because --enable-mis is set.")

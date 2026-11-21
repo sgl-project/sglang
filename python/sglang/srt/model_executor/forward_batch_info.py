@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -2483,3 +2483,32 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+_CUSTOM_PREFILL_READOUT_BATCH_FIELDS = (
+    "multi_item_delimiter_indices",
+    "token_indices_to_pool",
+    "decision_layouts",
+)
+_CUSTOM_PREFILL_READOUT_REQ_FIELDS = (
+    "multi_item_delimiter_indices",
+    "token_indices_to_pool",
+    "decision_layout",
+)
+
+
+def has_custom_prefill_readout(forward_batch: Any) -> bool:
+    """Return True if a forward batch uses MIS, pooling, or setwise readout."""
+    return any(
+        getattr(forward_batch, field, None) is not None
+        for field in _CUSTOM_PREFILL_READOUT_BATCH_FIELDS
+    )
+
+
+def has_custom_prefill_readout_reqs(reqs: Iterable[Any]) -> bool:
+    """Return True if any request in ``reqs`` uses a custom prefill readout."""
+    return any(
+        getattr(req, field, None) is not None
+        for req in reqs
+        for field in _CUSTOM_PREFILL_READOUT_REQ_FIELDS
+    )

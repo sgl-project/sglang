@@ -102,10 +102,9 @@ def pool_at_delimiter_positions(
         indices_tensor = forward_batch.multi_item_delimiter_indices[req_idx]
         n = len(indices_tensor)
         if n > 0:
-            # Note: if the first delimiter is at position 0 (empty query),
-            # indices - 1 wraps to -1. This is harmless — the first delimiter
-            # entry is always discarded by _process_multi_item_scoring_results.
-            all_index_tensors.append(indices_tensor + (offset - 1))
+            # Clamp to 0 when first_delim == 0 at offset == 0 so
+            # uninitialized padded tail rows are never indexed.
+            all_index_tensors.append((indices_tensor + (offset - 1)).clamp_min(0))
         delim_counts.append(n)
         offset += req_seq_len
 
