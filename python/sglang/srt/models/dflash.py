@@ -129,6 +129,14 @@ _GFX950_HIPBLASLT_ROWS = range(33, 129)
 logger = logging.getLogger(__name__)
 
 
+def _rocm_decode_gemm_tuned() -> bool:
+    """Tuned K3 decode GEMMs (ROCm + AITER only)."""
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_hip
+
+    return is_hip() and envs.SGLANG_USE_AITER.get()
+
+
 def _logical_linear_weight_shape(
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -1361,6 +1369,19 @@ class DFlashDraftModel(nn.Module):
             and self.fc.out_features % get_parallel().tp_size == 0
         ):
             projected = self._project_target_hidden_tp(target_hidden)
+        elif (
+            0 < target_hidden.shape[0] <= 64
+            and target_hidden.dtype == torch.bfloat16
+            and self.fc.weight.dtype == torch.bfloat16
+            and _rocm_decode_gemm_tuned()
+        ):
+            # ROCm decode: tuned hipBLASLt row via AITER tgemm (falls back to
+            # torch for untuned token counts).
+            from aiter.tuned_gemm import tgemm
+
+            projected = tgemm.mm(
+                target_hidden, self.fc.weight, None, otype=target_hidden.dtype
+            )
         else:
             projected = self.fc(target_hidden)
         return self.hidden_norm(projected)
