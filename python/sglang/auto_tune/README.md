@@ -19,6 +19,27 @@ At startup the tuner parses `/sgl-workspace/aiter` (`--aiter-dir`) and the SGLan
 
 Use it when a class is obsolete on the AITER pin under test, or when its accuracy is not acceptable. The built-in skip list is empty, so `QuickAllReduceInt4` competes unless a run names it. A skipped class is logged under `Not opened` and is not written into the table. A name that matches no scanned class is logged and does not stop the run. The names are also stored in the JSON `skip` field.
 
+`--scandir` sets which directories or files the scan reads. Without it the scan reads [`DEFAULT_SCAN_DIRS`](aiter_comms.py#L31-L35):
+
+| Default entry | Tree |
+| --- | --- |
+| `aiter/dist/device_communicators` | `--aiter-dir` |
+| `aiter/ops/flydsl/quick_allreduce*.py` | `--aiter-dir` |
+| `sglang/srt/distributed/device_communicators` | `--sglang-dir` |
+
+The second entry covers both FlyDSL layouts: `quick_allreduce.py` on current AITER and `quick_allreduce_int4.py` on older pins such as `90596736`.
+
+- A relative path is looked up under `--aiter-dir` and under `--sglang-dir`, and is read from whichever tree has it. An absolute path must lie inside one of the two trees.
+- `*` is expanded, so `aiter/ops/flydsl/*.py` works. A path that neither tree has is ignored.
+- Giving `--scandir` replaces the defaults. List the SGLang directory as well if SGLang's communicators should still compete.
+- Several paths can follow one `--scandir`, and the flag can be repeated.
+- The class names come from the file path, so keep the path relative to the tree root.
+- The run logs the entries under `Scan directories` and stores them in the JSON `scandirs` field. When the flag is not given, that field holds the defaults.
+
+```bash
+--scandir aiter/dist/device_communicators aiter/ops/flydsl/quick_allreduce.py sglang/srt/distributed/device_communicators
+```
+
 ## Tuner
 
 ```bash

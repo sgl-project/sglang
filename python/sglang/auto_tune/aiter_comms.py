@@ -21,31 +21,48 @@ DEFAULT_SGLANG_DIR = os.environ.get(
     "SGLANG_DIR", str(Path(__file__).resolve().parents[2])
 )
 
-# Directories that define the collectives. The rest of each tree is kernels.
+# Where the scan looks when ``--scandir`` is not given. Each entry is a
+# directory or a file, relative to the AITER tree (``--aiter-dir``) or to the
+# directory that contains the ``sglang`` package (``--sglang-dir``). An entry
+# may use ``*``. The rest of each tree is kernels.
 # FlyDSL all-reduce is whichever ``quick_allreduce*.py`` that revision ships:
 # ``quick_allreduce.py`` on current AITER, ``quick_allreduce_int4.py`` on
 # older trees such as 90596736. The scan reads the files that exist.
-_AITER_COMM_DIR = Path("aiter/dist/device_communicators")
-_AITER_FLYDSL_DIR = Path("aiter/ops/flydsl")
-_SGLANG_RELATIVE = (Path("sglang/srt/distributed/device_communicators"),)
+DEFAULT_SCAN_DIRS: Tuple[str, ...] = (
+    "aiter/dist/device_communicators",
+    "aiter/ops/flydsl/quick_allreduce*.py",
+    "sglang/srt/distributed/device_communicators",
+)
 
 
-def _aiter_sources(root: Path) -> Tuple[Path, ...]:
-    """Communicator sources under ``root``.
+def scan_dirs(scandirs: Sequence[str] = ()) -> Tuple[str, ...]:
+    """The entries the scan will use: ``scandirs``, or the defaults if empty."""
+    cleaned = tuple(entry.strip() for entry in scandirs if entry.strip())
+    return cleaned or DEFAULT_SCAN_DIRS
 
-    The device-communicator directory is always named. FlyDSL all-reduce
-    files are the ``quick_allreduce*.py`` modules present in that tree.
+
+def _sources(root: Path, scandirs: Sequence[str]) -> Tuple[Path, ...]:
+    """Paths under ``root`` named by ``scandirs`` that exist.
+
+    An absolute entry counts when it is inside ``root``. An entry with ``*``
+    is expanded against ``root``. An entry the tree does not have is skipped,
+    so one list can name both the AITER and the SGLang directories.
     """
-    sources = [_AITER_COMM_DIR]
-    flydsl = root / _AITER_FLYDSL_DIR
-    if flydsl.is_dir():
-        sources.extend(
-            sorted(
-                path.relative_to(root)
-                for path in flydsl.glob("quick_allreduce*.py")
+    sources: List[Path] = []
+    for entry in scan_dirs(scandirs):
+        candidate = Path(entry)
+        if candidate.is_absolute():
+            try:
+                candidate = candidate.relative_to(root)
+            except ValueError:
+                continue
+        if any(char in str(candidate) for char in "*?["):
+            sources.extend(
+                sorted(path.relative_to(root) for path in root.glob(str(candidate)))
             )
-        )
-    return tuple(sources)
+        elif (root / candidate).exists():
+            sources.append(candidate)
+    return tuple(dict.fromkeys(sources))
 
 _COMM_METHODS = {
     "all_reduce",
@@ -85,16 +102,19 @@ class AiterScan:
     error: str = ""
 
 
-def scan_aiter(root: str = DEFAULT_AITER_DIR) -> AiterScan:
+def scan_aiter(
+    root: str = DEFAULT_AITER_DIR, scandirs: Sequence[str] = ()
+) -> AiterScan:
     """Parse ``root`` and return the communicator classes and quant names.
 
-    Nothing is imported. A missing tree is an empty scan with ``error`` set,
-    so the tuner can still run.
+    ``scandirs`` are the directories or files to read, relative to ``root``;
+    empty means ``DEFAULT_SCAN_DIRS``. Nothing is imported. A missing tree is
+    an empty scan with ``error`` set, so the tuner can still run.
     """
     path = Path(root)
     if not path.is_dir():
         return AiterScan(None, (), (), (), error=f"{root} is not a directory")
-    found, regimes, fly, found_any = _scan_files(path, _aiter_sources(path))
+    found, regimes, fly, found_any = _scan_files(path, _sources(path, scandirs))
     if not found_any:
         return AiterScan(
             str(path),
@@ -122,15 +142,19 @@ class SglangScan:
     error: str = ""
 
 
-def scan_sglang(root: str = DEFAULT_SGLANG_DIR) -> SglangScan:
+def scan_sglang(
+    root: str = DEFAULT_SGLANG_DIR, scandirs: Sequence[str] = ()
+) -> SglangScan:
     """Parse SGLang's device communicators. Nothing is imported.
 
     ``root`` is the directory that contains the ``sglang`` package.
+    ``scandirs`` are the directories or files to read, relative to ``root``;
+    empty means ``DEFAULT_SCAN_DIRS``.
     """
     path = Path(root)
     if not path.is_dir():
         return SglangScan(None, (), error=f"{root} is not a directory")
-    found, _regimes, _fly, found_any = _scan_files(path, _SGLANG_RELATIVE)
+    found, _regimes, _fly, found_any = _scan_files(path, _sources(path, scandirs))
     if not found_any:
         return SglangScan(
             str(path),

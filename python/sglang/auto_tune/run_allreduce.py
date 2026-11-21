@@ -18,7 +18,11 @@ import argparse
 import os
 import sys
 
-from sglang.auto_tune.aiter_comms import DEFAULT_AITER_DIR, DEFAULT_SGLANG_DIR
+from sglang.auto_tune.aiter_comms import (
+    DEFAULT_AITER_DIR,
+    DEFAULT_SCAN_DIRS,
+    DEFAULT_SGLANG_DIR,
+)
 from sglang.auto_tune.allreduce_tuner import (
     _SYNC_EVERY,
     DEFAULT_NUM_WARMUP,
@@ -138,6 +142,23 @@ examples:
         help=(
             "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16 for HIP QuickReduce. 1 (the "
             "server default) casts inside the timed kernel."
+        ),
+    )
+    parser.add_argument(
+        "--scandir",
+        nargs="+",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Directories or files to parse for communicator classes. A "
+            "relative path is taken under --aiter-dir or --sglang-dir, "
+            "whichever has it; an absolute path must be inside one of them. "
+            "'*' is allowed. Give it to replace the defaults, so list the "
+            "SGLang directory too if it should still be scanned. Repeat the "
+            "flag, or pass several paths after one --scandir. Default: "
+            + ", ".join(DEFAULT_SCAN_DIRS)
+            + "."
         ),
     )
     parser.add_argument(
@@ -334,6 +355,7 @@ def main(argv: list[str] | None = None) -> None:
             aiter_dir=args.aiter_dir,
             sglang_dir=args.sglang_dir,
             skip=tuple(name for group in args.skip for name in group),
+            scandirs=tuple(path for group in args.scandir for path in group),
         )
         if rank == 0:
             print_allreduce_summary(results)
