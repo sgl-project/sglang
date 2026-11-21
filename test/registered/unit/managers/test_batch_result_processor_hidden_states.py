@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from contextlib import nullcontext
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
@@ -13,9 +14,12 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
@@ -24,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -44,14 +49,15 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     metrics_reporter.forward_ct_decode = 0
     # A tree that leases no state slots ahead of the checkpoints.
     tree_cache = SimpleNamespace(
-        lease_checkpoint_state_slots=lambda reqs: nullcontext()
+        lease_checkpoint_state_slots=lambda reqs: nullcontext(), finish=Mock()
+    )
+    model_config = SimpleNamespace(
+        vocab_size=1000, think_end_ids=None, self_opened_think_start_ids=None
     )
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        model_config=SimpleNamespace(
-            think_end_ids=None, self_opened_think_start_ids=None
-        ),
+        model_config=model_config,
         token_to_kv_pool_allocator=Mock(),
         tree_cache=tree_cache,
         hisparse_coordinator=None,
@@ -62,7 +68,9 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         metrics_reporter=metrics_reporter,
         draft_worker=None,
         model_worker=Mock(),
-        logprob_result_processor=None,
+        logprob_result_processor=SchedulerLogprobResultProcessor(
+            model_config=model_config
+        ),
         output_streamer=Mock(),
         beam_coordinator=Mock(),
         request_retirer=release_only_retirer(tree_cache=tree_cache),
@@ -351,6 +359,94 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
                 self.assertEqual(middle.hidden_states, [])
                 self.assertEqual(last.hidden_states, [[22.0]])
+
+
+class TestAbortedFinalPrefill(CustomTestCase):
+    def test_discard_drops_metadata_but_keeps_the_next_rows_packed_offsets(self):
+        """Dropping an aborted prefill must neither attach its metadata nor shift
+        the next live row's hidden states or input logprobs."""
+        for sampling_status in (None, SamplingMaskStatus.OVERFLOW):
+            with self.subTest(sampling_status=sampling_status):
+                aborted, live = [
+                    Req(
+                        rid=rid,
+                        origin_input_text="",
+                        origin_input_ids=array("q", ids),
+                        sampling_params=SamplingParams(max_new_tokens=8),
+                        return_logprob=True,
+                        return_hidden_states="last",
+                    )
+                    for rid, ids in (("aborted", [1, 2]), ("live", [3, 4, 5]))
+                ]
+                for req in (aborted, live):
+                    req.sampling_params.normalize(None)
+                    req.logprob_start_len = 0
+                reason = FINISH_ABORT("Running request timeout", 503)
+                aborted.request_finish(reason)
+                aborted.request_discard(reason)
+                aborted.kv.req_pool_idx = 0
+                aborted.return_sampling_mask = sampling_status is not None
+                aborted.grammar = Mock()
+                batch = ScheduleBatch(
+                    reqs=[aborted, live],
+                    return_logprob=True,
+                    return_hidden_states=True,
+                    return_hidden_states_mode=CaptureHiddenMode.LAST,
+                )
+                result = GenerationBatchResult(
+                    logits_output=LogitsProcessorOutput(
+                        next_token_logits=None,
+                        hidden_states=torch.tensor([[10.0], [20.0]]),
+                        customized_info={"tag": ["abort-meta", "live-meta"]},
+                        next_token_logprobs=torch.tensor([-0.5, -0.25]),
+                        input_token_logprobs=torch.tensor(
+                            [-1.0, -2.0, -10.0, -11.0, -12.0]
+                        ),
+                        next_token_sampling_mask_status=[sampling_status, None],
+                    ),
+                    next_token_ids=torch.tensor([101, 202]),
+                    extend_input_len_per_req=[2, 3],
+                    extend_logprob_start_len_per_req=[0, 0],
+                )
+                processor = _make_processor(self, "last")
+                cache = processor.tree_cache
+
+                def assert_clean_before_stream(*_):
+                    self.assertFalse(aborted.output_ids)
+                    self.assertFalse(aborted.hidden_states)
+                    self.assertIsNone(aborted.customized_info)
+
+                processor.output_streamer.stream_output.side_effect = (
+                    assert_clean_before_stream
+                )
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "request_retirer.release_kv_cache"
+                    ) as release,
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.checkpoint_kv_cache"
+                    ),
+                ):
+                    processor.process_batch_result_prefill(batch, result)
+
+                self.assertIs(aborted.finished_reason, reason)
+                self.assertFalse(aborted.output_ids)
+                self.assertFalse(aborted.hidden_states)
+                self.assertIsNone(aborted.customized_info)
+                self.assertIsNone(aborted.logprob.input_token_logprobs_val)
+                self.assertEqual(aborted.logprob.output_token_logprobs_val, [])
+                aborted.grammar.accept_token.assert_not_called()
+                release.assert_called_once_with(aborted, cache, checkpoint=False)
+                self.assertEqual(list(live.output_ids), [202])
+                self.assertEqual(live.hidden_states, [[20.0]])
+                self.assertEqual(live.customized_info, {"tag": ["live-meta"]})
+                self.assertEqual(
+                    live.logprob.input_token_logprobs_val, [None, -10.0, -11.0]
+                )
+                self.assertEqual(live.logprob.output_token_logprobs_val, [-0.25])
+                self.assertEqual(live.logprob.output_token_logprobs_idx, [202])
 
 
 class TestRowsStillInBatch(CustomTestCase):
