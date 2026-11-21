@@ -45,7 +45,9 @@ from sglang.kernels.ops.lora.moe.cutedsl.scheduler import (
 
 
 class GroupedGemmKernelSm90Bf16:
-    """Hopper grouped GEMM with the same config interface as SM100."""
+    """Hopper grouped GEMM with shared config and optional FP8 row scaling."""
+
+    ROW_SCALED = False
 
     def __init__(
         self,
@@ -175,6 +177,9 @@ class GroupedGemmKernelSm90Bf16:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        # Absent FP8 scales are compile-time None.
+        sfa: cute.Tensor = None,
+        sfb: cute.Tensor = None,
     ):
         self.a_dtype = a.element_type
         self.b_dtype = b.element_type
@@ -245,6 +250,8 @@ class GroupedGemmKernelSm90Bf16:
             tma_tensor_b,
             tma_atom_c,
             tma_tensor_c,
+            sfa,
+            sfb,
             group_m,
             direct_schedule,
             schedule_tiles,
@@ -273,6 +280,8 @@ class GroupedGemmKernelSm90Bf16:
         mB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         mC_mnl: cute.Tensor,
+        mSFA_mkl: cute.Tensor,  # ROW_SCALED: weight-row scales (N, E); else None
+        mSFB_nkl: cute.Tensor,  # ROW_SCALED: token scales (M, E|1); else None
         group_m: cute.Tensor,
         direct_schedule: cute.Tensor,
         schedule_tiles: cute.Tensor,
@@ -393,6 +402,26 @@ class GroupedGemmKernelSm90Bf16:
         tCrB = tiled_mma.make_fragment_B(tCsB)
         tCgC = thr_mma.partition_C(gC_mnl)
         accumulators = cute.make_rmem_tensor(tCgC.shape[:3], self.acc_dtype)
+        if cutlass.const_expr(self.ROW_SCALED):
+            # Match accumulator elements to (weight row, token) for scale lookup.
+            idC = cute.make_identity_tensor(
+                (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
+            )
+            tCcC = thr_mma.partition_C(idC)
+            # Mode 0 of the accumulator runs over (2 tokens, 2 rows 8 apart, N/8
+            # token blocks), mode 1 over 64-row blocks: a thread meets 2 weight
+            # rows per row block and N/4 tokens. Stride-0 fragments hold each
+            # scale once instead of once per accumulator.
+            num_v = cute.size(accumulators, mode=[0])
+            scale_shape = ((2, 2, num_v // 4), *accumulators.shape[1:])
+            sfa_frag = cute.make_rmem_tensor(
+                cute.make_layout(scale_shape, stride=((0, 1, 0), 2, 0)),
+                mSFA_mkl.element_type,
+            )
+            sfb_frag = cute.make_rmem_tensor(
+                cute.make_layout(scale_shape, stride=((1, 0, 2), 0, num_v // 2)),
+                mSFB_nkl.element_type,
+            )
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -520,6 +549,15 @@ class GroupedGemmKernelSm90Bf16:
                 producer_group=tma_store_producer_group,
             )
 
+            if cutlass.const_expr(self.ROW_SCALED):
+                # The warpgroup partition holds its base thread's coordinates; add
+                # this lane's row (16 per warp, 1 per 4 lanes) and column (2 per lane).
+                lane = tidx % 32
+                lane_row_base = (
+                    (tidx % self.num_threads_per_warp_group) // 32
+                ) * 16 + (lane // 4)
+                lane_col_base = (lane % 4) * 2
+
             # Rotate epilogue buffers by executed tiles, not global work index.
             num_tiles_executed = cutlass.Int32(0)
 
@@ -546,6 +584,38 @@ class GroupedGemmKernelSm90Bf16:
                         cutlass.Int32(0),
                     )
                 gC_mnl_slice = gC_mnl[(None, None, *mma_tile_coord_mnl)]
+                if cutlass.const_expr(self.ROW_SCALED):
+                    # The scales are K-invariant: load them before the mainloop,
+                    # which hides their latency. Weight scales follow the expert,
+                    # token scales the token slab (0 for flat segments).
+                    row_base = mma_tile_coord_mnl[0] * self.tile_shape_mnk[0]
+                    token_base = mma_tile_coord_mnl[1] * self.tile_shape_mnk[1]
+                    for im in cutlass.range_constexpr(
+                        cute.size(accumulators, mode=[1])
+                    ):
+                        for row in cutlass.range_constexpr(2):
+                            crd = (2 * row, im, 0)
+                            sfa_frag[crd] = mSFA_mkl[
+                                (
+                                    row_base + lane_row_base + tCcC[crd][0],
+                                    work_tile.expert_idx,
+                                )
+                            ]
+                    for in_ in cutlass.range_constexpr(
+                        cute.size(accumulators, mode=[2])
+                    ):
+                        for block in cutlass.range_constexpr(0, num_v, 4):
+                            for token in cutlass.range_constexpr(2):
+                                crd = (block + token, 0, in_)
+                                sfb_frag[crd] = mSFB_nkl[
+                                    (
+                                        token_base + lane_col_base + tCcC[crd][1],
+                                        mma_tile_coord_mnl[2],
+                                    )
+                                ]
+                    # Fetch the next work tile here too, not after the epilogue:
+                    # its schedule-entry load then waits alongside the scale loads.
+                    next_work_tile = tile_sched.advance_to_next_work()
 
                 mainloop_consumer_read_state.reset_count()
                 mainloop_consumer_release_state.reset_count()
@@ -603,6 +673,21 @@ class GroupedGemmKernelSm90Bf16:
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
                     mainloop_consumer_release_state.advance()
 
+                if cutlass.const_expr(self.ROW_SCALED):
+                    # One promotion with the scales loaded at tile start.
+                    # Nested coordinates pair layouts correctly; flat iteration does not.
+                    for v in cutlass.range_constexpr(cute.size(accumulators, mode=[0])):
+                        for im in cutlass.range_constexpr(
+                            cute.size(accumulators, mode=[1])
+                        ):
+                            for in_ in cutlass.range_constexpr(
+                                cute.size(accumulators, mode=[2])
+                            ):
+                                crd = (v, im, in_)
+                                accumulators[crd] = accumulators[crd] * (
+                                    sfa_frag[crd] * sfb_frag[crd]
+                                )
+
                 tCgC_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
                 bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
                     tma_atom_c,
@@ -647,7 +732,10 @@ class GroupedGemmKernelSm90Bf16:
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 num_tiles_executed += cutlass.Int32(1)
-                work_tile = tile_sched.advance_to_next_work()
+                if cutlass.const_expr(self.ROW_SCALED):
+                    work_tile = next_work_tile
+                else:
+                    work_tile = tile_sched.advance_to_next_work()
 
             tma_store_pipeline.producer_tail()
 
