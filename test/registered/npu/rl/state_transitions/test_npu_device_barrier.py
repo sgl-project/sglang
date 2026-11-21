@@ -97,16 +97,23 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 "get_model",
                 lambda: SimpleNamespace(weight_cache_mode="off"),
             ),
-            patch(
-                "torch.distributed.barrier",
-                lambda *args, **kwargs: events.append(("barrier", None)),
+            patch.object(
+                weight_updater_module,
+                "control_request_barrier",
+                lambda: events.append(("barrier", None)),
             ),
             patch(
-                "torch.npu.synchronize",
-                lambda: events.append(("sync", None)),
+                "torch.get_device_module",
+                return_value=SimpleNamespace(
+                    synchronize=lambda: events.append(("sync", None))
+                ),
             ),
-            # release_memory_occupation gates on the TP ranks being idle.
-            patch("torch.distributed.all_reduce", lambda *args, **kwargs: None),
+            # Every rank in the control-request group agrees that it is idle.
+            patch.object(
+                weight_updater_module,
+                "control_request_all_gather_object",
+                lambda idle: [idle],
+            ),
         ):
             manager.release_memory_occupation(SimpleNamespace(tags=["weights"]))
 
@@ -131,9 +138,10 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 "get_model",
                 lambda: SimpleNamespace(weight_cache_mode="off"),
             ),
-            patch(
-                "torch.distributed.barrier",
-                lambda *args, **kwargs: events.append(("barrier", None)),
+            patch.object(
+                weight_updater_module,
+                "control_request_barrier",
+                lambda: events.append(("barrier", None)),
             ),
         ):
             manager.resume_memory_occupation(SimpleNamespace(tags=["weights"]))
