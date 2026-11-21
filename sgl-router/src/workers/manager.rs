@@ -340,13 +340,14 @@ async fn run_manager(
             Some(url) = restore_rx.recv() => {
                 restore_suppressed_url(
                     &url,
+                    control.as_deref(),
                     &mut suppressed_discovery,
                     &registry,
                     &cfg,
                     &kv_index,
                     &introspector,
                     &mut pending,
-                );
+                ).await;
             }
             _ = reconcile.tick() => {
                 pending.retain(|_, registration| !registration.handle.is_finished());
@@ -487,21 +488,30 @@ async fn handle_control_command(
             if let Some(url) = removed_url {
                 restore_suppressed_url(
                     &url,
+                    Some(control),
                     suppressed_discovery,
                     registry,
                     cfg,
                     kv_index,
                     introspector,
                     pending,
-                );
+                )
+                .await;
             }
         }
     }
 }
 
+/// Re-register discovery specs suppressed for `url` once no API worker owns
+/// it. The restore queued by a failed create can be dequeued after the
+/// operator's retry for the same URL was accepted or spawned; registering the
+/// discovery spec then puts one URL under two ids. Await in-flight
+/// registrations for the URL, and keep the spec suppressed while an API record
+/// owns it: a failed retry queues another restore, a live one restores on delete.
 #[allow(clippy::too_many_arguments)]
-fn restore_suppressed_url(
+async fn restore_suppressed_url(
     url: &str,
+    control: Option<&WorkerControlService>,
     suppressed: &mut HashMap<WorkerId, WorkerSpec>,
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
@@ -509,6 +519,23 @@ fn restore_suppressed_url(
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, PendingRegistration>,
 ) {
+    let in_flight: Vec<_> = pending
+        .iter()
+        .filter(|(_, registration)| worker_urls_equal(&registration.url, url))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in in_flight {
+        if let Some(registration) = pending.remove(&id) {
+            let _ = registration.handle.await;
+        }
+    }
+    if control.is_some_and(|control| control.has_managed_url(url)) {
+        tracing::debug!(
+            worker_url = %url,
+            "discovery restore deferred: an API worker still owns this URL",
+        );
+        return;
+    }
     let ids: Vec<_> = suppressed
         .iter()
         .filter(|(_, spec)| worker_urls_equal(&spec.url, url))
