@@ -10,7 +10,10 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+)
 
 TOOL_CALL_BEGIN = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
@@ -40,7 +43,7 @@ class _Spark2_5ToolCall:
 
 
 def _get_param_type(tools: list[Tool], function_name: str, param_name: str) -> str:
-    """Return a parameter's declared JSON Schema type, or ``string``."""
+    """Infer a parameter's JSON Schema type, including nullable schemas."""
     for tool in tools:
         function = getattr(tool, "function", None)
         if function is None or function.name != function_name:
@@ -49,8 +52,11 @@ def _get_param_type(tools: list[Tool], function_name: str, param_name: str) -> s
         if not isinstance(parameters, dict):
             continue
         definition = get_schema_properties(parameters).get(param_name)
-        if isinstance(definition, dict) and isinstance(definition.get("type"), str):
-            return definition["type"]
+        if isinstance(definition, dict):
+            types = definition.get("type")
+            if isinstance(types, list) and "string" in types:
+                return "string"
+            return infer_type_from_json_schema(definition) or "string"
     return "string"
 
 
