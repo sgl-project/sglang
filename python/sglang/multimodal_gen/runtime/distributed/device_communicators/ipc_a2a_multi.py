@@ -472,6 +472,9 @@ class IpcA2AMultiState:
         for peer_dev in peers:
             # kernel-level dereference of peer mappings needs explicit peer access
             cudart.cudaDeviceEnablePeerAccess(peer_dev, 0)
+        # access enabled at worker start (worker_bootstrap) leaves
+        # cudaErrorPeerAccessAlreadyEnabled behind; it is not this call's failure
+        cudart.cudaGetLastError()
         self.ops = load_ipc_a2a_sync()
         self.memops = memops
         # flags[p] is written by peer p; seq[p] counts the calls sent to p

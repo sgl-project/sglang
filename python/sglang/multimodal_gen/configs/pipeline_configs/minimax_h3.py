@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -126,6 +127,18 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             return attention_backend
         attention_backend = self._server_arg_value(attention_backend)
         return AttentionBackendEnum[str(attention_backend).strip().upper()]
+
+    def ulysses_exchange_over_cuda_ipc(self, server_args) -> bool:
+        # dense attention pipelines its exchange over the copy-engine transport;
+        # a sparse backend's plain exchange picks its transport per call
+        from sglang.multimodal_gen.runtime.layers.attention.layer import (
+            PIPELINED_ATTENTION_BACKENDS,
+        )
+
+        return envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS not in (0, 1) and (
+            self.resolve_transformer_attention_backend(server_args)
+            in (None, *PIPELINED_ATTENTION_BACKENDS)
+        )
 
     def uses_subblock_attention(self, server_args) -> bool:
         """Return whether H3 must build SubBlock-only request metadata."""

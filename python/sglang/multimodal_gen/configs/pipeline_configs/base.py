@@ -480,6 +480,11 @@ class PipelineConfig:
 
         return True
 
+    def ulysses_exchange_over_cuda_ipc(self, server_args: Any) -> bool:
+        """Return whether the DiT's Ulysses exchanges run over CUDA IPC between
+        the group's GPUs, so that each worker enables peer access at its start."""
+        return False
+
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
         return False

@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_DMD_SVD_PRECISION: str = "medium"
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_DIFFUSION_REPLICATED_WEIGHT_COPY: bool = True
     SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
@@ -486,6 +487,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # model loading
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
+    ),
+    # a DiT that every rank loads whole reaches the GPUs as one host slice per
+    # rank plus an all-gather; 0 has every rank copy the whole checkpoint
+    "SGLANG_DIFFUSION_REPLICATED_WEIGHT_COPY": _lazy_bool(
+        "SGLANG_DIFFUSION_REPLICATED_WEIGHT_COPY", "true"
     ),
     "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW": _lazy_bool(
         "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"

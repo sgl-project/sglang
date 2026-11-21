@@ -176,7 +176,11 @@ class IpcA2AState:
                 f"no peer-to-peer access between CUDA devices {dev} and {peer_dev}"
             )
         # kernel-level dereference of peer mappings needs explicit peer access
-        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
+        cudart = ctypes.CDLL("libcudart.so")
+        cudart.cudaDeviceEnablePeerAccess(peer_dev, 0)
+        # access enabled at worker start (worker_bootstrap) leaves
+        # cudaErrorPeerAccessAlreadyEnabled behind; it is not this call's failure
+        cudart.cudaGetLastError()
         self.ops = load_ipc_a2a_sync()
         self.flag = ipc_shareable_zeros(1, dtype=torch.int32)
         self.my_seq = torch.zeros(1, dtype=torch.int32, device="cuda")

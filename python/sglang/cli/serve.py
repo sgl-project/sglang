@@ -21,6 +21,10 @@ from sglang.cli.utils import (
     is_registered_native_pipeline,
     try_get_model_path,
 )
+from sglang.multimodal_gen.runtime.utils.process import (
+    defer_full_gc_for_imports,
+    hold_nvml,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.log_utils import suppress_noisy_warnings
 
@@ -108,6 +112,7 @@ def _run_llm(request: ServeRequest) -> None:
     run_server(server_args)
 
 
+@defer_full_gc_for_imports()
 def _detect_diffusion(request: ServeRequest) -> ServeBackendDetection:
     if request.model_path is None:
         return ServeBackendDetection.UNKNOWN
@@ -125,18 +130,22 @@ def _run_diffusion(request: ServeRequest) -> None:
         _print_diffusion_help(request)
         return
 
-    from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
+    hold_nvml()
+    # no full collections while the diffusion runtime imports: they only trace
+    # the growing heap of new modules
+    with defer_full_gc_for_imports():
+        from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 
-    apply_plugin_hooks()
+        apply_plugin_hooks()
 
-    from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
-        add_multimodal_gen_serve_args,
-        execute_serve_cmd,
-    )
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
 
-    parser = argparse.ArgumentParser(description="SGLang Diffusion Model Serving")
-    add_multimodal_gen_serve_args(parser)
-    parsed_args, remaining_argv = parser.parse_known_args(list(request.argv))
+        parser = argparse.ArgumentParser(description="SGLang Diffusion Model Serving")
+        add_multimodal_gen_serve_args(parser)
+        parsed_args, remaining_argv = parser.parse_known_args(list(request.argv))
     if request.model_path_is_positional:
         parsed_args._sglang_explicit_arg_names = {"model_path"}
 
