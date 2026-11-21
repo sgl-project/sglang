@@ -221,6 +221,24 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.architectures, ["NemotronHForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
 
+    def test_gigachat35_omni_mtp_keeps_the_wrapper_quantization(self):
+        """The MTP layers are quantized like the LM, whose config only the wrapper has."""
+        quantization = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+        config = object.__new__(ModelConfig)
+        config.is_draft_model = True
+        config.speculative_algorithm = "EAGLE"
+        config.hf_config = SimpleNamespace(
+            architectures=["GigaChat35OmniForConditionalGeneration"],
+            quantization_config=quantization,
+        )
+        config.hf_text_config = SimpleNamespace(architectures=["GigaChat35ForCausalLM"])
+
+        config._config_draft_model()
+
+        self.assertIs(config.hf_config, config.hf_text_config)
+        self.assertEqual(config.hf_config.architectures, ["GigaChat35ForCausalLMNextN"])
+        self.assertIs(config.hf_config.quantization_config, quantization)
+
     def test_qwen4_exp_spec_hidden_size_keeps_hc_width(self):
         """Qwen4-Exp's MTP draft consumes the hc-flattened target stream,
         so spec_hidden_size must stay hidden_size * hc_mult; hy_v4 collapses first."""

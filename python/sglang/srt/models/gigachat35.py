@@ -570,12 +570,12 @@ class GigaChat35Model(nn.Module):
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.pp_group.is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+            if input_embeds is not None:
+                hidden_states = input_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
@@ -642,17 +642,25 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
-            input_ids, positions, forward_batch, inputs_embeds, pp_proxy_tensors
+            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
         if not self.pp_group.is_last_rank:
             return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        """Returns the token embedding, which multimodal wrappers call directly.
+
+        Returns:
+            The vocabulary embedding of the first pipeline stage.
+        """
+        return self.model.embed_tokens
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
