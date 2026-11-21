@@ -16,6 +16,8 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.qsa_sm90 import PREFILL_HEAD_PROFILES
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -55,6 +57,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_npu, is_sm100_supported, is_sm120
 
@@ -348,6 +351,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
         # started; that layer's _forward_extend_cp joins it.
         self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
+        self._sm90_bf16_prefill = self._supports_sm90_bf16_prefill()
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -846,8 +850,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
             defer_block_expansion=(
-                self._can_defer_block_expansion(forward_batch.forward_mode)
-                and decode_logical_positions is not None
+                (
+                    self._can_defer_block_expansion(forward_batch.forward_mode)
+                    and decode_logical_positions is not None
+                )
+                or self._can_defer_prefill_block_expansion(forward_batch)
             ),
             prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
@@ -1500,6 +1507,38 @@ class QwenSparseAttnBackend(AttentionBackend):
             and (forward_mode.is_decode() or forward_mode.is_target_verify())
         )
 
+    def _supports_sm90_bf16_prefill(self):
+        if (
+            not self._fused_kv_pool_eligible
+            or self._kv_shard_pool is not None
+            or self.qsa_profile is None
+            or self.compress_ratio != 4
+            or self.qsa_profile.block_topk != 512
+            or torch.version.hip is not None
+            or not str(self.device).startswith("cuda")
+        ):
+            return False
+        pool = self.token_to_kv_pool
+        storage = getattr(pool, "full_kv_pool", pool)
+        if storage.dtype != torch.bfloat16 or storage.page_size != 64:
+            return False
+        from sglang.srt.layers.attention.qsa.mqa import HAS_TILELANG
+
+        return HAS_TILELANG and torch.cuda.get_device_capability(self.device) == (9, 0)
+
+    def _can_defer_prefill_block_expansion(self, forward_batch):
+        return (
+            self._sm90_bf16_prefill
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and getattr(forward_batch, "_original_forward_mode", None) is None
+            and not (
+                getattr(forward_batch, "attn_cp_metadata", None) is not None
+                and is_cp_active(forward_batch)
+            )
+            and not is_batch_invariant_mode_enabled()
+            and not get_is_capture_mode()
+        )
+
     def _uses_block_indices(self, indices):
         return (
             self.qsa_profile is not None
@@ -1516,6 +1555,64 @@ class QwenSparseAttnBackend(AttentionBackend):
             indexer.get_seqlens_int32(),
             self.compress_ratio,
             self.qsa_profile.budget,
+        )
+
+    def _try_sm90_bf16_prefill(
+        self, q, blocks, positions, cu_q, max_q, layer, metadata
+    ):
+        if (
+            not self._sm90_bf16_prefill
+            or metadata.is_cuda_graph
+            or get_is_capture_mode()
+            or q.dtype != torch.bfloat16
+            or q.shape[0] == 0
+            or q.shape[2] != 256
+            or positions.numel() != q.shape[0]
+            or max_q <= 0
+            or layer.scaling != 0.0625
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        layer_cache = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+        k_cache, v_cache = layer_cache.key(), layer_cache.value()
+        if (
+            k_cache.ndim != 3
+            or k_cache.shape[-1] != 256
+            or k_cache.shape != v_cache.shape
+            or (q.shape[1], k_cache.shape[1]) not in PREFILL_HEAD_PROFILES
+            or k_cache.shape[0] % 64
+            or k_cache.dtype != q.dtype
+            or v_cache.dtype != q.dtype
+            or not k_cache.is_contiguous()
+            or not v_cache.is_contiguous()
+            or not metadata.token_slot_table.is_contiguous()
+            or not metadata.sequence_lengths.is_contiguous()
+            or any(
+                t.device != q.device
+                for t in (
+                    k_cache,
+                    v_cache,
+                    positions,
+                    metadata.sequence_lengths,
+                    metadata.token_slot_table,
+                )
+            )
+        ):
+            return None
+        from sglang.kernels.ops.attention.qsa_sm90.paged_prefill import (
+            sparse_prefill_blocks,
+        )
+
+        return sparse_prefill_blocks(
+            q.contiguous(),
+            k_cache,
+            v_cache,
+            blocks,
+            positions.contiguous(),
+            metadata.sequence_lengths,
+            cu_q,
+            metadata.token_slot_table,
+            max_q,
         )
 
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
@@ -1648,14 +1745,36 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        cu_seqlens_q = F.pad(
+            forward_batch.extend_seq_lens.to(q.device).cumsum(0, dtype=torch.int32),
+            (1, 0),
+        ).contiguous()
+        if self._uses_block_indices(topk_indices):
+            metadata = self._resolve_metadata(forward_batch)
+            positions = forward_batch.positions.flatten()[:num_valid_rows]
+            if save_kv_cache and sum(extend_lens) == num_valid_rows:
+                output = self._try_sm90_bf16_prefill(
+                    q,
+                    topk_indices,
+                    positions,
+                    cu_seqlens_q,
+                    max(extend_lens, default=0),
+                    layer,
+                    metadata,
+                )
+                if output is not None:
+                    return self._pad_extend_output(output, num_output_rows)
+            topk_indices = expand_qsa_block_indices(
+                topk_indices,
+                positions,
+                metadata.indexer_metadata.get_seqlens_expanded(),
+                self.compress_ratio,
+                self.qsa_profile.budget,
+            )
         sequence_lens = [int(x) for x in forward_batch.seq_lens_cpu]
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-            (1, 0),
-        ).contiguous()
         if not any(prefix_lens):
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),

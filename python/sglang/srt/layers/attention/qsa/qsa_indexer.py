@@ -34,6 +34,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -439,10 +440,15 @@ class QSAIndexer(MultiPlatformOp):
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
-        sequence_lengths_for_rows: torch.Tensor,
+        sequence_lengths_for_rows: Optional[torch.Tensor],
         max_row_keys: Optional[int] = None,
+        *,
+        defer_expansion: bool = False,
     ) -> torch.Tensor:
-        """Top-k token selection for packed prefill rows.
+        """Top-k selection for packed prefill rows.
+
+        Return compressed block IDs when the attention backend defers token
+        expansion. Other callers receive the usual expanded token indices.
 
         ``max_row_keys`` (host int, the longest request's compressed-block count)
         switches scoring to request-relative logits: [rows, max_row_keys] instead
@@ -452,13 +458,15 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
-        output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
-            dtype=torch.int32,
-            device=q.device,
+        if not defer_expansion and sequence_lengths_for_rows is None:
+            raise ValueError("QSA token expansion requires per-query sequence lengths")
+        selection_width = (
+            self.block_topk
+            if defer_expansion
+            else self.token_topk + self.compress_ratio - 1
         )
         if rows == 0:
-            return output
+            return q.new_empty((0, selection_width), dtype=torch.int32)
 
         relative = (
             not _is_npu
@@ -471,6 +479,11 @@ class QSAIndexer(MultiPlatformOp):
             rows,
             max_row_keys if relative else compressed_keys.shape[0],
             q.shape[1],
+        )
+        output = (
+            None
+            if defer_expansion and row_chunk_size == rows
+            else q.new_empty((rows, selection_width), dtype=torch.int32)
         )
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
@@ -512,12 +525,18 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
-            selected = expand_qsa_block_indices(
-                block_indices,
-                query_positions[chunk_slice],
-                sequence_lengths_for_rows[chunk_slice],
-                compress_ratio=self.compress_ratio,
-                token_topk=self.token_topk,
+            if output is None:
+                return block_indices
+            selected = (
+                block_indices
+                if defer_expansion
+                else expand_qsa_block_indices(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
             )
             output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
@@ -776,9 +795,19 @@ class QSAIndexer(MultiPlatformOp):
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
-        query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-        row_sequence_lengths = sequence_lengths.index_select(
-            0, query_sequence_ids.long()
+        # The prefill graph bridge must keep the token-index width on replay.
+        defer_expansion = (
+            q.is_cuda
+            and indexer_metadata.defer_block_expansion
+            and not get_is_capture_mode()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        row_sequence_lengths = (
+            None
+            if defer_expansion
+            else sequence_lengths.index_select(
+                0, indexer_metadata.get_token_to_batch_idx().long()
+            )
         )
         return self.select_prefill_tokens(
             q,
@@ -790,6 +819,7 @@ class QSAIndexer(MultiPlatformOp):
             max_row_keys=indexer_metadata.prefill_max_row_keys(
                 getattr(forward_batch, "seq_lens_cpu", None)
             ),
+            defer_expansion=defer_expansion,
         )
 
     def forward_cuda(
