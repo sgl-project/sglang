@@ -110,6 +110,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     get_plan_stream,
     load_token_map,
+    prune_quantized_lm_head,
     renorm_draft_probs,
     sample_draft_proposal,
     scatter_draft_probs_to_target_vocab,
@@ -171,6 +172,13 @@ def _qsa_index_share_requested(hf_config) -> bool:
             getattr(hf_config, "index_share_for_mtp_iteration", False),
         )
     )
+
+
+def _is_quantized_lm_head(lm_head) -> bool:
+    if lm_head is None:
+        return False
+    weight = lm_head.weight
+    return not weight.dtype.is_floating_point or weight.element_size() == 1
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -431,6 +439,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
 
         else:
+            if (
+                self.hot_token_id is not None
+                and head is not None
+                and _is_quantized_lm_head(target_lm_head)
+            ):
+                # The dense row slice below indexes a transposed quantized weight
+                # on the hidden dim; prune the target module instead.
+                if not hasattr(self.draft_runner.model, "set_lm_head_from_target"):
+                    raise NotImplementedError(
+                        "--speculative-token-map with a quantized lm_head requires "
+                        f"{type(self.draft_runner.model).__name__}.set_lm_head_from_target."
+                    )
+                self.hot_token_id = self.hot_token_id.to(head.device)
+                self.draft_runner.model.set_embed_and_head(embed, None)
+                self.draft_runner.model.set_lm_head_from_target(
+                    prune_quantized_lm_head(
+                        target_lm_head,
+                        hot_token_id=self.hot_token_id,
+                        hidden_size=self.target_worker.model_runner.model_config.hidden_size,
+                    )
+                )
+                return
+
             if self.hot_token_id is not None and head is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
