@@ -8,7 +8,7 @@ import torch_mlu  # noqa: F401 -- registers the MLU device backend
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
+register_mlu_ci(est_time=60, suite="extra-test-1-mlu")
 
 
 class TestRMSNormMLU(CustomTestCase):

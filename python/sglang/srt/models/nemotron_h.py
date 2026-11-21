@@ -17,6 +17,7 @@
 
 """Inference-only NemotronH model."""
 
+import logging
 from collections.abc import Iterable
 from functools import lru_cache, partial
 
@@ -66,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -91,10 +93,12 @@ from sglang.srt.utils import (
     LazyValue,
     get_current_device_stream_fast,
     is_cuda,
+    is_sm100_supported,
     is_sm120,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -310,6 +314,7 @@ class NemotronHMoE(nn.Module):
                 **(
                     dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
                     or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_flashinfer_megamoe()
                     else {}
@@ -847,7 +852,14 @@ class NemotronHModel(nn.Module):
 
     @property
     def supports_hybrid_prefill_graph(self) -> bool:
-        return is_sm120()
+        if is_sm120():
+            return True
+        # Default-on only for SM120; the SM100 family opts in with an explicit
+        # --cuda-graph-backend-prefill breakable.
+        return (
+            is_sm100_supported()
+            and get_exec().graph.cuda_graph_backend_prefill == Backend.BREAKABLE
+        )
 
     def forward(
         self,

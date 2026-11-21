@@ -1,6 +1,6 @@
 ---
 name: kernel-organization
-description: Apply the SGLang kernels RFC when adding, moving, splitting, or reviewing kernel APIs, registry metadata, kernel tests, benchmarks, and model-specific implementations. Use with add-jit-kernel, add-sgl-kernel, and write-sglang-test for placement and migration checks.
+description: Apply the SGLang kernels RFC when adding, moving, splitting, deduplicating, or reviewing kernel APIs, registry metadata, kernel tests, benchmarks, and model-specific implementations, and before optimizing an existing kernel (find the other implementations of its contract first). Use with add-jit-kernel, add-sgl-kernel, and write-sglang-test for placement and migration checks.
 ---
 
 # Kernel organization
@@ -60,6 +60,54 @@ logical grouping and remove the old `_jit_` filename prefix.
   Spark adapters); kernels must not import srt runtime modules to inspect
   model objects, so pass flags in. Adapters there need not pretend to be generic
   interfaces.
+
+## One implementation per contract
+
+A contract is what the op computes: inputs and outputs (dtype, layout, scale
+format) and the result on edge cases (ties, NaN, empty or fully masked rows).
+Implementations of the same contract are duplicates whatever their file,
+language or backend.
+
+Before adding a kernel, or optimizing one, find the others:
+
+- Search by computation, not only by name: the registry
+  (`registry.all_specs()`, see the kernels README), the owning group, inline
+  Triton or torch versions in `srt/layers` and model files, the AOT wheel, and
+  library wrappers (FlashInfer, DeepGEMM, TRT-LLM, CUTLASS).
+- Measure the candidates on the shapes the callers actually dispatch, including
+  CUDA-graph padded sizes, and put each next to its bound
+  ([performance-cuda.md](../add-jit-kernel/performance-cuda.md)).
+
+Then decide:
+
+- **Extend** the existing implementation when only a shape, dtype or flag is
+  missing.
+- **Migrate** when another implementation is already near the bound: move the
+  callers to it, show parity, delete the old kernel. Tuning an old kernel that
+  a better one already beats leaves two implementations to maintain and gains
+  nothing.
+- **Optimize** when none is near the bound: work on the one the others can
+  converge on (the most general contract, the better structure), not the one
+  that happens to be called today.
+- **Replace** when you write a better one: it takes over every case it covers,
+  and the variants it retires leave in the same PR or a tracked follow-up.
+- **Keep more than one** only when one is the only path on some platform,
+  architecture or dtype, or is measurably faster on shapes the dispatcher can
+  tell apart. Register them under one op (one `BaseFusedOp`, or `KernelSpec`s
+  sharing an `op` name) so one dispatcher chooses, and say at the dispatch site
+  why each exists.
+
+Every implementation states its coverage (shapes, dtypes, architectures it
+serves and what it rejects) at its entry point, so the next author can tell
+when it is replaceable. The evidence bar for retiring a variant is in
+[code-cleanup](../code-cleanup/patterns.md) B1 and B3: merging copies of one
+kernel is checked bit for bit, including ties, NaN and fully masked rows;
+moving callers onto a different kernel states its tolerance and shows the new
+path ran; either way with per-shape benchmarks, and the default flipped only
+where faster. When the search finds other implementations of the contract, a
+PR that adds, migrates or optimizes a kernel lists them, the measured time of
+each against the bound, and which one survives; when it finds none, the PR
+says so in one line.
 
 ## Register the public entry point
 
