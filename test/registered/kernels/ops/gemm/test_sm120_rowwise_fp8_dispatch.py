@@ -1,4 +1,4 @@
-"""Dispatch, fallback, and SM120 parity tests for small-M rowwise FP8 linear."""
+"""Dispatch, fallback, fused-op override, and SM120 parity tests for small-M rowwise FP8 linear."""
 
 from __future__ import annotations
 
@@ -9,17 +9,25 @@ from unittest import mock
 import pytest
 import torch
 
+from sglang.kernels import fused_op
+from sglang.kernels.ops import gemm as gemm_ops
+from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.utils import device as device_utils
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+
+_SM120_PLATFORM = PlatformInfo(
+    device_type="cuda", cuda_arch_major=12, cuda_arch_minor=0
+)
 
 
 def _is_live_sm120() -> bool:
     return (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability() == (12, 0)
-        and fp8_utils.get_cuda_version() >= (12, 8)
+        and device_utils.get_cuda_version() >= (12, 8)
     )
 
 
@@ -68,36 +76,36 @@ def test_sm120_torch_fp8_max_n_by_arch_and_cuda(
     expected: int,
 ):
     props = SimpleNamespace(major=major, minor=minor, multi_processor_count=sm_count)
-    fp8_utils._sm120_torch_fp8_max_n.cache_clear()
+    gemm_ops._sm120_torch_fp8_max_n.cache_clear()
     try:
         with (
             mock.patch.object(torch.cuda, "get_device_properties", return_value=props),
-            mock.patch.object(fp8_utils, "get_cuda_version", return_value=cuda_ver),
+            mock.patch.object(device_utils, "get_cuda_version", return_value=cuda_ver),
         ):
-            assert fp8_utils._sm120_torch_fp8_max_n(torch.device("cuda:0")) == expected
+            assert gemm_ops._sm120_torch_fp8_max_n(torch.device("cuda:0")) == expected
     finally:
-        fp8_utils._sm120_torch_fp8_max_n.cache_clear()
+        gemm_ops._sm120_torch_fp8_max_n.cache_clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "m,k,n,dtype,col_major,with_bias,max_n,compiling,tuned_cfg,expected_backend",
     [
-        # Compatible shapes route to torch._scaled_mm.
+        # Compatible shapes route through Fp8ScaledMMOp to torch._scaled_mm.
         (1, 4096, 4096, torch.bfloat16, True, False, 6656, False, None, "torch"),
         (16, 4096, 1536, torch.bfloat16, True, False, 6656, False, None, "torch"),
         (128, 5120, 6656, torch.float16, True, False, 6656, False, None, "torch"),
-        # Shape boundaries fall back to CUTLASS.
-        (129, 4096, 4096, torch.bfloat16, True, False, 6656, False, None, "cutlass"),
-        (16, 3968, 4096, torch.bfloat16, True, False, 6656, False, None, "cutlass"),
-        (16, 4096, 1408, torch.bfloat16, True, False, 6656, False, None, "cutlass"),
-        (16, 4096, 6784, torch.bfloat16, True, False, 6656, False, None, "cutlass"),
+        # Shape boundaries fall back to AOT CUTLASS.
+        (129, 4096, 4096, torch.bfloat16, True, False, 6656, False, None, "aot"),
+        (16, 3968, 4096, torch.bfloat16, True, False, 6656, False, None, "aot"),
+        (16, 4096, 1408, torch.bfloat16, True, False, 6656, False, None, "aot"),
+        (16, 4096, 6784, torch.bfloat16, True, False, 6656, False, None, "aot"),
         # Non-SM120, bias, non-col-major weight, and torch.compile fall back.
-        (16, 4096, 4096, torch.bfloat16, True, False, 0, False, None, "cutlass"),
-        (16, 4096, 4096, torch.bfloat16, True, True, 6656, False, None, "cutlass"),
-        (16, 4096, 4096, torch.bfloat16, False, False, 6656, False, None, "cutlass"),
-        (16, 4096, 4096, torch.bfloat16, True, False, 6656, True, None, "cutlass"),
-        # Tuned Triton configs keep precedence over the PyTorch route.
+        (16, 4096, 4096, torch.bfloat16, True, False, 0, False, None, "aot"),
+        (16, 4096, 4096, torch.bfloat16, True, True, 6656, False, None, "aot"),
+        (16, 4096, 4096, torch.bfloat16, False, False, 6656, False, None, "aot"),
+        (16, 4096, 4096, torch.bfloat16, True, False, 6656, True, None, "aot"),
+        # Tuned Triton configs keep precedence over Fp8ScaledMMOp.
         (
             16,
             4096,
@@ -140,49 +148,120 @@ def test_apply_fp8_linear_sm120_dispatch_and_fallbacks(
         s = torch.ones((inp.shape[0], 1), dtype=torch.float32, device=inp.device)
         return q, s
 
-    def fake_torch_scaled_mm(q, w, *, scale_a, scale_b, out_dtype):
+    def fake_torch_scaled_mm(
+        q, w, *, scale_a, scale_b, out_dtype, bias=None, use_fast_accum=False
+    ):
         called.append("torch")
         assert scale_a.shape == (m, 1)
         assert scale_b.shape == (1, n)
         assert out_dtype == dtype
+        assert bias is None
+        assert use_fast_accum is False
         return torch.zeros((m, n), dtype=out_dtype, device=q.device)
 
-    def fake_cutlass(q, w, sa, sb, *, out_dtype, bias=None):
-        called.append("cutlass")
+    def fake_aot(q, w, sa, sb, out_dtype, bias=None):
+        called.append("aot")
         return torch.zeros((m, n), dtype=out_dtype, device=q.device)
 
     def fake_triton(q, w, sa, sb, out_dtype, bias, **kwargs):
         called.append("triton")
         return torch.zeros((m, n), dtype=out_dtype, device=q.device)
 
-    with (
-        mock.patch.object(fp8_utils, "_is_cuda", True),
-        mock.patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", False),
-        mock.patch.object(fp8_utils, "_sm120_torch_fp8_max_n", return_value=max_n),
-        mock.patch.object(
-            fp8_utils, "get_w8a8_channelwise_fp8_config", return_value=tuned_cfg
-        ),
-        mock.patch.object(
-            fp8_utils, "sglang_per_token_quant_fp8", side_effect=fake_quant
-        ),
-        mock.patch.object(torch.compiler, "is_compiling", return_value=compiling),
-        mock.patch.object(torch, "_scaled_mm", side_effect=fake_torch_scaled_mm),
-        mock.patch.object(
-            fp8_utils, "fp8_scaled_mm", side_effect=fake_cutlass, create=True
-        ),
-        mock.patch.object(fp8_utils, "triton_scaled_mm", side_effect=fake_triton),
-    ):
-        out = fp8_utils.apply_fp8_linear(
-            x,
-            weight,
-            weight_scale,
-            bias=bias,
-            cutlass_fp8_supported=True,
-        )
+    fused_op.clear_fused_op_trace()
+    fused_op.enable_fused_op_trace()
+    try:
+        with (
+            mock.patch.object(fp8_utils, "_is_cuda", True),
+            mock.patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", False),
+            mock.patch.object(gemm_ops, "_platform", return_value=_SM120_PLATFORM),
+            mock.patch.object(fused_op, "_platform", return_value=_SM120_PLATFORM),
+            mock.patch.object(gemm_ops, "_sm120_torch_fp8_max_n", return_value=max_n),
+            mock.patch.object(
+                fp8_utils, "get_w8a8_channelwise_fp8_config", return_value=tuned_cfg
+            ),
+            mock.patch.object(
+                fp8_utils, "sglang_per_token_quant_fp8", side_effect=fake_quant
+            ),
+            mock.patch.object(torch.compiler, "is_compiling", return_value=compiling),
+            mock.patch.object(torch, "_scaled_mm", side_effect=fake_torch_scaled_mm),
+            mock.patch.object(
+                gemm_ops._FP8_SCALED_MM, "forward_aot", side_effect=fake_aot
+            ),
+            mock.patch.object(fp8_utils, "triton_scaled_mm", side_effect=fake_triton),
+        ):
+            out = fp8_utils.apply_fp8_linear(
+                x,
+                weight,
+                weight_scale,
+                bias=bias,
+                cutlass_fp8_supported=True,
+            )
+        records = fused_op.get_fused_op_trace()
+    finally:
+        fused_op.disable_fused_op_trace()
+        fused_op.clear_fused_op_trace()
 
     assert out.shape == (m, n)
     assert out.dtype == dtype
     assert called == [expected_backend]
+    if expected_backend in ("torch", "aot"):
+        assert len(records) == 1
+        assert records[0].op == "gemm.fp8_scaled_mm"
+        assert records[0].backend == expected_backend
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_force_fused_op_backend_aot_overrides_sm120_torch_route():
+    """SGLANG_FORCE_FUSED_OP_BACKEND=aot must force AOT CUTLASS and remain traced."""
+    m, k, n = 16, 17408, 5120
+    x, weight, weight_scale, _ = _make_rowwise_inputs(m, k, n, dtype=torch.bfloat16)
+    qx = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    x_scale = torch.full((m, 1), 0.05, dtype=torch.float32, device="cuda")
+    called: list[str] = []
+
+    def fake_torch_scaled_mm(*args, **kwargs):
+        called.append("torch")
+        return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
+
+    def fake_aot(*args, **kwargs):
+        called.append("aot")
+        return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
+
+    prev_backend = fused_op.get_fused_op_backend()
+    fused_op.clear_fused_op_trace()
+    fused_op.enable_fused_op_trace()
+    fused_op.set_fused_op_backend(KernelBackend.AOT)
+    try:
+        with (
+            mock.patch.object(fp8_utils, "_is_cuda", True),
+            mock.patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", False),
+            mock.patch.object(gemm_ops, "_platform", return_value=_SM120_PLATFORM),
+            mock.patch.object(fused_op, "_platform", return_value=_SM120_PLATFORM),
+            mock.patch.object(gemm_ops, "_sm120_torch_fp8_max_n", return_value=7936),
+            mock.patch.object(
+                fp8_utils, "get_w8a8_channelwise_fp8_config", return_value=None
+            ),
+            mock.patch.object(
+                fp8_utils, "sglang_per_token_quant_fp8", return_value=(qx, x_scale)
+            ),
+            mock.patch.object(torch, "_scaled_mm", side_effect=fake_torch_scaled_mm),
+            mock.patch.object(
+                gemm_ops._FP8_SCALED_MM, "forward_aot", side_effect=fake_aot
+            ),
+        ):
+            fp8_utils.apply_fp8_linear(
+                x, weight, weight_scale, cutlass_fp8_supported=True
+            )
+        records = fused_op.get_fused_op_trace()
+    finally:
+        fused_op.set_fused_op_backend(prev_backend)
+        fused_op.disable_fused_op_trace()
+        fused_op.clear_fused_op_trace()
+
+    assert called == ["aot"]
+    assert len(records) == 1
+    assert records[0].op == "gemm.fp8_scaled_mm"
+    assert records[0].backend == "aot"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -209,8 +288,8 @@ def test_deterministic_and_batch_invariant_modes_fall_back_to_cutlass(
         called.append("torch")
         return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
-    def fake_cutlass(*args, **kwargs):
-        called.append("cutlass")
+    def fake_aot(*args, **kwargs):
+        called.append("aot")
         return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
     fake_exec = SimpleNamespace(
@@ -222,7 +301,9 @@ def test_deterministic_and_batch_invariant_modes_fall_back_to_cutlass(
     with (
         mock.patch.object(fp8_utils, "_is_cuda", True),
         mock.patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", False),
-        mock.patch.object(fp8_utils, "_sm120_torch_fp8_max_n", return_value=6656),
+        mock.patch.object(gemm_ops, "_platform", return_value=_SM120_PLATFORM),
+        mock.patch.object(fused_op, "_platform", return_value=_SM120_PLATFORM),
+        mock.patch.object(gemm_ops, "_sm120_torch_fp8_max_n", return_value=6656),
         mock.patch.object(
             fp8_utils, "get_w8a8_channelwise_fp8_config", return_value=None
         ),
@@ -234,9 +315,7 @@ def test_deterministic_and_batch_invariant_modes_fall_back_to_cutlass(
         ),
         mock.patch.object(runtime_context, "get_exec", return_value=fake_exec),
         mock.patch.object(torch, "_scaled_mm", side_effect=fake_torch_scaled_mm),
-        mock.patch.object(
-            fp8_utils, "fp8_scaled_mm", side_effect=fake_cutlass, create=True
-        ),
+        mock.patch.object(gemm_ops._FP8_SCALED_MM, "forward_aot", side_effect=fake_aot),
     ):
         fp8_utils.apply_fp8_linear(
             x,
@@ -245,7 +324,7 @@ def test_deterministic_and_batch_invariant_modes_fall_back_to_cutlass(
             cutlass_fp8_supported=True,
         )
 
-    assert called == ["cutlass"]
+    assert called == ["aot"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -260,8 +339,8 @@ def test_static_scalar_input_scale_falls_back_to_cutlass():
         called.append("torch")
         return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
-    def fake_cutlass(*args, **kwargs):
-        called.append("cutlass")
+    def fake_aot(*args, **kwargs):
+        called.append("aot")
         return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
     fake_platform = SimpleNamespace(is_sm90=False, is_sm100=False, is_sm120=True)
@@ -269,14 +348,14 @@ def test_static_scalar_input_scale_falls_back_to_cutlass():
         mock.patch.object(fp8_utils, "_is_cuda", True),
         mock.patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", False),
         mock.patch.object(fp8_utils, "get_platform", return_value=fake_platform),
-        mock.patch.object(fp8_utils, "_sm120_torch_fp8_max_n", return_value=6656),
+        mock.patch.object(gemm_ops, "_platform", return_value=_SM120_PLATFORM),
+        mock.patch.object(fused_op, "_platform", return_value=_SM120_PLATFORM),
+        mock.patch.object(gemm_ops, "_sm120_torch_fp8_max_n", return_value=6656),
         mock.patch.object(
             fp8_utils, "get_w8a8_channelwise_fp8_config", return_value=None
         ),
         mock.patch.object(torch, "_scaled_mm", side_effect=fake_torch_scaled_mm),
-        mock.patch.object(
-            fp8_utils, "fp8_scaled_mm", side_effect=fake_cutlass, create=True
-        ),
+        mock.patch.object(gemm_ops._FP8_SCALED_MM, "forward_aot", side_effect=fake_aot),
     ):
         fp8_utils.apply_fp8_linear(
             qx,
@@ -287,7 +366,7 @@ def test_static_scalar_input_scale_falls_back_to_cutlass():
             pre_quant_output_dtype=torch.bfloat16,
         )
 
-    assert called == ["cutlass"]
+    assert called == ["aot"]
 
 
 @pytest.mark.skipif(
@@ -298,7 +377,7 @@ def test_static_scalar_input_scale_falls_back_to_cutlass():
     "m,k,n", [(1, 4096, 4096), (16, 4096, 4096), (128, 5120, 5120)]
 )
 def test_sm120_live_numerics_match_cutlass(m: int, k: int, n: int, dtype: torch.dtype):
-    max_n = fp8_utils._sm120_torch_fp8_max_n(torch.device("cuda:0"))
+    max_n = gemm_ops._sm120_torch_fp8_max_n(torch.device("cuda:0"))
     if n > max_n:
         pytest.skip(f"N={n} exceeds SM120 max_n={max_n} on this GPU")
 
@@ -309,7 +388,7 @@ def test_sm120_live_numerics_match_cutlass(m: int, k: int, n: int, dtype: torch.
         actual = fp8_utils.apply_fp8_linear(
             x, weight, weight_scale, cutlass_fp8_supported=True
         )
-        with mock.patch.object(fp8_utils, "_sm120_torch_fp8_max_n", return_value=0):
+        with mock.patch.object(gemm_ops, "_sm120_torch_fp8_max_n", return_value=0):
             expected = fp8_utils.apply_fp8_linear(
                 x, weight, weight_scale, cutlass_fp8_supported=True
             )
@@ -327,7 +406,7 @@ def test_sm120_live_numerics_match_cutlass(m: int, k: int, n: int, dtype: torch.
 )
 def test_sm120_live_cuda_graph_replay():
     m, k, n = 16, 4096, 4096
-    max_n = fp8_utils._sm120_torch_fp8_max_n(torch.device("cuda:0"))
+    max_n = gemm_ops._sm120_torch_fp8_max_n(torch.device("cuda:0"))
     if n > max_n:
         pytest.skip(f"N={n} exceeds SM120 max_n={max_n} on this GPU")
 

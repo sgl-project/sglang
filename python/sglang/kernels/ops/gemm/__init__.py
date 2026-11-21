@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
@@ -127,6 +128,85 @@ def _prefer_torch_rowwise_fp8(
     return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
 
 
+@lru_cache(maxsize=None)
+def _sm120_torch_fp8_max_n(device: torch.device) -> int:
+    import torch
+
+    from sglang.srt.utils.device import get_cuda_version
+
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (12, 0) or get_cuda_version() < (12, 8):
+        return 0
+    # Limit 128-column CUTLASS tiles to one third of the available SMs.
+    return props.multi_processor_count // 3 * 128
+
+
+def _prefer_sm120_torch_rowwise_fp8(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scales_a: torch.Tensor,
+    scales_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    """Whether Torch's SM120 cuBLASLt kernel wins for this small-M rowwise shape."""
+    import torch
+
+    if (
+        mat_a.device.type != "cuda"
+        or torch.compiler.is_compiling()
+        or not hasattr(torch, "_scaled_mm")
+    ):
+        return False
+    max_n = _sm120_torch_fp8_max_n(mat_a.device)
+    if max_n <= 0:
+        return False
+
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec
+
+    if is_batch_invariant_mode_enabled():
+        return False
+    try:
+        deterministic = get_exec().deterministic
+        if (
+            deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+        ):
+            return False
+    except ValueError:
+        pass
+
+    if (
+        bias is not None
+        or out_dtype not in (torch.bfloat16, torch.float16)
+        or mat_b.device != mat_a.device
+        or mat_a.dtype != torch.float8_e4m3fn
+        or mat_b.dtype != torch.float8_e4m3fn
+        or mat_a.ndim != 2
+        or mat_b.ndim != 2
+        or not mat_a.is_contiguous()
+        or not mat_b.t().is_contiguous()
+    ):
+        return False
+
+    m, k = mat_a.shape
+    n = mat_b.shape[1]
+    return (
+        0 < m <= 128
+        and k >= 4096
+        and 1536 <= n <= max_n
+        and scales_a.dtype == torch.float32
+        and scales_b.dtype == torch.float32
+        and scales_a.device == mat_a.device
+        and scales_b.device == mat_a.device
+        and scales_a.shape == (m, 1)
+        and scales_a.is_contiguous()
+        and scales_b.is_contiguous()
+        and scales_b.numel() == n
+    )
+
+
 class Fp8ScaledMMOp(BaseFusedOp):
     """FP8 GEMM with independent per-row A and per-column B scales."""
 
@@ -144,16 +224,18 @@ class Fp8ScaledMMOp(BaseFusedOp):
         out_dtype: torch.dtype,
         bias: Optional[torch.Tensor] = None,
     ) -> bool:
-        # The torch path is a measured SM90 win for some shapes, not a
+        # The torch path is a measured SM90/SM120 win for some shapes, not a
         # capability limit; elsewhere the AOT kernel always runs.
-        if (
-            backend is KernelBackend.AOT
-            and capabilities_satisfied(_SM90, _platform())
-            and _prefer_torch_rowwise_fp8(
+        if backend is KernelBackend.AOT:
+            plat = _platform()
+            if capabilities_satisfied(_SM90, plat) and _prefer_torch_rowwise_fp8(
                 mat_a, mat_b, scales_a, scales_b, out_dtype, bias
-            )
-        ):
-            return False
+            ):
+                return False
+            if capabilities_satisfied(_SM120, plat) and _prefer_sm120_torch_rowwise_fp8(
+                mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+            ):
+                return False
         return super().backend_eligible(
             backend, mat_a, mat_b, scales_a, scales_b, out_dtype, bias
         )
@@ -172,6 +254,7 @@ class Fp8ScaledMMOp(BaseFusedOp):
         m, n = mat_a.shape[0], mat_b.shape[1]
         scale_a = scales_a.reshape(m, 1) if scales_a.numel() == m else scales_a
         scale_b = scales_b.reshape(1, n) if scales_b.numel() == n else scales_b
+        use_fast_accum = not capabilities_satisfied(_SM120, _platform())
         return torch._scaled_mm(
             mat_a,
             mat_b,
@@ -179,7 +262,7 @@ class Fp8ScaledMMOp(BaseFusedOp):
             scale_b=scale_b,
             out_dtype=out_dtype,
             bias=bias,
-            use_fast_accum=True,
+            use_fast_accum=use_fast_accum,
         )
 
     def forward_aot(
