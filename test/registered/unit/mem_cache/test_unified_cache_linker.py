@@ -1182,7 +1182,9 @@ def test_commit_completed_offloads_batch_fifo_slice():
     }
     cache = _cache_for_wrapper(
         tree_core=_FakeExternalTreeCore(nodes),
-        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: f"lock_{node_id}"),
+        inc_lock_ref=lambda node_id: SimpleNamespace(
+            to_dec_params=lambda: f"lock_{node_id}"
+        ),
         dec_lock_ref=lambda node_id, params: unlocks.append((node_id, params)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
@@ -1195,7 +1197,6 @@ def test_commit_completed_offloads_batch_fifo_slice():
     assert nodes[2].external_cache_stored is False
     assert nodes[3].write_through_pending_id == 3
     assert unlocks == [(1, "lock_1"), (2, "lock_2")]
-
 
 
 def test_split_action_retargets_pending_external_offload():
