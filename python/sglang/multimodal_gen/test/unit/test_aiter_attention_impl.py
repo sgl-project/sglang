@@ -205,5 +205,94 @@ class TestBF16AttentionUnderCompile(unittest.TestCase):
         self.assertEqual(self._compiled_call(gfx1250=False, enable_ck=True), [True])
 
 
+def _packed_qkv_views(rows: int, heads: int):
+    """Q/K/V as strided views of a packed [rows, heads, 3 * D] buffer, the layout
+    the Ulysses head-group exchange hands to the attention backend."""
+    packed = torch.randn(rows, heads, 3 * HEAD_SIZE, dtype=torch.bfloat16)
+    q, k, v = packed.split(HEAD_SIZE, dim=-1)
+    assert not q.is_contiguous() and q.stride(-1) == 1
+    return q, k, v
+
+
+class TestVarlenStridedQKV(unittest.TestCase):
+    """forward_varlen passes strided Q/K/V to aiter instead of copying them."""
+
+    ROWS, HEADS = 24, 4
+
+    def _forward_varlen(self, *, strided_qkv=True, gfx1250=False, enable_ck=True):
+        pytest.importorskip("aiter", reason="AITer is a ROCm-only dependency")
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            aiter as aiter_backend,
+        )
+
+        seen = {}
+
+        def fake_flash_attn_varlen_func(q, k, v, **kwargs):
+            seen["qkv"] = (q, k, v)
+            return q.clone()
+
+        q, k, v = _packed_qkv_views(self.ROWS, self.HEADS)
+        cu_seqlens = torch.tensor([0, self.ROWS], dtype=torch.int32)
+        with (
+            patch.object(aiter_backend, "_AITER_VARLEN_STRIDED_QKV", strided_qkv),
+            patch.object(aiter_backend, "USE_AITER_GFX1250", gfx1250),
+            patch.object(aiter_backend, "_AITER_ENABLE_CK", enable_ck),
+            patch.object(
+                aiter_backend.aiter,
+                "flash_attn_varlen_func",
+                fake_flash_attn_varlen_func,
+            ),
+        ):
+            out = _build(self.HEADS, self.HEADS).forward_varlen(
+                q, k, v, cu_seqlens=cu_seqlens, max_seqlen=self.ROWS
+            )
+        torch.testing.assert_close(out, q)
+        return (q, k, v), seen["qkv"]
+
+    def test_strided_views_are_passed_through_without_a_copy(self):
+        given, seen = self._forward_varlen()
+        for src, got in zip(given, seen):
+            self.assertIs(src, got)
+
+    def test_opt_out_restores_the_contiguous_copies(self):
+        given, seen = self._forward_varlen(strided_qkv=False)
+        for src, got in zip(given, seen):
+            self.assertTrue(got.is_contiguous())
+            self.assertNotEqual(src.data_ptr(), got.data_ptr())
+            torch.testing.assert_close(got, src)
+
+    def test_gfx1250_and_triton_routes_keep_the_copies(self):
+        for kwargs in ({"gfx1250": True}, {"enable_ck": False}):
+            with self.subTest(**kwargs):
+                _, seen = self._forward_varlen(**kwargs)
+                self.assertTrue(all(t.is_contiguous() for t in seen))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a ROCm GPU running aiter"
+)
+@pytest.mark.parametrize("seqlens", [(1032,), (700, 332)])
+def test_varlen_strided_qkv_matches_contiguous_on_gpu(seqlens):
+    # The real aiter kernels must produce the same bytes from the strided views.
+    pytest.importorskip("aiter", reason="AITer is a ROCm-only dependency")
+    heads, total = 8, sum(seqlens)
+    torch.manual_seed(0)
+    packed = torch.randn(
+        total, heads, 3 * HEAD_SIZE, dtype=torch.bfloat16, device="cuda"
+    )
+    q, k, v = packed.split(HEAD_SIZE, dim=-1)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+    )
+    impl = _build(heads, heads)
+
+    def run(*qkv):
+        return impl.forward_varlen(*qkv, cu_seqlens=cu_seqlens, max_seqlen=max(seqlens))
+
+    out_strided = run(q, k, v)
+    out_contiguous = run(q.contiguous(), k.contiguous(), v.contiguous())
+    assert torch.equal(out_strided, out_contiguous)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
