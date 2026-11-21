@@ -80,7 +80,7 @@ class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
         """BUG REGRESSION. Unified used to disable prefill capture outright, so
         the default BREAKABLE graph silently never ran."""
         for backend in (Backend.BREAKABLE,):
-            for attn in (("fa4", "fa4"), ("triton", "triton")):
+            for attn in (("fa4", "fa4"), ("triton", "triton"), ("aiter", "aiter")):
                 with self.subTest(prefill=backend, attn=attn):
                     cg = _run_handler(prefill_backend=backend, attention_backends=attn)
                     self.assertEqual(cg.prefill.backend, backend)
@@ -95,7 +95,11 @@ class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
     def test_full_prefill_is_disabled_on_other_backends(self):
         """Warn and fall back rather than raise: Inkling declares FULL as a
         model default, indistinguishable at this point from a user flag."""
-        for attn in (("triton", "triton"), ("flashinfer", "flashinfer")):
+        for attn in (
+            ("triton", "triton"),
+            ("flashinfer", "flashinfer"),
+            ("aiter", "aiter"),
+        ):
             with self.subTest(attn=attn):
                 cg = _run_handler(prefill_backend=Backend.FULL, attention_backends=attn)
                 self.assertEqual(cg.prefill.backend, Backend.DISABLED)
