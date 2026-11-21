@@ -332,6 +332,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
         manager.encoder_dispatch_ready = {}
+        manager.mm_processor = SimpleNamespace()
         transport = MagicMock()
         manager._dispatch_to_scheduler = MagicMock(
             side_effect=RuntimeError("send failed")
@@ -1099,6 +1100,190 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             },
         )
         self.assertIsNone(req.multimodal_inputs)
+
+
+class TestShmFeatureDispatch(unittest.TestCase):
+    @staticmethod
+    def _tokenized_obj():
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+
+        items = [MultimodalDataItem(modality=Modality.IMAGE, feature=torch.arange(2))]
+        return SimpleNamespace(
+            rid="test-request",
+            mm_inputs=MultimodalProcessorOutput(input_ids=[1], mm_items=items),
+        )
+
+    def test_features_are_wrapped_off_the_event_loop(self):
+        from sglang.srt.managers import tokenizer_manager
+
+        manager = object.__new__(tokenizer_manager.TokenizerManager)
+        wrap_threads = []
+
+        def wrap(obj):
+            wrap_threads.append(threading.get_ident())
+            return obj
+
+        async def send():
+            with patch.object(tokenizer_manager, "wrap_shm_features", wrap):
+                await manager._wrap_shm_features_async(self._tokenized_obj())
+            return threading.get_ident()
+
+        loop_thread = asyncio.run(send())
+
+        self.assertEqual(len(wrap_threads), 1)
+        self.assertNotEqual(wrap_threads[0], loop_thread)
+
+    def test_cancelled_dispatch_discards_wrapped_features(self):
+        from sglang.srt.managers import tokenizer_manager
+
+        manager = object.__new__(tokenizer_manager.TokenizerManager)
+        tokenized_obj = self._tokenized_obj()
+        wrap_started = threading.Event()
+        release_wrap = threading.Event()
+
+        def wrap(obj):
+            wrap_started.set()
+            release_wrap.wait()
+            return obj
+
+        async def cancel_mid_wrap():
+            task = asyncio.create_task(manager._wrap_shm_features_async(tokenized_obj))
+            await asyncio.to_thread(wrap_started.wait)
+            task.cancel()
+            release_wrap.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        discard = MagicMock()
+        with (
+            patch.object(tokenizer_manager, "wrap_shm_features", wrap),
+            patch.object(tokenizer_manager, "discard_shm_features", discard),
+        ):
+            asyncio.run(cancel_mid_wrap())
+
+        discard.assert_called_once_with(tokenized_obj)
+
+    def test_repeated_cancellation_still_discards_wrapped_features(self):
+        """A task cancelled again while it waits for the copy to finish (a client
+        disconnect cancels through the server's cancel scope) must still release
+        the segments the copy produced."""
+        from sglang.srt.managers import tokenizer_manager
+
+        manager = object.__new__(tokenizer_manager.TokenizerManager)
+        tokenized_obj = self._tokenized_obj()
+        wrap_started = threading.Event()
+        release_wrap = threading.Event()
+
+        def wrap(obj):
+            wrap_started.set()
+            release_wrap.wait()
+            return obj
+
+        async def cancel_twice_mid_wrap():
+            task = asyncio.create_task(manager._wrap_shm_features_async(tokenized_obj))
+            await asyncio.to_thread(wrap_started.wait)
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            release_wrap.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            while not discard.called:
+                await asyncio.sleep(0.01)
+
+        discard = MagicMock()
+        with (
+            patch.object(tokenizer_manager, "wrap_shm_features", wrap),
+            patch.object(tokenizer_manager, "discard_shm_features", discard),
+        ):
+            asyncio.run(asyncio.wait_for(cancel_twice_mid_wrap(), timeout=10))
+
+        discard.assert_called_once_with(tokenized_obj)
+
+    @staticmethod
+    def _dispatching_manager(tokenized_obj, state):
+        from sglang.srt.managers import tokenizer_manager
+
+        manager = object.__new__(tokenizer_manager.TokenizerManager)
+        manager.rid_to_state = {tokenized_obj.rid: state}
+        manager.encoder_dispatch_ready = {}
+        manager.cuda_vmm_feature_transport = MagicMock(
+            prepare_for_dispatch_async=AsyncMock(return_value=[])
+        )
+        manager.positional_embeds_transport = MagicMock()
+        manager.canary_info_hook = None
+        manager.mm_processor = SimpleNamespace()
+        manager._dispatch_to_scheduler = MagicMock()
+        return manager
+
+    def test_abort_during_copy_skips_dispatch_and_discards_features(self):
+        """A request aborted while its features copy to shared memory is not
+        dispatched, since the scheduler drops an abort for a rid it has not seen,
+        and the segments the copy produced are released."""
+        from sglang.srt.managers import tokenizer_manager
+
+        tokenized_obj = self._tokenized_obj()
+        tokenized_obj.time_stats = MagicMock()
+        state = SimpleNamespace(abort_sent=False)
+        manager = self._dispatching_manager(tokenized_obj, state)
+
+        def wrap(obj):
+            state.abort_sent = True
+            return obj
+
+        discard = MagicMock()
+        with (
+            patch.object(tokenizer_manager, "wrap_shm_features", wrap),
+            patch.object(tokenizer_manager, "discard_shm_features", discard),
+        ):
+            asyncio.run(manager._send_one_request(tokenized_obj))
+
+        manager._dispatch_to_scheduler.assert_not_called()
+        discard.assert_called_once_with(tokenized_obj)
+
+    def test_cancelled_copy_returns_cuda_ipc_leases(self):
+        """A request cancelled while its features copy to shared memory is never
+        dispatched, so no consumer acknowledges the CUDA IPC leases preprocessing
+        took for it; they must go back to the pool."""
+        from sglang.srt.managers import tokenizer_manager
+
+        tokenized_obj = self._tokenized_obj()
+        tokenized_obj.time_stats = MagicMock()
+        proxy = MagicMock(spec=tokenizer_manager.CudaIpcTensorTransportProxy)
+        tokenized_obj.mm_inputs.mm_items[0].feature = proxy
+        manager = self._dispatching_manager(
+            tokenized_obj, SimpleNamespace(abort_sent=False)
+        )
+        pool = MagicMock()
+        manager.mm_processor = SimpleNamespace(cudaipc_mmfeature_pool=pool)
+        wrap_started = threading.Event()
+        release_wrap = threading.Event()
+
+        def wrap(obj):
+            wrap_started.set()
+            release_wrap.wait()
+            return obj
+
+        async def cancel_mid_copy():
+            task = asyncio.create_task(manager._send_one_request(tokenized_obj))
+            await asyncio.to_thread(wrap_started.wait)
+            task.cancel()
+            release_wrap.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with (
+            patch.object(tokenizer_manager, "wrap_shm_features", wrap),
+            patch.object(tokenizer_manager, "discard_shm_features", MagicMock()),
+        ):
+            asyncio.run(cancel_mid_copy())
+
+        pool.cancel_proxy.assert_called_once_with(proxy)
+        manager._dispatch_to_scheduler.assert_not_called()
 
 
 class TestVmmConsumerCount(unittest.TestCase):
