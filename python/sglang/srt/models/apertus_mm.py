@@ -37,7 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.apertus import ApertusForCausalLM
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
 _DEFAULT_IMAGE_TOKEN_OFFSET = 131272
@@ -102,9 +102,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        # The parent owns the Apertus decoder and receives its nested text
-        # config; the composite config stays available for the two tokenizers.
-        self.mm_config = config
         super().__init__(config.text_config, quant_config=quant_config, prefix=prefix)
 
         self.vision_tower: nn.Module | None = None
@@ -150,7 +147,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM):
                     self.config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             logits_config = copy.copy(self.config)
             logits_config.vocab_size = self._output_vocab_size
