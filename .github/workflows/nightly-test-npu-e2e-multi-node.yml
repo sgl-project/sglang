@@ -188,6 +188,479 @@ jobs:
           echo "dirs=${dirs}" >> "$GITHUB_OUTPUT"
           echo "Container patch dirs: ${dirs}"
 
+      # This payload belongs to the workflow definition, not the checkout under
+      # test. It also works when that checkout is main and runtime code is from
+      # the published image: no PR Python sources or diagnostic downloads.
+      - name: Prepare inline K3 image-code diagnostics
+        id: k3_pin_diagnostics
+        if: inputs.test_case == 'test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py' && inputs.use_image_sglang == 'true'
+        run: |
+          set -euo pipefail
+          patch_dir="container-patches/k3-pin-diagnostics"
+          mkdir -p "${patch_dir}"
+          cat > "${patch_dir}/install.sh" <<'K3_PIN_INSTALL_SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          patch_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          python_bin="${PYTHON_FOR_SGLANG:-python}"
+
+          # The Nightly hook runs before it configures PYTHONPATH. Match its later choice
+          # of checkout versus image code, without importing torch or initializing NPU.
+          if [ "$#" -gt 0 ]; then
+              package_root="$1"
+          elif [ "${SGLANG_USE_IMAGE:-}" = "true" ] || [ "${SGLANG_USE_IMAGE:-}" = "True" ]; then
+              package_root="$("${python_bin}" -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("sglang").origin).parent)')"
+          else
+              package_root="/root/sglang/python/sglang"
+          fi
+
+          "${python_bin}" "${patch_dir}/install.py" --package-root "${package_root}"
+          # Nightly runs this hook before sourcing the SDK. This process only reads
+          # metadata; actual loaded-library identity is captured again on the failure.
+          "${python_bin}" "${package_root}/srt/mem_cache/pool_host/npu_pin_diagnostics.py" --environment
+          K3_PIN_INSTALL_SH
+          cat > "${patch_dir}/install.py" <<'K3_PIN_INSTALL_PY'
+          """Install the reference prints into the package selected by the Nightly pod."""
+
+          import argparse
+          import fcntl
+          import hashlib
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+
+          def _atomic_write(path, content, mode=0o644):
+              descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+              try:
+                  with os.fdopen(descriptor, "wb") as stream:
+                      stream.write(content)
+                      os.fchmod(stream.fileno(), mode)
+                  os.replace(temporary, path)
+              finally:
+                  Path(temporary).unlink(missing_ok=True)
+
+
+          def install(package_root):
+              payload = Path(__file__).resolve().parent
+              target = package_root.resolve() / "srt/mem_cache/pool_host"
+              mamba = target / "mamba.py"
+              helper = target / "npu_pin_diagnostics.py"
+              helper_content = (payload / helper.name).read_bytes()
+              patch = payload / "mamba-pin-diagnostics.patch"
+
+              # The mounted checkout is shared by four pods. Serialize check/apply/write
+              # and publish each file atomically; repeat installs must not append hooks.
+              with (target / ".k3-pin-diagnostics.lock").open("a") as lock:
+                  fcntl.flock(lock, fcntl.LOCK_EX)
+                  original = mamba.read_bytes()
+                  if helper.exists() and helper.read_bytes() != helper_content:
+                      raise RuntimeError(
+                          f"A different diagnostic helper already exists: {helper}"
+                      )
+                  with tempfile.TemporaryDirectory(prefix="k3-pin-patch-") as temporary:
+                      root = Path(temporary)
+                      staged = root / "python/sglang/srt/mem_cache/pool_host/mamba.py"
+                      staged.parent.mkdir(parents=True)
+                      staged.write_bytes(original)
+                      command = ["git", "apply", "--check", str(patch)]
+                      check = subprocess.run(
+                          command, cwd=root, capture_output=True, text=True, check=False
+                      )
+                      if check.returncode == 0:
+                          subprocess.run(["git", "apply", str(patch)], cwd=root, check=True)
+                          updated = staged.read_bytes()
+                          status = "applied"
+                      else:
+                          reverse = subprocess.run(
+                              ["git", "apply", "--reverse", "--check", str(patch)],
+                              cwd=root,
+                              capture_output=True,
+                              text=True,
+                              check=False,
+                          )
+                          if reverse.returncode:
+                              raise RuntimeError(f"Patch does not match {mamba}: {check.stderr}")
+                          updated = original
+                          status = "already applied"
+                  compile(updated, str(mamba), "exec")
+                  compile(helper_content, str(helper), "exec")
+                  if updated != original:
+                      backup = mamba.with_name("mamba.py.k3-pin-original")
+                      if backup.exists():
+                          raise RuntimeError(f"Refusing to replace an existing backup: {backup}")
+                      _atomic_write(backup, original, mamba.stat().st_mode & 0o777)
+                  # Publish the dependency first, so another pod can safely import mamba.
+                  _atomic_write(helper, helper_content)
+                  if updated != original:
+                      _atomic_write(mamba, updated, mamba.stat().st_mode & 0o777)
+                  print(
+                      f"K3_PIN_PATCH {status}: {mamba} "
+                      f"sha256={hashlib.sha256(updated).hexdigest()}",
+                      flush=True,
+                  )
+
+
+          if __name__ == "__main__":
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("--package-root", required=True, type=Path)
+              install(parser.parse_args().package_root)
+          K3_PIN_INSTALL_PY
+          cat > "${patch_dir}/mamba-pin-diagnostics.patch" <<'K3_PIN_MAMBA_PATCH'
+          diff --git a/python/sglang/srt/mem_cache/pool_host/mamba.py b/python/sglang/srt/mem_cache/pool_host/mamba.py
+          index 0418a3cdf9..d14e704c15 100644
+          --- a/python/sglang/srt/mem_cache/pool_host/mamba.py
+          +++ b/python/sglang/srt/mem_cache/pool_host/mamba.py
+          @@ -695,13 +695,25 @@ class MambaPoolHost(HostKVCache):
+                           # NPU: mirror the load path — the dedicated kernel transfers all
+                           # layers at once via a single 2D strided copy
+                           # (device layer-first -> host page-first).
+          -                transfer_mamba_state(
+          -                    device_buf=src_layers,
+          -                    host_buf=dst,
+          -                    device_indices=src_indices,
+          -                    host_indices=dst_indices,
+          -                    direction=TransferDirection.D2H,
+          -                )
+          +                try:
+          +                    transfer_mamba_state(
+          +                        device_buf=src_layers,
+          +                        host_buf=dst,
+          +                        device_indices=src_indices,
+          +                        host_indices=dst_indices,
+          +                        direction=TransferDirection.D2H,
+          +                    )
+          +                except RuntimeError as exc:
+          +                    if "host buffer must use pinned memory" in str(exc):
+          +                        try:
+          +                            from sglang.srt.mem_cache.pool_host.npu_pin_diagnostics import (
+          +                                dump_mamba_pin_failure,
+          +                            )
+          +
+          +                            dump_mamba_pin_failure(dst, src_layers, exc)
+          +                        except Exception:
+          +                            logger.exception("Mamba pinned-memory diagnostics failed")
+          +                    raise
+                       else:
+                           # Per-layer fallback when the dedicated kernel is unavailable.
+                           device_indices = src_indices.to(
+          K3_PIN_MAMBA_PATCH
+          cat > "${patch_dir}/npu_pin_diagnostics.py" <<'K3_PIN_HELPER_PY'
+          """Reference diagnostics for Kimi K3's Nightly NPU HiCache failure.
+
+          The environment CLI uses only the standard library. In particular, it does not
+          initialize torch_npu or prime its process-local compatibility caches.
+          """
+
+          import ast
+          import ctypes
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import socket
+          import sys
+          import time
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+
+
+          def _observe(function):
+              """Keep probe errors as data so they cannot replace the original failure."""
+              try:
+                  return function()
+              except Exception as exc:  # noqa: BLE001
+                  return {"diagnostic_error": f"{type(exc).__name__}: {exc}"}
+
+
+          def _sha256(path):
+              digest = hashlib.sha256()
+              with Path(path).open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+
+          def _version_source(path):
+              values = {}
+              for node in ast.parse(path.read_text()).body:
+                  if isinstance(node, ast.Assign):
+                      for target in node.targets:
+                          if isinstance(target, ast.Name) and target.id in (
+                              "__version__",
+                              "git_version",
+                          ):
+                              values[target.id] = ast.literal_eval(node.value)
+              return values
+
+
+          def collect_environment_metadata():
+              """Collect image/package identity without importing torch or torch_npu."""
+              row = {
+                  "hostname": socket.gethostname(),
+                  "pid": os.getpid(),
+                  "time_ns": time.time_ns(),
+                  "python": sys.executable,
+                  "packages": {},
+                  "library_hashes": {},
+              }
+              for name in ("torch", "torch-npu", "sgl-kernel-npu", "sglang"):
+                  row["packages"][name] = _observe(
+                      lambda name=name: importlib.metadata.version(name)
+                  )
+              for package in ("torch", "torch_npu"):
+
+                  def version_source(package=package):
+                      distribution = importlib.metadata.distribution(package)
+                      return _version_source(
+                          Path(distribution.locate_file(f"{package}/version.py"))
+                      )
+
+                  row[f"{package}_version_source"] = _observe(version_source)
+              for package, relative in (
+                  ("torch-npu", "torch_npu/lib/libtorch_npu.so"),
+                  ("sgl-kernel-npu", "sgl_kernel_npu/lib/libsgl_kernel_npu.so"),
+              ):
+
+                  def library_identity(package=package, relative=relative):
+                      path = Path(
+                          importlib.metadata.distribution(package).locate_file(relative)
+                      ).resolve()
+                      return {"path": str(path), "sha256": _sha256(path)}
+
+                  row["library_hashes"][package] = _observe(library_identity)
+
+              def kernel_wheel():
+                  raw = importlib.metadata.distribution("sgl-kernel-npu").read_text(
+                      "direct_url.json"
+                  )
+                  data = json.loads(raw)
+                  # Keep the build-tagged filename, without URL credentials or signed queries.
+                  return {
+                      "filename": Path(unquote(urlsplit(data["url"]).path)).name,
+                      "archive_info": data.get("archive_info"),
+                  }
+
+              row["kernel_wheel"] = _observe(kernel_wheel)
+              cann = Path(
+                  os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
+              ).resolve()
+              row["cann_version_files"] = {}
+              for path in (
+                  cann / "aarch64-linux/ascend_toolkit_install.info",
+                  cann / "share/info/runtime/version.info",
+                  Path("/usr/local/Ascend/driver/version.info"),
+              ):
+                  row["cann_version_files"][str(path)] = _observe(
+                      lambda path=path: path.read_text()
+                  )
+              for name in ("libascendcl.so", "libruntime.so"):
+                  path = cann / "lib64" / name
+                  row["library_hashes"][name] = _observe(
+                      lambda path=path: {"path": str(path.resolve()), "sha256": _sha256(path)}
+                  )
+              mamba_path = Path(__file__).with_name("mamba.py")
+              row["checkout_mamba_source"] = {
+                  "path": str(mamba_path),
+                  "sha256": _observe(lambda: _sha256(mamba_path)),
+              }
+              return row
+
+
+          def _emit(row, event):
+              row["event"] = event
+              metrics = os.environ.get("METRICS_DATA_FILE")
+              if metrics:
+                  try:
+                      directory = Path(metrics) / "npu_pin_diagnostics"
+                      directory.mkdir(parents=True, exist_ok=True)
+                      output = (
+                          directory
+                          / f"{event}-{row['hostname']}-{row['pid']}-{row['time_ns']}.json"
+                      )
+                      row["artifact_path"] = str(output)
+                      output.write_text(json.dumps(row, indent=2))
+                  except (OSError, TypeError, ValueError) as exc:
+                      row["artifact_error"] = f"{type(exc).__name__}: {exc}"
+              print("NPU_PIN_DIAGNOSTIC " + json.dumps(row), file=sys.stderr, flush=True)
+              return row
+
+
+          def _read_known_branch_cache(library_path):
+              """Read a verified ELF's static cache, without invoking C++ through ctypes."""
+              if (
+                  _sha256(library_path)
+                  != "6557790a35e6cabf6300e91b8eda3944bc30d8ac834fff48161cf72d0c6e6b39"
+              ):
+                  return {"available": False, "reason": "unrecognized torch_npu ELF"}
+              library = ctypes.CDLL(str(library_path))
+              symbol = library._ZN6at_npu6native29CachingHostAllocator_isPinnedEPv
+              address = ctypes.cast(symbol, ctypes.c_void_p).value
+              # Confirm the call site as well as the file hash before reading known offsets.
+              if int.from_bytes(ctypes.string_at(address + 0x34, 4), "little") != 0x9409ABE0:
+                  return {"available": False, "reason": "unexpected function address"}
+              base = address - 0x1706D50
+              guard = ctypes.c_uint64.from_address(base + 0x4E22398).value
+              return {
+                  "available": True,
+                  "guard": guard,
+                  "AclrtPointerGetAttributesExist": (
+                      ctypes.c_bool.from_address(base + 0x4E223A0).value if guard & 1 else None
+                  ),
+              }
+
+
+          def _pointer_attributes(pointer):
+              class Location(ctypes.Structure):
+                  _fields_ = [("id", ctypes.c_uint32), ("type", ctypes.c_int)]
+
+              class Attributes(ctypes.Structure):
+                  _fields_ = [
+                      ("location", Location),
+                      ("page_size", ctypes.c_uint32),
+                      ("reserved", ctypes.c_uint32 * 4),
+                  ]
+
+              library = ctypes.CDLL("libascendcl.so")
+              query = library.aclrtPointerGetAttributes
+              query.argtypes = [ctypes.c_void_p, ctypes.POINTER(Attributes)]
+              query.restype = ctypes.c_int
+              attributes = Attributes()
+              ret = query(pointer, ctypes.byref(attributes))
+              return {
+                  "ret": ret,
+                  "location_type": attributes.location.type if ret == 0 else None,
+                  "location_id": attributes.location.id if ret == 0 else None,
+              }
+
+
+          def dump_mamba_pin_failure(host, device, error):
+              """Observe the original failed buffer; never register or replace it."""
+              import torch
+              import torch_npu
+
+              data_ptr = host.data_ptr()
+              storage_ptr = host.untyped_storage().data_ptr()
+              row = {
+                  "hostname": socket.gethostname(),
+                  "pid": os.getpid(),
+                  "time_ns": time.time_ns(),
+                  "error": str(error),
+                  "npu_python_initialized": torch.npu.is_initialized(),
+                  "host": {
+                      "data_ptr": hex(data_ptr),
+                      "storage_ptr": hex(storage_ptr),
+                      "storage_offset": host.storage_offset(),
+                      "shape": list(host.shape),
+                      "stride": list(host.stride()),
+                      "dtype": str(host.dtype),
+                      "bytes": host.numel() * host.element_size(),
+                      "contiguous": host.is_contiguous(),
+                  },
+                  "device": {
+                      "device": str(device.device),
+                      "shape": list(device.shape),
+                      "stride": list(device.stride()),
+                      "dtype": str(device.dtype),
+                  },
+                  "tls_include": str(torch._C._dispatch_tls_local_include_set()),
+                  "tls_exclude": str(torch._C._dispatch_tls_local_exclude_set()),
+                  "environment": {
+                      key: os.environ.get(key)
+                      for key in (
+                          "ASCEND_VISIBLE_DEVICES",
+                          "ASCEND_RT_VISIBLE_DEVICES",
+                          "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS",
+                          "SGLANG_HICACHE_HOST_MEM_BACKEND",
+                          "SGLANG_NPU_HICACHE_MAMBA_IO",
+                          "PYTORCH_NPU_ALLOC_CONF",
+                      )
+                  },
+              }
+              # Capture the cache before issuing new pinned/version queries. Unknown ELF
+              # builds still produce all other metadata; no offsets are read for them.
+              library_path = Path(torch_npu.__file__).parent / "lib/libtorch_npu.so"
+              row["pinned_branch_cache_before_queries"] = _observe(
+                  lambda: _read_known_branch_cache(library_path)
+              )
+              registry = sys.modules.get(
+                  "sgl_kernel_npu.operators.mem_cache.memfabric.host_memory"
+              )
+              row["matching_registrations"] = []
+              for pointer, length, mapping in getattr(registry, "_G_MAPPINGS", ()):
+                  if (
+                      pointer <= data_ptr < pointer + length
+                      or pointer <= storage_ptr < pointer + length
+                  ):
+                      row["matching_registrations"].append(
+                          {
+                              "base": hex(pointer),
+                              "bytes": length,
+                              "covers_data": pointer <= data_ptr < pointer + length,
+                              "covers_storage": pointer <= storage_ptr < pointer + length,
+                              "kind": getattr(mapping, "kind", None),
+                              "owned": getattr(mapping, "owned", None),
+                          }
+                      )
+              acl_rt = sys.modules.get("acl.rt")
+              if acl_rt is not None:
+                  row["acl_device_before_queries"] = _observe(acl_rt.get_device)
+                  row["acl_context_before_queries"] = _observe(acl_rt.get_context)
+              row["acl_attributes_data"] = _observe(lambda: _pointer_attributes(data_ptr))
+              row["acl_attributes_storage"] = _observe(lambda: _pointer_attributes(storage_ptr))
+              row["python_is_pinned"] = _observe(host.is_pinned)
+              row["aten_is_pinned"] = _observe(lambda: torch.ops.aten.is_pinned.default(host))
+              row["cann_versions_seen_by_torch_npu"] = {
+                  key: _observe(lambda key=key: torch_npu._C._get_cann_version(key))
+                  for key in ("CANN", "DRIVER", "RUNTIME")
+              }
+              row["aten_dispatch"] = _observe(lambda: torch._C._dispatch_dump("aten::is_pinned"))
+              row["mamba_dispatch"] = _observe(
+                  lambda: torch._C._dispatch_dump("npu::transfer_mamba_state")
+              )
+              row["mapped_libraries"] = sorted(
+                  {
+                      line.split()[-1]
+                      for line in Path("/proc/self/maps").read_text().splitlines()
+                      if any(
+                          name in line
+                          for name in (
+                              "libtorch_npu.so",
+                              "libtorch_cpu.so",
+                              "libascendcl.so",
+                              "libruntime.so",
+                              "libsgl_kernel_npu",
+                          )
+                      )
+                  }
+              )
+              row["loaded_library_hashes"] = {
+                  path: _observe(lambda path=path: _sha256(path))
+                  for path in row["mapped_libraries"]
+                  if "libtorch_cpu.so" not in path
+              }
+              mamba = sys.modules.get("sglang.srt.mem_cache.pool_host.mamba")
+              source = getattr(mamba, "__file__", None)
+              row["loaded_mamba_source"] = {
+                  "path": source,
+                  "sha256": _observe(lambda: _sha256(source)),
+              }
+              row["environment_metadata"] = collect_environment_metadata()
+              return _emit(row, "mamba-pin-failure")
+
+
+          if __name__ == "__main__":
+              import argparse
+
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("--environment", action="store_true", required=True)
+              parser.parse_args()
+              _emit(collect_environment_metadata(), "environment")
+          K3_PIN_HELPER_PY
+          echo "dir=${patch_dir}" >> "$GITHUB_OUTPUT"
+
       - name: Prepare code for testing
         timeout-minutes: 15
         run: |
@@ -235,6 +708,7 @@ jobs:
         timeout-minutes: 300
         env:
           CONTAINER_PATCH_DIRS: ${{ steps.container_patches.outputs.dirs }}
+          K3_PIN_PATCH_DIR: ${{ steps.k3_pin_diagnostics.outputs.dir }}
         run: |
           # sglang_source_relative_path is shared-disk path
           # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
@@ -302,6 +776,9 @@ jobs:
             --run-id ${{ github.run_id }}"
 
           container_patches="${CONTAINER_PATCH_DIRS:-}"
+          if [ -n "${K3_PIN_PATCH_DIR:-}" ]; then
+            container_patches="${container_patches:+${container_patches},}${K3_PIN_PATCH_DIR}"
+          fi
           if [ -n "${container_patches}" ]; then
             echo "Container patch dirs: ${container_patches}"
             CMD="${CMD} --container-patches ${container_patches}"
