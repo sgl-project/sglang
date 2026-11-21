@@ -6,7 +6,7 @@ import torch
 from sglang.srt.debug_utils.comparator.aligner.token_aligner.concat_steps import (
     execute_token_aligner_concat_steps,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import apply_dim_names
+from sglang.srt.debug_utils.comparator.dims_spec import apply_dim_names, get_dim_names
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -59,6 +59,8 @@ class TestExecuteConcat:
         # x: 3+5=8 tokens; y: 6 tokens → truncate to 6
         assert result.x.shape == (2, 6, 4)
         assert result.y.shape == (2, 6, 4)
+        assert get_dim_names(result.x) == ("b", "t", "h")
+        assert get_dim_names(result.y) == ("b", "t", "h")
 
     def test_named_dims_no_token_dim_fallback(self) -> None:
         """Named dims without t or s → fallback to dim 0."""

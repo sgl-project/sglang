@@ -133,10 +133,14 @@ def _resolve_dim_or_fallback(tensor: torch.Tensor, name: str) -> int:
 
 def _make_empty(*, tensor_of_step: dict[int, torch.Tensor]) -> torch.Tensor:
     dummy: torch.Tensor = next(iter(tensor_of_step.values()))
+    names = get_dim_names(dummy)
     token_dim: int = _resolve_dim_or_fallback(dummy, TOKEN_DIM_NAME)
     shape: list[int] = list(dummy.shape)
     shape[token_dim] = 0
-    return torch.empty(shape, dtype=dummy.dtype)
+    result: torch.Tensor = torch.empty(shape, dtype=dummy.dtype)
+    if names and names[0] is not None:
+        result = apply_dim_names(result, [n for n in names if n is not None])
+    return result
 
 
 def _extract_and_stack_tokens(
@@ -145,10 +149,14 @@ def _extract_and_stack_tokens(
     locator: TokenLocator,
 ) -> torch.Tensor:
     some_tensor: torch.Tensor = next(iter(tensor_of_step.values()))
+    names = get_dim_names(some_tensor)
     token_dim: int = _resolve_dim_or_fallback(some_tensor, TOKEN_DIM_NAME)
 
     tokens: list[torch.Tensor] = [
         tensor_of_step[s].select(dim=token_dim, index=i)
         for s, i in zip(locator.steps, locator.token_index_in_step)
     ]
-    return torch.stack(tokens, dim=token_dim)
+    result: torch.Tensor = torch.stack(tokens, dim=token_dim)
+    if names and names[0] is not None:
+        result = apply_dim_names(result, [n for n in names if n is not None])
+    return result

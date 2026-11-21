@@ -24,6 +24,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.types import 
 from sglang.srt.debug_utils.comparator.dims_spec import (
     TokenLayout,
     apply_dim_names,
+    get_dim_names,
     without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
@@ -190,6 +191,8 @@ class TestTokenDim:
         # token dim (dim 1) set to 0, other dims preserved -> [3, 0, 8]
         assert aligned.x.shape == (3, 0, 8)
         assert aligned.y.shape == (3, 0, 8)
+        assert get_dim_names(aligned.x) == ("a", "t", "h")
+        assert get_dim_names(aligned.y) == ("a", "t", "h")
 
     def test_high_rank_tensor(self) -> None:
         """tensor shape [2, 3, 5, 4, 8] (a b t c d), token_dim=2 -> stays at dim 2."""
@@ -378,6 +381,8 @@ class TestBSHDExecutor:
 
         assert aligned.x.shape == (3, 8)
         assert aligned.y.shape == (3, 8)
+        assert get_dim_names(aligned.x) == ("t", "h")
+        assert get_dim_names(aligned.y) == ("t", "h")
         assert torch.equal(aligned.x[0], tensor_thd[0])
         assert torch.equal(aligned.y[0], flat_bshd[0])
         assert torch.equal(aligned.y[2], flat_bshd[5])
