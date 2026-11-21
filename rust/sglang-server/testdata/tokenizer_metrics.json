@@ -208,6 +208,17 @@
       "buckets": null
     },
     {
+      "name": "sglang:cached_tokens_host_source_total",
+      "kind": "counter",
+      "documentation": "Number of cached prompt tokens on host by write source (write_back/prefetch).",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "host_source"
+      ],
+      "buckets": null
+    },
+    {
       "name": "sglang:num_requests_total",
       "kind": "counter",
       "documentation": "Number of requests processed.",

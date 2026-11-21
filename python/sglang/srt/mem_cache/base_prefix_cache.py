@@ -364,6 +364,12 @@ class MatchResult(NamedTuple):
                             equal to `last_host_node`.
         host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
                             loaded back to device. Pure-KV cache semantics;
+        host_hit_write_back :   Portion of host_hit_length whose host copy was last
+                            written by a device -> host backup.
+        host_hit_prefetch : Portion of host_hit_length whose host copy was last
+                            written by an L3 storage prefetch.
+                            Only the Python UnifiedTreeCore attributes these;
+                            other cache implementations leave both at 0.
         swa_branching_seqlen: The SWA radix cache branching point, which is the longest
                               page-aligned position that could've been cache hit if there
                               exists an SWA window.
@@ -397,6 +403,11 @@ class MatchResult(NamedTuple):
     # its device pool: by tree slot id inside the tree, by sub-pool name once
     # the cache hands the match out (`with_window_hits_by_sub_pool`).
     window_host_hit_lengths: Mapping[ComponentType | str, int] = MappingProxyType({})
+    # Appended to preserve existing positional MatchResult construction.
+    host_hit_write_back: int = 0
+    host_hit_prefetch: int = 0
+    # Absolute token ranges, in prefix order; None denotes unknown provenance.
+    host_hit_source_ranges: tuple[tuple[int, int, Optional[str]], ...] = ()
 
     def with_window_hits_by_sub_pool(
         self, sub_pool_of_slot: Callable[[ComponentType], str]
@@ -427,6 +438,9 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         window_host_hit_lengths=MappingProxyType({}),
+        host_hit_write_back=0,
+        host_hit_prefetch=0,
+        host_hit_source_ranges=(),
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,

@@ -27,6 +27,7 @@ import sys
 import time
 from array import array
 from collections import defaultdict
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -55,6 +56,13 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+class HostSource(str, Enum):
+    """Origin of the current Full-KV host copy."""
+
+    DEVICE_BACKUP = "device_backup"
+    L3_PREFETCH = "l3_prefetch"
 
 
 class RadixKey:
