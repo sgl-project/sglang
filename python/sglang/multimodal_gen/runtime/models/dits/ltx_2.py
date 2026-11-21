@@ -2357,7 +2357,23 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
             )
         late_layer_start = int(len(self.transformer_blocks) * float(late_layer_ratio))
+        # STG prefix sharing: a guidance pass that differs from another only by
+        # skipping self-attention from block K on runs blocks [0, K) identically,
+        # so one call also returns its block-K inputs and the other resumes from
+        # them instead of recomputing the prefix. Plain tensors in and out keep
+        # both calls capturable as breakable CUDA graphs.
+        stg_capture_block = kwargs.get("ltx2_stg_capture_block")
+        stg_resume_block = kwargs.get("ltx2_stg_resume_block")
+        stg_captured = None
         for block_pos, block in enumerate(self.transformer_blocks):
+            if stg_resume_block is not None:
+                if block_pos < stg_resume_block:
+                    continue
+                if block_pos == stg_resume_block:
+                    hidden_states = kwargs["ltx2_stg_resume_hidden_states"]
+                    audio_hidden_states = kwargs["ltx2_stg_resume_audio_hidden_states"]
+            if stg_capture_block is not None and block_pos == stg_capture_block:
+                stg_captured = (hidden_states.clone(), audio_hidden_states.clone())
             block_idx = getattr(block, "idx", -1)
             video_self_attn_perturbation_mask = None
             audio_self_attn_perturbation_mask = None
@@ -2481,6 +2497,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 # simple reshape for 1D patch
                 audio_hidden_states = audio_hidden_states.permute(0, 2, 1)  # [B, C, T]
 
+        if stg_captured is not None:
+            return hidden_states, audio_hidden_states, stg_captured
         return hidden_states, audio_hidden_states
 
 
