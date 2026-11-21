@@ -30,6 +30,7 @@ import threading
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import psutil
@@ -158,39 +159,36 @@ class ExecutionReporter:
         if self._owner == threading.get_ident():
             self._send("step" if is_step else "stage", name)
 
+    def watch_dispatch(self, dispatch):
+        from sglang.multimodal_gen.runtime.server_warmup import get_first_generation_req
 
-_reporter: ExecutionReporter | None = None
+        @wraps(dispatch)
+        def watched(items, *args):
+            with self.watch(get_first_generation_req(items[0][1])):
+                return dispatch(items, *args)
+
+        return watched
+
+
+execution_reporter: ExecutionReporter | None = None
 
 
 def init_execution_reporter(
     context: zmq.Context, server_args: Any, replica: int
-) -> None:
+) -> ExecutionReporter | None:
     """Replica driver: start reporting executions if the watchdog is on."""
-    global _reporter
+    global execution_reporter
     endpoint = request_watchdog_endpoint(server_args)
-    if endpoint is not None:
-        _reporter = ExecutionReporter(
+    if endpoint is None:
+        execution_reporter = None
+    else:
+        execution_reporter = ExecutionReporter(
             context,
             endpoint,
             parse_request_time_limits(server_args.request_time_limit),
             replica,
         )
-
-
-@contextmanager
-def watch_execution(req: Req | None) -> Iterator[None]:
-    """Scheduler: time the request it dispatches (no-op off the driver)."""
-    if _reporter is None:
-        yield
-        return
-    with _reporter.watch(req):
-        yield
-
-
-def report_region(name: str, is_step: bool) -> None:
-    """Stage profiler: the executing request entered a stage or a step."""
-    if _reporter is not None:
-        _reporter.enter_region(name, is_step)
+    return execution_reporter
 
 
 @dataclass

@@ -17,12 +17,12 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime import request_watchdog
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import get_metrics
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.request_watchdog import report_region
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     CYAN,
     RESET,
@@ -313,7 +313,8 @@ class StageProfiler:
             torch.get_device_module().synchronize()
 
     def __enter__(self):
-        report_region(self.stage_name, self._should_record_as_step())
+        if (reporter := request_watchdog.execution_reporter) is not None:
+            reporter.enter_region(self.stage_name, self._should_record_as_step())
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):

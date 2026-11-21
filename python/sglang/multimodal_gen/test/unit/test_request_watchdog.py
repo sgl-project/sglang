@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.request_watchdog import (
     request_watchdog_endpoint,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 LIMITS = {"t2va": 20.0, "fl2va": 30.0, "ref2va": 120.0}
 
@@ -131,6 +132,37 @@ def test_reporter_times_only_served_requests(tmp_path) -> None:
             with pair.reporter.watch(req):
                 pair.reporter.enter_region("stage", False)
         assert pair.messages() == []
+    finally:
+        pair.close()
+
+
+def test_unwatched_region_skips_step_classification(monkeypatch) -> None:
+    monkeypatch.setattr(request_watchdog, "execution_reporter", None)
+    region = StageProfiler("denoising_step_0", logger=None, metrics=None)
+    monkeypatch.setattr(
+        region, "_should_record_as_step", lambda: pytest.fail("unexpected step lookup")
+    )
+    with region:
+        pass
+
+
+def test_watch_deferred_dispatch_reports_region_and_end(tmp_path, monkeypatch) -> None:
+    pair = _Pair(tmp_path)
+    monkeypatch.setattr(request_watchdog, "execution_reporter", pair.reporter)
+
+    def results():
+        with StageProfiler("denoising_step_0", logger=None, metrics=None):
+            yield "frame"
+
+    try:
+        dispatch = pair.reporter.watch_dispatch(lambda items: results())
+        consume = pair.reporter.watch_dispatch(lambda items, outputs: list(outputs))
+        items = [(None, [_req("r1")])]
+        outputs = dispatch(items)
+        assert consume(items, outputs) == ["frame"]
+        messages = pair.messages()
+        assert [m[1] for m in messages] == ["begin", "end", "begin", "step", "end"]
+        assert messages[3] == [1, "step", "denoising_step_0"]
     finally:
         pair.close()
 
