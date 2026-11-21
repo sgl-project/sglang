@@ -134,6 +134,7 @@ from sglang.srt.utils.device import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -2389,6 +2390,16 @@ class KVCacheConfigurator:
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
         from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
+        # NPU mirror of the GPU DSA cache layer split: under prefill CP, swap
+        # in an owned-layers-only pool with owner-broadcast reads.
+        dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = None, 1
+        if is_dsa_model and not self.is_draft_worker:
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = (
+                get_glm_dsa_cp_layer_shard_info(self)
+            )
+
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
         if self.is_draft_worker:
@@ -2433,7 +2444,17 @@ class KVCacheConfigurator:
                     ]
                 ),
             }
-        token_to_kv_pool = NPUMLATokenToKVPool(
+        pool_cls = NPUMLATokenToKVPool
+        pool_kwargs = {}
+        if dsa_cp_layer_shard_rank is not None:
+            from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                LayerSplitNPUMLATokenToKVPool,
+            )
+
+            pool_cls = LayerSplitNPUMLATokenToKVPool
+            pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+            pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+        token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
@@ -2462,6 +2483,7 @@ class KVCacheConfigurator:
             use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
             **dsa_pool_kwargs,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 
@@ -3000,6 +3022,15 @@ class KVCacheConfigurator:
                 )
 
                 return NPUMLATokenToKVPool
+            if _is_npu:
+                # The in-tree DSA leaf stores fp8+scale index keys in a uint8
+                # facade sized for 64-token pages; the Ascend indexer kernels
+                # need the NPU DSA buffer layout instead.
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUDSATokenToKVPool,
+                )
+
+                return NPUDSATokenToKVPool
             return dsa_pool_class
         if _is_npu:
             self._reject_registered_kv_cache_dtype(pool="the NPU KV pool")
@@ -3482,10 +3513,16 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
+        # Foundry LOAD reuses the pool config SAVE resolved;
+        # the free-memory profile the pool sizes come from differs between the two.
+        replayed = get_foundry_adapter().replay_saved_memory_pool_config()
+        if replayed is not None:
+            return replayed
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
         if get_memory().enable_unified_memory and not self.is_draft_worker:
             config.mem_fraction_static = get_schedule().mem_fraction_static
+            get_foundry_adapter().record_memory_pool_config(config)
             return config
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
@@ -3493,6 +3530,8 @@ class KVCacheConfigurator:
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
+        # Foundry SAVE records the resolved config for LOAD.
+        get_foundry_adapter().record_memory_pool_config(config)
         return config
 
     def config_from_budget(
