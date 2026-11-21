@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
     dp_slot_in,
     set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
+    supports_dspark_moe_padding,
     world_dp_gather_enabled,
 )
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
@@ -641,6 +642,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # Phase-scaled counts before MAX_LEN/graph padding; separate collective metadata.
+    moe_dp_valid_counts: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -930,6 +933,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int64,
                 pin_memory=pin_memory,
             ).to(device, non_blocking=True)
+        # Preserve true row counts before collective padding rewrites them.
+        if (
+            not is_draft_worker
+            and (self.forward_mode.is_target_verify() or self.forward_mode.is_idle())
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_dspark()
+            and self.ragged_verify_layout is None
+            and self.spec_info is not None
+            and supports_dspark_moe_padding(
+                get_parallel(), self.spec_info.num_tokens_per_req
+            )
+        ):
+            self.moe_dp_valid_counts = self.global_num_tokens_gpu.clone()
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
