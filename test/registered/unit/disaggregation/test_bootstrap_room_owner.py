@@ -162,40 +162,41 @@ class TestBootstrapRoomOwner(CustomTestCase):
                 self.assertEqual(manager.request_status[ROOM], KVPoll.WaitingForInput)
 
     def test_second_prefill_on_a_held_room_fails_alone(self):
-        """A prefill request on a room that another live request holds fails
-        and leaves the holder's destination and status untouched."""
+        """A second prefill sender on a held room fails, also with the same
+        inputs, and leaves the holder's destination and status untouched."""
         for manager_type in BACKENDS:
-            with self.subTest(backend=manager_type.__name__):
-                manager = _prefill_manager(manager_type)
-                owner = _sender(manager, FP_A)
-                _run_bootstrap_loop(manager, _metadata(manager_type, A_ENDPOINT, FP_A))
+            for other_fp in (FP_B, FP_A):
+                with self.subTest(backend=manager_type.__name__, other=other_fp):
+                    manager = _prefill_manager(manager_type)
+                    owner = _sender(manager, FP_A)
+                    _run_bootstrap_loop(
+                        manager, _metadata(manager_type, A_ENDPOINT, FP_A)
+                    )
 
-                other = _sender(manager, FP_B)
-                self.assertEqual(other.poll(), KVPoll.Failed)
-                with self.assertRaisesRegex(KVTransferError, "in use by another"):
-                    other.failure_exception()
-                other.abort()
-                other.clear()
-                self.assertIn(ROOM, manager.transfer_infos)
-                self.assertEqual(owner.poll(), KVPoll.WaitingForInput)
+                    other = _sender(manager, other_fp)
+                    self.assertEqual(other.poll(), KVPoll.Failed)
+                    with self.assertRaisesRegex(KVTransferError, "in use by another"):
+                        other.failure_exception()
+                    other.abort()
+                    other.clear()
+                    self.assertIn(ROOM, manager.transfer_infos)
+                    self.assertEqual(owner.poll(), KVPoll.WaitingForInput)
 
-                owner.clear()
-                self.assertEqual(manager.room_owners, {})
+                    owner.clear()
+                    self.assertEqual(manager.room_owners, {})
 
-    def test_room_stays_held_until_every_sender_is_cleared(self):
-        """The samples of a parallel-sampling request reuse one room, and an
-        aborted sender keeps it until clear() drops the room's state; another
-        request cannot take the room before then."""
+    def test_aborted_sender_keeps_its_room_until_cleared(self):
+        """clear() drops the room's state, so an aborted sender holds the room
+        until then and no other request can take it."""
         manager_type = nixl_conn.NixlKVManager
         manager = _prefill_manager(manager_type)
-        first, second = _sender(manager, FP_A), _sender(manager, FP_A)
-        first.clear()
-        second.abort()
+        owner = _sender(manager, FP_A)
+        owner.abort()
         self.assertEqual(_sender(manager, FP_B).poll(), KVPoll.Failed)
         _run_bootstrap_loop(manager, _metadata(manager_type, B_ENDPOINT, FP_B))
         self.assertEqual(self._rejected_targets(manager), [B_ENDPOINT])
 
-        second.clear()
+        owner.clear()
         self.assertEqual(_sender(manager, FP_B).poll(), KVPoll.Bootstrapping)
 
     def test_unverifiable_metadata_keeps_the_old_behavior(self):

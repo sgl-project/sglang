@@ -193,11 +193,6 @@ class AckTarget(NamedTuple):
     generation: int
 
 
-class RoomClaim(NamedTuple):
-    prompt_fingerprint: str
-    senders: int
-
-
 def room_in_use_reason(bootstrap_room: int) -> str:
     return f"bootstrap_room {bootstrap_room} is in use by another request"
 
@@ -523,8 +518,8 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
-            # The live prefill request that owns each room.
-            self.room_owners: Dict[int, RoomClaim] = {}
+            # The prompt fingerprint of the live prefill sender owning each room.
+            self.room_owners: Dict[int, str] = {}
             # Serializes filing decode destinations with a sender claiming the room.
             self._room_owner_lock = threading.Lock()
             self.decode_kv_args_table = {}
@@ -928,7 +923,7 @@ class CommonKVManager(BaseKVManager):
         if prompt_fingerprint is None:
             return False
         owner = self.room_owners.get(bootstrap_room)
-        return owner is not None and owner.prompt_fingerprint != prompt_fingerprint
+        return owner is not None and owner != prompt_fingerprint
 
     def _is_foreign_abort(self, notification: AbortNotification) -> bool:
         return self._is_foreign_to_room(
@@ -939,21 +934,15 @@ class CommonKVManager(BaseKVManager):
     def claim_bootstrap_room(
         self, *, bootstrap_room: int, prompt_fingerprint: Optional[str]
     ) -> bool:
-        """Bind the room to a prefill request; False if another request holds it.
-        The first claim drops destinations another request filed before it."""
+        """Bind the room to one prefill sender; False while another live sender
+        holds it, even one with the same fingerprint. The claim drops
+        destinations another request filed before it."""
         if prompt_fingerprint is None or not self.verifies_bootstrap_room_owner:
             return True
         with self._room_owner_lock:
-            owner = self.room_owners.get(bootstrap_room)
-            if owner is not None:
-                if owner.prompt_fingerprint != prompt_fingerprint:
-                    return False
-                # The samples of a parallel-sampling request reuse its room.
-                self.room_owners[bootstrap_room] = owner._replace(
-                    senders=owner.senders + 1
-                )
-                return True
-            self.room_owners[bootstrap_room] = RoomClaim(prompt_fingerprint, 1)
+            if bootstrap_room in self.room_owners:
+                return False
+            self.room_owners[bootstrap_room] = prompt_fingerprint
             infos = self.transfer_infos.get(bootstrap_room, {})
             foreign_peers = [
                 peer
@@ -985,15 +974,7 @@ class CommonKVManager(BaseKVManager):
         if prompt_fingerprint is None or not self.verifies_bootstrap_room_owner:
             return
         with self._room_owner_lock:
-            owner = self.room_owners.get(bootstrap_room)
-            if owner is None or owner.prompt_fingerprint != prompt_fingerprint:
-                return
-            if owner.senders > 1:
-                self.room_owners[bootstrap_room] = owner._replace(
-                    senders=owner.senders - 1
-                )
-            else:
-                del self.room_owners[bootstrap_room]
+            self.room_owners.pop(bootstrap_room, None)
 
     def _add_transfer_info(self, *, bootstrap_room: int, peer: str, info) -> None:
         with self._room_owner_lock:
