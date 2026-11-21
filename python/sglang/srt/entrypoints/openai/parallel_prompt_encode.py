@@ -41,7 +41,9 @@ import re
 import threading
 import time
 import weakref
+from array import array
 from collections import OrderedDict
+from contextlib import nullcontext
 from itertools import chain
 
 from sglang.srt.environ import envs
@@ -54,7 +56,8 @@ _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
 # Per tokenizer; a text longer than the entry limit is encoded but not kept.
-_SEGMENT_CACHE_MAX_TOKENS = 1 << 20
+# Token ids are kept as uint32 arrays (4 B each): 8M tokens is 32 MB per tokenizer.
+_SEGMENT_CACHE_MAX_TOKENS = 1 << 23
 _SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
 
 # Pre-tokenizers that act on each piece independently of its position in the
@@ -334,6 +337,7 @@ class _SegmentEncoder:
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
         self.cuts = {}
         self.lock = threading.Lock()
+        self.encode_lock = threading.Lock()
         self.cache = OrderedDict()
         self.cached_tokens = 0
 
@@ -362,17 +366,22 @@ class _SegmentEncoder:
         if run:
             layout.append("".join(run))
 
-        texts = [item for item in layout if isinstance(item, str)]
         known = {}
-        with self.lock:
-            for text in texts:
-                ids = self.cache.get(text)
-                if ids is not None:
-                    self.cache.move_to_end(text)
-                    known[text] = ids
-        missing = list(dict.fromkeys(text for text in texts if text not in known))
+        missing = self._cached(
+            [item for item in layout if isinstance(item, str)], known
+        )
         if missing:
-            known.update(self._encode(missing))
+            long = (
+                max(map(len, missing))
+                >= envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+            )
+            # One long encode at a time: concurrent requests sharing a long
+            # history wait and then hit the cache instead of encoding it again.
+            with self.encode_lock if long else nullcontext():
+                if long:
+                    missing = self._cached(missing, known)
+                if missing:
+                    known.update(self._encode(missing))
 
         ids = []
         for item in layout:
@@ -381,6 +390,16 @@ class _SegmentEncoder:
             else:
                 ids.append(item)
         return ids
+
+    def _cached(self, texts, known):
+        """Copy the cached ids of `texts` into `known`; return the rest, once each."""
+        with self.lock:
+            for text in texts:
+                ids = self.cache.get(text)
+                if ids is not None:
+                    self.cache.move_to_end(text)
+                    known[text] = ids
+        return [text for text in dict.fromkeys(texts) if text not in known]
 
     def _encode(self, texts):
         min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
@@ -396,8 +415,9 @@ class _SegmentEncoder:
         encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
-            encoded[text] = tuple(
-                chain.from_iterable(e.ids for e in encodings[start : start + count])
+            encoded[text] = array(
+                "I",
+                chain.from_iterable(e.ids for e in encodings[start : start + count]),
             )
             start += count
 
@@ -445,3 +465,59 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
     ):
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments)
+
+
+# Per tokenizer: prompts checked against a whole encode, or False after a mismatch.
+_rendered_prompt_checks = weakref.WeakKeyDictionary()
+_RENDERED_PROMPT_CHECKS = 2
+
+
+def _rendered_checks(tokenizer):
+    try:
+        return _rendered_prompt_checks.get(tokenizer, 0)
+    except TypeError:
+        return 0
+
+
+def _set_rendered_checks(tokenizer, value):
+    try:
+        _rendered_prompt_checks[tokenizer] = value
+    except TypeError:
+        pass
+
+
+def encode_rendered_prompt(tokenizer, text, encode_kwargs=None):
+    """Encode a rendered chat prompt, splitting it at added (special) tokens so
+    the text between them goes through the segment cache; earlier turns of a
+    conversation are then encoded once. The first prompts per tokenizer are
+    checked against a whole encode, and a mismatch disables the split."""
+    encode_kwargs = encode_kwargs or {}
+    plan = None
+    if (
+        envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
+        and isinstance(text, str)
+        and len(text) >= envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        and _rendered_checks(tokenizer) is not False
+    ):
+        plan = _plan_for(tokenizer)
+    if plan is None or plan[2] is None:
+        return parallel_prompt_encode(tokenizer, text, encode_kwargs)
+    segments, pos = [], 0
+    for m in plan[2].finditer(text):
+        segments.append(text[pos : m.start()])
+        segments.append(m.group())
+        pos = m.end()
+    segments.append(text[pos:])
+    ids = encode_prompt_segments(tokenizer, segments, encode_kwargs)
+    checks = _rendered_checks(tokenizer)
+    if checks is not False and checks < _RENDERED_PROMPT_CHECKS:
+        expected = tokenizer.encode(text, **encode_kwargs)
+        if list(ids) != list(expected):
+            logger.error(
+                "encode_rendered_prompt: segment-cached ids differ from a whole encode for %s; using the whole encode from now on.",
+                type(tokenizer).__name__,
+            )
+            _set_rendered_checks(tokenizer, False)
+            return expected
+        _set_rendered_checks(tokenizer, checks + 1)
+    return ids

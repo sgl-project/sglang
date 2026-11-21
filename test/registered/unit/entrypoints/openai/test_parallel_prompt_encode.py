@@ -18,6 +18,8 @@ comparisons do not depend on it.
 
 import random
 import sys
+import threading
+import time
 import unittest
 import unittest.mock
 import weakref
@@ -746,6 +748,131 @@ class TestPromptSegments(_EncodeCase):
         self.assertLessEqual(encoder.cached_tokens, 40)
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
         self.assertNotIn("hello world " * 30, encoder.cache)
+
+
+class TestRenderedPrompt(_EncodeCase):
+    """`encode_rendered_prompt` cuts a rendered chat prompt at its added tokens
+    and sends the text between them through the segment cache."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("_segment_encoders", "_rendered_prompt_checks"):
+            self.addCleanup(setattr, ppe, name, getattr(ppe, name))
+            setattr(ppe, name, weakref.WeakKeyDictionary())
+        self.tokenizer = _tokenizer()
+        self._no_min_chars()
+
+    def _assert_rendered_matches(self, text, kwargs_variants=_ALL_KWARGS):
+        for encode_kwargs in kwargs_variants:
+            for _ in range(2):  # the second call reads the cache
+                self.assertEqual(
+                    list(
+                        ppe.encode_rendered_prompt(self.tokenizer, text, encode_kwargs)
+                    ),
+                    self.tokenizer.encode(text, **encode_kwargs),
+                    f"{encode_kwargs} on {text[:60]!r}",
+                )
+
+    def test_ids_equal_one_encode_of_the_prompt(self):
+        for text in _EDGE_TEXTS + ["".join(s) for s in _fuzz_segments()]:
+            self._assert_rendered_matches(text)
+        self.assertIsNot(ppe._rendered_checks(self.tokenizer), False)
+
+    def test_earlier_turns_are_encoded_once(self):
+        history = "hello world " * 40
+        first = f"<|user|>{history}<|assistant|><think>plan</think>answer"
+        second = f"{first}<|user|>next question<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            self._assert_rendered_matches(first, ({},))
+            self._assert_rendered_matches(second, ({},))
+        encoded = [text for call in encode.call_args_list for text in call.args[1]]
+        self.assertEqual(len(encoded), len(set(encoded)), encoded)
+        self.assertIn(history, encoded)
+        self.assertIn("next question", encoded)
+
+    def test_only_the_first_prompts_are_checked_against_a_whole_encode(self):
+        # The plan refuses a tokenizer whose encode is patched: build it first.
+        self.assertIsNotNone(ppe._plan_for(self.tokenizer)[2])
+        with unittest.mock.patch.object(
+            self.tokenizer, "encode", wraps=self.tokenizer.encode
+        ) as whole:
+            for i in range(2 * ppe._RENDERED_PROMPT_CHECKS):
+                ppe.encode_rendered_prompt(self.tokenizer, f"<|user|>turn {i}")
+        self.assertEqual(whole.call_count, ppe._RENDERED_PROMPT_CHECKS)
+
+    def test_a_mismatch_switches_the_tokenizer_to_the_whole_encode(self):
+        text = "<|user|>hello world<|assistant|>"
+        expected = self.tokenizer.encode(text)
+        with (
+            unittest.mock.patch.object(ppe, "encode_prompt_segments", return_value=[0]),
+            self.assertLogs(ppe.logger, "ERROR"),
+        ):
+            self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
+        self.assertIs(ppe._rendered_checks(self.tokenizer), False)
+        with unittest.mock.patch.object(
+            ppe, "encode_prompt_segments", side_effect=AssertionError("split taken")
+        ):
+            self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
+
+    def test_gates_use_parallel_prompt_encode(self):
+        text = "<|user|>" + "hello world " * 50 + "<|assistant|>"
+        cases = {"no plan": (_tokenizer(_metaspace), 0, True)}
+        cases["below the char threshold"] = (self.tokenizer, len(text) + 1, True)
+        cases["env switch off"] = (self.tokenizer, 0, False)
+        for name, (tokenizer, min_chars, enabled) in cases.items():
+            with (
+                self.subTest(name),
+                envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(min_chars),
+                envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(enabled),
+                unittest.mock.patch.object(
+                    ppe, "encode_prompt_segments", side_effect=AssertionError("split")
+                ),
+                unittest.mock.patch.object(
+                    ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+                ) as fallback,
+            ):
+                ids = ppe.encode_rendered_prompt(tokenizer, text)
+                fallback.assert_called_once()
+                self.assertEqual(ids, tokenizer.encode(text))
+
+    def test_concurrent_requests_encode_a_shared_history_once(self):
+        self._set_min_chars(64)
+        text = "<|user|>" + "hello world " * 50 + "<|assistant|>"
+        started, release = threading.Event(), threading.Event()
+        encode = ppe._SegmentEncoder._encode
+
+        def slow_encode(encoder, texts):
+            started.set()
+            release.wait(10)
+            return encode(encoder, texts)
+
+        results = []
+        threads = [
+            threading.Thread(
+                target=lambda: results.append(
+                    list(ppe.encode_rendered_prompt(self.tokenizer, text))
+                )
+            )
+            for _ in range(4)
+        ]
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder, "_encode", autospec=True, side_effect=slow_encode
+        ) as patched:
+            threads[0].start()
+            self.assertTrue(started.wait(10))
+            for thread in threads[1:]:
+                thread.start()
+            time.sleep(0.2)  # the others reach the encode lock
+            release.set()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(patched.call_count, 1)
+        self.assertEqual(results, [self.tokenizer.encode(text)] * 4)
 
 
 if __name__ == "__main__":

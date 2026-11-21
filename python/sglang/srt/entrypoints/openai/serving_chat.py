@@ -54,7 +54,7 @@ from sglang.srt.entrypoints.openai import (
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
-    parallel_prompt_encode,
+    encode_rendered_prompt,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -2279,7 +2279,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                prompt_ids = parallel_prompt_encode(
+                prompt_ids = encode_rendered_prompt(
                     self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
                 )
         decoded_prompt = (
