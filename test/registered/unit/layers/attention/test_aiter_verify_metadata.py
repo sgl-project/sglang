@@ -150,7 +150,7 @@ def _cprr_kernel_heads(*, gathered_heads, q_len):
 
 
 class _ShapeSupport:
-    """aiter's get_mla_decode_shape_support, answering from a fixed verdict table."""
+    # aiter's get_mla_decode_shape_support, answering from a fixed verdict table.
 
     def __init__(self, native_shapes, supported=True, arch="gfx950", reasons=()):
         self.native_shapes, self.supported, self.calls = native_shapes, supported, []
@@ -336,13 +336,22 @@ class TestAiterCprrKernelHeads(CustomTestCase):
                 self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 96)
                 self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
 
-    def test_unconfirmed_kernel_off_gfx950_is_not_native(self):
-        # The copied table describes gfx950 kernels only.
-        unknown = _ShapeSupport(
-            {(96, 6), (96, 8), (128, 6), (128, 8)}, supported=None, arch="gfx1250"
-        )
+    def test_unconfirmed_kernel_off_gfx950_keeps_the_table_verdict(self):
+        # Off gfx950 aiter's None leaves the dispatch as it was: the table decides,
+        # so gfx1250 is not sent to a Gluon fallback that asserts gfx950.
+        unknown = _ShapeSupport({(128, 6), (128, 8)}, supported=None, arch="gfx1250")
         with patch.object(aiter_backend, "get_mla_decode_shape_support", unknown):
-            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 0)
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=6), 96)
+            self.assertEqual(_cprr_kernel_heads(gathered_heads=96, q_len=8), 128)
+
+    def test_persist_disabled_by_the_operator_does_not_ask_aiter(self):
+        # SGLANG_AITER_MLA_PERSIST=0 keeps the verify on Gluon; the query (which can
+        # need aiter's planner extension) must not run.
+        support = self._query(_ShapeSupport({(96, 8)}))
+        with patch.object(aiter_backend, "_mla_persist_requested", False):
+            backend = _dcp_backend(num_draft_tokens=8)
+        self.assertFalse(backend._cprr_ask_aiter)
+        self.assertEqual(support.calls, [])
 
     def test_table_never_overrides_a_fold(self):
         # The table says 96 heads are native at q_len 6, but aiter's planner folds

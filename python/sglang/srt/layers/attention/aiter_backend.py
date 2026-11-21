@@ -191,6 +191,8 @@ logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
+# The operator's request; _use_mla_ps_kernel is later cleared by capability checks.
+_mla_persist_requested = _use_mla_ps_kernel
 
 
 # Use fp8 prefill only on gfx95
@@ -275,14 +277,17 @@ def _asm_cprr_shape_verdict(
             f"seqlen_fold {support.seqlen_fold})",
         )
     supported = support.supported
-    # None: aiter cannot confirm a kernel (a failed asm query, or a backend it has
-    # no table for). The copied table vouches for gfx950 only.
     if supported is None:
-        supported = support.arch == "gfx950" and in_table
+        # aiter cannot confirm a kernel (a failed asm query, or a backend it has no
+        # table for). Only gfx950 takes the copied table together with the fold
+        # veto; other archs keep the table's verdict alone, as before.
+        if support.arch != "gfx950":
+            return table_verdict
+        supported = in_table
         if not supported:
             reasons.append(
-                f"aiter cannot confirm a kernel on {support.arch} "
-                "and the copied gfx950 table does not cover it"
+                "aiter cannot confirm a kernel and the copied gfx950 table "
+                "does not cover it"
             )
     return support.native and supported, "; ".join(reasons)
 
@@ -295,7 +300,7 @@ def _in_asm_cprr_native_table(*, heads: int, q_len: int) -> bool:
 def _asm_cprr_kernel_heads(
     *, gathered_heads: int, supports: Callable[[int], bool]
 ) -> int:
-    """The smallest head count at or above the gathered one that supports, or 0."""
+    # The smallest head count at or above the gathered one that supports, or 0.
     for heads in sorted(_MLA_ASM_CPRR_NATIVE_QLENS):
         if heads >= gathered_heads and supports(heads):
             return heads
@@ -2337,7 +2342,8 @@ class AiterAttnBackend(AttentionBackend):
 
     def _asm_cprr_verify_requested(self) -> bool:
         return (
-            self.mla_verify_backend == "asm"
+            _mla_persist_requested
+            and self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
             and self.kv_cache_dtype == fp8_dtype
         )
