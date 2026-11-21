@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::{
     call_item, message_item, new_id, now_secs, reasoning_item, response_object, usage_from_chat,
-    EchoContext, Finish,
+    CallIds, EchoContext, Finish,
 };
 
 /// Output order: reasoning, message, function calls.
@@ -57,6 +57,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
         ));
     }
     let calls = tool_calls.map_or(&[][..], Vec::as_slice);
+    let mut ids = CallIds::default();
     for (i, tc) in calls.iter().enumerate() {
         // Only the last call can have been cut off.
         let status = if i + 1 == calls.len() {
@@ -64,11 +65,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
         } else {
             "completed"
         };
-        let call_id = tc
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| new_id("call"));
+        let call_id = ids.allocate(tc.get("id").and_then(Value::as_str));
         let name = tc
             .pointer("/function/name")
             .and_then(Value::as_str)
@@ -165,6 +162,16 @@ mod tests {
         let out = r["output"].as_array().unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "reasoning");
+    }
+
+    #[test]
+    fn buffered_repeated_worker_ids_are_unique() {
+        let f = json!({"id":"same","function":{"name":"f","arguments":"{}"}});
+        let chat =
+            json!({"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[f,f]}}]});
+        let output = &chat_to_response(&chat, &echo())["output"];
+        assert_eq!(output[0]["call_id"], "same");
+        assert_ne!(output[0]["call_id"], output[1]["call_id"]);
     }
 
     #[test]
