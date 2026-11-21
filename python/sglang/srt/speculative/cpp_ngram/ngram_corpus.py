@@ -132,6 +132,7 @@ class NgramCorpus:
         row_sets = [
             (i, {idx for idx, v in enumerate(row) if v == 1})
             for i, row in enumerate(tree_mask)
+            if row[0]
         ]
         leaf_sets = []
         leaf_rows = []
