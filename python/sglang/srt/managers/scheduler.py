@@ -762,6 +762,7 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        self.init_qsa_truncation_align()
         self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
 
@@ -1928,6 +1929,21 @@ class Scheduler(
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
             )
+
+    def init_qsa_truncation_align(self):
+        """Compressed QSA asserts that every extend's prefix is a whole number
+        of compress groups, so a chunk cut short of its prompt must end on that
+        grid. Use the LCM to preserve any existing alignment."""
+        ratio = getattr(
+            self.token_to_kv_pool_allocator.get_kvcache(), "qsa_compress_ratio", 1
+        )
+        if ratio <= 1:
+            return
+
+        if self.truncation_align_size is None:
+            self.truncation_align_size = ratio
+        else:
+            self.truncation_align_size = math.lcm(self.truncation_align_size, ratio)
 
     def init_mamba_truncation_align(self):
         """Under DCP a mamba checkpoint may only be donated where the cached

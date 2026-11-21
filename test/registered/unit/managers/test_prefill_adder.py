@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -561,6 +562,44 @@ class TestPrefillAdder(CustomTestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(req.extend_len, expected)
+
+    def test_qsa_chunk_cuts_land_on_the_compress_ratio_grid(self):
+        # Compressed QSA asserts that every extend's prefix is a whole number of
+        # compress groups. Exact chunk fill bills raw lengths, so a cut's budget
+        # can be off that grid; the cut still lands on it.
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.truncation_align_size = None
+        kv_pool = SimpleNamespace(qsa_compress_ratio=4)
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            get_kvcache=lambda: kv_pool
+        )
+        scheduler.init_qsa_truncation_align()
+        align = scheduler.truncation_align_size
+        self.assertEqual(align, 4)
+        # Radix cache off: no prefix sharing, so exact chunk fill stays on.
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        # With the radix cache off, ignore-EOS requests take their own cut.
+        for site in ("admission", "ignore_eos"):
+            with (
+                self.subTest(site=site),
+                patch.object(
+                    schedule_policy, "_use_exact_chunk_fill", return_value=True
+                ),
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=102
+                )
+                req = self.create_shared_req(site)
+                req.sampling_params.ignore_eos = site == "ignore_eos"
+                req.full_untruncated_fill_ids = list(range(300))
+                req.origin_input_ids = req.full_untruncated_fill_ids
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=align
+                )
+                self.assertEqual(req.extend_len, 100)
 
     def test_encoder_replay_rows_share_the_chunk(self):
         # A hit's replay rows run in the same step as its extend, so both must
