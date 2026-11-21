@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_model,
     get_parallel,
 )
@@ -128,6 +129,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage=None,
         forward_stream=None,
     ):
+        mooncake_config = None
+        if storage is None:
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+                MooncakeStoreConfig,
+            )
+
+            mooncake_config = MooncakeStoreConfig.load(extra_config)
+        else:
+            mooncake_config = getattr(storage, "config", None)
+        if (
+            mooncake_config is not None
+            and mooncake_config.standalone_storage
+            and mooncake_config.cuda_ipc_persistent_registration_enabled
+            and get_exec().features.enable_memory_saver
+        ):
+            raise ValueError(
+                "Persistent CUDA IPC registration requires a fixed GPU KV pool; "
+                "disable enable_memory_saver for this experiment."
+            )
+        self._registered_buffers: dict[tuple[int, int], torch.UntypedStorage] = {}
+        self._workers_stopped = False
+        self._closed = False
         self.forward_stream = forward_stream
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -174,11 +198,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             extra_config=extra_config,
         )
         if storage is None:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeStore,
+            self.storage = MooncakeStore(
+                storage_config, mem_pool=None, mooncake_config=mooncake_config
             )
-
-            self.storage = MooncakeStore(storage_config, mem_pool=None)
         else:
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
@@ -264,20 +286,35 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_thread.start()
 
     def register_buffers(self) -> None:
-        seen = set()
-        for pool in self.pools.values():
-            for buffer in pool.get_hybrid_pool_buffer():
-                storage = buffer.untyped_storage()
-                allocation = (int(storage.data_ptr()), int(storage.nbytes()))
-                if allocation in seen:
-                    continue
-                seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
-                if result not in (0, None):
-                    raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
-                    )
+        try:
+            for pool in self.pools.values():
+                for buffer in pool.get_hybrid_pool_buffer():
+                    storage = buffer.untyped_storage()
+                    allocation = (int(storage.data_ptr()), int(storage.nbytes()))
+                    if allocation in self._registered_buffers:
+                        continue
+                    result = self.storage.store.register_buffer(*allocation)
+                    if result not in (0, None):
+                        raise RuntimeError(
+                            "Failed to register GPU KV buffer with Mooncake, "
+                            f"error code: {result}."
+                        )
+                    # Keep the exporting allocation alive until its registration
+                    # has been removed, including an unregister retry.
+                    self._registered_buffers[allocation] = storage
+        except BaseException:
+            self.unregister_buffers()
+            raise
+
+    def unregister_buffers(self) -> None:
+        for allocation in list(self._registered_buffers):
+            result = self.storage.store.unregister_buffer(allocation[0])
+            if result not in (0, None):
+                raise RuntimeError(
+                    "Failed to unregister GPU KV buffer from Mooncake, "
+                    f"address: {allocation[0]:#x}, error code: {result}."
+                )
+            del self._registered_buffers[allocation]
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -679,13 +716,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.layer_done_counter.reset()
 
     def close(self) -> None:
-        self.reset()
-        self.load_queue.put(None)
-        self.offload_queue.put(None)
-        self.load_thread.join()
-        self.offload_thread.join()
-        self.load_io_executor.shutdown()
-        logger.info("Mooncake direct linker stats: %s", self.stats)
+        if self._closed:
+            return
+        if not self._workers_stopped:
+            self.reset()
+            self.load_queue.put(None)
+            self.offload_queue.put(None)
+            self.load_thread.join()
+            self.offload_thread.join()
+            self.load_io_executor.shutdown()
+            self._workers_stopped = True
+            logger.info("Mooncake direct linker stats: %s", self.stats)
+        self.unregister_buffers()
         self.storage.close()
         if self.mla_broadcaster is not None:
             self.mla_broadcaster.destroy()
+        self._closed = True
