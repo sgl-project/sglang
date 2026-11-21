@@ -30,7 +30,7 @@ pub(crate) async fn responses(
 ) -> Result<Response<Body>, ApiError> {
     let inline_system = model_supports_inline_system(&ctx);
     // Input items carry base64 images: parse and rebuild off the async worker.
-    let (converted, chat_body) = off_worker::run_for_body(body.len(), || {
+    let (echo, streaming, chat_body) = off_worker::run_for_body(body.len(), move || {
         let req: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| ApiError::BadRequest(format!("request body is not valid JSON: {e}")))?;
         let converted = responses::to_chat(req, inline_system).map_err(ApiError::BadRequest)?;
@@ -38,10 +38,10 @@ pub(crate) async fn responses(
             serde_json::to_vec(&converted.chat)
                 .map_err(|e| ApiError::Internal(anyhow::anyhow!("serialize chat request: {e}")))?,
         );
-        Ok::<_, ApiError>((converted, chat_body))
+        Ok::<_, ApiError>((converted.echo, converted.stream, chat_body))
     })?;
     let resp = chat_completions(State(ctx), headers, chat_body).await?;
-    Ok(adapt(resp, converted.echo, converted.stream).await)
+    Ok(adapt(resp, echo, streaming).await)
 }
 
 /// Keeps status, headers and extensions (access log); replaces the body.
