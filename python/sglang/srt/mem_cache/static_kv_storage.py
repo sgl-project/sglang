@@ -455,6 +455,7 @@ class StaticKVStorage:
         req_pool_indices,
         state_slots,
         state_writes_unknown: bool = False,
+        schedule_stream=None,
     ) -> None:
         """See `KVStorage.record_forward`: static pools never move a row, so
         nothing races a forward."""

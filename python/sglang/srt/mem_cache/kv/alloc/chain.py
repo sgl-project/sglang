@@ -500,9 +500,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def _snapshot_key_now(self) -> int:
         """The chain's capacity epoch and, per band, its compaction mode, which
-        is not a capacity field. Every capacity read goes through here, so the
-        state slots an open free group holds back are freed first: the bands
-        share the arena, and a free outside a group would have given them back."""
+        is not a capacity field. Every capacity read that prices a layout goes
+        through here, so the state slots an open free group holds back are freed
+        first: the bands share the arena, and a free outside a group would have
+        given them back."""
         self._settle_state_free_group()
         epoch = bits = 0
         for band in self.bands:
@@ -725,6 +726,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if state is not None and state.sub_pool_name in demands:
             self._settle_state_free_group()
+        # On a single stage the live layout already fits;
+        # a demand of no units is refused only by the owner's live-token cap.
+        if self.stage_capacity is None and not any(demands.values()):
+            return self._full_cap_reclaim(0) == 0
         return self._ask(
             "units_fit",
             lambda: _units_key(demands),
@@ -1569,6 +1574,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         with record_function("ChainAllocator.set_latest_forward_done_event"):
             for member in self.members:
                 member.set_latest_forward_done_event(event)
+
+    def record_unknown_forward(self, event: torch.cuda.Event) -> None:
+        """Record a forward whose write ids no band can read before it ends:
+        nothing moves until it retires."""
+        for member in self.members:
+            member.usage.record_forward(event, None, writes_unknown=True)
+            member.usage.latest_forward = event
 
     def set_inflight_forward(
         self,
