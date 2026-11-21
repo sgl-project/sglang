@@ -47,7 +47,8 @@ def fused_moe_router_cudacore_kernel(
     if moe_softcapping == 0:
         logits_softcapped = logits
     else:
-        logits_scaled = logits / moe_softcapping
+        # tanh is exactly 1 in fp32 beyond |x| = 20, and exp(40) cannot overflow to inf / inf
+        logits_scaled = tl.minimum(tl.maximum(logits / moe_softcapping, -20.0), 20.0)
         exped = tl.exp(2 * logits_scaled)
         top = exped - 1
         bottom = exped + 1
@@ -214,7 +215,8 @@ def fused_moe_router_tensorcore_kernel(
     if moe_softcapping == 0:
         logits_softcapped = acc
     else:
-        logits_scaled = acc / moe_softcapping
+        # tanh is exactly 1 in fp32 beyond |x| = 20, and exp(40) cannot overflow to inf / inf
+        logits_scaled = tl.minimum(tl.maximum(acc / moe_softcapping, -20.0), 20.0)
         exped = tl.exp(2 * logits_scaled)
         logits_softcapped = (exped - 1) / (exped + 1) * moe_softcapping
 
