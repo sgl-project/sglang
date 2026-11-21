@@ -1265,7 +1265,7 @@ class Envs:
     # else "asm". Explicit values are honored as-is.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStr("auto")
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
-    SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
+    SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("auto")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.

@@ -45,6 +45,90 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
+def k3_mla_verify_max_kv_len(
+    forward_batch: ForwardBatch, num_draft_tokens: int
+) -> Optional[int]:
+    """Longest verify KV length from the host mirror, or None without one (a
+    device max would sync every step)."""
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    if (
+        seq_lens_cpu is None
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.numel() == 0
+    ):
+        return None
+    return int(seq_lens_cpu.max()) + num_draft_tokens
+
+
+K3_MLA_VERIFY_GLUON = "gluon"
+K3_MLA_VERIFY_HK = "hk"
+
+# batch * max_kv_len from which AITER's HipKittens verify kernel beats
+# mla_gluon, keyed by the largest batch size each threshold covers (the default
+# covers larger batches). CUDA graphs on MI355X, QLEN 8, 12 heads, FP8 KV.
+_K3_MLA_VERIFY_HK_THRESHOLDS = {
+    1: 17000,
+    2: 22000,
+    3: 16000,
+    4: 25000,
+    5: 20000,
+    6: 19500,
+    7: 23000,
+    8: 26000,
+    10: 24000,
+    12: 21500,
+    16: 30000,
+    24: 30000,
+    32: 45000,
+    48: 36000,
+    64: 49000,
+}
+_K3_MLA_VERIFY_HK_DEFAULT_THRESHOLD = 49000
+
+
+def k3_mla_verify_hk_threshold(batch_size: int) -> int:
+    for bs in sorted(_K3_MLA_VERIFY_HK_THRESHOLDS):
+        if batch_size <= bs:
+            return _K3_MLA_VERIFY_HK_THRESHOLDS[bs]
+    return _K3_MLA_VERIFY_HK_DEFAULT_THRESHOLD
+
+
+def select_k3_mla_verify_kernel(
+    forward_batch: ForwardBatch, num_draft_tokens: int
+) -> str:
+    """Host pick of the K3 verify kernel. HipKittens serves any length, so it is
+    the pick when the host lengths are missing."""
+    max_kv_len = k3_mla_verify_max_kv_len(forward_batch, num_draft_tokens)
+    if max_kv_len is None:
+        return K3_MLA_VERIFY_HK
+    bs = forward_batch.batch_size
+    if bs > 0 and bs * max_kv_len >= k3_mla_verify_hk_threshold(bs):
+        return K3_MLA_VERIFY_HK
+    return K3_MLA_VERIFY_GLUON
+
+
+@dataclass(frozen=True)
+class K3MlaVerifyGraphVariants:
+    """One target-verify graph per AITER MLA verify kernel (Gluon, HipKittens)."""
+
+    num_draft_tokens: int
+    capture_labels: ClassVar[tuple[str, ...]] = (K3_MLA_VERIFY_GLUON, K3_MLA_VERIFY_HK)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        return select_k3_mla_verify_kernel(forward_batch, self.num_draft_tokens)
+
+
+def create_k3_mla_verify_graph_variants(
+    attn_backend, capture_forward_mode
+) -> Optional[K3MlaVerifyGraphVariants]:
+    if not capture_forward_mode.is_target_verify():
+        return None
+    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    if not getattr(backend, "use_k3_mla_verify", False):
+        return None
+    return K3MlaVerifyGraphVariants(backend.num_draft_tokens)
+
+
 class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
     """Graphs keyed by the batch's longest request: the first bucket whose limit
     covers it, else the fallback, which must serve any length."""
