@@ -1035,6 +1035,10 @@ struct AbortRequestBody {
     rid: Option<String>,
     #[serde(default)]
     abort_all: bool,
+    #[serde(default)]
+    wait_for_retirement: bool,
+    #[serde(default)]
+    cancellation_id: Option<String>,
 }
 
 /// `POST /abort_request` — cancel the live generations submitted under the
@@ -1061,6 +1065,19 @@ async fn abort_request(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
+    if body.wait_for_retirement {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "rid": body.rid.unwrap_or_default(),
+                "cancellation_id": body.cancellation_id.unwrap_or_default(),
+                "status": "unsupported",
+                "reason": "Retirement receipts require the Python tokenizer",
+                "completion_scope": "scheduler_owned_request",
+            })),
+        )
+            .into_response();
+    }
     let rid = body.rid.unwrap_or_default();
     let ending = AbortEnding::AbortFinishReason;
     if body.abort_all {
@@ -2197,6 +2214,21 @@ mod tests {
             (r#"{"rid": ""}"#, StatusCode::OK, false),
             ("{}", StatusCode::OK, false),
             (r#"{"rid": 3}"#, StatusCode::BAD_REQUEST, false),
+            (
+                r#"{"rid": "client-rid", "wait_for_retirement": true}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                false,
+            ),
+            (
+                r#"{"abort_all": true, "wait_for_retirement": true}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                false,
+            ),
+            (
+                r#"{"rid": "client-rid", "wait_for_retirement": false}"#,
+                StatusCode::OK,
+                true,
+            ),
         ] {
             let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
             let mut call = state
@@ -2232,6 +2264,10 @@ mod tests {
             let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
             if status == StatusCode::OK {
                 assert!(bytes.is_empty(), "{body}");
+            } else if status == StatusCode::UNPROCESSABLE_ENTITY {
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["status"], "unsupported");
+                assert_eq!(body["completion_scope"], "scheduler_owned_request");
             }
             if aborted {
                 assert!(
