@@ -38,9 +38,22 @@ class OllamaServing:
         """Get current timestamp in Ollama format."""
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    def _convert_options_to_sampling_params(self, options: dict = None) -> dict:
-        """Convert Ollama options to SGLang sampling params."""
+    def _convert_options_to_sampling_params(
+        self, options: dict = None, format: Union[str, dict, None] = None
+    ) -> dict:
+        """Convert Ollama options and format to SGLang sampling params."""
         sampling_params = {}
+
+        # Forward the Ollama `format` field (Structured Outputs) to the
+        # native grammar constraint. The `is not None` check matters: an
+        # empty schema {} is a legal constraint and differs from an omitted
+        # or null field.
+        if format == "json":
+            # JSON mode requires a valid JSON object, matching the native
+            # mapping used for OpenAI json_object responses.
+            sampling_params["json_schema"] = '{"type": "object"}'
+        elif format is not None:
+            sampling_params["json_schema"] = orjson.dumps(format).decode("utf-8")
 
         if options:
             # Map Ollama options to SGLang params
@@ -85,7 +98,9 @@ class OllamaServing:
         )
 
         # Convert options to sampling params
-        sampling_params = self._convert_options_to_sampling_params(request.options)
+        sampling_params = self._convert_options_to_sampling_params(
+            request.options, request.format
+        )
 
         # Create SGLang request with input_ids
         gen_request = GenerateReqInput(
@@ -203,7 +218,9 @@ class OllamaServing:
             return empty_response
 
         # Convert options to sampling params
-        sampling_params = self._convert_options_to_sampling_params(request.options)
+        sampling_params = self._convert_options_to_sampling_params(
+            request.options, request.format
+        )
 
         # Create SGLang request
         gen_request = GenerateReqInput(
