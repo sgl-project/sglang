@@ -54,6 +54,9 @@ from sglang.srt.parser.chat_parsing.response_templates import (
 logger = logging.getLogger(__name__)
 
 _THINKING_FIELD = "thinking"
+# Chat templates (and Transformers' `parse_response`) call the reasoning field
+# `reasoning_content`; accept it as an alias for the serving adapters' `thinking`.
+_REASONING_CONTENT_FIELD = "reasoning_content"
 _CONTENT_FIELD = "content"
 _TOOL_FIELD = "tool_calls"
 _PASSTHROUGH_FIELD = "normal"
@@ -87,7 +90,32 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
 
 def _derive_serving_templates(template: dict) -> _ServingTemplates:
     # Detectors are built several times per request; derive each template once.
+    template = _normalize_reasoning_field(template)
     return _derive_serving_templates_from_json(json.dumps(template))
+
+
+def _normalize_reasoning_field(template: dict) -> dict:
+    """Return `template` with a `reasoning_content` field renamed to `thinking`.
+
+    The serving adapters route reasoning through the `thinking` field name, so
+    normalizing once here keeps every derived template, and the auto-detection
+    check in `template_detection`, working for checkpoint templates that use
+    the `reasoning_content` name. A template that declares both names is
+    ambiguous, so it is rejected. The caller's dict is not mutated.
+    """
+    fields = template.get("fields", {})
+    if _REASONING_CONTENT_FIELD not in fields:
+        return template
+    if _THINKING_FIELD in fields:
+        raise ValueError(
+            "response_template cannot declare both 'thinking' and "
+            "'reasoning_content' fields"
+        )
+    normalized = copy.deepcopy(template)
+    normalized["fields"][_THINKING_FIELD] = normalized["fields"].pop(
+        _REASONING_CONTENT_FIELD
+    )
+    return normalized
 
 
 @functools.lru_cache(maxsize=8)
@@ -142,7 +170,10 @@ def _check_serving_fields(loaded: ResponseTemplate) -> None:
         if (
             field.content != "text"
             or field.transform is not None
-            or field.join is not None
+            # Only an empty join streams like the adapter, which concatenates
+            # successive regions with "". A non-empty join would differ
+            # between the streaming adapter and the non-streaming parser.
+            or field.join not in (None, "")
         ):
             raise ValueError(
                 f"response_template field {name!r} uses semantics that cannot "
