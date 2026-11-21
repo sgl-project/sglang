@@ -71,10 +71,15 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
         kv_shard_widening: int = 1,
+        context_len: int | None = None,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.max_req_len = max_req_len
+        # As TpModelWorker reports it: max_req_len = min(context_len, pool) - 1.
+        scheduler.model_config = SimpleNamespace(
+            context_len=max_req_len + 1 if context_len is None else context_len
+        )
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.kv_shard_widening = kv_shard_widening
@@ -220,6 +225,51 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, min_new_tokens=32)
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
+
+    _SCHEDULER_LOGGER = "sglang.srt.managers.scheduler"
+
+    def test_warns_when_pool_smaller_than_context_clips_request(self):
+        """Bug regression (#50443): a KV pool smaller than the context window
+        lowers max_req_len, which clipped an explicit max_new_tokens without a
+        log; the output then ended early as an ordinary 'length' finish."""
+        scheduler = self._new_scheduler(
+            max_req_len=64, max_total_num_tokens=1024, context_len=4096
+        )
+        req = self._new_req(max_new_tokens=200, input_len=8)
+        with self.assertLogs(self._SCHEDULER_LOGGER, level="WARNING") as logs:
+            self.assertEqual(self._init_and_check(scheduler, req), 64 - 8 - 1)
+        self.assertIn("from 200 to 55", logs.output[0])
+        self.assertIn("--mem-fraction-static", logs.output[0])
+
+    def test_warns_when_memory_budget_clips_request(self):
+        scheduler = self._new_scheduler(max_req_len=4096, max_total_num_tokens=64)
+        req = self._new_req(max_new_tokens=200, input_len=8)
+        with self.assertLogs(self._SCHEDULER_LOGGER, level="WARNING") as logs:
+            self.assertEqual(self._init_and_check(scheduler, req), 64 - 8 - 1 - 1)
+        self.assertIn("from 200 to 54", logs.output[0])
+
+    def test_no_pool_warning_when_request_fits_or_is_unset(self):
+        cases = {
+            "fits": self._new_req(max_new_tokens=16, input_len=8),
+            "unset": self._new_req(max_new_tokens=None, input_len=8),
+        }
+        for name, req in cases.items():
+            with self.subTest(name):
+                scheduler = self._new_scheduler(
+                    max_req_len=64, max_total_num_tokens=64, context_len=4096
+                )
+                with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+                    with self.assertNoLogs(self._SCHEDULER_LOGGER, level="WARNING"):
+                        self._init_and_check(scheduler, req)
+
+    def test_no_pool_warning_for_context_window_bound(self):
+        """The context window, not the pool, binds here; requests past it are
+        rejected or truncated (with a log) before they reach the scheduler."""
+        scheduler = self._new_scheduler(max_req_len=32, max_total_num_tokens=1024)
+        req = self._new_req(max_new_tokens=64, input_len=20)
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            with self.assertNoLogs(self._SCHEDULER_LOGGER, level="WARNING"):
+                self.assertEqual(self._init_and_check(scheduler, req), 32 - 20 - 1)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = build_test_unified_pools(
