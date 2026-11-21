@@ -121,7 +121,8 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 
 
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
-    """MegaMoE and TRT-LLM experts on Blackwell, requantized on gfx950, Marlin W4A16 elsewhere."""
+    """MegaMoE and TRT-LLM experts on SM100, opt-in cuTile W4A4 on SM12x,
+    requantized on gfx950, Marlin W4A16 elsewhere."""
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
     requires_blackwell = False
@@ -131,9 +132,18 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         # Marlin's kernels are CUDA-only; gfx950 requantizes the experts at load
         platform = get_platform()
         self.requantizes_experts = platform.is_hip and platform.is_gfx95
+        # Explicitly requested, so an unsupported machine is an error, not a fallback.
+        self.use_flashinfer_cutile = get_moe_runner_backend().is_flashinfer_cutile()
+        self._cutile_quant_info = None
+        if self.use_flashinfer_cutile:
+            self._validate_cutile_platform()
         # Marlin unpacks the packed NVFP4 weights in-register and multiplies on
         # bf16 tensor cores, keeping the 4-bit footprint without FP4 hardware.
-        self.use_marlin = not platform.is_blackwell and not self.requantizes_experts
+        self.use_marlin = (
+            not platform.is_blackwell
+            and not self.requantizes_experts
+            and not self.use_flashinfer_cutile
+        )
         self.use_flashinfer_trtllm = (
             not self.use_marlin
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -145,11 +155,28 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             not self.use_marlin
             and not self.requantizes_experts
             and not self.use_flashinfer_trtllm
+            and not self.use_flashinfer_cutile
             and not get_moe_a2a_backend().is_megamoe()
         ):
             raise ValueError(
                 "M3.1 NVFP4 experts require --moe-a2a-backend megamoe or "
                 "--moe-runner-backend flashinfer_trtllm_routed"
+            )
+
+    @staticmethod
+    def _validate_cutile_platform() -> None:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
+            cutile_nvfp4_platform_unsupported_reason,
+        )
+
+        reason = cutile_nvfp4_platform_unsupported_reason()
+        if reason is not None:
+            raise ValueError(
+                f"--moe-runner-backend flashinfer_cutile is unavailable: {reason}"
+            )
+        if not get_moe_a2a_backend().is_none():
+            raise ValueError(
+                "--moe-runner-backend flashinfer_cutile requires --moe-a2a-backend none"
             )
 
     @classmethod
@@ -167,6 +194,22 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         if self.requantizes_experts:
             self.runner = _hip.create_requantized_runner(moe_runner_config)
             return
+        if self.use_flashinfer_cutile:
+            from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
+                cutile_nvfp4_config_unsupported_reason,
+            )
+
+            reason = cutile_nvfp4_config_unsupported_reason(moe_runner_config)
+            if reason is not None:
+                raise ValueError(
+                    f"--moe-runner-backend flashinfer_cutile cannot run this MoE "
+                    f"layer: {reason}"
+                )
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTILE, moe_runner_config
+            )
+            return
         if self.use_marlin:
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
 
@@ -179,6 +222,44 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
                 self.runner = MoeRunner(
                     MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, moe_runner_config
                 )
+
+    def _process_cutile_weights(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
+            build_cutile_nvfp4_quant_info,
+        )
+
+        if layer._minimax_activation != "swigluoai":
+            raise ValueError(
+                "--moe-runner-backend flashinfer_cutile supports the swigluoai "
+                f"activation only, got {layer._minimax_activation!r}"
+            )
+        cfg = layer.moe_runner_config
+        self._cutile_quant_info = build_cutile_nvfp4_quant_info(
+            w13_packed=layer.w13_weight_packed.data,
+            w13_block_scale=layer.w13_weight_scale.data,
+            w13_weight_global_scale=layer.w13_weight_global_scale.data,
+            w13_input_global_scale=layer.w13_input_global_scale.data,
+            w2_packed=layer.w2_weight_packed.data,
+            w2_block_scale=layer.w2_weight_scale.data,
+            w2_weight_global_scale=layer.w2_weight_global_scale.data,
+            w2_input_global_scale=layer.w2_input_global_scale.data,
+            top_k=cfg.top_k,
+            swiglu_alpha=cfg.gemm1_alpha,
+            swiglu_beta=cfg.gemm1_beta,
+            swiglu_limit=cfg.gemm1_clamp_limit,
+        )
+        # The prepared view owns reordered GEMM1 weights and swizzled scales; the
+        # source parameters would otherwise stay resident for every layer.
+        for name in (
+            "w13_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_packed",
+            "w2_weight_scale",
+        ):
+            layer.register_parameter(name, None)
+
+        layer._mega_moe_nvfp4 = False
+        layer._mega_moe_weights_built = False
 
     def _process_marlin_weights(self, layer: torch.nn.Module) -> None:
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
@@ -278,6 +359,9 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         if self.requantizes_experts:
             _hip.process_requantized_weights(layer)
             return
+        if self.use_flashinfer_cutile:
+            self._process_cutile_weights(layer)
+            return
         if self.use_marlin:
             self._process_marlin_weights(layer)
             return
@@ -317,6 +401,8 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
     def apply_weights(self, layer, dispatch_output):
         if self.requantizes_experts:
             return _hip.apply_requantized_experts(self, layer, dispatch_output)
+        if self.use_flashinfer_cutile:
+            return self.runner.run(dispatch_output, self._cutile_quant_info)
         if self.use_marlin:
             return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
         if self.use_flashinfer_trtllm:
