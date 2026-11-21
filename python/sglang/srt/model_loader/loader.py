@@ -1710,7 +1710,8 @@ class ShardedStateLoader(BaseModelLoader):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
                 for module, quant_method in _modules_with_quant_method(model):
-                    quant_method.process_weights_after_loading(module)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
             rank = get_parallel().tp_rank
             pattern = os.path.join(
                 local_model_path,
