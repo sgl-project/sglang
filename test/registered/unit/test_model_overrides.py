@@ -4788,8 +4788,7 @@ class TestNemotronDecisionStartup(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         for architecture, supplied, context, sidecar_limit, expected in (
-            ("NemotronForDecision", None, 262144, 131072, 32768),
-            ("NemotronForDecision", 16384, 262144, 131072, 16384),
+            ("NemotronForDecision", None, 262144, 131072, 131072),
             ("NemotronForDecision", 65536, 262144, 131072, 65536),
             ("NemotronForDecision", None, 8192, 131072, 8192),
             ("NemotronForDecision", None, 262144, 4096, 4096),
@@ -4835,8 +4834,8 @@ class TestNemotronDecisionStartup(CustomTestCase):
         for memory, supplied, expected in (
             (48 * 1024, None, 16384),
             (60 * 1024 - 1, None, 16384),
-            (60 * 1024, None, 32768),
-            (None, None, 32768),
+            (60 * 1024, None, 131072),
+            (None, None, 16384),
             (48 * 1024, 8192, 8192),
         ):
             with self.subTest(memory=memory, supplied=supplied):
@@ -4854,6 +4853,152 @@ class TestNemotronDecisionStartup(CustomTestCase):
                 self.assertEqual(
                     resolution_result(args, "max_prefill_tokens"), expected
                 )
+
+    def test_default_memory_budget_can_hold_a_full_read(self):
+        import torch
+
+        from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            CudaGraphConfig,
+            PhaseConfig,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for memory_gib, architecture in (
+            (48, "NemotronForDecision"),
+            (64, "NemotronForDecision"),
+            (64, "Ministral3ForCausalLM"),
+        ):
+            with self.subTest(
+                memory_gib=memory_gib,
+                architecture=architecture,
+            ):
+                args = ServerArgs(
+                    model_path="dummy",
+                    device="cuda",
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                        prefill=PhaseConfig(
+                            backend=Backend.BREAKABLE, max_bs=8192, bs=[8192]
+                        ),
+                    ),
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=PretrainedConfig(
+                        architectures=[architecture],
+                        hidden_size=4096,
+                        intermediate_size=14336,
+                    ),
+                    dtype=torch.bfloat16,
+                    attention_arch=AttentionArch.MHA,
+                    is_multimodal=False,
+                    context_len=262144,
+                    nemotron_decision_config={"max_input_tokens": 131072},
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=memory_gib * 1024,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.model_overrides.nemotron_decision.get_device_memory_capacity",
+                        return_value=memory_gib * 1024,
+                    ),
+                ):
+                    handle_gpu_memory_settings(args)
+                fraction = resolution_result(args, "mem_fraction_static")
+                if memory_gib < 60:
+                    self.assertEqual(fraction, 0.487)
+                    self.assertEqual(
+                        resolution_result(args, "max_prefill_tokens"), 16384
+                    )
+                elif architecture == "Ministral3ForCausalLM":
+                    self.assertEqual(fraction, 0.803)
+                else:
+                    self.assertEqual(
+                        resolution_result(args, "max_prefill_tokens"), 131072
+                    )
+                    # Published BF16 tensor storage and one 128K KV pool.
+                    static_bytes = memory_gib * 1024**3 * fraction
+                    self.assertGreater(static_bytes, 16979144720 + 17 * 1024**3)
+                    # Measured eager activations need about 15 GiB before overhead.
+                    self.assertGreater(
+                        memory_gib * 1024**3 - static_bytes, 20 * 1024**3
+                    )
+
+    def test_explicit_memory_fraction_keeps_prefill_defaults(self):
+        from pathlib import Path
+
+        from transformers import Ministral3Config
+
+        from sglang.srt.server_args import ServerArgs
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            Ministral3Config(
+                architectures=["NemotronForDecision"],
+                hidden_size=128,
+                intermediate_size=256,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=64,
+                max_position_embeddings=262144,
+                is_causal=False,
+                sliding_window=None,
+                mask_token_id=100,
+                dtype="bfloat16",
+            ).save_pretrained(root)
+            (root / "decision.json").write_text(
+                json.dumps(
+                    dict(
+                        labels={
+                            kind: ["A", "B"] for kind in ("choice", "score", "noul")
+                        },
+                        max_questions=512,
+                        max_input_tokens=131072,
+                        max_candidates_per_read=2,
+                    )
+                )
+            )
+            (root / "decision_template.jinja").write_text(
+                "{{ decision_content }}<SPECIAL_100>"
+            )
+            for supplied, expected in ((None, 131072), (8192, 8192)):
+                with (
+                    self.subTest(supplied=supplied),
+                    override_platform(
+                        is_cuda=True,
+                        is_hip=False,
+                        is_sm90=True,
+                        is_hopper_with_cuda_12_3=True,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                        return_value=80 * 1024,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.model_overrides.nemotron_decision.get_device_memory_capacity",
+                        return_value=80 * 1024,
+                    ),
+                ):
+                    args = ServerArgs(
+                        model_path=directory,
+                        device="cuda",
+                        mem_fraction_static=0.8,
+                        max_prefill_tokens=supplied,
+                    )
+                    args.resolve_once()
+                    self.assertEqual(
+                        resolution_result(args, "mem_fraction_static"), 0.8
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "max_prefill_tokens"), expected
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "chunked_prefill_size"), -1
+                    )
 
     def test_rocm_is_rejected_before_causal_attention_can_run(self):
         config = SimpleNamespace(is_causal=False, sliding_window=None)
