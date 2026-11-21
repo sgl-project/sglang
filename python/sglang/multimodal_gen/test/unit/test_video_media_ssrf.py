@@ -243,6 +243,26 @@ class TestAvOpenGuard:
         fake_av.open.assert_not_called()
         assert exc.value.__context__ is None and exc.value.__cause__ is None
 
+    @pytest.mark.parametrize("relative", [False, True])
+    def test_unavailable_scratch_fails_before_download(
+        self, tmp_path, monkeypatch, relative
+    ):
+        root = (
+            "synthetic-private-root" if relative else str(tmp_path / "missing-volume")
+        )
+        monkeypatch.setenv("TMPDIR", root)
+        fake_av = self._fake_av()
+        with (
+            mock.patch.dict("sys.modules", {"av": fake_av}),
+            mock.patch.object(vision.requests, "get") as get,
+            pytest.raises(ValueError, match="Could not open video source") as exc,
+        ):
+            list(_iter_video_frames_pyav(PUBLIC_VIDEO_URL, 1))
+        get.assert_not_called()
+        fake_av.open.assert_not_called()
+        assert root not in str(exc.value)
+        assert exc.value.__context__ is None
+
     def test_local_path_still_reaches_av_open(self, tmp_path):
         fake_av = self._fake_av()
         path = tmp_path / "clip.mp4"

@@ -12,6 +12,7 @@ per-request from ``batch.data_type`` and the presence of
 import copy
 import json
 import math
+import os
 import tempfile
 from collections import deque
 from collections.abc import Iterator
@@ -248,7 +249,11 @@ def _open_video_stream(video_path: str):
         try:
             scheme = urlparse(video_path).scheme.lower()
             if scheme in ("http", "https"):
-                stream = files.enter_context(tempfile.TemporaryFile())
+                # An explicitly configured scratch volume must not fall back to another disk.
+                root = os.environ.get("TMPDIR") or None
+                if root is not None and not os.path.isabs(root):
+                    raise ValueError("TMPDIR must be absolute")
+                stream = files.enter_context(tempfile.TemporaryFile(dir=root))
                 download_video_to_stream(video_path, stream)
                 stream.seek(0)
             elif scheme == "data":
