@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 class EagleDraftRuntime:
     """Always-present dispatch for draft workers and their graph runners."""
 
+    def propose_chain(self, batch: ScheduleBatch, forward_batch: ForwardBatch):
+        return None
+
+    def plan_fused_extend(self, batch: ScheduleBatch, result: Any) -> Optional[Callable]:
+        return None
+
     def bind_draft_graphs(self, runner: Any) -> frozenset[int]:
         return frozenset()
 
@@ -150,6 +156,11 @@ def init_eagle_megakernel(*, draft_worker: Any) -> Optional[EagleMegakernel]:
 
 def init_eagle_draft_runtime(*, draft_worker: Any) -> EagleDraftRuntime:
     """Resolve draft dispatch once and always return a strategy."""
+    binding = getattr(draft_worker.draft_runner, "ascend_binding", None)
+    if binding is not None and binding.role == "nextn":
+        from sglang.srt.kernel_plugins.npu.eagle import NpuEagleDraftRuntime
+
+        return NpuEagleDraftRuntime(draft_worker, binding)
     specialized = init_eagle_megakernel(draft_worker=draft_worker)
     return STOCK_EAGLE_DRAFT_RUNTIME if specialized is None else specialized
 
