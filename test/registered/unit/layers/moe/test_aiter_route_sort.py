@@ -148,7 +148,7 @@ class TestAiterRouteSortConsumer(CustomTestCase):
         hit, launches = _route(consumer, 128, registrations)
         self.assertIsNone(hit)
         self.assertEqual(launches, 0)
-        # The layer's clear() drops a sort no fused_moe consumed (None).
+        # The scope drops a sort no fused_moe consumed (None).
         self.assertEqual([r and r["M"] for r in registrations], [16, None, None])
 
     def test_declines_before_it_has_seen_the_layers_fused_moe_call(self):
