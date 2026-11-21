@@ -131,6 +131,11 @@ pub struct Args {
     #[arg(long, default_value = "inf")]
     pub request_rate: String,
 
+    /// Pace arrivals at exactly `1 / --request-rate` instead of drawing gaps
+    /// from the arrival distribution. Needs a finite `--request-rate`.
+    #[arg(long)]
+    pub qps_fixed_interval: bool,
+
     /// Cap on requests in flight. Unset means unbounded.
     #[arg(long)]
     pub max_concurrency: Option<usize>,
@@ -483,6 +488,12 @@ mod tests {
                 .parse_request_rate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn qps_fixed_interval_parses() {
+        assert!(args(&["--qps-fixed-interval"]).qps_fixed_interval);
+        assert!(!args(&[]).qps_fixed_interval);
     }
 
     #[test]

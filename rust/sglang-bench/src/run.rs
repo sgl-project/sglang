@@ -51,6 +51,10 @@ pub fn run_blocking(args: Args) -> Result<serde_json::Value> {
 async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
     let base_url = args.base_url();
     let request_rate = args.parse_request_rate()?;
+    anyhow::ensure!(
+        request_rate.is_finite() || !args.qps_fixed_interval,
+        "--qps-fixed-interval needs a finite --request-rate"
+    );
     let headers = build_headers(&args)?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -207,6 +211,17 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
     Ok(result)
 }
 
+/// One arrival gap in seconds. `fixed` returns the mean gap itself, which turns
+/// the arrival process from Poisson into constant; otherwise the gap is the
+/// exponential draw with mean `1/rate` that the client has always used.
+fn arrival_interval<R: Rng + ?Sized>(rng: &mut R, rate: f64, fixed: bool) -> f64 {
+    if fixed {
+        return 1.0 / rate;
+    }
+    let uniform: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
+    -uniform.ln() / rate
+}
+
 /// Submit every request, pacing arrivals and capping concurrency.
 ///
 /// Arrivals are paced on this task while the requests themselves run as
@@ -246,11 +261,7 @@ async fn dispatch(
         }));
 
         if request_rate.is_finite() {
-            // Poisson arrivals: exponential gaps with mean 1/rate. Sampled
-            // from the uniform inverse CDF, since the gap distribution is the
-            // only random draw this loop makes.
-            let uniform: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
-            let interval = -uniform.ln() / request_rate;
+            let interval = arrival_interval(&mut rng, request_rate, args.qps_fixed_interval);
             tokio::time::sleep(Duration::from_secs_f64(interval)).await;
         }
     }
@@ -725,5 +736,23 @@ mod tests {
         // SGLANG_IS_IN_CI is not set in this test process.
         assert!(!should_flush_cache(&plain));
         assert!(!should_flush_cache(&vllm));
+    }
+
+    #[test]
+    fn fixed_interval_is_the_mean_gap() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..100 {
+            assert_eq!(arrival_interval(&mut rng, 1.69, true), 1.0 / 1.69);
+        }
+    }
+
+    #[test]
+    fn default_gaps_keep_the_mean_rate() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let n = 200_000;
+        let total: f64 = (0..n).map(|_| arrival_interval(&mut rng, 1.0, false)).sum();
+        let mean = total / n as f64;
+        // Exponential gaps with mean 1/rate, i.e. mean 1 at rate 1.
+        assert!((mean - 1.0).abs() < 0.02, "mean {mean}");
     }
 }
