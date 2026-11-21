@@ -471,7 +471,11 @@ impl ResponsesStream {
         };
         self.close_calls(calls_finish, out);
         self.flush_held(out);
-        self.close_open(held_finish, out);
+        if reason == "tool_calls" {
+            self.close_open_with_phase(held_finish, Some("commentary"), out);
+        } else {
+            self.close_open(held_finish, out);
+        }
         let mut resp = self.response(finish.status());
         finish.annotate(&mut resp);
         self.emit(finish.event(), json!({ "response": resp }), out);
@@ -859,6 +863,17 @@ mod tests {
         let mut c = call(name, args);
         c["tool_calls"][0]["index"] = json!(index);
         c
+    }
+
+    #[test]
+    fn text_buffered_until_a_tool_finish_is_commentary() {
+        let evs = run(&[
+            chunk(indexed(0, Some("f"), "{}"), None),
+            chunk(json!({"content":"checking"}), Some("tool_calls")),
+        ]);
+        let output = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[1]["phase"], "commentary");
     }
 
     #[test]
