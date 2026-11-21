@@ -180,6 +180,25 @@ class TestServerArgsPositionalOrder(CustomTestCase):
         self.assertEqual(args.grpc_response_timeout_secs, 123.0)
         self.assertFalse(args.enable_megamoe_for_layernorm_sp)
 
+    def test_latent_mxfp4_flag_is_appended_after_the_shortest_prefill_slots(self):
+        """An old positional call must leave the latent MXFP4 flag disabled."""
+        fields = msgspec.structs.fields(ServerArgs)
+        for index, name in (
+            (578, "shortest_prefill_boundary_halving_chunks"),
+            (579, "shortest_prefill_boundary_decay_start_chunks"),
+            (580, "shortest_prefill_budget_min_ratio"),
+            (581, "shortest_prefill_budget_doubling_chunks"),
+            (582, "enable_kimi_k3_latent_mxfp4"),
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(fields[index].name, name)
+        defaults = ServerArgs(model_path="dummy")
+        positional = [getattr(defaults, field.name) for field in fields[:582]]
+
+        args = ServerArgs(*positional)
+
+        self.assertFalse(args.enable_kimi_k3_latent_mxfp4)
+
     def test_builtin_fields_have_explicit_positional_slots(self):
         """New namespace fields cannot shift previously appended built-in options."""
         self.assertEqual(
