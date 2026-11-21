@@ -1060,12 +1060,6 @@ class MqaAttentionBase(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.q_head_norm = config.q_head_norm
 
-        # _normalize_q_lora below is this base's, and on HIP it reads the state that
-        # init_mqa_layer resolves. Every subclass goes through it -- DSparkAttention
-        # among them -- so the state is initialised here rather than in MQALayer.
-        if _is_hip:
-            _hip.init_mqa_layer(self, quant_config)
-
         self.compress_ratio: int = (
             compress_ratio
             if compress_ratio is not None
@@ -1226,6 +1220,14 @@ class MqaAttentionBase(nn.Module):
         freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
+
+        # _normalize_q_lora is this base's and on HIP reads the state init_mqa_layer
+        # resolves, so every subclass needs it, DSparkAttention included. It runs last
+        # because init_mqa_layer derives wo_a_fp8_block128 from self.wo_a_fp8 and
+        # self.wo_a.weight: called before those exist it would silently read the class
+        # default False and drop the fused WO-A output of unified-KV decode on gfx950.
+        if _is_hip:
+            _hip.init_mqa_layer(self, quant_config)
 
     @functools.cached_property
     def use_flashinfer_mxfp8_wo_b(self) -> bool:
