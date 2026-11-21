@@ -1005,6 +1005,43 @@ mod tests {
     }
 
     #[test]
+    fn short_image_chat_uses_the_rendezvous_worker() {
+        use crate::state::kv_events::{
+            compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
+        };
+        use crate::tokenizer::MEDIA_TAG_MARK;
+
+        let pool = [worker("a"), worker("b")];
+        let model = ModelId("model".into());
+        let prompt = [1, 2, 3, 90, MEDIA_TAG_MARK, 10, 20, 4];
+        let tree = Arc::new(HashTree::new());
+        tree.set_media_tokens(vec![90]);
+        tree.media().enable(std::time::Duration::from_secs(60));
+        let hashes = compute_block_hashes(&prompt, 1);
+        for w in &pool {
+            tree.insert(&KvWorkerId::new(w.url.clone(), 0), None, &hashes[..3]);
+        }
+        let blocks = BlockSizeOracle::new();
+        blocks.try_set(1).unwrap();
+        let provider = RadixTreePrefixProvider::new(tree, blocks);
+        let signal = provider
+            .match_request_tokens(&prompt, &Default::default())
+            .unwrap();
+        let ctx = SelectionContext::new(&model, None)
+            .with_request_tokens(Some(&prompt))
+            .with_input_tokens(8)
+            .with_external_prefix(Some(&signal));
+        let pick = CacheAwarePolicy::new(AffinityConfig::default())
+            .propose(&pool, &ctx)
+            .unwrap();
+        assert_eq!(pick.kind, ProposalKind::CacheAffinity);
+        assert_eq!(
+            signal.media_winners.as_slice(),
+            std::slice::from_ref(&pick.primary.url)
+        );
+    }
+
+    #[test]
     fn cache_candidates_keep_bounded_target_specific_uncached_work() {
         let model = ModelId("model".into());
         let hot = worker("hot");

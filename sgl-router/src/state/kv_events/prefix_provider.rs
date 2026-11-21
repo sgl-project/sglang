@@ -23,11 +23,9 @@ pub struct PrefixLookupResult {
     /// from its conversation key on, when it is a media chat under media
     /// affinity, so routing can record where the chat went.
     pub media_hashes: Option<Arc<[i64]>>,
-    /// Workers whose reported depth is a remembered media placement: deeper
-    /// than every confirmed match, and at least as deep as any other signal
-    /// for that worker. The cache gate's token floor does not apply
-    /// to them: it counts routing tokens, and the image KV and vision encoding
-    /// such a placement stands for are not among them.
+    /// URLs preferred by media affinity: remembered placements, or the
+    /// rendezvous winner when workers tie before the first image. A short
+    /// image prompt can use either signal below the absolute token floor.
     pub media_winners: Vec<String>,
 }
 
@@ -151,10 +149,11 @@ impl RadixTreePrefixProvider {
             }
             if deepened {
                 self.tree.media().record_hit();
-            } else if prefer_rendezvous(&mut depth_by_url, media.key) {
+            } else if let Some(winner) = prefer_rendezvous(&mut depth_by_url, media.key) {
                 // No placement remembered here (another router may have routed the
                 // previous turn): every router breaks the tie on the shared prefix
                 // the same way for the same conversation, by rendezvous hash.
+                media_winners.push(winner);
                 self.tree.record_media_tiebreak();
             }
         }
@@ -374,13 +373,11 @@ fn media_key(namespace: &CacheNamespace, parent: Option<i64>, tokens: &[u32]) ->
 /// Among the entries tied at the deepest depth, credit the one with the highest
 /// rendezvous score for `key` with one more block, so a cache-aware pick prefers
 /// it. Deterministic across routers; ties of one entry are left alone.
-fn prefer_rendezvous(depths: &mut BTreeMap<String, u32>, key: i64) -> bool {
-    if let Some(winner) = rendezvous_winner(depths, key) {
-        let deepest = depths[&winner];
-        depths.insert(winner, deepest.saturating_add(1));
-        return true;
-    }
-    false
+fn prefer_rendezvous(depths: &mut BTreeMap<String, u32>, key: i64) -> Option<String> {
+    let winner = rendezvous_winner(depths, key)?;
+    let depth = depths.get_mut(&winner)?;
+    *depth = depth.saturating_add(1);
+    Some(winner)
 }
 
 /// Among the names tied at the deepest depth (two or more, above zero), the one
@@ -543,7 +540,12 @@ mod tests {
         confirm(&provider, "http://b", turn1, 4);
         let first = lookup(&provider, turn1);
         assert!(first.media_hashes.is_some());
-        assert!(first.media_winners.is_empty(), "nothing remembered yet");
+        assert_eq!(first.media_winners.len(), 1);
+        assert_eq!(
+            provider.tree.media().hits(),
+            0,
+            "a tie-break is not a remembered placement"
+        );
         provider.record_route(&first, "http://b");
         let signal = lookup(&provider, &turn2);
         assert_eq!(
@@ -616,6 +618,7 @@ mod tests {
                     .filter(|(_, d)| *d == 5)
                     .collect();
                 assert_eq!(boosted.len(), 1, "exactly one worker is preferred");
+                assert_eq!(signal.media_winners, [boosted[0].0.clone()]);
                 boosted[0].0.clone()
             })
             .collect();
