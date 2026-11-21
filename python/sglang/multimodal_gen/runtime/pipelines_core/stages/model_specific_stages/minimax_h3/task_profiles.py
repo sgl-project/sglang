@@ -39,6 +39,10 @@ MINIMAX_H3_TASK_PARTITIONS = MappingProxyType(
     }
 )
 
+# --model-variant serving both video partitions from one process: t2va / fl2va
+# on the FL2VA transformer, ref2va on the Ref2VA one
+MINIMAX_H3_DUAL_VARIANT = "fl2va+ref2va"
+
 # One image checkpoint serves every task it declares, in this order.
 MINIMAX_H3_IMAGE_PARTITION = "image"
 MINIMAX_H3_IMAGE_TASKS = (MINIMAX_H3_TASK_T2I, MINIMAX_H3_TASK_EDIT)
@@ -333,6 +337,7 @@ __all__ = [
     "MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES",
     "MINIMAX_H3_CONDITION_ROLE_REFERENCE",
     "MINIMAX_H3_CANONICAL_MATERIAL_CHAINS",
+    "MINIMAX_H3_DUAL_VARIANT",
     "MINIMAX_H3_TASK_EDIT",
     "MINIMAX_H3_TASK_FL2VA",
     "MINIMAX_H3_IMAGE_PARTITION",

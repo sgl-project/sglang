@@ -502,12 +502,19 @@ def _high_quality_steps_computation_mask(num_inference_steps: int) -> list[int]:
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(
-        self, transformer, pipeline=None, stochastic_sampling: bool = False
+        self,
+        transformer,
+        pipeline=None,
+        stochastic_sampling: bool = False,
+        transformer_2=None,
     ) -> None:
+        # transformer_2: the Ref2VA DiT of a fl2va+ref2va server, which
+        # denoises the ref2va requests
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
+            transformer_2=transformer_2,
         )
         # the release's few-step re-noising update (release metadata)
         self.stochastic_sampling = stochastic_sampling
@@ -825,12 +832,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 ring_degree=server_args.ring_degree,
             )
 
+        transformer = self._begin_dit_use(ctx.is_ref2va, batch)
         placement_managed = self._component_residency_manager is not None
-        if placement_managed:
-            self._manage_dit_use_site(self.transformer, "transformer", batch)
         try:
             model = _resolve_denoise_model(
-                self.transformer,
+                transformer,
                 device,
                 placement_managed=placement_managed,
             )
@@ -979,6 +985,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+
+    def _begin_dit_use(self, is_ref2va: bool, batch: Req) -> Any:
+        """The DiT this request runs, placed by the residency manager when there
+        is one: a fl2va+ref2va server runs ref2va requests (the ones with
+        reference rows) on transformer_2."""
+        name = (
+            "transformer_2"
+            if is_ref2va and self.transformer_2 is not None
+            else "transformer"
+        )
+        transformer = getattr(self, name)
+        if self._component_residency_manager is not None:
+            if self.transformer_2 is not None:
+                # The FL2VA DiT stays ready after its request. Release the DiT this
+                # request does not run before placing the other: both may not fit.
+                idle = "transformer" if name == "transformer_2" else "transformer_2"
+                self.finish_unused_declared_component(
+                    component_name=idle, module=getattr(self, idle)
+                )
+            self._manage_dit_use_site(transformer, name, batch)
+        return transformer
 
     def _run_image_loop(self, batch: Req, plan: Any, server_args: ServerArgs) -> None:
         """Run the image loop over the published latent and reference rows."""
