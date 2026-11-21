@@ -941,6 +941,7 @@ class LoRAMemoryPool:
         # buffers are mutated.
         skipped_weight_names: set = set()
         matched_modules: set = set()
+        weight_to_target: Dict[str, str] = {}
         all_weight_names: list = []
         for layer in lora_adapter.layers:
             all_weight_names.extend(layer.weights.keys())
@@ -949,6 +950,7 @@ class LoRAMemoryPool:
         for name in all_weight_names:
             try:
                 target_module = get_target_module_name(name, self.target_modules)
+                weight_to_target[name] = target_module
                 matched_modules.add(target_module)
             except ValueError:
                 skipped_weight_names.add(name)
@@ -1004,7 +1006,9 @@ class LoRAMemoryPool:
             }
 
             for name, weights in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
+                target_module = weight_to_target.get(name)
+                if target_module is None:
+                    continue
 
                 # Check if this is an MoE weight (has expert index in name)
                 expert_match = re.search(r"experts\.(\d+)\.", name)
@@ -1446,7 +1450,9 @@ class LoRAMemoryPool:
 
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
-                target_module = get_target_module_name(name, self.target_modules)
+                target_module = weight_to_target.get(name)
+                if target_module is None:
+                    continue
                 if (
                     target_module == "embed_tokens"
                     and lora_embed_tokens_module is not None
