@@ -20,6 +20,60 @@ fn add_leaf<K: ChildKeyType>(core: &mut UnifiedTreeCore<K>, parent: NodeIdx_, ke
 }
 
 #[test]
+fn rotation_phase_counts_the_prefix_pages() {
+    for page_size in [1, 4, 64] {
+        for rotation_base in [0, 2] {
+            let mut core = UnifiedTreeCore::new(
+                CacheInitParams {
+                    page_size,
+                    ..CacheInitParams::default()
+                },
+                vec![FULL],
+            );
+            let tokens: Vec<i64> = (0..4 * page_size as i64).collect();
+            let mut sibling = tokens[..3 * page_size].to_vec();
+            sibling.extend((1000..).take(page_size));
+            let mut short_branch = tokens[..page_size].to_vec();
+            short_branch.extend((2000..).take(page_size));
+            // Two splits leave multiple ancestors above the original leaf.
+            for key in [&tokens, &sibling, &short_branch] {
+                core.insert(&InsertParams {
+                    rotation_base: Some(rotation_base),
+                    ..insert_params(key, key)
+                });
+            }
+            for (key, prefix_pages) in [
+                (tokens[..page_size].to_vec(), 0),
+                (tokens[..3 * page_size].to_vec(), 1),
+                (tokens, 3),
+                (sibling, 3),
+                (short_branch, 1),
+            ] {
+                let node = core.match_prefix(&match_params(&key)).last_device_node_id;
+                assert_eq!(
+                    core.rotation_phase_of(node).unwrap(),
+                    Some(rotation_base + prefix_pages),
+                    "page_size={page_size}, rotation_base={rotation_base}"
+                );
+            }
+            assert_eq!(
+                core.rotation_phase_of(core.root_node_handle(None)).unwrap(),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn unsharded_node_has_no_rotation_phase() {
+    let mut core = core();
+    let key = vec![1, 2, 3];
+    core.insert(&insert_params(&key, &[10, 11, 12]));
+    let node = core.match_prefix(&match_params(&key)).last_device_node_id;
+    assert_eq!(core.rotation_phase_of(node).unwrap(), None);
+}
+
+#[test]
 fn component_size_adjustment_tracks_changed_backing_through_locks_and_eviction() {
     let mut core = core();
     let root = core.arena.root();
