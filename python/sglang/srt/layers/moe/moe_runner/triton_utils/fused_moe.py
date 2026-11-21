@@ -757,8 +757,6 @@ def _fused_moe_kernel_sequence(
         and 128 < N // 2 < 256
         and (N // 2) % 16 == 0
     )
-    from sglang.srt.environ import envs
-
     try:
         deterministic = get_exec().deterministic
         det_disabled = (
@@ -769,7 +767,6 @@ def _fused_moe_kernel_sequence(
         det_disabled = False
     use_native_fused_fp8_contig = (
         not use_native_fused_fp8_tail
-        and not envs.SGLANG_DISABLE_SILU_BLOCK_FP8_QUANT_FUSION.get()
         and not torch.compiler.is_compiling()
         and not is_batch_invariant_mode_enabled()
         and not det_disabled

@@ -232,7 +232,6 @@ class Qwen2MoeMLP(nn.Module):
     def _can_use_silu_block_fp8_quant_fusion(self, gate_up: torch.Tensor) -> bool:
         if (
             not _is_cuda
-            or envs.SGLANG_DISABLE_SILU_BLOCK_FP8_QUANT_FUSION.get()
             or torch.compiler.is_compiling()
             or gate_up.dtype != torch.bfloat16
             or gate_up.ndim != 2

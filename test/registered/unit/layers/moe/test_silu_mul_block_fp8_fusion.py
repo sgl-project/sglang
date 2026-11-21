@@ -81,14 +81,13 @@ class TestQwen2MoeMlpBlockFp8FusionGating(CustomTestCase):
         ):
             self.assertTrue(mlp._can_use_silu_block_fp8_quant_fusion(gate_up))
 
-        # Rejects kill switch, deterministic/RL/LoRA/SP modes, batch-invariant,
+        # Rejects deterministic/RL/LoRA/SP modes, batch-invariant,
         # M=0, non-bf16, unsupported widths, base_layer, and MXFP8/Marlin.
         def _run_gate(
             mod,
             tensor,
             *,
             bi=False,
-            disable_env=False,
             det=False,
             rl_target=None,
             lora=False,
@@ -104,10 +103,6 @@ class TestQwen2MoeMlpBlockFp8FusionGating(CustomTestCase):
             fwd_ctx = SimpleNamespace(sp_active=sp)
             with (
                 patch("sglang.srt.models.qwen2_moe._is_cuda", True),
-                patch(
-                    "sglang.srt.models.qwen2_moe.envs.SGLANG_DISABLE_SILU_BLOCK_FP8_QUANT_FUSION.get",
-                    return_value=disable_env,
-                ),
                 patch(
                     "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
                     return_value=bi,
@@ -139,7 +134,6 @@ class TestQwen2MoeMlpBlockFp8FusionGating(CustomTestCase):
         lora_wrapped.down_proj.base_layer = object()
 
         for desc, mod, tensor, kw in [
-            ("kill_switch", _make_mlp(), gate_up, {"disable_env": True}),
             ("batch_invariant", _make_mlp(), gate_up, {"bi": True}),
             ("deterministic", _make_mlp(), gate_up, {"det": True}),
             ("rl_on_policy", _make_mlp(), gate_up, {"rl_target": "ref"}),
