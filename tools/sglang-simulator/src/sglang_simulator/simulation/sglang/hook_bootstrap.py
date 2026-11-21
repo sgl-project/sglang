@@ -53,6 +53,11 @@ def install_simulator_hooks() -> None:
             mem_pool_host.C_GenericHostKVCacheSubclassHook,
         ]
     )
+    from sglang_simulator.simulation.sglang.macos_compat import (
+        install_macos_cpu_compat,
+    )
+
+    install_macos_cpu_compat()
     _HOOKS_INSTALLED = True
 
 
