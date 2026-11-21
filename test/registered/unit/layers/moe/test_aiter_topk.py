@@ -479,8 +479,9 @@ class TestAiterSharedColumnsContract(CustomTestCase):
                 patch.object(topk_module, ordinary, side_effect=_Ordinary),
             ):
                 with self.assertRaises(_Ordinary):
+                    # The router reduces fp32 partials into an fp32 logits buffer.
                     topk_module.select_experts(
-                        hidden_states, router_logits, config, **kwargs
+                        hidden_states, router_logits.float(), config, **kwargs
                     )
         self.assertEqual(self.fake_kernel.calls, [])
         self.assertIsNone(config.aiter_shared_columns)
