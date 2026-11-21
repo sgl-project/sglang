@@ -159,7 +159,7 @@ def image_source(request, monkeypatch):
         "AsyncClient",
         lambda **kwargs: client_cls(transport=transport, **kwargs),
     )
-    return "https://example.invalid/image.png", ".png"
+    return "https://93.184.216.34/image.png", ".png"
 
 
 def test_save_image_sources_within_uploads_root(tmp_path, image_source):
