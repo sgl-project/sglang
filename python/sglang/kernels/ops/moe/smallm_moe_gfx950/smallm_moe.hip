@@ -24,8 +24,10 @@ static constexpr int DIM = 4096;
 static constexpr int MAX_NSLOT = 704;    // tok*slots <= 704 (tok <= 64 at 11 slots)
 
 __device__ __forceinline__ float e8m0_to_f32(uint32_t b) { return __uint_as_float(b << 23); }
+// byte offset of e8m0 scale (row, col) in the e8m0_shuffle layout of a [rows, C] scale; e8m0_shuffle pads C up to a
+// multiple of 8 (C = 4 at per-rank intermediate 128)
 __device__ __forceinline__ uint32_t sc_off(uint32_t row, uint32_t col, uint32_t C) {
-    return ((((row >> 5) * (C >> 3) + (col >> 3)) * 4 + (col & 3)) * 16 + (row & 15)) * 4 + ((col >> 2) & 1) * 2 + ((row >> 4) & 1);
+    return ((((row >> 5) * ((C + 7) >> 3) + (col >> 3)) * 4 + (col & 3)) * 16 + (row & 15)) * 4 + ((col >> 2) & 1) * 2 + ((row >> 4) & 1);
 }
 __device__ __forceinline__ bf16x8 cvt8(uint32_t d, float sc) {
     bf16x2 a = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(d, sc, 0);
@@ -407,6 +409,9 @@ extern "C" __global__ void __launch_bounds__(256) smallm_p2_i256_s10(Args a) { p
 extern "C" __global__ void __launch_bounds__(256) smallm_p2b_i256(Args a) { p2b_body<256>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_p2_i512_s11(Args a) { p2_body<512, 11>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_p2_i512_s10(Args a) { p2_body<512, 10>(a); }
+extern "C" __global__ void __launch_bounds__(256) smallm_p1_i128_c16(Args a) { p1_body<128, 4, 16>(a); }
+extern "C" __global__ void __launch_bounds__(256) smallm_p2_i128_s11(Args a) { p2_body<128, 11>(a); }
+extern "C" __global__ void __launch_bounds__(256) smallm_p2_i128_s10(Args a) { p2_body<128, 10>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_f8_p1_i256_c16(Args a) { p1_body<256, 4, 16, true>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_f8_p1_i128_c16(Args a) { p1_body<128, 4, 16, true>(a); }
 extern "C" __global__ void __launch_bounds__(256) smallm_f8_p2_i256_s11(Args a) { p2_body<256, 11, true>(a); }
