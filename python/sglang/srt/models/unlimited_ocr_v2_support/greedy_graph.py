@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.sampling.watermarking.core import WatermarkState
 
 
 class UocrGreedyGraph:
@@ -77,14 +76,12 @@ class UocrGreedyGraph:
         self,
         logits_output: LogitsProcessorOutput,
         forward_batch: ForwardBatch,
-        *,
-        watermark_state: Optional[WatermarkState],
     ) -> Optional[torch.Tensor]:
         """The graph-recorded greedy ids if they equal what the sampler would pick."""
         if forward_batch is not self._replayed_batch:
             return None
         sampling_info = forward_batch.sampling_info
-        if watermark_state is not None and sampling_info.has_watermark_candidates:
+        if sampling_info.watermark is not None:
             return None
         if (
             not forward_batch.forward_mode.is_decode()
@@ -98,10 +95,7 @@ class UocrGreedyGraph:
             sampling_info.logit_bias is not None
             or sampling_info.grammar_mask is not None
             or sampling_info.has_custom_logit_processor
-            or (
-                sampling_info.penalizer_orchestrator is not None
-                and sampling_info.penalizer_orchestrator.is_required
-            )
+            or sampling_info.step_penalties is not None
         ):
             return None
         rows = int(logits_output.next_token_logits.shape[0])

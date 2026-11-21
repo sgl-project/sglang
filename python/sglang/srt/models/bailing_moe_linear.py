@@ -74,11 +74,13 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_xpu,
 )
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -87,7 +89,7 @@ _is_cpu = is_cpu()
 class DsV3MLA(DeepseekV2AttentionMLA):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        if kwargs["rope_scaling"]:
+        if kwargs["rope_scaling"] and not _is_xpu:
             self.rotary_emb.forward = self.rotary_emb.forward_cuda
 
 
