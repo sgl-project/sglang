@@ -114,6 +114,16 @@ pub(crate) fn tag_images(ids: Vec<u32>, placeholders: &[u32], images: &[String])
     tagged
 }
 
+/// Length of the rendered prompt before routing-only image identity tags were added.
+pub(crate) fn rendered_token_count(mut ids: &[u32]) -> usize {
+    let mut count = 0;
+    while let Some(marker) = ids.iter().position(|&id| id == MEDIA_TAG_MARK) {
+        count += marker;
+        ids = &ids[(marker + MEDIA_TAG_LEN).min(ids.len())..];
+    }
+    count + ids.len()
+}
+
 /// An image's identity tag: [`MEDIA_TAG_MARK`], then the leading bytes of its
 /// source's SHA-256, as a URL or data URL is the identity the engine's own
 /// image hash follows.
@@ -747,6 +757,24 @@ mod tests {
             {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
         ]}]});
         assert!(formatter.encode(&tokenizer, &video_chat).is_err());
+    }
+
+    #[test]
+    fn routing_tags_do_not_contribute_to_prompt_length() {
+        let ids = [
+            4,
+            9,
+            MEDIA_TAG_MARK,
+            MEDIA_TAG_MARK,
+            10,
+            9,
+            MEDIA_TAG_MARK,
+            8,
+            9,
+            2,
+        ];
+        assert_eq!(rendered_token_count(&ids), 4);
+        assert_eq!(rendered_token_count(&[4, 9, 2]), 3);
     }
 
     #[test]

@@ -245,7 +245,18 @@ impl PreparedRequest {
         // Routing tokens can replace engine tokenization only for supported chat templates.
         let forwarding = forwarding_scope
             .map(|scope| input_ids_forwarding(scope, parsed_body.as_ref(), tokens.as_ref()));
-        let input_tokens = input_token_count(tokens.as_ref(), &body);
+        // Only a rendered multipart chat can contain router-inserted image tags.
+        let input_tokens = match &tokens {
+            Some(t)
+                if t.rendered_from_chat
+                    && parsed_body
+                        .as_ref()
+                        .is_some_and(request_has_non_text_content) =>
+            {
+                crate::tokenizer::rendered_token_count(&t.ids).max(1)
+            }
+            _ => input_token_count(tokens.as_ref(), &body),
+        };
         let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
             path,
