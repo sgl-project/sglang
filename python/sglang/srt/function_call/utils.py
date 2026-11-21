@@ -7,6 +7,7 @@ import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from urllib.parse import unquote
 
 import orjson
 import partial_json_parser
@@ -332,23 +333,61 @@ def _get_tool_schema(tool: Tool) -> dict:
     }
 
 
+def _resolve_local_schema_ref(ref: str, root: dict) -> Any:
+    """Resolve an internal JSON Pointer ``$ref`` inside ``root``."""
+    if not ref.startswith("#/"):
+        return None
+    node: Any = root
+    for raw_part in ref[2:].split("/"):
+        part = unquote(raw_part).replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            if part not in node:
+                return None
+            node = node[part]
+        elif isinstance(node, list) and part.isdigit():
+            index = int(part)
+            if index < 0 or index >= len(node):
+                return None
+            node = node[index]
+        else:
+            return None
+    return node
+
+
 def get_schema_properties(schema: Any) -> Dict[str, Any]:
-    """Top-level ``properties`` of a tool ``parameters`` schema, descending
-    into ``anyOf``/``oneOf``/``allOf`` branches when the top level declares
-    none (legal JSON Schema, e.g. discriminated-union arguments)."""
+    """Collect top-level ``properties`` of a tool ``parameters`` schema,
+    descending into ``anyOf``/``oneOf``/``allOf`` branches and local ``$ref``s."""
     if not isinstance(schema, dict):
         return {}
     properties = schema.get("properties")
-    if isinstance(properties, dict):
+    if isinstance(properties, dict) and not any(
+        key in schema for key in ("$ref", "anyOf", "oneOf", "allOf")
+    ):
         return properties
-    merged: Dict[str, Any] = {}
-    for keyword in ("anyOf", "oneOf", "allOf"):
-        branches = schema.get(keyword)
-        if isinstance(branches, list):
-            for branch in branches:
-                for key, value in get_schema_properties(branch).items():
+
+    def _collect(node: Any, seen: frozenset[int]) -> Dict[str, Any]:
+        if not isinstance(node, dict) or id(node) in seen:
+            return {}
+        next_seen = seen | {id(node)}
+        merged: Dict[str, Any] = {}
+        direct = node.get("properties")
+        if isinstance(direct, dict):
+            merged.update(direct)
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            target = _resolve_local_schema_ref(ref, schema)
+            if target is not None:
+                for key, value in _collect(target, next_seen).items():
                     merged.setdefault(key, value)
-    return merged
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            branches = node.get(keyword)
+            if isinstance(branches, list):
+                for branch in branches:
+                    for key, value in _collect(branch, next_seen).items():
+                        merged.setdefault(key, value)
+        return merged
+
+    return _collect(schema, frozenset())
 
 
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:

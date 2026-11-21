@@ -28,8 +28,10 @@ from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.granite_toolcall_detector import GraniteToolCallDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
@@ -38,6 +40,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -6196,6 +6199,118 @@ class TestGetSchemaProperties(unittest.TestCase):
         )
         self.assertEqual(get_schema_properties({"oneOf": "not-a-list"}), {})
 
+    def test_properties_combined_with_combinators(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "string"},
+            },
+            "allOf": [
+                {
+                    "properties": {
+                        "limit": {"type": "integer"},
+                        "enabled": {"type": "boolean"},
+                    }
+                }
+            ],
+            "anyOf": [{"properties": {"tag": {"type": "string"}}}],
+        }
+        # Explicit outer properties win on duplicates; combinators supply the rest.
+        self.assertEqual(
+            get_schema_properties(schema),
+            {
+                "query": {"type": "string"},
+                "limit": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "tag": {"type": "string"},
+            },
+        )
+        empty_top = {
+            "type": "object",
+            "properties": {},
+            "allOf": [{"properties": {"flag": {"type": "boolean"}}}],
+        }
+        self.assertEqual(
+            get_schema_properties(empty_top), {"flag": {"type": "boolean"}}
+        )
+
+    def test_local_ref_and_escaped_pointer(self):
+        root_ref = {
+            "$ref": "#/$defs/Base~1Core%20Args",
+            "properties": {"extra": {"type": "integer"}},
+            "$defs": {
+                "Base/Core Args": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "allOf": [{"$ref": "#/definitions/Mixin"}],
+                }
+            },
+            "definitions": {
+                "Mixin": {
+                    "type": "object",
+                    "properties": {"units": {"type": "string"}},
+                }
+            },
+        }
+        self.assertEqual(
+            get_schema_properties(root_ref),
+            {
+                "extra": {"type": "integer"},
+                "city": {"type": "string"},
+                "units": {"type": "string"},
+            },
+        )
+        unresolvable = {
+            "$ref": "https://example.com/external.json",
+            "allOf": [{"$ref": "#/$defs/Missing"}],
+        }
+        self.assertEqual(get_schema_properties(unresolvable), {})
+
+    def test_cyclic_ref_and_diamond_dag(self):
+        cyclic = {
+            "$ref": "#/$defs/NodeA",
+            "$defs": {
+                "NodeA": {
+                    "properties": {"a": {"type": "string"}},
+                    "allOf": [{"$ref": "#/$defs/NodeB"}],
+                },
+                "NodeB": {
+                    "properties": {"b": {"type": "integer"}},
+                    "allOf": [{"$ref": "#/$defs/NodeA"}],
+                },
+            },
+        }
+        self.assertEqual(
+            get_schema_properties(cyclic),
+            {"a": {"type": "string"}, "b": {"type": "integer"}},
+        )
+        diamond = {
+            "allOf": [
+                {"$ref": "#/$defs/Left"},
+                {"$ref": "#/$defs/Right"},
+            ],
+            "$defs": {
+                "Shared": {"properties": {"s": {"type": "boolean"}}},
+                "Left": {
+                    "allOf": [{"$ref": "#/$defs/Shared"}],
+                    "properties": {"l": {"type": "string"}},
+                },
+                "Right": {
+                    "allOf": [{"$ref": "#/$defs/Shared"}],
+                    "properties": {"r": {"type": "integer"}},
+                },
+            },
+        }
+        self.assertEqual(
+            get_schema_properties(diamond),
+            {
+                "l": {"type": "string"},
+                "s": {"type": "boolean"},
+                "r": {"type": "integer"},
+            },
+        )
+
 
 class TestTopLevelCompositeToolSchema(unittest.TestCase):
     """Parsers must resolve argument types when tool ``parameters`` declares
@@ -6334,6 +6449,76 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
         )
         self.assertEqual(name, "acme")
         self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_properties_combined_with_allof_and_ref_across_detectors(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "allOf": [
+                            {"$ref": "#/$defs/FilterArgs"},
+                            {
+                                "properties": {
+                                    "limit": {"type": "integer"},
+                                    "enabled": {"type": "boolean"},
+                                }
+                            },
+                        ],
+                        "$defs": {
+                            "FilterArgs": {
+                                "type": "object",
+                                "properties": {"tag": {"type": "string"}},
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+
+        granite_wire = (
+            "<tool_call><function=search>"
+            "<parameter=query>123</parameter>"
+            "<parameter=limit>5</parameter>"
+            "<parameter=enabled>true</parameter>"
+            "<parameter=tag>42</parameter>"
+            "</function></tool_call>"
+        )
+        granite_res = GraniteToolCallDetector().detect_and_parse(granite_wire, tools)
+        self.assertEqual(
+            json.loads(granite_res.calls[0].parameters),
+            {"query": "123", "limit": 5, "enabled": True, "tag": "42"},
+        )
+
+        spark_wire = (
+            "<tool_call>search"
+            "<arg_key>limit</arg_key><arg_value>5</arg_value>"
+            "<arg_key>enabled</arg_key><arg_value>true</arg_value>"
+            "<arg_key>tag</arg_key><arg_value>42</arg_value>"
+            "</tool_call>"
+        )
+        spark_res = Spark25Detector().detect_and_parse(spark_wire, tools)
+        self.assertEqual(
+            json.loads(spark_res.calls[0].parameters),
+            {"limit": 5, "enabled": True, "tag": "42"},
+        )
+
+        k2_wire = (
+            "<ifm|tool_calls><ifm|tool_call>search\n"
+            "<ifm|arg_key>query</ifm|arg_key><ifm|arg_value>123</ifm|arg_value>"
+            "<ifm|arg_key>limit</ifm|arg_key><ifm|arg_value>5</ifm|arg_value>"
+            "<ifm|arg_key>enabled</ifm|arg_key><ifm|arg_value>true</ifm|arg_value>"
+            "<ifm|arg_key>tag</ifm|arg_key><ifm|arg_value>42</ifm|arg_value>"
+            "</ifm|tool_call></ifm|tool_calls>"
+        )
+        k2_res = K2V3Detector().detect_and_parse(k2_wire, tools)
+        self.assertEqual(
+            json.loads(k2_res.calls[0].parameters),
+            {"query": "123", "limit": 5, "enabled": True, "tag": "42"},
+        )
 
 
 class TestMuseSparkFunctionCallParser(CustomTestCase):
