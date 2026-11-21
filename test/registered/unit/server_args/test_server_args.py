@@ -2114,6 +2114,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
 
         with (
+            override_platform(is_xpu=False),
             patch(
                 "sglang.srt.arg_groups.hisparse_hook.model_config_of",
                 return_value=model_config,
