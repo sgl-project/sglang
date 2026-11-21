@@ -1331,7 +1331,7 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
         and turn
         and all(isinstance(m, dict) and "role" in m and "content" in m for m in turn)
     ):
-        return [{"role": m["role"], "content": m["content"]} for m in turn]
+        return [dict(m) for m in turn]
     return None
 
 
