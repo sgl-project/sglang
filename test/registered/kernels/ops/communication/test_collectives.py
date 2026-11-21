@@ -10,10 +10,11 @@ import torch.distributed as dist
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention import attn_res
-from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication import (
     attn_res_collective,
     gemm_ag,
+    kimi_k3_comm,
+    nvlink_comm,
     sp_collective,
 )
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
@@ -27,6 +28,19 @@ from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(est_time=21, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
+
+
+def _rows(t):
+    """nvlink_comm's [tokens, hidden] view: K3 rows where they divide, else 16-byte rows."""
+    if t is None:
+        return None
+    return t.view(-1, 3584) if t.numel() % 3584 == 0 else t.view(-1, 8)
+
+
+def _push_res(comm, x, residual):
+    """In place: ``x = allreduce(x) [+ residual]``, 1-shot push (K3's small-message path)."""
+    nvlink_comm.all_reduce_push(comm.obj, _rows(x), _rows(x), _rows(residual))
+
 
 _HIDDEN_SIZE = 7168
 # The GEMV table's two ends, the first batch past it (slice GEMM + gather_add3 only),
@@ -80,7 +94,7 @@ def _init_comm():
     )
     if comm.disabled or not comm.has_multicast:
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
-    all_reduce.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    kimi_k3_comm.register_comm(lambda: comm.obj, world_size=comm.world_size)
     sp_collective.register_comm(lambda: comm.obj, world_size=comm.world_size)
     attn_res_collective.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
@@ -131,11 +145,7 @@ def test_all_reduce_push():
     dist.all_reduce(expected, group=nccl_group)
     expected += residual
 
-    all_reduce.all_reduce_push_res(
-        comm.world_size,
-        x,
-        residual,
-    )
+    _push_res(comm, x, residual)
     torch.cuda.synchronize()
     torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
@@ -337,7 +347,7 @@ def test_attention_residual_direct_all_gather():
 
 def _precompile(num_gpus):
     for world_size in num_gpus:
-        all_reduce._jit_module(world_size)
+        nvlink_comm._jit_push_module(torch.bfloat16, world_size)
         sp_collective._jit_module(world_size)
         if world_size in gemm_ag.WORLD_SIZES:
             gemm_ag._jit_module(world_size)

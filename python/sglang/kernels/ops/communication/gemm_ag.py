@@ -5,8 +5,8 @@ Each rank produces its ``7168 / world``-column slice of the latent MoE up_proj
 push workspace, where a Lamport-spin consumer assembles
 ``out = up_proj(x) + b (+ c)``. :func:`gemm_ag_up_proj` fuses a GEMV producer;
 :func:`gather_add3` takes a slice the caller computed. Needs
-:func:`sglang.kernels.ops.communication.all_reduce_residual.register_comm` once
-beforehand (the same registration the push all-reduce uses).
+:func:`sglang.kernels.ops.communication.kimi_k3_comm.register_comm` once
+beforehand.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.communication.all_reduce_residual import get_comm
+from sglang.kernels.ops.communication.kimi_k3_comm import get_comm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

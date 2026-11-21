@@ -72,8 +72,10 @@ def provider(monkeypatch):
     monkeypatch.setattr(custom, "can_fuse_all_reduce", lambda m, h: True)
     plain = Mock(return_value=(torch.ones(2, 8), torch.full((2, 8), 2.0)))
     finalize = Mock(return_value=(torch.ones(2, 8), torch.full((2, 8), 3.0)))
-    monkeypatch.setattr(custom, "all_reduce_residual_norm", plain)
-    monkeypatch.setattr(custom, "moe_finalize_all_reduce_residual_norm", finalize)
+    monkeypatch.setattr(custom.ar_fusion, "all_reduce_residual_norm", plain)
+    monkeypatch.setattr(
+        custom.ar_fusion, "moe_finalize_all_reduce_residual_norm", finalize
+    )
     rows = Layout(frozenset())
     plan = SimpleNamespace(
         norm=_norm(),
@@ -114,7 +116,6 @@ def test_supported_batch_fuses_each_consumer(provider, mode):
     p.finalize.assert_called_once()
     for call in (*p.plain.call_args_list, *p.finalize.call_args_list):
         assert call.kwargs["world_size"] == 4
-        assert call.kwargs["residual_out"].data_ptr() != residual.data_ptr()
     assert torch.count_nonzero(residual) == 0
 
 
@@ -192,7 +193,7 @@ def test_handoff_without_shared_expert_fuses(provider):
     finalize, _ = p.fusion.attn_input_fusions(p.plan)
     assert finalize(handoff, residual, p.batch, None) is not None
     p.finalize.assert_called_once()
-    assert p.finalize.call_args.args[4] is None
+    assert p.finalize.call_args.kwargs["shared_output"] is None
 
 
 def test_declined_sum_completes_once_before_normal_read(provider):

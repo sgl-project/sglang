@@ -1,5 +1,5 @@
 """Gemma-4 fused all-reduce sites: glue between ``models/gemma4_causal.py`` and
-``kernels.ops.communication.gemma4_ar_fusion``.
+``kernels.ops.communication.fused_all_reduce.pull``.
 
 Opt-in with ``SGLANG_GEMMA4_AR_FUSION=1``. Extend, mixed and decode batches
 of up to ``SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS`` tokens run every
@@ -16,12 +16,18 @@ linear takes pre-quantized ``(fp8, scales)`` input.
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
 from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication import fused_all_reduce
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +52,8 @@ def requested() -> bool:
 
 
 class _State(NamedTuple):
-    group: torch.distributed.ProcessGroup  # the TP CPU group
+    lease: WorkspaceLease
+    pull_blocks: int  # the fused sites' grid
     world_size: int
     rank: int
     group_name: str
@@ -82,18 +89,18 @@ def _get_state() -> Optional[_State]:
             "is unavailable"
         )
         return None
-    from sglang.kernels.ops.communication import gemma4_ar_fusion as mod
     from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
         get_all_reduce_config,
     )
 
-    # the fused sites' grid: the custom all-reduce's pull width, which they were tuned with
-    pull_blocks = get_all_reduce_config(lease.world_size).num_pull_blocks
-    mod.register_comm(
-        lambda: lease.get_communicator(pull_blocks=pull_blocks),
+    return _State(
+        lease=lease,
+        # the custom all-reduce's pull width, which the fused sites were tuned with
+        pull_blocks=get_all_reduce_config(lease.world_size).num_pull_blocks,
         world_size=lease.world_size,
+        rank=lease.rank,
+        group_name=group.cpu_group.group_name,
     )
-    return _State(lease.group, lease.world_size, lease.rank, group.cpu_group.group_name)
 
 
 class _Symm(NamedTuple):
@@ -130,9 +137,8 @@ class Gemma4ArFusion:
     """
 
     def __init__(self, state: _State, hidden_size: int, eps: float):
-        from sglang.kernels.ops.communication import gemma4_ar_fusion as mod
-
-        self._mod = mod
+        self._comm = state.lease.get_communicator(pull_blocks=state.pull_blocks)
+        self._num_blocks = state.pull_blocks
         self.world_size, self.rank = state.world_size, state.rank
         self.eps = float(eps)
         self.hidden = hidden_size
@@ -146,11 +152,9 @@ class Gemma4ArFusion:
         self.scales = _symm_buffer(
             (H // GROUP, _tma_aligned_rows(T)), torch.float32, state.group_name
         )
-        dev = self.partial.tensor.device
-        self.one = torch.ones(1, dtype=torch.float32, device=dev)
         self.used = set()  # "extend" / "decode" once their first fused forward ran
         torch.cuda.synchronize()
-        torch.distributed.barrier(state.group)
+        torch.distributed.barrier(state.lease.group)
         logger.info(
             "gemma4 all-reduce fusion: tp=%d, up to %d tokens, %.0f MB symmetric memory",
             self.world_size,
@@ -198,12 +202,13 @@ class Gemma4ArFusion:
         self,
         partial: torch.Tensor,
         residual: torch.Tensor,
-        w_a: torch.Tensor,
-        w_b: torch.Tensor,
+        post_norm_weight: torch.Tensor,
+        next_norm_weight: torch.Tensor,
         scalar: Optional[torch.Tensor],
-        round_a: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """allreduce(partial) -> norm(w_a) -> + residual (x scalar) -> norm(w_b) -> FP8.
+        """allreduce(partial) -> norm(post_norm_weight) -> + residual (x scalar)
+        -> norm(next_norm_weight) -> FP8, rounded to bf16 where Hugging Face's
+        layer rounds.
 
         Updates ``residual`` (this rank's rows) in place; returns ``(fp8 [T, H],
         fp32 scales [T, H / 128])`` for every row, the pre-quantized input of the
@@ -213,22 +218,23 @@ class Gemma4ArFusion:
         T = partial.shape[0]
         row0, rows = self.rows(T)
         scales = scales_view(self.scales.tensor, self.scales.tensor.shape[0], T)
-        self._mod.site(
+        fused_all_reduce.pull.all_reduce_norm_residual_norm_quant(
+            self._comm,
             self._stage(partial),
             self.partial.mc,
+            residual,
+            post_norm_weight,
+            next_norm_weight,
+            scalar,
+            self.eps,
             self.out.tensor[:T],
             self.out.mc,
             scales,
             self.scales.mc,
-            residual,
-            w_a,
-            w_b,
-            self.one if scalar is None else scalar,
-            self.eps,
-            row0,
-            rows,
-            round_a,
-            world_size=self.world_size,
+            row0=row0,
+            rows=rows,
+            num_blocks=self._num_blocks,
+            rows_per_group=1,
         )
         return self.out.tensor[:T], scales
 
@@ -236,25 +242,27 @@ class Gemma4ArFusion:
         self,
         partial: torch.Tensor,
         residual: torch.Tensor,
-        w_a: torch.Tensor,
+        post_norm_weight: torch.Tensor,
         scalar: torch.Tensor,
     ) -> torch.Tensor:
-        """allreduce(partial) -> norm(w_a) -> (+ residual) x scalar, every row as
-        bf16 (in the partial buffer)."""
+        """allreduce(partial) -> norm(post_norm_weight) -> (+ residual) x scalar,
+        every row as bf16 (in the partial buffer)."""
         T = partial.shape[0]
         row0, rows = self.rows(T)
         staged = self._stage(partial)
-        self._mod.final(
-            staged,
-            self.partial.mc,
+        fused_all_reduce.pull.all_reduce_norm_residual(
+            self._comm,
             staged,
             self.partial.mc,
             residual,
-            w_a,
+            post_norm_weight,
             scalar,
             self.eps,
-            row0,
-            rows,
-            world_size=self.world_size,
+            staged,
+            self.partial.mc,
+            row0=row0,
+            rows=rows,
+            num_blocks=self._num_blocks,
+            rows_per_group=1,
         )
         return staged

@@ -728,7 +728,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         self._ep_a2a = _uses_ep_a2a()
 
         # Defer the trtllm-gen finalize (top-k weighted unpermute) into the
-        # push all-reduce's staging pass (k3_ar_fusion.finalize_all_reduce_push_norm)
+        # push all-reduce's staging pass (k3_ar_fusion.moe_finalize_all_reduce_norm)
         # so the rank-local latent never materializes. Sizes beyond the push
         # window fall back to the in-op finalize at runtime.
         self._defer_moe_finalize = (
@@ -1765,7 +1765,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 not scatters
                 and self._defer_moe_finalize
                 and self.fuse_ar_norm
-                and k3_ar_fusion.finalize_push_fits(num_tokens)
+                and k3_ar_fusion.moe_finalize_all_reduce_norm_fits(num_tokens)
             )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1795,15 +1795,13 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 with torch.cuda.stream(self.alt_stream):
                     self._forward_shared(gate_up, shared_output)
                     # low-SM pull so the side-stream AR leaves the SMs to the
-                    # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
+                    # routed GEMMs it overlaps
                     if scatters:
                         shared_output = k3_sp_collective.sp_reduce_scatter(
                             shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
                         )
                     else:
-                        k3_ar_fusion.all_reduce_low_sm(
-                            shared_output, num_blocks=4, unroll=8
-                        )
+                        k3_ar_fusion.all_reduce_low_sm(shared_output)
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
@@ -1813,7 +1811,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 # finalize folded into the push AR's staging pass; the norm
                 # covers every latent row
                 fused_norm = True
-                k3_ar_fusion.finalize_all_reduce_push_norm(
+                k3_ar_fusion.moe_finalize_all_reduce_norm(
                     latent,
                     deferred.gemm2_out,
                     deferred.expanded_idx_to_permuted_idx,
@@ -1822,7 +1820,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 )
             elif self.fuse_ar_norm:
                 fused_norm = True
-                k3_ar_fusion.all_reduce_norm(
+                k3_ar_fusion.all_reduce_norm_prefix(
                     latent.view(-1, self.moe_hidden_size),
                     *self._get_fused_norm_params(),
                     num_tokens=num_tokens,
@@ -1850,7 +1848,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 shared_output = k3_sp_collective.sp_reduce_scatter(shared_output)
             elif self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
-                k3_ar_fusion.all_reduce_norm(
+                k3_ar_fusion.all_reduce_norm_prefix(
                     buf.view(-1, k3_ar_fusion.NORM_DIM),
                     *self._get_fused_norm_params(),
                     num_tokens=num_tokens,

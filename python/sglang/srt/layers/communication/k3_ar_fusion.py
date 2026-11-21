@@ -3,10 +3,11 @@
 Auto-enabled on SM100/SM103 when the TP symmetric workspace has multicast; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
 1 = attempt anywhere and warn when unavailable).
 
-Glue between the model and the
-``kernels.ops.communication.all_reduce_residual`` kernels. Small messages take
-the 1shot multicast-push through the group's symmetric workspace; large ones take the in-place NVLS 2shot, which needs its input to be a
-:func:`symm_buffer` slice and otherwise falls back to the regular all-reduce.
+Glue between the model and the ``nvlink_comm`` all-reduce and the
+``fused_all_reduce_{push,pull}`` norm kernels. Small messages take the 1-shot
+push through the group's symmetric workspace; large ones take the in-place NVLS
+2-shot, which needs its input to be a :func:`symm_buffer` slice and otherwise
+falls back to the regular all-reduce.
 
 Call-site contract when the fusion is active: ``enabled()`` was
 checked once (which initializes the state), ``x`` is bf16 and contiguous,
@@ -17,13 +18,16 @@ as the attn-res prefix sum) or ``None``.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, overload
 
 import torch
 
 import sglang.srt.runtime_context as ctx
 from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication import fused_all_reduce, kimi_k3_comm, nvlink_comm
 from sglang.srt.environ import envs
+from sglang.srt.layers.communication import ar_fusion
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.symm_workspace import (
@@ -37,9 +41,18 @@ logger = logging.getLogger(__name__)
 _PUSH_MAX_BYTES = 512 * 1024
 
 # Latent width of the K3 latent|shared MoE buffer the fused-norm AR expects
-# ([N, NORM_DIM] latent then [N, 2*NORM_DIM] shared). MUST match kNormDim in
-# csrc/kimi_k3/comm/ar_fusion.cuh — the mod hardcodes this row width.
+# ([N, NORM_DIM] latent then [N, 2*NORM_DIM] shared).
 NORM_DIM = 3584
+
+# Fused-norm pull: 2 rows per group; CTAs by message size. Measured on GB300 x8.
+_PULL_ROWS_PER_GROUP = 2
+_PULL_SMALL_MAX_BYTES = 672 * 1024
+_PULL_SMALL_NUM_BLOCKS = 8
+_PULL_LARGE_NUM_BLOCKS = 24
+# Side-stream pull: few CTAs so the routed GEMMs it overlaps keep their SMs.
+# Measured on GB300 x8 at K3 widths (alone, not under overlap).
+_LOW_SM_PULL_BLOCKS = 4
+_LOW_SM_PULL_UNROLL = 8
 
 # :func:`symm_buffer` names: o_proj's [rows, hidden_size] output, and the MoE
 # [latent | shared] pair flattened to rows x (moe_hidden_size + hidden_size).
@@ -122,9 +135,7 @@ def _get_state() -> Optional[_State]:
                 "is unavailable; using the regular all-reduce path."
             )
         return None
-    from sglang.kernels.ops.communication import all_reduce_residual as mod
-
-    mod.register_comm(lease.get_communicator, world_size=lease.world_size)
+    kimi_k3_comm.register_comm(lease.get_communicator, world_size=lease.world_size)
     logger.info("K3 all-reduce fusion enabled (world_size=%d)", lease.world_size)
     return _State(lease, group.cpu_group.group_name)
 
@@ -282,83 +293,176 @@ def all_reduce(
     residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x) [+ residual]``; returns ``x``."""
-    from sglang.kernels.ops.communication import all_reduce_residual as mod
-
     state = _get_state()
     assert state is not None
     if x.shape[0] == 0:
         return x if residual is None else x + residual
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes):
-        return mod.all_reduce_push_res(state.world_size, x, residual)
-    return mod.all_reduce_pull_res(
-        state.world_size, x, residual, input_mc_ptr=get_mc_ptr(x)
-    )
+        _k3_push_all_reduce(state.world_size, x, residual)
+    else:
+        _k3_pull_all_reduce(
+            state.world_size,
+            x,
+            get_mc_ptr(x),
+            residual=residual,
+            num_blocks_hint=0,
+            num_unroll=4,
+        )
+    return x
 
 
 def all_reduce_low_sm(
     x: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
-    *,
-    num_blocks: Optional[int] = None,
-    unroll: Optional[int] = None,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x) [+ residual]``, pinned to the low-SM NVLS pull.
 
     For side-stream use: push would fan out over many blocks and steal SMs from
-    the GEMMs it overlaps. ``num_blocks`` / ``unroll`` default to the tuned tables.
+    the GEMMs it overlaps.
     """
-    from sglang.kernels.ops.communication import all_reduce_residual as mod
-
     state = _get_state()
     assert state is not None
     if x.shape[0] == 0:
         return x if residual is None else x + residual
-    return mod.all_reduce_pull_res(
+    _k3_pull_all_reduce(
         state.world_size,
         x,
-        residual,
-        input_mc_ptr=get_mc_ptr(x),
-        num_blocks=num_blocks,
-        unroll=unroll,
+        get_mc_ptr(x),
+        residual=residual,
+        num_blocks_hint=_LOW_SM_PULL_BLOCKS,
+        num_unroll=_LOW_SM_PULL_UNROLL,
+    )
+    return x
+
+
+@overload
+def _rows(t: Literal[None]) -> Literal[None]: ...
+
+
+@overload
+def _rows(t: torch.Tensor) -> torch.Tensor: ...
+
+
+def _rows(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return None if t is None else t.view(-1, NORM_DIM)
+
+
+@register_custom_op(op_name="k3_push_all_reduce", mutates_args=["x"])
+def _k3_push_all_reduce(
+    world_size: int,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+) -> None:
+    rows = _rows(x)
+    nvlink_comm.all_reduce_push(
+        kimi_k3_comm.get_comm(world_size), rows, rows, _rows(residual)
     )
 
 
-def all_reduce_norm(
+@register_custom_op(op_name="k3_pull_all_reduce", mutates_args=["x"])
+def _k3_pull_all_reduce(
+    world_size: int,
     x: torch.Tensor,
-    weight: torch.Tensor,
+    x_mc: int,
+    residual: Optional[torch.Tensor],
+    num_blocks_hint: int,
+    num_unroll: int,
+) -> None:
+    rows = _rows(x)
+    nvlink_comm.all_reduce_pull(
+        kimi_k3_comm.get_comm(world_size),
+        rows,
+        rows,
+        _rows(residual),
+        in_mc_ptr=x_mc,
+        out_mc_ptr=x_mc,
+        num_unroll=num_unroll,
+        num_blocks_hint=num_blocks_hint,
+    )
+
+
+def all_reduce_norm_prefix(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
     eps: float = 1e-6,
     *,
     num_tokens: int,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x)`` with a fused RMSNorm over the first
     ``num_tokens`` rows of the 2D ``[rows, NORM_DIM]`` input."""
-    from sglang.kernels.ops.communication import all_reduce_residual as mod
-
     state = _get_state()
     assert state is not None
     if x.shape[0] == 0:
         return x
     nbytes = x.numel() * 2
     if nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes):
-        return mod.all_reduce_push_norm(
-            state.world_size,
-            x,
-            weight,
-            eps,
+        _k3_push_all_reduce_norm_prefix(
+            world_size=state.world_size,
+            x=x,
+            norm_weight=norm_weight,
+            eps=eps,
             num_norm_rows=num_tokens,
         )
-    return mod.all_reduce_pull_norm(
-        state.world_size,
-        x,
-        weight,
-        eps,
+        return x
+    num_blocks = (
+        _PULL_SMALL_NUM_BLOCKS
+        if nbytes <= _PULL_SMALL_MAX_BYTES
+        else _PULL_LARGE_NUM_BLOCKS
+    )
+    _k3_pull_all_reduce_norm_prefix(
+        world_size=state.world_size,
+        x=x,
+        x_mc=get_mc_ptr(x),
+        norm_weight=norm_weight,
+        eps=eps,
         num_norm_rows=num_tokens,
-        input_mc_ptr=get_mc_ptr(x),
+        num_blocks=num_blocks,
+    )
+    return x
+
+
+@register_custom_op(op_name="k3_push_all_reduce_norm_prefix", mutates_args=["x"])
+def _k3_push_all_reduce_norm_prefix(
+    world_size: int,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    num_norm_rows: int,
+) -> None:
+    fused_all_reduce.push.all_reduce_norm_prefix(
+        kimi_k3_comm.get_comm(world_size),
+        x,
+        norm_weight,
+        eps,
+        num_norm_rows=num_norm_rows,
+        cluster_size=ar_fusion.get_cluster_size(norm_weight.shape[0]),
     )
 
 
-def finalize_push_fits(num_tokens: int) -> bool:
+@register_custom_op(op_name="k3_pull_all_reduce_norm_prefix", mutates_args=["x"])
+def _k3_pull_all_reduce_norm_prefix(
+    world_size: int,
+    x: torch.Tensor,
+    x_mc: int,
+    norm_weight: torch.Tensor,
+    eps: float,
+    num_norm_rows: int,
+    num_blocks: int,
+) -> None:
+    fused_all_reduce.pull.all_reduce_norm_prefix(
+        kimi_k3_comm.get_comm(world_size),
+        x,
+        x_mc,
+        norm_weight,
+        eps,
+        num_norm_rows=num_norm_rows,
+        num_blocks=num_blocks,
+        rows_per_group=_PULL_ROWS_PER_GROUP,
+    )
+
+
+def moe_finalize_all_reduce_norm_fits(num_tokens: int) -> bool:
     """Whether a [num_tokens, NORM_DIM] latent fits the push window; the
     finalize-fused AR is push-only."""
     state = _get_state()
@@ -479,26 +583,49 @@ def moe_front_all_gather(local: torch.Tensor) -> torch.Tensor:
     return mod.moe_front_all_gather(state.world_size, local, out)
 
 
-def finalize_all_reduce_push_norm(
+def moe_finalize_all_reduce_norm(
     out: torch.Tensor,
     gemm2_out: torch.Tensor,
     expanded_idx_to_permuted_idx: torch.Tensor,
     expert_weights: torch.Tensor,
-    weight: torch.Tensor,
+    norm_weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Deferred MoE finalize fused into the 1shot push AR + RMSNorm; ``out`` is
-    output-only. Caller checked :func:`finalize_push_fits`."""
-    from sglang.kernels.ops.communication import all_reduce_residual as mod
-
+    """Deferred MoE finalize fused into the 1-shot push AR + RMSNorm; ``out`` is
+    output-only. Caller checked :func:`moe_finalize_all_reduce_norm_fits`."""
     state = _get_state()
     assert state is not None
-    return mod.finalize_all_reduce_push_norm(
-        state.world_size,
+    _k3_push_moe_finalize_all_reduce_norm(
+        world_size=state.world_size,
+        out=out,
+        gemm2_out=gemm2_out,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        expert_weights=expert_weights,
+        norm_weight=norm_weight,
+        eps=eps,
+    )
+    return out
+
+
+@register_custom_op(
+    op_name="k3_push_moe_finalize_all_reduce_norm", mutates_args=["out"]
+)
+def _k3_push_moe_finalize_all_reduce_norm(
+    world_size: int,
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> None:
+    fused_all_reduce.push.moe_finalize_all_reduce_norm(
+        kimi_k3_comm.get_comm(world_size),
         out,
         gemm2_out,
         expanded_idx_to_permuted_idx,
         expert_weights,
-        weight,
+        norm_weight,
         eps,
+        cluster_size=ar_fusion.get_cluster_size(norm_weight.shape[0]),
     )

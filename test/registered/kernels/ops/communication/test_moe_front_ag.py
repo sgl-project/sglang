@@ -16,8 +16,7 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
-from sglang.kernels.ops.communication import moe_front_ag
+from sglang.kernels.ops.communication import kimi_k3_comm, moe_front_ag, nvlink_comm
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
@@ -32,6 +31,20 @@ register_cuda_ci(est_time=120, stage="nightly", runner_config="8-gpu-b200")
 
 N = 896 + 3584  # K3 [router | latent] rows
 H = 7168
+
+
+def _rows(t):
+    """nvlink_comm's [tokens, hidden] view: K3 rows where they divide, else 16-byte rows."""
+    if t is None:
+        return None
+    return t.view(-1, 3584) if t.numel() % 3584 == 0 else t.view(-1, 8)
+
+
+def _push_res(comm, x, residual):
+    """In place: ``x = allreduce(x) [+ residual]``, 1-shot push (K3's small-message path)."""
+    nvlink_comm.all_reduce_push(comm.obj, _rows(x), _rows(x), _rows(residual))
+
+
 MB = 1024 * 1024
 TOKENS = [18, 96, 256]
 
@@ -73,7 +86,7 @@ def _build_comm() -> Optional[CustomAllReduceV2]:
     )
     if comm.disabled or not comm.has_multicast:
         return None
-    all_reduce.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    kimi_k3_comm.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return comm
 
@@ -145,7 +158,7 @@ def test_moe_front_all_gather_stress_with_push_all_reduce():
         x = x.to(_device())
         ref_x = x.clone()
         dist.all_reduce(ref_x, group=_init_nccl_group())
-        all_reduce.all_reduce_push_res(world, x, None)
+        _push_res(comm, x, None)
         _assert_gathered(out, _nccl_ref(block))
         torch.testing.assert_close(x, ref_x, atol=0, rtol=0)
 

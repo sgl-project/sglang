@@ -42,6 +42,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers.communication import ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -976,21 +977,17 @@ def run_attn_post(
     folds ``next``'s norm); the attention may decline the handover even when asked,
     so the type is the ground truth."""
     if isinstance(out, AttnOutput):
-        from sglang.kernels.ops.communication.all_reduce_mhc import (
-            all_reduce_mhc_post_combine_norm,
-        )
-
         assert next is not None
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
-        _, updated, normalized = all_reduce_mhc_post_combine_norm(
-            out.partial,
-            residual,
-            post_mix,
-            comb,
-            pre,
-            next.norm.weight,
-            next.norm.variance_epsilon,
+        _, updated, normalized = ar_fusion.all_reduce_mhc_post_combine_norm(
             world_size=world_size,
+            partial=out.partial,
+            residual=residual,
+            post=post_mix,
+            comb=comb,
+            pre=pre,
+            norm_weight=next.norm.weight,
+            eps=next.norm.variance_epsilon,
         )
         return HcState(updated, pre, HcNormed(normalized))
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
@@ -1023,15 +1020,15 @@ def run_moe_post(
         and can_fuse_all_reduce(out.routed.expert_weights.shape[0], hc.cfg.hidden)
     ):
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
-        args = (
-            out.routed.gemm2_out,
-            out.routed.expanded_idx_to_permuted_idx,
-            out.routed.expert_weights,
-            out.routed.top_k,
-            out.shared,
-            residual,
-            post_mix,
-            comb,
+        args = dict(
+            world_size=world_size,
+            gemm2_out=out.routed.gemm2_out,
+            expanded_idx_to_permuted_idx=out.routed.expanded_idx_to_permuted_idx,
+            expert_weights=out.routed.expert_weights,
+            shared_output=out.shared,
+            residual=residual,
+            post=post_mix,
+            comb=comb,
         )
         if (
             next is not None
@@ -1040,27 +1037,18 @@ def run_moe_post(
             # The quant epilogue supports at most 128 batch size
             and out.routed.expert_weights.shape[0] <= 128
         ):
-            from sglang.kernels.ops.communication.all_reduce_mhc import (
-                moe_finalize_all_reduce_mhc_post_combine_norm_quant,
-            )
-
             _, updated, normalized, q, sf = (
-                moe_finalize_all_reduce_mhc_post_combine_norm_quant(
-                    *args,
-                    pre,
-                    next.norm.weight,
-                    next.norm.variance_epsilon,
-                    world_size=world_size,
+                ar_fusion.moe_finalize_all_reduce_mhc_post_combine_norm_quant(
+                    **args,
+                    pre=pre,
+                    norm_weight=next.norm.weight,
+                    eps=next.norm.variance_epsilon,
                 )
             )
             return HcState(
                 updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
             )
-        from sglang.kernels.ops.communication.all_reduce_mhc import (
-            moe_finalize_all_reduce_mhc_post,
-        )
-
-        _, updated = moe_finalize_all_reduce_mhc_post(*args, world_size=world_size)
+        _, updated = ar_fusion.moe_finalize_all_reduce_mhc_post(**args)
         return HcState(updated, pre)
     if isinstance(out, MoEOutput):
         from sglang.srt.layers.moe import post_experts_all_reduce
