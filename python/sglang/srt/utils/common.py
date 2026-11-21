@@ -21,6 +21,7 @@ import functools
 import importlib
 import itertools
 import logging
+import math
 import os
 import random
 import re
@@ -177,6 +178,35 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def validate_forward_sleep_time(value: Optional[float]) -> Optional[float]:
+    """Validate a /slow_down ``forward_sleep_time``, returning it normalized.
+
+    ``None`` or a non-positive value disables the slowdown and returns
+    ``None``. Non-finite values and values above
+    ``SGLANG_MAX_FORWARD_SLEEP_TIME`` raise ``ValueError``: the scheduler
+    sleeps inside ``run_batch``, so an oversized sleep also blocks the
+    reset request that would clear it. A negative cap disables the bound.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"forward_sleep_time must be a number of seconds, got {value!r}."
+        )
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"forward_sleep_time must be finite, got {value}.")
+    if value <= 0:
+        return None
+    max_sleep = envs.SGLANG_MAX_FORWARD_SLEEP_TIME.get()
+    if max_sleep >= 0 and value > max_sleep:
+        raise ValueError(
+            f"forward_sleep_time must be at most {max_sleep} seconds "
+            f"(SGLANG_MAX_FORWARD_SLEEP_TIME), got {value}."
+        )
+    return value
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
