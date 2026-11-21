@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Align MUSA wheel filenames (+musa43/...) with internal METADATA Version and
+# Align MUSA wheel filenames (+musa52/...) with internal METADATA Version and
 # WHEEL tags after build. Two drifts need fixing in lockstep:
 #   - METADATA `Version:` must carry the `+musa<suffix>` local version, or
 #     recent pip versions reject the wheel with "inconsistent version".
@@ -73,7 +73,7 @@ for wheel in "${wheel_files[@]}"; do
 
     ORIG_VERSION=$(grep '^Version:' "$METADATA_FILE" | head -1 | sed 's/^Version:[[:space:]]*//')
     # Empty ORIG_VERSION would fall through the `+musa` check below and silently
-    # produce `Version: +musa43` — a broken release. Fail loud instead.
+    # produce `Version: +musa52` — a broken release. Fail loud instead.
     [[ -n "$ORIG_VERSION" ]] || { echo "ERROR: no 'Version:' line in $METADATA_FILE" >&2; exit 1; }
     if [[ "$ORIG_VERSION" == *"$MUSA_SUFFIX"* ]]; then
         echo "Skipping $wheel: version in METADATA is already suffixed."
