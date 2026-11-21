@@ -290,13 +290,26 @@ impl ResponsesStream {
             .filter(|i| !i.is_empty());
         let existing = match name {
             Some(_) => None,
-            None => chunk_id
-                .and_then(|cid| {
-                    self.calls
+            None => {
+                let by_id = chunk_id.and_then(|id| {
+                    let mut matching = self
+                        .calls
                         .iter()
-                        .rposition(|c| c.upstream_id.as_deref() == Some(cid))
-                })
-                .or_else(|| self.calls.iter().rposition(|c| c.tool_index == tool_index)),
+                        .enumerate()
+                        .rev()
+                        .filter(|(_, call)| call.upstream_id.as_deref() == Some(id));
+                    let (latest, call) = matching.next()?;
+                    if chunk.get("index").is_none() || call.tool_index == tool_index {
+                        return Some(latest);
+                    }
+                    Some(
+                        matching
+                            .find(|(_, call)| call.tool_index == tool_index)
+                            .map_or(latest, |(index, _)| index),
+                    )
+                });
+                by_id.or_else(|| self.calls.iter().rposition(|c| c.tool_index == tool_index))
+            }
         };
         let pos = match existing {
             Some(pos) => pos,
@@ -882,6 +895,25 @@ mod tests {
             .map(|(_, e)| &e["item"]["call_id"])
             .collect();
         assert_eq!(added, [&output[0]["call_id"], &output[1]["call_id"]]);
+    }
+
+    #[test]
+    fn repeated_ids_with_distinct_indices_accept_interleaved_arguments() {
+        let delta = |i, name, args| {
+            let mut d = indexed(i, name, args);
+            d["tool_calls"][0]["id"] = json!("shared");
+            d
+        };
+        let evs = run(&[
+            chunk(delta(0, Some("a"), "{"), None),
+            chunk(delta(1, Some("b"), "{"), None),
+            chunk(delta(0, None, r#""a":1}"#), None),
+            chunk(delta(1, None, r#""b":2}"#), Some("tool_calls")),
+        ]);
+        let calls = &evs.last().unwrap().1["response"]["output"];
+        assert_eq!(calls[0]["arguments"], r#"{"a":1}"#);
+        assert_eq!(calls[1]["arguments"], r#"{"b":2}"#);
+        assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
     }
 
     #[test]
