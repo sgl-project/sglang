@@ -1,5 +1,6 @@
 """Unit tests for the encode-disaggregation receiver."""
 
+import time
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     _select_mm_processor_prompt,
 )
 from sglang.srt.managers.io_struct import AbortReq, TokenizedGenerateReqInput
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -123,6 +125,54 @@ class TestWaitingRequestTimeout(CustomTestCase):
         self.assertEqual(abort_reqs, [(recv_req, "Aborted by user", 400)])
         self.assertEqual(receiver.waiting_list, [])
         self.assertEqual(receiver.waiting_by_rid, {})
+
+    def test_an_abort_applies_only_to_requests_received_before_it(self):
+        """With [abort_all, new_request] in one poll, the new request must keep
+        waiting for its embeddings; the forwarded AbortReq reaching the
+        scheduler must not abort it a second time."""
+        receiver = _abort_test_receiver()
+        receiver.waiting_list = []
+        receiver.waiting_by_rid = {}
+        receiver.mm_processor = None
+        receiver.model_type = None
+        receiver.hostname = "localhost"
+        receiver.scheduler_recv_socket = None
+        receiver.scheduler_context = None
+        receiver.scheduler_embedding_port = 0
+        recv_req = Mock(
+            spec=TokenizedGenerateReqInput,
+            rid="new",
+            need_wait_for_mm_inputs=True,
+            encoder_urls=["http://encoder"],
+        )
+
+        def waiting_cls(*, rid, recv_req, **kwargs):
+            waiting_req = _completing_waiting_req(recv_req)
+            waiting_req.start_time = time.time()
+            waiting_req._try_recv_mm_data = lambda: None
+            waiting_req.send_encode_request = Mock()
+            return waiting_req
+
+        abort = AbortReq(abort_all=True)
+
+        with patch("torch.distributed.all_reduce"):
+            new_recv_reqs, abort_reqs = receiver._process_waiting_requests(
+                [abort, recv_req], waiting_cls
+            )
+        scheduler = SimpleNamespace(
+            mm_receiver=receiver,
+            request_lists=lambda: {},
+            collect_inflight_reqs=lambda: [],
+        )
+        for req in new_recv_reqs:
+            Scheduler.abort_request(scheduler, req)
+
+        self.assertEqual(new_recv_reqs, [abort])
+        self.assertEqual(abort_reqs, [])
+        self.assertEqual(len(receiver.waiting_list), 1)
+        self.assertEqual(
+            receiver.waiting_list[0].status, WaitingMMRequestStatus.PENDING
+        )
 
 
 def _abort_test_receiver():
