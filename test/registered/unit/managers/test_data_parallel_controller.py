@@ -13,14 +13,16 @@ those. The abort-route test also sets `control_message_step` and builds the real
 dispatch table with `init_dispatcher`.
 """
 
+import importlib
 import threading
 import time
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -45,6 +47,12 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import (
+    DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+    PortArgs,
+    ServerArgs,
+)
+from sglang.srt.utils.network import try_bind_socket
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -183,6 +191,99 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         self._launch_joiner(parallel, handshake, launch)
 
         self.assertEqual(launch.call_args.args[-1], [1002])
+
+
+class TestSingleNodeWorkerPortHandshake(CustomTestCase):
+    def test_server_on_handshake_port_does_not_block_launch(self):
+        # Another server listens at our --port + DP_ATTENTION_HANDSHAKE_PORT_DELTA.
+        # On one node nothing asks for the worker ports, so that is no conflict.
+        other = try_bind_socket(port=0, listen=True)
+        port = other.getsockname()[1] - DP_ATTENTION_HANDSHAKE_PORT_DELTA
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.context = zmq.Context()
+        try:
+            with get_context().override_server_args(port=port, nnodes=1):
+                ports = controller._broadcast_worker_ports(MagicMock(), [7000, 7001])
+        finally:
+            other.close()
+            # destroy() closes any socket the call left open; term() would wait.
+            controller.context.destroy(linger=0)
+        self.assertEqual(ports, [7000, 7001])
+
+
+class TestRaySingleNodeDPAttentionPorts(CustomTestCase):
+    def test_ranks_take_the_launcher_ports(self):
+        # Stub the ray modules that the Ray launcher imports.
+        ray = ModuleType("ray")
+        ray.remote = lambda cls: cls
+        ray.get = lambda refs: refs
+        placement = ModuleType("ray.util.placement_group")
+        placement.PlacementGroup = object
+        strategies = ModuleType("ray.util.scheduling_strategies")
+        strategies.PlacementGroupSchedulingStrategy = object
+        stubs = {
+            "ray": ray,
+            "ray.util": ModuleType("ray.util"),
+            "ray.util.placement_group": placement,
+            "ray.util.scheduling_strategies": strategies,
+        }
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30000
+        server_args.nccl_port = None
+        server_args.tp_size = 2
+        server_args.attn_dp_size = 2
+        server_args.nnodes = 1
+        server_args.dist_init_addr = None
+        launcher = PortArgs.init_new(server_args)
+        created = []
+
+        def create_actor(**kwargs):
+            created.append(kwargs)
+            return SimpleNamespace(
+                get_info=SimpleNamespace(remote=dict),
+                run_event_loop=SimpleNamespace(remote=lambda: None),
+            )
+
+        srt_package = importlib.import_module("sglang.srt")
+        with patch.dict("sys.modules", stubs), patch.dict(vars(srt_package)):
+            ray_dp = importlib.import_module("sglang.srt.ray.data_parallel_controller")
+            controller_type = ray_dp.RayDataParallelController
+            controller = controller_type.__new__(controller_type)
+            controller.pg = object()
+            controller.is_custom_pg = False
+            controller.bundle_for_node = [0]
+            controller.rank0_node_ip = "127.0.0.1"
+            controller.scheduler_actors = []
+            controller.event_loop_refs = []
+            controller._record_scheduler_init_infos = MagicMock()
+            with (
+                get_context().override_server_args(
+                    tp_size=2, attn_dp_size=2, nnodes=1, pp_size=1, attn_cp_size=1
+                ),
+                patch.object(
+                    ray_dp, "_create_scheduler_actor", side_effect=create_actor
+                ),
+            ):
+                controller._launch_ray_tp_group(
+                    server_args, launcher, None, [41000, 41001]
+                )
+
+        self.assertEqual([actor["dp_rank"] for actor in created], [0, 1])
+        for actor in created:
+            port_args = actor["port_args"]
+            for name in (
+                "tokenizer_ipc_name",
+                "detokenizer_ipc_name",
+                "metrics_ipc_name",
+                "load_collector_ipc_name",
+                "nccl_port",
+                "instance_id",
+            ):
+                self.assertEqual(getattr(port_args, name), getattr(launcher, name))
+            self.assertEqual(
+                port_args.scheduler_input_ipc_name,
+                f"tcp://127.0.0.1:{41000 + actor['dp_rank']}",
+            )
 
 
 class TestLocalKvEventSources(CustomTestCase):
