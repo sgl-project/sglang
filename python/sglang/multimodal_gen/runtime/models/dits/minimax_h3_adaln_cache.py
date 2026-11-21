@@ -614,25 +614,25 @@ class MiniMaxH3AdalnCache(nn.Module):
 
         device = self.block_params.device
         pending_slots = self._allocate_slots(wanted=wanted, missing=missing)
-        slots = []
-        for key, timesteps in missing.items():
-            slot = pending_slots[key]
-            adaln_input = embed(timesteps.to(device))
-            if self.precision == "fp32":
-                # Compute the projections in fp32 once; the slab stays bf16.
-                adaln_input = adaln_input.float()
-            slots.append((slot, timesteps.numel(), adaln_input))
-            self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
-
-        # adaln_proj is a ColumnParallelLinear: each rank owns a slice of the
-        # output features and all-gathers afterwards. The rebuild has to do the
-        # same rather than read the full width in one go -- a sharded GEMM has a
-        # different N, so cuBLAS picks a different kernel and the outputs stop
-        # matching. It also cuts per-rank checkpoint reads to 1/tp.
-        tp_size = get_tp_world_size()
-        tp_rank = get_tp_rank() if tp_size > 1 else 0
-
         try:
+            slots = []
+            for key, timesteps in missing.items():
+                slot = pending_slots[key]
+                adaln_input = embed(timesteps.to(device))
+                if self.precision == "fp32":
+                    # Compute the projections in fp32 once; the slab stays bf16.
+                    adaln_input = adaln_input.float()
+                slots.append((slot, timesteps.numel(), adaln_input))
+                self.plan_timesteps[slot, : timesteps.numel()] = timesteps.to(device)
+
+            # adaln_proj is a ColumnParallelLinear: each rank owns a slice of the
+            # output features and all-gathers afterwards. The rebuild has to do the
+            # same rather than read the full width in one go -- a sharded GEMM has a
+            # different N, so cuBLAS picks a different kernel and the outputs stop
+            # matching. It also cuts per-rank checkpoint reads to 1/tp.
+            tp_size = get_tp_world_size()
+            tp_rank = get_tp_rank() if tp_size > 1 else 0
+
             with _fp32_gemm_guard(enabled=self.precision == "fp32", device=device):
                 self._project_plans_from_checkpoint(
                     slots, tp_size=tp_size, tp_rank=tp_rank, device=device
