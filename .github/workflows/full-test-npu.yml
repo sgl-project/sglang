@@ -260,7 +260,6 @@ jobs:
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
-
   full-perf-test-16-npu-a3:
     name: full-perf-test-16-npu-a3
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',full-perf-test-16-npu-a3,')) }}
