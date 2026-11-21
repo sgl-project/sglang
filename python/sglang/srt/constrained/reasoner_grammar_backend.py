@@ -427,6 +427,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._generated = self._generated
         return new_obj
 
+    def memory_size_bytes(self) -> Optional[int]:
+        if self.grammar is None:
+            return 0  # the wrapper alone holds no compiled artifact
+        return self.grammar.memory_size_bytes()
+
     @property
     def finished(self):
         if self.grammar is not None:
@@ -448,8 +453,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
+        cache_limit_bytes: Optional[int] = None,
     ):
-        super().__init__()
+        # This wrapper owns the cache the scheduler fills, so it takes the
+        # wrapped backend's budget unless given one explicitly.
+        if cache_limit_bytes is None:
+            cache_limit_bytes = getattr(grammar_backend, "cache_limit_bytes", None)
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
         self.grammar_backend = grammar_backend
         self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
         think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
@@ -595,11 +605,14 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self._budget_variant_keys.move_to_end(key)
         while len(self._budget_variant_keys) > _BUDGET_VARIANT_CACHE_SIZE:
             evicted, _ = self._budget_variant_keys.popitem(last=False)
-            self.cache.pop(evicted, None)
+            self.discard_cache(evicted)
 
     def reset(self):
         super().reset()
         self._budget_variant_keys.clear()
+        # /flush_cache must reach the wrapped backend too: with a reasoning
+        # parser configured, the xgrammar compiler cache lives there.
+        self.grammar_backend.reset()
 
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool

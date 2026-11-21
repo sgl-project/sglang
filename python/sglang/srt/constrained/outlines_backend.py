@@ -90,8 +90,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         self,
         tokenizer,
         whitespace_pattern: str | None,
+        cache_limit_bytes: int | None = None,
     ):
-        super().__init__()
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
 
         try:
             self.outlines_tokenizer = TransformerTokenizer(tokenizer)
