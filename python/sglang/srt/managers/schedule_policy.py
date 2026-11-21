@@ -230,6 +230,13 @@ class SchedulePolicy:
         self._bounded_next_selected = False
         self._bounded_skipped: set[int] = set()
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        self._lpm_with_priority = (
+            self.policy == CacheAwarePolicy.LPM and enable_priority_scheduling
+        )
+        # A fixed bounded batch could hold a new higher-priority request behind
+        # committed lower-priority members, so lpm with priority sorts per pass instead.
+        if self._lpm_with_priority:
+            self._bounded_lpm_enabled = False
         if not math.isfinite(shortest_prefill_aging_factor) or (
             shortest_prefill_aging_factor < 0
         ):
@@ -340,6 +347,9 @@ class SchedulePolicy:
                 + [r for r in tail if id(r) not in next_ids]
             )
 
+        if self._lpm_with_priority:
+            return self._sort_lpm_with_priority(waiting_queue, bootstrap_queue)
+
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
@@ -407,6 +417,41 @@ class SchedulePolicy:
 
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
         return waiting_queue
+
+    def _sort_lpm_with_priority(
+        self, waiting_queue: List[Req], bootstrap_queue: Iterable[Req]
+    ) -> List[Req]:
+        """Priority first, then longest cached prefix within a priority.
+
+        Only the first WAITING_QUEUE_PREFIX_MATCH_MAX requests in (priority, arrival)
+        order are prefix-matched; the tail keeps that order, so priority still holds
+        where plain lpm falls back to unsorted FCFS.
+        """
+        SchedulePolicy._sort_by_priority_and_fcfs(waiting_queue, self.priority_sign)
+        head = waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]
+        tail = waiting_queue[WAITING_QUEUE_PREFIX_MATCH_MAX:]
+        if tail:
+            # As for the bounded batch: touch the tail before matching the head, so
+            # the head's prefixes are the most recent; fast-match caches still see
+            # a prefix length for the tail.
+            if (
+                self.tree_cache.supports_fast_match_prefix()
+                and get_disagg().disaggregation_mode != "decode"
+            ):
+                for r in tail:
+                    r.init_next_round_input(self.tree_cache)
+            self._touch_waiting_prefixes(
+                CacheAgnosticPolicy.FCFS, tail, bootstrap_queue
+            )
+        deprioritized = self._compute_prefix_matches(head, CacheAwarePolicy.LPM)
+        head.sort(
+            key=lambda r: (
+                r.priority * self.priority_sign,
+                r.rid in deprioritized,
+                -r.num_matched_prefix_tokens,
+            )
+        )
+        return head + tail
 
     def _should_start_bounded_batch(self, waiting_queue: List[Req]) -> bool:
         from sglang.srt.managers.lpm_opportunity import (
