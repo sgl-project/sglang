@@ -105,6 +105,20 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
                 with self.assertRaises(ValueError):
                     latent_mxfp4_aiter_hip.run(x=x, weight=packed, scale=scale)
 
+    def test_rejects_unaligned_packed_weights(self):
+        _, packed, scale = self.projections[0]
+        # K = 7040 and 128 rows are not whole 256x256 tiles.
+        for rows, k in ((packed.shape[0], 7040), (128, 7168)):
+            with self.subTest(rows=rows, k=k):
+                weight = packed[:rows, : k // 2].contiguous()
+                x = torch.ones((1, k), dtype=torch.bfloat16, device=self.device)
+                with self.assertRaisesRegex(ValueError, "scales must match"):
+                    latent_mxfp4_aiter_hip.run(
+                        x=x,
+                        weight=weight,
+                        scale=scale[:rows, : k // 32].contiguous(),
+                    )
+
     def test_rejects_missing_or_host_scales(self):
         _, packed, scale = self.projections[0]
         x = torch.ones((1, 7168), dtype=torch.bfloat16, device=self.device)

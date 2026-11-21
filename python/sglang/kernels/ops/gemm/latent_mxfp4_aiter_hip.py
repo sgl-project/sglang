@@ -70,8 +70,12 @@ def run(*, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.
     """x @ weight.T after per-1x32 MXFP4 activation quantization."""
     if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] == 0:
         raise ValueError("latent MXFP4 GEMM needs nonempty 2D BF16 activations")
+    # gemm_a4w4 and the preshuffled scales read whole 256x256 tiles.
     if (
         weight.ndim != 2
+        or x.device.type != "cuda"
+        or weight.shape[0] % 256 != 0
+        or x.shape[1] % 256 != 0
         or x.shape[1] != weight.shape[1] * 2
         or weight.device != x.device
         or scale.device != x.device
