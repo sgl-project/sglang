@@ -1540,6 +1540,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_returns_the_model_used_for_generation() {
+        use api::sglang_service_client::SglangServiceClient;
+        use api::sglang_service_server::SglangServiceServer;
+
+        let args = ServerArgs {
+            chat_template: Some("chatml".into()),
+            tokenizer_path: concat!(env!("CARGO_MANIFEST_DIR"), "/testdata").into(),
+            ..test_server_args()
+        };
+        let harness = Harness::build(2, false, Duration::from_secs(1), true, None, args.clone());
+        let service = GrpcService::new(
+            harness.service.core.clone(),
+            Arc::new(args),
+            harness.service.hicache_manager.clone(),
+        );
+        let mut client = SglangServiceClient::new(SglangServiceServer::new(service));
+        for model in [None, Some("test-model"), Some("test-model:")] {
+            let request = api::OpenAiResponsesRequest {
+                input: Some(r#""hi""#.into()),
+                model: model.map(str::to_owned),
+                ..Default::default()
+            };
+            let answer = async {
+                let intake = harness.next_generation().await;
+                assert!(intake.admission.try_accept());
+                intake
+                    .sink
+                    .try_send(ResponseItem::Done(chunk(&intake.rid, "ok", 1, true)))
+                    .unwrap();
+                Ok(())
+            };
+            let (response, ()) =
+                tokio::try_join!(client.open_ai_responses(request), answer).unwrap();
+            let response = response.into_inner();
+            assert_eq!(response.status, "completed");
+            assert_eq!(response.model, model.unwrap_or("test-model"));
+        }
+    }
+
+    #[tokio::test]
     async fn generate_streams_cumulative_frames_for_a_text_prompt() {
         let harness = Harness::new(2, false, Duration::from_secs(1));
         let mut stream = harness

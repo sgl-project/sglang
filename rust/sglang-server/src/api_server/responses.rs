@@ -147,7 +147,7 @@ pub(crate) fn response_id() -> String {
 struct Echo {
     id: String,
     created_at: i64,
-    model: Option<String>,
+    model: String,
     parallel_tool_calls: bool,
     tool_choice: Value,
     tools: Value,
@@ -955,8 +955,12 @@ impl Responses<'_> {
             .clone()
             .filter(|id| !id.is_empty())
             .unwrap_or_else(response_id);
+        let model = request
+            .model
+            .as_ref()
+            .unwrap_or(&self.server_args.served_model_name);
         let mut chat_body = json!({
-            "model": request.model.clone().unwrap_or_else(|| self.server_args.served_model_name.clone()),
+            "model": model,
             "messages": messages,
             "stream": stream,
             "parallel_tool_calls": request.parallel_tool_calls.unwrap_or(true),
@@ -1067,7 +1071,7 @@ impl Responses<'_> {
         let echo = Echo {
             id,
             created_at: i64::from(unix_seconds_u32()),
-            model: request.model.clone(),
+            model: model.clone(),
             parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
             tool_choice,
             tools: Value::Array(request.tools.iter().map(echoed_tool).collect()),
@@ -1246,7 +1250,7 @@ impl Responses<'_> {
         let chat = unary_chat_response(
             vec![(0, call)],
             plan.echo.id.clone(),
-            plan.echo.model.clone().unwrap_or_default(),
+            plan.echo.model.clone(),
             0,
             plan.want_logprobs,
             parsing,
