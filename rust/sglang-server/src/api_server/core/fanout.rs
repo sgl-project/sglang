@@ -35,6 +35,40 @@ pub(crate) trait ControlTarget: Send + Sync {
 
     /// Deliver one request built by `build` and collect this target's replies.
     fn control<'a>(&'a self, build: &'a RequestBuilder<'a>) -> BoxFuture<'a, Vec<RankReply>>;
+
+    /// Why this target would refuse to relay `message` (its wire bytes), or
+    /// `None`.
+    fn relay_refusal(&self, message: &[u8]) -> Option<RelayRefusal> {
+        let _ = message;
+        None
+    }
+
+    /// Ask this target for the next control-request number (only DP rank 0's
+    /// listener gives them out; see `core::control_seq`), or `None` when this
+    /// target cannot be asked.
+    fn next_control_seq(&self) -> Option<BoxFuture<'_, Result<u64, CoreError>>> {
+        None
+    }
+}
+
+/// Why a peer listener refuses to relay a control message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelayRefusal {
+    /// No route fans this message out.
+    NotRelayed,
+    /// An admin-only operation, on a server with no admin key.
+    AdminKeyMissing,
+}
+
+impl std::fmt::Display for RelayRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotRelayed => "not a control message a peer listener relays",
+            Self::AdminKeyMissing => {
+                "a peer listener refuses an admin-only operation without an admin API key"
+            }
+        })
+    }
 }
 
 /// Every rank's reply to one control request, in DP-rank order.
@@ -83,6 +117,30 @@ pub(crate) async fn fan_out(
 }
 
 impl Replies {
+    /// Each rank that failed, with its error.
+    pub(crate) fn errors(&self) -> impl Iterator<Item = (RankId, &CoreError)> {
+        self.replies.iter().filter_map(|reply| {
+            reply
+                .outcome
+                .as_ref()
+                .err()
+                .map(|error| (reply.rank, error))
+        })
+    }
+
+    /// Every rank in `ranks` failed with `error`.
+    pub(crate) fn failed(ranks: impl IntoIterator<Item = RankId>, error: &CoreError) -> Self {
+        Self {
+            replies: ranks
+                .into_iter()
+                .map(|rank| RankReply {
+                    rank,
+                    outcome: Err(CoreError::Internal(error.to_string())),
+                })
+                .collect(),
+        }
+    }
+
     /// Decode every rank's reply as `T`, in rank order. Any rank that failed
     /// or returned an undecodable payload fails the whole operation; the
     /// error names each such rank. `what` names the operation in that error.

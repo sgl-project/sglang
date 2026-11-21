@@ -307,10 +307,11 @@ def _loop_worker(rank, path, level, drift_round):
             )
             self.world_group = NS(cpu_group=dist.group.WORLD)
             self.pause_state = NS(
-                holds_inputs=lambda: False,
-                take_inputs=lambda reqs, stop_at_pause: list(reqs),
+                holds_pause=lambda: False,
+                take_inputs=lambda reqs, **_: list(reqs),
                 may_launch=lambda: True,
             )
+            self.dp_attn_adapter = NS(runs_mlp_sync_gather=lambda: False)
             self.request_receiver = NS(recv_requests=self._recv_requests)
             self.metrics_reporter = NS(record_scheduler_active=lambda start: None)
             self.invariant_checker = NS(run=lambda *args: None)

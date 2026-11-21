@@ -495,10 +495,19 @@ impl Intake {
             }
         };
         // Control requests carry no tensor cell — empty `ids`.
-        if !self.to_scheduler_tx.try_push(SchedulerRequest {
+        let msg = SchedulerRequest {
             header,
             buffers: Vec::new(),
-        }) {
+        };
+        // A numbered request the scheduler never sees would hold every later
+        // one on every DP rank (see `api_server::core::control_seq`), so a full
+        // request ring must not drop it: it takes the reserved lane.
+        if matches!(&req.kind, RequestKind::Control(c) if matches!(**c, ControlRequest::Sequenced(_)))
+        {
+            if let Err(error) = self.push_reserved(msg) {
+                self.fail(&mut req, error, true); // registered
+            }
+        } else if !self.to_scheduler_tx.try_push(msg) {
             self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
     }
@@ -507,11 +516,15 @@ impl Intake {
     /// retry it, so it takes the reserved lane: a full request ring cannot
     /// drop it.
     fn push_one_way(&self, control: &ControlRequest) -> Result<(), Error> {
-        let header = control.encode()?;
-        if self.to_scheduler_tx.push_priority(SchedulerRequest {
-            header,
+        self.push_reserved(SchedulerRequest {
+            header: control.encode()?,
             buffers: Vec::new(),
-        }) {
+        })
+    }
+
+    /// Push onto the reserved lane, which a full request ring cannot block.
+    fn push_reserved(&self, msg: SchedulerRequest) -> Result<(), Error> {
+        if self.to_scheduler_tx.push_priority(msg) {
             Ok(())
         } else {
             Err(Error::Internal("to_scheduler channel closed".into()))

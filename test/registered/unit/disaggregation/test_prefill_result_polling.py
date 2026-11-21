@@ -251,6 +251,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch,
             shutdown_vote_pending=lambda: False,
+            runs_mlp_sync_gather=lambda: False,
         )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
@@ -473,7 +474,7 @@ def _rank_consensus_worker(rank, rendezvous):
                 assert [a[2] for a in scheduler.actions if a[1] == "result"] == list(
                     names
                 )
-                assert not scheduler.pause_state.holds_inputs()
+                assert not scheduler.pause_state.holds_pause()
                 for name, event in scheduler.copy_events.items():
                     assert event.synchronizations == 1
                     assert event.blocking_synchronizations == int(

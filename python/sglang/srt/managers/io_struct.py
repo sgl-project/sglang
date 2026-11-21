@@ -2503,8 +2503,8 @@ class ChecksumInfo(msgspec.Struct, kw_only=True):
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    # One ChecksumInfo per rank that ran the request in the same step: the TP
-    # group, or the DP shard under local control broadcast. Always a list.
+    # One ChecksumInfo per TP rank. The producer wraps the tp==1 result in a
+    # one-element list so the shape is always a list.
     payload: Optional[List[ChecksumInfo]] = None
 
 
@@ -2950,6 +2950,42 @@ def unwrap_object_fields_from_pickle(
     if obj is None or _USE_PICKLE_IPC:
         return obj
     return obj.map_object_fields(unpickle_values)
+
+
+# What a scheduler admits through the work channel, scoped to its own DP group;
+# everything else is a control request.
+WORK_REQ_TYPES = (
+    TokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
+    BatchTokenizedEmbeddingReqInput,
+    AbortReq,
+)
+
+
+class SequencedControlReq(BaseReq, kw_only=True):
+    """A control request numbered so that, under local control broadcast, every
+    attention-DP group applies it between the same two MLP-sync gathers (see
+    PauseState.take_inputs). The DP controller numbers and sends it; on the Rust
+    server, DP rank 0's listener gives the number to whichever listener fans the
+    request out. payload is the request, msgpack-encoded, or pickled when
+    `pickled` (the DP controller under pickle IPC; Rust listeners always send
+    msgpack)."""
+
+    seq: int
+    payload: bytes
+    pickled: bool = False
+
+    @classmethod
+    def wrap(cls, req: Any, seq: int) -> SequencedControlReq:
+        if _USE_PICKLE_IPC:
+            return cls(seq=seq, payload=pickle.dumps(req), pickled=True)
+        return cls(seq=seq, payload=msgpack_encode(req))
+
+    def unwrap(self) -> Any:
+        if self.pickled:
+            return pickle.loads(self.payload)
+        return msgpack_decode(self.payload)
 
 
 _struct_types = tuple(

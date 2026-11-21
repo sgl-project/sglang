@@ -117,7 +117,6 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
-from sglang.srt.distributed.communication_op import control_request_all_gather_object
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
     close_custom_all_reduce,
@@ -2354,7 +2353,7 @@ class Scheduler(
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
-            not self.pause_state.holds_inputs()
+            not self.pause_state.holds_pause()
             and get_parallel().pp_rank == 0
             and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
@@ -2363,7 +2362,9 @@ class Scheduler(
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
         recv_reqs = self.pause_state.take_inputs(
-            received_reqs, stop_at_pause=stop_at_pause
+            received_reqs,
+            stop_at_pause=stop_at_pause,
+            align_control_reqs=self.dp_attn_adapter.runs_mlp_sync_gather(),
         )
 
         if recv_reqs:
@@ -2780,6 +2781,8 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
+            get_control_seq_received=lambda: self.pause_state.control_seq_received,
+            on_control_seq_released=self.pause_state.release_control_seqs,
             **self._dp_drain_column_callbacks(),
         )
 
@@ -6130,8 +6133,9 @@ class Scheduler(
             # Held responses are released by polling, not by a socket event:
             # keep polling, and yield the GIL to the completion's worker.
             time.sleep(0)
-        else:
-            # sleep until next event
+        elif not self.pause_state.holds_control_reqs():
+            # sleep until next event; a held control request waits on the next
+            # MLP-sync gathers, which no socket event wakes
             self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
 
@@ -6514,7 +6518,11 @@ class Scheduler(
             error = str(e)
             logger.error(f"Failed to call rpc {recv_req.method}: {error}")
 
-        errors = control_request_all_gather_object(error)
+        errors = [error]
+        tp_group = get_parallel().tp_group
+        if tp_group.world_size > 1:
+            errors = [None] * tp_group.world_size
+            torch.distributed.all_gather_object(errors, error, group=tp_group.cpu_group)
         errors = [e for e in dict.fromkeys(errors) if e is not None]
         return RpcReqOutput(success=not errors, message="; ".join(errors))
 

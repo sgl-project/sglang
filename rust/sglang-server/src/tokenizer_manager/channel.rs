@@ -48,10 +48,15 @@ impl ToSchedulerTx {
         self.tx.try_send(msg).is_ok()
     }
 
-    /// Reserved, unbounded lane for scheduler cancellation and the one-way
-    /// control messages nothing retries. Active-request cardinality bounds
-    /// the aborts (the one-way messages are one-off), and request-ring
-    /// saturation must not make either lossy.
+    /// Reserved, unbounded lane for scheduler cancellation, the one-way
+    /// control messages nothing retries, and numbered control requests, which
+    /// every later numbered one waits behind (see
+    /// `api_server::core::control_seq`). Active-request cardinality bounds
+    /// the aborts, in-flight control requests bound the numbered ones (the
+    /// one-way messages are one-off), and request-ring saturation must not
+    /// make any of them lossy.
+    /// The scheduler drains this lane first, so its messages can pass requests
+    /// queued earlier on the ring.
     #[inline]
     pub fn push_priority(&self, msg: SchedulerRequest) -> bool {
         self.priority_tx.send(msg).is_ok()

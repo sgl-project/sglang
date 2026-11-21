@@ -17,14 +17,14 @@ use crate::message::io_struct::{
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
-use crate::message::types::ForwardedControlReq;
+use crate::message::types::{ForwardedControlReq, SequencedControlReq};
 use crate::utils::environ;
 
 use super::frontend_state::RelayedEffect;
 use super::generate::AbortEnding;
 use super::handle::{CoreHandle, translate_runtime_error};
 use crate::api_server::core::CoreError;
-use crate::api_server::core::fanout::{self, RankReply, RequestBuilder};
+use crate::api_server::core::fanout::{self, RankId, RankReply, RequestBuilder};
 use crate::tokenizer_manager::wiring::TmEvent;
 
 /// One relayed abort, connect to reply: the client was answered already,
@@ -551,6 +551,9 @@ impl CoreHandle {
 
     /// Deliver one control request to every DP rank of the deployment.
     pub(super) async fn control(&self, build: &RequestBuilder<'_>) -> fanout::Replies {
+        if self.inner.sequences_control_reqs {
+            return self.control_numbered(build).await;
+        }
         fanout::fan_out(
             self.inner.dp_rank,
             self.submit_control_req(build()),
@@ -558,6 +561,115 @@ impl CoreHandle {
             build,
         )
         .await
+    }
+
+    /// [`CoreHandle::control`] with the request numbered, so every
+    /// attention-DP group applies it in the same step (see
+    /// `core::control_seq`). A number some rank never receives holds every later
+    /// numbered request on that rank's listener, and so on every group: the
+    /// delivery runs detached so a dropped caller cannot cut it short, and each
+    /// rank's message (with its own rid) is encoded and checked before it takes
+    /// a number.
+    async fn control_numbered(&self, build: &RequestBuilder<'_>) -> fanout::Replies {
+        let peers = &self.inner.peer_endpoints;
+        let ranks: Vec<RankId> = std::iter::once(self.inner.dp_rank)
+            .chain(peers.iter().flat_map(|peer| peer.ranks().iter().copied()))
+            .collect();
+        let mut messages: Vec<(String, bytes::Bytes)> = Vec::with_capacity(1 + peers.len());
+        for _ in 0..=peers.len() {
+            let request = build();
+            match request.encode() {
+                Ok(header) => messages.push((request.rid().to_owned(), header)),
+                Err(error) => {
+                    return fanout::Replies::failed(ranks, &CoreError::Internal(error.to_string()));
+                }
+            }
+        }
+        // A peer that refused the message after it took its number would never
+        // hand that number to its scheduler, and its listener would then hold
+        // every later number; so refuse here, before numbering, what every peer
+        // would refuse.
+        if let Some(refusal) = peers
+            .iter()
+            .find_map(|peer| peer.relay_refusal(&messages[0].1))
+        {
+            return fanout::Replies::failed(
+                ranks,
+                &CoreError::InvalidArgument(refusal.to_string()),
+            );
+        }
+        let core = self.clone();
+        let delivery_ranks = ranks.clone();
+        let delivery = tokio::spawn(async move {
+            let seq = match core.next_control_seq().await {
+                Ok(seq) => seq,
+                Err(error) => return fanout::Replies::failed(delivery_ranks, &error),
+            };
+            let mut numbered: Vec<SequencedControlReq> = messages
+                .into_iter()
+                .map(|(rid, header)| SequencedControlReq { seq, rid, header })
+                .collect();
+            let local = numbered.pop().expect("one message per rank");
+            // fan_out has each target call `build` once; each call takes one
+            // peer's message.
+            let for_peers = std::sync::Mutex::new(numbered);
+            let build = || {
+                ControlRequest::Sequenced(
+                    for_peers
+                        .lock()
+                        .expect("never poisoned")
+                        .pop()
+                        .expect("one message per peer"),
+                )
+            };
+            let replies = fanout::fan_out(
+                core.inner.dp_rank,
+                core.submit_control_req(ControlRequest::Sequenced(local)),
+                &core.inner.peer_endpoints,
+                &build,
+            )
+            .await;
+            for (rank, error) in replies.errors() {
+                tracing::error!(
+                    "control request {seq} may not have reached DP rank {rank} ({error}); \
+                     if it did not, every later numbered control request stays held"
+                );
+            }
+            replies
+        });
+        match delivery.await {
+            Ok(replies) => replies,
+            Err(error) => fanout::Replies::failed(ranks, &CoreError::Internal(error.to_string())),
+        }
+    }
+
+    /// The next control-request number; rank 0's listener gives them out.
+    async fn next_control_seq(&self) -> Result<u64, CoreError> {
+        if self.inner.dp_rank == 0 {
+            return self.issue_control_seq();
+        }
+        match self
+            .inner
+            .control_seq_issuer
+            .as_ref()
+            .and_then(|issuer| issuer.next_control_seq())
+        {
+            Some(fetch) => fetch.await,
+            None => Err(CoreError::Internal(
+                "no peer listener gives out control-request numbers".into(),
+            )),
+        }
+    }
+
+    /// The next control-request number for another listener's request; only
+    /// rank 0's listener gives them out.
+    pub(crate) fn issue_control_seq(&self) -> Result<u64, CoreError> {
+        if self.inner.dp_rank != 0 {
+            return Err(CoreError::InvalidArgument(
+                "only DP rank 0's listener gives out control-request numbers".into(),
+            ));
+        }
+        Ok(self.inner.control_sequencer.issue())
     }
 
     /// Serve a peer's control request on the local scheduler only; never fan
@@ -574,8 +686,15 @@ impl CoreHandle {
         &self,
         header: bytes::Bytes,
     ) -> Result<bytes::Bytes, CoreError> {
-        let forwarded = ForwardedControlReq::parse(header)
-            .map_err(|error| CoreError::InvalidArgument(error.to_string()))?;
+        let invalid =
+            |error: crate::utils::error::Error| CoreError::InvalidArgument(error.to_string());
+        let sequenced = SequencedControlReq::parse(&header).map_err(invalid)?;
+        let forwarded = ForwardedControlReq::parse(
+            sequenced
+                .as_ref()
+                .map_or_else(|| header.clone(), |numbered| numbered.header.clone()),
+        )
+        .map_err(invalid)?;
         if let Some(abort) = AbortReq::decode(&forwarded.header)
             .map_err(|error| CoreError::InvalidArgument(error.to_string()))?
         {
@@ -592,9 +711,11 @@ impl CoreHandle {
             RelayedEffect::WeightUpdate => Some(self.inner.frontend.hold_for_update().await),
             _ => None,
         };
-        let reply = self
-            .submit_control_req(ControlRequest::Forwarded(forwarded))
-            .await;
+        let request = match sequenced {
+            Some(numbered) => ControlRequest::Sequenced(numbered),
+            None => ControlRequest::Forwarded(forwarded),
+        };
+        let reply = self.submit_control_req(request).await;
         drop(hold);
         match effect {
             RelayedEffect::None | RelayedEffect::WeightUpdate => {}
@@ -678,7 +799,20 @@ impl CoreHandle {
         &self,
         request: ControlRequest,
     ) -> Result<bytes::Bytes, CoreError> {
-        let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
+        let seq = match &request {
+            ControlRequest::Sequenced(numbered) => Some(numbered.seq),
+            _ => None,
+        };
+        let submit = self.submit(RequestKind::Control(Box::new(request)));
+        let mut call = match seq {
+            Some(seq) => {
+                self.inner
+                    .control_sequencer
+                    .submit_in_order(seq, submit)
+                    .await
+            }
+            None => submit.await,
+        }?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),
             Some(ResponseItem::Error(error)) => Err(translate_runtime_error(error)),
@@ -936,6 +1070,126 @@ mod tests {
             intake_rx.try_recv().is_err(),
             "one fan-out submits one local request"
         );
+    }
+
+    /// Under attention DP a listener other than rank 0 numbers a fanned-out
+    /// request with rank 0's next number, and every rank, its own scheduler
+    /// and each peer, receives that one number; a request the peers would
+    /// refuse is refused before it takes a number, so no rank misses one.
+    #[tokio::test]
+    async fn attention_dp_numbers_the_fan_out_from_rank_0() {
+        use crate::api_server::core::fanout::testing::status_bytes;
+        use crate::api_server::core::fanout::{ControlTarget, RankId, RelayRefusal};
+        use crate::message::config::DeploymentInfo;
+        use futures::future::BoxFuture;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct Numbered {
+            rank: [RankId; 1],
+            seen: Arc<Mutex<Vec<u64>>>,
+            refuses: bool,
+            fetches: Arc<AtomicUsize>,
+        }
+        impl ControlTarget for Numbered {
+            fn ranks(&self) -> &[RankId] {
+                &self.rank
+            }
+            fn relay_refusal(&self, _message: &[u8]) -> Option<RelayRefusal> {
+                self.refuses.then_some(RelayRefusal::AdminKeyMissing)
+            }
+            fn control<'a>(
+                &'a self,
+                build: &'a RequestBuilder<'a>,
+            ) -> BoxFuture<'a, Vec<RankReply>> {
+                Box::pin(async move {
+                    let ControlRequest::Sequenced(numbered) = build() else {
+                        panic!("an unnumbered fan-out under attention DP");
+                    };
+                    self.seen.lock().unwrap().push(numbered.seq);
+                    vec![RankReply {
+                        rank: self.rank[0],
+                        outcome: Ok(status_bytes(true, "")),
+                    }]
+                })
+            }
+            fn next_control_seq(&self) -> Option<BoxFuture<'_, Result<u64, CoreError>>> {
+                self.fetches.fetch_add(1, Ordering::SeqCst);
+                (self.rank[0] == 0).then(|| Box::pin(async { Ok(1_u64) }) as BoxFuture<'_, _>)
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let target = |rank, refuses| {
+            Arc::new(Numbered {
+                rank: [rank],
+                seen: seen.clone(),
+                refuses,
+                fetches: fetches.clone(),
+            }) as Arc<dyn ControlTarget>
+        };
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle_with = |peer_endpoints: Vec<Arc<dyn ControlTarget>>| {
+            CoreHandle::new(
+                intake_tx.clone(),
+                abort_tx.clone(),
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Vec::new(),
+                    multimodal: false,
+                    metrics: None,
+                    metadata: CoreMetadata {
+                        deployment_info: DeploymentInfo {
+                            dp_rank: Some(1),
+                            enable_dp_attention: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    peer_endpoints,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                },
+            )
+        };
+        let handle = handle_with(vec![target(0, false), target(2, false)]);
+        let local = async {
+            let request = accept_intake(intake_rx.recv_async().await.unwrap());
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            let ControlRequest::Sequenced(numbered) = control.as_ref() else {
+                panic!("an unnumbered local request under attention DP");
+            };
+            let seq = numbered.seq;
+            request
+                .sink
+                .try_send(ResponseItem::Control(status_bytes(true, "")))
+                .unwrap();
+            seq
+        };
+        let (outcome, local_seq) = tokio::join!(handle.flush_cache(1.0), local);
+        assert!(outcome.unwrap().success);
+        assert_eq!(local_seq, 1);
+        assert_eq!(*seen.lock().unwrap(), vec![1, 1]);
+
+        let fetched = fetches.load(Ordering::SeqCst);
+        let refused = handle_with(vec![target(0, false), target(2, true)])
+            .flush_cache(1.0)
+            .await;
+        assert!(!matches!(refused, Ok(ref output) if output.success));
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            fetched,
+            "refused before taking a number"
+        );
+        assert!(intake_rx.is_empty(), "the local scheduler got nothing");
+        assert_eq!(*seen.lock().unwrap(), vec![1, 1], "no peer got anything");
     }
 
     /// A relayed `AbortReq` ends this listener's own generations under the

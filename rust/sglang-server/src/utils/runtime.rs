@@ -576,6 +576,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
                 &cfg.server_args.api_keys,
+                crate::api_server::http::peer_relay_refusal,
             )?,
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
                 .with_server_info_state_keys(cfg.server_info_state_keys.clone()),

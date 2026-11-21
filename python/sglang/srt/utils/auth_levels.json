@@ -33,6 +33,7 @@
   "/hicache/storage-backend/clear": "admin_optional",
   "/init_weights_send_group_for_remote_instance": "admin_force",
   "/init_weights_update_group": "admin_force",
+  "/internal/control_seq": "admin_optional",
   "/internal/peer": "admin_optional",
   "/invocations": "normal",
   "/is_scaling_elastic_ep": "admin_optional",

@@ -308,18 +308,10 @@ def _request(**fields):
 
 class _WeightUpdaterManagerTestBase(CustomTestCase):
     def setUp(self):
-        patcher = patch(
-            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
-        )
+        patcher = patch("torch.distributed.barrier")
         patcher.start()
         self.addCleanup(patcher.stop)
-        # a single rank, whose gathers return its own outcome
-        group_gather = patch(
-            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
-            side_effect=lambda obj: [obj],
-        )
-        group_gather.start()
-        self.addCleanup(group_gather.stop)
+        # a single TP rank, whose gather returns its own outcome
         gather = patch(
             "torch.distributed.all_gather_object",
             side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
@@ -421,9 +413,7 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
-        with patch(
-            "sglang.srt.managers.scheduler_components.weight_updater.control_request_barrier"
-        ):
+        with patch("torch.distributed.barrier"):
             output = updater.end_weight_update(EndWeightUpdateReqInput())
 
         self.assertTrue(output.success)
@@ -543,12 +533,22 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertIsNone(manager._session)
 
     def test_end_reports_other_ranks_incomplete_update_once(self):
-        """Only one rank of the group replies: halves left unpaired on its peers fail its reply, named once."""
+        """Only rank 0 replies: halves left unpaired on ranks 1 and 2 fail its reply, named once."""
+        gathered = [
+            (0, None),
+            (0, "target: only one half"),
+            (0, "target: only one half"),
+        ]
         manager = self._manager(_runner())
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
-            return_value=[None, "target: only one half", "target: only one half"],
+        with (
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda outputs, obj, group: outputs.__setitem__(
+                    slice(None), gathered
+                ),
+            ),
+            get_parallel().override(tp_rank=0, tp_size=3),
         ):
             output = manager.end_weight_update(EndWeightUpdateReqInput())
 
@@ -764,10 +764,10 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
         manager.scheduler = None
         manager.memory_saver_adapter = Mock()
 
-        with patch(
-            "sglang.srt.managers.scheduler_components.weight_updater.control_request_all_gather_object",
-            return_value=[True, False],
-        ):
+        def a_peer_is_busy(busy, **kwargs):
+            busy.fill_(1)
+
+        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
             output = manager.release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
             )

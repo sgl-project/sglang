@@ -5,6 +5,7 @@
 //! Deliberately knows nothing about Axum, SSE framing, or Tonic.
 
 mod abort_hook;
+mod control_seq;
 mod drain;
 mod error;
 pub(crate) mod fanout;
@@ -16,6 +17,7 @@ mod request_log;
 mod validator;
 
 pub use abort_hook::AbortHook;
+pub(crate) use control_seq::{CONTROL_SEQ_PATH, ControlSequencer};
 pub(crate) use drain::{DrainEnd, DrainState, InFlight};
 pub(crate) use error::{CoreError, CoreErrorKind, STREAM_INVALID_REQUEST_ERROR};
 #[cfg(test)]

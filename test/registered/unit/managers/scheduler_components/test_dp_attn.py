@@ -705,8 +705,10 @@ class TestDPShutdownVote(CustomTestCase):
         # The adapter reads the scheduler's own exit flag, a peer's vote sets it,
         # and the rank keeps one gather pending until its own vote went out.
         from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.pause_state import PauseState
 
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.pause_state = PauseState()
         scheduler.tp_worker = SimpleNamespace(model_runner=Mock())
         scheduler.req_to_token_pool = Mock()
         scheduler.token_to_kv_pool_allocator = Mock()
@@ -743,6 +745,50 @@ class TestDPShutdownVote(CustomTestCase):
         self.assertEqual(info._get_fallback_tensor(device="cpu")[11].item(), 0)
         info.finalize_local()
         self.assertTrue(info.any_shutting_down)
+
+
+class TestDPControlSeqColumn(CustomTestCase):
+    """Each step's MLP-sync gather releases the control numbers every active
+    attention-DP group has received; an inactive slot never holds them back."""
+
+    def _released(self, *, local: int, peer: int, peer_active: bool = True) -> int:
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=0,
+            num_tokens_for_logprob=0,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.IDLE.value,
+            control_seq_received=local,
+        )
+
+        def fake_exchange(output, local_row, group):
+            peer_row = local_row.clone()
+            peer_row[13] = peer
+            output.copy_(torch.stack([local_row, peer_row]).flatten())
+
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(
+                active_ranks_cpu=torch.tensor([1, int(peer_active)])
+            )
+        )
+        with (
+            patch.object(dp_attn, "exchange_sync_rows", side_effect=fake_exchange),
+            patch.object(dp_attn, "get_parallel", return_value=parallel),
+        ):
+            info.all_gather(device="cpu", group=object())
+        return info.control_seq_released
+
+    def test_minimum_over_groups(self):
+        self.assertEqual(self._released(local=5, peer=3), 3)
+
+    def test_inactive_slot_does_not_hold_back(self):
+        self.assertEqual(self._released(local=5, peer=0, peer_active=False), 5)
 
 
 class TestDPDrainColumn(CustomTestCase):

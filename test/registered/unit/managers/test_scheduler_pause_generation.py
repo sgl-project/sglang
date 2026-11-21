@@ -27,7 +27,9 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordi
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
+    FlushCacheReqInput,
     PauseGenerationReqInput,
+    SequencedControlReq,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -983,6 +985,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             recv_requests=lambda local_reqs=None: next(inputs, [])
         )
         scheduler._poll_timeout_aborts = MagicMock(return_value=[])
+        scheduler.dp_attn_adapter = SimpleNamespace(runs_mlp_sync_gather=lambda: False)
         events = []
 
         def process_input_requests(reqs):
@@ -1143,6 +1146,86 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(decoding.dllm_initialized)
         self.assertEqual(len(decoding.dllm_incomplete_ids), 0)
         self.assertIsNone(decoding.dllm_algo_state)
+
+
+class TestPauseStateControlAlignment(CustomTestCase):
+    """Every attention-DP group must apply a numbered control request between
+    the same two MLP-sync gathers, and a paused engine runs none."""
+
+    @staticmethod
+    def _numbered(seq, req):
+        return SequencedControlReq.wrap(req, seq)
+
+    def _take(self, state, received, align=True, stop_at_pause=False):
+        return state.take_inputs(
+            received, stop_at_pause=stop_at_pause, align_control_reqs=align
+        )
+
+    def test_held_until_every_group_received_it(self):
+        state = PauseState()
+        abort = AbortReq(rid="a")
+        dispatched = self._take(state, [self._numbered(1, FlushCacheReqInput()), abort])
+        # Work passes the waiting control request.
+        self.assertEqual(dispatched, [abort])
+        self.assertEqual(state.control_seq_received, 1)
+        self.assertTrue(state.may_launch())
+        state.release_control_seqs(1)
+        self.assertIsInstance(self._take(state, [])[0], FlushCacheReqInput)
+
+    def test_paused_engine_applies_on_arrival_until_continue(self):
+        state = PauseState()
+        state.release_control_seqs(1)
+        dispatched = self._take(
+            state,
+            [
+                self._numbered(1, PauseGenerationReqInput(mode="in_place")),
+                self._numbered(2, FlushCacheReqInput()),
+                self._numbered(3, ContinueGenerationReqInput()),
+                self._numbered(4, FlushCacheReqInput()),
+            ],
+        )
+        # 2 and 3 follow the pause into the paused window; 4 follows the
+        # continue, after which the groups gather again, so it waits.
+        self.assertEqual(
+            [type(req) for req in dispatched],
+            [
+                PauseGenerationReqInput,
+                FlushCacheReqInput,
+                ContinueGenerationReqInput,
+            ],
+        )
+        self.assertEqual(self._take(state, []), [])
+
+    def test_paused_before_the_call_applies_on_arrival(self):
+        state = PauseState()
+        state.pause()
+        dispatched = self._take(state, [self._numbered(1, FlushCacheReqInput())])
+        self.assertIsInstance(dispatched[0], FlushCacheReqInput)
+
+    def test_a_group_goes_on_from_the_numbers_it_is_sent(self):
+        # The DP controller sends nothing to a group while it is inactive, and
+        # nothing before an elastic EP joiner joins: 2 never comes, 3 must not
+        # wait for it.
+        state = PauseState()
+        received = [self._numbered(seq, FlushCacheReqInput()) for seq in (1, 3)]
+        self.assertEqual(self._take(state, received), [])
+        self.assertEqual(state.control_seq_received, 3)
+        state.release_control_seqs(3)
+        self.assertEqual(len(self._take(state, [])), 2)
+
+    def test_numbered_requests_stay_behind_a_held_pause(self):
+        state = PauseState()
+        received = [
+            self._numbered(1, PauseGenerationReqInput(mode="in_place")),
+            self._numbered(2, FlushCacheReqInput()),
+        ]
+        state.release_control_seqs(2)
+        self.assertEqual(self._take(state, received, stop_at_pause=True), [])
+        self.assertTrue(state.holds_pause())
+        self.assertEqual(
+            [type(req) for req in self._take(state, [])],
+            [PauseGenerationReqInput, FlushCacheReqInput],
+        )
 
 
 if __name__ == "__main__":

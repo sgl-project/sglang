@@ -218,6 +218,9 @@ macro_rules! control_messages {
             /// A message another listener already encoded for its own DP
             /// rank's scheduler, relayed to this one unchanged.
             Forwarded($crate::message::types::ForwardedControlReq),
+            /// A message with the number rank 0's listener gave it, so every
+            /// attention-DP group applies it in the same step.
+            Sequenced($crate::message::types::SequencedControlReq),
         }
 
         impl ControlRequest {
@@ -230,6 +233,7 @@ macro_rules! control_messages {
                 match self {
                     $(Self::$name(m) => m.get_rid(),)+
                     Self::Forwarded(m) => &m.rid,
+                    Self::Sequenced(m) => &m.rid,
                 }
             }
 
@@ -239,6 +243,7 @@ macro_rules! control_messages {
                 match self {
                     $(Self::$name(m) => m.encode(),)+
                     Self::Forwarded(m) => Ok(m.header.clone()),
+                    Self::Sequenced(m) => m.encode(),
                 }
             }
         }
@@ -283,9 +288,92 @@ impl ForwardedControlReq {
     }
 }
 
+/// Python's `SequencedControlReq`: an encoded control message (`header`) with
+/// the number rank 0's listener gave it, as the positional
+/// `[tag, rid, http_worker_ipc, seq, payload]`. The scheduler holds a numbered
+/// message until every attention-DP group has received it, so all groups apply
+/// it in the same step; see `api_server::core::control_seq`.
+#[derive(Debug)]
+pub struct SequencedControlReq {
+    pub seq: u64,
+    /// The wrapped message's rid, which its reply carries.
+    pub rid: String,
+    pub header: Bytes,
+}
+
+impl SequencedControlReq {
+    pub const TAG: &'static str = "SequencedControlReq";
+
+    pub fn encode(&self) -> Result<Bytes, Error> {
+        let value = rmpv::Value::Array(vec![
+            Self::TAG.into(),
+            self.rid.as_str().into(),
+            rmpv::Value::Nil,
+            self.seq.into(),
+            rmpv::Value::Binary(self.header.to_vec()),
+        ]);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &value)
+            .map_err(|e| Error::Codec(format!("sequenced control request: {e}")))?;
+        Ok(Bytes::from(out))
+    }
+
+    /// The numbered message `body` encodes, or `None` when it is not one.
+    pub fn parse(body: &[u8]) -> Result<Option<Self>, Error> {
+        let invalid = |what: &str| Error::Codec(format!("sequenced control request: {what}"));
+        let value =
+            rmpv::decode::read_value(&mut &body[..]).map_err(|e| invalid(&e.to_string()))?;
+        let rmpv::Value::Array(items) = value else {
+            return Ok(None);
+        };
+        if items.first().and_then(rmpv::Value::as_str) != Some(Self::TAG) {
+            return Ok(None);
+        }
+        let (Some(rid), Some(seq), Some(rmpv::Value::Binary(header))) = (
+            items.get(1).and_then(rmpv::Value::as_str),
+            items.get(3).and_then(rmpv::Value::as_u64),
+            items.get(4),
+        ) else {
+            return Err(invalid(
+                "expected [tag, rid, http_worker_ipc, seq, payload]",
+            ));
+        };
+        Ok(Some(Self {
+            seq,
+            rid: rid.to_owned(),
+            header: Bytes::copy_from_slice(header),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A numbered message is written as the positional layout Python's
+    /// `SequencedControlReq` decodes (`test_msgpack_ipc_roundtrip.py` pins the
+    /// Python side), and any other message is not one.
+    #[test]
+    fn sequenced_control_writes_the_python_layout() {
+        let header = rmp_serde::to_vec(&("FlushCacheReqInput", "rid-7", (), 1.5)).unwrap();
+        let sequenced = SequencedControlReq {
+            seq: 42,
+            rid: "rid-7".into(),
+            header: Bytes::from(header.clone()),
+        };
+        let written = rmpv::decode::read_value(&mut &sequenced.encode().unwrap()[..]).unwrap();
+        assert_eq!(
+            written,
+            rmpv::Value::Array(vec![
+                "SequencedControlReq".into(),
+                "rid-7".into(),
+                rmpv::Value::Nil,
+                42_u64.into(),
+                rmpv::Value::Binary(header.clone()),
+            ])
+        );
+        assert!(SequencedControlReq::parse(&header).unwrap().is_none());
+    }
 
     /// A forwarded header's rid is the one at the `BaseReq` position, so the
     /// scheduler's reply routes back to the relaying request.

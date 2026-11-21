@@ -64,6 +64,9 @@ MLP_SYNC_CARRIES_DRAIN_STATE = True
 # The drain-state value of a gathered row with no listener behind it: an
 # inactive slot, or a rank that hosts no listener.
 DRAIN_STATE_NO_LISTENER = 8
+# The control-number value of a gathered row with no DP group behind it (an
+# inactive slot): the largest, so it never holds back the minimum.
+CONTROL_SEQ_NO_GROUP = torch.iinfo(torch.int64).max
 
 
 def exchange_sync_rows(
@@ -175,11 +178,14 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # The highest control number this rank received (see DPControlSeqColumn).
+    control_seq_received: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     any_health_check: bool = False
     any_shutting_down: bool = False
+    control_seq_released: int = 0
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
@@ -204,6 +210,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.control_seq_received,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +232,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                CONTROL_SEQ_NO_GROUP,  # control_seq_received
             ],
             device=device,
             dtype=dtype,
@@ -238,6 +246,7 @@ class MLPSyncBatchInfo:
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
+        self.control_seq_released = self.control_seq_received
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -315,6 +324,7 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        self.control_seq_released = int(tp0_info_cpu[:, 13].min())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -574,6 +584,23 @@ class DPDrainColumn:
         self.rows: Optional[list[int]] = None
 
 
+class DPControlSeqColumn:
+    """Carries, through the MLP-sync gather, the highest control number
+    (SequencedControlReq.seq) each attention-DP group has received.
+
+    ``local`` is the highest number this rank received; ``released`` gets the
+    minimum over the active DP groups whenever the gather produced metadata.
+    Every group has received every request up to it that was sent to it, so
+    each applies them before its next gather (see PauseState.take_inputs).
+    """
+
+    __slots__ = ("local", "released")
+
+    def __init__(self, local: int) -> None:
+        self.local = local
+        self.released: Optional[int] = None
+
+
 class DPShutdownVoteSent:
     """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
 
@@ -596,6 +623,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    control_seq_column: Optional[DPControlSeqColumn] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -713,6 +741,9 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        control_seq_received=(
+            control_seq_column.local if control_seq_column is not None else 0
+        ),
     )
 
     if num_dp_ranks == 1:
@@ -729,6 +760,8 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if control_seq_column is not None and metadata_ready:
+        control_seq_column.released = mlp_sync_info.control_seq_released
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -814,10 +847,25 @@ class SchedulerDPAttnAdapter:
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    # The highest control number this rank received, and the callback that
+    # gets, after each gather, the number every DP group has received up to
+    # (see DPControlSeqColumn).
+    get_control_seq_received: Callable[[], int] = lambda: 0
+    on_control_seq_released: Optional[Callable[[int], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
     )
+
+    def runs_mlp_sync_gather(self) -> bool:
+        """Whether this rank gathers with the other attention-DP ranks at every
+        batch selection."""
+        num_dp_ranks = get_parallel().num_dp_ranks
+        return (
+            self.get_require_mlp_sync()
+            and num_dp_ranks > 1
+            and not should_skip_scheduler_all_gather(num_dp_ranks)
+        )
 
     def shutdown_vote_pending(self) -> bool:
         """This rank honored a ShutdownReq that no MLP-sync gather has carried yet.
@@ -825,13 +873,10 @@ class SchedulerDPAttnAdapter:
         A loop that stops scheduling batches on shutdown still runs one batch
         selection while this holds, so its gather tells the other DP ranks.
         """
-        num_dp_ranks = get_parallel().num_dp_ranks
         return (
             self.get_shutting_down()
             and not self.shutdown_vote_sent.value
-            and self.get_require_mlp_sync()
-            and num_dp_ranks > 1
-            and not should_skip_scheduler_all_gather(num_dp_ranks)
+            and self.runs_mlp_sync_gather()
         )
 
     def drop_sync_wait_carry(self) -> None:
@@ -850,6 +895,7 @@ class SchedulerDPAttnAdapter:
 
         shutdown_vote = DPShutdownVote(self.get_shutting_down())
         drain_column = DPDrainColumn(self.get_drain_state())
+        control_seq_column = DPControlSeqColumn(self.get_control_seq_received())
         batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -863,9 +909,15 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            control_seq_column=control_seq_column,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
+        if (
+            control_seq_column.released is not None
+            and self.on_control_seq_released is not None
+        ):
+            self.on_control_seq_released(control_seq_column.released)
         if shutdown_vote.local:
             self.shutdown_vote_sent.value = True
         if (

@@ -6,6 +6,7 @@ mod corpus;
 pub(crate) mod generate_hook;
 mod hicache;
 mod info;
+pub(crate) use info::peer_relay_refusal;
 mod loads;
 mod metrics;
 mod native_api;
