@@ -412,6 +412,52 @@ class TestDirectGPUVAEState(unittest.TestCase):
         self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
         self.assertTrue(torch.equal(loaded.scale, expected_scale))
 
+    def test_direct_load_keeps_non_persistent_buffers(self):
+        class _RotaryVAE(self._StandardVAE):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.register_buffer("inv_freq", torch.arange(3.0), persistent=False)
+
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(QwenImagePipelineConfig())
+        server_args.component_weights_paths = {}
+        server_args.component_direct_gpu_weight_loading = {"vae": True}
+        with (
+            TemporaryDirectory() as root,
+            patch.object(
+                vae_loader,
+                "get_diffusers_component_config",
+                return_value={"_class_name": "TestVAE"},
+            ),
+            patch.object(
+                vae_loader.ModelRegistry,
+                "resolve_model_cls",
+                return_value=(_RotaryVAE, None),
+            ),
+            patch.object(
+                vae_loader,
+                "_list_safetensors_files",
+                return_value=[str(pathlib.Path(root) / "model.safetensors")],
+            ),
+            patch.object(loader, "target_device", return_value=torch.device("cpu")),
+            patch.object(
+                vae_loader.current_platform,
+                "optimize_vae",
+                side_effect=lambda vae: vae,
+            ),
+        ):
+            safetensors_save_file(
+                {
+                    "proj.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+                    "scale": torch.ones(1, dtype=torch.bfloat16),
+                },
+                pathlib.Path(root) / "model.safetensors",
+            )
+            loaded = loader.load_customized(root, server_args, "vae")
+
+        self.assertFalse(loaded.inv_freq.is_meta)
+        self.assertTrue(torch.equal(loaded.inv_freq.float(), torch.arange(3.0)))
+
     def test_native_vae_ignores_diffusers_auto_map_for_weight_override(self):
         loader = vae_loader.VAELoader()
         expected_weight = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
