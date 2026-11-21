@@ -14,6 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -246,6 +247,86 @@ class TestKVShardedMLADispatch(CustomTestCase):
                     ),
                     AttnForwardMethod.MHA_CHUNKED_KV,
                 )
+
+
+class TestMLUAttentionRouting(CustomTestCase):
+    def test_mlu_attention_routing(self):
+        # Expected methods are ordered by threshold: unset, then 10.
+        cases = (
+            # No prefix uses MHA regardless of the threshold.
+            (
+                "no_prefix",
+                {"extend_prefix_lens_cpu": [0, 0]},
+                False,
+                (AttnForwardMethod.MHA, AttnForwardMethod.MHA),
+            ),
+            # Only an explicit user threshold keeps short prefixes on MLA.
+            (
+                "short_prefix",
+                {"extend_prefix_lens_cpu": [0, 1]},
+                False,
+                (AttnForwardMethod.MHA_ONE_SHOT, AttnForwardMethod.MLA),
+            ),
+            # Prefix sum 10 meets either threshold; total length equals capacity.
+            (
+                "within_capacity",
+                {},
+                False,
+                (AttnForwardMethod.MHA_ONE_SHOT, AttnForwardMethod.MHA_ONE_SHOT),
+            ),
+            # Split KV when total length exceeds capacity.
+            (
+                "above_capacity",
+                {"seq_lens_sum": 33},
+                False,
+                (AttnForwardMethod.MHA_CHUNKED_KV, AttnForwardMethod.MHA_CHUNKED_KV),
+            ),
+            # Disabling prefix-cache MHA keeps the latent path.
+            (
+                "prefix_cache_disabled",
+                {},
+                True,
+                (AttnForwardMethod.MLA, AttnForwardMethod.MLA),
+            ),
+            # Decode and mixed batches use MLA regardless of the threshold.
+            (
+                "decode",
+                {"forward_mode": ForwardMode.DECODE},
+                False,
+                (AttnForwardMethod.MLA, AttnForwardMethod.MLA),
+            ),
+            (
+                "mixed",
+                {"forward_mode": ForwardMode.MIXED},
+                False,
+                (AttnForwardMethod.MLA, AttnForwardMethod.MLA),
+            ),
+        )
+
+        threshold = envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
+        for threshold_index, value in enumerate((None, 10)):
+            with threshold.override(value):
+                if value is None:
+                    # None represents an unset variable, not an explicit None value.
+                    threshold.clear()
+                for name, batch_overrides, disabled, expected_methods in cases:
+                    with self.subTest(threshold=value, case=name):
+                        attn = SimpleNamespace(
+                            disable_chunked_prefix_cache=disabled,
+                            chunked_prefix_cache_threshold=threshold.get(),
+                        )
+                        batch_fields = dict(
+                            forward_mode=ForwardMode.EXTEND,
+                            extend_prefix_lens_cpu=[5, 5],
+                            seq_lens_sum=32,
+                            get_max_chunk_capacity=lambda: 32,
+                        )
+                        batch_fields.update(batch_overrides)
+                        forward_batch = SimpleNamespace(**batch_fields)
+                        self.assertEqual(
+                            abh.handle_attention_mlu(attn, forward_batch),
+                            expected_methods[threshold_index],
+                        )
 
 
 if __name__ == "__main__":

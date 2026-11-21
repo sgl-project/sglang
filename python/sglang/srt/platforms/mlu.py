@@ -11,7 +11,8 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+from sglang.srt.platforms.interface import KVPoolKind, PlatformCapabilities, SRTPlatform
+from sglang.srt.runtime_context import attention_backends
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -77,3 +78,24 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "mlu"
+
+    def get_default_attention_backend(self) -> str:
+        return "mlu"
+
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
+        if kind == "mha":
+            prefill_backend, _ = attention_backends()
+            if prefill_backend != "mlu":
+                return None
+            from sglang.srt.hardware_backend.mlu.memory_pool import (
+                MLUMHATokenToKVPool,
+            )
+
+            return MLUMHATokenToKVPool
+        if kind == "mla":
+            from sglang.srt.hardware_backend.mlu.memory_pool import (
+                MLUMLATokenToKVPool,
+            )
+
+            return MLUMLATokenToKVPool
+        return None

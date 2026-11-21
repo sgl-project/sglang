@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
@@ -39,6 +40,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_mlu = is_mlu()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_sail = is_sail()

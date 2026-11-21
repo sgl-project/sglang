@@ -5,12 +5,14 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang import _platform_stubs
 from sglang.kernels.jit.utils.arch import _sail_arch_suffix
+from sglang.srt.environ import envs
 from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -639,6 +641,168 @@ class TestMluSRTPlatform(CustomTestCase):
         self.assertTrue(base.is_pin_memory_available())
         self.assertTrue(base.is_pin_memory_available(device="mlu"))
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
+
+    @staticmethod
+    def _resolve_attention(args):
+        from sglang.srt.arg_groups.attention_hook import (
+            handle_attention_backend_compatibility,
+        )
+        from sglang.srt.configs.model_config import AttentionArch
+        from sglang.srt.runtime_context import override_platform
+
+        args._model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            is_encoder_decoder=False,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            hf_text_config=SimpleNamespace(),
+        )
+        with (
+            override_platform(is_mlu=True),
+            patch(
+                "sglang.srt.arg_groups.model_override_base.current_platform",
+                MluSRTPlatform(),
+            ),
+        ):
+            handle_attention_backend_compatibility(args)
+
+    def test_supported_attention_backend_resolution(self):
+        """Unset phases inherit the base backend; explicit phase choices survive."""
+        from sglang.srt.arg_groups.model_override_base import (
+            attention_backends_of,
+            resolved_view,
+        )
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.arg_groups.platform_hook import handle_mlu_backends
+        from sglang.srt.server_args import ServerArgs
+
+        cases = (
+            # Unspecified backends default to MLU and PyTorch sampling.
+            ({}, ("mlu", "mlu", "mlu")),
+            # Explicit MLU and PyTorch sampling choices are accepted.
+            (
+                {"attention_backend": "mlu", "sampling_backend": "pytorch"},
+                ("mlu", "mlu", "mlu"),
+            ),
+            # Both phases inherit an explicit Triton base backend.
+            (
+                {"attention_backend": "triton", "page_size": 32},
+                ("triton", "triton", "triton"),
+            ),
+            (
+                {
+                    "prefill_attention_backend": "triton",
+                    "decode_attention_backend": "triton",
+                },
+                ("triton", "triton", "triton"),
+            ),
+        )
+        for fields, expected in cases:
+            with (
+                self.subTest(fields=fields),
+                envs.SGLANG_USE_HND_KVCACHE.override(None),
+            ):
+                envs.SGLANG_USE_HND_KVCACHE.clear()
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                handle_mlu_backends(args)
+                self._resolve_attention(args)
+                self.assertEqual(
+                    (
+                        resolution_result(args, "attention_backend"),
+                        *attention_backends_of(resolved_view(args)),
+                    ),
+                    expected,
+                )
+                self.assertEqual(resolution_result(args, "sampling_backend"), "pytorch")
+                self.assertEqual(
+                    resolution_result(args, "page_size"), fields.get("page_size", 16)
+                )
+                self.assertEqual(args.page_size, fields.get("page_size"))
+                self.assertEqual(
+                    args.attention_backend, fields.get("attention_backend")
+                )
+
+    def test_mixed_attention_backends_rejected(self):
+        """Different phase backends cannot share the current MLU cache layout."""
+        from sglang.srt.arg_groups.platform_hook import (
+            handle_mlu_attention_backend_compatibility,
+            handle_mlu_backends,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for prefill, decode in (("mlu", "triton"), ("triton", "mlu")):
+            with self.subTest(prefill=prefill, decode=decode):
+                args = ServerArgs(
+                    model_path="unused",
+                    device="mlu",
+                    prefill_attention_backend=prefill,
+                    decode_attention_backend=decode,
+                )
+                with self.assertRaises(ValueError):
+                    handle_mlu_backends(args)
+                    handle_mlu_attention_backend_compatibility(args)
+
+    def test_explicit_hnd_setting_is_preserved(self):
+        """Reject incompatible MHA layouts during resolution without changing the env."""
+        from contextlib import nullcontext
+
+        from sglang.srt.arg_groups.platform_hook import (
+            handle_mlu_attention_backend_compatibility,
+            handle_mlu_backends,
+        )
+        from sglang.srt.configs.model_config import AttentionArch
+        from sglang.srt.server_args import ServerArgs
+
+        for arch in (AttentionArch.MHA, AttentionArch.MLA):
+            for backend in ("mlu", "triton"):
+                for use_hnd in (False, True):
+                    with (
+                        self.subTest(arch=arch, backend=backend, use_hnd=use_hnd),
+                        envs.SGLANG_USE_HND_KVCACHE.override(use_hnd),
+                    ):
+                        args = ServerArgs(
+                            model_path="unused", device="mlu", attention_backend=backend
+                        )
+                        args._model_config = SimpleNamespace(attention_arch=arch)
+                        incompatible = arch == AttentionArch.MHA and use_hnd != (
+                            backend == "mlu"
+                        )
+                        with (
+                            self.assertRaises(ValueError)
+                            if incompatible
+                            else nullcontext()
+                        ):
+                            handle_mlu_backends(args)
+                            handle_mlu_attention_backend_compatibility(args)
+                        self.assertEqual(envs.SGLANG_USE_HND_KVCACHE.get(), use_hnd)
+
+    def test_unsupported_runtime_settings_fail_during_resolution(self):
+        """Reject unsupported runtime settings before model loading or execution."""
+        from sglang.srt.arg_groups.platform_hook import (
+            handle_mlu_attention_backend_compatibility,
+            handle_mlu_backends,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for field, value, error_type in (
+            ("attention_backend", "flashinfer", ValueError),
+            ("prefill_attention_backend", "flashinfer", ValueError),
+            ("decode_attention_backend", "flashinfer", ValueError),
+            ("sampling_backend", "flashinfer", ValueError),
+            ("quantization", "awq", NotImplementedError),
+            ("speculative_algorithm", "EAGLE", NotImplementedError),
+        ):
+            with self.subTest(field=field, value=value):
+                # A valid base backend must not hide an incompatible phase override.
+                fields = dict(
+                    attention_backend="mlu",
+                    prefill_attention_backend="mlu",
+                    decode_attention_backend="mlu",
+                )
+                fields[field] = value
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                with self.assertRaises(error_type):
+                    handle_mlu_backends(args)
+                    handle_mlu_attention_backend_compatibility(args)
 
 
 class TestPinMemoryAvailability(CustomTestCase):

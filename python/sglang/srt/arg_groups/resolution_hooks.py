@@ -54,6 +54,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_sail_backends",
         "handle_symm_mem_device_support",
         "handle_platform_defaults",
+        "handle_mlu_backends",
         "handle_gpu_memory_settings",
         "handle_model_specific_adjustments",
         "handle_deterministic_inference",
