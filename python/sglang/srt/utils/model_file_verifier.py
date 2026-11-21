@@ -106,7 +106,11 @@ def generate_checksums(
 ) -> Manifest:
     if Path(source).is_dir():
         model_path = Path(source).resolve()
-        files = _discover_files(model_path)
+        files = [
+            filename
+            for filename in _discover_files(model_path)
+            if (model_path / filename).resolve() != Path(output_path).resolve()
+        ]
         if not files:
             raise IntegrityError(f"No model files found in {model_path}")
         manifest = _compute_manifest_from_folder(
