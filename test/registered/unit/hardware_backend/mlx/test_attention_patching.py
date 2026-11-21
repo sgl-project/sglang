@@ -276,6 +276,7 @@ class TestMlxAttentionPatching(unittest.TestCase):
 class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_dense_prefill_keeps_pool_backed_radix_path(self):
         runner = object.__new__(MlxModelRunner)
+        runner._req_min_new_tokens = {}
         runner.model = FakeDenseModel(num_layers=2)
         _set_runner_cache_layout(
             runner,
@@ -343,6 +344,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         for req_ids in (["r0"], ["r0", "r1"]):
             with self.subTest(req_ids=req_ids):
                 runner = object.__new__(MlxModelRunner)
+                runner._req_min_new_tokens = {}
                 _set_runner_cache_layout(
                     runner,
                     num_layers=1,
@@ -386,6 +388,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_dense_chained_decode_uses_batched_attention_for_single_request(self):
         runner = object.__new__(MlxModelRunner)
+        runner._req_min_new_tokens = {}
         _set_runner_cache_layout(
             runner,
             num_layers=1,
@@ -580,6 +583,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_auxiliary_decode_uses_hybrid_batching_for_multi_request(self):
         runner = object.__new__(MlxModelRunner)
+        runner._req_min_new_tokens = {}
         _set_runner_cache_layout(
             runner,
             num_layers=2,
@@ -685,6 +689,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_auxiliary_state_prefill_restores_prefix_state(self):
         runner = object.__new__(MlxModelRunner)
+        runner._req_min_new_tokens = {}
         runner.model = FakeAuxiliaryStateModel()
         _set_runner_cache_layout(
             runner,
@@ -745,6 +750,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     def test_auxiliary_state_prefill_tracks_chunk_aligned_auxiliary_state(self):
         _set_dummy_server_args_for_auxiliary_state_tests()
         runner = object.__new__(MlxModelRunner)
+        runner._req_min_new_tokens = {}
         runner.model = FakeAuxiliaryStateModel()
         _set_runner_cache_layout(
             runner,
@@ -802,6 +808,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
     ):
         _set_dummy_server_args_for_auxiliary_state_tests()
         runner = object.__new__(MlxModelRunner)
+        runner._req_min_new_tokens = {}
         runner.model = FakeAuxiliaryStateModel()
         _set_runner_cache_layout(
             runner,
@@ -1542,6 +1549,7 @@ if _HAS_MLX:
     class FakeRequest:
         def __init__(self):
             self.kv = ReqKvInfo()
+            self.sampling_params = SimpleNamespace(min_new_tokens=0)
             self.mamba_branching_seqlen = None
             self.mamba_branching_seqlen = None
 
