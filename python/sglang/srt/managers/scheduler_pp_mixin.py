@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -342,6 +343,7 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_pending_chunked_abort()
+                schedule_start = time.monotonic()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -352,6 +354,8 @@ class SchedulerPPMixin:
                     batch = prefill_plan.batch_to_run
                     self.running_batch = prefill_plan.running_batch
                     batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                    if batch:
+                        batch.fpm_start_time = schedule_start
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
