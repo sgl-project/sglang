@@ -247,6 +247,69 @@ class TestAssertSame(RankConsensusCheckerTestCase):
             self._spawn(TestAssertSame.disabled_fn, tp_size=2, enable_env=False)
         )
 
+    @staticmethod
+    def call_count_divergence_on_shutdown_fn():
+        tp_group = get_tp_group()
+        configure([tp_group])
+        if tp_group.rank_in_group == 0:
+            assert_same("only called on rank 0")
+        shutdown()
+
+    def test_call_count_divergence_detected_on_shutdown(self):
+        """If one rank calls assert_same more times than a peer before shutdown(),
+        it must be detected as divergence rather than hanging in all_reduce."""
+        self.assertFalse(
+            self._spawn(TestAssertSame.call_count_divergence_on_shutdown_fn, tp_size=2)
+        )
+
+    @staticmethod
+    def boundary_collision_divergence_fn():
+        tp_group = get_tp_group()
+        configure([tp_group])
+        # Wait briefly so both events are queued in the same batch before draining
+        if tp_group.rank_in_group == 0:
+            assert_same("ab")
+            assert_same("c")
+        else:
+            assert_same("a")
+            assert_same("bc")
+        shutdown()
+
+    def test_message_boundary_divergence_detected(self):
+        """Different message boundaries (['ab', 'c'] vs ['a', 'bc']) must not
+        hash-collide to the same digest."""
+        self.assertFalse(
+            self._spawn(TestAssertSame.boundary_collision_divergence_fn, tp_size=2)
+        )
+
+    def test_check_for_consensus_framing_and_single_all_reduce(self):
+        """Verify _check_for_consensus issues 1 all_reduce per group and frames
+        messages by byte length so ['ab', 'c'] != ['a', 'bc'] and [] != ['']."""
+        import sglang.srt.utils.rank_consensus_checker as rcc
+
+        recorded_tensors = []
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            recorded_tensors.append(tensor.clone())
+
+        sentinel_group = object()
+        with (
+            patch.object(rcc, "_sync_groups", [sentinel_group]),
+            patch.object(rcc.dist, "all_reduce", side_effect=fake_all_reduce),
+        ):
+            rcc._check_for_consensus(["ab", "c"])
+            rcc._check_for_consensus(["a", "bc"])
+            rcc._check_for_consensus([])
+            rcc._check_for_consensus([""])
+
+        self.assertEqual(len(recorded_tensors), 4)
+        self.assertFalse(
+            rcc.torch.equal(recorded_tensors[0][:20], recorded_tensors[1][:20])
+        )
+        self.assertFalse(
+            rcc.torch.equal(recorded_tensors[2][:20], recorded_tensors[3][:20])
+        )
+
 
 class TestRankConsensusDecorator(RankConsensusCheckerTestCase):
     @staticmethod
