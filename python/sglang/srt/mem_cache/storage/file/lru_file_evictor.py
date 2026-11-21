@@ -15,7 +15,8 @@ A backend constructs one evictor and drives it through a small lifecycle::
     reserve(key, n_bytes) -> bool    # admit a new write, evicting if needed
         commit(key)                  #   write landed on disk
         abort(key)                   #   write failed; release the reservation
-    clear()                          # backend wiped all files
+    clear_storage() -> bool          # remove owned files and reset bookkeeping
+    clear()                          # reset bookkeeping only
 
 When eviction is not configured the evictor is inert: ``reserve`` always admits
 and the other calls are no-ops, so the backend behaves as unbounded storage.
@@ -247,6 +248,54 @@ class LRUFileEvictor:
             self._lru.clear()
             self._pending_writes.clear()
             self._total_bytes = 0
+
+    def clear_storage(self) -> bool:
+        """Remove this rank's owned ``.bin`` pages and reset bookkeeping.
+
+        Files belonging to other suffixes, non-``.bin`` files, and non-regular
+        entries are left alone. Concurrent unlink races (``FileNotFoundError``)
+        are ignored; returns False if scanning fails or any owned file could not
+        be removed.
+        """
+        if not self._owned_suffixes:
+            self.clear()
+            return True
+        success = True
+        remaining: OrderedDict[str, int] = OrderedDict()
+        with self._lock:
+            try:
+                entries = list(os.scandir(self.file_path))
+            except FileNotFoundError:
+                entries = []
+            except OSError as exc:
+                logger.error("Failed to scan HiCacheFile storage during clear: %s", exc)
+                return False
+            for entry in entries:
+                if not entry.name.endswith(".bin"):
+                    continue
+                stem = entry.name[:-4]
+                if not self._owns(stem):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    os.remove(entry.path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    success = False
+                    logger.warning(
+                        "Failed to clear HiCacheFile path %s: %s", entry.path, exc
+                    )
+                    if self._eviction_enabled:
+                        try:
+                            remaining[stem] = entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+            self._lru = remaining
+            self._pending_writes.clear()
+            self._total_bytes = sum(remaining.values())
+        return success
 
     def _fs_stats(self) -> Optional[tuple]:
         """(total, available) bytes for the filesystem; None if unavailable."""

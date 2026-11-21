@@ -912,5 +912,204 @@ class TestUncachedBatchExists(HiCacheFileLRUTestBase):
             self.assertEqual(b.batch_exists_v2([]).kv_hit_pages, 0)
 
 
+class TestClearIsolationAndConcurrency(HiCacheFileLRUTestBase):
+    def test_clear_preserves_other_models_ranks_and_non_cache_files(self):
+        b_a0 = self.make_backend(
+            max_size="1000",
+            tp_rank=0,
+            tp_size=2,
+            model="model_a",
+            subdir="shared",
+            enable_metadata_cache=True,
+        )
+        b_a1 = self.make_backend(
+            max_size="1000",
+            tp_rank=1,
+            tp_size=2,
+            model="model_a",
+            subdir="shared",
+            enable_metadata_cache=True,
+        )
+        b_b0 = self.make_backend(
+            max_size="1000",
+            tp_rank=0,
+            tp_size=2,
+            model="model_b",
+            subdir="shared",
+            enable_metadata_cache=True,
+        )
+        self.assertTrue(b_a0.set("k1", _t(100)))
+        self.assertTrue(b_a1.set("k1", _t(100)))
+        self.assertTrue(b_b0.set("k1", _t(100)))
+
+        keep_txt = os.path.join(b_a0.file_path, "keep.txt")
+        keep_tmp = os.path.join(b_a0.file_path, ".inprogress.tmp")
+        owned_dir = os.path.join(b_a0.file_path, f"dir{b_a0.config_suffix}.bin")
+        with open(keep_txt, "wb") as f:
+            f.write(b"keep")
+        with open(keep_tmp, "wb") as f:
+            f.write(b"tmp")
+        os.mkdir(owned_dir)
+
+        self.assertTrue(b_a0.clear())
+        self.assertEqual(b_a0._evictor._total_bytes, 0)
+        self.assertEqual(len(b_a0._evictor._lru), 0)
+        self.assertFalse(b_a0.metadata_cache.contains(b_a0._get_suffixed_key("k1")))
+        self.assertFalse(b_a0.exists("k1"))
+
+        # Other ranks, other models, non-.bin files, and directories survive.
+        self.assertTrue(os.path.exists(keep_txt))
+        self.assertTrue(os.path.exists(keep_tmp))
+        self.assertTrue(os.path.isdir(owned_dir))
+        self.assertTrue(
+            os.path.isfile(
+                os.path.join(b_a1.file_path, f"{b_a1._get_suffixed_key('k1')}.bin")
+            )
+        )
+        self.assertTrue(
+            os.path.isfile(
+                os.path.join(b_b0.file_path, f"{b_b0._get_suffixed_key('k1')}.bin")
+            )
+        )
+
+    def test_clear_mla_non_writer_preserves_shared_kv_and_clears_own_state(self):
+        r0 = self.make_backend(
+            max_size="1000",
+            tp_rank=0,
+            tp_size=2,
+            is_mla=True,
+            subdir="mla_clear",
+            enable_metadata_cache=True,
+        )
+        r1 = self.make_backend(
+            max_size="1000",
+            tp_rank=1,
+            tp_size=2,
+            is_mla=True,
+            subdir="mla_clear",
+            enable_metadata_cache=True,
+        )
+        self.assertTrue(r0.set("k1", _t(100)))
+        self.assertTrue(r0.set("k1.mamba", _t(50)))
+        self.assertTrue(r1.set("k1.mamba", _t(50)))
+        self.assertTrue(r1.exists("k1"))
+        self.assertTrue(r1.metadata_cache.contains(r1._get_suffixed_key("k1")))
+
+        # Non-writer clears only its own TP-sharded files, plus local metadata.
+        self.assertTrue(r1.clear())
+        self.assertEqual(r1._evictor._total_bytes, 0)
+        self.assertFalse(r1.metadata_cache.contains(r1._get_suffixed_key("k1")))
+        self.assertFalse(r1.exists("k1.mamba"))
+        self.assertTrue(
+            os.path.isfile(
+                os.path.join(r0.file_path, f"{r0._get_suffixed_key('k1')}.bin")
+            )
+        )
+        self.assertTrue(r0.exists("k1.mamba"))
+
+        # Writer removes the shared MLA KV and its own Mamba file.
+        self.assertTrue(r0.clear())
+        self.assertEqual(r0._evictor._total_bytes, 0)
+        self.assertFalse(r0.metadata_cache.contains(r0._get_suffixed_key("k1")))
+        self.assertFalse(r0.exists("k1"))
+        self.assertFalse(r0.exists("k1.mamba"))
+
+    def test_clear_ignores_concurrent_file_not_found_and_resets_state(self):
+        b = self.make_backend(max_size="1000", enable_metadata_cache=True)
+        self.assertTrue(b.set("k1", _t(100)))
+        self.assertTrue(b.set("k2", _t(100)))
+        k1_stem = b._get_suffixed_key("k1")
+        k2_stem = b._get_suffixed_key("k2")
+        k1_path = os.path.join(b.file_path, f"{k1_stem}.bin")
+        k2_path = os.path.join(b.file_path, f"{k2_stem}.bin")
+
+        real_remove = os.remove
+
+        def racing_remove(path):
+            if path == k1_path:
+                real_remove(path)
+                raise FileNotFoundError(path)
+            real_remove(path)
+
+        with mock.patch("os.remove", side_effect=racing_remove):
+            self.assertTrue(b.clear())
+
+        self.assertFalse(os.path.exists(k1_path))
+        self.assertFalse(os.path.exists(k2_path))
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertEqual(len(b._evictor._lru), 0)
+        self.assertFalse(b.metadata_cache.contains(k1_stem))
+        self.assertFalse(b.metadata_cache.contains(k2_stem))
+
+    def test_clear_handles_unlink_oserror_without_skipping_remaining_files(self):
+        b = self.make_backend(max_size="1000", enable_metadata_cache=True)
+        self.assertTrue(b.set("k1", _t(100)))
+        self.assertTrue(b.set("k2", _t(120)))
+        k1_stem = b._get_suffixed_key("k1")
+        k2_stem = b._get_suffixed_key("k2")
+        k1_path = os.path.join(b.file_path, f"{k1_stem}.bin")
+        k2_path = os.path.join(b.file_path, f"{k2_stem}.bin")
+
+        real_remove = os.remove
+
+        def failing_remove(path):
+            if path == k1_path:
+                raise PermissionError("denied")
+            real_remove(path)
+
+        with mock.patch("os.remove", side_effect=failing_remove):
+            self.assertFalse(b.clear())
+
+        self.assertTrue(os.path.exists(k1_path))
+        self.assertFalse(os.path.exists(k2_path))
+        self.assertEqual(b._evictor._total_bytes, 100)
+        self.assertEqual(list(b._evictor._lru.keys()), [k1_stem])
+        self.assertFalse(b.metadata_cache.contains(k1_stem))
+        self.assertFalse(b.metadata_cache.contains(k2_stem))
+
+    def test_clear_missing_directory_succeeds_and_resets_state(self):
+        b = self.make_backend(max_size="1000", enable_metadata_cache=True)
+        self.assertTrue(b.set("k1", _t(100)))
+        shutil.rmtree(b.file_path)
+
+        self.assertTrue(b.clear())
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertEqual(len(b._evictor._lru), 0)
+        self.assertFalse(b.metadata_cache.contains(b._get_suffixed_key("k1")))
+
+    def test_clear_unified_non_writer_preserves_writer_chunks(self):
+        d = os.path.join(self.tmpdir, "unified_clear")
+        os.makedirs(d, exist_ok=True)
+        writer_cfg = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=2,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="testmodel",
+            unified_suffixes=["ukv1-test_L0-1"],
+            extra_config={"enable_metadata_cache": True},
+        )
+        reader_cfg = replace(writer_cfg, attn_cp_rank=1)
+        writer = HiCacheFile(writer_cfg, file_path=d)
+        reader = HiCacheFile(reader_cfg, file_path=d)
+
+        self.assertTrue(writer.set("k1", _t(64)))
+        self.assertTrue(reader.exists("k1"))
+        self.assertTrue(reader.metadata_cache.contains("k1_ukv1-test_L0-1"))
+
+        self.assertTrue(reader.clear())
+        self.assertFalse(reader.metadata_cache.contains("k1_ukv1-test_L0-1"))
+        self.assertTrue(writer.exists("k1"))
+
+        self.assertTrue(writer.clear())
+        self.assertFalse(writer.metadata_cache.contains("k1_ukv1-test_L0-1"))
+        self.assertFalse(writer.exists("k1"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

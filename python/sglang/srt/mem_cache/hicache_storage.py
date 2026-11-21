@@ -1370,16 +1370,11 @@ class HiCacheFile(HiCacheStorage):
         return self._batch_io_v2(transfers, self._write_page)
 
     def clear(self) -> bool:
-        try:
-            for filename in os.listdir(self.file_path):
-                file_path = os.path.join(self.file_path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
-            self._evictor.clear()
-            if self.metadata_cache is not None:
-                self.metadata_cache.clear()
-            logger.info("Cleared all entries in HiCacheFile storage.")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to clear HiCacheFile storage: {e}")
-            return False
+        success = self._evictor.clear_storage()
+        if self.metadata_cache is not None:
+            self.metadata_cache.clear()
+        if success:
+            logger.info("Cleared HiCacheFile storage.")
+        else:
+            logger.error("Failed to fully clear HiCacheFile storage.")
+        return success
