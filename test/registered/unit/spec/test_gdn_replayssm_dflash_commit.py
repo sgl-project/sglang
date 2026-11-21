@@ -7,6 +7,7 @@ through ``HybridLinearAttnBackend.update_mamba_state_after_mtp_verify``, which
 goes through the same ring commit as the generic spec commit.
 """
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -265,56 +266,117 @@ class TestGDNReplaySSMBackendCommit(CustomTestCase):
 class TestGDNReplaySSMGenericCommit(CustomTestCase):
     def test_cursor_advance_gets_the_state_slots(self):
         """The cursor advance skips the rows the verify and fold skip (state
-        slot -1), so it gets the same state slots as the fold."""
+        slot -1), so it gets the same state slots as the fold. The bf16
+        checkpoint folds every commit unless the lazy fold is opted in and the
+        batch has at least REPLAYSSM_LAZY_FOLD_MIN_STATES request states."""
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+            REPLAYSSM_LAZY_FOLD_MIN_STATES,
+        )
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         target_worker = MagicMock()
         pool = _gdn_pool()
-        pool.get_speculative_mamba2_params_all_layers = lambda: _spec_state()
+        spec_state = _spec_state()
+        pool.get_speculative_mamba2_params_all_layers = lambda: spec_state
         router = target_worker.model_runner.token_to_kv_pool.layer_router
         router.part_view.return_value = pool
-        slots = torch.tensor([5, -1])
-        batch = MagicMock()
-        batch.forward_mode.is_idle.return_value = False
-        batch.req_pool_indices = torch.tensor([17, 23])
-        batch.mamba_track_indices = None
-        accept_lens = torch.tensor([2, 1], dtype=torch.int32)
-        accept_index = torch.tensor([[0, 1, -1], [3, -1, -1]], dtype=torch.int32)
+        # The smallest batch with enough request states, and one request fewer.
+        value_heads = spec_state.temporal.shape[2]
+        lazy_from = -(-REPLAYSSM_LAZY_FOLD_MIN_STATES // value_heads)
 
-        with (
-            patch(
-                "sglang.srt.speculative.spec_utils.mambaish_config",
-                return_value={"some": "config"},
-            ),
-            patch(f"{_KERNELS}.commit_gdn_replayssm_spec") as advance,
-            patch(f"{_KERNELS}.commit_gdn_replayssm_circular") as fold,
-            patch(
-                "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
-                "fused_conv_window_scatter_with_mask"
-            ),
-            patch(f"{_BACKEND}.commit_ple_states_after_verify") as ple,
+        for lazy_fold, num_requests in itertools.product(
+            (False, True), (lazy_from - 1, lazy_from)
         ):
-            commit_mamba_states_after_verify(
-                target_worker,
-                batch,
-                accept_lens,
-                accept_index,
-                draft_token_num=3,
-                state_slots=ForwardStateSlots(slots, None, batch.req_pool_indices),
-            )
+            # Request 1 has no state slot; requests accept 2, 1, 2, ... drafts.
+            slots = torch.tensor([5, -1, *range(6, 4 + num_requests)])
+            batch = MagicMock()
+            batch.forward_mode.is_idle.return_value = False
+            batch.req_pool_indices = torch.arange(17, 17 + num_requests)
+            batch.mamba_track_indices = None
+            accept_lens = 2 - torch.arange(num_requests, dtype=torch.int32) % 2
+            accept_index = torch.full((num_requests, 3), -1, dtype=torch.int32)
+            for i, accepted in enumerate(accept_lens.tolist()):
+                accept_index[i, :accepted] = torch.arange(3 * i, 3 * i + accepted)
+            with (
+                self.subTest(lazy_fold=lazy_fold, num_requests=num_requests),
+                envs.SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD.override(lazy_fold),
+                patch(
+                    "sglang.srt.speculative.spec_utils.mambaish_config",
+                    return_value={"some": "config"},
+                ),
+                patch(f"{_KERNELS}.commit_gdn_replayssm_spec") as advance,
+                patch(f"{_KERNELS}.commit_gdn_replayssm_circular") as fold,
+                patch(
+                    "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
+                    "fused_conv_window_scatter_with_mask"
+                ),
+                patch(f"{_BACKEND}.commit_ple_states_after_verify") as ple,
+            ):
+                commit_mamba_states_after_verify(
+                    target_worker,
+                    batch,
+                    accept_lens,
+                    accept_index,
+                    draft_token_num=3,
+                    state_slots=ForwardStateSlots(slots, None, batch.req_pool_indices),
+                )
 
-        for kernel in (advance, fold):
-            self.assertEqual(
-                kernel.call_args.kwargs["state_batch_indices"].tolist(),
-                slots.tolist(),
-            )
-        # PLE side states roll back with the same slots and accepted steps.
-        ple.assert_called_once()
-        router_arg, state_arg, steps_arg, track_arg = ple.call_args.args[:4]
-        self.assertIs(router_arg, router)
-        self.assertEqual(state_arg.tolist(), slots.tolist())
-        self.assertEqual(steps_arg.tolist(), [1, 0])
-        self.assertIsNone(track_arg)
+                self.assertIs(
+                    advance.call_args.kwargs["fold_every_commit"],
+                    not (lazy_fold and num_requests == lazy_from),
+                )
+                for kernel in (advance, fold):
+                    self.assertEqual(
+                        kernel.call_args.kwargs["state_batch_indices"].tolist(),
+                        slots.tolist(),
+                    )
+                # PLE side states roll back with the same slots and accepted steps.
+                ple.assert_called_once()
+                router_arg, state_arg, steps_arg, track_arg = ple.call_args.args[:4]
+                self.assertIs(router_arg, router)
+                self.assertEqual(state_arg.tolist(), slots.tolist())
+                self.assertEqual(steps_arg.tolist(), (accept_lens - 1).tolist())
+                self.assertIsNone(track_arg)
+
+
+class TestGDNReplaySSMLazyFoldRefusal(CustomTestCase):
+    def test_lazy_fold_refuses_checkpoint_readers(self):
+        """SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD lets a bf16 checkpoint lag its
+        ring between folds; the configurations that read it without the ring,
+        grow the window past the fold margin or fold every commit are refused,
+        and only under the opt-in."""
+        from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+        from sglang.srt.server_args import ServerArgs
+
+        served = dict(
+            model_path="dummy",
+            enable_linear_replayssm_spec=True,
+            mamba_ssm_dtype="bfloat16",
+            linear_attn_decode_backend="triton",
+            speculative_algorithm="EAGLE",
+            mamba_radix_cache_strategy="extra_buffer",
+        )
+        refused = {
+            "mixed chunk": dict(enable_mixed_chunk=True),
+            "streaming session": dict(enable_streaming_session=True),
+            "adaptive": dict(speculative_adaptive=True),
+            "PD decode": dict(disaggregation_mode="decode"),
+            "no_buffer": dict(mamba_radix_cache_strategy="no_buffer"),
+            "DFLASH": dict(speculative_algorithm="DFLASH"),
+        }
+        with envs.SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD.override(True):
+            handle_linear_attn_backend(ServerArgs(**served))
+            for name, extra in refused.items():
+                with (
+                    self.subTest(name),
+                    self.assertRaisesRegex(
+                        ValueError, "SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD"
+                    ),
+                ):
+                    handle_linear_attn_backend(ServerArgs(**{**served, **extra}))
+        for name, extra in refused.items():
+            with self.subTest(name, opt_in=False):
+                handle_linear_attn_backend(ServerArgs(**{**served, **extra}))
 
 
 class TestGDNRaggedVerifyRefusal(CustomTestCase):
