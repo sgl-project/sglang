@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
     ExpertFormat,
     PostLoad,
+    UnquantizedFormat,
     expert_params,
     format_for,
 )
@@ -73,6 +74,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         num_resident: int,
         graphs: bool = False,
         auto_size: bool = False,
+        copy_engine_rows: Optional[int] = None,
     ):
         torch.nn.Module.__init__(self)
         self.base_method = base_method
@@ -85,6 +87,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         # --paged-experts-num-resident auto: built with K = top_k; the model runner sizes K once
         # the KV cache is allocated (sizing.ExpertSlotSizing).
         self.auto_size = auto_size
+        self.copy_engine_rows = copy_engine_rows
         self._slot_pool = None  # holds the K = top_k tables until sizing frees them
         self.checkpoint_params = ()  # found once the base method has created them
         self.contract = None  # follows from the runner the base method builds
@@ -322,6 +325,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         """The executors and, with CUDA graphs, the device residency, for the final K."""
         self.policy = LRUPolicy(self.num_resident)
         self.store.bind(layer, device_planned=self.graphs)
+        if self.copy_engine_rows is not None:
+            self.store.bind_copy_engine(
+                layer, min(self.copy_engine_rows, self.num_resident)
+            )
         residency = None
         if self.graphs:
             residency = DeviceResidency(
@@ -451,6 +458,7 @@ def make_for_layer(layer, base_method) -> PagedExpertsMoEMethod:
         num_resident=num_resident,
         graphs=not cuda_graph_fully_disabled(),
         auto_size=requested is None,
+        copy_engine_rows=get_exec().moe.paged_experts_copy_engine_rows,
     )
 
 
@@ -492,6 +500,22 @@ def check_paged_experts_compat(layer, expert_format) -> None:
     for name in ("tp_size", "ep_size", "pp_size", "dp_size"):
         if getattr(parallel, name) > 1:
             problems.append(f"--{name.replace('_', '-')} must be 1 (single GPU only)")
+    if get_exec().moe.paged_experts_copy_engine_rows is not None:
+        from sglang.srt.utils.device import is_cuda
+
+        if not is_cuda() or torch.cuda.get_device_capability() < (7, 0):
+            problems.append(
+                "copy-engine staging requires a CUDA GPU with SM70 or newer"
+            )
+        if not check_cuda_graph_backend(Phase.DECODE, Backend.FULL):
+            problems.append("copy-engine staging requires full decode CUDA graphs")
+        if (
+            not isinstance(expert_format, UnquantizedFormat)
+            or layer.params_dtype != torch.bfloat16
+        ):
+            problems.append(
+                "copy-engine staging is validated only for unquantized BF16"
+            )
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
     if get_spec().speculative_algorithm:

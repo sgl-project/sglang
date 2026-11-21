@@ -47,6 +47,13 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
 - **`--paged-experts-num-resident K|auto`**: Routed experts per MoE layer kept on the GPU, at least
   the router's `top_k`; larger values page less but leave less memory for the KV cache. `auto` (the
   default) sizes K after the model is loaded; see [Choosing K](#choosing-k).
+- **`--paged-experts-copy-engine-rows N`**: Stage up to N missing experts per MoE layer with
+  the CUDA copy engine. Off by default. Requires an explicit `--paged-experts-num-resident`,
+  full decode CUDA graphs, and an in-memory store with unquantized BF16 experts on the Triton
+  runner. N must be between 1 and 32 and is capped at K. A request that exceeds staging
+  capacity or whose copy misses its deadline uses the regular SM gather. Staging adds GPU
+  memory equal to N expert rows per layer, allocated before the KV cache. The worker polls
+  for GPU plans on one host thread per device.
 - **`--paged-experts-enable-disk`**: Let Paged Experts write to disk: keep each MoE layer's
   experts in the [expert cache](#the-expert-cache), so that later starts read them instead of
   loading and repacking them, and serve the experts that do not fit host memory from there
