@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=7200,
-    suite="nightly-acc-test-4-npu-a5",
+    suite="nightly-acc-test-4-npu-a5-mix",
     nightly=True,
 )
 
@@ -72,6 +72,7 @@ DEEPSEEK_V4_FLASH_FP8_4P_OTHER_ARGS = [
     32,
     "--chunked-prefill-size",
     131072,
+    "--enable-mixed-chunk",
     "--max-prefill-tokens",
     131072,
     "--cuda-graph-bs-decode",
