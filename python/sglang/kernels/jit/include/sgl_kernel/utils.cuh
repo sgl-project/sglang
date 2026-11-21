@@ -26,7 +26,15 @@
 #include <cstdint>
 #include <optional>
 #include <type_traits>
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+#elif !defined(USE_ROCM)
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -60,7 +68,23 @@ inline constexpr auto cudaSuccess = hipSuccess;
 
 namespace sglang {
 
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __mt_bfloat16;
+using fp8_e4m3_t = __mt_fp8_e4m3;
+using fp8_e5m2_t = __mt_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __mt_bfloat162;
+using fp8x2_e4m3_t = __mt_fp8x2_e4m3;
+using fp8x2_e5m2_t = __mt_fp8x2_e5m2;
+using fp8x4_e4m3_t = __mt_fp8x4_e4m3;
+using fp8x4_e5m2_t = __mt_fp8x4_e5m2;
+
+using fp32x4_t = float4;
+#elif !defined(USE_ROCM)
 using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
@@ -95,14 +119,19 @@ using fp32x4_t = float4;
 /*
  * LDG Support
  */
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+#define SGLANG_LDG(arg) __ldg(arg)
+#elif !defined(USE_ROCM)
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
 #endif
 
 // DLPack device type for the current platform
-#ifndef USE_ROCM
+#if defined(__MUSACC__)
+inline constexpr auto kDLGPU = kDLExtDev;
+inline constexpr auto kDLGPUHost = kDLCPU;
+#elif !defined(USE_ROCM)
 inline constexpr auto kDLGPU = kDLCUDA;
 inline constexpr auto kDLGPUHost = kDLCUDAHost;
 #else
@@ -119,7 +148,7 @@ namespace device {
 // Architecture detection: SGL_CUDA_ARCH is injected by load_jit() and is
 // available in both host and device compilation passes, whereas __CUDA_ARCH__
 // is only defined by nvcc during the device pass.
-#if !defined(USE_ROCM)
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
@@ -129,7 +158,7 @@ static_assert(
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
 #define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
-#else  // USE_ROCM
+#else  // USE_ROCM || USE_MUSA
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
@@ -161,7 +190,7 @@ inline constexpr uint32_t kWarpSize = kWarpThreads;
  */
 template <uint32_t kNumThreads = kWarpThreads>
 SGL_DEVICE uint32_t get_lane_id() {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM)
   static_assert(kNumThreads <= 32 && host::is_pow2(kNumThreads));
   uint32_t lane_id;
   asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
@@ -367,7 +396,7 @@ inline const char* get_cuda_error_string(::cudaError_t error) {
   return ::cudaGetErrorString(error);
 }
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 
 inline bool is_cuda_error(::CUresult error) {
   return error != ::CUDA_SUCCESS;
@@ -449,7 +478,7 @@ struct LaunchKernel {
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(USE_MUSA)
     (void)enabled;
     m_config.numAttrs = 0;
 #else
@@ -468,7 +497,11 @@ struct LaunchKernel {
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
+#ifdef USE_MUSA
+    attr.id = musaLaunchAttributeClusterDimension;
+#else
     attr.id = cudaLaunchAttributeClusterDimension;
+#endif
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
 #endif
@@ -487,7 +520,11 @@ struct LaunchKernel {
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
+#ifdef USE_MUSA
+      attr.id = musaLaunchAttributeCooperative;
+#else
       attr.id = cudaLaunchAttributeCooperative;
+#endif
       attr.val.cooperative = 1;
       m_config.attrs = m_attrs;
     }
@@ -521,6 +558,8 @@ struct LaunchKernel {
         m_config.stream,
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
+#elif defined(USE_MUSA)
+    RuntimeDeviceCheck(::musaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
