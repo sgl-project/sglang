@@ -1,47 +1,63 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiniCPM5's chat template renders flat function tools, as Beam's does, so its
-Responses tools take Beam's translation. Codex also replays tool_search items,
-which the template cannot render: the tools a search loaded are declared with
-the request's own, and the search items are left out of the prompt."""
+"""Translate MiniCPM Responses tools using Beam's flat function format.
+
+Merge tools loaded by searches across the effective input history. Keep search
+items out of the prompt because MiniCPM's chat template cannot render them.
+"""
 
 import msgspec
 
 from sglang.srt.entrypoints.openai.responses_tools.beam import BeamToolAdapter
 
 
-def tool_search_tools(request):
-    """Tools loaded by ``tool_search_output`` input items that the request does
-    not declare itself."""
+def tools_with_search_results(request, input_items):
+    """Keep request definitions first, then add new tools and namespace members."""
     from sglang.srt.entrypoints.openai.protocol import ResponseTool
 
-    if not isinstance(request.input, list):
-        return []
-    seen = {(tool.type, tool.name) for tool in request.tools}
-    loaded = []
-    for item in request.input:
+    tools = list(request.tools)
+    indices = {(tool.type, tool.name): i for i, tool in enumerate(tools)}
+    for item in input_items:
         if not isinstance(item, dict) or item.get("type") != "tool_search_output":
             continue
-        for tool in item.get("tools") or []:
-            if not isinstance(tool, dict):
+        for raw_tool in item.get("tools") or []:
+            if not isinstance(raw_tool, dict) or raw_tool.get("type") not in (
+                "function",
+                "custom",
+                "namespace",
+            ):
                 continue
-            key = (tool.get("type"), tool.get("name"))
-            if key[0] not in ("function", "custom", "namespace") or key in seen:
+            tool = ResponseTool.model_validate(raw_tool)
+            key = (tool.type, tool.name)
+            index = indices.get(key)
+            if index is None:
+                indices[key] = len(tools)
+                tools.append(tool)
                 continue
-            seen.add(key)
-            loaded.append(ResponseTool.model_validate(tool))
-    return loaded
+            if tool.type == "namespace":
+                existing = tools[index]
+                members = list(existing.tools or [])
+                seen = {(member.get("type"), member.get("name")) for member in members}
+                for member in tool.tools or []:
+                    member_key = (member.get("type"), member.get("name"))
+                    if member_key not in seen:
+                        members.append(member)
+                        seen.add(member_key)
+                tools[index] = existing.model_copy(update={"tools": members})
+    return tools
 
 
 class MiniCPMToolAdapter(BeamToolAdapter):
     @classmethod
-    def from_request(cls, request, *, tool_call_parser):
+    def from_request(cls, request, *, tool_call_parser, input_items=None):
+        if input_items is None:
+            input_items = request.input if isinstance(request.input, list) else []
         translated, adapter = super().from_request(
             request.model_copy(
-                update={"tools": [*request.tools, *tool_search_tools(request)]}
+                update={"tools": tools_with_search_results(request, input_items)}
             ),
             tool_call_parser=tool_call_parser,
         )
-        # The response echoes the tools the client declared, not the loaded ones.
+        # Public responses echo the tools declared by the client.
         translated._tool_state = msgspec.structs.replace(
             translated._tool_state, public_tools=request.tools
         )

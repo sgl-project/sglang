@@ -397,5 +397,282 @@ class CodexNamespaceAdapterTestCase(CustomTestCase):
         )
 
 
+class CodexSearchHistoryTestCase(CustomTestCase):
+    def test_search_batches_merge_namespace_members_and_keep_first_definition(self):
+        spawn, wait = CODEX_MULTI_AGENT_NAMESPACE["tools"]
+        first = {**CODEX_MULTI_AGENT_NAMESPACE, "tools": [spawn]}
+        second = {
+            **CODEX_MULTI_AGENT_NAMESPACE,
+            "tools": [{**spawn, "description": "later"}, wait],
+        }
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"type": "tool_search_output", "tools": [first]},
+                {"type": "tool_search_output", "tools": [second]},
+                {"type": "tool_search_output", "tools": [second]},
+            ],
+            tools=[{"type": "tool_search"}],
+            tool_choice={
+                "type": "function",
+                "namespace": "multi_agent_v1",
+                "name": "wait_agent",
+            },
+        )
+        original = request.model_dump()
+        translated, _ = MiniCPMToolAdapter.from_request(
+            request, tool_call_parser="minicpm5"
+        )
+        functions = [tool for tool in translated.tools if tool.type == "function"]
+        self.assertEqual(
+            [tool.name for tool in functions],
+            [
+                "multi_agent_v1__spawn_agent",
+                "multi_agent_v1__wait_agent",
+            ],
+        )
+        self.assertEqual(functions[0].description.split("\n")[-1], spawn["description"])
+        self.assertEqual(functions[1].parameters, wait["parameters"])
+        self.assertEqual(
+            translated.tool_choice,
+            {"type": "function", "name": "multi_agent_v1__wait_agent"},
+        )
+        self.assertEqual(request.model_dump(), original)
+        self.assertEqual(translated._tool_state.public_tools, request.tools)
+
+    def test_declared_namespace_overrides_search_members_without_losing_new_members(
+        self,
+    ):
+        spawn, wait = CODEX_MULTI_AGENT_NAMESPACE["tools"]
+        declared = {**CODEX_MULTI_AGENT_NAMESPACE, "tools": [spawn]}
+        loaded = {
+            **CODEX_MULTI_AGENT_NAMESPACE,
+            "tools": [
+                {**spawn, "parameters": {"type": "object", "properties": {}}},
+                wait,
+            ],
+        }
+        request = ResponsesRequest(
+            model="x",
+            input=[{"type": "tool_search_output", "tools": [loaded]}],
+            tools=[declared],
+        )
+        original = request.model_dump()
+        translated, _ = MiniCPMToolAdapter.from_request(
+            request, tool_call_parser="minicpm5"
+        )
+        self.assertEqual(
+            [tool.name for tool in translated.tools],
+            [
+                "multi_agent_v1__spawn_agent",
+                "multi_agent_v1__wait_agent",
+            ],
+        )
+        self.assertEqual(translated.tools[0].parameters, spawn["parameters"])
+        self.assertEqual(translated.tools[1].parameters, wait["parameters"])
+        self.assertEqual(request.model_dump(), original)
+        self.assertEqual(translated._tool_state.public_tools, request.tools)
+
+    def test_namespace_merge_preserves_custom_tools_and_rejects_name_collisions(self):
+        custom = {"type": "custom", "name": "execute", "format": {"type": "text"}}
+        search = {
+            "type": "tool_search_output",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "files",
+                    "tools": [custom],
+                }
+            ],
+        }
+        request = ResponsesRequest(
+            model="x",
+            input=[search, search],
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "files",
+                    "tools": [{"type": "function", "name": "read"}],
+                }
+            ],
+        )
+        translated, _ = MiniCPMToolAdapter.from_request(
+            request, tool_call_parser="minicpm5"
+        )
+        self.assertEqual(
+            [(tool.type, tool.name) for tool in translated.tools],
+            [
+                ("function", "files__read"),
+                ("custom", "files__execute"),
+            ],
+        )
+        for declared in (
+            [{"type": "function", "name": "files__execute"}],
+            [
+                {
+                    "type": "namespace",
+                    "name": "files",
+                    "tools": [{"type": "function", "name": "execute"}],
+                }
+            ],
+            [CODEX_MULTI_AGENT_NAMESPACE, CODEX_MULTI_AGENT_NAMESPACE],
+        ):
+            with self.subTest(declared=declared):
+                with self.assertRaises(ValueError):
+                    MiniCPMToolAdapter.from_request(
+                        ResponsesRequest(model="x", input=[search], tools=declared),
+                        tool_call_parser="minicpm5",
+                    )
+
+    def test_stored_search_tools_match_full_replay_for_named_calls(self):
+        serving = _make_minicpm_serving()
+        serving.enable_response_store = True
+        serving.reasoning_parser = None
+        serving.default_chat_template_kwargs = {}
+        serving.template_manager.chat_template_name = None
+        serving.template_manager.jinja_template_content_format = "string"
+        serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        serving.tokenizer_manager.abort_request = Mock()
+        generated = []
+
+        async def generate(*args, **kwargs):
+            generated.append(args)
+            text = (
+                "Ready."
+                if len(generated) == 1
+                else (
+                    '[{"name":"multi_agent_v1__wait_agent","parameters":{"targets":["a1"]}}]'
+                )
+            )
+            yield engine_chunk(text, finish=True)
+
+        serving.tokenizer_manager.generate_request.side_effect = generate
+        first_input = [
+            {"role": "user", "content": "Find the agent tools."},
+            {
+                "type": "tool_search_output",
+                "call_id": "ts_1",
+                "tools": [CODEX_MULTI_AGENT_NAMESPACE],
+            },
+        ]
+        search_tools = [{"type": "tool_search"}]
+        choice = {
+            "type": "function",
+            "namespace": "multi_agent_v1",
+            "name": "wait_agent",
+        }
+
+        async def result(request):
+            response = await serving.create_responses(request)
+            if request.stream:
+                events = [event async for event in response]
+                completed = [
+                    p
+                    for p in event_payloads(events)
+                    if p["type"] == "response.completed"
+                ]
+                self.assertEqual(len(completed), 1)
+                return completed[0]["response"]
+            self.assertFalse(
+                hasattr(response, "status_code"), getattr(response, "body", None)
+            )
+            return response.model_dump()
+
+        async def run():
+            first = await result(
+                ResponsesRequest(
+                    model="x",
+                    input=first_input,
+                    tools=search_tools,
+                    store=True,
+                )
+            )
+            response_id = first["id"]
+            self.assertIn(response_id, serving.response_store)
+            history = list(serving.msg_store[response_id])
+            self.assertTrue(
+                any(item.get("type") == "tool_search_output" for item in history)
+            )
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    next_input = [{"role": "user", "content": "Wait for a1."}]
+                    replay = await result(
+                        ResponsesRequest(
+                            model="x",
+                            input=[*first_input, *first["output"], *next_input],
+                            tools=search_tools,
+                            tool_choice=choice,
+                            store=False,
+                            stream=stream,
+                        )
+                    )
+                    replay_template = serving.tokenizer_manager.tokenizer.apply_chat_template.call_args
+                    stored = await result(
+                        ResponsesRequest(
+                            model="x",
+                            input=next_input,
+                            previous_response_id=response_id,
+                            tools=search_tools,
+                            tool_choice=choice,
+                            store=False,
+                            stream=stream,
+                        )
+                    )
+                    self.assertEqual(
+                        serving.tokenizer_manager.tokenizer.apply_chat_template.call_args,
+                        replay_template,
+                    )
+                    for response in (replay, stored):
+                        calls = [
+                            item
+                            for item in response["output"]
+                            if item["type"] == "function_call"
+                        ]
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(calls[0]["namespace"], "multi_agent_v1")
+                        self.assertEqual(calls[0]["name"], "wait_agent")
+                        self.assertEqual(
+                            json.loads(calls[0]["arguments"]), {"targets": ["a1"]}
+                        )
+                        self.assertEqual(response["tools"], first["tools"])
+                    self.assertEqual(serving.msg_store[response_id], history)
+            self.assertEqual(len(generated), 5)
+
+        asyncio.run(run())
+
+    def test_previous_response_errors_are_checked_before_loading_history(self):
+        serving = _make_minicpm_serving()
+        serving.enable_response_store = True
+        for response_id, status in (("invalid", 400), ("resp_missing", 404)):
+            with self.subTest(response_id=response_id):
+                request = ResponsesRequest(
+                    model="x",
+                    input="Continue.",
+                    previous_response_id=response_id,
+                    tools=[{"type": "tool_search"}],
+                    tool_choice={
+                        "type": "function",
+                        "namespace": "files",
+                        "name": "read",
+                    },
+                )
+                response = asyncio.run(serving.create_responses(request))
+                self.assertEqual(response.status_code, status)
+        serving.enable_response_store = False
+        response = asyncio.run(
+            serving.create_responses(
+                ResponsesRequest(
+                    model="x",
+                    input="Continue.",
+                    previous_response_id="resp_missing",
+                )
+            )
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"]["param"], "previous_response_id"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

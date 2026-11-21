@@ -327,11 +327,31 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
+        if not self.enable_response_store and request.previous_response_id is not None:
+            return self._response_store_disabled_error("previous_response_id")
+
+        # Handle the previous response ID
+        prev_response_id = request.previous_response_id
+        if prev_response_id is not None:
+            if not prev_response_id.startswith("resp_"):
+                return self._make_invalid_id_error(prev_response_id)
+            async with self.response_store_lock:
+                prev_response = self.response_store.get(prev_response_id)
+            if prev_response is None:
+                return self._make_not_found_error(prev_response_id)
+        else:
+            prev_response = None
+
         tool_adapter = None
         if self._tool_adapter_cls is not None:
             try:
+                adapter_kwargs = {"tool_call_parser": self.tool_call_parser}
+                if self._tool_adapter_cls is MiniCPMToolAdapter:
+                    adapter_kwargs["input_items"] = self._response_input_history(
+                        request
+                    )
                 request, tool_adapter = self._tool_adapter_cls.from_request(
-                    request, tool_call_parser=self.tool_call_parser
+                    request, **adapter_kwargs
                 )
             except ResponseToolChoiceError as exc:
                 return self.create_error_response(str(exc), param="tool_choice")
@@ -342,8 +362,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "Shell tools are not supported by this model", param="tools"
             )
 
-        if not self.enable_response_store and request.previous_response_id is not None:
-            return self._response_store_disabled_error("previous_response_id")
         if not self.enable_response_store and request.background:
             return self._response_store_disabled_error("background")
         if request.background and not request.store:
@@ -420,18 +438,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "with prefill-decode disaggregation",
                 param="tools",
             )
-
-        # Handle the previous response ID
-        prev_response_id = request.previous_response_id
-        if prev_response_id is not None:
-            if not prev_response_id.startswith("resp_"):
-                return self._make_invalid_id_error(prev_response_id)
-            async with self.response_store_lock:
-                prev_response = self.response_store.get(prev_response_id)
-            if prev_response is None:
-                return self._make_not_found_error(prev_response_id)
-        else:
-            prev_response = None
 
         try:
             model_name = request.model
