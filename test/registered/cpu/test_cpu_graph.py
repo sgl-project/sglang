@@ -5,7 +5,7 @@ python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -1247,6 +1247,153 @@ class TestCPUGraph(CustomTestCase):
         runner._reset_mamba_cache_if_needed()
         self.assertTrue(torch.all(conv_tensor == 0))
         self.assertTrue(torch.all(temporal_tensor == 0))
+
+    def test_attention_backend_registry_handles_intel_amx(self):
+        from sglang.srt.models.deepseek_common.attention_backend_handler import (
+            AttentionBackendRegistry,
+            handle_attention_intel_amx,
+        )
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+            AttnForwardMethod,
+        )
+
+        handler = AttentionBackendRegistry.get_handler("intel_amx")
+        self.assertIs(handler, handle_attention_intel_amx)
+
+        # 1. Decode returns MLA subtype
+        decode_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: False,
+            )
+        )
+        self.assertEqual(
+            handle_attention_intel_amx(SimpleNamespace(), decode_fb),
+            AttnForwardMethod.MLA,
+        )
+
+        # 2. Speculative decoding returns MLA subtype
+        target_verify_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: False,
+            )
+        )
+        self.assertEqual(
+            handle_attention_intel_amx(SimpleNamespace(), target_verify_fb),
+            AttnForwardMethod.MLA,
+        )
+
+        # 3. Pure prefill (prefix == 0) returns MHA
+        pure_prefill_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: True,
+            ),
+            extend_prefix_lens_cpu=[0, 0],
+            extend_prefix_lens=None,
+        )
+        self.assertEqual(
+            handle_attention_intel_amx(object(), pure_prefill_fb),
+            AttnForwardMethod.MHA,
+        )
+
+        # 4. Prefix cache hit (prefix > 0) in eager mode returns MLA subtype
+        prefix_hit_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: True,
+            ),
+            extend_prefix_lens_cpu=[0, 10],
+            extend_prefix_lens=None,
+        )
+        self.assertEqual(
+            handle_attention_intel_amx(SimpleNamespace(), prefix_hit_fb),
+            AttnForwardMethod.MLA,
+        )
+
+        # 5. Prefix cache hit with tensor fallback (extend_prefix_lens_cpu is None)
+        prefix_hit_tensor_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_extend_without_speculative=lambda: True,
+            ),
+            extend_prefix_lens_cpu=None,
+            extend_prefix_lens=torch.tensor([0, 5], dtype=torch.int32),
+        )
+        self.assertEqual(
+            handle_attention_intel_amx(SimpleNamespace(), prefix_hit_tensor_fb),
+            AttnForwardMethod.MLA,
+        )
+
+        # 6. During torch.compile tracing (is_compiling() == True), returns MHA unconditionally
+        # to avoid Dynamo list length guards on extend_prefix_lens_cpu
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            self.assertEqual(
+                handle_attention_intel_amx(SimpleNamespace(), prefix_hit_fb),
+                AttnForwardMethod.MHA,
+            )
+
+    def test_can_run_prefill_graph_handles_mla_prefix_cache(self):
+        runner = _make_cpu_graph_runner()
+        runner.prefill_graphs = {128: object()}
+        runner.capture_num_tokens = [128]
+        runner.prefill_max_bs = 4
+        runner.use_mla = True
+
+        # Pure prefill on MLA can run graph
+        pure_fb = _make_cpu_prefill_forward_batch(num_tokens=128, batch_size=2)
+        pure_fb.extend_prefix_lens_cpu = [0, 0]
+        self.assertTrue(runner._can_run_prefill_graph(pure_fb))
+
+        # Prefix hit on MLA (list) must be rejected from prefill graph
+        prefix_hit_fb = _make_cpu_prefill_forward_batch(num_tokens=128, batch_size=2)
+        prefix_hit_fb.extend_prefix_lens_cpu = [10, 0]
+        self.assertFalse(runner._can_run_prefill_graph(prefix_hit_fb))
+
+        # Prefix hit on MLA (tensor fallback when extend_prefix_lens_cpu is None)
+        prefix_hit_tensor_fb = _make_cpu_prefill_forward_batch(
+            num_tokens=128, batch_size=2
+        )
+        prefix_hit_tensor_fb.extend_prefix_lens_cpu = None
+        prefix_hit_tensor_fb.extend_prefix_lens = torch.tensor(
+            [5, 0], dtype=torch.int32
+        )
+        self.assertFalse(runner._can_run_prefill_graph(prefix_hit_tensor_fb))
+
+        # Non-MLA model (e.g. LLaMA) with prefix hit can run prefill graph
+        runner.use_mla = False
+        self.assertTrue(runner._can_run_prefill_graph(prefix_hit_fb))
+
+    def test_warmup_prefill_eager_calls_model_forward(self):
+        runner = CPUGraphRunner.__new__(CPUGraphRunner)
+        runner.capture_num_tokens = [128]
+        runner.device = "cpu"
+        runner.is_generation = True
+        runner.model_is_mrope = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        model_runner = SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(),
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+            model=SimpleNamespace(forward=MagicMock()),
+        )
+        runner.model_runner = model_runner
+
+        with (
+            patch(
+                "sglang.srt.model_executor.cpu_graph_runner.enable_num_token_non_padded",
+                return_value=False,
+            ),
+            patch.object(
+                cpu_graph_runner_module,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_group=SimpleNamespace(barrier=MagicMock()),
+                    moe_ep_size=1,
+                ),
+            ),
+        ):
+            runner._warmup_prefill_eager()
+
+        model_runner.model.forward.assert_called_once()
 
     @intel_amx_benchmark(
         extra_args=[

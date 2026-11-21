@@ -1,3 +1,5 @@
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -256,6 +258,30 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 
+def handle_attention_intel_amx(attn, forward_batch):
+    # During torch.compile tracing of CPU prefill graph, return MHA unconditionally.
+    # This prevents Dynamo from inspecting the Python list `extend_prefix_lens_cpu`
+    # (e.g. via sum() or any()), which would otherwise install a guard on
+    # `len(extend_prefix_lens_cpu) == N` and cause recompilations on every batch size.
+    # The CPU prefill graph is captured exclusively for pure prefill (prefix == 0).
+    if torch.compiler.is_compiling():
+        return AttnForwardMethod.MHA
+
+    if forward_batch.forward_mode.is_extend_without_speculative():
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if prefix_lens is not None:
+            has_prefix = any(prefix_lens)
+        elif forward_batch.extend_prefix_lens is not None:
+            has_prefix = bool((forward_batch.extend_prefix_lens > 0).any())
+        else:
+            has_prefix = False
+
+        if not has_prefix:
+            return AttnForwardMethod.MHA
+
+    return _dispatch_mla_subtype(attn, forward_batch)
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -269,3 +295,4 @@ AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("dsa", handle_attention_dsa)
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register("intel_amx", handle_attention_intel_amx)
