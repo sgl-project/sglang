@@ -84,6 +84,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>~/.cache/sglang</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FLASHINFER_HC_SUM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's HC sum backend for supported Qwen4-Exp gated hyper-connections on SM100/SM103. Requires an HC-enabled FlashInfer build; see the requirements below. Read at model construction.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_DIR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default directory for the file-backed Qwen4-Exp PLE table (`--ple-offload-backend file`); one subdirectory per model path is created under it</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>{SGLANG_CACHE_DIR}/ple</code></td>
@@ -120,6 +125,43 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 </tbody>
 </table>
+
+### FlashInfer HC sum
+
+Set `SGLANG_ENABLE_FLASHINFER_HC_SUM=1` before loading the model to opt into
+FlashInfer's experimental HC sum backend. The adapter accepts BF16/FP16;
+Qwen4-Exp currently constructs its HC weights in BF16. It selects supported
+mix-and-combine layers on SM100/SM103; unsupported configurations and the final
+mix-only module keep the existing backend. `torch.compile` and `--enable-deterministic-inference`
+do not select this backend: FlashInfer HC's deterministic mode guarantees
+repeatability at a fixed token count, not SGLang's batch-invariance contract.
+
+The FlashInfer installation must provide `flashinfer.hyperconnection` and the
+CUDA sources under `flashinfer/experimental/hc_sum_sm100/csrc/`. The official
+FlashInfer 0.7.4 wheel does not include this backend. For development, a source
+build pinned to
+[`d2981ed4a64e926530ebd236168f9c39363c88e1`](https://github.com/flashinfer-ai/flashinfer/tree/d2981ed4a64e926530ebd236168f9c39363c88e1)
+contains the HC implementation and its wheel-packaging fix. Follow
+[FlashInfer's source-installation instructions](https://docs.flashinfer.ai/installation.html#install-from-source)
+in your CUDA development environment. Keep the selected build consistent across
+all ranks and verify its HC API and sources; the version number alone is not
+sufficient. HC compiles on first use and must be warmed before CUDA Graph capture.
+
+For a wheel built from that pinned revision, set
+`FLASHINFER_LOCAL_VERSION=hc.d2981ed4a` and leave
+`FLASHINFER_DEV_RELEASE_SUFFIX` unset during the build. Install the resulting
+`0.7.4+hc.d2981ed4a` wheel and retain a
+`flashinfer-python==0.7.4+hc.d2981ed4a` constraint when installing or upgrading
+SGLang, so the resolver cannot replace it with the official 0.7.4 wheel. Keep
+version checks enabled. The custom build uses source JIT when official
+precompiled artifacts do not match its version.
+
+Online weight updates are not supported with this backend. Create native,
+presharded and IPC weight caches with the same selected backend used for serving;
+their HC parameter layout differs from the existing backend. Loading FI-native
+HC weights after falling back to the existing backend is rejected. FlashInfer owns
+weight packing, kernels and execution state; SGLang owns model parameters and
+checkpoint loading.
 
 ## Performance Tuning
 

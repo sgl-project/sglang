@@ -3,7 +3,7 @@
 import copy
 import logging
 from contextlib import ExitStack
-from typing import Optional
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -11,6 +11,12 @@ from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.hyperconnection_flashinfer import (
+    FlashInferHCCheckpoint,
+    bind_flashinfer_hc,
+    install_flashinfer_hc_load_guard,
+    zero_flashinfer_hc_padding,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -23,6 +29,18 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
+
+
+def _mtp_param_name(name: str) -> Optional[str]:
+    """The draft's HC parameter name for an MTP checkpoint tensor, as
+    Qwen3_5ForCausalLMMTP.load_weights maps it; None for the target's."""
+    if "mtp" not in name:
+        return None
+    if name.startswith("mtp."):
+        name = name.replace("mtp.", "model.")
+    if ".self_attn." in name:
+        name = name.replace(".self_attn", "")
+    return name
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
@@ -70,6 +88,23 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        install_flashinfer_hc_load_guard(self)
+
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
+        hc_checkpoint = FlashInferHCCheckpoint(self)
+        loaded_params = super().load_weights(
+            hc_checkpoint.route(weights, param_name=_mtp_param_name), is_mtp=is_mtp
+        )
+        loaded_params.update(hc_checkpoint.finish())
+        return loaded_params
+
+    def post_load_weights(self) -> None:
+        zero_flashinfer_hc_padding(self)
+
+    def precompile_kernels_after_loading(self) -> None:
+        bind_flashinfer_hc(self)
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
