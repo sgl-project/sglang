@@ -13,7 +13,13 @@ from PIL import Image
 from safetensors.torch import load, save
 from torch import nn
 
-from sglang.srt.configs.inkling2 import Inkling2ModelConfig
+from sglang.srt.configs.inkling2 import (
+    INKLING2_ARCHS,
+    Inkling2LoopMMConfig,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+)
+from sglang.srt.hf_transformers import get_config
 from sglang.srt.layers import logits_processor as logits_module
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
@@ -160,6 +166,77 @@ _RELEASE_CONFIG = {
 @pytest.fixture
 def release_config():
     return copy.deepcopy(_RELEASE_CONFIG)
+
+
+def _loop_text_config(release_config, *, is_varloop):
+    loop = dict(
+        core_start=6, core_end=18, num_passes=3, gate_rank=64, is_varloop=is_varloop
+    )
+    return Inkling2ModelConfig(**release_config["text_config"], loop_config=loop)
+
+
+def test_loop_cache_layout(release_config):
+    """KV layers follow the pass count unless shared; conv states stay per visit."""
+    text = _loop_text_config(release_config, is_varloop=True)
+    assert text.num_attention_layers == text.num_layer_visits == 72
+    assert [text.cache_layer_id(6, p) for p in range(3)] == [6, 48, 60]
+
+    text.configure_loop(num_passes=2, share_cache=True)
+    assert text.num_layer_visits == 60 and text.num_attention_layers == 48
+    assert text.full_attention_layer_ids == list(range(48))
+    assert text.conv_layer_ids == list(range(60))
+    assert [text.cache_layer_id(17, p) for p in range(2)] == [17, 17]
+    assert [text.conv_layer_id(17, p) for p in range(2)] == [17, 59]
+    assert [text.conv_layer_id(i, 1) for i in range(6, 18)] == list(range(48, 60))
+
+    text.configure_loop(num_passes=1, share_cache=False)
+    assert text.num_attention_layers == text.num_layer_visits == 48
+
+
+def test_loop_config_loads_through_auto_config(tmp_path, release_config):
+    """A looped checkpoint must load as the loop config class with a typed text config."""
+    release_config["model_type"] = "inkling2_loop"
+    release_config["architectures"] = ["Inkling2LoopForConditionalGeneration"]
+    release_config["text_config"]["loop_config"] = dict(
+        core_start=6, core_end=18, num_passes=3, gate_rank=64, is_varloop=False
+    )
+    (tmp_path / "config.json").write_text(json.dumps(release_config))
+    config = get_config(str(tmp_path), trust_remote_code=False)
+    assert isinstance(config, Inkling2LoopMMConfig)
+    assert isinstance(config.text_config, Inkling2ModelConfig)
+    assert config.text_config.num_layer_visits == 72
+
+
+@pytest.mark.parametrize("arch", INKLING2_ARCHS)
+def test_every_target_arch_name_reaches_inkling2_paths(arch):
+    """Each config.json architecture name must resolve to the model, its image
+    processor and the Inkling2 chat renderer; a missed site falls back silently."""
+    from sglang.srt.arg_groups.model_override_base import _MODEL_OVERRIDE_FNS
+    from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+    from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
+    from sglang.srt.models.registry import ModelRegistry
+    from sglang.srt.multimodal.processors.inkling2 import Inkling2MultimodalProcessor
+
+    assert _inkling_overrides in _MODEL_OVERRIDE_FNS[arch]
+    model_cls, _ = ModelRegistry.resolve_model_cls([arch])
+    assert issubclass(model_cls, Inkling2ForConditionalGeneration)
+    assert arch in [m.__name__ for m in Inkling2MultimodalProcessor.models]
+    hf_config = SimpleNamespace(architectures=[arch], model_type="inkling2")
+    assert resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=None) == "inkling2"
+
+
+def test_loop_overrides_need_varloop(release_config):
+    fixed = _loop_text_config(release_config, is_varloop=False)
+    with pytest.raises(ValueError, match="is_varloop=true"):
+        fixed.configure_loop(num_passes=None, share_cache=True)
+    with pytest.raises(ValueError, match="at least 2 passes"):
+        loop = {**fixed.loop_config, "num_passes": 1}
+        Inkling2ModelConfig(**release_config["text_config"], loop_config=loop)
+    varloop = _loop_text_config(release_config, is_varloop=True)
+    with pytest.raises(ValueError, match="at least 1 passes"):
+        varloop.configure_loop(num_passes=0, share_cache=False)
+    with pytest.raises(ValueError, match="model_type inkling2_loop"):
+        Inkling2MMConfig(text_config=varloop)
 
 
 @pytest.mark.parametrize(
@@ -342,6 +419,43 @@ def test_packed_checkpoint_loads_bitwise_without_requantizing(
             assert torch.equal(
                 actual.view(torch.uint8), expected.contiguous().view(torch.uint8)
             )
+
+
+def test_mega_nvfp4_padding_matches_padded_checkpoint():
+    """Intermediate 1152 runs NVFP4 MegaMoE at 1280: zero gate/up rows, zero w2
+    columns and zero scales, laid out as if the checkpoint were 1280 wide."""
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    E, H, I, pad = 2, 256, 1152, 128
+    gen = torch.Generator().manual_seed(0)
+
+    def rand(*shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=gen)
+
+    w13, w2 = rand(E, 2 * I, H // 2), rand(E, H, I // 2)
+    s13, s2 = rand(E, 2 * I, H // 16), rand(E, H, I // 16)
+    experts = moe.Inkling2Experts.__new__(moe.Inkling2Experts)
+    nn.Module.__init__(experts)
+    experts.w13_weight, experts.w2_weight = w13, w2
+    experts.w13_scale = swizzle_blockscale(s13).flatten(1)
+    experts.w2_scale = swizzle_blockscale(s2).flatten(1)
+    experts._mega_padded = None
+    experts._empty_weight = lambda shape, dtype: torch.empty(shape, dtype=dtype)
+    pad_rows = torch.nn.functional.pad
+    expected = (
+        pad_rows(w13, (0, 0, 0, 2 * pad)),
+        swizzle_blockscale(pad_rows(s13, (0, 0, 0, 2 * pad))).flatten(1),
+        pad_rows(w2, (0, pad // 2)),
+        swizzle_blockscale(pad_rows(s2, (0, pad // 16))).flatten(1),
+    )
+    first = experts._mega_nvfp4_weights()
+    for got, want in zip(first, expected):
+        assert torch.equal(got, want)
+    # A reload rewrites the same storage (captured graphs hold the addresses).
+    experts.w2_weight.zero_()
+    again = experts._mega_nvfp4_weights()
+    assert [t.data_ptr() for t in again] == [t.data_ptr() for t in first]
+    assert not again[2].any()
 
 
 @pytest.fixture

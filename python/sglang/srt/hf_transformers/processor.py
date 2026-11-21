@@ -318,7 +318,7 @@ def _get_processor(
         return get_tokenizer(
             tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
         )
-    if config.model_type == "inkling2":
+    if config.model_type in ("inkling2", "inkling2_loop"):
         from sglang.srt.multimodal.inkling2.processor import Inkling2Processor
 
         return Inkling2Processor.from_pretrained(

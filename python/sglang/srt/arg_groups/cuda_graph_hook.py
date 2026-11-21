@@ -421,11 +421,13 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
     arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     ):
         declare_resolution(
             server_args,

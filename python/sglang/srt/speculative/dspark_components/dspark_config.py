@@ -185,9 +185,9 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
     prefixed dspark_* keys on the target hf config. Single source of truth
     for the bundling convention (draft-path defaulting, draft-arch remap)."""
-    if _cfg_get(hf_config, "architectures", None) == [
-        "Inkling2ForConditionalGeneration"
-    ]:
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
+    if _cfg_get(hf_config, "architectures", None) in [[a] for a in INKLING2_ARCHS]:
         return _cfg_get(hf_config, "mtp_config", None) is not None
     return any(
         _cfg_get(hf_config, key, None) is not None
@@ -238,13 +238,18 @@ def _get_dspark_config(config: Any) -> dict:
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
-    if _cfg_get(draft_hf_config, "architectures", None) == [
-        "Inkling2ForConditionalGeneration"
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
+    if _cfg_get(draft_hf_config, "architectures", None) in [
+        [a] for a in INKLING2_ARCHS
     ]:
-        from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
+        from sglang.srt.configs.inkling2 import (
+            Inkling2MTPConfig,
+            inkling2_config_from_dict,
+        )
 
         if isinstance(draft_hf_config, dict):
-            draft_hf_config = Inkling2MMConfig(**draft_hf_config)
+            draft_hf_config = inkling2_config_from_dict(draft_hf_config)
         draft_hf_config = Inkling2MTPConfig.from_target(draft_hf_config)
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
 

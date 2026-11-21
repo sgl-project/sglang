@@ -235,6 +235,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "enable_p2p_check",
                     "boundary_reduction",
                     "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
@@ -1301,9 +1302,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         MegaMoE; an explicit backend, BF16 experts, SM90 and TP1 keep theirs."""
         from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
 
-        hf = SimpleNamespace(architectures=["Inkling2ForConditionalGeneration"])
-
-        def backend(sm=100, tp=4, a2a="none", quantization="inkling2"):
+        def backend(
+            sm=100,
+            tp=4,
+            a2a="none",
+            quantization="inkling2",
+            intermediate=2304,
+            arch="Inkling2ForConditionalGeneration",
+        ):
+            text = SimpleNamespace(hidden_size=4608, intermediate_size=intermediate)
+            hf = SimpleNamespace(
+                architectures=[arch],
+                get_text_config=lambda: text,
+            )
             args = SimpleNamespace(
                 tool_call_parser="inkling2",
                 reasoning_parser="inkling",
@@ -1324,7 +1335,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 _model_config=SimpleNamespace(quantization=quantization),
             )
-            with override_platform(is_cuda=True, device_sm=sm):
+            with override_platform(is_cuda=True, device_sm=sm, is_sm120=False):
                 out = _inkling_overrides(args, hf)
             return out.get("moe_a2a_backend", a2a), out.get("disable_attn_tp_gather")
 
@@ -1335,6 +1346,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(backend(tp=1), ("none", None))
         self.assertEqual(backend(quantization=None), ("none", None))
         self.assertEqual(backend(a2a="deepep"), ("deepep", None))
+        # Inkling2Experts pads 1152 to 1280 for NVFP4 MegaMoE.
+        self.assertEqual(backend(intermediate=1152)[0], "megamoe")
+        loop = "Inkling2LoopForConditionalGeneration"
+        self.assertEqual(backend(arch=loop), ("megamoe", True))
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),

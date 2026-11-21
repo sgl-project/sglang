@@ -213,19 +213,41 @@ class Inkling2Attention(nn.Module):
         self.v_sconv = ShortConvolution(
             sconv_type=SconvType.V_LOCAL if is_local else SconvType.V_FULL, **conv_args
         )
-        self.attn = RadixAttention(
-            self.num_tp_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_tp_kv_heads,
-            layer_id,
-            sliding_window_size=config.sliding_window_size - 1 if is_local else -1,
-            prefix=add_prefix("attn", prefix),
-            out_dtype=torch.float32,
-            num_splits=1,
-            pack_gqa=False,
-            strided_lse=True,
+        # A looped core layer visits num_passes times. Each visit keeps its own
+        # conv state; KV is per pass too unless the passes share the cache.
+        num_passes = (
+            config.loop_config["num_passes"]
+            if layer_id in config.loop_core_layers
+            else 1
         )
+        self.conv_layer_ids = tuple(
+            config.conv_layer_id(layer_id, pass_idx) for pass_idx in range(num_passes)
+        )
+        pass_cache_layer_ids = [
+            config.cache_layer_id(layer_id, pass_idx) for pass_idx in range(num_passes)
+        ]
+        cache_layer_ids = list(dict.fromkeys(pass_cache_layer_ids))
+        self.pass_attn_index = tuple(
+            cache_layer_ids.index(cache_layer_id)
+            for cache_layer_id in pass_cache_layer_ids
+        )
+        attention = [
+            RadixAttention(
+                self.num_tp_heads,
+                self.head_dim,
+                self.scaling,
+                self.num_tp_kv_heads,
+                cache_layer_id,
+                sliding_window_size=config.sliding_window_size - 1 if is_local else -1,
+                prefix=add_prefix("attn", prefix),
+                out_dtype=torch.float32,
+                num_splits=1,
+                pack_gqa=False,
+                strided_lse=True,
+            )
+            for cache_layer_id in cache_layer_ids
+        ]
+        self.attn = attention[0] if len(attention) == 1 else nn.ModuleList(attention)
         # FA4 packs GQA heads only for group sizes dividing 128, so decode pads
         # each KV group with zero query heads up to the next power of two.
         group = self.num_tp_heads // self.num_tp_kv_heads
@@ -247,18 +269,23 @@ class Inkling2Attention(nn.Module):
             and self.v_sconv.use_residual
         )
         self.attn_padded = (
-            RadixAttention(
-                self.num_tp_kv_heads * self.padded_group,
-                self.head_dim,
-                self.scaling,
-                self.num_tp_kv_heads,
-                layer_id,
-                sliding_window_size=config.sliding_window_size - 1 if is_local else -1,
-                prefix=add_prefix("attn_padded", prefix),
-                out_dtype=torch.float32,
-                num_splits=0 if get_platform().is_sm90 else 1,
-                pack_gqa=True,
-                strided_lse=True,
+            nn.ModuleList(
+                RadixAttention(
+                    self.num_tp_kv_heads * self.padded_group,
+                    self.head_dim,
+                    self.scaling,
+                    self.num_tp_kv_heads,
+                    cache_layer_id,
+                    sliding_window_size=(
+                        config.sliding_window_size - 1 if is_local else -1
+                    ),
+                    prefix=add_prefix("attn_padded", prefix),
+                    out_dtype=torch.float32,
+                    num_splits=0 if get_platform().is_sm90 else 1,
+                    pack_gqa=True,
+                    strided_lse=True,
+                )
+                for cache_layer_id in cache_layer_ids
             )
             if group > 1 and 128 % group
             else None
@@ -267,6 +294,8 @@ class Inkling2Attention(nn.Module):
         self.verify_max_splits = (
             -(-config.sliding_window_size // 128) + 1 if is_local else 128
         )
+        # SM120 has no NVLink multicast.
+        self.group_all_reduce = get_platform().is_sm120
 
     def _pad_heads(self, x):
         return pad_head_groups(
@@ -411,7 +440,24 @@ class Inkling2Attention(nn.Module):
         q, _, _, r, gate, sinks = q_proj
         return q, k_proj[1], v_proj[2], r, gate, sinks
 
-    def forward(self, hidden_states, positions, forward_batch):
+    def forward(self, hidden_states, positions, forward_batch, *, pass_idx=0):
+        index = self.pass_attn_index[pass_idx]
+        attn = self.attn[index] if isinstance(self.attn, nn.ModuleList) else self.attn
+        attn_padded = None if self.attn_padded is None else self.attn_padded[index]
+        conv_layer_id = self.conv_layer_ids[pass_idx]
+        with (
+            self.k_sconv.state_layer_override(conv_layer_id),
+            self.v_sconv.state_layer_override(conv_layer_id),
+        ):
+            return self._forward(
+                hidden_states,
+                positions,
+                forward_batch,
+                attn=attn,
+                attn_padded=attn_padded,
+            )
+
+    def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
         assert serving_attention_backend(forward_batch) == "fa4", (
             "Inkling2 requires FA4 attention"
         )
@@ -439,7 +485,7 @@ class Inkling2Attention(nn.Module):
             )
         )
         padded = (
-            self.attn_padded is not None
+            attn_padded is not None
             and not compact
             and (get_platform().is_sm90 or tokens >= PADDED_DECODE_MIN_TOKENS)
             and (mode.is_decode() or verify)
@@ -451,17 +497,19 @@ class Inkling2Attention(nn.Module):
             )
         elif padded and verify and self.fused_decode_prologue:
             fa_meta = get_attn_backend().forward_metadata
-            # The MXFP8 score modifier consumes the unsheared relative-bias row.
+            # The MXFP8 score modifier consumes the unsheared relative-bias row;
+            # SM120 FA4 tiles differ from the 128-row preshear layout, so it shears.
             presheared = (
                 not mxfp8
                 and not get_platform().is_sm90
+                and not get_platform().is_sm120
                 and fa_meta.swa_spec_metadata is None
                 and fa_meta.max_seq_len_q * self.padded_group <= 128
             )
             shear = (
                 (
                     fa_meta.cache_seqlens_int32,
-                    self.attn.sliding_window_size if self.is_local else None,
+                    attn.sliding_window_size if self.is_local else None,
                 )
                 if presheared
                 else None
@@ -499,7 +547,7 @@ class Inkling2Attention(nn.Module):
         else:
             attention_kwargs = dict(rel_bias=rel_bias, **bias_kwargs)
         if compact:
-            output = self.attn(
+            output = attn(
                 q,
                 k,
                 v,
@@ -525,8 +573,8 @@ class Inkling2Attention(nn.Module):
                         get_device_core_count(q.device.index),
                         self.verify_max_splits,
                     )
-                self.attn_padded.num_splits = num_splits
-            output, lse = self.attn_padded(
+                attn_padded.num_splits = num_splits
+            output, lse = attn_padded(
                 q,
                 k,
                 v,
@@ -536,7 +584,7 @@ class Inkling2Attention(nn.Module):
             )
             head_groups = (self.num_tp_heads // self.num_tp_kv_heads, self.padded_group)
         else:
-            output, lse = self.attn(
+            output, lse = attn(
                 q,
                 k,
                 v,
@@ -556,7 +604,7 @@ class Inkling2Attention(nn.Module):
             )
         parallel = get_parallel()
         multicast = parallel.moe_ep_size > 1
-        if (
+        if self.group_all_reduce or (
             multicast
             and (mode.is_decode() or verify)
             and envs.SGLANG_OPT_INKLING2_ATTN_PUSH_ALL_REDUCE.get()

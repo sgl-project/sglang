@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication import (
     attn_res_collective,
     gemm_ag,
+    inkling2_comm,
     sp_collective,
 )
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
@@ -106,6 +108,36 @@ def _symmetric_tensor(shape):
     if multicast_ptr == 0:
         raise RuntimeError("symmetric tensor has no multicast mapping")
     return tensor, handle, multicast_ptr
+
+
+@torch.inference_mode()
+def test_inkling2_fp32_oneshot_matches_multimem():
+    _, nccl_group = _init_world()
+    group = SimpleNamespace(world_size=dist.get_world_size(), device_group=nccl_group)
+    rank = dist.get_rank()
+    for rows in (1, 2, inkling2_comm.FP32_ONESHOT_MAX_TOKENS):
+        generator = torch.Generator().manual_seed(100 * rank + rows)
+        x = torch.randn((rows, _HIDDEN_SIZE), generator=generator).to(_device())
+        ref = inkling2_comm.multicast_all_reduce_input(group, x.shape, torch.float32)
+        ref.copy_(x)
+        buffer = inkling2_comm.oneshot_all_reduce_input(
+            group, rows, _HIDDEN_SIZE, torch.float32, tag="test_f32"
+        )
+        assert buffer is not None
+        buffer.copy_(x)
+        torch.cuda.synchronize()
+        dist.barrier()
+        expected = inkling2_comm.multicast_all_reduce(ref, group).clone()
+        out = inkling2_comm.oneshot_all_reduce(buffer, group, tag="test_f32")
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    rows = inkling2_comm.FP32_ONESHOT_MAX_TOKENS + 1
+    assert (
+        inkling2_comm.oneshot_all_reduce_input(
+            group, rows, _HIDDEN_SIZE, torch.float32, tag="test_f32"
+        )
+        is None
+    )
 
 
 @torch.inference_mode()

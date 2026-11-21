@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import torch
 from torch import nn
 
@@ -51,6 +53,15 @@ class ShortConvolution(InklingShortConvolution):
                 self.weight_proj, {"weight_loader": self.weight_proj_loader}
             )
             set_weight_attrs(self.static_w, {"weight_loader": self.static_w_loader})
+
+    @contextmanager
+    def state_layer_override(self, layer_id: int):
+        """Read and write the conv state of cache layer layer_id instead of our own."""
+        previous, self.layer_id = self.layer_id, layer_id
+        try:
+            yield
+        finally:
+            self.layer_id = previous
 
     def weight_proj_loader(self, param, loaded_weight):
         if loaded_weight.shape != param.shape:

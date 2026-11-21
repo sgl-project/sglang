@@ -9,14 +9,31 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
 
+def _mega_moe_fits(text_config: Any) -> bool:
+    from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
+
+    # NVFP4 has the strictest MegaMoE alignment of the expert precisions;
+    # Inkling2Experts pads the intermediate width to a multiple of 256 for it.
+    try:
+        check_mega_moe_shapes(
+            hidden=text_config.hidden_size,
+            intermediate=-(-text_config.intermediate_size // 256) * 256,
+            mma_type="nvfp4xnvfp4",
+        )
+    except ValueError:
+        return False
+    return True
+
+
 @_register_for(
     "InklingForConditionalGeneration",
-    "Inkling2ForConditionalGeneration",
+    *INKLING2_ARCHS,
     "InklingForConditionalGenerationMTP",
 )
 def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -35,7 +52,8 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
 
     overrides: Dict[str, Any] = {}
-    if "Inkling2ForConditionalGeneration" in hf_config.architectures:
+    inkling2 = any(arch in INKLING2_ARCHS for arch in hf_config.architectures)
+    if inkling2:
         if cfg.tool_call_parser is None:
             overrides["tool_call_parser"] = "inkling2"
         if cfg.reasoning_parser is None:
@@ -51,6 +69,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             and not cfg.encoder_only
             and not (cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap)
             and model_config_of(server_args).quantization == "inkling2"
+            and _mega_moe_fits(hf_config.get_text_config())
         ):
             overrides["moe_a2a_backend"] = "megamoe"
         # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
@@ -62,6 +81,13 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
         # default; any other value is the user's and wins.
         if cfg.ep_size == 1 and moe_ranks > 1:
             overrides["ep_size"] = moe_ranks
+        # SM120 hosts may lack PCIe P2P, and the default assumes it works:
+        # custom all-reduce would exchange IPC handles before finding out.
+        if get_platform().is_sm120:
+            overrides["enable_p2p_check"] = True
+            # Page size 1 left 0.5 GB after the KV pool; requests ran out of memory.
+            if cfg.page_size is None:
+                overrides["page_size"] = 128
     # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
     # resolved in __post_init__ before declarations are materialized, so a
     # cuda_graph_backend_prefill declared here lands too late (the breakable
@@ -95,7 +121,12 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if is_attention_backend_not_set(cfg):
-        if get_platform().is_sm90 or get_platform().is_sm100:
+        # Inkling2 attention asserts fa4, which SM120 runs on its FA4 forward host.
+        if (
+            get_platform().is_sm90
+            or get_platform().is_sm100
+            or (inkling2 and get_platform().is_sm120)
+        ):
             inkling_attn_backend = "fa4"
         else:
             inkling_attn_backend = "triton"

@@ -84,7 +84,7 @@ class Inkling2VisionAttention(nn.Module):
                 flash_attn_varlen_func,
             )
 
-            if torch.cuda.get_device_capability(hidden.device)[0] not in (9, 10):
+            if torch.cuda.get_device_capability(hidden.device)[0] not in (9, 10, 12):
                 raise ValueError(
                     "Inkling2 vision attention requires Hopper or Blackwell"
                 )

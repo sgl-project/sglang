@@ -37,6 +37,8 @@ def resolve_chat_encoding_spec(
     if tool_call_parser == "kimi_k3":
         return "kimi_k3"
 
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
     architectures = hf_config.architectures
     arch = architectures[0] if architectures else ""
 
@@ -50,7 +52,7 @@ def resolve_chat_encoding_spec(
     # Inkling has no Jinja chat_template and uses a tiktoken base + a special-token
     # overlay + negative MM placeholders, so it can't go through apply_chat_template;
     # render input_ids directly via the Inkling renderer (serving_chat._encode_messages).
-    if "Inkling2ForConditionalGeneration" in arch:
+    if arch in INKLING2_ARCHS:
         return "inkling2"
     if "InklingForConditionalGeneration" in arch:
         return "inkling"

@@ -314,7 +314,11 @@ class Parallel(msgspec.Struct):
     ] = False
     enable_p2p_check: A[
         bool,
-        "Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
+        Arg(
+            help="Enable P2P check for GPU access, otherwise the p2p access is "
+            "allowed by default.",
+            resolvable=True,
+        ),
     ] = False
 
     # -------------------------------------------------------------------------
