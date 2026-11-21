@@ -49,8 +49,8 @@ def _publish(test):
 
 
 def _full_batch(num_tokens, device):
-    # A non-padded count keeps select_experts on the ordinary routing + append path
-    # while masking no row, which makes it the reference for the fusion.
+    # A non-padded count keeps select_experts on the ordinary routing + append path;
+    # no row is masked, so it is the reference for the fusion.
     return torch.tensor([num_tokens], dtype=torch.int32, device=device)
 
 
@@ -177,9 +177,8 @@ class TestAiterSharedColumnsKernel(CustomTestCase):
 
 
 class _FakeAiterBiasedGroupedTopk:
-    # Stand-in for aiter.biased_grouped_topk with the same call contract.
-    # The copy_ calls below honor the row stride of the views they are handed,
-    # so a caller that passed contiguous scratch instead of a view would lose its shared columns.
+    # Stand-in for aiter.biased_grouped_topk with the same call contract;
+    # its copy_ calls honor the row stride, so a caller passing scratch would lose its shared columns.
 
     def __init__(self):
         self.calls = []
@@ -231,8 +230,8 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         self.fake_kernel = _FakeAiterBiasedGroupedTopk()
         fake_aiter = types.ModuleType("aiter")
         fake_aiter.biased_grouped_topk = self.fake_kernel
-        # The fusion imports aiter lazily, so swapping the module entry covers
-        # both "aiter absent" (NVIDIA) and "aiter present" (ROCm).
+        # The fusion imports aiter lazily,
+        # so swapping the module entry covers "aiter absent" (NVIDIA) and "aiter present" (ROCm).
         patcher = patch.dict(sys.modules, {"aiter": fake_aiter})
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -380,8 +379,8 @@ class TestAiterSharedColumnsContract(CustomTestCase):
                 routed_ids = output.topk_ids[:, : self.TOPK_ROUTED]
                 self.assertTrue(torch.all(routed_ids < self.NUM_EXPERTS))
 
-                # The kernel gets a strided view whose row stride spans the
-                # shared columns; that stride is what removes the append kernel.
+                # The kernel gets a strided view whose row stride spans the shared columns;
+                # that stride is what removes the append kernel.
                 (call,) = self.fake_kernel.calls
                 self.assertEqual(call["weights_shape"], (37, self.TOPK_ROUTED))
                 self.assertEqual(call["weights_row_stride"], total)
@@ -429,6 +428,7 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         for bias_dtype, expected in (
             (torch.float32, torch.float32),
             (torch.bfloat16, torch.bfloat16),
+            (torch.float16, torch.bfloat16),
         ):
             with self.subTest(bias_dtype=bias_dtype):
                 self.fake_kernel.calls.clear()
@@ -473,11 +473,12 @@ class TestAiterSharedColumnsContract(CustomTestCase):
                 patch.object(topk_module, "_is_hip", True),
                 patch.object(topk_module, "_use_aiter", True),
                 patch.object(topk_module, ordinary, side_effect=_Ordinary),
+                # Only ROCm imports the partials reduction, so create it for the others.
+                patch.object(topk_module, "rocm_router_reduce_partials", create=True),
             ):
                 with self.assertRaises(_Ordinary):
-                    # The router reduces fp32 partials into an fp32 logits buffer.
                     topk_module.select_experts(
-                        hidden_states, router_logits.float(), config, **kwargs
+                        hidden_states, router_logits, config, **kwargs
                     )
         self.assertEqual(self.fake_kernel.calls, [])
         self.assertIsNone(config.aiter_shared_columns)
@@ -627,9 +628,8 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             self.assertEqual(len(self.fake_kernel.calls), 1)
             self.assertEqual(tuple(fused.topk_ids.shape), (37, total))
 
-            # Fall-through: the ordinary routing gate is stubbed because the
-            # real one resolves to aiter symbols that a non-ROCm build never
-            # imported; the shared-expert append after it is backend-neutral.
+            # Fall-through: the ordinary routing gate is stubbed, since the real one needs
+            # aiter symbols a non-ROCm build never imported; the append after it is backend-neutral.
             routed = (
                 torch.rand((37, self.TOPK_ROUTED), device=router_logits.device),
                 torch.randint(
