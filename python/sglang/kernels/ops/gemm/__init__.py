@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
@@ -128,6 +128,20 @@ def _prefer_torch_rowwise_fp8(
     return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
 
 
+_SM120_RT_DEPS: Optional[Tuple[object, object, object]] = None
+
+
+def _get_sm120_rt_deps():
+    global _SM120_RT_DEPS
+    if _SM120_RT_DEPS is None:
+        import torch
+
+        from sglang.srt import batch_invariant_ops, runtime_context
+
+        _SM120_RT_DEPS = (torch, batch_invariant_ops, runtime_context)
+    return _SM120_RT_DEPS
+
+
 @lru_cache(maxsize=None)
 def _sm120_torch_fp8_max_n(device: torch.device) -> int:
     import torch
@@ -150,25 +164,44 @@ def _prefer_sm120_torch_rowwise_fp8(
     bias: Optional[torch.Tensor],
 ) -> bool:
     """Whether Torch's SM120 cuBLASLt kernel wins for this small-M rowwise shape."""
-    import torch
+    if bias is not None or mat_a.ndim != 2 or mat_b.ndim != 2:
+        return False
+    m, k = mat_a.shape
+    n = mat_b.shape[1]
+    if m <= 0 or m > 128 or k < 4096 or n < 1536:
+        return False
 
+    dev = mat_a.device
+    if dev.type != "cuda":
+        return False
+    max_n = _sm120_torch_fp8_max_n(dev)
+    if max_n <= 0 or n > max_n:
+        return False
+
+    torch, batch_invariant_ops, runtime_context = _get_sm120_rt_deps()
     if (
-        mat_a.device.type != "cuda"
+        out_dtype not in (torch.bfloat16, torch.float16)
+        or mat_b.device != dev
+        or mat_a.dtype != torch.float8_e4m3fn
+        or mat_b.dtype != torch.float8_e4m3fn
+        or scales_a.dtype != torch.float32
+        or scales_b.dtype != torch.float32
+        or scales_a.device != dev
+        or scales_b.device != dev
+        or scales_a.shape != (m, 1)
+        or scales_b.numel() != n
+        or not mat_a.is_contiguous()
+        or not mat_b.t().is_contiguous()
+        or not scales_a.is_contiguous()
+        or not scales_b.is_contiguous()
         or torch.compiler.is_compiling()
         or not hasattr(torch, "_scaled_mm")
+        or batch_invariant_ops.is_batch_invariant_mode_enabled()
     ):
         return False
-    max_n = _sm120_torch_fp8_max_n(mat_a.device)
-    if max_n <= 0:
-        return False
 
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-    from sglang.srt.runtime_context import get_exec
-
-    if is_batch_invariant_mode_enabled():
-        return False
     try:
-        deterministic = get_exec().deterministic
+        deterministic = runtime_context.get_exec().deterministic
         if (
             deterministic.enable_deterministic_inference
             or deterministic.rl_on_policy_target is not None
@@ -176,35 +209,7 @@ def _prefer_sm120_torch_rowwise_fp8(
             return False
     except ValueError:
         pass
-
-    if (
-        bias is not None
-        or out_dtype not in (torch.bfloat16, torch.float16)
-        or mat_b.device != mat_a.device
-        or mat_a.dtype != torch.float8_e4m3fn
-        or mat_b.dtype != torch.float8_e4m3fn
-        or mat_a.ndim != 2
-        or mat_b.ndim != 2
-        or not mat_a.is_contiguous()
-        or not mat_b.t().is_contiguous()
-    ):
-        return False
-
-    m, k = mat_a.shape
-    n = mat_b.shape[1]
-    return (
-        0 < m <= 128
-        and k >= 4096
-        and 1536 <= n <= max_n
-        and scales_a.dtype == torch.float32
-        and scales_b.dtype == torch.float32
-        and scales_a.device == mat_a.device
-        and scales_b.device == mat_a.device
-        and scales_a.shape == (m, 1)
-        and scales_a.is_contiguous()
-        and scales_b.is_contiguous()
-        and scales_b.numel() == n
-    )
+    return True
 
 
 class Fp8ScaledMMOp(BaseFusedOp):
