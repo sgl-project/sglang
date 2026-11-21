@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from queue import Queue
@@ -823,6 +824,59 @@ class TestStorageWorkerStop(unittest.TestCase):
         cc.pp_prefetch_command_thread = finished
         self.assertEqual(cc._storage_worker_threads(), [])
         self.assertEqual(cc.dead_storage_workers(), [])
+
+
+class TestConcurrentPrefetchReads(unittest.TestCase):
+    def test_read_ahead_keeps_the_hit_prefix_and_waits_for_in_flight_reads(self):
+        cc = _controller()
+        cc.prefetch_io_threads = 3
+        cc.prefetch_batch_executor = ThreadPoolExecutor(3)
+        self.addCleanup(cc.prefetch_batch_executor.shutdown)
+        operation = PrefetchOperation("r", list(range(4 * PAGE)))
+        operation.hash_value = ["h0", "h1", "h2", "h3"]
+        operation.host_indices = torch.arange(4 * PAGE)
+        overlap = threading.Barrier(3)
+        finished = []
+
+        def kv_batch(op, hashes, *_):
+            if hashes[0] != "h3":
+                overlap.wait(timeout=10)
+            time.sleep(0.05)
+            finished.append(hashes[0])
+            return 0 if hashes[0] == "h1" else len(hashes)
+
+        cc._page_transfer_kv_batch = kv_batch
+        with patch.object(cache_controller, "STORAGE_BATCH_SIZE", 1):
+            self.assertEqual(cc._page_transfer(operation), 1)
+        self.assertEqual(sorted(finished), ["h0", "h1", "h2", "h3"])
+        acks = [cc.prefetch_sync_queue.get_nowait() for _ in range(4)]
+        self.assertEqual([a.completed_tokens for a in acks], [PAGE] * 4)
+        self.assertTrue(cc.prefetch_sync_queue.empty())
+
+    def test_kv_and_kv_derived_pools_are_read_concurrently(self):
+        cc = _controller()
+        cc.prefetch_sidecar_executor = ThreadPoolExecutor(1)
+        self.addCleanup(cc.prefetch_sidecar_executor.shutdown)
+        overlap = threading.Barrier(2)
+
+        def kv_get(op, hashes, *_):
+            overlap.wait(timeout=10)
+            return len(hashes)
+
+        def sidecar_get(transfers, extra_info=None):
+            overlap.wait(timeout=10)
+            return {"indexer": [True, False]}
+
+        cc.page_get_func = kv_get
+        cc.storage_backend = SimpleNamespace(batch_get_v2=sidecar_get)
+        hits = cc._page_transfer_kv_batch(
+            PrefetchOperation("r", list(range(2 * PAGE))),
+            ["h0", "h1"],
+            torch.arange(2 * PAGE),
+            None,
+            [PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)],
+        )
+        self.assertEqual(hits, 1)
 
 
 if __name__ == "__main__":
