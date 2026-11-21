@@ -723,6 +723,9 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Prefill admission frees each request's KV before committing it and defers
+    # the request when eviction cannot, instead of raising in alloc_for_extend.
+    SGLANG_ENABLE_PREFILL_KV_BACKOFF = EnvBool(True)
     # UniBoost: estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
 
