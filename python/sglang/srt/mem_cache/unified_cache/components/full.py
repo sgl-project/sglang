@@ -22,6 +22,8 @@ from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
+    device_kv_slots,
+    unpack_device_kv_slots,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -185,7 +187,9 @@ class FullComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            device_frees[self.component_type].append(cd.value)
+            device_frees[self.component_type].append(
+                device_kv_slots(cd.value, node.rotation_phase)
+            )
             # Progress toward an eviction request and the ledger move are
             # both in allocator units (see reclaimable_value_len).
             freed = self.reclaimable_value_len(node)
@@ -555,9 +559,10 @@ class FullComponent(TreeComponent):
             pass
         elif isinstance(action, FreeComponentDeviceSlot):
             storage, sub_pool = self.storage_and_sub_pool()
-            for indices in action.indices:
+            for item in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
-                storage.free_units(sub_pool, indices)
+                indices, rotation_base = unpack_device_kv_slots(item)
+                storage.free_units(sub_pool, indices, rotation_base=rotation_base)
         else:
             raise AssertionError(
                 f"FullComponent: unhandled ComponentAction {type(action).__name__}"

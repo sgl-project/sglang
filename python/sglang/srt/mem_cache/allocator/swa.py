@@ -653,13 +653,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ):
         if free_index.numel() == 0:
             return
         # SWA first, as in free(): it reads the mapping that a later cache
         # action in this group may re-point.
         self.free_swa_segment(free_index, start_pos=start_pos)
-        self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
+        self.full_attn_allocator.free_segment(
+            free_index, start_pos=start_pos, rotation_base=rotation_base
+        )
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
         if free_index.numel() == 0:
@@ -887,7 +895,13 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # release once the SWA side is gone.
         return
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ):
         # Single pool: the parent's split into an SWA and a full half would
         # release the same slots twice.
         self.free(free_index)

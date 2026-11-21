@@ -386,24 +386,35 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         released. A single pool has no SWA peer, so this is a plain free()."""
         self.free(free_index)
 
-    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+    def free_segment(
+        self,
+        free_index: torch.Tensor,
+        *,
+        start_pos: int,
+        rotation_base: Optional[int] = None,
+    ):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request.
 
         In page units the segment is ``[start_pos // ps, ceil(end / ps))``:
         ``start_pos`` sits on a page boundary, the end may fall mid-page, and
-        the whole last page is released."""
+        the whole last page is released. ``rotation_base`` is the row's chain
+        rotation base under logical-page KV sharding (the owner of the row's
+        position-page P is ``(rotation_base + P) % shard_size``); allocators
+        without owner classes ignore it."""
         assert start_pos % self.page_size == 0, (
             f"segment start {start_pos} is not page-aligned"
         )
         self.free(free_index)
 
-    def free_segments(self, segments):
+    def free_segments(self, segments, *, rotation_base: Optional[int] = None):
         """Free several ``(free_index, start_pos)`` segments of one request's
         kv row. Each covers pages ``[start_pos // ps, ceil(end / ps))``; starts
         are page-aligned and consecutive page ranges do not overlap, so every
-        page is released exactly once."""
+        page is released exactly once. ``rotation_base``: see free_segment()."""
         for free_index, start_pos in self._page_disjoint(segments):
-            self.free_segment(free_index, start_pos=start_pos)
+            self.free_segment(
+                free_index, start_pos=start_pos, rotation_base=rotation_base
+            )
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """free_full() for a kv-row segment; same start-alignment contract as
