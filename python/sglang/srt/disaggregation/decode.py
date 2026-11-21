@@ -4391,7 +4391,9 @@ class SchedulerDisaggregationDecodeMixin:
 
         if self.enable_priority_scheduling:
             self.waiting_queue.reorder(
-                self.policy.calc_priority(self.waiting_queue, running_batch)
+                self.schedule_planner.calc_priority(
+                    self.waiting_queue, running_batch.reqs
+                )
             )
 
         host_restore = get_disagg().disaggregation_decode_host_receive_threshold < 1

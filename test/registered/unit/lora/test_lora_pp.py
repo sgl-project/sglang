@@ -31,7 +31,7 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
 from sglang.srt.lora.utils import LoRAType
-from sglang.srt.managers.schedule_policy import AddReqResult, SchedulePolicy
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
@@ -42,6 +42,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.scheduler_test_utils import FakeReq
 
@@ -157,9 +158,9 @@ class TestAllPPLoras(CustomTestCase):
             is_mixed_chunk=False,
             dllm_config=None,
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
-            policy=mock.Mock(
-                spec=SchedulePolicy,
-                _bounded_active=bounded_active,
+            schedule_planner=mock.Mock(
+                spec=SchedulePlanner,
+                bounded_lpm_active=bounded_active,
                 calc_priority=lambda waiting, *args, **kwargs: list(waiting),
                 admission_candidates=mock.Mock(side_effect=iter),
                 allows_admission=mock.Mock(return_value=True),
@@ -210,13 +211,15 @@ class TestAllPPLoras(CustomTestCase):
             )
 
         if bounded_active:
-            self.assertEqual(scheduler.policy.admission_candidates.call_count, 4)
-            self.assertEqual(scheduler.policy.allows_admission.call_count, 4)
+            self.assertEqual(
+                scheduler.schedule_planner.admission_candidates.call_count, 4
+            )
+            self.assertEqual(scheduler.schedule_planner.allows_admission.call_count, 4)
         else:
-            scheduler.policy.admission_candidates.assert_not_called()
-            scheduler.policy.allows_admission.assert_not_called()
+            scheduler.schedule_planner.admission_candidates.assert_not_called()
+            scheduler.schedule_planner.allows_admission.assert_not_called()
         # The exhausted pass budget stops before any temporary LoRA skip.
-        scheduler.policy.mark_admission_skipped.assert_not_called()
+        scheduler.schedule_planner.mark_admission_skipped.assert_not_called()
 
 
 class TestFetchKeepsLiveAdapters(CustomTestCase):

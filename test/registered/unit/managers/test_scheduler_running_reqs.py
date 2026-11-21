@@ -398,8 +398,8 @@ class TestRunningReqsHooks(CustomTestCase):
         move([waiting], s.waiting_queue)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock(
-            _bounded_active=False,
+        s.schedule_planner = Mock(
+            bounded_lpm_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
@@ -469,14 +469,8 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         s = Scheduler.__new__(Scheduler)
-        s.schedule_policy = "fcfs"
-        s.tree_cache = MagicMock()
-        s.enable_hierarchical_cache = False
         s.enable_priority_scheduling = True
-        s.schedule_low_priority_values_first = False
-        s.metrics_reporter = SimpleNamespace(enable_metrics=False)
-        s.dllm_config = None
-        Scheduler.init_schedule_policy(s)
+        Scheduler.init_priority_preemption(s)
         return s.enable_priority_preemption
 
     def test_off_with_unified_memory(self):

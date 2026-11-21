@@ -252,7 +252,6 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
-    SchedulePolicy,
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -330,6 +329,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     RPC_METHODS,
@@ -731,8 +731,12 @@ class Scheduler(
         # frontend starts.
         self.init_kv_events_publisher()
 
-        # Init schedule policy and new token estimation
-        self.init_schedule_policy()
+        # Init the schedule planner, prefill delayer, priority preemption, and
+        # new token estimation
+        self.init_schedule_planner()
+        self.init_prefill_delayer()
+        self.init_priority_preemption()
+        self.init_new_token_ratio_tracker()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1553,9 +1557,8 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
-    def init_schedule_policy(self):
-        # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(
+    def init_schedule_planner(self):
+        self.schedule_planner = SchedulePlanner(
             self.schedule_policy,
             self.tree_cache,
             self.enable_hierarchical_cache,
@@ -1570,11 +1573,13 @@ class Scheduler(
             or get_parallel().pp_size > 1,
             uniboost_step_clock=lambda: self.forward_ct,
         )
-        self.policy._on_bounded_state_change = lambda active: (
+        self.schedule_planner.on_bounded_lpm_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
-                self.policy.retire_waiting_members if active else None
+                self.schedule_planner.retire_waiting_members if active else None
             )
         )
+
+    def init_prefill_delayer(self):
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
@@ -1598,6 +1603,7 @@ class Scheduler(
                     debug_log_enabled=get_parallel().attn_tp_rank == 0,
                 )
 
+    def init_priority_preemption(self):
         # NOTE: preemption is enabled by default for priority scheduling.
         # TODO(ch-wan): a unified pool admits by pricing demands, and preemption
         # does not yet ask admission itself whether its victims make room; it
@@ -1608,6 +1614,7 @@ class Scheduler(
             and not get_memory().enable_unified_memory
         )
 
+    def init_new_token_ratio_tracker(self):
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
     def feed_watchdog(self) -> None:
@@ -2936,7 +2943,7 @@ class Scheduler(
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
             waiting_queue_prefix_matched=lambda: (
-                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
+                self.schedule_planner.waiting_queue_prefix_matched(self.waiting_queue)
             ),
             get_recent_cache_hit_rate=lambda: (
                 self.metrics_reporter.recent_cache_hit_rate
@@ -3025,9 +3032,9 @@ class Scheduler(
 
     def maybe_wire_uniboost_gamma_ada(self) -> None:
         # gamma-Ada records the latency of every request that ends.
-        if self.policy.uniboost_gamma_ada is not None:
+        if self.schedule_planner.uniboost_gamma_ada is not None:
             self.request_retirer.release_observer = (
-                self.policy.uniboost_gamma_ada.record_finish
+                self.schedule_planner.uniboost_gamma_ada.record_finish
             )
 
     def maybe_init_decode_offload_manager(self) -> None:
@@ -4667,11 +4674,11 @@ class Scheduler(
         # After the early returns, so a full-batch pass does not scan the queue.
         self._ack_waiting_health_checks()
         # Get priority queue
-        self.policy.poll_storage_prefetches(self.waiting_queue)
+        self.schedule_planner.poll_storage_prefetches(self.waiting_queue)
         self.waiting_queue.reorder(
-            self.policy.calc_priority(
+            self.schedule_planner.calc_priority(
                 self.waiting_queue,
-                running_batch,
+                running_batch.reqs,
                 processed_tokens=self.processed_tokens_counter,
                 bootstrap_queue=(
                     self.disagg_prefill_bootstrap_queue.queue
@@ -4728,7 +4735,7 @@ class Scheduler(
         resumed_req = self.chunked_req
         if resumed_req is not None:
             resumed_req.init_next_round_input()
-            adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+            adder.chunked_req_limit = self.schedule_planner.chunked_req_limit(
                 resumed_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
@@ -4783,14 +4790,14 @@ class Scheduler(
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
-        bounded_active = self.policy._bounded_active
+        bounded_active = self.schedule_planner.bounded_lpm_active
         candidates = (
-            self.policy.admission_candidates(self.waiting_queue)
+            self.schedule_planner.admission_candidates(self.waiting_queue)
             if bounded_active
             else self.waiting_queue
         )
         for req in candidates:
-            if bounded_active and not self.policy.allows_admission(req):
+            if bounded_active and not self.schedule_planner.allows_admission(req):
                 break
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
@@ -4798,7 +4805,7 @@ class Scheduler(
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 if bounded_active:
-                    self.policy.mark_admission_skipped(req)
+                    self.schedule_planner.mark_admission_skipped(req)
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4809,7 +4816,7 @@ class Scheduler(
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
                 if bounded_active:
-                    self.policy.mark_admission_skipped(req)
+                    self.schedule_planner.mark_admission_skipped(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4844,7 +4851,7 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     if bounded_active:
-                        self.policy.mark_admission_skipped(req)
+                        self.schedule_planner.mark_admission_skipped(req)
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4873,7 +4880,7 @@ class Scheduler(
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
                 if bounded_active:
-                    self.policy.mark_admission_skipped(req)
+                    self.schedule_planner.mark_admission_skipped(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4882,7 +4889,7 @@ class Scheduler(
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
                     if bounded_active:
-                        self.policy.mark_admission_skipped(req)
+                        self.schedule_planner.mark_admission_skipped(req)
                     continue
             res = adder.add_one_req(
                 req,

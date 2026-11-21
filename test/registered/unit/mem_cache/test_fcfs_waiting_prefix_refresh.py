@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import SchedulePolicy
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -83,15 +83,15 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
             ServerArgs(model_path="dummy", radix_eviction_policy=eviction_policy),
             role="test",
         )
-        policy = SchedulePolicy("fcfs", cache, False, False, False)
+        planner = SchedulePlanner("fcfs", cache, False, False, False)
         # Isolate the scheduler clock from the radix cache's recency timestamps.
         with patch("sglang.srt.managers.schedule_policy.time", create=True) as clock:
             clock.monotonic.return_value = 100.0
-            queue = policy.calc_priority(queue)
+            queue = planner.calc_priority(queue)
             if second_refresh_time is not None:
                 cache.touch_prefix(RadixKey(array("q", NEWER_PREFIX)))
                 clock.monotonic.return_value = second_refresh_time
-                queue = policy.calc_priority(queue)
+                queue = planner.calc_priority(queue)
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
             cache.match_prefix(

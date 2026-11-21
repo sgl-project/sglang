@@ -17,9 +17,9 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
-    SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler_components.schedule_planner import SchedulePlanner
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -304,7 +304,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()
-        policy = SchedulePolicy(
+        planner = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -318,7 +318,7 @@ class TestPrefillAdder(CustomTestCase):
             req.origin_input_ids = list(range(length))
             req.full_untruncated_fill_ids = list(range(length))
             req.num_matched_prefix_tokens = 0
-        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+        adder.chunked_req_limit = planner.chunked_req_limit(
             continuation,
             waiting,
             adder.rem_chunk_tokens,
@@ -339,7 +339,7 @@ class TestPrefillAdder(CustomTestCase):
         # without them leaves the hit unable to fit whole, so it waits and the
         # room reserved for it goes unused.
         adder = self.create_shortest_prefill_adder(encoder_replay=True)
-        policy = SchedulePolicy(
+        planner = SchedulePlanner(
             policy="shortest-prefill-first",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
@@ -355,7 +355,7 @@ class TestPrefillAdder(CustomTestCase):
         hit.prefix_len = 4096
         hit.kv.req_pool_idx = None
         hit.is_retracted = False
-        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+        adder.chunked_req_limit = planner.chunked_req_limit(
             continuation,
             [hit],
             adder.rem_chunk_tokens,
