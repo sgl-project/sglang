@@ -906,6 +906,12 @@ class Scheduler(
                 get_parallel().attn_tp_rank == 0
                 or get_observability().enable_metrics_for_all_schedulers
             ),
+            detokenizer_router_metrics_enabled=(
+                get_observability().enable_metrics
+                and not envs.SGLANG_RUST_SERVER.get()
+                and not self.skip_tokenizer_init
+                and get_serving().detokenizer_worker_num > 1
+            ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
 
