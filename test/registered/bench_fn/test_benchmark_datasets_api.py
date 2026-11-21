@@ -58,6 +58,7 @@ from sglang.benchmark.serving import (
     async_request_openai_embeddings,
     flush_server_cache,
 )
+from sglang.benchmark.utils import download_and_cache_file
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -538,6 +539,20 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         )
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows_text))
         self.assertTrue(all(isinstance(row.prompt, list) for row in rows_ids))
+
+    def test_download_cache_reuses_valid_jsonl(self):
+        """A multi-record trace already cached on disk must work offline."""
+        path = self.tmpdir_path / "cached-trace.jsonl"
+        original = '{"timestamp": 1}\n{"timestamp": 2}\n'
+        path.write_text(original)
+        with patch(
+            "sglang.benchmark.utils.requests.get", side_effect=AssertionError("offline")
+        ):
+            actual = download_and_cache_file(
+                "https://example.invalid/trace.jsonl", str(path)
+            )
+        self.assertEqual(actual, str(path))
+        self.assertEqual(path.read_text(), original)
 
     def test_custom_sampler(self):
         dataset_path = self._write_custom_jsonl()
