@@ -261,6 +261,39 @@ class TestCgroupPageCache:
         )
         assert host_memory_available_bytes() == 20 * GIB_BYTES
 
+    @pytest.mark.parametrize(
+        "cap_gib, ranks, expected_layers", [(32, 1, 4), (32, 2, 4), (256, 1, 50)]
+    )
+    def test_mapped_streaming_leaves_room_before_warmup(
+        self, monkeypatch, tmp_path, cap_gib, ranks, expected_layers
+    ):
+        """A hot checkpoint in the file LRU must not be converted entirely into pins."""
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(cap_gib * GIB_BYTES, 30 * GIB_BYTES),
+            stat={"active_file": 8 * GIB_BYTES, "inactive_file": 7 * GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            host_memory_budget, "host_copies_are_redundant", lambda: False
+        )
+        budget = HostPinBudget.for_local_worker(ranks)
+        layer = 5 * GIB_BYTES // 4
+        # Sharded couriers use 5 GiB in total. The shared file window is 2.5 GiB.
+        budget.reserve_streaming_memory(
+            weight_bytes=50 * layer,
+            staging_bytes=4 * layer // ranks,
+            mmap_window_bytes=2 * layer,
+        )
+        granted = sum(
+            budget.request(component_name="dit", weight_bytes=layer) for _ in range(50)
+        )
+        assert granted * ranks == expected_layers
+        assert (
+            budget.planning_capacity_bytes
+            == budget.committed_bytes + budget.spendable_bytes
+        )
+
     def test_v1_subtracts_the_cache_of_the_whole_subtree(self, monkeypatch, tmp_path):
         # v1 usage_in_bytes covers descendants; the unprefixed stat keys do not
         self._capped(
@@ -279,6 +312,9 @@ class TestCgroupPageCache:
 
 class TestHostPinBudget:
     def test_local_workers_split_one_node_allowance(self, monkeypatch):
+        monkeypatch.setattr(
+            host_memory_budget, "host_copies_are_redundant", lambda: False
+        )
         monkeypatch.setattr(
             host_memory_budget,
             "host_memory_available_bytes",

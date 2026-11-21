@@ -1359,7 +1359,10 @@ class LayerwiseOffloadManager:
         # to be weighed as one sum against the live reading. Asking about any
         # one tier alone counts the same free bytes twice, and the error only
         # ever says "fits".
-        if unpinned and host_copies_would_not_fit(anonymous_new_bytes()):
+        if unpinned and (
+            self._pin_budget.mmap_share_bytes > 0
+            or host_copies_would_not_fit(anonymous_new_bytes())
+        ):
             for layer_idx in unpinned:
                 if mapped[layer_idx]:
                     hosting[layer_idx] = "mapped"
@@ -3032,19 +3035,8 @@ class LayerwiseOffloadableModuleMixin:
             self.__dict__["_park_placeholder_store"] = store
         return store
 
-    def configure_layerwise_offload(
-        self,
-        server_args: ServerArgs,
-        *,
-        pin_budget: HostPinBudget | None = None,
-        component_name: str | None = None,
-    ):
-        self.park_non_layer_weights_between_uses = (
-            server_args.performance_mode == "memory"
-        )
-        self.layerwise_offload_managers = []
+    def _layerwise_specs(self, server_args, component_name):
         named_modules = dict(self.named_modules())
-        layer_specs = []
         # `--dit-*` is the group default these fall back to, not a scope.
         prefetch_value, resident_value, residency_policy, residency_lifetime = (
             server_args.layerwise_tuning_for(
@@ -3074,8 +3066,27 @@ class LayerwiseOffloadableModuleMixin:
             else:
                 resident_layers = min(num_layers, int(resident_value))
 
-            layer_specs.append((layer_name, num_layers, prefetch_size, resident_layers))
+            yield (
+                layer_name,
+                module_list,
+                prefetch_size,
+                resident_layers,
+                residency_policy,
+                residency_lifetime,
+            )
 
+    def configure_layerwise_offload(
+        self,
+        server_args: ServerArgs,
+        *,
+        pin_budget: HostPinBudget | None = None,
+        component_name: str | None = None,
+    ):
+        self.park_non_layer_weights_between_uses = (
+            server_args.performance_mode == "memory"
+        )
+        self.layerwise_offload_managers = []
+        layer_specs = list(self._layerwise_specs(server_args, component_name))
         if not layer_specs:
             logger.debug(
                 "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
@@ -3093,13 +3104,19 @@ class LayerwiseOffloadableModuleMixin:
             "Configuring layerwise offload for %s: %s",
             component_label,
             ", ".join(
-                f"{layer_name} ({num_layers} layers)"
-                for layer_name, num_layers, _, _ in layer_specs
+                f"{name} ({len(layers)} layers)" for name, layers, *_ in layer_specs
             ),
         )
         started_at = perf_counter()
 
-        for layer_name, num_layers, prefetch_size, resident_layers in layer_specs:
+        for (
+            layer_name,
+            layers,
+            prefetch_size,
+            resident_layers,
+            residency_policy,
+            residency_lifetime,
+        ) in layer_specs:
             # Pinning these weights is what lets the copy stream run ahead of
             # compute, but pinned pages are the ones the kernel cannot reclaim,
             # so they are handed out only while the budget lasts. The budget goes
@@ -3111,7 +3128,7 @@ class LayerwiseOffloadableModuleMixin:
             manager = LayerwiseOffloadManager(
                 model=self,
                 layers_attr_str=layer_name,
-                num_layers=num_layers,
+                num_layers=len(layers),
                 enabled=True,
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 pin_budget=pin_budget,
@@ -3550,6 +3567,49 @@ def get_layerwise_offload_component_names_for_pipeline(
     return selected_pipeline_component_names
 
 
+def _reserve_layerwise_streaming_memory(modules, server_args, pin_budget):
+    """Size outstanding courier slots and the active file window before pinning."""
+    regions = MappedRegions()
+    weight_bytes = staging_bytes = mmap_window_bytes = 0
+    for name, module in modules:
+        for _, layers, prefetch, resident, policy, lifetime in module._layerwise_specs(
+            server_args, name
+        ):
+            indices = (
+                compute_streamed_layers(
+                    num_layers=len(layers), resident_layers=resident, policy=policy
+                )
+                if lifetime == RESIDENCY_LIFETIME_PERMANENT
+                else range(len(layers))
+            )
+            layer_sizes = []
+            largest_slot = 0
+            for idx in indices:
+                size = slot = 0
+                for parameter in layers[idx].parameters():
+                    tensor = LayerwiseOffloadManager._to_local_tensor(parameter)
+                    nbytes = tensor.numel() * tensor.element_size()
+                    weight_bytes += nbytes
+                    if tensor.is_contiguous() and regions.holds(tensor):
+                        size += nbytes
+                        # Direct reads need alignment slack per tensor.
+                        slot += nbytes + 2 * _DIRECT_ALIGN
+                layer_sizes.append(size)
+                largest_slot = max(largest_slot, slot)
+            if not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER:
+                aligned = (largest_slot + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
+                staging_bytes += MappedLayerCourier._NUM_SLOTS * aligned
+            # Current layer plus the prefetched group. Each stage can reclaim
+            # the previous stage's file pages, unlike its allocated slots.
+            window = sum(sorted(layer_sizes, reverse=True)[: 1 + max(1, prefetch)])
+            mmap_window_bytes = max(mmap_window_bytes, window)
+    pin_budget.reserve_streaming_memory(
+        weight_bytes=weight_bytes,
+        staging_bytes=staging_bytes,
+        mmap_window_bytes=mmap_window_bytes,
+    )
+
+
 def configure_layerwise_offload_modules(
     modules: Mapping[str, object],
     server_args: ServerArgs,
@@ -3569,7 +3629,6 @@ def configure_layerwise_offload_modules(
 
     # components which has already been configured to be layerwise-offload
     configured_component_names: list[str] = []
-    configured_module_ids: set[int] = set()
     normalized_component_names = normalize_layerwise_offload_components(component_names)
     selected_component_names = (
         set(normalized_component_names)
@@ -3734,24 +3793,30 @@ def configure_layerwise_offload_modules(
         key=_h2d_bytes_a_pin_would_save,
         reverse=True,
     )
+    # Aliases share a store and courier. Keep the first (highest priority) name.
+    unique_modules = {}
+    for name in selected_pipeline_component_names:
+        module = modules[name]
+        server_args.record_component_layerwise_capability(name, supported=True)
+        unique_modules.setdefault(id(module), (name, module))
+
     if pin_budget is None:
-        pin_budget = HostPinBudget()
+        pin_budget = HostPinBudget.for_local_worker(
+            server_args.num_gpus // server_args.nnodes
+        )
+    if server_args.pin_cpu_memory and pin_budget.spendable_bytes:
+        _reserve_layerwise_streaming_memory(
+            (
+                (name, module)
+                for name, module in unique_modules.values()
+                if not is_layerwise_offloaded_module(module)
+            ),
+            server_args,
+            pin_budget,
+        )
     logger.info("Layerwise offload host memory: %s", describe_host_memory())
 
-    for component_name in selected_pipeline_component_names:
-        module = modules[component_name]
-        if not isinstance(module, LayerwiseOffloadableModuleMixin):
-            continue
-        server_args.record_component_layerwise_capability(
-            component_name, supported=True
-        )
-        module_id = id(module)
-        if module_id in configured_module_ids:
-            # avoid duplicated configures on a same module
-            continue
-
-        configured_module_ids.add(module_id)
-
+    for component_name, module in unique_modules.values():
         if not is_layerwise_offloaded_module(module):
             module.configure_layerwise_offload(
                 server_args, pin_budget=pin_budget, component_name=component_name

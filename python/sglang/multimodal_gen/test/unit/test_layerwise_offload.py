@@ -211,6 +211,8 @@ class _TestServerArgs(SimpleNamespace):
 
 def _server_args(**kwargs):
     defaults = dict(
+        num_gpus=1,
+        nnodes=1,
         component_residency=None,
         disagg_role=RoleType.MONOLITHIC,
         performance_mode="auto",
@@ -441,6 +443,52 @@ def test_layerwise_pipeline_selection_uses_dit_group(monkeypatch):
     assert selected == ["text_encoder", "text_encoder_alias"]
     assert configured == ["text_encoder"]
     assert is_layerwise_offloaded_module(layerwise_module)
+
+
+@pytest.mark.skipif(
+    not pathlib.Path("/proc/self/maps").exists(), reason="needs Linux file mappings"
+)
+@pytest.mark.parametrize("room_mib, expected_pins", [(9, 4), (64, 12)])
+def test_pipeline_reserves_streaming_memory_before_first_forward(
+    tmp_path, monkeypatch, room_mib, expected_pins
+):
+    """A tight host keeps a partial mapped store. A roomy host pins the whole stack."""
+    mib = 1 << 20
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    # Exercise placement on CPU without requiring a page-locking driver.
+    monkeypatch.setattr(layerwise_offload_mod, "_pinned_empty", torch.empty)
+    monkeypatch.setattr(
+        layerwise_offload_mod.current_platform,
+        "device_shares_host_memory",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        host_memory_budget,
+        "host_memory_available_bytes",
+        lambda: host_memory_budget.HOST_COPY_RESERVE_BYTES + room_mib * mib,
+    )
+    model = _NestedDummyModel()
+    model.encoder.blocks = torch.nn.ModuleList()
+    for index in range(12):
+        block = torch.nn.Module()
+        weight = torch.from_file(
+            str(tmp_path / f"layer-{index}"),
+            shared=True,
+            size=mib // 4,
+            dtype=torch.float32,
+        )
+        block.weight = torch.nn.Parameter(weight)
+        model.encoder.blocks.append(block)
+
+    args = _server_args(pin_cpu_memory=True)
+    modules = {"transformer": model, "alias": model}
+    configure_layerwise_offload_modules(modules, args)
+    (manager,) = model.layerwise_offload_managers
+    assert manager._pin_budget.committed_bytes == expected_pins * mib
+    assert manager._mapped_bytes == (12 - expected_pins) * mib
 
 
 def test_pin_budget_ranks_by_steps_resolved_from_model_index(monkeypatch):
