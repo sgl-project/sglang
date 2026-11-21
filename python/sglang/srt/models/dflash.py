@@ -1374,8 +1374,11 @@ class DFlashDraftModel(nn.Module):
             or self.quantizable
             or parallel.tp_size == 1
             or hidden_size % parallel.tp_size != 0
-            # An attention-owning draft runs under a narrowed TP group (draft_tp_context).
-            or parallel.attn_dp_enabled
+            # On Ascend, an attention-owning draft can narrow TP to one DP
+            # shard while retaining the target's attn_dp_enabled flag.
+            or (
+                parallel.attn_dp_enabled and (not _is_npu or parallel.attn_dp_size != 1)
+            )
             or parallel.attn_cp_size > 1
         ):
             return None

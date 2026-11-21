@@ -89,7 +89,7 @@ def plan_indexer_query_shard(
 
 
 class _IndexerQueryShard(NamedTuple):
-    """This rank's rows of an extend batch, and how to reassemble the top-k."""
+    """This rank's query rows and how to reassemble the top-k."""
 
     start: int
     rows: int
@@ -98,6 +98,7 @@ class _IndexerQueryShard(NamedTuple):
     tp_size: int
     actual_seq_lengths_q: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+    request_rows: Optional[slice] = None
 
     def take(self, x: torch.Tensor) -> torch.Tensor:
         if self.num_real == self.rows:
@@ -121,7 +122,11 @@ class _IndexerQueryShard(NamedTuple):
 
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
-        plan = get_dsa_token_shard_plan(forward_batch)
+        plan = (
+            get_dsa_token_shard_plan(forward_batch)
+            if self.request_rows is None
+            else None
+        )
         local = plan is not None
         if local and (plan.rows != self.rows or plan.local_start != self.start):
             # Same arithmetic, but the two sites read their inputs separately;
@@ -214,6 +219,40 @@ def _get_indexer_query_shard(
         )
         return None
     return shard
+
+
+def _build_verify_indexer_shard(
+    num_tokens: int,
+    verify_width: int,
+    query_ends: torch.Tensor,
+    kv_lens: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+) -> Optional[_IndexerQueryShard]:
+    """Assign contiguous requests using the captured shape on every rank."""
+    batch_size = query_ends.numel()
+    if (
+        batch_size < tp_size
+        or batch_size % tp_size != 0
+        or num_tokens != batch_size * verify_width
+        or kv_lens.numel() != batch_size
+    ):
+        return None
+    requests_per_rank = batch_size // tp_size
+    request_start = tp_rank * requests_per_rank
+    request_rows = slice(request_start, request_start + requests_per_rank)
+    rows = requests_per_rank * verify_width
+    start = request_start * verify_width
+    return _IndexerQueryShard(
+        start=start,
+        rows=rows,
+        num_real=rows,
+        total=num_tokens,
+        tp_size=tp_size,
+        actual_seq_lengths_q=query_ends[request_rows] - start,
+        actual_seq_lengths_kv=kv_lens[request_rows],
+        request_rows=request_rows,
+    )
 
 
 class DSANPUIndexerMixin:
@@ -607,6 +646,28 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table,
             )
+        verify_valid_requests = attn_backend.forward_metadata.indexer_valid_requests
+        if (
+            verify_valid_requests is not None
+            and block_table is not None
+            and actual_seq_lengths_kv.device == k.device
+            and not use_quant_indexer
+            and not input_on_attn_tp_slices
+            and not get_attn_tp_context().input_scattered
+        ):
+            verify_width = attn_backend.speculative_num_draft_tokens
+            shard = _build_verify_indexer_shard(
+                bs,
+                verify_width,
+                actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                parallel.attn_tp_size,
+                parallel.attn_tp_rank,
+            )
+            if shard is not None:
+                print_info_once(
+                    f"DSA Verify indexer request sharding: {shard.rows} query rows per rank"
+                )
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
@@ -643,6 +704,8 @@ class DSANPUIndexerMixin:
                 weights = shard.take(weights)
                 actual_seq_lengths_q = shard.actual_seq_lengths_q
                 actual_seq_lengths_kv = shard.actual_seq_lengths_kv
+                if shard.request_rows is not None:
+                    block_table = block_table[shard.request_rows]
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(
@@ -680,20 +743,35 @@ class DSANPUIndexerMixin:
                     key_quant_mode=0,
                 ).squeeze(1)
             else:
+                kv_lens = actual_seq_lengths_kv.to(device=k.device, dtype=torch.int32)
+                valid_requests = None
+                if shard is not None and shard.request_rows is not None:
+                    valid_requests = (kv_lens > 0) & verify_valid_requests[
+                        shard.request_rows
+                    ]
+                    # An all-empty shard may leave indexer output unwritten.
+                    # Run padded rows against the reserved page zero, then
+                    # discard their output before the fixed-size all-gather.
+                    kv_lens = torch.where(valid_requests, kv_lens, verify_width)
+                    block_table = block_table.masked_fill(~valid_requests[:, None], 0)
                 topk_indices = torch_npu.npu_lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                        torch.int32
-                    ),
+                    actual_seq_lengths_key=kv_lens,
                     block_table=block_table,
                     layout_query="TND",
                     layout_key="PA_BSND",
                     sparse_count=self.index_topk,
                     sparse_mode=3,
                 )[0].squeeze(1)
+                if valid_requests is not None:
+                    topk_indices = (
+                        topk_indices.view(-1, verify_width, self.index_topk)
+                        .masked_fill(~valid_requests[:, None, None], -1)
+                        .view(-1, self.index_topk)
+                    )
             if shard is not None:
                 topk_indices = shard.resolve(
                     topk_indices, num_query_tokens, forward_batch

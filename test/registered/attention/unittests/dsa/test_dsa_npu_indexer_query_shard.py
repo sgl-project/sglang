@@ -27,6 +27,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
+    _build_verify_indexer_shard,
     _get_indexer_query_shard,
     _IndexerQueryShard,
     plan_indexer_query_shard,
@@ -181,6 +182,43 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
         _, _, local, gathered = self._resolve([0], [16384], 16, 3, plan_rank=5)
         self.assertFalse(local)
         self.assertTrue(gathered)
+
+
+class TestVerifyIndexerRequestShard(CustomTestCase):
+    def test_whole_requests_and_rank_order(self):
+        width, batch_size, tp_size = 5, 32, 16
+        query = torch.arange(batch_size * width)
+        query_ends = torch.arange(width, width * (batch_size + 1), width)
+        kv_lens = torch.arange(batch_size) + 4096
+        shards = [
+            _build_verify_indexer_shard(
+                query.numel(), width, query_ends, kv_lens, tp_size, rank
+            )
+            for rank in range(tp_size)
+        ]
+        for rank, shard in enumerate(shards):
+            self.assertEqual(shard.rows, 10)
+            self.assertEqual(shard.actual_seq_lengths_q.tolist(), [5, 10])
+            self.assertEqual(
+                shard.actual_seq_lengths_kv.tolist(), [4096 + 2 * rank, 4097 + 2 * rank]
+            )
+        self.assertTrue(torch.equal(torch.cat([s.take(query) for s in shards]), query))
+
+    def test_incompatible_captured_shapes(self):
+        for num_tokens, batch_size, kv_size in (
+            (75, 15, 15),
+            (79, 16, 16),
+            (80, 16, 15),
+        ):
+            with self.subTest(
+                num_tokens=num_tokens, batch_size=batch_size, kv_size=kv_size
+            ):
+                query_ends = torch.arange(1, batch_size + 1) * 5
+                self.assertIsNone(
+                    _build_verify_indexer_shard(
+                        num_tokens, 5, query_ends, torch.ones(kv_size), 16, 0
+                    )
+                )
 
 
 if __name__ == "__main__":
