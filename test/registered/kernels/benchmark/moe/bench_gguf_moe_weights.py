@@ -21,7 +21,7 @@ def torch_weight(outputs, weights, ids):
 @marker.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float32], [torch.float16]
 )
-@marker.benchmark("provider", ["aot", "torch"])
+@marker.benchmark("provider", ["aot", "torch"], gate=[])
 def benchmark(tokens, hidden, dtype, provider):
     device = "musa" if is_musa() else "cuda"
     native = resolve_gguf_moe_weights(device)
@@ -42,7 +42,7 @@ def benchmark(tokens, hidden, dtype, provider):
 @marker.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float32], [torch.float16]
 )
-@marker.benchmark("provider", ["jit", "aot"])
+@marker.benchmark("provider", ["jit", "aot"], gate=["jit"])
 def benchmark_vector(tokens, dtype, provider):
     """Compare the same all-valid Q4_0 vector operation, including private scratch."""
     from sgl_kernel.quantization import ggml_moe_a8_vec

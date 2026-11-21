@@ -109,7 +109,7 @@ NATIVE_M1_CASES = [
     MODEL_FP8_CASES,
     [("Qwen3.8-27B/attn-qkv", 9, 8192, 5120)],
 )
-@marker.benchmark("provider", ["kda", "torch", "flashinfer"])
+@marker.benchmark("provider", ["kda", "torch", "flashinfer"], gate=["kda"])
 def benchmark(model: str, m: int, n: int, k: int, provider: str):
     del model
     args = _make_inputs(m, n, k)
@@ -126,7 +126,7 @@ def benchmark(model: str, m: int, n: int, k: int, provider: str):
     NATIVE_M1_CASES,
     [("Qwen3.8-27B/attn-qkv", 8192, 5120)],
 )
-@marker.benchmark("provider", ["kda", "native"])
+@marker.benchmark("provider", ["kda", "native"], gate=["kda"])
 def benchmark_m1_native(model: str, n: int, k: int, provider: str):
     """Compare M=1 with SGLang's existing SM120 GEMV before dispatching."""
     del model

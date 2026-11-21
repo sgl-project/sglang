@@ -38,7 +38,7 @@ FN_MAP = {"fused": fused, "stock": stock, "softmax": softmax_only}
 # and top_k per row; "softmax" is the softmax alone, the floor of the fused kernel.
 @marker.parametrize("vocab_size", [129280, 151936, 163840, 248320], [248320])
 @marker.parametrize("batch_size", marker.range(9, pattern="pow2"), [1, 64])
-@marker.benchmark("impl", ["fused", "stock", "softmax"])
+@marker.benchmark("impl", ["fused", "stock", "softmax"], gate=["fused"])
 def benchmark(vocab_size: int, batch_size: int, impl: str):
     logits = create_random(batch_size, vocab_size, dtype=torch.float32)
     temperatures = torch.linspace(0.5, 1.5, batch_size, device=logits.device).view(
