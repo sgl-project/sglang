@@ -86,6 +86,9 @@ class TestEagleLlama3TokenMap(EagleLlama2Base, SpecAccuracyKit):
     spec_tokens = 8
     cuda_graph_max_bs_decode = 5
     gsm8k_accept_len_thres = 2.5  # FR-Spec token map lowers accept (~2.57)
+    # The target is bf16 and the draft checkpoint fp16: auto must run the draft
+    # in the target's dtype.
+    dtype = "auto"
     extra_args = (
         "--speculative-token-map",
         "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",

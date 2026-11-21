@@ -1108,6 +1108,15 @@ class ModelConfig:
             if is_draft_model
             else cfg.decrypted_config_file
         )
+        dtype = cfg.dtype
+        if (
+            is_draft_model
+            and dtype == "auto"
+            and cfg.speculative_algorithm != "STANDALONE"
+        ):
+            # The draft shares the target's embedding, lm_head, or hidden states,
+            # so it runs in the target's dtype, not its own checkpoint's.
+            dtype = ModelConfig.from_server_args(server_args).dtype
         return ModelConfig(
             model_path=model_path or cfg.model_path,
             trust_remote_code=cfg.trust_remote_code,
@@ -1120,7 +1129,7 @@ class ModelConfig:
             enable_multimodal=(
                 False if cfg.disable_multimodal else cfg.enable_multimodal
             ),
-            dtype=cfg.dtype,
+            dtype=dtype,
             quantization=quantization,
             model_impl=cfg.model_impl,
             sampling_defaults=cfg.sampling_defaults,
