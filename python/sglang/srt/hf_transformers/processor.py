@@ -51,6 +51,7 @@ from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
     _fix_v5_add_bos_eos_token,
+    _fix_v5_tokenizer_components,
     _install_tokenizer_warnings_filter,
     _shim_fastokens_backend,
     get_tokenizer,
@@ -455,6 +456,11 @@ def _get_processor(
             processor.tokenizer = tokenizer
 
     _install_tokenizer_warnings_filter(tokenizer)
+    # AutoProcessor may return a tokenizer whose v5 class constructor rebuilt
+    # the checkpoint's pre_tokenizer/decoder (e.g. LlamaTokenizerFast over a
+    # ByteLevel tokenizer.json, which then drops "\n"). Apply the same repairs
+    # as get_tokenizer so both loaders tokenize identically.
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
     if tokenizer.chat_template is None:

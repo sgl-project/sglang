@@ -46,6 +46,66 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def _write_llama_declared_byte_level_tokenizer(model_path):
+    """Write a tiny ByteLevel BPE tokenizer whose config declares LlamaTokenizerFast.
+
+    Transformers v5's LlamaTokenizer rebuilds the pre_tokenizer as Metaspace,
+    so "\\n" (vocab entry "Ċ") is no longer produced unless sglang restores the
+    tokenizer.json components.
+    """
+    byte_level = {
+        "type": "ByteLevel",
+        "add_prefix_space": False,
+        "trim_offsets": True,
+        "use_regex": True,
+    }
+    special = {
+        "single_word": False,
+        "lstrip": False,
+        "rstrip": False,
+        "normalized": False,
+        "special": True,
+    }
+    tokenizer_json = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {"id": 0, "content": "<s>", **special},
+            {"id": 1, "content": "</s>", **special},
+        ],
+        "normalizer": None,
+        "pre_tokenizer": byte_level,
+        "post_processor": None,
+        "decoder": byte_level,
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": None,
+            "end_of_word_suffix": None,
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "ignore_merges": False,
+            "vocab": {"<s>": 0, "</s>": 1, "H": 2, "i": 3, "Ċ": 4, "Ġ": 5},
+            "merges": [],
+        },
+    }
+    Path(model_path, "tokenizer.json").write_text(json.dumps(tokenizer_json))
+    Path(model_path, "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "LlamaTokenizerFast",
+                "bos_token": "<s>",
+                "eos_token": "</s>",
+                "add_bos_token": False,
+                "add_eos_token": False,
+                "chat_template": "{{ messages[0]['content'] }}",
+            }
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_processor
 # ---------------------------------------------------------------------------
@@ -106,6 +166,48 @@ class TestGetProcessor(CustomTestCase):
         self.assertTrue(tokenizer.add_bos_token)
         self.assertFalse(tokenizer.add_eos_token)
         self.assertEqual(tokenizer.update_post_processor_calls, 1)
+
+    def test_processor_tokenizer_keeps_byte_level_newlines(self):
+        """A checkpoint declaring LlamaTokenizerFast over a ByteLevel tokenizer.json
+        must not lose "\\n" when its tokenizer is loaded through a processor."""
+        from transformers import AutoTokenizer
+
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
+
+        with tempfile.TemporaryDirectory() as model_path:
+            _write_llama_declared_byte_level_tokenizer(model_path)
+            processor_tokenizer = AutoTokenizer.from_pretrained(model_path)
+            text = "Hi\nHi"
+            if "Ċ" in processor_tokenizer.tokenize(text):
+                self.skipTest(
+                    "this transformers version keeps the ByteLevel pre_tokenizer"
+                )
+
+            config = SimpleNamespace(model_type="test_vlm", auto_map={})
+            loaded_processor = SimpleNamespace(tokenizer=processor_tokenizer)
+            auto_config = MagicMock()
+            auto_config.from_pretrained.return_value = config
+            auto_processor = MagicMock()
+            auto_processor.from_pretrained.return_value = loaded_processor
+            with patch.multiple(
+                processor_utils,
+                AutoConfig=auto_config,
+                AutoProcessor=auto_processor,
+            ):
+                processor = processor_utils.get_processor(model_path)
+
+            text_tokenizer = get_tokenizer(model_path)
+
+            tokenizer = processor.tokenizer
+            self.assertEqual(
+                tokenizer.tokenize(text, add_special_tokens=False),
+                ["H", "i", "Ċ", "H", "i"],
+            )
+            self.assertEqual(
+                tokenizer.encode(text, add_special_tokens=False),
+                text_tokenizer.encode(text, add_special_tokens=False),
+            )
+            self.assertEqual(tokenizer.decode(tokenizer.encode(text)), text)
 
     def test_does_not_forward_backend_to_auto_processor(self):
         config = SimpleNamespace(model_type="test_vlm", auto_map={})
