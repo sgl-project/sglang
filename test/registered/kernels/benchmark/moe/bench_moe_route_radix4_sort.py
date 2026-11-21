@@ -25,7 +25,8 @@ SORT_WS = moe_route_radix4.new_sort_workspace(torch.device("cuda"))
 
 
 def _aiter_sort(ids, weights, moe_buf, block_m):
-    # The aux-sort pipeline's call: it also writes the aux tensors and zeroes moe_buf.
+    # The consuming call: the BM=16 pipeline is the aux sort, which also writes the aux tensors
+    # (AITER has no aux sort at BM=32); both zero moe_buf.
     return moe_sorting(
         ids,
         weights,
@@ -33,7 +34,7 @@ def _aiter_sort(ids, weights, moe_buf, block_m):
         MODEL_DIM,
         torch.bfloat16,
         block_size=block_m,
-        output_aux=True,
+        output_aux=block_m == 16,
         output=moe_buf,
     )
 
