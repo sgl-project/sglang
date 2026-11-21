@@ -15,6 +15,8 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `enable_lora_overlap_loading`: Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.
 
+* `enable_lora_cpu_preparation`: Prepare dynamically loaded file/Hugging Face adapters in a background worker, including pinned CPU buffers matching the GPU slot layout. Requires `enable_lora_overlap_loading`, CUDA, pipeline parallel size 1, no DP attention, and no speculative decoding. Disabled by default.
+
 * `lora_paths`: The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: &lt;PATH&gt; | &lt;NAME&gt;=&lt;PATH&gt; | JSON with schema &#123;"lora_name":str,"lora_path":str,"pinned":bool&#125;.
 
 * `max_loras_per_batch`: GPU pool capacity in distinct adapter IDs, including `None` for base-model requests. With pipeline parallelism, this capacity is shared across all in-flight microbatches. More slots reserve more GPU memory. Defaults to 8.
@@ -459,6 +461,12 @@ Keep these constraints in mind:
 - The built-in LoRA memory pool does not support `--enable-lora-overlap-loading` with DPA. The server rejects that combination rather than allowing DP ranks to assign different GPU slots.
 
 ## LoRA Overlap Loading
+
+### Background CPU preparation
+
+For large dynamically loaded adapters, add `--enable-lora-cpu-preparation` alongside `--enable-lora-overlap-loading`. File reads, normalization, scaling and GPU-layout packing then run outside the scheduler thread. The scheduler installs the CPU adapter only after every TP rank has prepared and validated it. GPU admission submits copies from the prepared buffers, which are reused after GPU eviction.
+
+This uses additional pinned CPU memory approximately equal to one GPU adapter slot per CPU-resident adapter. Padding to the configured maximum rank can increase transfer bytes. The original CPU weights remain available if the GPU pool changes. The option applies to `/load_lora_adapter`; startup adapters and serialized-tensor loading keep their existing paths. A successful load response means the CPU adapter is registered; GPU residency is still determined when requests are admitted.
 
 
 By using the `--enable-lora-overlap-loading` server argument, the SGLang engine is able to overlap the loading of LoRA weights with prefill and decode compute, essentially hiding the data movement for LoRA weights behind GPU computation. Our benchmarks show that under adversarial conditions, enabling this feature can result in a ~35% reduction in median TTFT - (see the [LoRA overlap loading PR](https://github.com/sgl-project/sglang/pull/15512) for detailed benchmarks).
