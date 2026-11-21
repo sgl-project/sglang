@@ -3,6 +3,9 @@ from dataclasses import field
 from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclasses.dataclass
@@ -43,12 +46,47 @@ class LTX2SamplingParams(SamplingParams):
         "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
     )
 
+    def _adjust(self, server_args: Any) -> None:
+        self._align_resolution(server_args)
+        super()._adjust(server_args)
+
     def prepare_synthetic_warmup_request_for_queue(
         self, req: Any, server_args: Any
     ) -> None:
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args)
         # BCG must capture the same CFG/STG/modality branches and LoRA phase
         # strengths as real requests, including LTX-2.3 and HQ overrides.
         self.apply_request_extra(req)
+
+    def _align_resolution(self, server_args: Any) -> None:
+        from sglang.multimodal_gen.runtime.server_args import (
+            is_ltx2_two_stage_pipeline_name,
+        )
+
+        # LTX2HalveResolutionStage rejects other sizes; one-stage has no such grid.
+        if not is_ltx2_two_stage_pipeline_name(
+            getattr(server_args, "pipeline_class_name", None)
+        ):
+            return
+        if not isinstance(self.width, int) or not isinstance(self.height, int):
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        vae_scale_factor = getattr(server_args.pipeline_config, "vae_scale_factor", 32)
+        m = max(64, int(vae_scale_factor) * 2)
+        requested_size = (self.width, self.height)
+        self.width = max(m, self.width // m * m)
+        self.height = max(m, self.height // m * m)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "LTX-2 two-stage requires dimensions divisible by %s; adjusted "
+                "requested resolution from %sx%s to %sx%s",
+                m,
+                *requested_size,
+                self.width,
+                self.height,
+            )
 
 
 @dataclasses.dataclass
