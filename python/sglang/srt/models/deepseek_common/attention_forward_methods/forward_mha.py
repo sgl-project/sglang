@@ -72,7 +72,7 @@ def resolve_attn_backend(forward_batch: ForwardBatch):
 def use_dense_prefix_kv(backend) -> bool:
     """Whether the backend substitutes dense K/V for prefix chunks."""
     return (
-        getattr(backend, "pack_prefix_chunk_kv", None) is not None
+        backend.supports_prefix_chunk_kv_pack
         and getattr(backend, "pack_all_prefix_chunks", False)
         and not get_parallel().dcp_enabled
     )
@@ -489,7 +489,11 @@ class DeepseekMHAForwardMixin:
         from sglang.srt.layers.attention.merge_state import merge_state
 
         backend = resolve_attn_backend(forward_batch)
-        pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
+        pack_fn = (
+            backend.pack_prefix_chunk_kv
+            if backend.supports_prefix_chunk_kv_pack
+            else None
+        )
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
         get_mla_kv_buffer = (
             self._get_mla_kv_buffer_rocm if _is_hip else self._get_mla_kv_buffer

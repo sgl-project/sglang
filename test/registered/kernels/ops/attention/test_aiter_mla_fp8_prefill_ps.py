@@ -1,0 +1,293 @@
+"""Numerics of the aiter asm fp8 MLA prefill (PS metadata + mla_reduce_v1) on gfx950."""
+
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_amd_ci(est_time=180, suite="base-b-test-1-gpu-small-amd-mi35x")
+
+_RUNNABLE = is_hip() and torch.cuda.is_available()
+if _RUNNABLE:
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+    from sglang.srt.layers.attention.aiter_backend import (
+        AiterAttnBackend,
+        ForwardMetadata,
+        _aiter_has_mla_reduce_v1_instance,
+    )
+    from sglang.srt.layers.attention.merge_state import merge_state
+    from sglang.srt.utils import is_gfx95_supported
+
+    _RUNNABLE = is_gfx95_supported()
+
+QK_NOPE, QK_ROPE, V_HEAD = 128, 64, 128
+SCALE = (QK_NOPE + QK_ROPE) ** -0.5
+# Kimi-K3 at TP8: runs natively when the compiled mla_reduce_v1 has 12 heads, else pads to 16.
+KIMI_K3_TP8_HEADS = 12
+
+
+def _backend(num_heads, q_lens, extended=True):
+    backend = object.__new__(AiterAttnBackend)
+    backend.device = torch.device("cuda")
+    backend.input_dtype = torch.bfloat16
+    backend._arange_buf = None
+    backend.use_fp8_prefill_attn = True
+    backend.mla_fp8_prefill_extended = extended
+    backend.fp8_prefill_num_head = backend.check_fp8_prefill_num_head(
+        num_head=num_heads, num_kv_head=num_heads, v_head_dim=V_HEAD, ask_aiter=extended
+    )
+    backend.fp8_prefill_num_kv_head = backend.fp8_prefill_num_head
+    qo_indptr = torch.zeros(len(q_lens) + 1, dtype=torch.int32)
+    qo_indptr[1:] = torch.tensor(q_lens).cumsum(0)
+    backend.forward_metadata = ForwardMetadata(
+        kv_indptr=None,
+        kv_indices=None,
+        qo_indptr=qo_indptr.cuda(),
+        kv_last_page_len=None,
+        max_q_len=max(q_lens),
+        max_kv_len=None,
+    )
+    return backend
+
+
+def _backend_with_probe(num_heads, q_lens, *, supported, extended=True):
+    _aiter_has_mla_reduce_v1_instance.cache_clear()
+    try:
+        with mock.patch(
+            "aiter.ops.attention.mla_reduce_v1_supports",
+            return_value=supported,
+            create=True,
+        ):
+            return _backend(num_heads, q_lens, extended=extended)
+    finally:
+        _aiter_has_mla_reduce_v1_instance.cache_clear()
+
+
+def _layer(num_heads):
+    return SimpleNamespace(tp_q_head_num=num_heads, v_head_dim=V_HEAD, scaling=SCALE)
+
+
+def _qkv(num_heads, q_lens, kv_lens):
+    q = torch.randn(sum(q_lens), num_heads, QK_NOPE + QK_ROPE, device="cuda")
+    k_nope = torch.randn(sum(kv_lens), num_heads, QK_NOPE, device="cuda")
+    k_pe = torch.randn(sum(kv_lens), 1, QK_ROPE, device="cuda")
+    v = torch.randn(sum(kv_lens), num_heads, V_HEAD, device="cuda")
+    return [t.to(torch.bfloat16) for t in (q, k_nope, k_pe, v)]
+
+
+def _cat_k(k_nope, k_pe):
+    return torch.cat([k_nope, k_pe.expand(-1, k_nope.shape[1], -1)], dim=-1)
+
+
+def _reference(q, k, v, q_lens, kv_lens, fp8_inputs=True):
+    # fp32 non-causal attention per request over the (fp8-rounded) inputs.
+    in_dtype = fp8_dtype if fp8_inputs else q.dtype
+    q, k, v = (t.to(in_dtype).float() for t in (q, k, v))
+    out = torch.zeros(q.shape[0], q.shape[1], V_HEAD, device=q.device)
+    lse = torch.full(q.shape[:2], float("-inf"), device=q.device)
+    q_off = kv_off = 0
+    for q_len, kv_len in zip(q_lens, kv_lens):
+        if kv_len:
+            qs = slice(q_off, q_off + q_len)
+            ks = slice(kv_off, kv_off + kv_len)
+            scores = torch.einsum("qhd,khd->hqk", q[qs], k[ks]) * SCALE
+            lse[qs] = scores.logsumexp(-1).transpose(0, 1)
+            out[qs] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v[ks])
+        q_off += q_len
+        kv_off += kv_len
+    return out, lse
+
+
+@unittest.skipUnless(_RUNNABLE, "requires gfx950 with AITER")
+class TestAiterMlaFp8PrefillPs(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+
+    def _assert_matches(self, out, lse, ref_out, ref_lse, rows, rtol=0.03):
+        err = (out[rows].float() - ref_out[rows]).abs().max().item()
+        self.assertLess(err, rtol * ref_out[rows].abs().max().item())
+        lse_err = (lse[rows] - ref_lse[rows]).abs().max().item()
+        self.assertLess(lse_err, 1e-2)
+
+    def test_head_count_follows_the_aiter_probe(self):
+        for supported, extended, expected in (
+            (True, True, KIMI_K3_TP8_HEADS),
+            (False, True, 16),
+            (True, False, 16),
+        ):
+            with self.subTest(supported=supported, extended=extended):
+                backend = _backend_with_probe(
+                    KIMI_K3_TP8_HEADS, [1], supported=supported, extended=extended
+                )
+                self.assertEqual(backend.fp8_prefill_num_head, expected)
+
+    def test_prefill_heads_match_reference(self):
+        """Heads without an mla_reduce_v1 instance pad up to one;
+        padding must not perturb the real heads' output or LSE, nor reach a missing instance."""
+        q_lens, kv_lens = [300, 77], [517, 1200]
+        # Which 12/48/96-head (Kimi-K3 at TP8/TP2/TP1) path runs on the extended paths
+        # depends on the installed AITER, so also force the padded one. Without the
+        # extension the table alone decides and repeat-padding fills (other models).
+        for num_heads, pad, extended in (
+            (KIMI_K3_TP8_HEADS, False, True),
+            (KIMI_K3_TP8_HEADS, True, True),
+            (KIMI_K3_TP8_HEADS, True, False),
+            (16, False, True),
+            (48, False, True),
+            (96, False, True),
+        ):
+            with self.subTest(num_heads=num_heads, pad=pad, extended=extended):
+                if pad:
+                    backend = _backend_with_probe(
+                        num_heads, q_lens, supported=False, extended=extended
+                    )
+                    self.assertEqual(backend.fp8_prefill_num_head, 16)
+                else:
+                    backend = _backend(num_heads, q_lens)
+                    if (
+                        _aiter_has_mla_reduce_v1_instance(
+                            num_head=num_heads, head_dim=V_HEAD
+                        )
+                        or num_heads == 16
+                    ):
+                        self.assertEqual(backend.fp8_prefill_num_head, num_heads)
+                    else:
+                        self.assertGreater(backend.fp8_prefill_num_head, num_heads)
+                kv_indptr = torch.zeros(len(kv_lens) + 1, dtype=torch.int32)
+                kv_indptr[1:] = torch.tensor(kv_lens).cumsum(0)
+                ps = backend._build_prefill_ps_metadata(
+                    qo_indptr=backend.forward_metadata.qo_indptr,
+                    kv_indptr=kv_indptr.cuda(),
+                    kv_lens_cpu=torch.tensor(kv_lens, dtype=torch.int32),
+                    num_kv_tokens=sum(kv_lens),
+                    max_q_len=max(q_lens),
+                    is_causal=False,
+                    need_lse=True,
+                )
+                q, k_nope, k_pe, v = _qkv(num_heads, q_lens, kv_lens)
+                k = _cat_k(k_nope, k_pe)
+                out, lse = backend._mla_fp8_prefill_attn_ps(
+                    q, k, v, _layer(num_heads), ps
+                )
+                self.assertEqual(out.shape, (sum(q_lens), num_heads, V_HEAD))
+                self.assertTrue(lse.is_contiguous())
+                ref_out, ref_lse = _reference(q, k, v, q_lens, kv_lens)
+                self._assert_matches(out, lse, ref_out, ref_lse, slice(None))
+
+    def test_prefix_chunk_with_keyless_requests(self):
+        """Prefix chunk where some requests have no keys: their rows leave with LSE -inf,
+        so merge_state keeps the other state; the rest must match the reference."""
+        q_lens = [130, 40, 260]
+        num_heads = KIMI_K3_TP8_HEADS
+        # Middle request keyless (gathered rows) and leading one keyless (slice).
+        for chunk_lens in ([700, 0, 333], [0, 515, 260]):
+            with self.subTest(chunk_lens=chunk_lens):
+                backend = _backend(num_heads, q_lens)
+                chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
+                cu = torch.zeros(1, len(chunk_lens) + 1, dtype=torch.int32)
+                cu[:, 1:] = chunk_lens_t.cumsum(1)
+                batch = SimpleNamespace(
+                    extend_seq_lens_cpu=q_lens,
+                    num_prefix_chunks=1,
+                    prefix_chunk_idx=0,
+                    prefix_chunk_seq_lens_cpu=chunk_lens_t,
+                    prefix_chunk_has_zero_kv=[True],
+                    prefix_chunk_cu_seq_lens=cu.cuda(),
+                    prefix_chunk_num_tokens=[sum(chunk_lens)],
+                )
+                backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
+                q, k_nope, k_pe, v = _qkv(num_heads, q_lens, chunk_lens)
+                layer = _layer(num_heads)
+
+                k_fp8, v_fp8 = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
+                self.assertEqual((k_fp8.dtype, v_fp8.dtype), (fp8_dtype, fp8_dtype))
+                out, lse = backend._forward_extend_prefix_chunk(
+                    q, k_fp8, v_fp8, layer, batch
+                )
+                # Packing to fp8 up front must equal the kernel path's own unit-scale cast.
+                out_bf16_kv, lse_bf16_kv = backend._forward_extend_prefix_chunk(
+                    q, _cat_k(k_nope, k_pe), v, layer, batch
+                )
+                torch.testing.assert_close(out, out_bf16_kv, rtol=0, atol=0)
+                torch.testing.assert_close(lse, lse_bf16_kv, rtol=0, atol=0)
+
+                ref_out, ref_lse = _reference(
+                    q, _cat_k(k_nope, k_pe), v, q_lens, chunk_lens
+                )
+                keyless = torch.repeat_interleave(
+                    torch.tensor([n == 0 for n in chunk_lens]), torch.tensor(q_lens)
+                ).cuda()
+                self._assert_matches(out, lse, ref_out, ref_lse, ~keyless)
+                self.assertTrue(torch.isneginf(lse[keyless]).all())
+
+                other_out = torch.randn_like(out)
+                other_lse = torch.randn_like(lse)
+                merged, _ = merge_state(out, lse, other_out, other_lse)
+                self.assertFalse(merged.isnan().any())
+                torch.testing.assert_close(merged[keyless], other_out[keyless])
+
+    def test_all_keyless_prefix_chunk_packs_bf16(self):
+        """A chunk without PS metadata runs on bf16 varlen, so its K/V must not be packed to fp8."""
+        q_lens, chunk_lens = [130, 40, 260], [0, 0, 0]
+        backend = _backend(KIMI_K3_TP8_HEADS, q_lens)
+        chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=q_lens,
+            num_prefix_chunks=1,
+            prefix_chunk_idx=0,
+            prefix_chunk_seq_lens_cpu=chunk_lens_t,
+            prefix_chunk_has_zero_kv=[True],
+            prefix_chunk_cu_seq_lens=torch.zeros(
+                1, len(chunk_lens) + 1, dtype=torch.int32
+            ).cuda(),
+            prefix_chunk_num_tokens=[0],
+        )
+        backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
+        self.assertEqual(backend.forward_metadata.chunked_prefix_ps_metadatas, [None])
+
+        _, k_nope, k_pe, v = _qkv(KIMI_K3_TP8_HEADS, q_lens, [4, 0, 0])
+        k, packed_v = backend.pack_prefix_chunk_kv(k_nope, k_pe, v)
+        self.assertEqual((k.dtype, packed_v.dtype), (torch.bfloat16, torch.bfloat16))
+        self.assertTrue(torch.equal(k, _cat_k(k_nope, k_pe)))
+
+    def test_keyless_prefix_chunk_stays_bf16_without_the_extension(self):
+        """Keyless prefix chunks run on the asm fp8 prefill only where a model declares
+        mla_fp8_prefill_extended; every other MLA model keeps such a chunk on bf16 varlen."""
+        q_lens, chunk_lens = [130, 40, 260], [700, 0, 333]
+        num_heads = 16
+        backend = _backend(num_heads, q_lens, extended=False)
+        chunk_lens_t = torch.tensor([chunk_lens], dtype=torch.int32)
+        cu = torch.zeros(1, len(chunk_lens) + 1, dtype=torch.int32)
+        cu[:, 1:] = chunk_lens_t.cumsum(1)
+        batch = SimpleNamespace(
+            extend_seq_lens_cpu=q_lens,
+            num_prefix_chunks=1,
+            prefix_chunk_idx=0,
+            prefix_chunk_seq_lens_cpu=chunk_lens_t,
+            prefix_chunk_has_zero_kv=[True],
+            prefix_chunk_cu_seq_lens=cu.cuda(),
+            prefix_chunk_max_seq_lens=[max(chunk_lens)],
+        )
+        backend.init_mha_chunk_metadata(batch, disable_flashinfer_ragged=True)
+        self.assertEqual(backend.forward_metadata.chunked_prefix_ps_metadatas, [None])
+
+        q, k_nope, k_pe, v = _qkv(num_heads, q_lens, chunk_lens)
+        k = _cat_k(k_nope, k_pe)
+        out, lse = backend._forward_extend_prefix_chunk(
+            q, k, v, _layer(num_heads), batch
+        )
+        ref_out, ref_lse = _reference(q, k, v, q_lens, chunk_lens, fp8_inputs=False)
+        keyless = torch.repeat_interleave(
+            torch.tensor([n == 0 for n in chunk_lens]), torch.tensor(q_lens)
+        ).cuda()
+        # fp8 inputs miss this bound by several times on random normal inputs.
+        self._assert_matches(out, lse, ref_out, ref_lse, ~keyless, rtol=0.01)
+
+
+if __name__ == "__main__":
+    unittest.main()
