@@ -131,6 +131,7 @@ from sglang.srt.hf_transformers import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.layers.attention.mis_swa_guard import validate_swa_mis_delimiters
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
@@ -1301,6 +1302,15 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        attn_backend = getattr(
+            getattr(self.tp_worker, "model_runner", None), "attn_backend", None
+        )
+        self.min_positive_swa_window = (
+            attn_backend.resolve_min_positive_swa_window()
+            if attn_backend is not None
+            and hasattr(attn_backend, "resolve_min_positive_swa_window")
+            else None
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -2102,6 +2112,7 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "min_positive_swa_window": getattr(self, "min_positive_swa_window", None),
             "startup_time": self.startup_time,
         }
 
@@ -3671,6 +3682,9 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self._abort_if_invalid_mis_swa(req=req):
+            return
+
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -3963,6 +3977,26 @@ class Scheduler(
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)
 
+    def _abort_if_invalid_mis_swa(self, *, req: Req) -> bool:
+        """Reject an --enable-mis request whose logical span exceeds SWA capacity."""
+        if not get_exec().features.enable_mis:
+            return False
+        delimiters = req.multi_item_delimiter_indices
+        window_left = getattr(self, "min_positive_swa_window", None)
+        if window_left is None or not delimiters:
+            return False
+        try:
+            validate_swa_mis_delimiters(
+                prefix_len=int(delimiters[0]),
+                delimiters=delimiters,
+                window_left=window_left,
+                raw_seq_len=len(req.origin_input_ids),
+            )
+        except ValueError as exc:
+            self._reject_bad_request(req, str(exc))
+            return True
+        return False
+
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the
         priority scheduling mode."""
@@ -4188,6 +4222,9 @@ class Scheduler(
                 )
                 self._add_request_to_queue(req)
                 return
+
+        if self._abort_if_invalid_mis_swa(req=req):
+            return
 
         # Validate prompts length
         error_msg = validate_input_length(

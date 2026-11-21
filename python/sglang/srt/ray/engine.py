@@ -31,6 +31,7 @@ from sglang.srt.entrypoints.engine import (
     _calculate_rank_ranges,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mis_swa_guard import merge_scheduler_swa_windows
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.runtime_context import (
@@ -393,6 +394,7 @@ class RayEngine(Engine):
                     [actor.get_info.remote() for actor in scheduler_actors]
                 )
                 merge_scheduler_info_layouts(scheduler_infos)
+                merge_scheduler_swa_windows(infos=scheduler_infos)
             except ray.exceptions.RayActorError as e:
                 for actor in scheduler_actors:
                     try:

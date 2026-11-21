@@ -752,6 +752,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
+        self.min_positive_swa_window = None  # Will be set later in engine.py
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens()

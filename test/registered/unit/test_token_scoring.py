@@ -1,7 +1,10 @@
 import asyncio
 import json
 import unittest
+from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 from tokenizers import Tokenizer
@@ -10,13 +13,19 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 from transformers import PreTrainedTokenizerFast
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.openai.protocol import ScoringRequest
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.layers.attention.mis_swa_guard import merge_scheduler_swa_windows
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.runtime_context import publish, restore_context, snapshot_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -260,6 +269,224 @@ class TestSyncTokenScoring(unittest.TestCase):
         finally:
             engine.loop.run_until_complete(engine.loop.shutdown_asyncgens())
             engine.loop.close()
+
+
+class TestSWAMultiItemScoringIngressGuard(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    def _make_intake_scheduler(
+        self, *, min_positive_swa_window: int | None
+    ) -> Scheduler:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler.validate_dllm_request = lambda req: None
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler._record_kv_event_lora_name = MagicMock()
+        scheduler.spec_algorithm = SimpleNamespace(
+            is_dflash_family=lambda: False,
+            is_uno=lambda: False,
+            is_none=lambda: True,
+        )
+        scheduler.init_req_max_new_tokens = MagicMock()
+        scheduler.max_req_input_len = 2048
+        scheduler.invariant_checker = MagicMock()
+        scheduler.grammar_manager = SimpleNamespace(
+            process_req_with_grammar=lambda req: False
+        )
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.output_streamer = MagicMock()
+        scheduler.tree_cache = MagicMock(cache_controller=None)
+        scheduler.beam_coordinator = MagicMock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.send_abort_output = MagicMock()
+        scheduler.min_positive_swa_window = min_positive_swa_window
+        scheduler.init_request_retirer()
+        return scheduler
+
+    def _make_tokenized_intake_req(
+        self, *, input_ids: list[int], delimiters: list[int]
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            rid="swa-intake-req",
+            input_text="",
+            input_ids=array("q", input_ids),
+            sampling_params=SamplingParams(max_new_tokens=0),
+            mm_inputs=None,
+            session_params=None,
+            session_id=None,
+            input_embeds=None,
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            return_sampling_mask=False,
+            sampling_logprobs_mode="top_k",
+            return_flat_raw_top_logprobs=False,
+            stream=False,
+            lora_id=None,
+            lora_name=None,
+            positional_embed_overrides=None,
+            token_type_ids=None,
+            custom_logit_processor=None,
+            require_reasoning=False,
+            return_hidden_states=False,
+            return_routed_experts=False,
+            routed_experts_start_len=0,
+            return_indexer_topk=False,
+            bootstrap_host=None,
+            bootstrap_port=1,
+            bootstrap_room=None,
+            routed_dp_rank=None,
+            disagg_prefill_dp_rank=None,
+            kv_hints=None,
+            priority=None,
+            routing_key=None,
+            extra_key=None,
+            cache_salt=None,
+            http_worker_ipc=None,
+            time_stats=None,
+            token_indices_to_pool=None,
+            pp_prefetch_ticketed=False,
+            dimensions=None,
+            encoding_format=None,
+            return_pooled_hidden_states=False,
+            decision_layout=None,
+            multi_item_delimiter_indices=delimiters,
+        )
+
+    def test_ingress_guard_boundary_and_same_instance_recovery(self):
+        manager = ScoringManager(enable_mis=True)
+        manager.min_positive_swa_window = 31
+
+        combined, delims = manager._build_multi_item_token_sequence(
+            [1] * 31, [[2]], 9999
+        )
+        self.assertEqual(len(combined), 34)
+        self.assertEqual(delims, [31, 33])
+
+        with self.assertRaises(ValueError):
+            manager._build_multi_item_token_sequence([1] * 31, [[2, 3]], 9999)
+        with self.assertRaises(ValueError):
+            manager._build_multi_item_token_sequence([1] * 32, [[2]], 9999)
+
+        handler = OpenAIServingScore(manager)
+        bad_req = ScoringRequest(
+            query=[4] * 32, items=[[5]], label_token_ids=[1, 3], apply_softmax=False
+        )
+        bad_resp = asyncio.run(
+            handler._handle_non_streaming_request(bad_req, bad_req, None)
+        )
+        self.assertEqual(bad_resp.status_code, 400)
+        self.assertEqual(json.loads(bad_resp.body)["type"], "BadRequestError")
+        self.assertEqual(manager.requests, [])
+
+        ok_req = ScoringRequest(
+            query=[4] * 31, items=[[5]], label_token_ids=[1, 3], apply_softmax=False
+        )
+        ok_resp = asyncio.run(
+            handler._handle_non_streaming_request(ok_req, ok_req, None)
+        )
+        self.assertEqual(ok_resp.status_code, 200)
+        self.assertEqual(len(manager.requests), 1)
+
+        engine = EngineScoreMixin()
+        engine.tokenizer_manager = manager
+        engine.loop = asyncio.new_event_loop()
+        try:
+            with self.assertRaises(ValueError):
+                engine.score(
+                    query=[4] * 31,
+                    items=[[5, 6]],
+                    label_token_ids=[1, 3],
+                    apply_softmax=False,
+                )
+            self.assertEqual(len(manager.requests), 1)
+
+            recovered = engine.score(
+                query=[4] * 31,
+                items=[[5]],
+                label_token_ids=[1, 3],
+                apply_softmax=False,
+            )
+            self.assertEqual(len(recovered.scores), 1)
+            self.assertEqual(len(manager.requests), 2)
+        finally:
+            engine.loop.run_until_complete(engine.loop.shutdown_asyncgens())
+            engine.loop.close()
+
+        non_mis_manager = ScoringManager(enable_mis=False)
+        non_mis_manager.min_positive_swa_window = 31
+        non_mis_res = asyncio.run(
+            non_mis_manager.score_request(
+                query=[4] * 64,
+                items=[[5] * 8, [6] * 8],
+                label_token_ids=[1, 3],
+                apply_softmax=False,
+            )
+        )
+        self.assertEqual(len(non_mis_res.scores), 2)
+
+    def test_scheduler_retires_overflow_without_queuing_and_respects_enable_mis(self):
+        for method_name in ("handle_generate_request", "handle_embedding_request"):
+            with self.subTest(entrypoint=method_name, case="overflow_rejected"):
+                publish(ServerArgs(model_path="dummy", enable_mis=True), role="test")
+                scheduler = self._make_intake_scheduler(min_positive_swa_window=31)
+                bad_req = self._make_tokenized_intake_req(
+                    input_ids=list(range(35)), delimiters=[32, 34]
+                )
+                getattr(scheduler, method_name)(bad_req)
+                scheduler._add_request_to_queue.assert_not_called()
+                scheduler.output_streamer.stream_output.assert_called_once()
+                streamed_reqs = scheduler.output_streamer.stream_output.call_args.args[
+                    0
+                ]
+                self.assertEqual(len(streamed_reqs), 1)
+                retired_req = streamed_reqs[0]
+                self.assertTrue(retired_req.finished())
+                self.assertEqual(
+                    retired_req.finished_reason.status_code, HTTPStatus.BAD_REQUEST
+                )
+                self.assertIn("window_left", retired_req.finished_reason.message)
+                scheduler.tree_cache.finish.assert_called_once()
+                self.assertEqual(
+                    scheduler.tree_cache.finish.call_args.args[1],
+                    CacheRequestOutcome.ABORT,
+                )
+
+            with self.subTest(entrypoint=method_name, case="valid_boundary_queued"):
+                publish(ServerArgs(model_path="dummy", enable_mis=True), role="test")
+                scheduler = self._make_intake_scheduler(min_positive_swa_window=31)
+                ok_req = self._make_tokenized_intake_req(
+                    input_ids=list(range(34)), delimiters=[31, 33]
+                )
+                getattr(scheduler, method_name)(ok_req)
+                scheduler._add_request_to_queue.assert_called_once()
+                scheduler.output_streamer.stream_output.assert_not_called()
+
+            with self.subTest(entrypoint=method_name, case="enable_mis_false_ignored"):
+                publish(ServerArgs(model_path="dummy", enable_mis=False), role="test")
+                scheduler = self._make_intake_scheduler(min_positive_swa_window=31)
+                ignored_req = self._make_tokenized_intake_req(
+                    input_ids=list(range(35)), delimiters=[32, 34]
+                )
+                getattr(scheduler, method_name)(ignored_req)
+                scheduler._add_request_to_queue.assert_called_once()
+                scheduler.output_streamer.stream_output.assert_not_called()
+
+        infos = [
+            {"min_positive_swa_window": None},
+            {"min_positive_swa_window": 32},
+            {"min_positive_swa_window": 31},
+        ]
+        self.assertEqual(merge_scheduler_swa_windows(infos=infos), 31)
+        self.assertTrue(all(info["min_positive_swa_window"] == 31 for info in infos))
 
 
 if __name__ == "__main__":

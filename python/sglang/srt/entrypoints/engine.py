@@ -68,6 +68,7 @@ from sglang.srt.entrypoints.server_utils import (
 )
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mis_swa_guard import merge_scheduler_swa_windows
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -1023,6 +1024,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             # Each PP stage reports only its own L3 pools; give every info the merged layout.
             merge_scheduler_info_layouts(infos)
+            merge_scheduler_swa_windows(infos=infos)
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:
@@ -1426,6 +1428,9 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
                 0
             ]["max_req_input_len"]
+            tokenizer_manager.min_positive_swa_window = (
+                scheduler_init_result.scheduler_infos[0].get("min_positive_swa_window")
+            )
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
@@ -1468,6 +1473,9 @@ class Engine(EngineScoreMixin, EngineBase):
             TokenizerManagerClass=get_tokenizer_worker_class(server_args),
         )
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+        tokenizer_manager.min_positive_swa_window = scheduler_info.get(
+            "min_positive_swa_window"
+        )
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager
 

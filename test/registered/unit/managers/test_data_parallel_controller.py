@@ -299,6 +299,30 @@ class TestInitInfoReply(CustomTestCase):
         )
         self.assertNotIn("router_l3_layout", self._reply(info, info))
 
+    def test_min_positive_swa_window_aggregates_strictest_across_ranks(self):
+        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        self.assertIsNone(self._reply(info, info)["min_positive_swa_window"])
+        self.assertIsNone(
+            self._reply({**info, "min_positive_swa_window": -1}, info)[
+                "min_positive_swa_window"
+            ]
+        )
+        self.assertEqual(
+            self._reply(
+                {**info, "min_positive_swa_window": None},
+                {**info, "min_positive_swa_window": 63},
+                {**info, "min_positive_swa_window": 31},
+            )["min_positive_swa_window"],
+            31,
+        )
+        self.assertEqual(
+            self._reply(
+                {**info, "min_positive_swa_window": -1},
+                {**info, "min_positive_swa_window": 32},
+            )["min_positive_swa_window"],
+            32,
+        )
+
 
 class TestDPBudgetUpdateBudget(CustomTestCase):
     def test_maps_running_plus_waiting_to_total_requests(self):

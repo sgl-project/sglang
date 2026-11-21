@@ -36,6 +36,7 @@ from sglang.srt.elastic_ep.topology import (
     validate_matching_attention_topology,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mis_swa_guard import aggregate_min_positive_swa_window
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -814,6 +815,12 @@ class DataParallelController:
             self._scheduler_init_infos.extend(infos)
             self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
             self.max_req_input_len = infos[0]["max_req_input_len"]
+            self.min_positive_swa_window = aggregate_min_positive_swa_window(
+                windows=(
+                    info.get("min_positive_swa_window")
+                    for info in self._scheduler_init_infos
+                )
+            )
             self.startup_time = aggregate_scheduler_startup_times(
                 info.get("startup_time") for info in self._scheduler_init_infos
             )
@@ -824,6 +831,9 @@ class DataParallelController:
             init_info = {
                 "max_total_num_tokens": self.max_total_num_tokens,
                 "max_req_input_len": self.max_req_input_len,
+                "min_positive_swa_window": getattr(
+                    self, "min_positive_swa_window", None
+                ),
                 "startup_time": self.startup_time,
             }
             layout = merge_l3_layouts(
