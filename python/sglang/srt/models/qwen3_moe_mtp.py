@@ -120,6 +120,9 @@ class Qwen3MoeForCausalLMMTP(Qwen3MoeForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=True)
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
