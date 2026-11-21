@@ -3,6 +3,7 @@
 import json
 
 from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.environ import envs
 
 _RSV_ARCHITECTURES = {
     "BailingMoELinearForCausalLM",
@@ -84,6 +85,7 @@ def resolve_boundary_reduction(view):
                 trust_remote_code=view.trust_remote_code,
                 revision=view.speculative_draft_model_revision,
                 model_override_args=json.loads(view.json_model_override_args),
+                use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
                 **kwargs,
             )
             draft = model_boundary_reduction(config)

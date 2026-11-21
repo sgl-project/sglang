@@ -27,3 +27,21 @@ docker run --gpus all \
 ```
 
 Note that modelscope uses a different cache directory than huggingface. You may need to set it manually to avoid running out of disk space.
+
+## Select the draft model source
+
+`SGLANG_DRAFT_USE_MODELSCOPE` overrides the source for speculative draft models
+and their token maps. When unset, it inherits `SGLANG_USE_MODELSCOPE`.
+The tokenizer follows the main model's source; existing local paths are used directly.
+
+| `SGLANG_USE_MODELSCOPE` | `SGLANG_DRAFT_USE_MODELSCOPE` | Main model | Draft model |
+| --- | --- | --- | --- |
+| `0` | unset | Hugging Face | Hugging Face |
+| `1` | unset | ModelScope | ModelScope |
+| `0` | `1` | Hugging Face | ModelScope |
+| `1` | `0` | ModelScope | Hugging Face |
+
+Use ordinary repository IDs in `--model-path` and `--speculative-draft-model-path`.
+Hugging Face models keep the existing on-demand download behavior. ModelScope
+models use the existing snapshot download behavior. A draft that reuses the
+main model's local checkpoint continues to use that checkpoint.

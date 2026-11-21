@@ -65,6 +65,7 @@ def draft_uses_compressed_kv_attention() -> bool:
         revision=get_spec().speculative_draft_model_revision,
         model_override_args=json.loads(get_model().json_model_override_args),
         model_config_parser=get_model().model_config_parser,
+        use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
     )
     return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
 
@@ -173,6 +174,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
         trust_remote_code=resolving.trust_remote_code,
         revision=resolving.speculative_draft_model_revision,
         model_override_args=json.loads(resolving.json_model_override_args),
+        use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
     )
     if _cfg_get(draft_hf_config, "architectures", []) == ["DSparkMiniMaxDraftModel"]:
         from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark

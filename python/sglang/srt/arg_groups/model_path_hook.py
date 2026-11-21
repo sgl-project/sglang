@@ -82,7 +82,12 @@ def resolve_hf_gguf_model_path(server_args: Any):
             )
 
 
-def handle_modelscope_paths(server_args: Any):
+def handle_modelscope_paths(
+    server_args: Any,
+    *,
+    use_modelscope: bool = True,
+    draft_use_modelscope: Optional[bool] = None,
+):
     """Resolve model / tokenizer / speculative-draft paths from the local
     ModelScope cache when possible, falling back to snapshot_download
     for any path that is not already present on disk.
@@ -135,21 +140,24 @@ def handle_modelscope_paths(server_args: Any):
             **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
         )
 
-    declare_resolution(
-        server_args,
-        "_handle_modelscope_paths",
-        model_path=_resolve_or_download(cfg.model_path, revision=cfg.revision),
-    )
-    declare_resolution(
-        server_args,
-        "_handle_modelscope_paths",
-        tokenizer_path=_resolve_or_download(
-            cfg.tokenizer_path,
-            ignore_patterns=["*.bin", "*.safetensors"],
-            revision=cfg.revision,
-        ),
-    )
-    if cfg.speculative_draft_model_path:
+    if use_modelscope:
+        declare_resolution(
+            server_args,
+            "_handle_modelscope_paths",
+            model_path=_resolve_or_download(cfg.model_path, revision=cfg.revision),
+        )
+        declare_resolution(
+            server_args,
+            "_handle_modelscope_paths",
+            tokenizer_path=_resolve_or_download(
+                cfg.tokenizer_path,
+                ignore_patterns=["*.bin", "*.safetensors"],
+                revision=cfg.revision,
+            ),
+        )
+    if draft_use_modelscope is None:
+        draft_use_modelscope = use_modelscope
+    if draft_use_modelscope and cfg.speculative_draft_model_path:
         declare_resolution(
             server_args,
             "_handle_modelscope_paths",
