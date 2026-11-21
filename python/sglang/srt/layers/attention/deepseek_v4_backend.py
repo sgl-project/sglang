@@ -653,9 +653,11 @@ class DSV4AttnMetadata:
             )
         self.trtllm_swa_lens = _tile_padded(
             SWA_WINDOW,
-            self.swa_topk_lengths.clamp_min(SWA_WINDOW)
-            if swa_width > SWA_WINDOW
-            else None,
+            (
+                self.swa_topk_lengths.clamp_min(SWA_WINDOW)
+                if swa_width > SWA_WINDOW
+                else None
+            ),
         )
         for ratio in self.low_ratios:
             lengths = self.sparse_topk_lengths(ratio)
@@ -1973,6 +1975,10 @@ class DeepseekV4AttnBackend(
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
+        # A graph batch pads request tensors, but retains the live CPU lengths.
+        # CP's eager tail must contain only those live requests.
+        num_reqs = len(extend_lens_cpu)
+        seq_lens_cpu = seq_lens_cpu[:num_reqs]
         device = forward_batch.out_cache_loc.device
         token_indices, tail_lens_cpu, swa_replay_start = late_layer_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
@@ -2059,8 +2065,8 @@ class DeepseekV4AttnBackend(
                 if max_seq_len_override is not None
                 else int(seq_lens_cpu.max().item())
             ),
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            req_pool_indices=forward_batch.req_pool_indices[:num_reqs],
+            seq_lens=forward_batch.seq_lens[:num_reqs].to(torch.int32),
             seq_lens_cpu=seq_lens_cpu.tolist(),
             out_cache_loc=out_cache_loc,
             num_tokens=sum(tail_lens_cpu),
@@ -2084,7 +2090,7 @@ class DeepseekV4AttnBackend(
             # The graph build keeps the bucket-sized request/position rows the
             # prefill-graph metadata init published; eager uses the exact rows.
             metadata.low_ratio_req_indices = torch.repeat_interleave(
-                forward_batch.req_pool_indices.to(torch.int64),
+                forward_batch.req_pool_indices[:num_reqs].to(torch.int64),
                 tail_lens.to(torch.int64),
                 output_size=sum(tail_lens_cpu),
             )
@@ -2188,7 +2194,7 @@ class DeepseekV4AttnBackend(
             ]
         )
         tail_request_ids = torch.repeat_interleave(
-            torch.arange(forward_batch.batch_size, device=device),
+            torch.arange(tail_lens.numel(), device=device),
             tail_lens.to(torch.int64),
             output_size=total,
         )
@@ -2202,7 +2208,7 @@ class DeepseekV4AttnBackend(
             per_rank_actual_token=[max_local] * cp_size,
             max_rank_len=[max_local] * cp_size,
             total_seq_lens=total,
-            bs=forward_batch.batch_size,
+            bs=tail_lens.numel(),
             per_rank_logical_token=counts,
             gather_index=gather_index,
             local_index=local_metadata_rows,
@@ -2212,7 +2218,7 @@ class DeepseekV4AttnBackend(
             local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
             local_positions=local_positions,
             local_lens_cpu=torch.bincount(
-                tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
+                tail_request_ids[local_tail_rows], minlength=tail_lens.numel()
             ).tolist(),
             pad_rows=pad_rows,
         )
@@ -3497,6 +3503,13 @@ class DeepseekV4AttnBackend(
         tail block size (shared by every captured shape of that size), refreshed
         in place like the full metadata, since the captured low-ratio
         compressors and indexers read its tensors by address."""
+        if is_cp_active(forward_batch):
+            # CP tail shapes and ownership change with request boundaries. The
+            # late stack runs at an eager break and writes a fixed full-shard
+            # bridge, so none of these dynamic metadata addresses are captured.
+            return self._build_late_layer_tail_metadata(
+                forward_batch, max_seq_len_override=max_seq_len
+            )
         fresh = self._build_late_layer_tail_metadata(
             forward_batch, for_prefill_graph=True, max_seq_len_override=max_seq_len
         )
@@ -4540,9 +4553,9 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                     swa_topk_lengths=swa_topk_lengths,
                     extra_k_cache=extra_k_cache,
-                    extra_indices=None
-                    if extra_indices is None
-                    else extra_indices.squeeze(1),
+                    extra_indices=(
+                        None if extra_indices is None else extra_indices.squeeze(1)
+                    ),
                     extra_topk_lengths=extra_topk_lengths,
                 )
 

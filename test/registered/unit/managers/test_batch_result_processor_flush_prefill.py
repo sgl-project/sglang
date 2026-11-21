@@ -2,6 +2,7 @@
 KV calls are queued and run in order, before free_group_end and the send. A subclass
 that sends first gets the same KV calls, in the same order and one free group."""
 
+import time
 import unittest
 from array import array
 from contextlib import ExitStack, nullcontext
@@ -20,6 +21,11 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    PrefillStats,
+    SchedulerMetricsReporter,
+)
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.kv.alloc.band import Band
@@ -27,6 +33,9 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -114,7 +123,7 @@ def _result(batch):
     )
 
 
-def _run(cls, *, hisparse=False):
+def _run(cls, *, hisparse=False, reporter=None, tail_graph=None):
     """One prefill result through ``cls``; returns the log of KV calls, free group
     and send."""
     log = []
@@ -144,6 +153,17 @@ def _run(cls, *, hisparse=False):
     )
     batch = _batch()
     result = _result(batch)
+    if reporter is not None:
+        kwargs["metrics_reporter"] = reporter
+        batch.prefill_stats = PrefillStats(
+            log_input_tokens=12,
+            log_hit_tokens=0,
+            new_token_ratio=1.0,
+            num_running_reqs=SimpleNamespace(total=0),
+            num_new_seqs=4,
+        )
+        result.can_run_cuda_graph = True
+        result.tail_cuda_graph_replayed = tail_graph
     memory = SimpleNamespace(enable_hisparse=hisparse)
     with (
         published_topology(),
@@ -165,6 +185,90 @@ def _run(cls, *, hisparse=False):
 
 SEND = "send"
 KV_CALLS = [("release", "r0", True), ("checkpoint", "r1"), ("release", "r3", False)]
+
+
+class TestTailGraphBatchStats(CustomTestCase):
+    def test_batch_result_keeps_tail_status_after_later_forwards(self):
+        """Overlap/draft work must not replace the earlier target batch's verdict."""
+        worker = TpModelWorker.__new__(TpModelWorker)
+        worker.dllm_algorithm = None
+        worker.pp_group = SimpleNamespace(is_last_rank=True)
+        worker.enable_overlap = worker.enable_spec = False
+        calls = []
+
+        def forward(batch, **kwargs):
+            if not calls:
+                batch.tail_cuda_graph_replayed = True
+            calls.append(True)
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(next_token_logits=None),
+                can_run_graph=True,
+                expert_distribution_metrics=None,
+                routed_experts_output=None,
+                indexer_topk_output=None,
+                kv_weight_version_record=None,
+            )
+
+        worker._model_runner = SimpleNamespace(forward=forward)
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=torch.arange(4),
+            seq_lens=torch.tensor([4]),
+            is_prefill_only=True,
+            batch_size=1,
+            req_pool_indices=torch.tensor([0]),
+            out_cache_loc=torch.arange(4),
+            seq_lens_sum=4,
+        )
+        with (
+            get_context().override_server_args(enable_decoder_swa_bounded_replay=True),
+            patch.object(worker, "_maybe_finalize_elastic_cuda_graph_scale"),
+        ):
+            first = worker.forward_batch_generation(None, forward_batch=batch)
+            second = worker.forward_batch_generation(None, forward_batch=batch)
+        self.assertIs(first.tail_cuda_graph_replayed, True)
+        self.assertIs(second.tail_cuda_graph_replayed, False)
+        self.assertIs(first.tail_cuda_graph_replayed, True)
+        with (
+            get_context().override_server_args(enable_decoder_swa_bounded_replay=False),
+            patch.object(worker, "_maybe_finalize_elastic_cuda_graph_scale"),
+        ):
+            third = worker.forward_batch_generation(None, forward_batch=batch)
+        self.assertIsNone(third.tail_cuda_graph_replayed)
+
+    def test_prefill_line_uses_the_processed_batch_result(self):
+        """Each batch line must retain prefix and tail verdicts independently."""
+        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.is_stats_logging_rank = True
+        reporter.current_scheduler_metrics_enabled = False
+        reporter.last_prefill_stats_tic = time.perf_counter() - 1
+        reporter.stats = SimpleNamespace()
+        reporter._graph_backend_label = "cuda graph"
+        reporter.enable_mfu_metrics = False
+        reporter.scheduler = SimpleNamespace(
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_prefill_usage_msg_parts=lambda: []
+                )
+            ),
+            forward_ct=0,
+            waiting_queue=[],
+            disaggregation_mode=None,
+            kv_events_publisher=Mock(),
+        )
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter", level="INFO"
+        ) as captured:
+            for replayed in (True, False, True, None):
+                _run(
+                    SchedulerBatchResultProcessor,
+                    reporter=reporter,
+                    tail_graph=replayed,
+                )
+        self.assertEqual(len(captured.output), 4)
+        for line, replayed in zip(captured.output, (True, False, True)):
+            self.assertIn(f"cuda graph: True, tail cuda graph: {replayed},", line)
+        self.assertNotIn("tail cuda graph:", captured.output[-1])
 
 
 class TestFlushPrefill(CustomTestCase):
