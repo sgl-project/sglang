@@ -19,7 +19,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    checkpoint_prompt_end,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -1785,6 +1789,49 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._check_branch_checkpoint_keeps_prompt_end(
             tail_len=max(1, self.cfg.page_size // 2), chunked=True
         )
+
+    @requires_swa_only
+    def test_prompt_end_checkpoint_survives_decode_and_finish(self):
+        """Checkpoint the prompt end of a request with a pending SWA branch.
+        The branching point and the prompt end must both match. Decode retirement
+        must not free the prompt-end window that the tree owns. The finish insert
+        must still publish the decoded tokens."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps, window = self.cfg.page_size, self.cfg.sliding_window_size
+        prompt = self._make_seq(1, max(4, -(-4 * window // ps)))
+        output = list(range(10**6, 10**6 + 2 * window + 1))
+        req, kv_indices = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, prompt, output
+        )
+        branching_seqlen = len(prompt) // ps // 2 * ps
+        req.swa_branching_seqlen = branching_seqlen
+        req.extend_end = len(prompt)
+
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            checkpoint_prompt_end(req, cache)
+            self.assertIsNone(req.swa_branching_seqlen)
+            self.assertEqual(req.kv.cache_protected_len, len(prompt))
+            self.assertEqual(
+                match_prefix(cache, prompt[:branching_seqlen]).device_prefix_len,
+                branching_seqlen,
+            )
+            self.assertEqual(match_prefix(cache, prompt).device_prefix_len, len(prompt))
+
+            retire_window(req, len(prompt) + len(output) - 1, cache)
+            mapping = allocator.full_to_swa_index_mapping
+            prompt_end_window = kv_indices[len(prompt) - window : len(prompt)]
+            self.assertEqual(
+                torch.count_nonzero(mapping[prompt_end_window]).item(), window
+            )
+
+            total = len(prompt) + len(output)
+            finish_req(cache, req, up_to=total)
+        self.assertEqual(match_prefix(cache, prompt).device_prefix_len, len(prompt))
+        self.assertEqual(
+            match_prefix(cache, prompt + output).device_prefix_len,
+            total // ps * ps,
+        )
+        cache.sanity_check()
 
 
 define_config_test_classes(UnifiedRadixCacheCoreSuite, globals())
