@@ -153,9 +153,11 @@ fn collapse(total: usize, mut failures: Vec<(RankId, CoreError)>) -> CoreError {
     );
     match lead {
         Some(CoreError::InvalidArgument(_)) => CoreError::InvalidArgument(message),
+        Some(CoreError::FailedPrecondition(_)) => CoreError::FailedPrecondition(message),
         Some(CoreError::Overloaded(_)) => CoreError::Overloaded(message),
         Some(CoreError::Cancelled(_)) => CoreError::Cancelled(message),
         Some(CoreError::DeadlineExceeded(_)) => CoreError::DeadlineExceeded(message),
+        Some(CoreError::Unimplemented(_)) => CoreError::Unimplemented(message),
         Some(CoreError::InvalidResponse(_)) => CoreError::InvalidResponse(message),
         Some(CoreError::RuntimeRejected {
             kind,
@@ -466,6 +468,38 @@ mod tests {
             mixed.to_string(),
             "control request failed on 3 of 3 dp ranks: dp rank 0: service unavailable; \
              dp rank 1: bad timeout; dp rank 2: boom"
+        );
+        // Mixed bare Unavailable + new message-carrying category: keep the new
+        // category and still name every failing rank. The single-rank path
+        // returns the original error unchanged.
+        let mixed_precondition = collapse(
+            2,
+            vec![
+                (0, CoreError::Unavailable),
+                (1, CoreError::FailedPrecondition("receipt expired".into())),
+            ],
+        );
+        assert_eq!(mixed_precondition.kind(), CoreErrorKind::FailedPrecondition);
+        assert_eq!(
+            mixed_precondition.to_string(),
+            "control request failed on 2 of 2 dp ranks: dp rank 0: service unavailable; \
+             dp rank 1: receipt expired"
+        );
+        let mixed_unimplemented = collapse(
+            2,
+            vec![
+                (0, CoreError::Unavailable),
+                (
+                    1,
+                    CoreError::Unimplemented("retirement not supported".into()),
+                ),
+            ],
+        );
+        assert_eq!(mixed_unimplemented.kind(), CoreErrorKind::Unimplemented);
+        assert_eq!(
+            mixed_unimplemented.to_string(),
+            "control request failed on 2 of 2 dp ranks: dp rank 0: service unavailable; \
+             dp rank 1: retirement not supported"
         );
         let rejected = collapse(
             2,

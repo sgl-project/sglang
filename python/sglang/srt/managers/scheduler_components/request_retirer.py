@@ -146,6 +146,7 @@ class RequestRetirer:
         self.send_abort_output(
             make_abort_req(req, finished_reason=reason.to_json()), req
         )
+        req.retraction_aborted = True
 
     def abandon(self, req: Req, error: Exception) -> None:
         """Take out a request whose release raised `error`, freeing nothing.

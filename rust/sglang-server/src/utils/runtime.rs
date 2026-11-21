@@ -2373,6 +2373,7 @@ mod tests {
                 let request = proto::AbortRequest {
                     rid: rid.into(),
                     abort_all,
+                    ..Default::default()
                 };
                 client.abort(request).await.expect("Abort RPC");
             }
