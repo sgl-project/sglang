@@ -279,6 +279,41 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         )
 
 
+class TestDecodeReservation(CustomTestCase):
+    def test_reserved_pages_advance_metadata_without_device_staging(self):
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        reqs = [
+            SimpleNamespace(
+                kv=ReqKvInfo(kv_committed_len=n, kv_allocated_len=cap),
+                sampling_params=SimpleNamespace(top_k=1),
+                decode_batch_idx=0,
+            )
+            for n, cap in ((32, 64), (100, 128))
+        ]
+        device = torch.device("cuda" if _HAS_CUDA else "cpu")
+        batch = SimpleNamespace(
+            reqs=reqs,
+            device=device,
+            batch_size=lambda: len(reqs),
+            maybe_evict_swa=lambda: None,
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+            tree_cache=None,
+            req_to_token_pool=None,
+            req_pool_indices=torch.arange(len(reqs), device=device),
+        )
+        info = DFlashDraftInputV2.create_idle_input(device)
+        with get_context().override_server_args(speculative_num_draft_tokens=8):
+            info.prepare_for_decode(batch)
+        self.assertIsNone(info._prepare_cur_kv_lens_gpu_buf)
+        self.assertIsNone(info._prepare_nxt_kv_lens_gpu_buf)
+        self.assertEqual(batch.seq_lens_cpu.tolist(), [32, 100])
+        self.assertEqual(info.nxt_kv_lens_cpu.tolist(), [64, 128])
+        self.assertEqual(batch.max_seq_len_host, 128)
+        self.assertEqual([r.decode_batch_idx for r in reqs], [1, 1])
+
+
 class TestFilterBatchHostIndices(CustomTestCase):
     def test_host_keep_list_matches_gpu_indices(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
