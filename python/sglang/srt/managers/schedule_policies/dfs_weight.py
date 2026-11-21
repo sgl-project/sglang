@@ -25,7 +25,6 @@ class DfsWeightRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        """Sorts the waiting queue based on a depth-first search weighting."""
         order = self.tree_cache.dfs_weight_order(
             [req.last_node for req in waiting_queue]
         )

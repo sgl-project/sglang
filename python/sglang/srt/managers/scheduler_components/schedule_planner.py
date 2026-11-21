@@ -18,7 +18,6 @@ from sglang.srt.managers.schedule_policies.bounded_lpm import BoundedLpmAdmissio
 from sglang.srt.managers.schedule_policies.cache_agnostic import (
     FcfsRanker,
     LofRanker,
-    PriorityFcfsRanker,
     RandomRanker,
     RoutingKeyRanker,
 )
@@ -66,7 +65,8 @@ WAITING_PREFIX_REFRESH_INTERVAL = 32
 
 
 class SchedulePlanner:
-    """Orders the waiting queue for admission under the configured policy."""
+    """Plans each scheduling pass: ranks the waiting queue under the configured
+    policy, matches prefixes for it, and bounds the resumed chunked request."""
 
     def __init__(
         self,
@@ -107,14 +107,18 @@ class SchedulePlanner:
                 "shortest_prefill_aging_factor requires schedule_policy=shortest-prefill-first"
             )
         self.tree_cache = tree_cache
-        priority_sign = 1 if schedule_low_priority_values_first else -1
+        priority_sign = (
+            (1 if schedule_low_priority_values_first else -1)
+            if enable_priority_scheduling
+            else None
+        )
 
-        # Owned here: the scheduler feeds it finished requests, the planner stamps
-        # first-seen steps, and the UniBoost ranker reads its gamma.
         if enable_uniboost_gamma_ada and policy_enum != SchedulePolicy.UNIBOOST:
             raise ValueError(
                 "enable_uniboost_gamma_ada requires schedule_policy=uniboost"
             )
+        # Owned here: the scheduler feeds it finished requests, the planner stamps
+        # first-seen steps, and the UniBoost ranker reads its gamma.
         self.uniboost_gamma_ada: Optional[GammaAdaController] = (
             GammaAdaController(
                 uniboost_gamma,
@@ -126,13 +130,9 @@ class SchedulePlanner:
 
         def make_ranker(p: SchedulePolicy) -> BaseRanker:
             if p == SchedulePolicy.FCFS:
-                return (
-                    PriorityFcfsRanker(priority_sign)
-                    if enable_priority_scheduling
-                    else FcfsRanker()
-                )
+                return FcfsRanker(priority_sign)
             elif p == SchedulePolicy.LOF:
-                return LofRanker(priority_sign if enable_priority_scheduling else None)
+                return LofRanker(priority_sign)
             elif p == SchedulePolicy.RANDOM:
                 return RandomRanker()
             elif p == SchedulePolicy.ROUTING_KEY:
@@ -177,7 +177,8 @@ class SchedulePlanner:
         self._fcfs_fallback = FcfsRanker()
         self._waiting_prefix_refresh_calls = 0
 
-        # It is used to find the matching prefix for in-batch prefix caching.
+        # A simulated tree that finds prefixes shared by waiting requests, for
+        # in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
     def calc_priority(
@@ -199,9 +200,9 @@ class SchedulePlanner:
         if self.bounded_lpm_active:
             self._bounded.reset_skipped()
             members, tail = self._bounded.split(waiting_queue)
-            # Keep the existing FCFS refresh cadence/cap for non-members.
-            # Touch them first so matching the current batch makes its prefixes
-            # more recent. Fast-match caches retain the existing match-anyway path.
+            # Non-members keep the FCFS refresh cadence and cap. Touch them first
+            # so matching the current batch makes its prefixes more recent.
+            # Fast-match caches match them anyway, as on the NoMatch path below.
             if (
                 self.tree_cache.supports_fast_match_prefix()
                 and get_disagg().disaggregation_mode != "decode"
@@ -211,8 +212,7 @@ class SchedulePlanner:
             self._touch_waiting_prefixes(tail, bootstrap_queue)
             if not members:
                 return waiting_queue
-            deprioritized = self._compute_prefix_matches(members)
-            self.ranker.sort(members, deprioritized)
+            self._rank_bounded_batch(members)
             return self._bounded.order(tail)
 
         ranker = self._active_ranker(waiting_queue)
@@ -273,7 +273,8 @@ class SchedulePlanner:
 
         The caller reports temporary skips. A resource/budget break closes this
         generator before it can expose next-batch candidates. Matching the next
-        batch is lazy, so the normal path still sorts at most 64 requests.
+        batch is lazy, so the normal path still sorts at most
+        ``BOUNDED_LPM_WINDOW_SIZE`` requests.
         """
         if not self.bounded_lpm_active:
             yield from waiting
@@ -282,8 +283,7 @@ class SchedulePlanner:
         yield from self._bounded.members
         next_members = self._bounded.fallback_members(waiting)
         if next_members:
-            deprioritized = self._compute_prefix_matches(next_members)
-            self.ranker.sort(next_members, deprioritized)
+            self._rank_bounded_batch(next_members)
             yield from next_members
 
     def allows_admission(self, req: Req) -> bool:
@@ -337,6 +337,12 @@ class SchedulePlanner:
             or self.tree_cache.supports_fast_match_prefix()
         )
 
+    def _rank_bounded_batch(self, batch: List[Req]) -> None:
+        deprioritized = self._compute_prefix_matches(
+            batch, self.ranker.match_plan.leader_key
+        )
+        self.ranker.sort(batch, deprioritized)
+
     def _compute_prefix_matches(
         self,
         waiting_queue: List[Req],
@@ -382,7 +388,7 @@ class SchedulePlanner:
             ):
                 temporary_deprioritized.add(r.rid)
             else:
-                # Insert with a dummy key
+                # Insert with a dummy value; only the keys are matched.
                 self.waiting_queue_radix_tree.insert(
                     InsertParams(
                         key=RadixKey(

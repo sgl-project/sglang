@@ -20,21 +20,8 @@ logger = logging.getLogger(__name__)
 class FcfsRanker(BaseRanker):
     """First come first serve."""
 
-    def sort(
-        self,
-        waiting_queue: List[Req],
-        temporary_deprioritized: Set[int],
-        *,
-        processed_tokens: int = 0,
-        running_reqs: Optional[List[Req]] = None,
-    ) -> None:
-        """Keeps the queue in arrival order."""
-
-
-class PriorityFcfsRanker(BaseRanker):
-    """First come first serve, ordered by request priority first."""
-
-    def __init__(self, priority_sign: int):
+    def __init__(self, priority_sign: Optional[int] = None):
+        """``priority_sign`` orders by request priority first; None skips it."""
         self.priority_sign = priority_sign
 
     def sort(
@@ -45,13 +32,13 @@ class PriorityFcfsRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        """Sorts the waiting queue based on the request priority then received timestamp."""
-        waiting_queue.sort(
-            key=lambda x: (
-                x.priority * self.priority_sign,
-                x.time_stats.wait_queue_entry_time,
+        if self.priority_sign is not None:
+            waiting_queue.sort(
+                key=lambda x: (
+                    x.priority * self.priority_sign,
+                    x.time_stats.wait_queue_entry_time,
+                )
             )
-        )
 
 
 class LofRanker(BaseRanker):
@@ -69,7 +56,6 @@ class LofRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        """Sorts the waiting queue based on the longest output (max_new_tokens). If using priority scheduling, sort by priority first."""
         if self.priority_sign is not None:
             waiting_queue.sort(
                 key=lambda x: (
@@ -92,7 +78,6 @@ class RandomRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        """Shuffles the waiting queue randomly."""
         random.shuffle(waiting_queue)
 
 
@@ -107,7 +92,6 @@ class RoutingKeyRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        """Sorts waiting queue by routing key frequency in running batch."""
         if running_reqs is None:
             return
         routing_key_counts = Counter(

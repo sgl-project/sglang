@@ -17,7 +17,7 @@ class HrrnRanker(BaseRanker):
     @staticmethod
     def _uncached_len(r: Req) -> int:
         """Number of tokens that must actually be prefilled for this req
-        (all cache levels — device + host via hicache — counted as cached)."""
+        (all cache levels, device and host via hicache, counted as cached)."""
         return max(0, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
 
     def sort(

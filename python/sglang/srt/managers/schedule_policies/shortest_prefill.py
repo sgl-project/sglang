@@ -44,7 +44,6 @@ class ShortestPrefillFirstRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        # Prioritize short uncached prefills while deferring duplicate prefixes.
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,

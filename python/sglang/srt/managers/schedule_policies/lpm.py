@@ -22,7 +22,6 @@ class LpmRanker(BaseRanker):
         processed_tokens: int = 0,
         running_reqs: Optional[List[Req]] = None,
     ) -> None:
-        """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
                 -r.num_matched_prefix_tokens
