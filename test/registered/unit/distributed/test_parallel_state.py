@@ -504,13 +504,76 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            publish_build_topology(tp_size=8, pp_size=1, dcp_size=4)
             parallel_state.initialize_model_parallel()
 
             assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
 
             parallel_state.destroy_model_parallel()
+
+
+def _init_tp8_dcp(is_hip, dcp_size=8):
+    created = {}
+
+    def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+        group = Mock()
+        group.device_group = Mock()
+        created[kwargs.get("group_name", "unknown")] = group
+        return group
+
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_DCP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "is_hip", return_value=is_hip),
+        patch.object(parallel_state, "is_cuda", return_value=not is_hip),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=8),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+        patch.dict(
+            sys.modules,
+            {"sglang.srt.layers.sampler": Mock(SYNC_TOKEN_IDS_ACROSS_TP=False)},
+        ),
+        patch.object(
+            parallel_state,
+            "init_model_parallel_group",
+            side_effect=mock_init_model_parallel_group,
+        ),
+        patch.object(parallel_state, "get_world_group") as mock_world_group,
+    ):
+        mock_world = Mock()
+        mock_world.device_group = Mock()
+        mock_world.local_rank = 0
+        mock_world_group.return_value = mock_world
+
+        publish_build_topology(tp_size=8, pp_size=1, dcp_size=dcp_size)
+        parallel_state.initialize_model_parallel()
+        tp, dcp = parallel_state._TP, parallel_state._DCP
+        parallel_state.destroy_model_parallel()
+        dcp_destroys = dcp.destroy.call_count if dcp is not None else 0
+        return created, tp, dcp, dcp_destroys, tp.destroy.call_count
+
+
+def test_hip_full_width_dcp_reuses_tp_group():
+    """On ROCm, DCP spanning the whole TP group must not build a second coordinator,
+    and teardown must not destroy the shared TP group once more for DCP."""
+    created, tp, dcp, _, tp_destroys = _init_tp8_dcp(is_hip=True)
+    assert "dcp" not in created
+    assert dcp is tp
+    *_, tp_destroys_without_dcp = _init_tp8_dcp(is_hip=True, dcp_size=1)
+    assert tp_destroys == tp_destroys_without_dcp
+
+
+def test_non_hip_full_width_dcp_keeps_separate_group():
+    created, tp, dcp, dcp_destroys, _ = _init_tp8_dcp(is_hip=False)
+    assert "dcp" in created
+    assert dcp is not tp
+    assert dcp_destroys == 1
 
 
 def _read_group_descs(group_name):

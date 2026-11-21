@@ -2734,20 +2734,24 @@ def initialize_model_parallel(
                 dcp_group_ranks.append(
                     tp_group[start : start + decode_context_parallel_size]
                 )
-        _DCP = init_model_parallel_group(
-            dcp_group_ranks,
-            get_world_group().local_rank,
-            backend,
-            # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
-            # FP32 all-reduce. QuickAllReduce does not serve these collectives,
-            # but its communicator reserves a large workspace on every rank.
-            use_quick_allreduce=False,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-            group_name="dcp",
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
+        if is_hip() and decode_context_parallel_size == tensor_model_parallel_size:
+            # Full-width DCP preserves TP rank order.
+            _DCP = _TP
+        else:
+            _DCP = init_model_parallel_group(
+                dcp_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
+                # FP32 all-reduce. QuickAllReduce does not serve these collectives,
+                # but its communicator reserves a large workspace on every rank.
+                use_quick_allreduce=False,
+                use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+                group_name="dcp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
         if _TP.rank_in_group == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
@@ -3299,6 +3303,7 @@ def destroy_model_parallel():
         _SHARED_EXPERTS_TP.destroy()
     _SHARED_EXPERTS_TP = None
 
+    tp_group_destroyed = _TP
     if _TP:
         _TP.destroy()
     _TP = None
@@ -3309,7 +3314,7 @@ def destroy_model_parallel():
     _PP = None
 
     global _DCP
-    if _DCP:
+    if _DCP and _DCP is not tp_group_destroyed:
         _DCP.destroy()
     _DCP = None
 
