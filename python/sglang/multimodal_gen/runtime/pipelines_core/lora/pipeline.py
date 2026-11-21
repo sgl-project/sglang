@@ -157,6 +157,17 @@ def _store_fused_lora_groups(
             adapter[f"{base}.alpha"] = torch.tensor(float(fused_alpha), device=device)
 
 
+def strip_diffusers_transformer_prefix(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Drop the ``transformer.`` that diffusers ``save_lora_weights`` puts on every
+    DiT key. Mixed-component files keep their keys."""
+    prefix = "transformer."
+    if state_dict and all(key.startswith(prefix) for key in state_dict):
+        return {key[len(prefix) :]: value for key, value in state_dict.items()}
+    return state_dict
+
+
 class LoRAPipeline(ComposedPipelineBase):
     """
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
@@ -1021,10 +1032,12 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_fingerprint = (stat.st_size, stat.st_mtime_ns)
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
-        lora_state_dict = normalize_lora_state_dict(
-            raw_state_dict,
-            logger=logger,
-            adapter_config=adapter_config,
+        lora_state_dict = strip_diffusers_transformer_prefix(
+            normalize_lora_state_dict(
+                raw_state_dict,
+                logger=logger,
+                adapter_config=adapter_config,
+            )
         )
         adapter_lora_alpha = lora_alpha
         if adapter_lora_alpha is None:
