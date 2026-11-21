@@ -6,10 +6,12 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     is_attention_backend_not_set,
+    model_config_of,
     reject_dp_size_under_context_parallel,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
@@ -41,6 +43,90 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
         overrides["dcp_replicate_q_proj"] = True
     return overrides
+
+
+def _glm_split_index_k_dcp_overrides(cfg: Any) -> dict:
+    topk_backends = [cfg.dsa_topk_backend]
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+    # NGRAM drafts without a model, so it has no draft indexer.
+    if not (spec_algorithm.is_none() or spec_algorithm.is_ngram()):
+        topk_backends.append(cfg.speculative_dsa_topk_backend)
+    if (
+        any(backend != "sgl-kernel" for backend in topk_backends)
+        or not envs.SGLANG_OPT_USE_TOPK_V2.get()
+        or not envs.SGLANG_DSA_FUSE_TOPK.get()
+    ):
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 needs the fused sgl-kernel v2 DSA top-k "
+            "(--dsa-topk-backend and --speculative-dsa-topk-backend sgl-kernel, "
+            "SGLANG_OPT_USE_TOPK_V2 and SGLANG_DSA_FUSE_TOPK on)."
+        )
+    if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        # The sharded indexer returns only this rank's local KV slots.
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 does not support --enable-return-indexer-topk "
+            "or SGLANG_DSA_TOPK_BROADCAST."
+        )
+    if cfg.dsa_prefill_backend not in (None, "flashmla_sparse_q8", "flashmla_kv"):
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 supports --dsa-prefill-backend "
+            f"flashmla_sparse_q8 / flashmla_kv; got {cfg.dsa_prefill_backend!r}."
+        )
+    if cfg.dsa_decode_backend not in (None, "flashmla_kv"):
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 requires --dsa-decode-backend flashmla_kv; "
+            f"got {cfg.dsa_decode_backend!r}."
+        )
+    if cfg.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 requires --kv-cache-dtype fp8_e4m3; "
+            f"got {cfg.kv_cache_dtype!r}."
+        )
+    return {
+        "dsa_prefill_backend": cfg.dsa_prefill_backend or "flashmla_sparse_q8",
+        "dsa_decode_backend": "flashmla_kv",
+        "kv_cache_dtype": "fp8_e4m3",
+    }
+
+
+def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        max_speculative_num_draft_tokens,
+    )
+    from sglang.srt.configs.model_config import glm_dsa_shards_index_k
+    from sglang.srt.mem_cache.allocation_sizing import req_to_token_extra_context_len
+
+    cfg = resolving_view(server_args)
+    model_config = model_config_of(server_args)
+    if not glm_dsa_shards_index_k(model_config.hf_config, cfg.dcp_size):
+        return
+    alloc_page_size = cfg.page_size * cfg.dcp_size
+    extra_context_len = req_to_token_extra_context_len(
+        speculative_algorithm=cfg.speculative_algorithm,
+        num_steps=cfg.speculative_num_steps,
+        eagle_topk=cfg.speculative_eagle_topk,
+        num_draft_tokens=max_speculative_num_draft_tokens(server_args),
+        page_size=alloc_page_size,
+    )
+    # The merge takes rows of at most 2^20 scores; a row spans the request
+    # table rounded up to whole allocator pages.
+    max_context_len = (1 << 20) // alloc_page_size * alloc_page_size - extra_context_len
+    if cfg.context_length is None:
+        if model_config.context_len > max_context_len:
+            declare_resolution(
+                server_args,
+                "cap_glm_split_index_k_dcp_context_length",
+                context_length=max_context_len,
+            )
+    elif cfg.context_length > max_context_len:
+        raise ValueError(
+            "GLM-5 DSA DCP on SM90 supports --context-length "
+            f"{max_context_len} or less with this --dcp-size and speculative "
+            f"decoding setup; got {cfg.context_length}."
+        )
 
 
 def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
@@ -81,6 +167,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
+        glm_dsa_shards_index_k,
         is_deepseek_dsa,
         is_kimi_k31,
         unwrap_modelopt_quantization_config,
@@ -134,6 +221,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         if not is_kimi_k31(hf_config):
             overrides.update(_dsa_dcp_overrides(cfg))
+        if glm_dsa_shards_index_k(hf_config, cfg.dcp_size):
+            # Replaces the trtllm defaults above, which need SM100.
+            overrides.update(_glm_split_index_k_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"

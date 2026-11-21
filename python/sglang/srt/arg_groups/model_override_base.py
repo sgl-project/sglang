@@ -225,8 +225,9 @@ def model_config_of(server_args: Any):
     # `ModelConfig` re-points its own `model_path` at the local pull
     # directory when the weights sit behind an object-store URI, so its
     # field is not the key. An override that turns the SWA pool off changes
-    # `is_hybrid_swa`, so that flag is part of the key too.
-    key = (cfg.model_path, cfg.disable_hybrid_swa_memory)
+    # `is_hybrid_swa`, and one that caps the context changes `context_len`,
+    # so both are part of the key too.
+    key = (cfg.model_path, cfg.disable_hybrid_swa_memory, cfg.context_length)
     if memo is not None and built_from == key:
         return memo
 

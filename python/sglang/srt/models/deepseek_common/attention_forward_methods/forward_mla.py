@@ -208,6 +208,8 @@ class DeepseekMLAForwardMixin:
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
             return True
+        if self.use_dsa and dsa_shards_index_k() and mode.is_draft_extend_v2():
+            return True
         # DSA extend on HIP merges owned partials like decode, so replicating
         # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
         # On gfx950, Kimi-K3.1's sharded index-K prefill attends the gathered KV
