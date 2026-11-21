@@ -47,6 +47,60 @@ with patch.dict(
 Workspace = _load("_route_workspace", "sglang/srt/lora/workspace.py").LoraWorkspace
 
 
+@pytest.mark.parametrize(
+    "compute_first, expected",
+    [(False, ["side", "compute"]), (True, ["compute", "side"])],
+)
+def test_run_parallel_orders_cpu_callbacks(compute_first, expected):
+    calls = []
+    value = object()
+
+    def compute():
+        calls.append("compute")
+        return value
+
+    result = Workspace().run_parallel(
+        name="test",
+        device=torch.device("cpu"),
+        compute=compute,
+        side=lambda: calls.append("side"),
+        compute_first=compute_first,
+    )
+    assert result is value
+    assert calls == expected
+
+
+def test_run_parallel_does_not_fork_if_compute_first_raises(monkeypatch):
+    workspace = Workspace()
+    device = torch.device("cuda:0")
+    calls = []
+    current = SimpleNamespace(device=device, cuda_stream=11)
+    side = SimpleNamespace(
+        device=device, cuda_stream=22, wait_event=lambda _: calls.append("fork")
+    )
+
+    def event(_, name):
+        return SimpleNamespace(record=lambda _: calls.append(name))
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _: current)
+    monkeypatch.setattr(workspace, "side_stream", lambda _: side)
+    monkeypatch.setattr(workspace, "event", event)
+
+    def compute():
+        calls.append("compute")
+        raise RuntimeError("compute failed")
+
+    with pytest.raises(RuntimeError, match="compute failed"):
+        workspace.run_parallel(
+            name="test",
+            device=device,
+            compute=compute,
+            side=lambda: calls.append("side"),
+            compute_first=True,
+        )
+    assert calls == ["test:ready", "compute"]
+
+
 @pytest.mark.parametrize("cached", [False, True])
 def test_large_route_scratch_is_fresh_or_workspace_backed(cached):
     workspace = Workspace() if cached else None

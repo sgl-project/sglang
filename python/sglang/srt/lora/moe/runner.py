@@ -877,6 +877,7 @@ class MoeLoraRunner:
                 device=act_out.device,
                 compute=base,
                 side=down_a,
+                compute_first=provider.down_gemm_first,
             )
             if plan.down_b_into_base:
                 down_b_into_base(down_out)
@@ -893,6 +894,7 @@ class MoeLoraRunner:
                 device=act_out.device,
                 compute=base,
                 side=down_a_b,
+                compute_first=provider.down_gemm_first,
             )
 
         return down_out, state.rank, state.delta
