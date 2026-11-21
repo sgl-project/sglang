@@ -158,6 +158,7 @@ def benchmark_config(
     enable_up_tma: bool = False,
     tune_round: str = "both",
     down_use_tma_map: dict = None,
+    is_gated: bool = True,
 ) -> float:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
@@ -165,6 +166,8 @@ def benchmark_config(
     # Weights here are per-call, so a cached descriptor only pins a dead w1/w2.
     clear_b_tma_desc_cache()
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
+    # w2 takes the activation output: half of w1's rows when gated, all of them otherwise
+    down_size = shard_intermediate_size // 2 if is_gated else shard_intermediate_size
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
         w1 = torch.randint(
@@ -183,7 +186,7 @@ def benchmark_config(
             (
                 num_experts,
                 hidden_size,
-                shard_intermediate_size // 2,
+                down_size,
             ),
             dtype=torch.int8,
         )
@@ -204,7 +207,7 @@ def benchmark_config(
             (
                 num_experts,
                 hidden_size,
-                shard_intermediate_size // 4,
+                down_size // 2,
             ),
             dtype=torch.uint8,
         )
@@ -212,9 +215,7 @@ def benchmark_config(
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
         )
-        w2 = torch.randn(
-            num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
-        )
+        w2 = torch.randn(num_experts, hidden_size, down_size, dtype=init_dtype)
 
     w1_scale = None
     w2_scale = None
@@ -231,7 +232,7 @@ def benchmark_config(
         n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
         n_tiles_w2 = (hidden_size + block_n - 1) // block_n
         k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-        k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+        k_tiles_w2 = (down_size + block_k - 1) // block_k
         w1_scale = torch.randn(
             (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.bfloat16
         )
@@ -254,7 +255,7 @@ def benchmark_config(
             n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
             n_tiles_w2 = (hidden_size + block_n - 1) // block_n
             k_tiles_w1 = (hidden_size + block_k - 1) // block_k
-            k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
+            k_tiles_w2 = (down_size + block_k - 1) // block_k
             w1_scale = torch.rand(
                 (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
             )
@@ -301,7 +302,7 @@ def benchmark_config(
         (total_tokens, N),
     )
     intermediate_cache2 = torch.empty(
-        (total_tokens, N // 2),
+        (total_tokens, N // 2 if is_gated else N),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -575,6 +576,7 @@ class BenchmarkWorker:
         topk_ids_dir: str,
         ep_size: int = 1,
         enable_up_tma: bool = False,
+        is_gated: bool = True,
     ) -> Tuple[Dict[str, int], float]:
         device_module.manual_seed_all(0)
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
@@ -601,6 +603,7 @@ class BenchmarkWorker:
                     topk_ids_list,
                     block_shape,
                     ep_size=ep_size,
+                    is_gated=is_gated,
                     enable_up_tma=True,
                     tune_round="down",
                 )
@@ -620,6 +623,7 @@ class BenchmarkWorker:
                     topk_ids_list,
                     block_shape,
                     ep_size=ep_size,
+                    is_gated=is_gated,
                     enable_up_tma=True,
                     tune_round="up",
                     down_use_tma_map={cfg["BLOCK_SIZE_M"]: down_use_tma},
@@ -641,6 +645,7 @@ class BenchmarkWorker:
                     topk_ids_list,
                     block_shape,
                     ep_size=ep_size,
+                    is_gated=is_gated,
                     enable_up_tma=False,
                     tune_round="both",
                 )
@@ -663,6 +668,7 @@ class BenchmarkWorker:
         topk_ids_dir: str,
         ep_size: int = 1,
         enable_up_tma: bool = False,
+        is_gated: bool = True,
     ) -> Dict[str, int]:
         topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
 
@@ -694,6 +700,7 @@ class BenchmarkWorker:
                             topk_ids_list,
                             block_shape,
                             ep_size=ep_size,
+                            is_gated=is_gated,
                             num_iters=100,
                             enable_up_tma=False,
                             tune_round="both",
@@ -737,6 +744,7 @@ class BenchmarkWorker:
                             topk_ids_list,
                             block_shape,
                             ep_size=ep_size,
+                            is_gated=is_gated,
                             num_iters=100,
                             enable_up_tma=True,
                             tune_round="down",
@@ -780,6 +788,7 @@ class BenchmarkWorker:
                             topk_ids_list,
                             block_shape,
                             ep_size=ep_size,
+                            is_gated=is_gated,
                             num_iters=100,
                             enable_up_tma=True,
                             tune_round="up",
@@ -824,6 +833,7 @@ class BenchmarkWorker:
         cmp_config_files: List[str],
         topk_ids_dir: str,
         ep_size: int = 1,
+        is_gated: bool = True,
     ):
         # compare performance of different configs
         cmp_configs = []
@@ -863,6 +873,7 @@ class BenchmarkWorker:
                         topk_ids_list,
                         block_shape,
                         ep_size=ep_size,
+                        is_gated=is_gated,
                     )
                     kernel_times.append(kernel_time)
                 print(f"batch_size={bs=}:")
@@ -883,6 +894,7 @@ def save_configs_sep(
     use_int4_w4a16: bool,
     block_shape: List[int],
     down_moe: bool = False,
+    is_gated: bool = True,
 ) -> None:
     dtype_str = get_config_dtype_str(
         dtype,
@@ -896,7 +908,7 @@ def save_configs_sep(
     # is the intermediate size after silu_and_mul.
     filename = get_config_file_name(
         num_experts,
-        shard_intermediate_size // 2,
+        shard_intermediate_size // 2 if is_gated else shard_intermediate_size,
         dtype_str,
         block_shape,
         down_moe=down_moe,
@@ -927,6 +939,7 @@ def main(args: argparse.Namespace):
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
     shard_intermediate_size = model_config["shard_intermediate_size"]
+    is_gated = model_config["is_gated"]
     dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
 
@@ -959,6 +972,7 @@ def main(args: argparse.Namespace):
             args.cmp_configs,
             topk_ids_dir,
             args.ep_size,
+            is_gated=is_gated,
         )
         return
 
@@ -982,6 +996,7 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
                 enable_up_tma=args.enable_tune_up_tma,
+                is_gated=is_gated,
             )
         else:
             cfg = {
@@ -1009,6 +1024,7 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
                 enable_up_tma=args.enable_tune_up_tma,
+                is_gated=is_gated,
             )
             print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
         return
@@ -1051,6 +1067,7 @@ def main(args: argparse.Namespace):
         use_int4_w4a16,
         False,
         block_shape,
+        is_gated=is_gated,
     )
     print(
         f"Start tuning over {len(search_space)} configurations to create {filename}..."
@@ -1076,6 +1093,7 @@ def main(args: argparse.Namespace):
                 topk_ids_dir,
                 args.ep_size,
                 args.enable_tune_up_tma,
+                is_gated,
             )
             for batch_size in batch_sizes
         ],
@@ -1102,6 +1120,7 @@ def main(args: argparse.Namespace):
         use_int8_w8a16,
         use_int4_w4a16,
         block_shape,
+        is_gated=is_gated,
     )
 
     best_configs1 = {M: sort_config(config) for M, config in zip(batch_sizes, configs1)}
@@ -1118,6 +1137,7 @@ def main(args: argparse.Namespace):
         use_int4_w4a16,
         block_shape,
         down_moe=True,
+        is_gated=is_gated,
     )
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
