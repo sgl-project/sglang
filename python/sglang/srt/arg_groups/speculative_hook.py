@@ -16,13 +16,13 @@ from sglang.srt.arg_groups.model_override_base import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.arg_groups.model_overrides.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     declare_resolution,
     record_foreign_defaults,
     run_post_process_pass,
 )
-from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
