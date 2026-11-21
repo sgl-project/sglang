@@ -13,7 +13,7 @@
 # ==============================================================================
 """DCP verify fp8 query gather against the bf16 gather + cat + cast it must match.
 
-python -m pytest test/registered/unit/layers/test_dcp_fp8_q_gather.py -v
+python -m pytest test/registered/unit/layers/dcp/test_dcp_fp8_q_gather.py -v
 """
 
 import threading

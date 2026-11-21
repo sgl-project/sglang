@@ -6,6 +6,7 @@ gathering a bf16 query for a cprr kernel (or an fp8 one for a Gluon consumer tha
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
@@ -13,6 +14,8 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla_rocm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,6 +60,37 @@ class TestTakesFp8DcpVerifyQ(CustomTestCase):
             with self.subTest(takes=takes):
                 backend = _wrapper(TboAttnBackend, primary=_child(takes))
                 self.assertEqual(backend.takes_fp8_dcp_verify_q(), takes)
+
+
+class TestDcpVerifyQFp8Routing(CustomTestCase):
+    """The model gathers an fp8 query only where core can consume it unscaled."""
+
+    def _routes(
+        self, *, aiter=True, mode=ForwardMode.TARGET_VERIFY, scaling=None, takes=True
+    ):
+        with (
+            patch.object(forward_mla_rocm, "_use_aiter", aiter),
+            patch.object(
+                forward_mla_rocm, "get_attn_backend", return_value=_child(takes)
+            ),
+        ):
+            return forward_mla_rocm._gathers_dcp_verify_q_fp8(
+                forward_batch=SimpleNamespace(forward_mode=mode),
+                llama_4_scaling=scaling,
+            )
+
+    def test_target_verify_on_a_taking_backend_gathers_fp8(self):
+        self.assertTrue(self._routes())
+
+    def test_each_other_condition_keeps_the_bf16_gather(self):
+        for name, kwargs in (
+            ("not aiter", dict(aiter=False)),
+            ("decode", dict(mode=ForwardMode.DECODE)),
+            ("llama 4 scaling", dict(scaling=object())),
+            ("backend declines", dict(takes=False)),
+        ):
+            with self.subTest(case=name):
+                self.assertFalse(self._routes(**kwargs))
 
 
 if __name__ == "__main__":
