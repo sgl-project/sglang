@@ -84,11 +84,24 @@ def _lora_compute_dtype(x: torch.Tensor, lora_dtype: torch.dtype) -> torch.dtype
     An fp16 adapter on bf16/fp32 activations computes in the activations'
     dtype (the autocast dtype under autocast, e.g. Wan), as a bf16 adapter
     would: cast to fp16, DiT activations beyond 65504 overflow to inf and the
-    output turns into NaN (a black image). Other adapters compute in their own
-    dtype, as before.
+    output turns into NaN (a black image).
+
+    An fp32 adapter on 16-bit activations computes in their dtype when the
+    request allows lossless fast paths, exactly as the same adapter saved in
+    that dtype would (e.g. the fp32 and bf16 files of a Lightning LoRA); in
+    fp32 its matmuls miss the tensor cores and cast every activation. Other
+    adapters compute in their own dtype, as before.
     """
-    if lora_dtype != torch.float16 or x.dtype == torch.float16:
-        return lora_dtype
+    if lora_dtype == torch.float16 and x.dtype != torch.float16:
+        return _activation_dtype(x)
+    if lora_dtype == torch.float32 and request_allows_lossless():
+        activation_dtype = _activation_dtype(x)
+        if activation_dtype in (torch.bfloat16, torch.float16):
+            return activation_dtype
+    return lora_dtype
+
+
+def _activation_dtype(x: torch.Tensor) -> torch.dtype:
     if torch.is_autocast_enabled(x.device.type):
         return torch.get_autocast_dtype(x.device.type)
     return x.dtype
