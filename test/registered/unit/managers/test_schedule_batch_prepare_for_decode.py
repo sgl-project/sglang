@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.sampling.penaltylib import (  # noqa: E402
+from sglang.srt.sampling.penalties import (  # noqa: E402
     BatchedFrequencyPenalizer,
     BatchedMinNewTokensPenalizer,
     BatchedPenalizerOrchestrator,

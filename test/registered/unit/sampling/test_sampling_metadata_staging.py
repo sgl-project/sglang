@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.sampling.penaltylib import (
+from sglang.srt.sampling.penalties import (
     BatchedMinNewTokensPenalizer,
     BatchedPenalizerOrchestrator,
 )
