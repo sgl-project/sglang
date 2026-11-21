@@ -84,12 +84,13 @@ class GCFreezer:
         if not self._batch_froze:
             self._batch_froze = True
             # gc.get_freeze_count() walks the frozen list: only at the first freeze.
+            frozen = gc.get_freeze_count()
             logger.info(
                 "Froze the scheduler heap at batch %d in %.1f ms: %d objects; young "
                 "re-freeze every %s batches, full pass every %d",
                 forward_ct,
                 (time.monotonic() - start) * 1e3,
-                gc.get_freeze_count(),
+                frozen,
                 self._freeze_every_batches or "no",
                 self._freeze_after_batches,
             )
