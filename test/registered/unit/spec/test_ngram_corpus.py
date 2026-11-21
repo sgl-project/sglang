@@ -163,6 +163,39 @@ EXPECTED_PROB_MASKS = [
 ]
 
 
+class TestNgramCorpusValidation(CustomTestCase):
+    def test_shared_cpp_validation(self):
+        # CUDA and NPU construct the same CPU corpus. Invalid values must keep
+        # reaching its existing C++ checks rather than a backend-specific copy.
+        for values, message in (
+            (dict(max_trie_depth=1), "max_trie_depth must be greater than 1"),
+            (dict(min_bfs_breadth=0), "min_bfs_breadth must be greater than 0"),
+            (
+                dict(min_bfs_breadth=9, max_bfs_breadth=8),
+                "min_bfs_breadth must be less than or equal",
+            ),
+            (dict(draft_token_num=0), "draft_token_num must be greater than 0"),
+        ):
+            with (
+                self.subTest(values=values),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                _make_corpus(**values)
+
+    def test_shared_policy_without_external_corpus(self):
+        # Preserve the existing constructor policy: unused SAM settings and a
+        # small trie allocation must not acquire new Python-only restrictions.
+        corpus = _make_corpus(
+            capacity=12,
+            max_trie_depth=12,
+            draft_token_num=8,
+            external_sam_budget=8,
+            external_corpus_max_tokens=0,
+        )
+        ids, _ = _batch_get(corpus, [[1]])
+        self.assertEqual(ids[0], 1)
+
+
 class TestNgramCorpusBFS(CustomTestCase):
     """Golden-output tests for BFS matching mode."""
 

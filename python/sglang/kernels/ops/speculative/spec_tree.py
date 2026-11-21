@@ -488,6 +488,8 @@ def verify_tree_greedy_func(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
+    *,
+    is_ngram: bool = False,
 ):
     if _is_cuda or _is_hip or _is_musa:
         if _is_cuda or _is_hip:
@@ -522,7 +524,12 @@ def verify_tree_greedy_func(
         )
 
     elif _is_npu:
-        from sgl_kernel_npu.operators.speculative import verify_tree_greedy
+        if is_ngram:
+            from sgl_kernel_npu.sample.verify_ngram_tree_greedy import (
+                verify_ngram_tree_greedy as verify_tree_greedy,
+            )
+        else:
+            from sgl_kernel_npu.operators.speculative import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,

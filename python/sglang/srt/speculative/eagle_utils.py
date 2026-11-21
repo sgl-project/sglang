@@ -753,6 +753,7 @@ def eagle_sample(
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
+    is_ngram: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -925,6 +926,7 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
+                is_ngram=is_ngram,
             )
 
         if _is_hip:
@@ -968,6 +970,7 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
+                is_ngram=is_ngram,
             )
     elif sparse:
         from sglang.srt.speculative.uno_utils import (
@@ -1004,6 +1007,7 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
+                is_ngram=is_ngram,
             )
 
         tp_group = (

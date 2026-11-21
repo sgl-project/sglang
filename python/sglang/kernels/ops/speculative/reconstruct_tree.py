@@ -40,12 +40,16 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu, next_power_of_2
 
 _is_xpu = is_xpu()
 
 if is_cuda() or is_hip():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+elif is_npu():
+    from sgl_kernel_npu.speculative import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
 elif not _is_xpu:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 

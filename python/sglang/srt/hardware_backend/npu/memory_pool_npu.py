@@ -284,6 +284,27 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
 
+    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Compact accepted tree nodes in the NPU page-major allocation.
+
+        Snapshot sources before writing: a branch can move into slots occupied
+        by other source nodes. The CUDA pointer-copy kernel cannot address this
+        layout, and token indices must span page and slot axes together.
+        """
+        if tgt_loc.numel() == 0:
+            return
+        if self._hicache_k_buffer.dtype in (torch.float16, torch.bfloat16):
+            from sgl_kernel_npu.mem_cache.kv_cache_move import move_kv_cache_rows
+
+            move_kv_cache_rows(
+                self._hicache_k_buffer, self._hicache_v_buffer, tgt_loc, src_loc
+            )
+            return
+        keys = self._hicache_k_buffer.flatten(1, 2)
+        values = self._hicache_v_buffer.flatten(1, 2)
+        keys.index_copy_(1, tgt_loc, keys.index_select(1, src_loc))
+        values.index_copy_(1, tgt_loc, values.index_select(1, src_loc))
+
     def get_kv_scale_buffer(self, layer_id: int):
         local_layer = layer_id - self.start_layer
         return self.k_scale_buffer[local_layer], self.v_scale_buffer[local_layer]
@@ -714,6 +735,49 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
     rows_are_dcp_collapsed = False
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Relocate accepted latent/RoPE rows, preserving overlapping sources."""
+        if tgt_loc.numel() == 0:
+            return
+        self._raise_if_native_kv_cache_disabled()
+        if self.index_k_buffer is None and self.k_buffer.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            from sgl_kernel_npu.mem_cache.mla_cache_move import move_mla_kv_cache
+
+            move_mla_kv_cache(
+                self.k_buffer,
+                self.v_buffer,
+                tgt_loc,
+                src_loc,
+                self.page_size,
+                self.use_fia_nz,
+            )
+            return
+        tgt_loc = tgt_loc.flatten().long()
+        src_loc = src_loc.flatten().long()
+        for cache in (self.k_buffer, self.v_buffer):
+            if cache.numel() == 0:
+                continue
+            if self.use_fia_nz and not self.dsa_kv_cache_store_fp8:
+                head_dim = cache.shape[-1]
+                src_rows = _mla_fia_nz_scatter_indices(
+                    src_loc, head_dim, self.page_size
+                ).flatten()
+                tgt_rows = _mla_fia_nz_scatter_indices(
+                    tgt_loc, head_dim, self.page_size
+                ).flatten()
+                rows = cache.view(self.layer_num, -1, 16)
+            else:
+                src_rows, tgt_rows = src_loc, tgt_loc
+                rows = cache.flatten(1, 2)
+            rows.index_copy_(1, tgt_rows, rows.index_select(1, src_rows))
+        for cache in (self.index_k_buffer, self.index_k_scale_buffer):
+            if cache is not None:
+                rows = cache.flatten(1, 2)
+                rows.index_copy_(1, tgt_loc, rows.index_select(1, src_loc))
 
     def __init__(
         self,

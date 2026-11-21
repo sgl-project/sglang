@@ -157,11 +157,14 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             )
             return seq_lens + [0] * (runner.bs - len(seq_lens))
         if forward_batch.forward_mode.is_target_verify():
-            # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
+            # DFlash and NGRAM refresh forward_metadata.seq_lens_cpu_list at
             # replay; other algorithms keep the capture-time list, so
             # recompute from the live batch as before — reading the
             # backend list there would replay stale capture-time lengths.
-            if runner.model_runner.spec_algorithm.is_dflash():
+            if (
+                runner.model_runner.spec_algorithm.is_dflash()
+                or runner.model_runner.spec_algorithm.is_ngram()
+            ):
                 _attn = runner.attn_backend
                 _meta = getattr(_attn, "forward_metadata", None)
                 _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
@@ -170,7 +173,7 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             if _meta_list is not None:
                 # graph.update must carry the exact KV length already
                 # computed in forward_metadata.seq_lens_cpu_list (it
-                # already includes the draft block for DFlash); do not
+                # already includes the draft block); do not
                 # recompute and double-add here.
                 seq_lens = list(_meta_list)
             else:
@@ -203,6 +206,12 @@ class NPUCudaGraphBackend(BaseGraphBackend):
 
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
+        # NGRAM's tree mask changes even when the batch was already planned.
+        # The common runner also skips full staging for a planned batch, so
+        # invalidate that plan before it enters load_batch.
+        if runner is not None and runner.model_runner.spec_algorithm.is_ngram():
+            forward_batch.forward_metadata_ready = False
+            return False
         if runner is None or forward_batch.needs_forward_metadata_init():
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():

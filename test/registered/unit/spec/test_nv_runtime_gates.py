@@ -20,8 +20,16 @@ class TestNativeEagerVerify(CustomTestCase):
                 n
                 for n in ast.walk(tree)
                 if isinstance(n, ast.If)
-                and ast.unparse(n.test)
-                == "envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()"
+                and any(
+                    ast.unparse(term)
+                    == "envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()"
+                    for term in (
+                        n.test.values
+                        if isinstance(n.test, ast.BoolOp)
+                        and isinstance(n.test.op, ast.And)
+                        else [n.test]
+                    )
+                )
                 and any(
                     isinstance(c, ast.Call)
                     and isinstance(c.func, ast.Name)
@@ -60,6 +68,7 @@ class TestNativeEagerVerify(CustomTestCase):
                     )
                     scope = dict(
                         envs=envs,
+                        _is_npu=False,
                         batch=batch,
                         verify_input=object(),
                         logits_output=object(),
@@ -107,6 +116,8 @@ class TestNativeEagerVerify(CustomTestCase):
                                 simulated_acc_len_rng=scope["simulated_acc_len_rng"],
                                 sparse_bonus_argmax=True,
                             )
+                        else:
+                            kwargs["is_ngram"] = True
                         sample.assert_called_once_with(
                             scope["verify_input"],
                             batch,

@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=12, suite="extra-a-test-npu")
 
 
-def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
+def make_backend(*, dflash=False, dspark=False, ngram=False, width=1, bs=4, raw_bs=2):
     backend = mod.NPUCudaGraphBackend.__new__(mod.NPUCudaGraphBackend)
     attention = SimpleNamespace(forward_metadata=None)
     runner = runner_mod.DecodeCudaGraphRunner.__new__(runner_mod.DecodeCudaGraphRunner)
@@ -31,6 +31,7 @@ def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
             spec_algorithm=SimpleNamespace(
                 is_dflash=lambda: dflash,
                 is_dspark=lambda: dspark,
+                is_ngram=lambda: ngram,
                 is_dflash_family=lambda: dflash or dspark,
             ),
         ),
@@ -73,6 +74,32 @@ def test_dflash_replay_metadata_lengths_are_not_double_added():
     )
     attention.forward_metadata = SimpleNamespace(seq_lens_cpu_list=[13, 14, 0, 0])
     assert backend._decode_update_lengths(batch) == [13, 14, 0, 0]
+
+
+def test_ngram_preplanned_batch_requires_full_load():
+    backend, _, _ = make_backend(ngram=True)
+    batch = SimpleNamespace(forward_metadata_ready=True)
+    batch.needs_forward_metadata_init = lambda: not batch.forward_metadata_ready
+
+    assert not batch.needs_forward_metadata_init()
+    assert backend.prepare_replay(batch) is False
+    # The common runner's load_batch must take its full staging path, even
+    # though the batch was previously planned with a different tree mask.
+    assert batch.needs_forward_metadata_init()
+
+
+def test_ngram_replay_uses_current_metadata_lengths():
+    backend, _, attention = make_backend(ngram=True, width=3)
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+        seq_lens_cpu=torch.tensor([10, 11]),
+        seq_lens=mock.Mock(),
+    )
+    attention.forward_metadata = SimpleNamespace(seq_lens_cpu_list=[13, 14, 0, 0])
+    assert backend._decode_update_lengths(batch) == [13, 14, 0, 0]
+    attention.forward_metadata.seq_lens_cpu_list = [17, 19, 0, 0]
+    assert backend._decode_update_lengths(batch) == [17, 19, 0, 0]
+    batch.seq_lens.cpu.assert_not_called()
 
 
 @pytest.mark.parametrize("verify", [False, True])

@@ -87,10 +87,14 @@ def make_batch(mode, lengths):
         seq_lens=torch.tensor(lengths, dtype=torch.int64),
         seq_lens_cpu=None,
         spec_algorithm=SimpleNamespace(
-            is_dflash=lambda: False, is_dflash_family=lambda: True
+            is_dflash=lambda: False,
+            is_dflash_family=lambda: True,
+            is_ngram=lambda: False,
         ),
         req_pool_indices=torch.arange(len(lengths)),
-        spec_info=SimpleNamespace(draft_token_num=8)
+        spec_info=SimpleNamespace(
+            draft_token_num=8, spec_input_type=mod.SpecInputType.EAGLE_VERIFY
+        )
         if mode.is_target_verify()
         else None,
         extend_seq_lens=None,
@@ -340,6 +344,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
     needs_cpu = force_cpu or not (uses_flash_mla or uses_paged_mtp)
     spec = SimpleNamespace(
         is_dspark=lambda: dspark,
+        is_ngram=lambda: False,
         is_none=lambda: not dspark,
         is_dflash_family=lambda: dspark,
         get_num_tokens_per_req_for_target_verify=lambda count, **kwargs: count,
