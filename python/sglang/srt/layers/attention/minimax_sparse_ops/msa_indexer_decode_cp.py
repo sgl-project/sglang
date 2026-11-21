@@ -21,6 +21,9 @@ from sglang.kernels.ops.attention.msa_v1.indexer_decode_cp import (
     gather_scores,
     scatter_scores,
 )
+from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    in_one_nvlink_domain,
+)
 from sglang.srt.runtime_context import get_parallel
 
 # Private MSA entry points: the score-only GEMM and the stock top-k.
@@ -273,6 +276,8 @@ def make_msa_v1_indexer_decode_cp(
         why = f"MSA score-only entry points are missing ({_MSA_IMPORT_ERROR})"
     elif max_rows <= 0:
         why = "no decode CUDA graph batch size to size the buffers"
+    elif not in_one_nvlink_domain(group.cpu_group, device):
+        why = "the attention TP ranks are not in one NVLink domain"
     if why is not None:
         logger.warning("MSA-v1 indexer decode CP disabled: %s", why)
         return None
