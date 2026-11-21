@@ -268,7 +268,7 @@ impl MediaCounts {
     /// Counts one OpenAI chat content part by its `type`; text parts count nothing.
     pub fn add_part(&mut self, part_type: &str) {
         match part_type {
-            "image_url" => self.images = self.images.saturating_add(1),
+            "image_url" | "input_image" => self.images = self.images.saturating_add(1),
             "video_url" => self.videos = self.videos.saturating_add(1),
             "audio_url" | "input_audio" => self.audios = self.audios.saturating_add(1),
             _ => {}

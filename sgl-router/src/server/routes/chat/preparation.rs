@@ -1532,7 +1532,13 @@ fn request_has_multimodal_content(value: &Value) -> bool {
                         parts.iter().any(|p| {
                             matches!(
                                 p.get("type").and_then(|t| t.as_str()),
-                                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                                Some(
+                                    "image_url"
+                                        | "input_image"
+                                        | "video_url"
+                                        | "audio_url"
+                                        | "input_audio"
+                                )
                             )
                         })
                     })
@@ -2346,6 +2352,7 @@ mod tests {
     fn request_has_multimodal_content_detects_media_parts() {
         for part in [
             json!({"type":"image_url","image_url":{"url":"x"}}),
+            json!({"type":"input_image","image_url":"x"}),
             json!({"type":"video_url","video_url":{"url":"x"}}),
             json!({"type":"audio_url","audio_url":{"url":"x"}}),
             json!({"type":"input_audio","input_audio":{"data":"x"}}),
