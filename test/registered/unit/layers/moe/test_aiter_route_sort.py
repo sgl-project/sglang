@@ -224,9 +224,22 @@ class TestSortTailResidency(CustomTestCase):
     def test_routing_declines_without_launching_when_the_tail_cannot_fit(self):
         consumer = aiter_route_sort.AiterRouteSortConsumer()
         consumer.takes_sort = lambda m: True
-        hit, launches = _route(consumer, 1024, [], tail_fits=False)
+        hit, launches = _route(consumer, 256, [], tail_fits=False)
         self.assertIsNone(hit)
         self.assertEqual(launches, 0)
+
+    def test_routing_declines_past_the_batch_size_where_aiters_sort_wins(self):
+        consumer = aiter_route_sort.AiterRouteSortConsumer()
+        consumer.takes_sort = lambda m: True
+        radix4 = route_sort.moe_route_radix4
+        for m, launched in (
+            (radix4.SORT_MAX_TOKENS, 1),
+            (radix4.SORT_MAX_TOKENS + 1, 0),
+        ):
+            with self.subTest(m=m):
+                hit, launches = _route(consumer, m, [])
+                self.assertEqual(launches, launched)
+                self.assertEqual(hit is not None, bool(launched))
 
 
 class TestAiterRouteSortConsumerAiterAnswers(CustomTestCase):

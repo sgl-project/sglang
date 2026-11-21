@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 _NUM_EXPERTS = 896
 _TOPK = 16
 _SORT_BLOCK_M = 16
+# The largest batch the dispatcher fuses the sort for: bench_moe_route_radix4_sort.py (fp32, cold L2) has
+# the fused launch ahead of AITER's route + moe_sorting up to 256 tokens and behind it from 512.
+SORT_MAX_TOKENS = 256
 # Mirrors kRadix4LeaderSortMaxTokens, kRadix4TailChunk and kRadix4MaxTailCtas in route_radix4_hip.cuh.
 _LEADER_SORT_MAX_TOKENS = 64
 _TAIL_CHUNK = 16

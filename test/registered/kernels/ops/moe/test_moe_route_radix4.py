@@ -869,7 +869,11 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     expected = {}
     for m in sizes:
         metadata = get_2stage_cfgs(**consumer.cfg_args(m))
-        expected[m] = bool(metadata.output_aux) and int(metadata.block_m) == BM
+        expected[m] = (
+            bool(metadata.output_aux)
+            and int(metadata.block_m) == BM
+            and m <= moe_route_radix4.SORT_MAX_TOKENS
+        )
     registered = {}
     for m in sizes:
         registrations = []

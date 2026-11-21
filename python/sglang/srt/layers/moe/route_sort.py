@@ -177,6 +177,9 @@ def try_route_sort_fused(
     Caller must have checked moe_route_radix4.covered().
     """
     consumer, num_token_non_padded = _take()
+    # Past SORT_MAX_TOKENS AITER's own sort is the faster pipeline.
+    if scores.shape[0] > moe_route_radix4.SORT_MAX_TOKENS:
+        return None
     if consumer is None or not consumer.takes_sort(scores.shape[0]):
         return None
     # The tail sort's helper CTAs wait on each other, so a partition too small to hold them
