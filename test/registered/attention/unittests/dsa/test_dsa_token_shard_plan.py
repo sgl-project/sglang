@@ -514,7 +514,7 @@ class TestReusedTopkAcrossPpStage(CustomTestCase):
     def _core(self, tp_rank, topk, preset_local=None):
         mod = _npu_mla_module()
         plan = plan_dsa_token_shard([self.TOKENS], [117], 4, tp_rank)
-        batch = types.SimpleNamespace()
+        batch = types.SimpleNamespace(attn_dcp_metadata=None)
         if preset_local is not None:
             batch.npu_indexer_topk_is_local = preset_local
         m = types.SimpleNamespace(
