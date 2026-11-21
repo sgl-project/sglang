@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils.device import is_pin_memory_available
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,12 @@ class HiSparseHostPoolMixin:
                     f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
                 )
 
+            if host_locs.device.type == "cpu" and is_pin_memory_available(device):
+                # A pageable H2D copy synchronizes the current (schedule)
+                # stream behind the in-flight forward; pinning the tiny page
+                # list keeps the copy asynchronous. The caching host allocator
+                # keeps the pinned source alive until the copy has executed.
+                host_locs = host_locs.pin_memory()
             req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
                 device=device, non_blocking=True
             )
