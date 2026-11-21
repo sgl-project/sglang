@@ -1,0 +1,307 @@
+"""Unit tests for the batched retained-block gather used by dLLM FDFO KV reuse.
+
+``_alloc_extend_loc_with_kv_reuse`` re-reads each reuse row's retained KV block
+out of ``req_to_token``. It used to do that one row at a time (a slice + cast
+kernel per row); the rows share a block length, so they are now fetched with a
+single flat index op. The index arithmetic (``row * width + start``, flattened
+and reshaped back) is what the first class pins down -- it is the part a
+"looks equivalent" rewrite silently gets wrong.
+
+The second class covers the caller instead of the helper. Batching splits the
+row loop into two independent cursors (``reuse_ptr`` over gathered rows,
+``fresh_ptr`` over freshly allocated tokens); if either advances on the wrong
+row the batch is silently mispaired, which no helper-level test can see. Every
+case therefore runs the same batch with batching forced off and forced on and
+requires the two ``out_cache_loc`` tensors to be identical -- the off path is
+the pre-existing behaviour, so agreement is the regression signal.
+"""
+
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+import sglang.srt.mem_cache.allocation as allocation
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocation import (
+    _alloc_extend_loc_with_kv_reuse,
+    _gather_reused_block_locs,
+)
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+ROWS, WIDTH = 8, 64
+
+
+def _fingerprint_pool() -> torch.Tensor:
+    # Slot at [row, col] is row*1000 + col, so a wrong row or a wrong start
+    # offset is visible in the value itself rather than only in the shape.
+    rows = torch.arange(ROWS, dtype=torch.int32).unsqueeze(1) * 1000
+    return rows + torch.arange(WIDTH, dtype=torch.int32)
+
+
+def _per_row_reference(req_to_token, req_pool_indices, prefix_lens, block_len, dtype):
+    return torch.stack(
+        [
+            req_to_token[idx, start : start + block_len].to(dtype)
+            for idx, start in zip(req_pool_indices, prefix_lens)
+        ]
+    )
+
+
+class TestGatherReusedBlockLocs(CustomTestCase):
+    def _gather(self, req_pool_indices, prefix_lens, block_len, dtype=torch.int64):
+        pool = _fingerprint_pool()
+        got = _gather_reused_block_locs(
+            req_to_token=pool,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            block_len=block_len,
+            device=torch.device("cpu"),
+            out_dtype=dtype,
+        )
+        want = _per_row_reference(pool, req_pool_indices, prefix_lens, block_len, dtype)
+        return got, want
+
+    def test_preserves_row_order_when_pool_indices_are_unsorted(self):
+        # The gather feeds out_cache_loc positionally, so it must follow the
+        # caller's row order rather than the pool index order. Rows are
+        # non-contiguous and start at distinct offsets, so the flat index must
+        # pair each row with its own start.
+        got, want = self._gather([5, 0, 3], [0, 12, 4], 4)
+        self.assertTrue(torch.equal(got, want))
+        self.assertEqual([row[0] for row in got.tolist()], [5000, 12, 3004])
+        # torch.equal no longer compares dtype, so pin the out_dtype cast
+        # explicitly: in an all-reuse batch fresh_slots is None and
+        # out_cache_loc's dtype comes solely from this cast (the pool is int32).
+        self.assertEqual(got.dtype, torch.int64)
+
+    def test_block_touching_the_row_end_does_not_bleed_into_the_next_row(self):
+        # A block ending exactly at WIDTH is the case a flat index gets wrong
+        # by reading past the row boundary.
+        got, want = self._gather([2], [WIDTH - 4], 4)
+        self.assertTrue(torch.equal(got, want))
+        self.assertEqual(got.tolist(), [[2060, 2061, 2062, 2063]])
+
+
+class _FakeStorage:
+    """Hands out consecutive slots so the same batch allocates identically with
+    batching on and off, making the two out_cache_loc tensors comparable."""
+
+    def __init__(self, base: int = 10_000):
+        self.base = base
+        self.cursor = 0
+
+    def take_tokens(self, num_tokens: int, make_room=None) -> torch.Tensor:
+        start = self.base + self.cursor
+        self.cursor += num_tokens
+        return torch.arange(start, start + num_tokens, dtype=torch.int64)
+
+    def take_extend(self, *, num_tokens, seq_lens_cpu=None, **_kwargs) -> torch.Tensor:
+        self.last_extend_seq_lens = (
+            None if seq_lens_cpu is None else seq_lens_cpu.tolist()
+        )
+        return self.take_tokens(num_tokens)
+
+
+class _FakeTreeCache:
+    # kv_storage_of returns the allocator's own storage when it has one, so the
+    # fake storage above is the only collaborator alloc_token_slots needs.
+    def __init__(self):
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = SimpleNamespace(storage=_FakeStorage())
+
+
+def _make_batch(*, reuse_kv, prefix_lens, extend_lens):
+    reqs = [
+        SimpleNamespace(
+            dllm_incomplete_ids=[0] * extend_lens[i] if reuse_kv[i] else [],
+            kv=SimpleNamespace(kv_allocated_len=prefix_lens[i] + extend_lens[i]),
+        )
+        for i in range(len(reuse_kv))
+    ]
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        req_to_token_pool=SimpleNamespace(req_to_token=_fingerprint_pool()),
+        reqs=reqs,
+        tree_cache=_FakeTreeCache(),
+    )
+
+
+class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
+    """The caller's reuse/fresh reassembly, with batching off vs on."""
+
+    def _run(self, *, reuse_kv, prefix_lens, extend_lens, min_rows):
+        # The env var is what we vary: _auto_min_rows_for_batched_gather is
+        # lru_cached and process-sticky, so the auto default must not be the
+        # knob under test. -1 disables outright; 0 batches every reuse row.
+        with envs.SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.override(min_rows):
+            return _alloc_extend_loc_with_kv_reuse(
+                _make_batch(
+                    reuse_kv=reuse_kv,
+                    prefix_lens=prefix_lens,
+                    extend_lens=extend_lens,
+                ),
+                reuse_kv,
+                [torch.empty(0, dtype=torch.int64)] * len(reuse_kv),
+                torch.tensor(list(range(len(reuse_kv))), dtype=torch.int64),
+                torch.tensor(prefix_lens, dtype=torch.int64),
+                torch.tensor(extend_lens, dtype=torch.int64),
+                torch.tensor(list(range(len(reuse_kv))), dtype=torch.int64),
+                1,
+            )
+
+    def _assert_batching_is_transparent(self, **kwargs):
+        off = self._run(min_rows=-1, **kwargs)
+        on = self._run(min_rows=0, **kwargs)
+        self.assertTrue(
+            torch.equal(off, on),
+            f"batching changed out_cache_loc:\n off={off.tolist()}\n on ={on.tolist()}",
+        )
+        return on
+
+    def test_interleaved_reuse_and_fresh_rows_keep_their_positions(self):
+        # The failure this guards: a cursor that advances on every row instead
+        # of only on its own kind silently shifts rows against each other.
+        # Fresh slots come from _FakeStorage (10000+), reuse rows carry the
+        # pool fingerprint (row*1000 + col), so a swap is visible in the values.
+        out = self._assert_batching_is_transparent(
+            reuse_kv=[False, True, False, True],
+            prefix_lens=[0, 8, 0, 12],
+            extend_lens=[3, 4, 2, 4],
+        )
+        # fmt: off
+        self.assertEqual(
+            out.tolist(),
+            [
+                10000, 10001, 10002,          # row 0, fresh
+                1008, 1009, 1010, 1011,       # row 1, reuse @ pool row 1 off 8
+                10003, 10004,                 # row 2, fresh
+                3012, 3013, 3014, 3015,       # row 3, reuse @ pool row 3 off 12
+            ],
+        )
+        # fmt: on
+
+    def test_threshold_is_inclusive_and_negative_disables(self):
+        # Two gate boundaries the equality cases cannot see (both sides agree
+        # either way): a batch with exactly min_rows reuse rows batches
+        # (min_rows is a minimum, not a strict bound), and -1 disables
+        # outright (len(reuse_rows) >= -1 would otherwise always hold).
+        kwargs = dict(
+            reuse_kv=[True, False, True],
+            prefix_lens=[0, 0, 8],
+            extend_lens=[4, 3, 4],
+        )
+        with mock.patch.object(
+            allocation, "_gather_reused_block_locs", wraps=_gather_reused_block_locs
+        ) as spy:
+            self._run(min_rows=2, **kwargs)
+            self.assertEqual(spy.call_count, 1)
+            self._run(min_rows=3, **kwargs)
+            self.assertEqual(spy.call_count, 1)
+            self._run(min_rows=-1, **kwargs)
+            self.assertEqual(spy.call_count, 1)
+
+    def test_reuse_rows_of_unequal_length_fall_back_per_row(self):
+        # Rows of different block_len cannot share one flat index, so the
+        # caller must decline to batch them. If that guard is dropped the
+        # gather reshapes against the wrong width and this diverges.
+        self._assert_batching_is_transparent(
+            reuse_kv=[True, False, True],
+            prefix_lens=[0, 0, 8],
+            extend_lens=[4, 3, 8],
+        )
+
+
+class TestPagedKvReuseBranch(CustomTestCase):
+    """The paged fresh-allocation branch: reuse rows book only their prefix,
+    and the last_loc filler is one shared [-1] tensor, created only when a row
+    with an empty prefix actually needs it."""
+
+    def _run_paged(self, *, reuse_kv, prefix_lens, extend_lens, prefix_tensors):
+        batch = _make_batch(
+            reuse_kv=reuse_kv, prefix_lens=prefix_lens, extend_lens=extend_lens
+        )
+        batch.seq_lens_cpu = torch.tensor(
+            [p + e for p, e in zip(prefix_lens, extend_lens)], dtype=torch.int64
+        )
+        self._storage = batch.tree_cache.token_to_kv_pool_allocator.storage
+        with envs.SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.override(-1):
+            return _alloc_extend_loc_with_kv_reuse(
+                batch,
+                reuse_kv,
+                prefix_tensors,
+                torch.tensor(list(range(len(reuse_kv))), dtype=torch.int64),
+                torch.tensor(prefix_lens, dtype=torch.int64),
+                torch.tensor(extend_lens, dtype=torch.int64),
+                torch.tensor(list(range(len(reuse_kv))), dtype=torch.int64),
+                4,
+            )
+
+    def _filler_creations(self, fn):
+        real_tensor = torch.tensor
+        created = []
+
+        def spy(data, *args, **kwargs):
+            if isinstance(data, list) and data == [-1]:
+                created.append(1)
+            return real_tensor(data, *args, **kwargs)
+
+        with mock.patch.object(torch, "tensor", new=spy):
+            out = fn()
+        return len(created), out
+
+    def test_no_empty_prefix_creates_no_filler(self):
+        creations, out = self._filler_creations(
+            lambda: self._run_paged(
+                reuse_kv=[True, False],
+                prefix_lens=[8, 4],
+                extend_lens=[4, 3],
+                prefix_tensors=[
+                    torch.arange(8, dtype=torch.int64),
+                    torch.arange(4, dtype=torch.int64),
+                ],
+            )
+        )
+        self.assertEqual(creations, 0)
+        self.assertEqual(out.shape[0], 7)
+
+    def test_reuse_rows_book_only_their_prefix_with_the_paged_allocator(self):
+        # A reuse row's retained block already holds pages; passing
+        # prefix + extend as its length would book those pages a second time.
+        self._run_paged(
+            reuse_kv=[True, False],
+            prefix_lens=[8, 4],
+            extend_lens=[4, 3],
+            prefix_tensors=[
+                torch.arange(8, dtype=torch.int64),
+                torch.arange(4, dtype=torch.int64),
+            ],
+        )
+        self.assertEqual(self._storage.last_extend_seq_lens, [8, 7])
+
+    def test_empty_prefixes_share_one_filler(self):
+        creations, out = self._filler_creations(
+            lambda: self._run_paged(
+                reuse_kv=[False, False, True],
+                prefix_lens=[0, 0, 8],
+                extend_lens=[3, 2, 4],
+                prefix_tensors=[
+                    torch.empty(0, dtype=torch.int64),
+                    torch.empty(0, dtype=torch.int64),
+                    torch.arange(8, dtype=torch.int64),
+                ],
+            )
+        )
+        self.assertEqual(creations, 1)
+        self.assertEqual(out.shape[0], 9)
+
+
+if __name__ == "__main__":
+    unittest.main()
