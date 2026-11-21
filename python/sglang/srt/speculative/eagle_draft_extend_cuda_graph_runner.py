@@ -12,6 +12,10 @@ from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -46,12 +50,6 @@ from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
-from sglang.srt.utils import (
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-)
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
@@ -418,6 +416,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         return is_bs_supported
 
+    def _run_capture_tail_hooks(self, out, forward_batch, num_tokens: int) -> None:
+        """The model runner's capture tail hooks, after the draft-extend forward of a
+        captured batch size (under the runner's own attention backend)."""
+        for capture_hook in self.model_runner.capture_tail_hooks:
+            capture_hook(self, out, forward_batch, num_tokens)
+
     def capture_one_shape(
         self,
         size: int,
@@ -537,6 +541,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
         def run_once():

@@ -49,6 +49,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.deep_gemm.set_num_sms = MagicMock(
             side_effect=lambda num_sms: setattr(self.deep_gemm, "num_sms", num_sms)
         )
+        self.deep_gemm.destroy_localizer = MagicMock()
         max_num_sms = patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=130)
         self.max_num_sms = max_num_sms.start()
         self.addCleanup(max_num_sms.stop)
@@ -174,6 +175,26 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         buf = self._get_test_buffer(object())
         self.assertEqual(buf, 132)
         deep_gemm.set_num_sms.assert_not_called()
+
+    def test_new_buffer_stops_mlopart_helper_on_sm100_only(self):
+        """SM100 must stop the MLOPart helper, which blocks cuda-checkpoint, once per
+        new buffer. SM90 must not call it, since that would start the helper."""
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: object()
+        )
+        for sm100, expected_calls in ((False, 0), (True, 1)):
+            with (
+                self.subTest(sm100=sm100),
+                patch.object(mega_moe, "is_sm100_supported", return_value=sm100),
+            ):
+                mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+                self.deep_gemm.destroy_localizer.reset_mock()
+                group = object()
+                self._get_test_buffer(group)
+                self._get_test_buffer(group)
+                self.assertEqual(
+                    self.deep_gemm.destroy_localizer.call_count, expected_calls
+                )
 
     def test_buffer_allocation_failure_restores_sm_budget(self):
         deep_gemm = self.deep_gemm
@@ -702,6 +723,30 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                             torch.tensor([[0.5 * scale] * 2] * 3 + [[0.0, 0.0]]),
                         )
 
+    def test_mega_gate_row_masks_rebuilt_inside_graph_capture(self):
+        # The decoder replay tail captures after eager warm-ups in the same forward.
+        bound = torch.tensor([3], dtype=torch.int32)
+        forward_batch = SimpleNamespace()
+
+        def masks(capturing):
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=capturing
+            ):
+                return mega_gate_runtime._gate_row_masks(
+                    None, 4, bound, None, "cpu", forward_batch
+                )[0]
+
+        with (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True),
+            mega_gate_runtime.mega_gate_forward_scope(forward_batch),
+        ):
+            eager = masks(False)
+            self.assertIs(masks(False), eager)
+            captured = masks(True)
+            self.assertIsNot(captured, eager)
+            self.assertIs(masks(True), captured)
+        torch.testing.assert_close(captured, torch.tensor([True, True, True, False]))
+
     def test_mega_gate_maps_eplb_in_kernel_and_records_from_buffer(self):
         moe = self._mega_gate_moe()
         hidden = torch.ones((4, 256), dtype=torch.bfloat16)
@@ -817,6 +862,16 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
+
+    def test_shape_check_mxf4_takes_intermediate_multiples_of_128(self):
+        # The MXFP4 intermediate SFs are MN-major like fp8xfp4's, so DeepSeek-V4.1-Flash's
+        # 2304 (not a multiple of 512) is accepted; the input SF rows still need hidden % 512.
+        mega_moe.check_mega_moe_shapes(5120, 2304, "mxf4xmxf4")
+        mega_moe.check_mega_moe_shapes(512, 128, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 128"):
+            mega_moe.check_mega_moe_shapes(5120, 2240, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "hidden_size.*multiple of 512"):
+            mega_moe.check_mega_moe_shapes(4864, 2304, "mxf4xmxf4")
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)

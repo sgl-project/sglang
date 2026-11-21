@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
 SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
@@ -121,10 +120,10 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     if x.is_cuda and not _UNCACHED_STAGING and not torch.compiler.is_compiling():
         from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
             IPC_A2A_MULTI,
-            ipc_a2a_multi_ready,
+            plain_exchange_ready,
         )
 
-        if ipc_a2a_multi_ready(ulysses_pg):
+        if plain_exchange_ready(ulysses_pg, x.numel() * x.element_size()):
             world_size = torch.distributed.get_world_size(group=ulysses_pg)
             received = IPC_A2A_MULTI.exchange(x.view(world_size, -1))
             if received is not None:
@@ -905,10 +904,6 @@ def ring_attn(
         output = torch.permute(output, [0, 2, 1, 3])
         return output, softmax_lse, *rest
 
-    # Starting from torch 2.6.0, _templated_ring_attention expects an integer
-    # segment_id for the attention function.
-    use_segment_id = torch_release >= (2, 6)
-
     attn_kwargs = dict(
         op=attn_callable_adapter,
         dropout_p=dropout_p,
@@ -919,17 +914,7 @@ def ring_attn(
         group=ring_pg,  # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
     )
 
-    if use_segment_id:
-        # For torch >= 2.6, segment_id is required. The value '1' is a placeholder
-        # as we are not using complex segmentation features.
-        out, lse, *_ = _templated_ring_attention(
-            seq_dim=1,  # segment_id
-            **attn_kwargs,
-        )
-    else:
-        out, lse, *_ = _templated_ring_attention(
-            **attn_kwargs,
-        )
+    out, lse, *_ = _templated_ring_attention(seq_dim=1, **attn_kwargs)
 
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])
@@ -1022,9 +1007,15 @@ def _ring_attention_varlen(
 
     # K and V travel as one stacked buffer so each hop is a single P2P
     # send/recv pair instead of two; stacking also makes the buffer
-    # contiguous, so no separate .contiguous() call is needed.
-    kv0 = torch.stack((k, v))
-    kv_bufs = [kv0, torch.empty_like(kv0)]
+    # contiguous, so no separate .contiguous() call is needed. The pair is
+    # reused across calls: a fresh pair stays held for the P2P stream until the
+    # GPU reaches it, and with the host layers ahead that is one pair per
+    # queued layer (MiniMax-H3 on 2xMI350X runs out of device memory in 4 steps).
+    kv_bufs = [
+        _a2a_staging_buffer(f"ring_kv_{i}", (2, *k.shape), k.dtype, k.device)
+        for i in range(2)
+    ]
+    torch.stack((k, v), out=kv_bufs[0])
     cur = 0
 
     out_acc: torch.Tensor | None = None

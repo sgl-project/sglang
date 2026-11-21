@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
+from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
@@ -40,10 +41,8 @@ from sglang.srt.speculative.uno_utils import (
     sample_uno_candidates,
     sample_uno_clean_root,
 )
-from sglang.srt.utils.common import (
-    get_available_gpu_memory,
-    log_info_on_rank0,
-)
+from sglang.srt.utils.device import get_available_gpu_memory
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -264,10 +263,8 @@ class UnoWorkerV2(BaseSpecWorker):
 
         penalizer = sampling_info.penalizer_orchestrator
         penalties_active = (
-            (penalizer is not None and penalizer.is_required)
-            or sampling_info.acc_additive_penalties is not None
-            or sampling_info.acc_scaling_penalties is not None
-        )
+            penalizer is not None and penalizer.is_required
+        ) or has_acc_penalties(sampling_info)
         if penalties_active:
             raise NotImplementedError("UNO does not support sampling penalties.")
 

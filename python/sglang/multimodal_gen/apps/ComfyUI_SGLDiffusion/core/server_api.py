@@ -252,7 +252,8 @@ class SGLDiffusionServerAPI:
 
         ``progress_callback`` gets the job's ``progress`` (0-100) on each poll.
         ``check_interrupt`` is called between polls and may raise to stop
-        waiting; the server has no abort yet, so the job itself keeps running.
+        waiting; the server job keeps running unless it is cancelled with
+        ``DELETE /v1/videos/{id}``.
 
         Args:
             prompt: Text prompt for video generation
@@ -656,25 +657,3 @@ class SGLDiffusionServerAPI:
             return response.json()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
-
-
-if __name__ == "__main__":
-    api = SGLDiffusionServerAPI(
-        base_url="http://localhost:30010/v1", api_key="sk-proj-1234567890"
-    )
-    model_info = api.get_model_info()
-    print(api.get_model_info())
-    if model_info.get("task_type") == "T2V" or model_info.get("task_type") == "I2V":
-        print(
-            api.generate_video(
-                prompt="A calico cat playing a piano on stage",
-                num_inference_steps=1,
-                size="480x480",
-            )
-        )
-    else:
-        print(
-            api.generate_image(
-                prompt="A calico cat playing a piano on stage", size="1024x1024"
-            )
-        )

@@ -2,7 +2,7 @@ import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 from sglang.srt.utils import get_compiler_backend, is_npu
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _is_npu = is_npu()
 
@@ -49,11 +49,11 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             .unsqueeze_(1)
         )
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
-        self.cumulated_repetition_penalties.scatter_(
-            dim=1,
-            index=output_ids.unsqueeze(1),
-            src=self.repetition_penalties,
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
+        self.cumulated_repetition_penalties[req_indices, output_ids] = (
+            self.repetition_penalties[req_indices, 0]
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

@@ -53,7 +53,7 @@ OTHER_ARGS = [
     "--reasoning-parser",
     "glm45",
     "--tool-call-parser",
-    "glm45",
+    "glm",
 ]
 
 

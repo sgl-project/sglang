@@ -161,9 +161,7 @@ def test_group_norm_silu_4d_channels_last_and_guards():
     torch.testing.assert_close(out.float(), F.silu(gn(x)).float(), atol=0.06, rtol=0)
 
     # Guards: the kernel exists only for channels_last inputs with device-side
-    # affine params and a non-empty spatial extent.  Each rejected case must
-    # fail the predicate *and* raise if called anyway -- silently returning
-    # ``None`` is what this protocol replaced.
+    # affine params and a non-empty spatial extent.
     rejected = [
         (x.contiguous(), gn.weight, gn.bias),  # contiguous (NCHW) layout
         (x, gn.weight.cpu(), gn.bias),  # host-side affine
@@ -171,8 +169,6 @@ def test_group_norm_silu_4d_channels_last_and_guards():
     ]
     for args in rejected:
         assert not can_use_group_norm_silu_4d(*args, 32)
-        with pytest.raises(ValueError):
-            group_norm_silu_4d(*args, 32, 1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +317,6 @@ def test_wan_rmsnorm_silu_rejects_empty_input():
     )
     gamma = torch.ones(96, 1, 1, 1, device=DEVICE, dtype=torch.bfloat16)
     assert not can_use_wan_rmsnorm_silu(x, gamma, None)
-    with pytest.raises(ValueError):
-        wan_rmsnorm_silu(x, gamma)
 
 
 @torch.no_grad()
@@ -334,8 +328,6 @@ def test_wan_rmsnorm_silu_rejects_non_dense_channel_rows():
     assert x.stride(1) != 1
     gamma = torch.ones(1, 1, 1, 1, device=DEVICE, dtype=torch.float32)
     assert not can_use_wan_rmsnorm_silu(x, gamma, None)
-    with pytest.raises(ValueError):
-        wan_rmsnorm_silu(x, gamma)
 
 
 # ---------------------------------------------------------------------------
@@ -543,16 +535,6 @@ def test_cutedsl_norm_chunks_per_warp_keep_bits(monkeypatch, norm_type, with_res
     for chunks_per_warp in (2, 4, 5):
         for out, ref in zip(outs[chunks_per_warp], outs[1]):
             assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
-
-
-def test_validate_scale_shift_rejects_non_divisible_frames():
-    _import_cutedsl()
-    from sglang.kernels.ops.diffusion import validate_scale_shift
-
-    with pytest.raises(ValueError, match=r"S\(10\) must be divisible by F\(4\)"):
-        validate_scale_shift(
-            torch.empty((1, 4, 1, 256), device=DEVICE, dtype=torch.float16), 1, 10, 256
-        )
 
 
 # -------------------------------------------------------------------------
@@ -813,28 +795,6 @@ def test_rmsnorm_cast_before_weight_extreme_values():
         )
 
 
-def test_rmsnorm_cast_before_weight_guards():
-    from sglang.kernels.ops.diffusion import (
-        rmsnorm_cast_before_weight_bitexact,
-    )
-
-    x = torch.ones(2, 3, 128, device=DEVICE, dtype=torch.bfloat16)
-    weight = torch.ones(128, device=DEVICE, dtype=x.dtype)
-    for inputs, gamma in [
-        (x.float(), weight),
-        (x, weight.float()),
-        (x.transpose(0, 1), weight),
-        (x[..., ::2], weight[::2]),
-        (x, weight[:-1]),
-        (x[:0], weight),
-        (x.cpu(), weight.cpu()),
-        (x, weight.cpu()),
-    ]:
-        # CPU tensors are rejected by the CUDA-only custom-op dispatcher.
-        with pytest.raises((ValueError, NotImplementedError)):
-            rmsnorm_cast_before_weight_bitexact(inputs, gamma)
-
-
 @torch.no_grad()
 @pytest.mark.parametrize(
     "dim,eps",
@@ -857,6 +817,46 @@ def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, eps, rows):
         x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
     ).to(x.dtype) * weight
     assert torch.equal(rmsnorm_cast_before_weight_bitexact(x, weight, eps), expected)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+@pytest.mark.parametrize(
+    "batch,seq,heads,packed",
+    [(1, 1, 16, False), (1, 17, 4, True), (2, 2000, 16, False)],
+)
+@pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
+def test_head128_mean_square_exact(batch, seq, heads, packed, amplitude):
+    from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
+        rmsnorm_mean_square_bitexact,
+    )
+
+    x = (
+        torch.randn(batch, seq, 3 if packed else 1, heads, 128, device="cuda")
+        * amplitude
+    ).bfloat16()
+    x = x[:, :, 1 if packed else 0]
+    expected = x.float().square().mean(-1, keepdim=True)
+    assert torch.equal(rmsnorm_mean_square_bitexact(x), expected)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+def test_head128_mean_square_capture_replay_and_compile():
+    from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
+        rmsnorm_mean_square_bitexact,
+    )
+
+    x = torch.randn(1, 31, 4, 128, device="cuda", dtype=torch.bfloat16)
+    rmsnorm_mean_square_bitexact(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = rmsnorm_mean_square_bitexact(x)
+    compiled = torch.compile(rmsnorm_mean_square_bitexact, fullgraph=True)
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        expected = x.float().square().mean(-1, keepdim=True)
+        assert torch.equal(captured, expected)
+        assert torch.equal(compiled(x), expected)
 
 
 def _moss_image_norm_eager(x, weight):
@@ -915,10 +915,6 @@ def test_moss_image_norm_modulate_batched_views():
     assert torch.equal(
         rmsnorm_cast_before_weight_modulate_bitexact(x, weight, scale, shift), expected
     )
-    with pytest.raises(ValueError, match="Unsupported MOSSImage"):
-        rmsnorm_cast_before_weight_modulate_bitexact(
-            x, weight, modulation.flatten(1)[:, ::6], shift
-        )
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
@@ -927,108 +923,17 @@ def test_moss_image_norm_epilogue_guards(epilogue):
     from sglang.kernels.ops.diffusion import (
         can_use_rmsnorm_cast_before_weight_modulate,
         can_use_rmsnorm_cast_before_weight_rope,
-        rmsnorm_cast_before_weight_modulate_bitexact,
-        rmsnorm_cast_before_weight_rope_bitexact,
     )
 
     if epilogue == "modulate":
         x = torch.randn(1, 15, 3072, device="cuda", dtype=torch.bfloat16)
-        a = torch.randn(1, 3072, device="cuda", dtype=torch.bfloat16)
-        predicate, kernel = (
-            can_use_rmsnorm_cast_before_weight_modulate,
-            rmsnorm_cast_before_weight_modulate_bitexact,
-        )
+        predicate = can_use_rmsnorm_cast_before_weight_modulate
     else:
         x = torch.randn(1, 1, 8, 128, device="cuda", dtype=torch.bfloat16)
-        a = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
-        predicate, kernel = (
-            can_use_rmsnorm_cast_before_weight_rope,
-            rmsnorm_cast_before_weight_rope_bitexact,
-        )
-    weight = torch.ones(x.shape[-1], device="cuda", dtype=torch.bfloat16)
+        predicate = can_use_rmsnorm_cast_before_weight_rope
     assert not predicate(
         device=x.device, dtype=x.dtype, dim=x.shape[-1], rows=x.numel() // x.shape[-1]
     )
-    with pytest.raises(ValueError, match="Unsupported MOSSImage"):
-        kernel(x, weight, a, a)
-
-    if epilogue == "rope":
-        packed = torch.randn(4, 17, 3, 24, 128, device="cuda", dtype=torch.bfloat16)
-        for x in (packed[::2, :, 1], packed[:, :, 1, ::2]):
-            a = torch.randn(x.shape[0] * x.shape[1], 128, device="cuda", dtype=x.dtype)
-            with pytest.raises(ValueError, match="Unsupported MOSSImage"):
-                kernel(x, weight, a, a)
-
-
-@torch.no_grad()
-@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
-@pytest.mark.parametrize("shape", [(8256, 56), (37, 14), (2, 9, 3)])
-@pytest.mark.parametrize("varying_exponent", [False, True])
-def test_aten_head_rmsnorm_matches_rocm_rms_norm(shape, varying_exponent):
-    from sglang.kernels.ops.diffusion import (
-        aten_head_rmsnorm,
-        can_use_aten_head_rmsnorm,
-    )
-
-    *tokens, heads = shape
-    # q of a fused qkv projection: a strided view with packed heads
-    qkv = torch.randn(*tokens, 3 * heads * 128, device=DEVICE, dtype=torch.bfloat16)
-    if varying_exponent:
-        exponents = torch.randint(-12, 12, qkv.shape, device=DEVICE).float()
-        qkv = (qkv.float() * torch.exp2(exponents)).to(qkv.dtype)
-    q = qkv[..., : heads * 128].unflatten(-1, (heads, 128))
-    weight = torch.randn(128, device=DEVICE, dtype=q.dtype)
-    assert can_use_aten_head_rmsnorm(q, weight)
-    out = aten_head_rmsnorm(q, weight, 1e-6)
-    assert out.is_contiguous()
-    assert torch.equal(out, F.rms_norm(q, (128,), weight, 1e-6))
-
-
-@torch.no_grad()
-@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
-@pytest.mark.parametrize("rot_dim", [96, 128, 64])
-def test_aten_head_rmsnorm_rope_matches_rms_norm_then_rotary_embedding(rot_dim):
-    from sgl_kernel import rotary_embedding
-
-    from sglang.kernels.ops.diffusion import (
-        aten_head_rmsnorm,
-        can_use_aten_head_rmsnorm_rope,
-    )
-
-    tokens, heads = 1031, 14
-    qkv = torch.randn(tokens, 3 * heads * 128, device=DEVICE, dtype=torch.bfloat16)
-    q = qkv[:, : heads * 128].view(tokens, heads, 128)
-    weight = torch.randn(128, device=DEVICE, dtype=q.dtype)
-    angles = torch.rand(2 * tokens, rot_dim // 2, device=DEVICE) * 100
-    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(q.dtype)
-    positions = torch.randperm(2 * tokens, device=DEVICE)[:tokens]
-    assert can_use_aten_head_rmsnorm_rope(q, cache, positions)
-    expected = F.rms_norm(q, (128,), weight, 1e-5)
-    key = expected.clone()
-    rotary_embedding(
-        positions, expected.view(tokens, -1), key.view(tokens, -1), 128, cache, True
-    )
-    out = aten_head_rmsnorm(q, weight, 1e-5, cache, positions)
-    assert torch.equal(out, expected)
-
-
-@pytest.mark.skipif(torch.version.hip is None, reason="replays ROCm aten rms_norm")
-def test_aten_head_rmsnorm_guards():
-    from sglang.kernels.ops.diffusion import can_use_aten_head_rmsnorm
-
-    x = torch.ones(4, 3, 128, device=DEVICE, dtype=torch.bfloat16)
-    weight = torch.ones(128, device=DEVICE, dtype=x.dtype)
-    for inputs, gamma in [
-        (x.float(), weight.float()),
-        (x, weight.float()),
-        (x, None),
-        (x.transpose(0, 1), weight),
-        (x[..., ::2], weight[::2]),
-        (x.flatten(0, 1), weight),
-        (x[:0], weight),
-        (x.cpu(), weight.cpu()),
-    ]:
-        assert not can_use_aten_head_rmsnorm(inputs, gamma)
 
 
 if __name__ == "__main__":

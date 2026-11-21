@@ -14,6 +14,7 @@ The overfull-bin rescan is shared by CUDA and ROCm, so the tie and graph-replay
 cases run on both.
 """
 
+import sys
 import unittest
 
 import pytest
@@ -27,7 +28,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: compile the HIP JIT path and exercise wave64 graph replay.
-register_amd_ci(est_time=90, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=90, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Test requires a GPU")
@@ -233,4 +234,4 @@ def test_graph_replay_short_rows_page_mapping_and_tail(long_length):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__, "-v"]))

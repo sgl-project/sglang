@@ -2,7 +2,7 @@
 
 Validates safetensors/bin files and shard completeness, and repairs the HF cache
 by deleting what has to be re-downloaded. `weight_utils.py` gates every entry
-point here behind `is_in_ci()`; regular users take the plain download path.
+point here behind `SGLANG_IS_IN_CI`; regular users take the plain download path.
 """
 
 import glob as glob_module
@@ -861,9 +861,9 @@ def ci_validate_and_clean_hf_cache(model_path: str) -> None:
     HFRunner calls transformers' from_pretrained() directly, which bypasses the
     validation in this module; a corrupted cache surfaces as "EOF while parsing".
     """
-    from sglang.utils import is_in_ci
+    from sglang.srt.environ import envs
 
-    if not is_in_ci():
+    if not envs.SGLANG_IS_IN_CI.get():
         return
 
     # Skip for local paths
