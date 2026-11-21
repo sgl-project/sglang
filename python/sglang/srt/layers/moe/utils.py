@@ -117,14 +117,15 @@ class AscendOpsConfig:
     - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
       or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
     - ``decode``: ``low_latency`` (EP MC2 dispatch_v2 -> gmm -> activation ->
-      gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
+      gmm -> combine_v2).
+    - Either phase can select ``fused_op`` (MegaMoE dispatch, FFN and combine).
     - ``ll_dispatch_alg`` / ``ll_combine_alg``: the ``comm_alg`` handed to the
       MC2 dispatch/combine ops of the ``low_latency`` path. The defaults are the
       ones recommended by the operator owners (full-mesh dispatch, default
       combine).
     """
 
-    PREFILL_CHOICES = ("allgather", "alltoallv")
+    PREFILL_CHOICES = ("allgather", "alltoallv", "fused_op")
     DECODE_CHOICES = ("low_latency", "fused_op")
 
     prefill: str = "alltoallv"
@@ -143,11 +144,10 @@ class AscendOpsConfig:
                 f"invalid moe-ascend-ops-config decode mode {self.decode!r}; "
                 f"expected one of {self.DECODE_CHOICES}"
             )
-        if self.decode == "fused_op":
-            raise ValueError(
-                "moe-ascend-ops-config decode mode 'fused_op' is not implemented; "
-                "use 'low_latency'"
-            )
+
+    @property
+    def uses_fused_op(self) -> bool:
+        return "fused_op" in (self.prefill, self.decode)
 
     @classmethod
     def from_json_str(cls, s: Optional[str]) -> AscendOpsConfig:

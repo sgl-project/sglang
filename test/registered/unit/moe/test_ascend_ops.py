@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     MoeA2ABackend,
 )
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.srt.models.deepseek_common.moe_transport import MoeRowTransport
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -39,11 +40,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestAscendOpsConfig(CustomTestCase):
-    # Protects the configuration boundary from accepting an advertised but
-    # unimplemented decode implementation.
-    def test_fused_op_is_rejected_during_config_validation(self):
-        with self.assertRaisesRegex(ValueError, "fused_op.*not implemented"):
-            AscendOpsConfig.from_json_str('{"decode":"fused_op"}')
+    def test_fused_op_can_be_selected_independently(self):
+        prefill = AscendOpsConfig.from_json_str('{"prefill":"fused_op"}')
+        decode = AscendOpsConfig.from_json_str('{"decode":"fused_op"}')
+        self.assertEqual((prefill.prefill, prefill.decode), ("fused_op", "low_latency"))
+        self.assertEqual((decode.prefill, decode.decode), ("alltoallv", "fused_op"))
 
     # Protects the default path used when no Ascend Ops config is supplied.
     def test_low_latency_is_the_default_decode_mode(self):
@@ -56,6 +57,30 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
         dispatcher.quant_config = quant_config or {}
         return dispatcher
+
+    def test_prefill_graph_uses_prefill_capacity_with_extend_flag_false(self):
+        # Prefill graph capture clears the extend flag. Without the graph
+        # scope check, dispatch selects the smaller decode buffer.
+        dispatcher = self._dispatcher_for_quant_mode()
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(
+            prefill="fused_op", decode="fused_op"
+        )
+        dispatcher._fused_prefill_capacity = 4
+        dispatcher._fused_decode_capacity = 1
+        dispatcher.ep_group = object()
+        hidden_states = torch.zeros((2, 4))
+        topk_output = (torch.ones((2, 1)), torch.zeros((2, 1), dtype=torch.int32), None)
+
+        with (
+            get_forward().scoped(is_extend_in_batch=False),
+            get_flags().dp.override(enabled=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "decode.*capacity of 1"):
+                dispatcher.dispatch(hidden_states, topk_output)
+            with prefill_graph_scope(full_graph=True):
+                result = dispatcher.dispatch(hidden_states, topk_output)
+        self.assertEqual(result.forward_state.capacity, 4)
+        self.assertIs(result.hidden_states, hidden_states)
 
     # Protects mode-specific quantization settings from being ignored in favor
     # of the shared dispatcher dtype.
