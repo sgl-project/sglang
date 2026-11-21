@@ -29,6 +29,7 @@ from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
+    MoriKVReceiver,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
 )
@@ -470,6 +471,39 @@ class TestMoriAuxLayout(CustomTestCase):
         receive(b"\x02" * 8, room=b"12")
         self.assertEqual(bytes(rows), b"\x02" * 8 + bytes(8))
         self.assertEqual(manager.request_status[12], KVPoll.WaitingForInput)
+
+    def test_an_aux_item_dropped_after_success_fails_the_request(self):
+        """Metadata and Success travel on separate sockets, so Success can arrive
+        first and the receiver caches it while it waits for the metadata. An
+        item dropped after that must still fail the request."""
+        rows = (ctypes.c_ubyte * 16)()
+        manager = _manager()
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[ctypes.addressof(rows)], aux_item_lens=[8]
+        )
+        manager.addr_to_rooms_tracker = defaultdict(set)
+        manager.prefill_response_tracker = {}
+        receiver = MoriKVReceiver(manager, "prefill:8998", 11)
+        manager.update_status(11, KVPoll.WaitingForInput)
+        manager.update_status(11, KVPoll.Success)
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+        data = b"\x01" * 16
+        with patch("sglang.srt.disaggregation.mori.conn.logger.error"):
+            manager._handle_aux_data(
+                [
+                    MoriKVManager.AUX_DATA_HEADER,
+                    b"11",
+                    b"0",
+                    b"0",
+                    struct.pack(">I", len(data)),
+                    data,
+                ]
+            )
+
+        self.assertEqual(bytes(rows), bytes(16))
+        self.assertEqual(receiver.poll(), KVPoll.Failed)
+        self.assertIn("AUX_DATA rejected", manager.failure_records[11])
 
 
 if __name__ == "__main__":
