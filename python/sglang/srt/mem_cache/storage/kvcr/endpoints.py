@@ -7,7 +7,6 @@ source lease or prove that a transfer completed.
 """
 
 import ipaddress
-import socket
 from urllib.parse import urlsplit
 
 
@@ -48,19 +47,10 @@ def require_routable_host(host: str) -> None:
     abbreviated IPv4 forms such as 127.1 and IPv4-mapped IPv6. DNS names are
     not resolved.
     """
-    literal = host[1:-1] if host.startswith("[") else host
-    if literal == "*" or literal.rstrip(".").lower() == "localhost":
-        raise ValueError("KVCR control_advertise_host must not be loopback")
-    try:
-        address = ipaddress.ip_address(literal)
-    except ValueError:
-        try:
-            address = ipaddress.IPv4Address(socket.inet_aton(literal))
-        except OSError:
-            return
-    if address.version == 6 and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    if address.is_loopback or address.is_unspecified:
+    # Imported here: this module stays stdlib-only at import time.
+    from sglang.srt.utils.network import is_unreachable_host
+
+    if is_unreachable_host(host):
         raise ValueError("KVCR control_advertise_host must not be loopback")
 
 

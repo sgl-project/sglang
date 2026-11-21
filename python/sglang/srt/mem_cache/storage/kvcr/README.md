@@ -1,7 +1,8 @@
 # KVCR HiCacheStorage backend
 
 This optional backend uses KVCR's indexed-region public API and NIXL/UCX
-transport. Install KVCR 0.2.0 or later separately; selecting another
+transport. Install KVCR 0.2.0 or later separately (PyPI's latest stable
+release, 0.1.1, is too old and is rejected at startup); selecting another
 HiCache backend does not import KVCR.
 
 ## Ownership and data path
@@ -40,9 +41,25 @@ offsets and be reachable by peers. The control endpoint's TCP scheme does not
 select the NIXL payload transport. The backend currently requires PP=1 and
 DCP=1.
 
-An optional positive integer `startup_timeout_seconds` requires a KVCR build
-that accepts it. Omitting it preserves KVCR's normal startup budget. Transfer
-and abandonment deadlines are separate from this initialization setting.
+Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
+
+- `control_advertise_host` (`127.0.0.1`): host peers and routers dial for this
+  worker's control endpoint.
+- `control_host` (`0.0.0.0`): host the control endpoint binds.
+- `control_port` (`32100`): base control port.
+- `nixl_listen_port` (`control_port + 1024`): base NIXL listen port.
+- `local_dram_bytes` (8 GiB): KVCR DRAM per rank; each pool gets the same
+  fraction of its host pages (bytes split in proportion to host bytes).
+- `local_dram_pool_pages` (`{}`): `{pool name: pages}`, an integer of at least
+  1 per named pool, overriding that split.
+- `operation_timeout_ms` (`30000`) and `abandon_timeout_ms` (`60000`): KVCR's
+  transfer and abandonment deadlines; KVCR requires abandonment to be at least
+  twice the operation deadline.
+- `enable_remote_hint` and `publish_inventory` (`false`): see below.
+
+An optional positive integer `startup_timeout_seconds` overrides KVCR's startup
+budget; omitting it keeps KVCR's default. Unknown keys are ignored with a
+warning.
 
 This version does not report backend transfer metrics. With
 `--enable-storage-metrics`, only HiCache's own prefetch and backup counters are
@@ -100,7 +117,9 @@ KV events must be on, with a ZMQ publisher in Dynamo format, e.g.
 state agent's host as well. Startup fails for another format, a null or
 connect-mode publisher, an IPC endpoint or a loopback bind.
 
-The KVCR-owned events go out on the worker's ordinary KV event stream. Only
+The KVCR-owned events go out on the worker's ordinary KV event stream: the
+`/owner/<id>` topic suffix only separates engine incarnations, so any
+subscriber to the configured topic (or to all topics) receives them. Only
 Dynamo's state agent reads their `ownership` today; sgl-router and
 sgl-kv-indexer ignore it and would file KVCR DRAM pages as the worker's own
 HiCache host pages. Do not combine `publish_inventory` with sgl-router KV
@@ -154,14 +173,14 @@ then routes on, and hints from, actual KVCR residency, and a worker fetches
 hinted pages from that peer's KVCR DRAM. See Dynamo's SGLang README
 ("KVCR-owned inventory") and router docs ("KV Fetch Hints").
 
-Limits of this version: each worker runs on one node (`--nnodes 1`; peers may
-be on other hosts), PP=1, no DCP, one tokenizer worker, and not replica DP
-combined with attention DP; the backend must be configured at launch (no
-runtime attach or detach). Inventory is process-local and starts empty: each
-page is announced once, so pages stored before the worker attaches to the state
-agent stay unknown to the router, and a dropped event (a ZMQ sequence gap)
-stops the inventory until the worker restarts. Warm KVCR only after the worker
-is attached.
+Limits of this version: with remote hints or inventory, each worker runs on one
+node (`--nnodes 1`; peers may be on other hosts); PP=1, no DCP, one tokenizer
+worker, and not replica DP combined with attention DP; the backend must be
+configured at launch (no runtime attach or detach). Inventory is process-local
+and starts empty: each page is announced once, so pages stored before the
+worker attaches to the state agent stay unknown to the router, and a dropped
+event (a ZMQ sequence gap) stops the inventory until the worker restarts. Warm
+KVCR only after the worker is attached.
 
 ## Failure handling
 
@@ -169,7 +188,12 @@ Successful or missed operations must reach terminal native completion before
 HiCache can reuse their buffers. If native transfer state is uncertain, the
 worker exits (`os._exit(1)`) because HiCache cannot quarantine pages that NIXL
 may still access. Startup, progress and shutdown failures likewise must not
-release registered memory while native access may remain possible.
+release registered memory while native access may remain possible. The `kvcr`
+version and the options are checked when the backend is created, and the
+per-pool DRAM split when the cache attaches its host pools; memory
+registration and the control/NIXL binds happen on the first storage operation
+(a draft sidecar pool may still register until then), where a failure, e.g. a
+port already in use, terminates the worker.
 
 ## Validation
 
@@ -178,5 +202,9 @@ python test/registered/unit/mem_cache/test_kvcr_storage.py -v
 python test/registered/unit/mem_cache/test_kvcr_endpoints.py -v
 ```
 
-These CPU tests replace the native transport with a byte-copying fake. They do
-not exercise NIXL, model accuracy or inference performance.
+Most of these CPU tests replace the native transport with a byte-copying fake
+and always run. `TestRealKVCR` runs only on Linux with KVCR and its NIXL
+bindings installed, and is skipped otherwise: it starts real KVCR on host
+memory and checks a backup, query, local restore and inventory round trip.
+None of these tests cover peer reads across hosts, model accuracy or inference
+performance.

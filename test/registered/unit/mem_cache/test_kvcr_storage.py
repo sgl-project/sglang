@@ -1,4 +1,4 @@
-"""CPU contracts for indexed HiCache IO; the native NIXL transport is faked."""
+"""CPU contracts for indexed HiCache IO; NIXL is faked except in TestRealKVCR."""
 
 import atexit
 import copy
@@ -6,6 +6,7 @@ import ctypes
 import dataclasses
 import functools
 import hashlib
+import importlib.util
 import json
 import mmap
 import re
@@ -78,9 +79,16 @@ from sglang.srt.mem_cache.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, find_available_port
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def _kvcr_module():
+    """A kvcr>=0.2.0 stand-in: construction checks only this export."""
+    module = types.ModuleType("kvcr")
+    module.ZmqPeerControlChannel = object
+    return module
 
 
 class _HostPool:
@@ -244,21 +252,21 @@ class TestKVCRStorage(CustomTestCase):
             is_page_first_layout=True,
             model_name="glm-test",
         )
-        # A standalone replica: no DP controller numbered this process.
-        self.enterContext(get_parallel().override(dp_rank=None))
+        # A standalone replica on one node: no DP controller numbered this process.
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        types_module = types.ModuleType("kvcr.types")
+        types_module.MemoryRef, types_module.QueryStatus = _MemoryRef, _QueryStatus
+        self.stub = patch.dict(
+            "sys.modules",
+            {"kvcr": _kvcr_module(), "kvcr.types": types_module},
+        )
+        self.stub.start()
+        self.addCleanup(self.stub.stop)
         self.pool = _HostPool()
         self.backend = KVCRStore(self.config, self.pool)
         self.backend._namespace = storage_namespace(self.config, self.backend._layouts)
         self.transport = self.backend._runner = _CopyTransport(self.backend._layouts)
         self.keys = [f"{i + 1:064x}" for i in range(4)]
-        types_module = types.ModuleType("kvcr.types")
-        types_module.MemoryRef, types_module.QueryStatus = _MemoryRef, _QueryStatus
-        self.stub = patch.dict(
-            "sys.modules",
-            {"kvcr": types.ModuleType("kvcr"), "kvcr.types": types_module},
-        )
-        self.stub.start()
-        self.addCleanup(self.stub.stop)
 
     def test_rank_local_backup_preserves_upstream_writer_selection(self):
         controller = object.__new__(HiCacheController)
@@ -653,6 +661,105 @@ class TestKVCRStorage(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "startup_timeout_seconds"):
                     KVCRStore(self.config, self.pool)
 
+    def test_static_misconfiguration_fails_construction(self):
+        """A missing package or bad option fails the attach, not every later IO."""
+        for module in (None, types.ModuleType("kvcr")):
+            # Missing, or older than 0.2.0 (no top-level ZmqPeerControlChannel).
+            with (
+                self.subTest(kvcr=module),
+                patch.dict("sys.modules", {"kvcr": module}),
+                self.assertRaisesRegex(ImportError, "kvcr>=0.2.0"),
+            ):
+                KVCRStore(self.config, self.pool)
+        for extra, message in (
+            ({"local_dram_bytes": "8G"}, "local DRAM budget"),
+            ({"local_dram_bytes": 0}, "local DRAM budget"),
+            ({"local_dram_pool_pages": [1]}, "local DRAM budget"),
+            ({"local_dram_pool_pages": {"kv": 0}}, "local DRAM budget"),
+            ({"local_dram_pool_pages": {"kv": "100"}}, "local DRAM budget"),
+            ({"operation_timeout_ms": 40000}, "at least twice"),
+            ({"operation_timeout_ms": 0}, "operation_timeout_ms"),
+            ({"operation_timeout_ms": "30000"}, "operation_timeout_ms"),
+            ({"abandon_timeout_ms": 1000}, "at least twice"),
+            ({"nixl_listen_port": 70000}, "nixl_listen_port"),
+            ({"nixl_listen_port": True}, "nixl_listen_port"),
+            ({"control_port": 70000}, "control_port"),
+            ({"control_port": 65535}, "control-port range"),
+            ({"control_port": 40000, "nixl_listen_port": 40000}, "overlaps"),
+            ({"control_advertise_host": "0.0.0.0"}, "unspecified"),
+        ):
+            with (
+                self.subTest(extra=extra),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                KVCRStore(
+                    dataclasses.replace(self.config, extra_config=extra), self.pool
+                )
+        # A budget below one page fails the attach once the pools are known.
+        tiny = KVCRStore(
+            dataclasses.replace(self.config, extra_config={"local_dram_bytes": 1}),
+            self.pool,
+        )
+        self.addCleanup(tiny.close)
+        with self.assertRaisesRegex(ValueError, "cannot hold one page"):
+            tiny.on_host_pools_registered()
+        # Native startup (registration, binds) still waits for the first IO.
+        backend = KVCRStore(self.config, self.pool)
+        self.addCleanup(backend.close)
+        backend.on_host_pools_registered()
+        self.assertIsNone(backend._runner)
+        self.assertIsNone(backend._poll_thread)
+
+    def test_remote_hints_require_one_node(self):
+        """Peers address shard k from shard 0's host, so shards cannot span nodes."""
+        hinted = {"enable_remote_hint": True, "control_advertise_host": "10.0.0.1"}
+        with get_parallel().override(nnodes=2):
+            for extra in (hinted, {**hinted, "publish_inventory": True}):
+                with (
+                    self.subTest(extra=extra),
+                    self.assertRaisesRegex(ValueError, "--nnodes 1"),
+                ):
+                    KVCRStore(
+                        dataclasses.replace(self.config, tp_rank=1, extra_config=extra),
+                        self.pool,
+                    )
+            # Local-only KVCR has no cross-node addressing.
+            local = KVCRStore(self.config, self.pool)
+            self.addCleanup(local.close)
+
+    def test_unknown_extra_config_keys_warn(self):
+        module = "sglang.srt.mem_cache.storage.kvcr.kvcr_store"
+        with self.assertLogs(module, "WARNING") as logs:
+            typo = KVCRStore(
+                dataclasses.replace(
+                    self.config,
+                    extra_config={"enable_remote_hints": True, "control_port": 32100},
+                ),
+                self.pool,
+            )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("['enable_remote_hints']", logs.output[0])
+        self.assertFalse(typo.consumes_kv_hints())
+        documented = {
+            "enable_remote_hint": True,
+            "publish_inventory": False,
+            "control_advertise_host": "source.example",
+            "control_host": "0.0.0.0",
+            "control_port": 32100,
+            "nixl_listen_port": 33000,
+            "local_dram_bytes": 1 << 20,
+            "local_dram_pool_pages": {},
+            "operation_timeout_ms": 1000,
+            "abandon_timeout_ms": 2000,
+            "startup_timeout_seconds": 60,
+            # A generic HiCache key that decode offload passes through.
+            "prefetch_threshold": 256,
+        }
+        with self.assertNoLogs(module, "WARNING"):
+            KVCRStore(
+                dataclasses.replace(self.config, extra_config=documented), self.pool
+            )
+
     def test_logical_anchor_queries_intersect_physical_all_page_pools(self):
         """A DSv4 logical anchor proves nothing without its physical sidecars."""
         backend = KVCRStore(self.config, SimpleNamespace(kv_buffer=None))
@@ -694,8 +801,8 @@ class TestKVCRStorage(CustomTestCase):
         """A startup error cannot leave wait_complete behind a dead IO thread.
 
         A quiescent failure may unwind mappings, but a nonquiescent failure
-        must retain them until process exit. The unset optional deadline must
-        also work with older KVCR configuration constructors.
+        must retain them until process exit. An unset optional deadline keeps
+        KVCR's default.
         """
 
         class StartupError(RuntimeError):
@@ -765,7 +872,7 @@ class TestKVCRStorage(CustomTestCase):
                             [error_type is RuntimeError] * len(mappings),
                         )
                         if budget is None:
-                            self.assertNotIn("startup_timeout_seconds", captured[0])
+                            self.assertIsNone(captured[0]["startup_timeout_seconds"])
                         else:
                             self.assertEqual(
                                 captured[0]["startup_timeout_seconds"], budget
@@ -975,6 +1082,51 @@ class TestKVCRStorage(CustomTestCase):
         self.transport.completed = {11: {"one": True}, 12: {"two": True}}
         self.assertEqual(self.backend._wait(12), {"two": True})
         self.assertEqual(self.backend._wait(11), {"one": True})
+
+    def test_waiter_polls_its_own_completion(self):
+        """Without a poll thread, the waiter alone drives completion."""
+        results = [[], [], [(7, {"k": True})]]
+        with patch.object(
+            self.transport, "poll_completed", side_effect=results
+        ) as poll:
+            self.assertEqual(self.backend._wait(7), {"k": True})
+        self.assertEqual(poll.call_count, 3)
+
+    def test_peer_hint_no_retain_by_value(self):
+        """false/null carry no retention mark; anything else skips the fetch."""
+        for value, kept in (
+            (False, True),
+            (None, True),
+            (True, False),
+            ("false", False),
+            (0, False),
+        ):
+            info = HiCacheStorageExtraInfo(
+                extra_info={
+                    "kv_hints": {
+                        "protocol_version": "0.1",
+                        "actions": [
+                            {
+                                "action_type": "kv.fetch",
+                                "action_version": "1.0",
+                                "payload": {
+                                    "source_control_endpoint": "tcp://source:32000",
+                                    "block_hashes": [7],
+                                    "no_retain": value,
+                                },
+                            }
+                        ],
+                    }
+                }
+            )
+            with self.subTest(no_retain=value):
+                hint = peer_hint(info, 0)
+                if not kept:
+                    self.assertIsNone(hint)
+                    continue
+                payload = hint["actions"][0]["payload"]
+                self.assertEqual(payload["block_hashes"], [7])
+                self.assertNotIn("no_retain", payload)
 
     def test_hint_is_rank_aligned_and_discarded(self):
         info = HiCacheStorageExtraInfo(
@@ -1198,14 +1350,14 @@ class TestKVCRInventoryPublication(CustomTestCase):
             is_page_first_layout=True,
             model_name="glm-test",
         )
-        self.enterContext(get_parallel().override(dp_rank=None))
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
         self.pool = _HostPool()
         types_module = types.ModuleType("kvcr.types")
         types_module.MemoryRef, types_module.QueryStatus = _MemoryRef, _QueryStatus
         self.enterContext(
             patch.dict(
                 "sys.modules",
-                {"kvcr": types.ModuleType("kvcr"), "kvcr.types": types_module},
+                {"kvcr": _kvcr_module(), "kvcr.types": types_module},
             )
         )
         self.keys = [f"{i + 1:064x}" for i in range(4)]
@@ -1441,7 +1593,7 @@ class TestKVCRInventoryPublication(CustomTestCase):
         )
         self.assertEqual(quiet.take_kv_events(), [])
 
-    def test_start_wires_inventory_sink_only_when_publishing(self):
+    def test_start_wires_inventory_sink_when_publishing(self):
         class StartupError(RuntimeError):
             pass
 
@@ -1492,8 +1644,7 @@ class TestKVCRInventoryPublication(CustomTestCase):
                     self.assertEqual(backend._inventory.namespace, backend._namespace)
                     self.assertEqual(backend._inventory.required_pools, {"kv"})
                 else:
-                    # Older KVCR builds construct without the field.
-                    self.assertNotIn("inventory_sink", bindings[0])
+                    self.assertIsNone(bindings[0]["inventory_sink"])
 
     def test_unified_radix_cache_publishes_only_for_inventory(self):
         for publish in (True, False):
@@ -1627,6 +1778,104 @@ class TestKVCRInventoryPublication(CustomTestCase):
             )
             self.assertTrue(all(type(h) is int for h in event["block_hashes"]))
         self.assertEqual(len(wire_events[0]["token_ids"]), wire_events[0]["block_size"])
+
+
+_REAL_KVCR = sys.platform == "linux" and all(
+    importlib.util.find_spec(name) is not None for name in ("kvcr", "nixl")
+)
+
+
+@unittest.skipUnless(_REAL_KVCR, "needs kvcr>=0.2.0 and NIXL on Linux")
+class TestRealKVCR(CustomTestCase):
+    """The KVCR contract the fakes above stand in for, on the installed package."""
+
+    _metadata = TestKVCRInventoryPublication._metadata
+
+    def test_installed_package_matches_the_store_contract(self):
+        from kvcr import KVCRBindings, ZmqPeerControlChannel  # noqa: F401
+        from kvcr.config import KVCRConfig
+        from kvcr.types import CacheTier, InventoryEvent
+
+        self.assertIn("startup_timeout_seconds", KVCRConfig.__struct_fields__)
+        self.assertIn("inventory_sink", KVCRBindings.__struct_fields__)
+        self.assertEqual(CacheTier.LOCAL_G2.value, "DRAM")
+        self.assertLessEqual(
+            {"keys", "tier", "removed"}, set(InventoryEvent.__struct_fields__)
+        )
+
+    def test_backup_query_restore_and_inventory_round_trip(self):
+        exits = []
+
+        def fail_instead_of_exit(code):
+            # Also reached from the poll thread, where a raise alone is lost.
+            exits.append(code)
+            raise RuntimeError(f"KVCR store called os._exit({code})")
+
+        # Cleanups run last-in first-out: this check runs after close.
+        self.addCleanup(lambda: self.assertEqual(exits, []))
+        self.enterContext(
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.os._exit",
+                side_effect=fail_instead_of_exit,
+            )
+        )
+        self.enterContext(get_parallel().override(dp_rank=None, nnodes=1))
+        control_port = find_available_port(33100)
+        config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="kvcr-real",
+            extra_config={
+                "enable_remote_hint": True,
+                "publish_inventory": True,
+                # Advertised only (TEST-NET-1); nothing dials it here.
+                "control_advertise_host": "192.0.2.1",
+                "control_host": "127.0.0.1",
+                "control_port": control_port,
+                "nixl_listen_port": find_available_port(control_port + 2000),
+                "local_dram_bytes": 1 << 20,
+                "startup_timeout_seconds": 60,
+            },
+        )
+        pool = _HostPool()
+        backend = KVCRStore(config, pool)
+        self.addCleanup(backend.close)
+        keys = [f"{i + 1:064x}" for i in range(2)]
+        generator = torch.Generator().manual_seed(0)
+        for buffer in pool.buffers:
+            buffer[:2].copy_(
+                torch.randint(
+                    0, 256, buffer[:2].shape, dtype=torch.uint8, generator=generator
+                )
+            )
+        info = HiCacheStorageExtraInfo(
+            extra_info={"kv_event_metadata": self._metadata(keys)}
+        )
+        # The first IO starts real KVCR: registration, binds, local DRAM deposit.
+        self.assertEqual(backend.batch_set_v1(keys, torch.arange(4), info), [True] * 2)
+        self.assertIsNotNone(backend._runner)
+        # Real InventoryEvent/CacheTier through inventory_sink.
+        events, deadline = [], time.monotonic() + 5
+        while len(events) < 2 and time.monotonic() < deadline:
+            events += backend.take_kv_events()
+            if len(events) < 2:
+                time.sleep(0.01)
+        self.assertEqual(sorted(e.block_hashes[0] for e in events), [100, 101])
+        for event in events:
+            self.assertIsInstance(event, BlockStored)
+            self.assertEqual((event.ownership, event.medium), ("kvcr", "CPU_PINNED"))
+        # Real query statuses, then a local restore into other slots.
+        self.assertEqual(backend.batch_exists_v2(keys).kv_hit_pages, 2)
+        self.assertEqual(backend.batch_get_v1(keys, torch.arange(8, 12)), [True] * 2)
+        for buffer in pool.buffers:
+            self.assertTrue(torch.equal(buffer[:2], buffer[4:6]))
 
 
 if __name__ == "__main__":

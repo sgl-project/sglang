@@ -533,6 +533,7 @@ class TestStorageOwnedKvEventPublisher(CustomTestCase):
             (dynamo, "none", "routable TCP endpoint"),
             (dynamo, "ipc:///tmp/kv", "routable TCP endpoint"),
             (dynamo, "tcp://127.0.0.1:5557", "routable TCP endpoint"),
+            (dynamo, "tcp://127.1:5557", "routable TCP endpoint"),
             (dynamo, "tcp://[::1]:5557", "routable TCP endpoint"),
             (dynamo, "tcp://localhost:5557", "routable TCP endpoint"),
             (dynamo, "tcp://*:5557", "routable TCP endpoint"),

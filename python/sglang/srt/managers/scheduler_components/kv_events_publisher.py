@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import logging
 import time
 from dataclasses import dataclass
@@ -25,6 +24,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.network import is_unreachable_host
 
 logger = logging.getLogger(__name__)
 
@@ -47,19 +47,6 @@ class KvMetrics(msgspec.Struct, tag=True, kw_only=True, array_like=True):
 
 
 hook_custom_types(KvMetrics)
-
-
-def _is_loopback(host: str) -> bool:
-    # Also true for wildcard and unspecified hosts: no remote peer can dial them.
-    if host == "*" or host.rstrip(".").lower() == "localhost":
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    if address.version == 6 and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    return address.is_loopback or address.is_unspecified
 
 
 @dataclass(kw_only=True, slots=True)
@@ -134,7 +121,7 @@ class SchedulerKvEventsPublisher:
         host = None
         if source is not None and source["endpoint"].startswith("tcp://"):
             host = urlsplit(source["endpoint"]).hostname
-        if host is None or _is_loopback(host):
+        if host is None or is_unreachable_host(host):
             self.kv_event_publisher.shutdown()
             raise ValueError(
                 "The HiCache storage backend publishes KV events for a subscriber "

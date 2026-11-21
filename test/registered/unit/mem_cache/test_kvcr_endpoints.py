@@ -108,26 +108,6 @@ class TestKVCRRankEndpoints(CustomTestCase):
             with self.subTest(host=host), self.assertRaises(ValueError):
                 endpoints.control_address(config, {"control_advertise_host": host})
 
-    def test_decode_offload_and_decode_radix_cache_cannot_share_kvcr(self):
-        # Each would build a KVCR store binding the same rank-local ports.
-        from sglang.srt.arg_groups.hicache_hook import handle_hicache
-
-        def args(radix_cache):
-            return SimpleNamespace(
-                unified_cache_external_linker_config=None,
-                unified_cache_external_linker_backend=None,
-                enable_unified_cache_external_linker=False,
-                enable_linker_mla_dedup=False,
-                enable_hierarchical_cache=True,
-                hicache_storage_backend="kvcr",
-                disaggregation_mode="decode",
-                disaggregation_decode_enable_offload_kvcache=True,
-                disaggregation_decode_enable_radix_cache=radix_cache,
-            )
-
-        with self.assertRaisesRegex(ValueError, "decode radix cache"):
-            handle_hicache(args(radix_cache=True))
-
     def test_endpoint_helpers_do_not_import_the_optional_runtime(self):
         result = subprocess.run(
             [

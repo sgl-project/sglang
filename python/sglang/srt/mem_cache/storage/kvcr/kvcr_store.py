@@ -45,8 +45,9 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
-# The completion poll runs at this interval while callers wait or completions arrive,
-# and backs off to the cap while idle: each wakeup takes the GIL from the scheduler.
+# Waiters poll at this interval themselves. The background poll runs at it only
+# after draining completions and otherwise backs off to the cap: each wakeup
+# takes the GIL from the scheduler.
 _POLL_INTERVAL_SECONDS = 0.001
 _IDLE_POLL_MAX_SECONDS = 0.02
 
@@ -62,6 +63,34 @@ _TRAILING_POOLS = frozenset(
         PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
         PoolName.DEEPSEEK_V4_C128_STATE,
     )
+)
+
+# Extra-config keys this backend reads.
+_EXTRA_CONFIG_KEYS = frozenset(
+    {
+        "abandon_timeout_ms",
+        "control_advertise_host",
+        "control_host",
+        "control_port",
+        "enable_remote_hint",
+        "local_dram_bytes",
+        "local_dram_pool_pages",
+        "nixl_listen_port",
+        "operation_timeout_ms",
+        "publish_inventory",
+        "startup_timeout_seconds",
+    }
+)
+# Generic HiCache keys; decode offload passes them through unpopped.
+_HICACHE_GENERIC_KEYS = frozenset(
+    {
+        "prefetch_threshold",
+        "prefetch_timeout_base",
+        "prefetch_timeout_per_ki_token",
+        "hicache_storage_pass_prefix_keys",
+        "tp_lcm_size",
+        "file_storage_path",
+    }
 )
 
 
@@ -146,23 +175,74 @@ class KVCRStore(HiCacheStorage):
         self._layouts = {}
         self._runner = None
         self._maps = []
+        # Serializes every KVCR call: its API allows one caller at a time, but it
+        # is not thread-affine (NIXL and ZMQ sockets live on KVCR's progress thread).
         self._lock = threading.RLock()
         self._completion = threading.Condition(self._lock)
         self._completed = {}
         self._poll_thread = None
         self._stop_poll = threading.Event()
-        # Callers blocked in _wait; the poll loop stays at its short interval while any wait.
-        self._waiters = 0
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
+        unknown = sorted(set(self._extra) - _EXTRA_CONFIG_KEYS - _HICACHE_GENERIC_KEYS)
+        if unknown:
+            logger.warning("KVCR ignores unknown extra-config keys: %s", unknown)
         self._remote_hint = _bool_option(self._extra, "enable_remote_hint")
+        if self._remote_hint and get_parallel().nnodes > 1:
+            # Peers reach shard k at shard 0's advertised host, port + k.
+            raise ValueError(
+                "KVCR enable_remote_hint (and publish_inventory) requires --nnodes 1"
+            )
         if "startup_timeout_seconds" in self._extra and (
             type(self._extra["startup_timeout_seconds"]) is not int
             or self._extra["startup_timeout_seconds"] <= 0
         ):
             raise ValueError("startup_timeout_seconds must be a positive integer")
         self._offset = rank_offset(storage_config)
+        # Fail the attach, not every later storage call, on a static
+        # misconfiguration. Memory registration and the port binds stay at the
+        # first IO: host pools (e.g. a draft sidecar) may still register.
+        try:
+            # Exported from 0.2.0 on; the import also loads its NIXL bindings.
+            from kvcr import ZmqPeerControlChannel  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "KVCR HiCache backend requires the kvcr>=0.2.0 package and its "
+                "NIXL Python bindings (PyPI's latest stable kvcr, 0.1.1, is older)"
+            ) from e
+        self._budget = self._extra.get("local_dram_bytes", 8 << 30)
+        self._pages_by_pool = self._extra.get("local_dram_pool_pages", {})
+        if (
+            type(self._budget) is not int
+            or self._budget <= 0
+            or not isinstance(self._pages_by_pool, dict)
+            or any(type(v) is not int or v < 1 for v in self._pages_by_pool.values())
+        ):
+            raise ValueError("Invalid KVCR local DRAM budget")
+        # KVCR's own rule, checked here so that it cannot fail the first IO.
+        self._operation_timeout_ms = self._extra.get("operation_timeout_ms", 30000)
+        self._abandon_timeout_ms = self._extra.get("abandon_timeout_ms", 60000)
+        if (
+            type(self._operation_timeout_ms) is not int
+            or type(self._abandon_timeout_ms) is not int
+            or self._operation_timeout_ms <= 0
+            or self._abandon_timeout_ms < 2 * self._operation_timeout_ms
+        ):
+            raise ValueError(
+                "KVCR operation_timeout_ms must be a positive integer and "
+                "abandon_timeout_ms an integer at least twice it"
+            )
+        self._control = control_address(self.config, self._extra)
+        port = self._control[1]
+        dp_stride = self.config.tp_size * self.config.attn_cp_size * self.config.pp_size
+        offset = self.config.dp_rank * dp_stride + self._offset
+        nixl_base_port = self._extra.get("nixl_listen_port", port - offset + 1024)
+        if type(nixl_base_port) is not int or not 0 < nixl_base_port <= 65535:
+            raise ValueError("KVCR nixl_listen_port must be a valid integer port")
+        self._nixl_port = nixl_base_port + offset
+        if not 0 < self._nixl_port <= 65535 or port == self._nixl_port:
+            raise ValueError("KVCR control/NIXL port range is invalid or overlaps")
         self._agent_name = f"sglang-kvcr-{uuid.uuid4().hex}"
         # Publish this shard's DRAM residency as KV events (ownership "kvcr")
         # for an external KV state agent, e.g. Dynamo's.
@@ -174,7 +254,7 @@ class KVCRStore(HiCacheStorage):
                     "explicit control_advertise_host"
                 )
             # The state agent subscribes to the events on this host.
-            require_routable_host(control_address(self.config, self._extra)[0])
+            require_routable_host(self._control[0])
         self._inventory = KVCRInventory() if self.publishes_kv_events else None
         # Each attention TP x CP rank stores its own shard (no PP, no DCP), and a
         # page is advertised once every shard holds it.
@@ -200,7 +280,7 @@ class KVCRStore(HiCacheStorage):
             or "control_advertise_host" not in self._extra
         ):
             return None
-        host, port = control_address(self.config, self._extra)
+        host, port = self._control
         source = {
             "dp_rank": int(self.config.dp_rank),
             "capabilities": ["router_hint"],
@@ -255,6 +335,28 @@ class KVCRStore(HiCacheStorage):
             self._layouts[name] = describe_pool(name, host_pool)
             self.registered_pools[name] = host_pool
 
+    def on_host_pools_registered(self) -> None:
+        # Fail the attach if the budget cannot give a registered pool one page.
+        if self._layouts:
+            self._pool_pages()
+
+    def _pool_pages(self) -> dict:
+        """KVCR DRAM pages per registered physical pool."""
+        total = sum(
+            component.size * component.count
+            for layout in self._layouts.values()
+            for component in layout.components
+        )
+        pages_by_pool = {}
+        for name, layout in self._layouts.items():
+            pages = self._pages_by_pool.get(
+                name, self._budget * layout.components[0].count // total
+            )
+            if pages < 1:
+                raise ValueError(f"KVCR DRAM budget cannot hold one page of {name}")
+            pages_by_pool[name] = pages
+        return pages_by_pool
+
     def _start(self):
         if self._closed:
             raise RuntimeError("KVCR storage backend is closed")
@@ -272,36 +374,10 @@ class KVCRStore(HiCacheStorage):
                 self._namespace,
                 [name for name in self._layouts if name not in _TRAILING_POOLS],
             )
-        total = sum(
-            component.size * component.count
-            for layout in self._layouts.values()
-            for component in layout.components
-        )
-        budget = self._extra.get("local_dram_bytes", 8 << 30)
-        pages_by_pool = self._extra.get("local_dram_pool_pages", {})
-        if (
-            type(budget) is not int
-            or budget <= 0
-            or not isinstance(pages_by_pool, dict)
-        ):
-            raise ValueError("Invalid KVCR local DRAM budget")
-        host, port = control_address(self.config, self._extra)
-        dp_stride = self.config.tp_size * self.config.attn_cp_size * self.config.pp_size
-        offset = self.config.dp_rank * dp_stride + self._offset
-        base_port = port - offset
-        nixl_base_port = self._extra.get("nixl_listen_port", base_port + 1024)
-        if type(nixl_base_port) is not int or not 0 < nixl_base_port <= 65535:
-            raise ValueError("KVCR nixl_listen_port must be a valid integer port")
-        nixl_port = nixl_base_port + offset
-        if not 0 < port <= 65535 or not 0 < nixl_port <= 65535 or port == nixl_port:
-            raise ValueError("KVCR control/NIXL port range is invalid or overlaps")
+        host, port = self._control
         layouts, regions, plans = [], [], []
-        for name, layout in self._layouts.items():
-            pages = pages_by_pool.get(
-                name, budget * layout.components[0].count // total
-            )
-            if type(pages) is not int or pages < 1:
-                raise ValueError(f"KVCR DRAM budget cannot hold one page of {name}")
+        for name, pages in self._pool_pages().items():
+            layout = self._layouts[name]
             for component in layout.components:
                 plans.append((component.name, pages * component.size))
                 layouts.append((component.name, component.size))
@@ -329,29 +405,16 @@ class KVCRStore(HiCacheStorage):
                 address = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
                 allocations.append((name, address, length))
             try:
-                # Do not pass the new option when unset: ordinary deployments
-                # remain compatible with KVCR versions predating this field.
-                startup_options = (
-                    {"startup_timeout_seconds": self._extra["startup_timeout_seconds"]}
-                    if "startup_timeout_seconds" in self._extra
-                    else {}
-                )
-                # Likewise only wire the inventory sink when publishing.
-                inventory_options = (
-                    {"inventory_sink": self._record_inventory}
-                    if self._inventory is not None
-                    else {}
-                )
                 self._runner = KVCR(
                     config=KVCRConfig(
                         nixl_agent_name=self._agent_name,
-                        nixl_listen_port=nixl_port,
+                        nixl_listen_port=self._nixl_port,
                         pool_layouts=layouts,
-                        operation_timeout_ms=self._extra.get(
-                            "operation_timeout_ms", 30000
+                        operation_timeout_ms=self._operation_timeout_ms,
+                        abandon_timeout_ms=self._abandon_timeout_ms,
+                        startup_timeout_seconds=self._extra.get(
+                            "startup_timeout_seconds"
                         ),
-                        abandon_timeout_ms=self._extra.get("abandon_timeout_ms", 60000),
-                        **startup_options,
                     ),
                     bindings=KVCRBindings(
                         request_pin=self._pinning.request_pin,
@@ -360,7 +423,11 @@ class KVCRStore(HiCacheStorage):
                         framework_control=channel,
                         key_adapter=StorageKeyAdapter(),
                         on_resilience_event=self._resilience_event,
-                        **inventory_options,
+                        inventory_sink=(
+                            self._record_inventory
+                            if self._inventory is not None
+                            else None
+                        ),
                     ),
                     backend_configs=KVCRBackendConfigs(
                         framework_regions=regions,
@@ -430,14 +497,10 @@ class KVCRStore(HiCacheStorage):
         # There can be concurrent backup and prefetch threads. One caller may
         # drain another caller's completion; keep it until the owner consumes it.
         with self._completion:
-            self._waiters += 1
-            try:
-                while handle not in self._completed:
-                    self._completed.update(self._runner.poll_completed())
-                    if handle not in self._completed:
-                        self._completion.wait(timeout=_POLL_INTERVAL_SECONDS)
-            finally:
-                self._waiters -= 1
+            while handle not in self._completed:
+                self._completed.update(self._runner.poll_completed())
+                if handle not in self._completed:
+                    self._completion.wait(timeout=_POLL_INTERVAL_SECONDS)
             result = self._completed.pop(handle)
             self._completion.notify_all()
             return result
@@ -451,7 +514,7 @@ class KVCRStore(HiCacheStorage):
                     completed = list(self._runner.poll_completed())
                     self._completed.update(completed)
                     self._completion.notify_all()
-                    busy = bool(completed) or self._waiters > 0
+                    busy = bool(completed)
             except Exception:
                 # Native progress failure cannot safely be treated as a cache
                 # miss: HiCache could recycle a buffer still exposed to NIXL.

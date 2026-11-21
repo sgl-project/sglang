@@ -136,7 +136,7 @@ class TestStorageKvEventSync(CustomTestCase):
         for pending, peer_pending, drains in ((0, 0, False), (0, 2, True)):
             with self.subTest(pending=pending, peer_pending=peer_pending):
                 cache = self._make_cache(_PublishingBackend(pending=pending))
-                exchange = MagicMock(width=16)
+                exchange = MagicMock(width=9)
 
                 def allgather(values, peer=peer_pending):
                     # The shm exchange stores only values in [0, 2**40).
@@ -150,6 +150,74 @@ class TestStorageKvEventSync(CustomTestCase):
                 )
                 self.assertEqual(cache._drain_storage_kv_events.called, drains)
                 cache._all_reduce.assert_not_called()
+
+    def test_shared_memory_table_fits_the_column(self):
+        # A dense storage row is 8 values; the event column needs a 9th.
+        for backend, width in ((_PublishingBackend(), 9), (None, 8)):
+            with self.subTest(width=width):
+                cache = self._make_cache(backend)
+                cache.attn_cp_group = cache.attn_tp_group = None
+                cache.tp_group, cache.tp_world_size = object(), 2
+                with patch(
+                    "sglang.srt.mem_cache.unified_radix_cache.get_shm_exchange"
+                ) as get_exchange:
+                    UnifiedRadixCache._shm_count_exchange(cache)
+                self.assertEqual(get_exchange.call_args.kwargs["width"], width)
+
+    def _sync_event_column(self, cache):
+        self.assertEqual(cache._sync_hicache_ready_counts(), (0, 0, (0, 0, 0, 0), ()))
+        return cache._all_reduce.call_args.args[0].tolist()[6]
+
+    def test_drain_waits_for_the_interval_since_the_last_drain(self):
+        """A gathering drain runs at most once per interval unless a peer is due."""
+        in_interval = time.monotonic() + 3600
+        for drained_at, peer_due, drains in (
+            (in_interval, False, False),
+            (float("-inf"), False, True),
+            (in_interval, True, True),
+        ):
+            with self.subTest(drained_at=drained_at, peer_due=peer_due):
+                cache = self._make_cache(_PublishingBackend(pending=2))
+                cache.attn_cp_group, cache.attn_tp_group = None, object()
+                cache.tp_world_size = 2
+                if drained_at != float("-inf"):
+                    cache._storage_events_drained_at = drained_at
+
+                def reduce_with_peer(counts, _, peer=peer_due):
+                    counts[6] = min(int(counts[6]), 0 if peer else 1)
+
+                cache._all_reduce.side_effect = reduce_with_peer
+                with patch.object(
+                    torch.distributed, "get_world_size", return_value=2
+                ) as world_size:
+                    column = self._sync_event_column(cache)
+                    self._sync_event_column(cache)
+                self.assertEqual(column, 0 if drains else 1)
+                self.assertEqual(cache._drain_storage_kv_events.called, drains)
+                # The gather groups are resolved once, not per step.
+                world_size.assert_called_once()
+
+    def test_drain_without_a_gather_publishes_every_step(self):
+        # TP1 gathers nothing, so the interval would only delay its events.
+        cache = self._make_cache(_PublishingBackend(pending=2))
+        cache.attn_cp_group = cache.attn_tp_group = None
+        cache.tp_world_size = 1
+        cache._storage_events_drained_at = time.monotonic() + 3600
+        self.assertEqual(self._sync_event_column(cache), 0)
+        cache._drain_storage_kv_events.assert_called_once()
+
+    def test_drain_records_when_it_ran(self):
+        cache = object.__new__(UnifiedRadixCache)
+        backend = _PublishingBackend()
+        cache.cache_controller = SimpleNamespace(storage_backend=backend)
+        cache.tree_core = SimpleNamespace(kv_events=SimpleNamespace(enabled=False))
+        cache.attn_cp_group = cache.attn_tp_group = None
+        cache.tp_world_size = 1
+        before = time.monotonic()
+        UnifiedRadixCache._drain_storage_kv_events(cache)
+        self.assertLessEqual(before, cache._storage_events_drained_at)
+        self.assertLessEqual(cache._storage_events_drained_at, time.monotonic())
+        backend.take_kv_events.assert_called_once()
 
     def test_follower_joins_the_gather_without_retaining_events(self):
         # A follower that skipped the collective would hang the publisher.

@@ -207,23 +207,48 @@ class TestStorageEventMetadata(CustomTestCase):
         self.assertEqual(recorder.prefetch_storage_metadata(tail, [], "h"), {})
         self.assertEqual(recorder.take(), [])
 
+    def test_unnamespaced_prefetch_hashes_only_its_span(self):
+        """The span extends last_hash; the matched prefix is never replayed."""
+        from sglang.srt.mem_cache import events
+
+        pages = ["0c" * 32, "0d" * 32]
+        calls = []
+
+        def fake_hash(key, prior_hash=None, page_size=None):
+            calls.append((list(key.token_ids), prior_hash))
+            return pages
+
+        recorder = KVCacheEventRecorder(enabled=False, page_size=2)
+        tail = _Tokens([5, 6, 7, 8])
+        with patch.object(events, "get_storage_hash_str", fake_hash):
+            metadata = recorder.prefetch_storage_metadata(tail, [1, 2, 3, 4], "0b" * 32)
+        self.assertEqual(calls, [([5, 6, 7, 8], "0b" * 32)])
+        self.assertEqual(list(metadata), pages)
+        first, second = (metadata[page] for page in pages)
+        self.assertEqual(first.parent_block_hash, int("0b" * 8, 16))
+        self.assertEqual(second.parent_block_hash, first.block_hashes[0])
+        self.assertEqual((first.token_ids, second.token_ids), ([5, 6], [7, 8]))
+        self.assertEqual(recorder.take(), [])
+
     @unittest.skipUnless(
         sys.platform == "linux", "HiCache native hasher requires Linux"
     )
     def test_prefetch_metadata_matches_backup_metadata(self):
         recorder = KVCacheEventRecorder(enabled=False, page_size=2, dynamo_format=True)
-        for salt in (None, "tenant-a"):
-            with self.subTest(salt=salt):
-                key = _Tokens([1, 2, 3, 4], extra_key="adapter", cache_salt=salt)
+        for extra, salt in ((None, None), ("adapter", None), ("adapter", "tenant-a")):
+            with self.subTest(extra_key=extra, salt=salt):
+                key = _Tokens([1, 2, 3, 4], extra_key=extra, cache_salt=salt)
                 complete = recorder.storage_metadata(_StorageEventSpan(key))
                 hashes = get_storage_hash_str(key, page_size=2)
                 self.assertEqual(list(complete), hashes)
-                tail = _Tokens([3, 4], extra_key="adapter", cache_salt=salt)
+                tail = _Tokens([3, 4], extra_key=extra, cache_salt=salt)
                 suffix = recorder.prefetch_storage_metadata(tail, [1, 2], hashes[0])
                 self.assertEqual(suffix, {hashes[1]: complete[hashes[1]]})
-                self.assertEqual(
-                    recorder.prefetch_storage_metadata(tail, [1, 2], "wrong"), {}
-                )
+                if extra is not None:
+                    # Namespaced event IDs need the prefix replayed and verified.
+                    self.assertEqual(
+                        recorder.prefetch_storage_metadata(tail, [1, 2], "wrong"), {}
+                    )
                 self.assertEqual(recorder.take(), [])
 
 

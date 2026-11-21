@@ -187,6 +187,11 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# A drain is an object gather over the attention groups whatever its size, so
+# residency events coalesce for up to this long instead of gathering on every
+# step that has some.
+_STORAGE_KV_EVENT_DRAIN_INTERVAL_S = 0.1
+
 
 class _OngoingWriteThrough(NamedTuple):
     """Tracks an in-flight D→H write-through operation."""
@@ -770,6 +775,10 @@ class UnifiedRadixCache(BasePrefixCache):
     # Joins the per-shard residency of a backend that publishes KV events;
     # set by _init_storage_kv_events for a backend configured at launch.
     _storage_event_reducer: Optional[StorageEventReducer] = None
+    # When this rank last drained; the first pending events are due at once.
+    _storage_events_drained_at: float = float("-inf")
+    # The attention groups the drain gathers over, resolved on first use.
+    _storage_event_groups: Optional[list] = None
 
     def _init_storage_kv_events(self) -> None:
         backend = getattr(self.cache_controller, "storage_backend", None)
@@ -4327,14 +4336,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # equal iff reclaim victim order and live prefetch set matched on every rank.
         digest = self._hicache_sync_digest()
         # A KV-event-publishing backend adds one column, 0 if this rank has
-        # residency events and 1 otherwise: its MIN is 0 iff any rank has some,
-        # and then every rank joins the drain's gather. Non-negative, as the
-        # shm exchange requires. Absent otherwise, so the row is unchanged.
-        event_column = (
-            (0 if self.cache_controller.storage_backend.pending_kv_events() else 1,)
-            if self.storage_kv_events_enabled
-            else ()
-        )
+        # residency events due and 1 otherwise: its MIN is 0 iff any rank is
+        # due, and then every rank joins the drain's gather. Pending events are
+        # due once the last drain is an interval old, or at once when the drain
+        # gathers nothing. Non-negative, as the shm exchange requires. Absent
+        # otherwise, so the row is unchanged.
+        event_column = ()
+        if self.storage_kv_events_enabled:
+            due = self.cache_controller.storage_backend.pending_kv_events() and (
+                not self._storage_event_gather_groups()
+                or time.monotonic() - self._storage_events_drained_at
+                >= _STORAGE_KV_EVENT_DRAIN_INTERVAL_S
+            )
+            event_column = (0 if due else 1,)
         counts_end = 2 + len(storage_queue_sizes)
         exchange = self._shm_count_exchange()
         if exchange is not None:
@@ -4404,7 +4418,23 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # Across hosts the leaders' all_gather beats an all-rank gloo reduce (measured at TP8);
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
-        return get_shm_exchange(group, "hicache", multihost=True)
+        # A publishing backend's event column makes a dense storage row 9 wide.
+        width = 8 + int(self.storage_kv_events_enabled)
+        return get_shm_exchange(group, "hicache", multihost=True, width=width)
+
+    def _storage_event_gather_groups(self) -> list:
+        """The attention groups the storage KV event drain gathers over."""
+        if self._storage_event_groups is None:
+            groups = [
+                group
+                for group in (self.attn_cp_group, self.attn_tp_group)
+                if group is not None
+                and torch.distributed.get_world_size(group=group) > 1
+            ]
+            if not groups and self.tp_world_size > 1:
+                groups = [self.tp_group]
+            self._storage_event_groups = groups
+        return self._storage_event_groups
 
     def _drain_storage_kv_events(self) -> None:
         """Join every attention shard's backend residency into published events.
@@ -4413,16 +4443,10 @@ class UnifiedRadixCache(BasePrefixCache):
         it in the same sync step. Only the rank that publishes KV events keeps
         the reduced events.
         """
+        self._storage_events_drained_at = time.monotonic()
         backend = self.cache_controller.storage_backend
         batches = {backend.kv_event_shard: backend.take_kv_events()}
-        groups = [
-            group
-            for group in (self.attn_cp_group, self.attn_tp_group)
-            if group is not None and torch.distributed.get_world_size(group=group) > 1
-        ]
-        if not groups and self.tp_world_size > 1:
-            groups = [self.tp_group]
-        for group in groups:
+        for group in self._storage_event_gather_groups():
             gathered = [None] * torch.distributed.get_world_size(group=group)
             torch.distributed.all_gather_object(gathered, batches, group=group)
             batches = {

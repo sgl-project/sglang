@@ -395,7 +395,8 @@ class _RustKVCacheEventRecorder(KVCacheEventRecorder):
             _kv_event_from_tagged(event, self.lora_names, self.dynamo_format)
             for event in self._binding.take_events()
         ]
-        return events + super().take()
+        events.extend(super().take())
+        return events
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):

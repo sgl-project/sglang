@@ -58,7 +58,9 @@ def peer_hint(extra_info, offset: int, keys=None) -> dict | None:
         payload = action.get("payload")
         if not isinstance(payload, dict) or payload.get("mode", "copy") != "copy":
             continue
-        if "no_retain" in payload:
+        no_retain = payload.get("no_retain")
+        if no_retain is not None and no_retain is not False:
+            # Retention marks are not forwarded; false/null mean no mark.
             continue
         endpoint = payload.get("source_control_endpoint")
         hashes = payload.get("block_hashes")

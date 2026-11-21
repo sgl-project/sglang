@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.storage_key_binding import verified_storage_span
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
+    get_storage_hash_str,
     hash_str_to_int64,
 )
 
@@ -537,9 +538,34 @@ class KVCacheEventRecorder:
     ) -> dict:
         """Describe the pages a prefetch of ``key`` may read.
 
-        Empty when the prefix cannot be verified against ``last_hash``. The
-        backend still proves actual residency before it publishes a page.
+        Un-namespaced spans extend ``last_hash`` directly, as the controller
+        keys its reads; only namespaced spans replay and verify the prefix, and
+        are empty when it does not reproduce ``last_hash``. The backend still
+        proves actual residency before it publishes a page.
         """
+        if key.extra_key is None and key.cache_salt is None:
+            # Un-namespaced event IDs are the storage chain itself, so a page's
+            # identity follows from last_hash and its own tokens alone.
+            prefix = matched_prefix_tokens or ()
+            if len(prefix) % self.page_size or (last_hash is None) != (not prefix):
+                return {}
+            anchor = None
+            if last_hash is not None:
+                # _parent_block_hash treats a parent whose own parent is None as
+                # the root, so a placeholder grandparent links the first page to
+                # last_hash. The placeholder keys are never read.
+                anchor = _StorageEventSpan(
+                    key[:0], parent=_StorageEventSpan(key[:0]), hash_value=[last_hash]
+                )
+            return self.storage_metadata(
+                _StorageEventSpan(
+                    key,
+                    parent=anchor,
+                    hash_value=get_storage_hash_str(
+                        key, last_hash, page_size=self.page_size
+                    ),
+                )
+            )
         span = verified_storage_span(
             key, self.page_size, matched_prefix_tokens, last_hash
         )

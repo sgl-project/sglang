@@ -3100,6 +3100,28 @@ class TestHiCacheArgs(CustomTestCase):
                 "expected_mem_layout": "page_first_direct",
             },
             {
+                "name": "kvcr_kernel_with_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "kvcr",
+                    "hicache_io_backend": "kernel",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "kvcr_direct_with_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "kvcr",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "direct",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "dcp_mooncake_layer_first",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -3186,6 +3208,37 @@ class TestHiCacheArgs(CustomTestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
+
+    def test_kvcr_rejects_decode_offload_with_decode_radix_cache(self):
+        # Each would build a KVCR store binding the same rank-local ports.
+        base = dict(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="kvcr",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+        )
+        with self.assertRaisesRegex(ValueError, "decode radix cache"):
+            handle_hicache(
+                self._make_args(disaggregation_decode_enable_radix_cache=True, **base)
+            )
+
+        # Accepted: offload without the decode radix cache, the radix cache
+        # without offload, and other backends with both.
+        handle_hicache(
+            self._make_args(disaggregation_decode_enable_radix_cache=False, **base)
+        )
+        handle_hicache(
+            self._make_args(
+                disaggregation_decode_enable_radix_cache=True,
+                **{**base, "disaggregation_decode_enable_offload_kvcache": False},
+            )
+        )
+        handle_hicache(
+            self._make_args(
+                disaggregation_decode_enable_radix_cache=True,
+                **{**base, "hicache_storage_backend": "mooncake"},
+            )
+        )
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

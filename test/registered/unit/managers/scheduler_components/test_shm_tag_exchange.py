@@ -21,6 +21,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     _broadcast_via_exchange,
 )
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
+from sglang.srt.mem_cache.storage_events import StorageEventReducer
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.utils import stale_shm_cleanup
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -111,6 +112,36 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
         torch.distributed.destroy_process_group()
 
 
+def _sync_publishing_row_through_shm(rank: int, init_file: str) -> None:
+    # Its own processes: the per-process exchange cache keeps the first table's width.
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
+    )
+    try:
+        with (
+            envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True),
+            _sleep_on_idle(False),
+            _shm_names(),
+        ):
+            cache = _hicache_tp_rank(rank, 0)
+            # Only rank 1 has residency events; the MIN of the column drains both.
+            cache.cache_controller.storage_backend = SimpleNamespace(
+                pending_kv_events=lambda: rank
+            )
+            cache._storage_event_reducer = StorageEventReducer(2)
+            drains = []
+            cache._drain_storage_kv_events = lambda: drains.append(rank)
+            got = cache._sync_hicache_ready_counts()
+            assert got == (0, 1, (2, 3, 4, 5), ()), got
+            assert drains == [rank], drains
+            exchange = cache._shm_count_exchange()
+            assert exchange.width == 9, exchange.width
+            assert exchange.seq == 1, f"{exchange.seq} rows went through shm, not 1"
+            exchange.close()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 def _exchange_rounds(rank: int, init_file: str) -> None:
     torch.distributed.init_process_group(
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
@@ -189,6 +220,17 @@ class TestHiCacheReadyCountsThroughShm(CustomTestCase):
         with TemporaryDirectory() as directory:
             torch.multiprocessing.spawn(
                 _sync_hicache_ready_counts,
+                args=(str(Path(directory) / "gloo-init"),),
+                nprocs=2,
+                join=True,
+            )
+
+    def test_event_column_row_fits_the_table(self):
+        """A publishing backend's event column widens the dense storage row to 9
+        values; the table is sized for it, so the row still skips the gloo reduce."""
+        with TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _sync_publishing_row_through_shm,
                 args=(str(Path(directory) / "gloo-init"),),
                 nprocs=2,
                 join=True,
