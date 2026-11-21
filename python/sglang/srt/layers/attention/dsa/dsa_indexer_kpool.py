@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.kernels.ops.attention.dsa.indexer_q import (
+    can_use_fused_kpool_q_hadamard_quant,
+    fused_kpool_q_hadamard_quant,
+)
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     rotate_activation,
@@ -266,6 +272,37 @@ class IndexerKPool(MultiPlatformOp):
         if head_weights is not None:
             return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
         return self._get_logits_head_gate(x, q_scale)
+
+    def _can_defer_query_rotation(self) -> bool:
+        # Only the no-RoPE, per-head UE8M0 path has the fused contract.
+        return (
+            self.skip_rope
+            and self.head_dim == self.block_size == 128
+            and self.scale_fmt is not None
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and get_fused_op_backend() in (None, KernelBackend.JIT)
+            and can_use_fused_kpool_q_hadamard_quant()
+        )
+
+    def _quantize_query_and_weights(
+        self, query, x, head_weights, act_quant, deferred_rotation
+    ):
+        if deferred_rotation:
+            if (
+                query.dtype == torch.bfloat16
+                and query.is_contiguous()
+                and query.storage_offset() % 4 == 0
+                and head_weights is not None
+                and head_weights.dtype == torch.float32
+                and head_weights.is_contiguous()
+            ):
+                return fused_kpool_q_hadamard_quant(
+                    query, head_weights, self.softmax_scale
+                )
+            # An unsupported projection layout/dtype retains both original ops.
+            query = rotate_activation(query)
+        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        return q_fp8, self._resolve_head_gate_weights(x, q_scale, head_weights)
 
     def _can_overlap_prefill(
         self,
@@ -647,6 +684,7 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch: ForwardBatch,
         precompute_compress_gate: bool = False,
         precompute_head_gate: bool = False,
+        defer_query_rotation: bool = False,
     ):
         gate_score = None
         head_weights = None
@@ -670,7 +708,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
             if precompute_head_gate:
                 head_weights = self._project_and_scale_head_gates(x)
-            if not apply_rope:
+            if not apply_rope and not defer_query_rotation:
                 query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
@@ -1555,6 +1593,9 @@ class IndexerKPool(MultiPlatformOp):
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
+        defer_query_rotation = (
+            enable_dual_stream and return_indices and self._can_defer_query_rotation()
+        )
 
         query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
             q_lora,
@@ -1566,6 +1607,7 @@ class IndexerKPool(MultiPlatformOp):
                 enable_dual_stream and self.compress_gate_stream is not None
             ),
             precompute_head_gate=enable_dual_stream and return_indices,
+            defer_query_rotation=defer_query_rotation,
         )
 
         pool = get_token_to_kv_pool()
@@ -1608,8 +1650,9 @@ class IndexerKPool(MultiPlatformOp):
                 assert self.compress_gate_stream is not None
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, weights = self._quantize_query_and_weights(
+                    query, x, head_weights, act_quant, defer_query_rotation
+                )
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
@@ -1750,6 +1793,12 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices,
             )
 
+        overlap_decode = (
+            enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        defer_query_rotation = (
+            overlap_decode and return_indices and self._can_defer_query_rotation()
+        )
         precompute_compress_gate = (
             self.index_kpool > 1
             and self.index_kpool_compress
@@ -1765,6 +1814,7 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
             precompute_head_gate=enable_dual_stream and return_indices,
+            defer_query_rotation=defer_query_rotation,
         )
 
         has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
@@ -1786,9 +1836,6 @@ class IndexerKPool(MultiPlatformOp):
                 write_cache=not defer_kpool_cache_write,
             )
 
-        overlap_decode = (
-            enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle()
-        )
         if overlap_decode or self._can_overlap_prefill(forward_batch, return_indices):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1797,8 +1844,9 @@ class IndexerKPool(MultiPlatformOp):
             with torch.cuda.stream(self.alt_stream):
                 kpool_extend_cache = compress_write()
             if return_indices:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+                q_fp8, weights = self._quantize_query_and_weights(
+                    query, x, head_weights, act_quant, defer_query_rotation
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
             if return_indices:

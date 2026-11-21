@@ -21,7 +21,10 @@ from sglang.kernels.ops.attention.dsa.indexer_k import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
 )
-from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
+from sglang.kernels.ops.attention.dsa.indexer_q import (
+    fused_kpool_q_hadamard_quant,
+    fused_q_indexer_rope_first_quant,
+)
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -180,6 +183,43 @@ def test_q_rope_quant_matches_reference(pos_dtype):
     assert (err <= 0.0625 * ref.abs() + scale).all(), (
         f"max fp8 dequant error {err.max().item()}"
     )
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 32, 1024])
+def test_kpool_q_hadamard_quant_matches_unfused(tokens):
+    _skip_if_unavailable()
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("KPool Q fusion requires SM12x")
+    from sglang.kernels.ops.quantization.act_quant_triton import act_quant
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform
+
+    torch.manual_seed(20261121)
+    q = torch.randn(tokens, 32, 128, dtype=torch.bfloat16, device="cuda")
+    gate = torch.randn(tokens, 32, dtype=torch.float32, device="cuda")
+    softmax_scale = 128**-0.5
+    q8, weights = fused_kpool_q_hadamard_quant(q, gate, softmax_scale)
+    if tokens == 0:
+        assert q8.shape == q.shape and weights.shape == (0, 32, 1)
+        return
+    # Keep the BF16 round and quantizer floor; the gate must stay FP32.
+    q[0, 0].zero_()
+    q[0, 1].mul_(1e-6)
+    q[0, 2].add_(64)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        q8, weights = fused_kpool_q_hadamard_quant(q, gate, softmax_scale)
+    for factor in (1.0, -0.25):
+        q.mul_(factor)
+        gate.mul_(factor)
+        ref_q, scale = act_quant(
+            hadamard_transform(q, scale=softmax_scale), 128, "ue8m0"
+        )
+        ref_weights = gate.unsqueeze(-1) * scale * softmax_scale
+        graph.replay()
+        torch.testing.assert_close(
+            q8.view(torch.uint8), ref_q.view(torch.uint8), rtol=0, atol=0
+        )
+        torch.testing.assert_close(weights, ref_weights, rtol=0, atol=0)
 
 
 # ----------------------------------------------------------------------------

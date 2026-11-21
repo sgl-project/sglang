@@ -241,6 +241,9 @@ class TestKPoolStreamScheduling(unittest.TestCase):
         indexer._can_overlap_prefill = MethodType(
             IndexerKPool._can_overlap_prefill, indexer
         )
+        indexer._quantize_query_and_weights = MethodType(
+            IndexerKPool._quantize_query_and_weights, indexer
+        )
 
         def compress(**kwargs):
             streams.record("compress")
@@ -294,6 +297,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
         self.assertEqual(calls[0]["write_cache"], has_plan or not return_indices)
         self.assertFalse(prepare_qk.call_args.args[3])
         self.assertFalse(prepare_qk.call_args.kwargs["precompute_head_gate"])
+        self.assertFalse(prepare_qk.call_args.kwargs["defer_query_rotation"])
         overlap = not cp and return_indices
         self.assertIn(("compress", "alt" if overlap else "main"), streams.trace)
         if overlap:
