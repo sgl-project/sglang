@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.attention.dsa.dsa_indexer as dsa_indexer
+import sglang.srt.layers.attention.dsa.dsa_indexer_hip as indexer_hip
 import sglang.srt.layers.attention.dsa.indexer_prologue_hip as prologue_hip
 from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
     fp4_paged_mqa_logits,
@@ -29,7 +30,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 # backend-specific: AITER's preshuffled index-K, paged-MQA logits and NoPE prologue.
-register_amd_ci(est_time=18, suite="base-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=24, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 PAGE, HEADS, HEAD_DIM = 64, 32, 128
 ROWS = 4096
@@ -345,6 +346,114 @@ class TestFp4IndexKHip(CustomTestCase):
             tol = dict(rtol=1e-5, atol=1e-5 * float(ref.abs().max()))
             torch.testing.assert_close(logits[r, :end], ref, **tol)
             torch.testing.assert_close(prefill[r, start : start + end], ref, **tol)
+
+
+@unittest.skipUnless(
+    dsa_indexer._use_aiter and dsa_indexer._is_gfx95_supported,
+    "needs SGLANG_USE_AITER=1 on gfx950",
+)
+class TestPrefillLogitsBufferHip(CustomTestCase):
+    def setUp(self):
+        indexer_hip._prefill_logits_buffers.clear()
+
+    def tearDown(self):
+        indexer_hip._prefill_logits_buffers.clear()
+
+    def test_growing_chunks_reuse_one_buffer(self):
+        """Prefill chunks that each see more keys take a few doublings of one buffer,
+        not a new block per chunk; another stream gets its own."""
+        dev = torch.device("cuda", torch.cuda.current_device())
+        ptrs = set()
+        for cols in range(16384, 240000, 16384):
+            view = indexer_hip.prefill_logits_out(2048, cols, dev, 0)
+            self.assertEqual(tuple(view.shape), (2048, cols))
+            self.assertEqual(view.stride(), (-(-cols // 256) * 256, 1))
+            ptrs.add(indexer_hip._prefill_logits_buffers[(dev.index, 0)].data_ptr())
+        # 14 widths, 16384 .. 229376 keys: 4 doublings
+        self.assertLessEqual(len(ptrs), 5)
+        smaller = indexer_hip.prefill_logits_out(512, 1000, dev, 0)
+        self.assertEqual(smaller.data_ptr(), view.data_ptr())
+        other = indexer_hip.prefill_logits_out(4, 300, dev, 1)
+        self.assertNotEqual(other.data_ptr(), view.data_ptr())
+
+    def test_ragged_logits_and_topk_match_a_fresh_buffer(self):
+        """Through the reused buffer, with +inf left in it from before, the in-window
+        logits equal the allocating call bit for bit and the top-k picks keys inside
+        each row's window with the same scores: nothing reads a stale column."""
+        if not indexer_hip._prefill_mqa_logits_takes_out():
+            self.skipTest("AITER fp8_mqa_logits without out=")
+        from sgl_kernel import fast_topk_v2
+
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        fn = indexer_hip._prefill_mqa_logits_fn()
+        stub = SimpleNamespace(fp4_index_k=False)
+        stream = torch.cuda.current_stream().cuda_stream
+        rows, topk = 1024, 2048
+        for cols in (6000, 70000, 40000):
+            q = torch.randn(rows, HEADS, HEAD_DIM, device="cuda", generator=gen)
+            q = q.to(torch.float8_e4m3fn)
+            kv = torch.randn(cols, HEAD_DIM, device="cuda", generator=gen)
+            kv = kv.to(torch.float8_e4m3fn)
+            scale = torch.rand(cols, device="cuda", generator=gen) + 0.5
+            weights = torch.randn(rows, HEADS, device="cuda", generator=gen)
+            ke = (cols - rows + 1 + torch.arange(rows, device="cuda")).int()
+            ks = torch.zeros_like(ke)
+            ks[::7] = ke[::7] // 3
+            indexer_hip.prefill_logits_out(rows, cols, q.device, stream)
+            for buf in indexer_hip._prefill_logits_buffers.values():
+                buf.fill_(float("inf"))
+            got = indexer_hip.ragged_mqa_logits(stub, q, weights, (kv, scale), ks, ke)
+            self.assertIn(
+                got.data_ptr(),
+                [b.data_ptr() for b in indexer_hip._prefill_logits_buffers.values()],
+            )
+            ref = fn(q, kv, scale, weights, ks, ke, clean_logits=False)
+            col = torch.arange(cols, device="cuda")
+            inside = (col[None, :] >= ks[:, None]) & (col[None, :] < ke[:, None])
+            self.assertTrue(
+                torch.equal(
+                    got[inside].view(torch.int32), ref[inside].view(torch.int32)
+                )
+            )
+            lengths = ke - ks
+            # fast_topk_v2 orders a row's picks, and breaks exact ties at the k-th
+            # score, differently from call to call even for one input, so compare
+            # the picked scores rather than the positions
+            scores = []
+            for x in (got, ref):
+                picks = fast_topk_v2(x, lengths, topk, row_starts=ks).long()
+                self.assertTrue(bool(((picks >= 0) & (picks < lengths[:, None])).all()))
+                picked = ref.gather(1, picks + ks[:, None].long())
+                scores.append(picked.sort(dim=1).values.view(torch.int32))
+            self.assertTrue(torch.equal(*scores))
+
+    def test_capture_and_old_aiter_allocate_per_call(self):
+        """Under stream capture, or with an AITER whose kernel has no out=, the call
+        goes out as before and no buffer is kept."""
+        seen = []
+
+        def takes_out(*args, clean_logits, out=None):
+            seen.append(out)
+            return out
+
+        def no_out(*args, clean_logits):
+            seen.append("no out")
+
+        q = torch.zeros(8, HEADS, HEAD_DIM, device="cuda")
+        kv = (torch.zeros(300, HEAD_DIM, device="cuda"), torch.ones(300, device="cuda"))
+        stub, ks = SimpleNamespace(fp4_index_k=False), torch.zeros(8, device="cuda")
+        for fn, capturing in ((takes_out, True), (no_out, False)):
+            indexer_hip._prefill_mqa_logits_takes_out.cache_clear()
+            with (
+                patch.object(indexer_hip, "_prefill_mqa_logits_fn", lambda: fn),
+                patch.object(
+                    torch.cuda, "is_current_stream_capturing", lambda: capturing
+                ),
+            ):
+                indexer_hip.ragged_mqa_logits(stub, q, q[:, 0], kv, ks, ks)
+        indexer_hip._prefill_mqa_logits_takes_out.cache_clear()
+        self.assertEqual(seen, [None, "no out"])
+        self.assertEqual(indexer_hip._prefill_logits_buffers, {})
 
 
 if __name__ == "__main__":
