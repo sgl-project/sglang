@@ -2113,6 +2113,14 @@ class Envs:
     # only way to ask; on separate-KV it is the reverse -- --kv-cache-dtype
     # picks the buffer dtype and this switch is inert.
     SGLANG_DSV4_UNIFIED_KV_FP8 = EnvBool(False)
+    # DSv4.1 MegaAttention sparse prefill (DeepseekV4MegaAttnBackend, 64 heads):
+    # gather the flat sparse-prefill KV workspace as plain e4m3 instead of bf16,
+    # which switches FlashMLA's fused prefill to its all-fp8 (Q/K/V/P) path.
+    # Needs an sgl-flash-mla that includes sgl-project/FlashMLA#29, whose
+    # fused_norm_rope_attn_rope_cast.prefill accepts an fp8 kv; the current
+    # 1.0.5 wheel does not include it:
+    # https://github.com/sgl-project/FlashMLA/pull/29
+    SGLANG_DSV41_FP8_PREFILL_WORKSPACE = EnvBool(False)
     # ROCm gfx950, DeepSeek-V4 128x128 block-fp8 dense linears: run the GEMM as
     # aiter's e8m0 mxscale bpreshuffle (flydsl) instead of the fp32-scale
     # CK/asm/triton bpreshuffle. The weight bytes are shared; only an e8m0 copy

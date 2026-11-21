@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     NOPE_ROPE_BYTES,
     PADDED_SCALE_PER_TOKEN,
     dequantize_k_cache_paged_dsv4,
+    fp8_dtype,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.k_cache_reference import (
@@ -89,6 +90,53 @@ class TestDSV4DequantKCachePaged(CustomTestCase):
         self._check(num_tokens, page_size, out=workspace[:num_tokens])
         # Rows past the slice stay untouched.
         self.assertTrue(torch.isnan(workspace[num_tokens:].float()).all())
+
+    def _finite_cache(self, num_pages, page_size):
+        # Random bytes put NaN (0xFF) scale bytes and NaN rope values into rows,
+        # which would make the bytewise e4m3 comparison meaningless.
+        cache = _make_cache(num_pages, page_size, self.device)
+        view = cache[:, : page_size * NOPE_ROPE_BYTES].view(
+            num_pages, page_size, NOPE_ROPE_BYTES
+        )
+        mag = torch.randint(-12, 8, (num_pages, page_size, 1), device=self.device)
+        rope = torch.randn(num_pages, page_size, 64, device=self.device)
+        view[..., 448:] = (
+            (rope * torch.exp2(mag.float())).to(torch.bfloat16).view(torch.uint8)
+        )
+        nope = view[..., :448]
+        # e4m3fn NaN is 0x7F / 0xFF.
+        nope.masked_fill_((nope & 0x7F) == 0x7F, 0)
+        s_off = page_size * NOPE_ROPE_BYTES
+        scales = cache[:, s_off : s_off + page_size * PADDED_SCALE_PER_TOKEN]
+        scales.copy_(torch.randint_like(scales, 100, 135))
+        return cache
+
+    def test_fp8_workspace_unit_scale(self):
+        # An e4m3 ``out`` is the exact dequant cast once to e4m3.
+        num_tokens, page_size = 333, 64
+        num_pages = num_tokens // page_size + 2
+        cache = self._finite_cache(num_pages, page_size)
+        table = torch.randint(
+            0, num_pages * page_size, (num_tokens,), dtype=torch.int32, device="cuda"
+        )
+        exact = dequantize_k_cache_paged_ref(cache, table, page_size).float()
+        out = torch.empty(num_tokens, 1, 512, dtype=fp8_dtype, device="cuda")
+        got = dequantize_k_cache_paged_dsv4(cache, table, page_size, out=out)
+        finfo = torch.finfo(fp8_dtype)
+        want = exact.clamp(finfo.min, finfo.max).to(fp8_dtype)
+        self.assertTrue(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+
+    def test_rejects_other_out_dtypes(self):
+        # Only a bf16 or a plain e4m3 workspace is a valid destination.
+        cache = self._finite_cache(2, 64)
+        table = torch.zeros(4, dtype=torch.int32, device="cuda")
+        with self.assertRaises(AssertionError):
+            dequantize_k_cache_paged_dsv4(
+                cache,
+                table,
+                64,
+                out=torch.empty(4, 1, 512, dtype=torch.float16, device="cuda"),
+            )
 
 
 if __name__ == "__main__":
