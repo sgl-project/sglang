@@ -1454,6 +1454,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"{base_url}/set_lora",
             json={
                 "lora_nickname": ["default", "lora2"],
+                "lora_path": [None, None],
                 "target": ["transformer", "transformer"],
                 "strength": [0.6, 0.35],
             },
