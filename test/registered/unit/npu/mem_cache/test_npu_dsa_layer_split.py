@@ -23,6 +23,7 @@ from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.layers.attention.dsa.utils import _dsa_split_row_bound
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.mem_cache.static_kv_storage import _static_owner_region
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +57,7 @@ def _make_pool(
     pool.store_dtype = torch.float32
     pool.dtype = torch.float32
     pool.use_combined_kv_buffer = False
+    pool.dsa_kv_cache_store_fp8 = False
     pool.use_fia_nz = False
 
     owned_start, owned_end = get_layer_shard_range(shard_rank, shard_size, layer_num)
@@ -123,6 +125,27 @@ class TestShardBookkeeping(CustomTestCase):
         pool = _make_pool(layer_num=10, start_layer=2, shard_rank=1, shard_size=4)
         with patch.object(POOL, "get_state_layer_ids", lambda self: [10]):
             self.assertEqual(pool.get_kv_layer_ids(), [5, 6, 7, 5, 6, 7, 10])
+
+    def test_static_owner_layer_ids_match_exported_buffer_groups(self):
+        # Packed FP8 does not export V. The owned global IDs must only follow
+        # buffer groups that are actually registered for PD transfer.
+        pool = _make_pool(layer_num=8, start_layer=5, shard_rank=1, shard_size=4)
+        pool.is_draft_worker = False
+        pool.dcp_size = 1
+        pool.indexer_layer_ids = [7, 8]
+        pool.index_k_scale_buffer = torch.zeros_like(pool.index_k_buffer)
+
+        cases = (
+            (False, (7, 8, 7, 8, 7, 8, 7, 8)),
+            (True, (7, 8, 7, 8, 7, 8)),
+        )
+        for packed, expected_ids in cases:
+            with self.subTest(packed=packed):
+                pool.dsa_kv_cache_store_fp8 = packed
+                region = _static_owner_region(pool)
+                self.assertEqual(region.layer_ids, expected_ids)
+                self.assertEqual(len(region.layer_ids), len(region.ptrs))
+                self.assertEqual(len(region.layer_ids), len(region.item_lens))
 
     def test_get_kv_transfer_layer_span_counts_buffer_groups(self):
         pool = _make_pool()

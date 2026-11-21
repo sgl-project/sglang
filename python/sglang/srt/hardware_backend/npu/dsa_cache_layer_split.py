@@ -692,7 +692,8 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         owned = list(
             range(self.start_layer + owned_start, self.start_layer + owned_end)
         )
-        return owned * 2 + self.get_state_layer_ids()
+        kv_groups = 1 if self.dsa_kv_cache_store_fp8 else 2
+        return owned * kv_groups + self.get_state_layer_ids()
 
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.
