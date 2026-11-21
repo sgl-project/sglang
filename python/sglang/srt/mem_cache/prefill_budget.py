@@ -164,6 +164,16 @@ class PrefillBudget:
     def remaining_window_tokens(self):
         return 0
 
+    def admission_capacity(self) -> tuple[int, ...] | None:
+        """Cache only global exhaustion; candidate-specific refusals must retry.
+
+        Future-token reserves and prefix hits can improve without physical
+        capacity growing. CP padding may also admit at zero fresh capacity.
+        """
+        if is_cp_sharded_padded() or self.remaining_current > 0:
+            return None
+        return (self.remaining_current,)
+
     def has_capacity(self) -> bool:
         if is_cp_sharded_padded():
             # CP can reuse padding in already reserved pages when fresh capacity is zero.
@@ -334,6 +344,11 @@ class SWAPrefillBudget(PrefillBudget):
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
         return global_full_available_size + self.tree_cache.full_evictable_size()
+
+    def admission_capacity(self) -> tuple[int, ...] | None:
+        # Window demand depends on the candidate; only full-pool exhaustion
+        # rules out every ordinary candidate independently of prefix hits.
+        return super().admission_capacity()
 
     @property
     def remaining_window_tokens(self):
@@ -558,6 +573,10 @@ class ChainPrefillBudget(PrefillBudget):
     # between them (`_one_memory_state`), and the evictable credit it read.
     _one_state = False
     _held_evictable: Optional[Dict[str, int]] = None
+
+    def admission_capacity(self) -> tuple[int, ...] | None:
+        # Demands are priced jointly across pools, so no single count tracks them.
+        return None
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
