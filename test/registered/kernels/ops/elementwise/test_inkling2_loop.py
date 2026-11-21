@@ -1,5 +1,5 @@
 """The fused loop message controllers must match the unfused op chain they replace
-(RMSNorm, K-group down linear, gain / forget GEMMs, tanh mix) up to rounding."""
+(RMSNorm, down linear, gain / forget GEMMs, tanh mix) up to rounding."""
 
 import sys
 
@@ -20,7 +20,7 @@ def _reference(dest, message, down, gain, forget):
     normalized = rms_norm(
         torch.stack((dest, message), dim=1), None, 1e-6, output_dtype=torch.bfloat16
     ).flatten(1)
-    hidden = linear(normalized, down)
+    hidden = (normalized.double() @ down.double().T).bfloat16()
     g = torch.tanh(linear(hidden, gain, out_dtype=torch.float32))
     f = torch.tanh(linear(hidden, forget, out_dtype=torch.float32))
     return (1.0 - f) * dest + g * message

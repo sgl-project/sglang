@@ -582,5 +582,7 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_num_candidates",
     "watermark_context_history_size",
     "watermark_skip_first_ngram_calls",
+    "inkling2_loop_num_passes",
+    "inkling2_loop_share_cache",
 )
 # fmt: on
