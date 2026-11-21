@@ -1042,6 +1042,7 @@ def run_eagle_verify(
         accept_index,
         num_draft_tokens,
         prepared_step_indices=prepared_commit_steps,
+        checkpoint_commit=getattr(speculative_runtime_hooks, "checkpoint_commit", None),
     )
 
     if not batch.forward_mode.is_idle() and watermark is not None:

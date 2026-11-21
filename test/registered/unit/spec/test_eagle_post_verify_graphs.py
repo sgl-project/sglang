@@ -22,6 +22,13 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
+maybe_stub_sgl_kernel()
+
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -38,11 +45,6 @@ from sglang.srt.speculative import (
 from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
 from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
-
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 TOKENS = 7
 VOCAB = 257
@@ -537,6 +539,61 @@ class TestPostVerifyGraphs(CustomTestCase):
                 for name, src in inputs.items():
                     self.assertTrue(torch.equal(staged[name], src), name)
                 self.assertEqual(int(staged["sim_accept_len"]), 3)
+
+
+class TestCheckpointHookGraphWiring(CustomTestCase):
+    def test_worker_binds_before_graph_setup_and_passes_the_same_hooks_to_eager(self):
+        hooks = SimpleNamespace(checkpoint_commit=lambda view: True)
+        with patch.object(
+            eagle_worker_v2, "bind_eagle_runtime_hooks", return_value=hooks
+        ) as bind:
+            worker = _worker(switch=True)
+        bind.assert_called_once_with(worker.target_worker, supports_sharded_verify=True)
+        self.assertIs(worker._post_verify_graphs._speculative_runtime_hooks, hooks)
+        self.assertIs(_verify_kwargs(worker)["speculative_runtime_hooks"], hooks)
+
+    def test_half_constructed_workers_and_graphs_keep_the_stock_checkpoint(self):
+        from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+        for cls in (eagle_worker_v2.EAGLEWorkerV2, NGRAMWorker, EaglePostVerifyGraphs):
+            with self.subTest(cls=cls.__name__):
+                obj = cls.__new__(cls)
+                self.assertNotIn("_speculative_runtime_hooks", obj.__dict__)
+                self.assertIs(
+                    obj._speculative_runtime_hooks,
+                    eagle_worker_v2.STOCK_SPECULATIVE_RUNTIME_HOOKS,
+                )
+                self.assertIsNone(
+                    getattr(obj._speculative_runtime_hooks, "checkpoint_commit", None)
+                )
+
+    def test_graph_commit_forwards_the_bound_callback(self):
+        callback = lambda view: True
+        graphs = EaglePostVerifyGraphs.__new__(EaglePostVerifyGraphs)
+        graphs._target_worker = object()
+        graphs._speculative_runtime_hooks = SimpleNamespace(checkpoint_commit=callback)
+        slot = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            staged={
+                "seq_lens": torch.tensor([5]),
+                "req_pool_indices": torch.tensor([0]),
+            },
+            tree_cache=None,
+            tokens_per_request=7,
+        )
+        outputs = (
+            None,
+            torch.tensor([2]),
+            torch.tensor([[0, 1]]),
+            None,
+            None,
+            None,
+            (None, None),
+        )
+        with patch.object(spec_utils, "commit_mamba_states_after_verify") as commit:
+            graphs._commit(slot, outputs)
+        self.assertIs(commit.call_args.kwargs["checkpoint_commit"], callback)
+        self.assertIs(commit.call_args.kwargs["prepared_step_indices"], outputs[6])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

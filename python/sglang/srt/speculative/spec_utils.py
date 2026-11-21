@@ -66,6 +66,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
+    from sglang.kernels.plugin_kernels.nvidia.spec import CheckpointCommit
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -1244,6 +1245,7 @@ def commit_mamba_states_after_verify(
     draft_token_num: int,
     prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
     state_slots: Optional[ForwardStateSlots] = None,
+    checkpoint_commit: Optional[CheckpointCommit] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -1378,6 +1380,28 @@ def commit_mamba_states_after_verify(
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         assert state_slots.ring is not None, "the GDN ring is indexed per request"
         replay_indices = state_slots.ring[:bs]
+        compact_commit = None
+        if checkpoint_commit is not None:
+            from sglang.kernels.plugin_kernels.nvidia.spec import CheckpointCommitView
+
+            view = CheckpointCommitView(
+                checkpoint=spec_state.temporal,
+                updates=spec_state.replayssm_d,
+                keys=spec_state.replayssm_k,
+                log_decays=spec_state.replayssm_g,
+                update_residuals=spec_state.replayssm_rawv,
+                key_residuals=spec_state.replayssm_rawk,
+                state_indices=replay_state_indices,
+                history_indices=replay_indices,
+                history_lengths=mamba_pool.replayssm_spec_write_pos,
+                history_offsets=mamba_pool.replayssm_cache_base,
+                fold_mask=mamba_pool.replayssm_is_flush,
+                accepted_lengths=accept_lens,
+                track_state_indices=replay_track_indices,
+                track_steps=mamba_steps_to_track,
+                null_index=-1,
+            )
+            compact_commit = lambda: checkpoint_commit(view)
         # Advance the request cursors by the accepted count (incl. the bonus
         # token), fold capacity rows into `temporal`, and roll back conv.
         commit_gdn_replayssm_after_verify(
@@ -1395,6 +1419,7 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            compact_commit=compact_commit,
         )
         commit_ple_states_after_verify(
             model_runner.token_to_kv_pool.layer_router,
