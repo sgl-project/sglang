@@ -27,10 +27,7 @@ impl TokenPieces {
             }
         }
         // `_is_byte_level_tokenizer` answers a fast tokenizer with its declared decoder.
-        let decoder = &tokenizer["decoder"];
-        let byte_level = std::iter::once(decoder)
-            .chain(decoder["decoders"].as_array().into_iter().flatten())
-            .any(|step| step["type"] == "ByteLevel");
+        let byte_level = is_byte_level_decoder(&tokenizer["decoder"]);
         Self { pieces, byte_level }
     }
 
@@ -43,6 +40,16 @@ impl TokenPieces {
             .collect::<Option<Vec<u8>>>()?;
         (!bytes.is_empty()).then_some(bytes)
     }
+}
+
+fn is_byte_level_decoder(mut decoder: &Value) -> bool {
+    while decoder["type"] == "Sequence" {
+        match decoder["decoders"].as_array().map(Vec::as_slice) {
+            Some([step]) => decoder = step,
+            _ => return false,
+        }
+    }
+    decoder["type"] == "ByteLevel"
 }
 
 /// GPT-2's `bytes_to_unicode`, inverted for one character.
@@ -91,5 +98,31 @@ mod tests {
             None
         );
         assert_eq!(byte_level_byte('Ġ'), Some(b' '));
+
+        let nested = json!({
+            "model": {"vocab": {"ð": 1, "Ł": 2, "ĺ": 3, "Ģ": 4}},
+            "added_tokens": [{"id": 0, "content": "<｜begin▁of▁sentence｜>"}],
+            "decoder": {"type": "Sequence", "decoders": [
+                {"type": "Sequence", "decoders": [{"type": "ByteLevel"}]}
+            ]}
+        });
+        let pieces = TokenPieces::from_tokenizer_json(&nested);
+        let bytes: Vec<_> = (1..=4)
+            .flat_map(|id| pieces.byte_level_bytes(id).unwrap())
+            .collect();
+        assert_eq!(bytes, "😀".as_bytes());
+        assert_eq!(pieces.byte_level_bytes(0), None);
+
+        let transforming = json!({
+            "model": {"vocab": {"é": 0}},
+            "decoder": {"type": "Sequence", "decoders": [
+                {"type": "Replace", "pattern": {"String": "é"}, "content": "Ã©"},
+                {"type": "ByteLevel"}
+            ]}
+        });
+        assert_eq!(
+            TokenPieces::from_tokenizer_json(&transforming).byte_level_bytes(0),
+            None
+        );
     }
 }

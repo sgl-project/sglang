@@ -45,6 +45,15 @@ def _build_byte_decoder() -> dict[str, int]:
     return dict(zip(cs, bs))
 
 
+def _is_byte_level_decoder(decoder) -> bool:
+    while isinstance(decoder, dict) and decoder.get("type") == "Sequence":
+        steps = decoder.get("decoders", [])
+        if len(steps) != 1:
+            return False
+        decoder = steps[0]
+    return isinstance(decoder, dict) and decoder.get("type") == "ByteLevel"
+
+
 def _is_byte_level_tokenizer(tokenizer) -> bool:
     """Determine whether *tokenizer* uses GPT-2 byte-level BPE.
 
@@ -68,11 +77,12 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
 
     if isinstance(tokenizer, PreTrainedTokenizerFast):
         # fastokens backs the tokenizer with a shim whose decoder carries no type
-        decoder = json.loads(tokenizer.backend_tokenizer.to_str()).get("decoder") or {}
-        is_bl = any(
-            step.get("type") == "ByteLevel"
-            for step in [decoder, *decoder.get("decoders", [])]
-        )
+        try:
+            decoder = json.loads(tokenizer.backend_tokenizer.to_str()).get("decoder")
+        except Exception:
+            # Custom decoders may not support serialization; display fallback is safe.
+            decoder = None
+        is_bl = _is_byte_level_decoder(decoder)
         _BYTE_LEVEL_VERDICTS[tid] = is_bl
         return is_bl
 

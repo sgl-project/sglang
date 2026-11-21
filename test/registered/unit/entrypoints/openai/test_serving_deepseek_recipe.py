@@ -536,6 +536,28 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 )
                 self.assertEqual(logprob.bytes, [0xF0])
 
+    def test_only_byte_preserving_decoder_sequences_use_byte_table(self):
+        from tokenizers import Tokenizer, decoders, models
+        from transformers import PreTrainedTokenizerFast
+
+        from sglang.srt.entrypoints.openai import utils
+
+        def make_tokenizer(decoder):
+            backend = Tokenizer(models.BPE(vocab={"ð": 0, "é": 1}, merges=[]))
+            backend.decoder = decoder
+            return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+        utils._BYTE_LEVEL_VERDICTS.clear()
+        nested = make_tokenizer(
+            decoders.Sequence([decoders.Sequence([decoders.ByteLevel()])])
+        )
+        self.assertEqual(utils.token_id_to_bytes(nested, 0), [0xF0])
+
+        transforming = make_tokenizer(
+            decoders.Sequence([decoders.Replace("é", "Ã©"), decoders.ByteLevel()])
+        )
+        self.assertIsNone(utils.token_id_to_bytes(transforming, 1))
+
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
