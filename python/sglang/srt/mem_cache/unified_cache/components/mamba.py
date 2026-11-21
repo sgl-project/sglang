@@ -1064,6 +1064,7 @@ class MambaComponent(TreeComponent):
             else:
                 mamba_value_donated = self._try_alloc_mamba_slot(req)
                 if mamba_value_donated is None:
+                    insert_params.mamba_no_buffer_checkpoint_failed = True
                     return 0
                 storage, sub_pool = self._state()
                 storage.copy_state(
