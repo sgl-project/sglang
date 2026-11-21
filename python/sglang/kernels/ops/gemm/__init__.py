@@ -13,7 +13,6 @@ from sglang.kernels.spec import (
     CapabilityRequirement,
     KernelBackend,
     KernelSpec,
-    capabilities_satisfied,
 )
 
 if TYPE_CHECKING:
@@ -128,7 +127,7 @@ def _prefer_torch_rowwise_fp8(
     return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
 
 
-_SM120_RT_DEPS: Optional[Tuple[object, object, object]] = None
+_SM120_RT_DEPS: Optional[Tuple[object, object, object, bool]] = None
 
 
 def _get_sm120_rt_deps():
@@ -138,7 +137,12 @@ def _get_sm120_rt_deps():
 
         from sglang.srt import batch_invariant_ops, runtime_context
 
-        _SM120_RT_DEPS = (torch, batch_invariant_ops, runtime_context)
+        _SM120_RT_DEPS = (
+            torch,
+            batch_invariant_ops,
+            runtime_context,
+            hasattr(torch, "_scaled_mm"),
+        )
     return _SM120_RT_DEPS
 
 
@@ -178,24 +182,25 @@ def _prefer_sm120_torch_rowwise_fp8(
     if max_n <= 0 or n > max_n:
         return False
 
-    torch, batch_invariant_ops, runtime_context = _get_sm120_rt_deps()
+    torch, batch_invariant_ops, runtime_context, has_scaled_mm = _get_sm120_rt_deps()
     if (
-        out_dtype not in (torch.bfloat16, torch.float16)
+        not has_scaled_mm
+        or (out_dtype is not torch.bfloat16 and out_dtype is not torch.float16)
         or mat_b.device != dev
-        or mat_a.dtype != torch.float8_e4m3fn
-        or mat_b.dtype != torch.float8_e4m3fn
-        or scales_a.dtype != torch.float32
-        or scales_b.dtype != torch.float32
+        or mat_a.dtype is not torch.float8_e4m3fn
+        or mat_b.dtype is not torch.float8_e4m3fn
+        or scales_a.dtype is not torch.float32
+        or scales_b.dtype is not torch.float32
         or scales_a.device != dev
         or scales_b.device != dev
         or scales_a.shape != (m, 1)
         or scales_b.numel() != n
         or not mat_a.is_contiguous()
-        or not mat_b.t().is_contiguous()
+        or mat_b.stride(0) != 1
+        or (n > 1 and mat_b.stride(1) != k)
         or not scales_a.is_contiguous()
         or not scales_b.is_contiguous()
         or torch.compiler.is_compiling()
-        or not hasattr(torch, "_scaled_mm")
         or batch_invariant_ops.is_batch_invariant_mode_enabled()
     ):
         return False
@@ -233,14 +238,16 @@ class Fp8ScaledMMOp(BaseFusedOp):
         # capability limit; elsewhere the AOT kernel always runs.
         if backend is KernelBackend.AOT:
             plat = _platform()
-            if capabilities_satisfied(_SM90, plat) and _prefer_torch_rowwise_fp8(
-                mat_a, mat_b, scales_a, scales_b, out_dtype, bias
-            ):
-                return False
-            if capabilities_satisfied(_SM120, plat) and _prefer_sm120_torch_rowwise_fp8(
-                mat_a, mat_b, scales_a, scales_b, out_dtype, bias
-            ):
-                return False
+            if plat.device_type == "cuda":
+                if plat.cuda_arch_major == 12 and plat.cuda_arch_minor == 0:
+                    return not _prefer_sm120_torch_rowwise_fp8(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+                    )
+                if plat.cuda_arch_major == 9 and plat.cuda_arch_minor == 0:
+                    return not _prefer_torch_rowwise_fp8(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+                    )
+                return True
         return super().backend_eligible(
             backend, mat_a, mat_b, scales_a, scales_b, out_dtype, bias
         )
@@ -254,12 +261,24 @@ class Fp8ScaledMMOp(BaseFusedOp):
         out_dtype: torch.dtype,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import torch
-
+        torch = _get_sm120_rt_deps()[0]
         m, n = mat_a.shape[0], mat_b.shape[1]
-        scale_a = scales_a.reshape(m, 1) if scales_a.numel() == m else scales_a
-        scale_b = scales_b.reshape(1, n) if scales_b.numel() == n else scales_b
-        use_fast_accum = not capabilities_satisfied(_SM120, _platform())
+        scale_a = (
+            scales_a
+            if scales_a.shape == (m, 1)
+            else (scales_a.reshape(m, 1) if scales_a.numel() == m else scales_a)
+        )
+        scale_b = (
+            scales_b
+            if scales_b.shape == (1, n)
+            else (scales_b.reshape(1, n) if scales_b.numel() == n else scales_b)
+        )
+        plat = _platform()
+        use_fast_accum = not (
+            plat.device_type == "cuda"
+            and plat.cuda_arch_major == 12
+            and plat.cuda_arch_minor == 0
+        )
         return torch._scaled_mm(
             mat_a,
             mat_b,
