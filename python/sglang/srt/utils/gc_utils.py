@@ -51,7 +51,8 @@ def configure_gc_logging(process_name: str) -> None:
                 f"LONG GARBAGE COLLECTION DETECTED | {process_name} | Generation {gen} | "
                 f"Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
                 f"This may cause latency jitter. Long-lived objects keep each full pass slow; "
-                f"in the scheduler, --gc-freeze-on-idle-secs freezes them."
+                f"in the scheduler, --gc-freeze-on-idle-secs (idle) or "
+                f"--gc-freeze-after-batches (busy) freezes them."
             )
 
     gc.callbacks.append(gc_callback)

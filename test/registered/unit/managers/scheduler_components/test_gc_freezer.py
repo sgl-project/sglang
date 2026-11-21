@@ -1,6 +1,7 @@
 import collections
 import gc
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -38,11 +39,11 @@ class TestGCFreezer(CustomTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _freezer(self, *, freeze_on_idle_secs):
-        return GCFreezer(freeze_on_idle_secs=freeze_on_idle_secs)
+    def _freezer(self, *, freeze_on_idle_secs=0.0, **batch_trigger):
+        return GCFreezer(freeze_on_idle_secs=freeze_on_idle_secs, **batch_trigger)
 
     def _gc_calls(self):
-        names = ("collect", "freeze_gc", "refreeze_gc", "unfreeze")
+        names = ("collect", "freeze", "freeze_gc", "refreeze_gc", "unfreeze")
         return [c for c in self.gc_ops.mock_calls if c[0] in names]
 
     def _two_idle_periods(self, freezer):
@@ -85,45 +86,79 @@ class TestGCFreezer(CustomTestCase):
             [call.unfreeze(), call.freeze_gc("Scheduler")],
         )
 
-    def _batch_gc_calls(self):
-        names = ("collect", "freeze", "freeze_gc", "refreeze_gc", "unfreeze")
-        return [c for c in self.gc_ops.mock_calls if c[0] in names]
+    def _frozen_at(self, freezer, forward_cts):
+        frozen_at = []
+        for forward_ct in forward_cts:
+            before = len(self._gc_calls())
+            freezer.on_batch(forward_ct)
+            if len(self._gc_calls()) > before:
+                frozen_at.append(forward_ct)
+        return frozen_at
 
     def test_batch_freeze_collects_young_generations_only_and_repeats(self):
         """A busy scheduler is never idle; its freeze must not run the full
         collection whose pause it removes, and must not walk the frozen list
         (gc.get_freeze_count) on every re-freeze."""
-        freezer = GCFreezer(
-            freeze_on_idle_secs=0.0, freeze_after_batches=10, freeze_every_batches=4
-        )
-        frozen_at = []
-        for forward_ct in range(1, 19):
-            before = len(self._batch_gc_calls())
-            freezer.on_batch(forward_ct)
-            if len(self._batch_gc_calls()) > before:
-                frozen_at.append(forward_ct)
-        self.assertEqual(frozen_at, [10, 14, 18])
-        self.assertEqual(self._batch_gc_calls(), [call.collect(1), call.freeze()] * 3)
+        freezer = self._freezer(freeze_after_batches=10, freeze_every_batches=4)
+        self.assertEqual(self._frozen_at(freezer, range(1, 19)), [10, 14, 18])
+        self.assertEqual(self._gc_calls(), [call.collect(1), call.freeze()] * 3)
         self.gc_ops.get_freeze_count.assert_called_once()
 
     def test_batch_freeze_is_off_by_default(self):
-        freezer = self._freezer(freeze_on_idle_secs=0.0)
+        freezer = self._freezer()
         for forward_ct in range(1, 100):
             freezer.on_batch(forward_ct)
-        self.assertEqual(self._batch_gc_calls(), [])
+        self.assertEqual(self._gc_calls(), [])
 
-    def test_cache_reset_unfreezes_and_the_next_batch_freezes_again(self):
-        freezer = GCFreezer(freeze_on_idle_secs=0.0, freeze_after_batches=5)
-        for forward_ct in range(1, 8):
-            freezer.on_batch(forward_ct)
-        freezer.on_cache_reset()
-        freezer.on_batch(8)
-        freezer.on_batch(9)
+    def test_batch_freeze_runs_a_full_collection_and_heap_check_each_interval(self):
+        """Frozen cyclic garbage on a never-idle scheduler is bounded by one full
+        collection per interval; the heap-growth check runs with it."""
+        self.gc_ops.get_freeze_count.return_value = 0
+        freezer = self._freezer(freeze_after_batches=1, freeze_every_batches=1)
+        freezer.on_batch(1)
+        self.now[0] += gc_freezer.GC_CHECK_INTERVAL_SECS
+        freezer.on_batch(2)
+        freezer.on_batch(3)
         self.assertEqual(
-            self._batch_gc_calls(),
-            [call.collect(1), call.freeze(), call.unfreeze()]
+            self._gc_calls(),
+            [call.collect(1), call.freeze()]
+            + [call.unfreeze(), call.freeze_gc("Scheduler")]
             + [call.collect(1), call.freeze()],
         )
+        self.gc_ops.get_objects.assert_called_once_with(2)
+
+    def test_cache_reset_makes_the_next_batch_freeze_collect_fully(self):
+        # Unfrozen objects land in the oldest generation, which collect(1) misses.
+        freezer = self._freezer(freeze_after_batches=5)
+        self._frozen_at(freezer, range(1, 8))
+        freezer.on_cache_reset()
+        self.assertEqual(self._frozen_at(freezer, (8, 9)), [8])
+        self.assertEqual(
+            self._gc_calls(),
+            [call.collect(1), call.freeze(), call.unfreeze()]
+            + [call.unfreeze(), call.freeze_gc("Scheduler")],
+        )
+
+    def test_cache_reset_before_the_first_freeze_keeps_the_schedule(self):
+        freezer = self._freezer(freeze_after_batches=5, freeze_every_batches=3)
+        freezer.on_cache_reset()
+        self.assertEqual(self._frozen_at(freezer, range(1, 9)), [5, 8])
+        self.assertEqual(
+            self._gc_calls(), [call.unfreeze()] + [call.collect(1), call.freeze()] * 2
+        )
+
+    def test_cache_reset_restarts_the_cadence_from_the_next_batch(self):
+        freezer = self._freezer(freeze_after_batches=10, freeze_every_batches=4)
+        self.assertEqual(self._frozen_at(freezer, range(1, 15)), [10, 14])
+        freezer.on_cache_reset()
+        self.assertEqual(self._frozen_at(freezer, range(15, 24)), [15, 19, 23])
+
+    def test_idle_and_batch_freeze_together(self):
+        freezer = self._freezer(freeze_on_idle_secs=5.0, freeze_after_batches=3)
+        self.assertEqual(self._frozen_at(freezer, range(1, 4)), [3])
+        self.gc_ops.reset_mock()
+        self._two_idle_periods(freezer)
+        self.assertEqual(self._gc_calls(), [call.freeze_gc("Scheduler")] * 2)
 
     def test_heap_growth_warns_at_each_half_again(self):
         freezer = self._freezer(freeze_on_idle_secs=0.0)
@@ -135,6 +170,27 @@ class TestGCFreezer(CustomTestCase):
             freezer._check_heap_growth()
             warned.append(self.gc_ops.logger.warning.called)
         self.assertEqual(warned, [False, False, True, False, True])
+
+
+class TestBatchFreezeAfterCacheReset(CustomTestCase):
+    def test_cyclic_garbage_frozen_by_a_batch_freeze_is_freed_after_a_reset(self):
+        """A cache flush must free cyclic garbage that a batch freeze had frozen;
+        a young-generation collection never reaches the unfrozen heap."""
+        freezer = GCFreezer(freeze_on_idle_secs=0.0, freeze_after_batches=1)
+        root = _Node()
+        for _ in range(10):
+            _Node(root)
+        alive = weakref.ref(root)
+        gc.disable()  # Only the freezer's own collections may run.
+        try:
+            freezer.on_batch(1)
+            del root
+            freezer.on_cache_reset()
+            freezer.on_batch(2)
+            self.assertIsNone(alive())
+        finally:
+            gc.unfreeze()
+            gc.enable()
 
 
 class TestRefreezeGC(CustomTestCase):

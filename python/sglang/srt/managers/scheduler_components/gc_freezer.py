@@ -25,6 +25,9 @@ class GCFreezer:
         self._freeze_every_batches = freeze_every_batches
         self._next_batch_freeze = freeze_after_batches or math.inf
         self._batch_froze = False
+        # After a cache reset the heap is unfrozen into the oldest generation,
+        # which a young-generation collection never reaches.
+        self._full_collect_next = False
         self._seen_forward_ct = -1
         self._next_freeze = math.inf
         now = time.monotonic()
@@ -39,6 +42,7 @@ class GCFreezer:
             self._next_freeze = time.monotonic()
         if self._batch_froze:
             self._next_batch_freeze = 0
+            self._full_collect_next = True
 
     def on_batch(self, forward_ct: int) -> None:
         if forward_ct < self._next_batch_freeze:
@@ -48,24 +52,39 @@ class GCFreezer:
             if self._freeze_every_batches > 0
             else math.inf
         )
-        start = time.monotonic()
-        # Young generations only: a full collection on a busy scheduler is the
-        # pause this freeze exists to avoid.
-        gc.collect(1)
-        gc.freeze()
-        elapsed_ms = (time.monotonic() - start) * 1e3
-        if self._batch_froze:
-            logger.debug(
-                f"Froze the scheduler heap at batch {forward_ct} in {elapsed_ms:.1f} ms"
+        now = time.monotonic()
+        if self._full_collect_next or now >= self._next_garbage_check:
+            # One full collection after a cache reset and once per interval, so
+            # frozen cyclic garbage stays bounded on a scheduler that is never idle.
+            self._full_collect_next = False
+            self._next_garbage_check = now + GC_CHECK_INTERVAL_SECS
+            gc.unfreeze()
+            freeze_gc("Scheduler")
+        else:
+            # Young generations only: a full collection on a busy scheduler is
+            # the pause this freeze exists to avoid.
+            gc.collect(1)
+            gc.freeze()
+        if now >= self._next_heap_check:
+            self._next_heap_check = now + GC_CHECK_INTERVAL_SECS
+            self._check_heap_growth()
+        if not self._batch_froze:
+            self._batch_froze = True
+            # gc.get_freeze_count() walks the frozen list: only at the first freeze.
+            logger.info(
+                "Froze the scheduler heap at batch %d in %.1f ms: %d objects; "
+                "again every %s batches",
+                forward_ct,
+                (time.monotonic() - now) * 1e3,
+                gc.get_freeze_count(),
+                self._freeze_every_batches or "no more",
             )
-            return
-        self._batch_froze = True
-        # gc.get_freeze_count() walks the frozen list: only at the first freeze.
-        logger.info(
-            f"Froze the scheduler heap at batch {forward_ct} in {elapsed_ms:.1f} ms: "
-            f"{gc.get_freeze_count()} objects; next every "
-            f"{self._freeze_every_batches or 'never'} batches"
-        )
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Froze the scheduler heap at batch %d in %.1f ms",
+                forward_ct,
+                (time.monotonic() - now) * 1e3,
+            )
 
     def on_idle(self, forward_ct: int) -> None:
         now = time.monotonic()
