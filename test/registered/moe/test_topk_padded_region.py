@@ -1,23 +1,38 @@
+import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang.kernels.ops.moe.fill_padded_rows as fill_mod
+import sglang.kernels.ops.moe.moe_fused_gate as gate_mod
 import sglang.srt.layers.moe.topk as topk_mod
 from sglang.kernels.ops.moe.fill_padded_rows import (
     _can_fuse_padded_region,
+    _fill_dp_pad_rows,
     _fill_padded_rows,
 )
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.eplb.expert_distribution import _SelectExpertsSinglePassGatherer
+from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _mask_topk_ids_padded_region,
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
+    select_experts,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    set_forward_context,
+)
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,6 +50,21 @@ def _eager_fill_padded_rows(x, num_token_non_padded, fill_value):
     indices = torch.arange(0, x.shape[0], device=x.device)
     out[indices >= num_token_non_padded, :] = fill_value
     return out
+
+
+def _eager_fill_dp_pad_rows(x, dp_real_rows, fill_value):
+    out = x.clone()
+    rows_per_rank = x.shape[0] // dp_real_rows.numel()
+    for rank, n_real in enumerate(dp_real_rows.tolist()):
+        start = rank * rows_per_rank
+        out[start + min(n_real, rows_per_rank) : start + rows_per_rank] = fill_value
+    return out
+
+
+def _dp_live_rows(num_rows, dp_real_rows):
+    rows = torch.arange(num_rows, device=dp_real_rows.device)
+    rows_per_rank = num_rows // dp_real_rows.numel()
+    return rows % rows_per_rank < dp_real_rows[rows // rows_per_rank]
 
 
 class _ComparisonDtypeRecorder(TorchDispatchMode):
@@ -424,5 +454,285 @@ class TestSelectExpertsPerRankSharedSlotPadMask(CustomTestCase):
                 self.assertTrue(torch.all(out.topk_ids[:n_valid, -1] == home_shared_id))
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "DP padded-row fill needs a GPU")
+class TestDpPadRows(CustomTestCase):
+    """A MAX_LEN DP gather: one equal slot per DP rank, real rows first."""
+
+    DEVICE = "cuda"
+
+    def _publish_dummy_config(self):
+        # select_experts reads the published config; put the previous context
+        # back so a later test file in the same process does not inherit it.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_matches_eager_across_layouts(self):
+        # (DP ranks, rows per rank, cols): one row per rank, a padded graph
+        # bucket, and rows wider than one block of columns.
+        for num_ranks, rows_per_rank, cols in [(8, 1, 9), (8, 16, 9), (4, 3, 129)]:
+            for idle_rank in range(3):
+                counts = torch.randint(
+                    0, rows_per_rank + 1, (num_ranks,), dtype=torch.int32
+                )
+                counts[idle_rank % num_ranks] = 0
+                counts = counts.to(self.DEVICE)
+                ids = torch.randint(
+                    0,
+                    288,
+                    (num_ranks * rows_per_rank, cols),
+                    device=self.DEVICE,
+                    dtype=torch.int32,
+                )
+                with self.subTest(
+                    num_ranks=num_ranks, rows_per_rank=rows_per_rank, cols=cols
+                ):
+                    expected = _eager_fill_dp_pad_rows(ids, counts, -1)
+                    _fill_dp_pad_rows(ids, counts, -1)
+                    self.assertTrue(torch.equal(ids, expected))
+
+    def test_cuda_graph_replay_reads_counts(self):
+        # The decode graph is captured with every row live and replayed with
+        # each step's counts, so the kernel has to read them from device memory.
+        num_ranks, rows_per_rank, k = 8, 4, 9
+        ids = torch.randint(
+            0,
+            288,
+            (num_ranks * rows_per_rank, k),
+            device=self.DEVICE,
+            dtype=torch.int32,
+        )
+        counts = torch.full(
+            (num_ranks,), rows_per_rank, device=self.DEVICE, dtype=torch.int32
+        )
+        work = ids.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            _fill_dp_pad_rows(work.clone(), counts, -1)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _fill_dp_pad_rows(work, counts, -1)
+
+        for step in ([4] * 8, [1, 0, 0, 0, 0, 0, 0, 0], [0, 2, 4, 1, 3, 0, 4, 1]):
+            work.copy_(ids)
+            counts.copy_(torch.tensor(step, dtype=torch.int32))
+            graph.replay()
+            torch.cuda.synchronize()
+            with self.subTest(counts=step):
+                self.assertTrue(
+                    torch.equal(work, _eager_fill_dp_pad_rows(ids, counts, -1))
+                )
+
+    def test_fused_gate_masks_only_dp_pad_rows(self):
+        # The Triton router (fused shared expert) and the fast path it may take
+        # without one must both return the unmasked routes on real rows.
+        counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE, dtype=torch.int64)
+        num_rows, num_experts = 3 * counts.numel(), 64
+        live = _dp_live_rows(num_rows, counts)
+        scores = torch.randn(num_rows, num_experts, device=self.DEVICE)
+        bias = 0.1 * torch.randn(num_experts, device=self.DEVICE)
+        for num_shared in (1, 0):
+            with self.subTest(num_fused_shared_experts=num_shared):
+                kwargs = dict(
+                    topk=8 + num_shared,
+                    num_fused_shared_experts=num_shared,
+                    routed_scaling_factor=2.5,
+                )
+                weights_all, ids_all = moe_fused_gate(scores, bias, **kwargs)
+                weights, ids = moe_fused_gate(
+                    scores, bias, dp_real_rows=counts, **kwargs
+                )
+                self.assertTrue(torch.equal(ids[live], ids_all[live]))
+                self.assertTrue(torch.equal(weights[live], weights_all[live]))
+                self.assertTrue(torch.all(ids[~live] == -1))
+                self.assertTrue(torch.all(weights[~live] == 0))
+
+    @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
+    def test_glm_router_masks_in_its_launch(self):
+        # GLM-5.3-Flash's router (288 experts, top-8 plus one fused shared slot,
+        # sigmoid) takes the warp router with or without DP counts: real rows
+        # match the call without counts bit for bit, and no mask runs outside
+        # the router launch.
+        self._publish_dummy_config()
+        num_experts = 288
+        counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE, dtype=torch.int64)
+        num_rows = 3 * counts.numel()
+        live = _dp_live_rows(num_rows, counts)
+        x = torch.randn(num_rows, 256, device=self.DEVICE, dtype=torch.bfloat16)
+        logits = torch.randn(num_rows, num_experts, device=self.DEVICE)
+        config = TopKConfig(
+            top_k=8 + 1,
+            use_grouped_topk=True,
+            num_expert_group=1,
+            topk_group=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
+            correction_bias=0.1 * torch.randn(num_experts, device=self.DEVICE),
+            scoring_func="sigmoid",
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            allow_routed_experts_capture=False,
+        )
+        ref = select_experts(hidden_states=x, router_logits=logits, topk_config=config)
+        extra_mask = AssertionError("DP mask launched outside the router")
+        with (
+            forward_context(
+                ForwardContext(attn_backend=None, moe_dp_real_rows=lambda: counts)
+            ),
+            patch.object(
+                topk_mod, "_mask_topk_ids_dp_pad_rows", side_effect=extra_mask
+            ),
+            patch.object(gate_mod, "_mask_dp_pad_routes", side_effect=extra_mask),
+        ):
+            got = select_experts(
+                hidden_states=x, router_logits=logits, topk_config=config
+            )
+        self.assertTrue(torch.equal(got.topk_ids[live], ref.topk_ids[live]))
+        self.assertTrue(torch.equal(got.topk_weights[live], ref.topk_weights[live]))
+        self.assertTrue(torch.all(got.topk_ids[~live] == -1))
+        self.assertTrue(torch.all(got.topk_weights[~live] == 0))
+
+    @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
+    def test_recorded_load_excludes_dp_padding(self):
+        self._publish_dummy_config()
+        counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE)
+        logits = torch.randn(12, 16, device=self.DEVICE)
+        x = torch.randn(12, 256, device=self.DEVICE, dtype=torch.bfloat16)
+        config = TopKConfig(
+            top_k=4, renormalize=False, allow_routed_experts_capture=False
+        )
+        gatherer = _SelectExpertsSinglePassGatherer.__new__(
+            _SelectExpertsSinglePassGatherer
+        )
+        gatherer._data = torch.zeros((1, 16), dtype=torch.int32, device=self.DEVICE)
+        recorder = SimpleNamespace(
+            get_current_pass_count_buffer=lambda: gatherer._data[0],
+            on_select_experts=lambda topk_ids: gatherer.on_select_experts(0, topk_ids),
+        )
+        with (
+            forward_context(
+                ForwardContext(attn_backend=None, moe_dp_real_rows=lambda: counts)
+            ),
+            patch.object(
+                topk_mod,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            routed = select_experts(x, logits, config)
+            self.assertEqual(gatherer._data.sum().item(), 24)
+            gatherer._data.zero_()
+            weights, ids = torch.topk(logits.softmax(-1), 4)
+            precomputed = topk_mod.build_precomputed_topk_output(
+                weights, ids.int(), config, 0
+            )
+            self.assertEqual(gatherer._data.sum().item(), 24)
+            self.assertTrue(
+                torch.all(precomputed.topk_ids[~_dp_live_rows(12, counts)] == -1)
+            )
+            self.assertTrue(
+                torch.all(routed.topk_ids[~_dp_live_rows(12, counts)] == -1)
+            )
+
+    @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
+    def test_k3_dp_padding_uses_masked_routes_at_handoff(self):
+        self._publish_dummy_config()
+        x = torch.randn(8, 3584, device=self.DEVICE, dtype=torch.bfloat16)
+        logits = torch.randn(8, 896, device=self.DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(896, device=self.DEVICE)
+        counts = torch.tensor([1, 3], device=self.DEVICE)
+        route_quant_handoff.stage(x)
+        try:
+            with patch.object(
+                route_quant_handoff,
+                "try_route_quant_fused",
+                side_effect=AssertionError("unmasked handoff"),
+            ):
+                weights, ids = topk_mod.biased_grouped_topk_gpu(
+                    x,
+                    logits,
+                    bias,
+                    16,
+                    True,
+                    num_expert_group=1,
+                    topk_group=1,
+                    dp_pad_rows=topk_mod._DpPadRows(counts),
+                )
+            self.assertIsNone(route_quant_handoff.take(x))
+            self.assertIsNone(route_quant_handoff.take_prepared_routing(ids))
+            self.assertTrue(torch.all(ids[~_dp_live_rows(8, counts)] == -1))
+            self.assertTrue(torch.all(weights[~_dp_live_rows(8, counts)] == 0))
+        finally:
+            route_quant_handoff.clear()
+
+    @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
+    def test_fused_moe_skips_dp_pad_rows(self):
+        # Under a DP-gathered forward, select_experts routes the padding rows to
+        # -1, in the Triton router (the biased sigmoid paths, grouped as
+        # GLM-5.3-Flash configures it, with a fused shared expert) or after it
+        # (softmax); the TP fused MoE then returns zeros there and real rows
+        # unchanged.
+        self._publish_dummy_config()
+        num_experts, hidden, inter = 16, 256, 128
+        counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE, dtype=torch.int64)
+        num_rows = 3 * counts.numel()
+        live = _dp_live_rows(num_rows, counts)
+        x = torch.randn(num_rows, hidden, device=self.DEVICE).to(torch.bfloat16)
+        logits = torch.randn(num_rows, num_experts, device=self.DEVICE)
+        # One more expert for the fused shared slot (id num_experts).
+        w1 = torch.randn(num_experts + 1, 2 * inter, hidden, device=self.DEVICE)
+        w2 = torch.randn(num_experts + 1, hidden, inter, device=self.DEVICE)
+        w1 = (w1 / hidden**0.5).to(torch.bfloat16)
+        w2 = (w2 / inter**0.5).to(torch.bfloat16)
+        bias = 0.1 * torch.randn(num_experts, device=self.DEVICE)
+        shared = SharedExpertsConfig(num_fused_shared_experts=1)
+        configs = {
+            "softmax": TopKConfig(top_k=4, renormalize=False),
+            "sigmoid_shared": TopKConfig(
+                top_k=4 + 1,
+                shared_experts=shared,
+                correction_bias=bias,
+                scoring_func="sigmoid",
+                routed_scaling_factor=2.5,
+                allow_routed_experts_capture=False,
+            ),
+            # More than 8 routed slots takes the grouped path's Triton router.
+            "grouped_sigmoid_shared": TopKConfig(
+                top_k=9 + 1,
+                use_grouped_topk=True,
+                num_expert_group=1,
+                topk_group=1,
+                shared_experts=shared,
+                correction_bias=bias,
+                scoring_func="sigmoid",
+                routed_scaling_factor=2.5,
+                allow_routed_experts_capture=False,
+            ),
+        }
+        for name, topk_config in configs.items():
+            with self.subTest(router=name):
+                routed_all = select_experts(
+                    hidden_states=x, router_logits=logits, topk_config=topk_config
+                )
+                prev = set_forward_context(
+                    ForwardContext(attn_backend=None, moe_dp_real_rows=lambda: counts)
+                )
+                try:
+                    routed = select_experts(
+                        hidden_states=x, router_logits=logits, topk_config=topk_config
+                    )
+                finally:
+                    set_forward_context(prev)
+                self.assertTrue(
+                    torch.equal(routed.topk_ids[live], routed_all.topk_ids[live])
+                )
+                self.assertTrue(torch.all(routed.topk_ids[~live] == -1))
+                out_all = fused_moe(x.clone(), w1, w2, routed_all)
+                out = fused_moe(x.clone(), w1, w2, routed)
+                self.assertTrue(torch.equal(out[live], out_all[live]))
+                self.assertTrue(torch.all(out[~live] == 0))
+
+
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

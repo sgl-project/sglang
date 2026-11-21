@@ -1653,6 +1653,7 @@ def biased_topk_jit_kernel_impl(
     sqrtsoftplus_log1p: bool = False,
     router_logits_partials: Optional[torch.Tensor] = None,
     num_shared_append: int = 0,
+    dp_real_rows: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """num_shared_append is only workable when router_logits_partials is not None
     and it is only used by rocm_router_gate"""
@@ -1720,6 +1721,7 @@ def biased_topk_jit_kernel_impl(
             # Optional FlashInfer routed-MoE packed ids, written in the same launch.
             packed_out=packed_out,
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
+            dp_real_rows=dp_real_rows,
         )
         topk_weights, topk_ids = (
             topk_weights.to(torch.float32),
@@ -1851,6 +1853,7 @@ def biased_grouped_topk_impl(
 
 from sglang.kernels.ops.moe.fill_padded_rows import (
     _can_fuse_padded_region,
+    _fill_dp_pad_rows,
     _fill_padded_rows,
 )
 
@@ -1941,6 +1944,59 @@ def _mask_topk_ids_padded_region(
         topk_ids[_padded_row_mask(topk_ids, num_token_non_padded), :] = fill_value
 
 
+def _resolve_dp_real_rows() -> Optional[torch.Tensor]:
+    """Real rows per DP rank when the MoE input is a MAX_LEN DP gather."""
+    if not has_forward_context():
+        return None
+    get_rows = get_forward_context().moe_dp_real_rows
+    return get_rows() if get_rows is not None else None
+
+
+@dataclass
+class _DpPadRows:
+    """The padding rows of a MAX_LEN DP gather, to route to no expert.
+
+    ``masked`` is set once a router call has done it, so select_experts skips its
+    own mask launch.
+    """
+
+    real_rows: torch.Tensor
+    masked: bool = False
+
+
+def _dp_pad_rows_gate_kwargs(dp_pad_rows: Optional[_DpPadRows]) -> dict:
+    """Hand the DP padding rows to a moe_fused_gate call, which masks them."""
+    if dp_pad_rows is None:
+        return {}
+    dp_pad_rows.masked = True
+    return {"dp_real_rows": dp_pad_rows.real_rows}
+
+
+def _mask_topk_ids_dp_pad_rows(
+    topk_ids: torch.Tensor, dp_real_rows: torch.Tensor
+) -> None:
+    """Route the padding rows of a MAX_LEN DP-gathered MoE input to no expert.
+
+    The gather hands every DP rank's padded slot to the router. The fused MoE
+    skips -1 ids, so padding rows load no expert weights and contribute zeros.
+    """
+    if topk_ids.shape[0] == 0:
+        return
+    if _can_fuse_padded_region(topk_ids):
+        _fill_dp_pad_rows(topk_ids, dp_real_rows, -1)
+        return
+    num_rows = topk_ids.shape[0]
+    num_ranks = dp_real_rows.numel()
+    if num_ranks == 0 or num_rows % num_ranks != 0:
+        raise ValueError(
+            f"{num_rows} rows do not split into {num_ranks} equal DP slots"
+        )
+    rows = torch.arange(num_rows, device=topk_ids.device)
+    rows_per_rank = num_rows // num_ranks
+    live = rows % rows_per_rank < dp_real_rows[rows // rows_per_rank]
+    topk_ids.masked_fill_(~live[:, None], -1)
+
+
 def _zero_topk_weights_padded_region(
     topk_weights: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -1978,6 +2034,7 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    dp_pad_rows: Optional[_DpPadRows] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
@@ -2052,6 +2109,7 @@ def biased_grouped_topk_gpu(
                 ),
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                **_dp_pad_rows_gate_kwargs(dp_pad_rows),
             )
     if (
         _is_cuda
@@ -2233,17 +2291,19 @@ def biased_grouped_topk_gpu(
             # (weights, ids); a miss falls through to the unfused router.
             from sglang.srt.layers.moe import route_quant_handoff
 
-            fused = route_quant_handoff.try_route_quant_fused(
-                _gating,
-                correction_bias.to(dtype=torch.float32),
-                topk,
-                num_fused_shared_experts=num_fused_shared_experts,
-                renormalize=renormalize,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=bool(
-                    apply_routed_scaling_factor_on_output
-                ),
-            )
+            fused = None
+            if dp_pad_rows is None:
+                fused = route_quant_handoff.try_route_quant_fused(
+                    _gating,
+                    correction_bias.to(dtype=torch.float32),
+                    topk,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=bool(
+                        apply_routed_scaling_factor_on_output
+                    ),
+                )
             if fused is not None:
                 return fused
             return jit_gate(
@@ -2257,6 +2317,7 @@ def biased_grouped_topk_gpu(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **_dp_pad_rows_gate_kwargs(dp_pad_rows),
             )
         elif (
             _is_cuda
@@ -2280,6 +2341,7 @@ def biased_grouped_topk_gpu(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **_dp_pad_rows_gate_kwargs(dp_pad_rows),
             )
         elif (
             _is_xpu
@@ -2569,6 +2631,8 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
+    dp_real_rows: Optional[torch.Tensor] = None,
+    dp_rows_masked: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_shared_topk_slots = topk_config.num_shared_topk_slots
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(num_shared_topk_slots)
@@ -2645,7 +2709,7 @@ def _post_process_topk_ids(
             fused_topk_ids = None
             recorder = get_global_expert_distribution_recorder()
             load_buffer = recorder.get_current_pass_count_buffer()
-            if load_buffer is not None:
+            if load_buffer is not None and dp_real_rows is None:
                 fused_topk_ids = topk_ids_logical_to_physical_and_record(
                     topk_ids,
                     expert_location_dispatch_info,
@@ -2839,6 +2903,18 @@ def _post_process_topk_ids(
         # with all expert weights zeroed.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
+    # Rows the router already sent to -1 stay -1 through the identity remap and
+    # the shared-column concat; an EPLB remap or the per-rank shared-slot remap
+    # would rewrite them.
+    if dp_real_rows is not None and not (
+        dp_rows_masked
+        and expert_location_dispatch_info is None
+        and not use_per_rank_shared_slots
+    ):
+        _mask_topk_ids_dp_pad_rows(topk_ids, dp_real_rows)
+        if recorder_topk_ids is not None and recorder_topk_ids is not topk_ids:
+            _mask_topk_ids_dp_pad_rows(recorder_topk_ids, dp_real_rows)
+
     return topk_ids, topk_weights, recorder_topk_ids
 
 
@@ -2877,6 +2953,10 @@ def select_experts(
     packed_topk = None
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
+    # The padding rows of a MAX_LEN DP gather (CUDA), routed to no expert by the
+    # router where it can and by one mask launch after post-processing otherwise.
+    dp_real_rows = _resolve_dp_real_rows() if _is_cuda else None
+    dp_pad_rows = _DpPadRows(dp_real_rows) if dp_real_rows is not None else None
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -2995,6 +3075,7 @@ def select_experts(
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **({"dp_pad_rows": dp_pad_rows} if dp_pad_rows is not None else {}),
             )
             padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
     elif torch_native and custom_routing_function is None:
@@ -3033,6 +3114,8 @@ def select_experts(
                 _packed_kwargs = dict(packed_out=packed_topk)
             if topk_config.sqrtsoftplus_log1p:
                 _packed_kwargs["sqrtsoftplus_log1p"] = True
+            if _biased_topk is biased_topk_jit_kernel_impl:
+                _packed_kwargs.update(_dp_pad_rows_gate_kwargs(dp_pad_rows))
             if router_logits_partials is not None:
                 _packed_kwargs["router_logits_partials"] = router_logits_partials
                 if (
@@ -3159,6 +3242,8 @@ def select_experts(
         )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
+        if dp_pad_rows is not None:
+            dp_pad_rows.masked = False
 
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
@@ -3169,6 +3254,8 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
+        dp_real_rows=dp_real_rows,
+        dp_rows_masked=dp_pad_rows is not None and dp_pad_rows.masked,
     )
 
     if recorder_topk_ids is not None:
@@ -3213,7 +3300,12 @@ def build_precomputed_topk_output(
     routing simulation. Fake dispatch changes logits *before* top-k selection,
     so it must use the ordinary router rather than this entry point.
     """
-    if num_token_non_padded is None and expert_location_dispatch_info is None:
+    dp_real_rows = _resolve_dp_real_rows() if _is_cuda else None
+    if (
+        num_token_non_padded is None
+        and expert_location_dispatch_info is None
+        and dp_real_rows is None
+    ):
         capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         return StandardTopKOutput(topk_weights, topk_ids, None)
@@ -3225,6 +3317,7 @@ def build_precomputed_topk_output(
         layer_id=layer_id,
         num_token_non_padded=num_token_non_padded,
         expert_location_dispatch_info=expert_location_dispatch_info,
+        dp_real_rows=dp_real_rows,
     )
     if recorder_topk_ids is not None:
         get_global_expert_distribution_recorder().on_select_experts(

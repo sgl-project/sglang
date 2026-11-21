@@ -55,6 +55,10 @@ struct Params {
   int32_t* __restrict__ out_i;                 // [T, K + num_shared]
   int32_t* __restrict__ out_packed;            // optional [T, K + num_shared]: id << 16 | bf16(w)
   const int32_t* __restrict__ num_non_padded;  // optional device scalar
+  // optional [R] int32 / int64: real rows of each DP rank's slot (MAX_LEN gather, real rows first)
+  const void* __restrict__ dp_real_rows;
+  uint32_t dp_rows_per_rank;
+  bool dp_real_rows_i64;
   int64_t logits_stride;
   uint32_t num_tokens;
   uint32_t num_shared;
@@ -158,7 +162,14 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
 
   const auto out_w = p.out_w + static_cast<int64_t>(token) * k_total;
   const auto out_i = p.out_i + static_cast<int64_t>(token) * k_total;
-  if (p.num_non_padded != nullptr && token >= static_cast<uint32_t>(*p.num_non_padded)) {
+  bool padded = p.num_non_padded != nullptr && token >= static_cast<uint32_t>(*p.num_non_padded);
+  if (p.dp_real_rows != nullptr) {
+    const uint32_t rank = token / p.dp_rows_per_rank;
+    const int64_t real = p.dp_real_rows_i64 ? static_cast<const int64_t*>(p.dp_real_rows)[rank]
+                                            : static_cast<const int32_t*>(p.dp_real_rows)[rank];
+    padded |= static_cast<int64_t>(token - rank * p.dp_rows_per_rank) >= real;
+  }
+  if (padded) {
     if (lane_id < k_total) {
       if constexpr (!kMuseSpark) out_w[lane_id] = 0.0f;
       out_i[lane_id] = -1;
@@ -359,7 +370,8 @@ struct RouteWarpKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> expert_map,
       const tvm::ffi::Optional<tvm::ffi::TensorView> input_ids,
       const tvm::ffi::Optional<tvm::ffi::TensorView> bias_alt,
-      const int32_t bias_alt_token_id) {
+      const int32_t bias_alt_token_id,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> dp_real_rows) {
     using namespace host;
     constexpr uint32_t L = E / 32;
     const auto k_total = static_cast<int64_t>(K) + num_shared;
@@ -412,6 +424,18 @@ struct RouteWarpKernel {
     if (out_packed.has_value()) p.out_packed = static_cast<int32_t*>(out_packed.value().data_ptr());
     p.logits_stride = logits.stride(0);
     p.num_tokens = static_cast<uint32_t>(logits.size(0));
+    if (dp_real_rows.has_value()) {
+      TensorMatcher({-1})  //
+          .with_dtype<int32_t, int64_t>()
+          .with_device(device_sym)
+          .verify(dp_real_rows.value());
+      const auto num_ranks = static_cast<uint32_t>(dp_real_rows.value().size(0));
+      CHECK_HOST(num_ranks > 0 && p.num_tokens % num_ranks == 0)
+          << "route_warp: " << p.num_tokens << " rows do not split into " << num_ranks << " DP slots";
+      p.dp_real_rows = dp_real_rows.value().data_ptr();
+      p.dp_rows_per_rank = p.num_tokens / num_ranks;
+      p.dp_real_rows_i64 = is_type<int64_t>(dp_real_rows.value().dtype());
+    }
     p.num_shared = static_cast<uint32_t>(num_shared);
     p.scale = scale;
     p.shared_weight = apply_scale ? 1.0f : 1.0f / scale;

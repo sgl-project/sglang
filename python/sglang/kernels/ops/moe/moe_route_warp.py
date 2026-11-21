@@ -5,7 +5,8 @@ the Triton router in ``moe_fused_gate``.
 
 Same contract as the router in ``moe_fused_gate`` for the inputs ``covered``
 accepts: fp32 weights and int32 ids in descending ranking order, lowest expert
-id wins ties, rows past ``num_token_non_padded`` get zero weights and id -1,
+id wins ties, rows past ``num_token_non_padded`` and the padding rows of a
+MAX_LEN DP gather (``dp_real_rows``) get zero weights and id -1,
 fused shared-expert slots follow the routed ones. NaN logits rank last. Grouped
 routing scores a group by the sum of its two largest biased values, a duplicated
 maximum counted twice (DeepSeek reference and flashinfer ``fused_topk_deepseek``).
@@ -147,11 +148,14 @@ def moe_route_warp(
     input_ids: Optional[torch.Tensor] = None,
     bias_alt: Optional[torch.Tensor] = None,
     bias_alt_token_id: Optional[int] = None,
+    dp_real_rows: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Returns (weights [T, topk] fp32, ids [T, topk] int32); ``topk`` counts the
     fused shared-expert slots. ``bias`` is optional for softmax, which then
     ranks and weighs ``logits + bias``. ``num_token_non_padded`` is an int32
-    device scalar. ``packed_out`` ([T, topk] int32) also receives ``id << 16 |
+    device scalar. With ``dp_real_rows`` (int32 or int64, one count per DP rank)
+    the rows form one equal slot per rank, real rows first, and the rest are
+    padding rows. ``packed_out`` ([T, topk] int32) also receives ``id << 16 |
     bf16_bits(weight)``. Rows whose ``input_ids`` equal ``bias_alt_token_id``
     rank with ``bias_alt`` instead of ``bias``. Caller must have checked
     :func:`covered` and :func:`bias_layout_ok`."""
@@ -190,6 +194,7 @@ def moe_route_warp(
         input_ids,
         bias_alt,
         0 if bias_alt_token_id is None else int(bias_alt_token_id),
+        dp_real_rows,
     )
     return out_w, out_i
 
@@ -263,5 +268,6 @@ def muse_spark_route_warp(
         None,
         None,
         0,
+        None,
     )
     return topk_weights, topk_ids

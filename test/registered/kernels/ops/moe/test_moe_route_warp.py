@@ -419,6 +419,70 @@ def test_padding_and_packed(config: str) -> None:
     assert torch.equal(packed, (i << 16) | bits)
 
 
+def _dp_live_rows(num_rows: int, counts: torch.Tensor) -> torch.Tensor:
+    rows = torch.arange(num_rows, device=counts.device)
+    rows_per_rank = num_rows // counts.numel()
+    return rows % rows_per_rank < counts[rows // rows_per_rank]
+
+
+@pytest.mark.parametrize(
+    "config", ["deepseek_v3", "kimi_k2", "qwen3_moe", "deepseek_v4"]
+)
+@pytest.mark.parametrize("counts_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_shared", [0, 1])
+def test_dp_pad_rows(config: str, counts_dtype, num_shared: int) -> None:
+    # A MAX_LEN DP gather: one equal slot per rank, real rows first. Real rows
+    # route as without the counts, bit for bit; the rest are padding rows.
+    counts = torch.tensor([3, 0, 5, 1], device=DEVICE, dtype=counts_dtype)
+    num_rows = 5 * counts.numel()
+    scores, bias = _inputs(config, num_rows, seed=31)
+    kwargs = _kwargs(config, num_fused_shared_experts=num_shared)
+    kwargs["topk"] += num_shared
+    w_all, i_all = moe_route_warp(scores, bias, **kwargs)
+    packed = torch.empty(num_rows, kwargs["topk"], dtype=torch.int32, device=DEVICE)
+    w, i = moe_route_warp(
+        scores, bias, dp_real_rows=counts, packed_out=packed, **kwargs
+    )
+    live = _dp_live_rows(num_rows, counts)
+    assert torch.equal(i[live], i_all[live]) and torch.equal(w[live], w_all[live])
+    assert (w[~live] == 0).all() and (i[~live] == -1).all()
+    bits = w.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    assert torch.equal(packed, (i << 16) | bits)
+    # moe_fused_gate keeps the warp router when it gets DP counts.
+    fw, fi = moe_fused_gate(scores, bias, dp_real_rows=counts, **kwargs)
+    assert torch.equal(fi, i) and torch.equal(fw, w)
+
+
+def test_dp_pad_rows_cuda_graph() -> None:
+    # The decode graph is captured once and replayed with each step's counts.
+    scores, bias = _inputs("kimi_k2", 32, seed=33)
+    kwargs = _kwargs("kimi_k2")
+    w_all, i_all = moe_route_warp(scores, bias, **kwargs)
+    counts = torch.full((8,), 4, device=DEVICE, dtype=torch.int64)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        moe_route_warp(scores, bias, dp_real_rows=counts, **kwargs)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w, i = moe_route_warp(scores, bias, dp_real_rows=counts, **kwargs)
+    for step in ([4] * 8, [1] + [0] * 7, [0, 2, 4, 1, 3, 0, 4, 1]):
+        counts.copy_(torch.tensor(step))
+        graph.replay()
+        torch.cuda.synchronize()
+        live = _dp_live_rows(32, counts)
+        assert torch.equal(i[live], i_all[live]) and torch.equal(w[live], w_all[live])
+        assert (w[~live] == 0).all() and (i[~live] == -1).all()
+
+
+def test_dp_pad_rows_uneven_split() -> None:
+    scores, bias = _inputs("kimi_k2", 30, seed=34)
+    counts = torch.ones(8, device=DEVICE, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="DP slots"):
+        moe_route_warp(scores, bias, dp_real_rows=counts, **_kwargs("kimi_k2"))
+
+
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_bias(bias_dtype: torch.dtype) -> None:
     scores, bias = _inputs("kimi_k2", 64, seed=9)
