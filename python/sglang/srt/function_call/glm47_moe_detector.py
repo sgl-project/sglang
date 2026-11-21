@@ -315,9 +315,13 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.use_full_assistant_constraint = False
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        # An unclosed trailing call matches the second branch, with group 1 unset,
+        # so the scan does not restart from every opener in the unclosed tail.
+        self.func_call_regex = r"(<tool_call>.*?</tool_call>)|<tool_call>.*"
+        # Each split call starts at its opener, and a later opener sees a subset of
+        # the text, so anchoring keeps a failed search from rescanning per opener.
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
+            r"\A<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
@@ -371,6 +375,8 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Find all tool call matches
         for match in re.finditer(self.func_call_regex, text, re.DOTALL):
+            if match.group(1) is None:
+                continue
             # Add text before this tool call
             if match.start() > last_end:
                 normal_text_parts.append(text[last_end : match.start()])
@@ -392,7 +398,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_name = func_detail.group(1).strip() if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:

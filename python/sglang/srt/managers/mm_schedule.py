@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -13,7 +14,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -316,7 +318,9 @@ def _get_chunked_embedding_full(
     """
     item_hashes = [item.cache_key for item in embedding_items_per_req]
     embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-    embedding_per_req = embedding_cache.get(item_hashes)
+    embedding_per_req = embedding_cache.get(
+        item_hashes, combined_hash=embedding_items_hash
+    )
 
     # A compact feature hash can collide for inputs with different token
     # counts.  Never feed a stale cache entry into the scheduler: the length

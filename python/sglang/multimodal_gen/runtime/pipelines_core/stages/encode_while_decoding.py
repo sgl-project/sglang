@@ -41,6 +41,9 @@ def can_encode_while_decoding(
         and not server_args.enable_torch_compile
         and type(server_args.pipeline_config).post_decoding
         is PipelineConfig.post_decoding
+        # S2V trims its reference/motion frames there and muxes audio after.
+        and type(server_args.pipeline_config).postprocess_decoded_batch
+        is PipelineConfig.postprocess_decoded_batch
     )
 
 

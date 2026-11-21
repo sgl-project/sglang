@@ -41,8 +41,9 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -244,6 +245,11 @@ class LinearBase(torch.nn.Module):
     # Module value under self._modules, which this default then shadows on read.
     # VocabParallelEmbedding and FusedMoE carry the same default.
     scheme = None
+    # Set on a layer whose input producer hands it an already-quantized NVFP4
+    # (fp4, swizzled block scale) tuple instead of an activation; the quant
+    # method then skips its own input quantization. An explicit opt-in, so a
+    # stray tuple cannot silently bypass quantization.
+    _accepts_prequantized_fp4: bool = False
     tp_group: GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None = None
 
     def __init__(
@@ -923,8 +929,19 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 pad_loaded_weight,
             )
 
+            pad_output_sizes = output_sizes
+            if (
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
+                and param.packed_dim == param.output_dim
+            ):
+                pad_output_sizes = [
+                    param.adjust_shard_indexes_for_packing(
+                        shard_size=size, shard_offset=0
+                    )[0]
+                    for size in output_sizes
+                ]
             loaded_weight = pad_loaded_weight(
-                loaded_weight, param.output_dim, output_sizes
+                loaded_weight, param.output_dim, pad_output_sizes
             )
 
         for shard_id, shard_offset, shard_size in shard_offsets:

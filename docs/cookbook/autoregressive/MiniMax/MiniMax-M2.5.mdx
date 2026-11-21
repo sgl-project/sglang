@@ -60,7 +60,7 @@ The A3 selector provides **one Ascend A3 node with 8 cards / 16 NPU dies**, runn
 This recipe is based on the upstream Ascend best practice. Hardware validation of the generated A3 cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe. The tested A2 selector is a separate low-concurrency configuration and does not validate the A3 preset.
 </Note>
 
-1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). The reference environment uses CANN 9.0.0 and `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
+1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). The reference environment uses CANN 9.1.0 and `quay.io/ascend/sglang:main-cann9.1.0-a3`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
 2. Check device health and allocation with `npu-smi info` inside the container. Confirm that all 16 dies are visible. For source builds, follow [installation with NPU support](/docs/hardware-platforms/ascend-npus/getting-started/installation), keep the CANN, TorchNPU, and kernel versions compatible, and record the SGLang commit you install.
 3. Reserve space for the **230.82 GB** main weights, the draft model, download cache, and at least **30 GB** for the container image. Download both models below, or reuse complete copies from shared storage.
 
@@ -180,7 +180,7 @@ The generated A3 command follows the [8-card throughput reference](/docs/hardwar
 
 | Setting | A3 preset | Purpose |
 | --- | --- | --- |
-| Device and parallelism | `--device npu --tp-size 16 --dp-size 16 --enable-dp-attention` | Use 16 dies on one node with DP attention. |
+| Device and parallelism | `--device npu --tp-size 16 --attn-dp-size 16` | Use 16 dies on one node with DP attention. |
 | Quantization and communication | `--quantization modelslim --moe-a2a-backend ascend_fuseep --fuseep-mode 2` | Run the Ascend W8A8 weights with FuseEP. |
 | Speculative decoding | EAGLE3, 3 steps, top-k 1, 4 draft tokens, unquantized draft | Load the custom draft model from the supplied directory. |
 | Static memory and concurrency | `--mem-fraction-static 0.75 --max-running-requests 320` | Use the memory and request limits of the reference workload. |
@@ -1263,7 +1263,7 @@ python -m sglang.launch_server \
   --context-length 4096 --max-running-requests 1 \
   --chunked-prefill-size 128 --max-prefill-tokens 4096 \
   --mem-fraction-static 0.96 --max-total-tokens 4096 \
-  --disable-cuda-graph --disable-radix-cache
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph --disable-radix-cache
 ```
 
 The paths above are the experiment paths: `model` contains the complete main weights, while `metadata` contains the tokenizer and configuration files from the same model repository, downloaded separately while weights were transferring. Replace both paths with your local directories. The selector defaults both paths to one complete repository directory; this path convenience differs from the original experiment's separate metadata directory. Keep tokenizer and weights from the same revision.
@@ -1327,7 +1327,7 @@ python -m sglang.launch_server \
   --context-length 8192 --max-running-requests 8 \
   --chunked-prefill-size 128 --max-prefill-tokens 4096 \
   --mem-fraction-static 0.97 --max-total-tokens 16384 \
-  --disable-cuda-graph --disable-radix-cache
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph --disable-radix-cache
 ```
 
 #### 5.5.1 Workload and measured results

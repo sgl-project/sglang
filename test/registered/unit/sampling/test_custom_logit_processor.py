@@ -1,9 +1,10 @@
 """Unit tests for srt/sampling/custom_logit_processor.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from array import array
@@ -119,7 +120,6 @@ class TestCustomLogitProcessorRows(CustomTestCase):
             need_top_k_sampling=False,
             need_min_p_sampling=False,
             vocab_size=4,
-            penalizer_orchestrator=MagicMock(is_required=False),
             has_custom_logit_processor=True,
             custom_params=[{"row": i} for i in range(batch_size)],
             custom_logit_processor={

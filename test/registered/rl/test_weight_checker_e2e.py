@@ -28,9 +28,11 @@ import torch
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -65,7 +67,11 @@ class TestWeightCheckerE2E(CustomTestCase):
             _MODEL_NAME,
             cls.url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--mem-fraction-static", "0.7"],
+            other_args=[
+                "--mem-fraction-static",
+                "0.7",
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
+            ],
         )
 
     @classmethod
@@ -73,15 +79,21 @@ class TestWeightCheckerE2E(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def _post(self, action: str) -> requests.Response:
-        return requests.post(
-            f"{self.url}/weights_checker", json={"action": action}, timeout=120
+        return admin_post(
+            f"{self.url}/weights_checker",
+            json={"action": action},
+            timeout=120,
         )
 
     def _update_weights(
         self, named_tensors: List[Tuple[str, torch.Tensor]]
     ) -> requests.Response:
-        requests.post(f"{self.url}/begin_weight_update", json={}, timeout=120)
-        resp = requests.post(
+        admin_post(
+            f"{self.url}/begin_weight_update",
+            json={},
+            timeout=120,
+        )
+        resp = admin_post(
             f"{self.url}/update_weights_from_tensor",
             json={
                 "serialized_named_tensors": [
@@ -91,7 +103,11 @@ class TestWeightCheckerE2E(CustomTestCase):
             },
             timeout=120,
         )
-        requests.post(f"{self.url}/end_weight_update", json={}, timeout=120)
+        admin_post(
+            f"{self.url}/end_weight_update",
+            json={},
+            timeout=120,
+        )
         return resp
 
     def test_a_snapshot_then_compare_unchanged_succeeds(self):

@@ -135,6 +135,8 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
             return torch.zeros(q.shape[0], q.shape[1], d_v, dtype=torch.bfloat16)
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.dsa_triton_union = union
 
         # `get_is_capture_mode` is patched although the method no longer reads
@@ -226,6 +228,8 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
         from sglang.srt.model_executor.forward_mode import ForwardMode
 
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.dsa_kv_cache_store_fp8 = store_fp8
         backend.dsa_prefill_impl = prefill_impl
         return backend.get_topk_transform_method(
@@ -289,7 +293,9 @@ class TestTritonSparseMLARegistration(CustomTestCase):
                 patch.object(
                     overrides,
                     "model_config_of",
-                    return_value=SimpleNamespace(hf_config=hf_config),
+                    return_value=SimpleNamespace(
+                        hf_config=hf_config, kv_lora_rank=512, qk_rope_head_dim=64
+                    ),
                 ),
                 patch.object(overrides, "get_platform", return_value=platform),
                 patch(
