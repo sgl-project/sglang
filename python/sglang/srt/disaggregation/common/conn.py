@@ -2529,8 +2529,13 @@ class CommonKVSender(BaseKVSender):
         if mgr.deferred_bootstrap is not None:
             room_state = mgr.deferred_bootstrap.open(bootstrap_room, self)
             self._owns_bootstrap_room = room_state is not None
+            if room_state is None:
+                # Another live sender owns the room, so fail only this one.
+                self._failure_reason = room_in_use_reason(bootstrap_room)
+                self.conclude_state = KVPoll.Failed
+                return
             mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
-            if room_state is None or room_state.failed:
+            if room_state.failed:
                 mgr.record_failure(
                     bootstrap_room, "Duplicate or cancelled bootstrap room"
                 )
