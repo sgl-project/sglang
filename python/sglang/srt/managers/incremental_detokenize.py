@@ -7,7 +7,15 @@ from __future__ import annotations
 import logging
 from array import array
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    AbstractSet,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 import msgspec
 
@@ -20,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 PROMPT_TAIL_LEN = 5
+
+# A stalled tail (decoding to nothing or to a trailing U+FFFD) longer than this is
+# committed up to its last few ids, so the decode window stays bounded.
+MAX_UNCOMMITTED_IDS = 16
+# A character's continuation bytes span at most 3 more byte tokens.
+MAX_CHAR_CONTINUATION_IDS = 3
 
 DETOKENIZER_MAX_STATES = envs.SGLANG_DETOKENIZER_MAX_STATES.get()
 
@@ -137,6 +151,8 @@ class DetokenizeState(msgspec.Struct):
     # Output ids received so far; a non-beam row's completion_tokens is this
     # plus the row's output ids.
     num_received_ids: int = 0
+    # The last row's text ended incomplete, so offsets did not advance.
+    stalled: bool = False
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
     decoded_text: str = ""
@@ -192,6 +208,23 @@ class DetokenizeState(msgspec.Struct):
                 raise RuntimeError(msg)
             logger.warning(msg)
 
+    def compact_skipped_ids(self, skipped_ids: AbstractSet[int]) -> None:
+        """Drop invisible IDs from the active window, keeping the raw stop ID."""
+        if not self.header.skip_special_tokens or not skipped_ids:
+            return
+        last = len(self.decode_ids) - 1
+        kept = []
+        removed_before_read = 0
+        for i in range(self.surr_offset, len(self.decode_ids)):
+            token = self.decode_ids[i]
+            # trim_matched_stop removes the terminal ID for an integer stop.
+            if token in skipped_ids and i != last:
+                removed_before_read += i < self.read_offset
+            else:
+                kept.append(token)
+        self.decode_ids[self.surr_offset :] = kept
+        self.read_offset -= removed_before_read
+
     def decode_inputs(
         self, *, finished_reason: Optional[Dict], trim_matched_stop: Callable
     ) -> Tuple[List[int], List[int]]:
@@ -204,6 +237,24 @@ class DetokenizeState(msgspec.Struct):
         surr_ids = self.decode_ids[self.surr_offset : self.read_offset]
         return read_ids, surr_ids
 
+    def stalled_commit_cut(self, skipped_ids: AbstractSet[int]) -> Optional[int]:
+        """Where to commit a long stalled tail, or None.
+
+        The cut sits before the last MAX_CHAR_CONTINUATION_IDS ids that decode to
+        bytes (skipped special tokens do not count), so a character still being
+        completed is left out of the commit."""
+        if not self.stalled:
+            return None
+        cut, kept = len(self.decode_ids), 0
+        for i in range(len(self.decode_ids) - 1, self.read_offset - 1, -1):
+            if self.decode_ids[i] not in skipped_ids:
+                cut, kept = i, kept + 1
+                if kept == MAX_CHAR_CONTINUATION_IDS:
+                    break
+        if cut - self.read_offset <= MAX_UNCOMMITTED_IDS:
+            return None
+        return cut
+
     def step(
         self,
         *,
@@ -211,6 +262,7 @@ class DetokenizeState(msgspec.Struct):
         surr_text: str,
         finished_reason: Optional[Dict],
         trim_matched_stop: Callable,
+        stalled_commit: Optional[Tuple[int, str]] = None,
     ) -> str:
         """Advance by one row's decoded texts; return the text to send."""
         new_text = read_text[len(surr_text) :]
@@ -226,14 +278,25 @@ class DetokenizeState(msgspec.Struct):
                 self.surr_offset = self.read_offset
                 self.read_offset = len(self.decode_ids)
                 self.sent_offset = self.decoded_text_len
+                self.stalled = False
                 return new_text[pending:] if pending else new_text
-            else:
-                # Incomplete UTF-8: emit the printable prefix only; do not
-                # commit (token offsets stay so the next iteration retries
-                # with more tokens).
-                printable = find_printable_text(new_text)
-                self.sent_offset = self.decoded_text_len + len(printable)
-                return printable[pending:] if pending else printable
+            self.stalled = True
+            if stalled_commit is not None and read_text.startswith(stalled_commit[1]):
+                # The later ids do not change this prefix's text: commit it so
+                # the window stops growing while the tail stays incomplete.
+                cut, cut_text = stalled_commit
+                committed = cut_text[len(surr_text) :]
+                self.append_decoded_text(committed)
+                self.surr_offset = self.read_offset
+                self.read_offset = cut
+                self.sent_offset = max(self.sent_offset, self.decoded_text_len)
+                return committed[pending:]
+            # Incomplete UTF-8: emit the printable prefix only; do not
+            # commit (token offsets stay so the next iteration retries
+            # with more tokens).
+            printable = find_printable_text(new_text)
+            self.sent_offset = self.decoded_text_len + len(printable)
+            return printable[pending:] if pending else printable
 
         # Finished: materialize once, trim the matched stop, emit the tail.
         output_str = trim_matched_stop(
