@@ -35,6 +35,12 @@ from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
 
+# Bound consecutive unlink failures per eviction pass. A directory that refuses
+# every unlink (read-only remount, lost permission, dead FUSE/NFS mount) must
+# not cost one attempt and one warning per tracked file while the evictor lock
+# is held. Eight keeps the normal path unchanged and caps the pathological one.
+_MAX_CONSECUTIVE_UNLINK_FAILURES = 8
+
 
 def _parse_size_to_bytes(value: Any) -> int:
     """Parse a size to bytes via human_readable_int (e.g. '200G', '1Gi', '1048576').
@@ -311,10 +317,12 @@ class LRUFileEvictor:
 
         - ``("evicted", n)``: oldest entry dropped from the index; ``n`` disk
           bytes reclaimed (0 if the file was already gone).
-        - ``("skipped", 0)``: oldest entry is an in-flight write; re-pinned at MRU
-          so the writer is not evicted out from under itself.
-        - ``("stop", 0)``: nothing evictable (empty index) or the unlink failed
-          (entry re-pinned at LRU); the caller should stop its eviction loop.
+        - ``("skipped", 0)``: oldest entry is an in-flight write; re-pinned at
+          MRU so the writer is not evicted out from under itself.
+        - ``("failed", 0)``: the unlink failed; the entry is re-pinned at MRU so
+          a later pass rotates other victims in. ``_evict_while`` stops after a
+          bounded number of consecutive failures.
+        - ``("stop", 0)``: empty index; stop the eviction loop.
         """
         if not self._lru:
             return "stop", 0
@@ -335,9 +343,10 @@ class LRUFileEvictor:
                 self._on_evict(evict_stem)
         except OSError as e:
             logger.warning(f"HiCacheFile eviction failed for {evict_stem}: {e}")
+            # Re-inserting after the pop re-pins it at MRU; the bytes stay
+            # charged until a retry succeeds.
             self._lru[evict_stem] = evict_size
-            self._lru.move_to_end(evict_stem, last=False)
-            return "stop", 0
+            return "failed", 0
         self._total_bytes -= evict_size
         return "evicted", freed
 
@@ -345,22 +354,32 @@ class LRUFileEvictor:
         """Evict oldest non-pending entries while ``should_continue(reclaimed)``.
 
         ``should_continue`` is passed the disk bytes reclaimed so far and returns
-        whether to keep evicting. In-flight writes are skipped; the loop is bounded
-        so it can't spin once every remaining entry is pending. Caller holds _lock.
+        whether to keep evicting. In-flight writes are skipped. Consecutive
+        unlink failures stop the pass after ``_MAX_CONSECUTIVE_UNLINK_FAILURES``;
+        the failed entries are re-pinned at MRU, so later passes rotate other
+        victims in. The loop is bounded so it cannot spin. Caller holds _lock.
         Returns the total disk bytes reclaimed.
         """
         reclaimed = 0
         attempts_left = len(self._lru)
+        failures_left = _MAX_CONSECUTIVE_UNLINK_FAILURES
         while self._lru and attempts_left > 0 and should_continue(reclaimed):
             outcome, freed = self._evict_one_lru_locked()
             if outcome == "stop":
                 break
+            if outcome == "failed":
+                attempts_left -= 1
+                failures_left -= 1
+                if failures_left <= 0:
+                    break
+                continue
             if outcome == "skipped":
                 attempts_left -= 1
                 continue
             # An entry left the index; reset the skip budget and bank the bytes.
             reclaimed += freed
             attempts_left = len(self._lru)
+            failures_left = _MAX_CONSECUTIVE_UNLINK_FAILURES
         return reclaimed
 
     def _evict_locked(self, needed_bytes: int) -> None:
