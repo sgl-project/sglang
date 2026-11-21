@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -165,3 +165,39 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
     if FP4_GEMM_RUNNER_BACKEND is None:
         FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend.AUTO
     return FP4_GEMM_RUNNER_BACKEND
+
+
+def fused_global_scale_ratio(
+    global_scales: torch.Tensor, logical_widths: List[int], *, divisor: bool
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """The weight global scale an NVFP4 GEMM runs with, and the per-column
+    factor that gives each fused projection back its own.
+
+    The FP4 GEMMs take one weight global scale per layer, but a fused layer
+    (q/k/v, gate/up) stores one per projection. A global scale is a factor on
+    its projection's output columns, so running the GEMM with the largest one
+    and multiplying each projection's columns by its own scale over that one is
+    exact. ``divisor`` marks compressed-tensors' convention (1 / scale).
+
+    Returns the kept scale (in the stored convention, fp32 scalar) and the
+    ratio over this rank's output columns (fp32), or None when every
+    projection stores the same scale.
+    """
+    stored = global_scales.to(torch.float32).reshape(-1)
+    multiplier = 1.0 / stored if divisor else stored
+    kept = multiplier.max()
+    kept_stored = (1.0 / kept) if divisor else kept
+    if bool((multiplier == kept).all()) or len(logical_widths) != stored.numel():
+        return kept_stored, None
+    widths = torch.tensor(logical_widths, device=stored.device)
+    return kept_stored, torch.repeat_interleave(multiplier / kept, widths).contiguous()
+
+
+def apply_fused_global_scale_ratio(
+    out: torch.Tensor, ratio: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Multiply each output column by its projection's global-scale ratio
+    (see fused_global_scale_ratio); a no-op when the projections share one."""
+    if ratio is None:
+        return out
+    return (out.float() * ratio).to(out.dtype)
