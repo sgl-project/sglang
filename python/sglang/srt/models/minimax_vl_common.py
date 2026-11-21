@@ -807,6 +807,10 @@ class MiniMaxVLVisionModel(nn.Module):
         # Required by run_dp_sharded_mrope_vision_model when input is empty.
         self.out_hidden_size = text_hidden_size
 
+    @property
+    def device(self) -> torch.device:
+        return self.vision_model.embeddings.patch_embedding.weight.device
+
     def forward(
         self,
         pixel_values: torch.Tensor,
