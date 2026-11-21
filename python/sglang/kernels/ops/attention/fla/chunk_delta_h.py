@@ -3,6 +3,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import os
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -14,41 +15,30 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
-from sglang.kernels.ops.attention.fla.utils import (
-    autotune_cache_kwargs,
-    is_nvidia_hopper,
-)
+from sglang.kernels.ops.attention.fla.utils import is_nvidia_hopper
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
-
-
-@triton.autotune(
-    # Single hardcoded config. The kernel writes ht (final state) back into
-    # initial_state in-place; with multiple configs, triton's autotune benchmark
-    # phase invokes the kernel many times for timing and corrupts the cache pool,
-    # producing silently wrong output on the first user request. Restoring via
-    # `restore_value=["initial_state"]` works for unit tests but OOMs on
-    # production-scale models (e.g. Kimi-Linear-48B at default mem_fraction)
-    # because cloning the cache pool for each benchmark exceeds available memory.
-    # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
-    # future per-bucket configs once the kernel is refactored to write final
-    # state to a separate output buffer). The env knobs keep this single-config
-    # property while allowing model/hardware-local validation of the selected
-    # tile without corrupting the state pool through multi-config autotune.
-    configs=[
-        triton.Config(
-            {"BV": GDN_CHUNK_H_BV},
-            num_warps=GDN_CHUNK_H_NUM_WARPS,
-            num_stages=GDN_CHUNK_H_NUM_STAGES,
-        )
-    ],
-    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
-    **autotune_cache_kwargs,
+_FIXED_CONFIG = any(
+    key in os.environ
+    for key in (
+        "SGLANG_GDN_CHUNK_H_BV",
+        "SGLANG_GDN_CHUNK_H_NUM_WARPS",
+        "SGLANG_GDN_CHUNK_H_NUM_STAGES",
+    )
 )
+
+
+@lru_cache(maxsize=None)
+def _is_h20(device_index: int) -> bool:
+    props = torch.cuda.get_device_properties(device_index)
+    return props.major == 9 and props.minor == 0 and props.multi_processor_count == 78
+
+
+# Offline configs: autotuning repeatedly overwrites the initial state in-place.
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -79,7 +69,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRACK_STATE: tl.constexpr,
 ):
@@ -369,6 +358,29 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
+    num_stages = GDN_CHUNK_H_NUM_STAGES
+    if (
+        not _FIXED_CONFIG
+        and is_nvidia_hopper
+        and N == 1
+        and NT >= 32
+        and K == V == 128
+        and (H, Hg) in ((16, 8), (32, 16))
+        and k.dtype == w.dtype == u.dtype == torch.bfloat16
+        and g is not None
+        and gk is None
+        and cu_seqlens is not None
+        and inplace_update
+        and save_new_value
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+        and initial_state.is_contiguous()
+        and _is_h20(k.device.index)
+    ):
+        # Extra pipelining helps a long single sequence; parallel short
+        # sequences need the occupancy of the two-stage configuration.
+        num_stages = 3
+
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -399,8 +411,10 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=inplace_update,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
+        BV=GDN_CHUNK_H_BV,
+        num_warps=GDN_CHUNK_H_NUM_WARPS,
+        num_stages=num_stages,
     )
     return h, v_new
