@@ -918,6 +918,7 @@ def test_per_frame_denoise_mask_overlays_only_video_targets():
     fk, branch = build_step_forward_kwargs(inputs, device=torch.device("cpu"))
     sigma_v = float(timestep.reshape(-1)[0] / 1000.0)
     unique = fk["unique_timesteps"]
+    assert fk["adaln_timestep_bits"] == tuple(unique.view(torch.int32).tolist())
     inverse = fk["inverse_indices"]
     target_ts = unique[inverse[branch.img_target_seq_idx]]
     frame0 = target_ts[:4]

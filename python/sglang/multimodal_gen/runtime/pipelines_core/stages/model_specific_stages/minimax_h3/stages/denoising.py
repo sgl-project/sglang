@@ -1143,6 +1143,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             runner = self._maybe_get_bcg_runner(model)
             if runner is None:
                 return model(**call_kwargs)
+            # timestep bits are eager memo keys, not graph specialization inputs
+            call_kwargs.pop("adaln_timestep_bits", None)
             return self._bcg_run(runner, call_kwargs, model)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

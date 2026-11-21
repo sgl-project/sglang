@@ -186,6 +186,7 @@ def test_precomputed_timestep_plan_matches_full_unique_reference():
             reference[branch.audio_target_seq_idx] = audio_t
             reference[branch.audio_ref_seq_idx] = max(audio_t, 0.4)
             expected = torch.unique(reference, sorted=True, return_inverse=True)
+            assert plan[step].fp32_bits == tuple(expected[0].view(torch.int32).tolist())
             torch.testing.assert_close(plan[step][0], expected[0], rtol=0, atol=0)
             torch.testing.assert_close(plan[step][1], expected[1], rtol=0, atol=0)
             torch.testing.assert_close(
