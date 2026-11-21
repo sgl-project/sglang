@@ -193,8 +193,12 @@ class Gemma4Router(nn.Module):
         self.norm = Gemma4RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, with_scale=False
         )
-        # Per-dimension learned scale, applied after norm + root_size
+        # Per-dimension learned scale, applied after norm + root_size. Folded
+        # into norm.weight as soon as it is loaded, so that the loaded model
+        # holds the folded weight and no forward writes a weight: a process
+        # that shares the weights (the weight cache) sees them as loaded.
         self.scale = nn.Parameter(torch.ones(self.hidden_size))
+        self.scale.weight_loader = self._load_scale
         # Constant 1/sqrt(hidden_size) scaling factor
         self.register_buffer(
             "root_size",
@@ -211,10 +215,17 @@ class Gemma4Router(nn.Module):
         )
         self._scale_fused = False
 
+    def _load_scale(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        default_weight_loader(param, loaded_weight)
+        self.fuse_scale()
+
     def fuse_scale(self):
-        """Fold scale * root_size into norm.weight so forward needs no extra mul."""
-        fused = (self.scale * self.root_size).to(self.norm.weight.dtype)
-        self.norm.weight.data.copy_(fused)
+        """Fold scale * root_size into norm.weight so forward needs no extra mul.
+        Computed where norm.weight is: with CPU offload the parameters may be on
+        the CPU while root_size, a buffer, stays on the GPU."""
+        weight = self.norm.weight
+        scale = self.scale.to(weight.device) * self.root_size.to(weight.device)
+        weight.data.copy_(scale.to(weight.dtype))
         self._scale_fused = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -224,6 +235,15 @@ class Gemma4Router(nn.Module):
         x = self.norm(x)
         router_logits, _ = self.proj(x)
         return router_logits
+
+
+def fold_router_scales(model: nn.Module) -> None:
+    """Fold every Gemma4Router's scale, for loaders that do not call
+    load_weights() (dummy, sharded state): the scale's weight_loader folds it
+    otherwise."""
+    for module in model.modules():
+        if isinstance(module, Gemma4Router):
+            module.fuse_scale()
 
 
 class Gemma4MoE(nn.Module):
@@ -1428,6 +1448,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
         return {
             i for i, lt in enumerate(self.config.layer_types) if lt == "full_attention"
         }
+
+    def post_load_weights(self):
+        fold_router_scales(self)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

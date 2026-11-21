@@ -341,6 +341,19 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
     ue8m0: bool
 
 
+class AiterQuantType(str, Enum):
+    """The quantization type a MoE layer hands AITER. It lives here, not in
+    moe_runner/aiter.py (which re-exports it): the FP8 MoE methods store a
+    member in their dispatcher's config on every platform, and a process that
+    receives a loaded model without post-processing it (the weight cache)
+    needs the class without importing the AITER runner."""
+
+    NONE = "No"
+    PER_TOKEN = "per_Token"
+    PER_128X128 = "per_128x128"
+    PER_1X32 = "per_1x32"
+
+
 class DeepEPMode(Enum):
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
@@ -551,6 +564,23 @@ def _default_speculative_moe_runner_backend(
     if target_runner_backend.is_flashinfer_megamoe():
         return MoeRunnerBackend.FLASHINFER_TRTLLM
     return target_runner_backend
+
+
+# The per-token expert count, under the names MoE architectures give it
+# (e.g. Gemma4 uses ``top_k_experts``, LongCat-2.0 uses ``moe_topk``).
+_MOE_TOPK_ATTRS = (
+    "num_experts_per_tok",
+    "num_experts_per_token",
+    "top_k_experts",
+    "moe_top_k",
+    "moe_topk",
+)
+
+
+def has_moe_layers(hf_text_config) -> bool:
+    """Whether a language model config describes MoE layers. A process seeds
+    the MoE flags (initialize_moe_config) only for such a model."""
+    return any(hasattr(hf_text_config, attr) for attr in _MOE_TOPK_ATTRS)
 
 
 def initialize_moe_config():

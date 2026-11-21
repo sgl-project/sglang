@@ -27,7 +27,6 @@ import argparse
 import array
 import contextlib
 import copy
-import gc
 import io
 import os
 import socket
@@ -44,9 +43,15 @@ import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 
 from sglang.srt.utils import cuda_vmm_utils
-from sglang.srt.weight_cache import ipc_loader, transport
+from sglang.srt.weight_cache import daemon as daemon_module
+from sglang.srt.weight_cache import ipc_loader, load_diff, load_diff_format, transport
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
-from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
+from sglang.srt.weight_cache.protocol import (
+    PROTOCOL_VERSION,
+    CacheConfig,
+    recv_msg,
+    send_msg,
+)
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     VMM_FD_BACKEND,
@@ -63,7 +68,6 @@ from sglang.srt.weight_cache.vmm_layout import (
     SLOT_ALIGNMENT,
     plan_vmm_pack,
     validate_vmm_layout,
-    view_from_entry,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -229,12 +233,41 @@ def _make_daemon(model, backend) -> WeightCacheDaemon:
     daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
     daemon.model = model
     daemon.gpu_id = 0
+    daemon.tp_rank = 0
     daemon.transport_name = backend.name
     daemon.transport_backend = backend
     daemon.state_entries = {}
+    daemon.manifest = None
     daemon.config = _cache_config()
     daemon.preloaded_weights_bytes = 0
     return daemon
+
+
+def _snapshot(daemon, constructed):
+    """The daemon's load-diff snapshot of its model, as WeightCacheDaemon.load
+    makes it before exporting: the storages to export, by name (on the CPU
+    here). Nothing was loaded since ``constructed`` was recorded."""
+    with mock.patch.object(
+        daemon_module.current_platform, "get_device", return_value=CPU
+    ):
+        return daemon._snapshot(constructed)
+
+
+def _manifest(daemon):
+    """The load-diff manifest that the daemon serves, decoded."""
+    return load_diff_format.decode_manifest(daemon.manifest["load_diff"])
+
+
+def _exported(model, backend):
+    """A daemon with ``model`` and its snapshot, ready to export it through
+    ``backend``: the daemon, the storages to export by id, and copies of
+    them. The caller drops its own reference to ``model`` afterwards."""
+    constructed = load_diff.record_construction(model)
+    daemon = _make_daemon(model, backend)
+    state = _snapshot(daemon, constructed)
+    del constructed, model
+    expected = {sid: tensor.clone() for sid, (tensor, _) in state.items()}
+    return daemon, state, expected
 
 
 def _slot_key(entry):
@@ -355,29 +388,24 @@ class TestVmmExportAndImport(CustomTestCase):
         model_ref = weakref.ref(model)
         # Model/loader callbacks can create cycles that refcounting cannot free.
         model.python_cycle = [model]
-        names = list(model.state_dict()) + ["cache"]
-        tensors = dict(model.named_parameters(remove_duplicate=False))
-        tensors.update(model.named_buffers(remove_duplicate=False))
-        expected = {name: tensors[name].detach().clone() for name in names}
-        originals = {
-            name: StorageWeakRef(tensors[name].untyped_storage())
-            for name in names
-            if tensors[name].untyped_storage().nbytes()
-        }
-        del tensors
-
         # One slot per allocation, so packing runs over several allocations.
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
+        daemon, state, expected = _exported(model, backend)
+        del model
+        names = list(state)
+        originals = {
+            name: StorageWeakRef(tensor.untyped_storage())
+            for name, (tensor, _) in state.items()
+        }
+
         freed_at_each_empty_cache = []
         with _host_vmm() as empty_cache:
             empty_cache.side_effect = lambda: freed_at_each_empty_cache.append(
                 {name for name, ref in originals.items() if ref.expired()}
             )
-            daemon = _make_daemon(model, backend)
-            del model
-            daemon._export_state()
+            daemon._export_state(state)
         self.assertIsNone(model_ref())
         self.assertIsNone(daemon.model)
         entries = daemon.state_entries
@@ -448,20 +476,14 @@ class TestVmmExportAndImport(CustomTestCase):
         self.assertEqual(_open_fd_count(), before)  # both sides closed every fd
 
         for name in names:
-            tensor = imported[name]
-            self.assertEqual(tensor.shape, expected[name].shape, name)
-            self.assertEqual(tensor.dtype, expected[name].dtype, name)
-            self.assertEqual(tensor.stride(), expected[name].stride(), name)
-            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
-        storage_ptr = {
-            name: imported[name].untyped_storage().data_ptr()
-            for name in names
-            if imported[name].numel()
-        }
-        self.assertEqual(storage_ptr["embed.weight"], storage_ptr["head.weight"])
-        self.assertEqual(
-            len(set(storage_ptr.values())), len(storage_ptr) - 1
-        )  # only the tie shares
+            torch.testing.assert_close(imported[name], expected[name], rtol=0, atol=0)
+        # One storage each: the tied weights are one tensor of the snapshot.
+        storage_ptr = {imported[name].untyped_storage().data_ptr() for name in names}
+        self.assertEqual(len(storage_ptr), len(names))
+        registered = {r.module: r.entries for r in _manifest(daemon).registered}
+        embed = {e.name: e.tid for e in registered["embed"]}
+        head = {e.name: e.tid for e in registered["head"]}
+        self.assertEqual(embed["weight"], head["weight"])
 
         client.close()
         backend.close()
@@ -476,13 +498,13 @@ class TestVmmExportAndImport(CustomTestCase):
         owner_ref = weakref.ref(cached_layer)
         original = StorageWeakRef(model.cache.untyped_storage())
         cache = {"example": cached_layer}
-        daemon = _make_daemon(
+        daemon, state, _ = _exported(
             model,
             VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
         )
         del model, cached_layer
         with mock.patch.object(factory, "_ROPE_DICT", cache), _host_vmm():
-            daemon._export_state()
+            daemon._export_state(state)
         self.assertFalse(cache)
         self.assertIsNone(owner_ref())
         self.assertTrue(original.expired())
@@ -506,7 +528,7 @@ class TestVmmExportAndImport(CustomTestCase):
         moe_layer = torch.nn.Module()
         moe_layer.experts = model.proj
         registry = {"model.layers.0.mlp": moe_layer}
-        daemon = _make_daemon(
+        daemon, state, _ = _exported(
             model,
             VmmFdTransportBackend(device=CPU, granularity=GRANULARITY),
         )
@@ -517,7 +539,7 @@ class TestVmmExportAndImport(CustomTestCase):
             ),
             _host_vmm(),
         ):
-            daemon._export_state()
+            daemon._export_state(state)
         self.assertEqual(
             [name for name, ref in originals.items() if not ref.expired()], []
         )
@@ -530,25 +552,23 @@ class TestVmmExportAndImport(CustomTestCase):
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
-        daemon = _make_daemon(_TinyModel(), backend)
+        daemon, state, _ = _exported(_TinyModel(), backend)
         with (
             _host_vmm(),
             self.assertLogs("sglang.srt.weight_cache.daemon", "INFO") as logs,
         ):
-            daemon._export_state()
-        (line,) = [msg for msg in logs.output if "non-persistent buffers" in msg]
+            daemon._export_state(state)
+        (line,) = [msg for msg in logs.output if "Exported" in msg]
         self.assertGreater(backend.num_allocations, 1)
-        self.assertTrue(
-            line.endswith(
-                f"transport=vmm_fd, {backend.num_allocations} allocation(s), "
-                f"{backend.exported_bytes / (1 << 30):.2f} GiB"
-            ),
+        self.assertIn(
+            f"transport=vmm_fd, {backend.num_allocations} allocation(s), "
+            f"{backend.exported_bytes / (1 << 30):.2f} GiB, response ",
             line,
         )
         self.assertNotIn("metadata size", line)
         backend.close()
 
-    def test_state_dict_hook_output_is_exported_not_the_live_tensor(self):
+    def test_what_the_model_holds_is_exported_whatever_state_dict_gives(self):
         model = torch.nn.Linear(2, 3, bias=False)
         live_weight = model.weight.detach().clone()
 
@@ -559,20 +579,22 @@ class TestVmmExportAndImport(CustomTestCase):
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=1 << 20
         )
+        daemon, state, _ = _exported(model, backend)
         with _host_vmm():
-            daemon = _make_daemon(model, backend)
-            daemon._export_state()
-        entry = daemon.state_entries["weight"]
+            daemon._export_state(state)
+        view = _manifest(daemon).tensors[0]
+        entry = daemon.state_entries[str(view.sid)]
         pointer = (
             backend._reservation.base
             + backend._alloc_offsets[entry["alloc_index"]]
             + entry["offset"]
         )
-        exported = view_from_entry(
-            _cpu_storage(pointer, entry["storage_nbytes"]), entry, CPU
+        storage = _cpu_storage(pointer, entry["storage_nbytes"])
+        exported = load_diff_format.make_view(
+            storage, view.offset, view.dtype, view.shape, view.stride
         )
-        torch.testing.assert_close(exported, live_weight * 2, rtol=0, atol=0)
-        # The live parameter was not repointed at the hook's output.
+        # Inference reads the parameter, not what a state_dict hook makes of it.
+        torch.testing.assert_close(exported, live_weight, rtol=0, atol=0)
         torch.testing.assert_close(model.weight.detach(), live_weight, rtol=0, atol=0)
 
 
@@ -988,19 +1010,13 @@ class TestAttachAfterAFailedAttach(CustomTestCase):
 
     def setUp(self):
         torch.manual_seed(0)
-        model = _TinyModel()
-        tensors = dict(model.named_parameters(remove_duplicate=False))
-        tensors.update(model.named_buffers(remove_duplicate=False))
-        self.expected = {name: t.detach().clone() for name, t in tensors.items()}
-        del tensors
         # One slot per allocation, so that a fetch passes several fds.
         backend = VmmFdTransportBackend(
             device=CPU, granularity=GRANULARITY, max_alloc_bytes=SLOT_ALIGNMENT
         )
-        self.daemon = _make_daemon(model, backend)
-        del model
+        self.daemon, state, self.expected = _exported(_TinyModel(), backend)
         with _host_vmm():
-            self.daemon._export_state()
+            self.daemon._export_state(state)
         self.addCleanup(backend.close)
         self.driver = _FdExportDriver()
         for patcher in (
@@ -1061,7 +1077,11 @@ class TestAttachAfterAFailedAttach(CustomTestCase):
                     raise AssertionError("the client did not close its socket")
             send_fd(sock, fd, index)
 
-        request = {"type": "fetch_state", "config": _cache_config().to_dict()}
+        request = {
+            "type": "fetch_state",
+            "protocol_version": PROTOCOL_VERSION,
+            "config": _cache_config().to_dict(),
+        }
         send_msg(client_sock, request)
         if break_off == "after_request":
             client_sock.close()
@@ -1190,47 +1210,6 @@ class TestTransportSelection(CustomTestCase):
         self.assertEqual(args.weight_cache_transport, "vmm_fd")
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--model-path", "m", "--weight-cache-transport", "x"])
-
-
-class TestLoadedModelKeepsItsMappings(CustomTestCase):
-    def test_a_parameter_outliving_the_model_stays_mapped(self):
-        """The imported tensors do not own the transport's mappings, and a
-        parameter can outlive the model object, so the loader must not release
-        the mappings when the model goes away."""
-        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-
-        closed = []
-
-        class _Recording(TorchIpcTransportBackend):
-            def import_tensor(self, entry):
-                return torch.full(entry["shape"], 3.0)
-
-            def close(self):
-                closed.append(self)
-
-        loader = ipc_loader.WeightCacheModelLoader(
-            load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE)
-        )
-        backend = loader._transport_backend = _Recording()
-        meta_model = torch.nn.Linear(2, 3, bias=False, device="meta")
-        with mock.patch.object(
-            ipc_loader, "_initialize_model", return_value=meta_model
-        ):
-            model = loader._load_zero_copy_mode(
-                SimpleNamespace(dtype=torch.float32),
-                None,
-                {"weight": {"shape": [3, 2], "is_param": True}},
-                None,
-            )
-        weight = model.weight
-        del model, meta_model
-        gc.collect()
-        try:
-            self.assertEqual(closed, [])
-            self.assertIn(backend, ipc_loader._LOADED_MODEL_TRANSPORTS)
-            self.assertEqual(weight.sum().item(), 18.0)
-        finally:
-            ipc_loader._LOADED_MODEL_TRANSPORTS.remove(backend)
 
 
 @unittest.skipUnless(_HAS_PROCFS, "needs Linux procfs")

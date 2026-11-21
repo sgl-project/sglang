@@ -23,9 +23,8 @@ logger = logging.getLogger(__name__)
 
 class CacheConfig(msgspec.Struct):
     """Fingerprint of the cached weights. Used to validate compatibility
-    between a daemon's cached state and a requesting engine process.
-
-    Any mismatch triggers a fallback to disk loading.
+    between a daemon's cached state and a requesting engine process; the
+    engine refuses a daemon whose fingerprint differs.
     """
 
     model_path: str
@@ -206,10 +205,56 @@ def check_ipc_quant_support(
 
 MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
 
+# The socket protocol and the meaning of a fetch_state response. 2: the
+# entries are the GPU storages of a load-diff snapshot; the response's
+# "manifest" carries its load_diff bytes, every storage's size and device,
+# and the CPU storages' bytes (sglang.srt.weight_cache.load_diff).
+PROTOCOL_VERSION = 2
+
+# The models a daemon serves, named by a fetch_state request's "role" and
+# echoed in the response: the target, and with speculative decoding its draft
+# (weight_cache/draft.py). A request without a role is for the target, so the
+# field needs no new protocol version: a daemon that predates it ignores the
+# field and answers with its target, which a draft runner refuses because the
+# response names no "draft" role.
+TARGET_ROLE = "target"
+DRAFT_ROLE = "draft"
+
+
+class ProtocolVersionError(RuntimeError):
+    """The peer does not use a compatible weight cache protocol."""
+
+
+def check_protocol_version(version: Any) -> None:
+    """Require an explicit, equal protocol version from the peer."""
+    if type(version) is int and version == PROTOCOL_VERSION:
+        return
+    raise ProtocolVersionError(
+        f"Weight cache protocol version mismatch: local={PROTOCOL_VERSION}, "
+        f"peer={version!r}. Run the same SGLang version in the engine and the "
+        f"daemon; stop the engines attached to a daemon before restarting it."
+    )
+
+
+def handshake_with_daemon(sock) -> None:
+    """Check the daemon's protocol version before any config or weight
+    request, so that a daemon of another version sends no handle or fd."""
+    send_msg(sock, {"type": "handshake", "protocol_version": PROTOCOL_VERSION})
+    response = recv_msg(sock)
+    if not isinstance(response, dict):
+        raise RuntimeError("Invalid weight cache handshake response: expected a dict.")
+    check_protocol_version(response.get("protocol_version"))
+    if response.get("status") != "ok":
+        raise RuntimeError(
+            f"Weight cache handshake failed: {response.get('message', response)}"
+        )
+
 
 def send_msg(sock, obj: Any) -> None:
     """Send a length-prefixed pickled message over a socket."""
     data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    if len(data) > MAX_MSG_SIZE:
+        raise ValueError(f"Message size {len(data)} exceeds {MAX_MSG_SIZE} byte cap")
     header = struct.pack("!I", len(data))
     sock.sendall(header + data)
 

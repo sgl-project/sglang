@@ -53,7 +53,11 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3MLP
-from sglang.srt.models.gemma4_causal import Gemma4MoE, Gemma4Router
+from sglang.srt.models.gemma4_causal import (
+    Gemma4MoE,
+    Gemma4Router,
+    fold_router_scales,
+)
 from sglang.srt.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
     Gemma4MultimodalEmbedder,
@@ -598,6 +602,9 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         return torch.empty(
             0, self.text_config.hidden_size, device=embed.device, dtype=embed.dtype
         )
+
+    def post_load_weights(self):
+        fold_router_scales(self)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

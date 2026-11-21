@@ -55,6 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
 from sglang.srt.models.gemma4_causal import (
     Gemma4TextModel,
+    fold_router_scales,
     load_tied_lm_head,
     pp_filter_load_weight,
 )
@@ -891,6 +892,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return {
             i for i, lt in enumerate(text_config.layer_types) if lt == "full_attention"
         }
+
+    def post_load_weights(self):
+        fold_router_scales(self)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         k_eq_v_layers = self._get_k_eq_v_layers()

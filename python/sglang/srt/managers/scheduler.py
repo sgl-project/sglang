@@ -136,6 +136,7 @@ from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
 from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe.utils import has_moe_layers
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
@@ -1066,19 +1067,7 @@ class Scheduler(
         # Use the language config already normalized by ModelConfig. Multimodal
         # wrappers expose it under different attributes (for example,
         # ``text_config`` or ``llm_config``).
-        config_to_check = self.model_config.hf_text_config
-
-        # Different MoE architectures expose the per-token expert count under
-        # different attribute names (e.g. Gemma4 uses ``top_k_experts``,
-        # LongCat-2.0 uses ``moe_topk``).
-        moe_topk_attrs = (
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "top_k_experts",
-            "moe_top_k",
-            "moe_topk",
-        )
-        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+        if has_moe_layers(self.model_config.hf_text_config):
             initialize_moe_config()
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
