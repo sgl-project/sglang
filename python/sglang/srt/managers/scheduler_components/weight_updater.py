@@ -68,6 +68,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.weight_sync.refusal import weight_update_request
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -176,13 +177,18 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    @weight_update_request()
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
+            runners = self._select_runners()
+            error = self._weight_update_unsupported_reason(runners)
+            if error is not None:
+                return UpdateWeightFromDiskReqOutput(success=False, message=error)
             self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -226,6 +232,24 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
+    def _weight_update_unsupported_reason(
+        self, runners: List[Tuple[str, Any]]
+    ) -> Optional[str]:
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            _unsupported_derived_weight_cache_error,
+        )
+
+        # Check every selected runner before mutating any of them. Declarations
+        # are startup-determined and identical on all ranks, like session state.
+        for _, runner in runners:
+            error = _unsupported_derived_weight_cache_error(
+                runner.weight_updater.get_model()
+            )
+            if error is not None:
+                return error
+        return None
+
+    @weight_update_request()
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -272,8 +296,12 @@ class SchedulerWeightUpdaterManager:
         self, weights: List[Tuple[str, torch.Tensor]], selector: str
     ) -> Tuple[bool, str]:
         """Load tensors the target runner received into every selected runner."""
+        runners = self._select_runners(selector)
+        error = self._weight_update_unsupported_reason(runners)
+        if error is not None:
+            return False, error
         success, message = True, "Succeeded to update parameter online."
-        for _, runner in self._select_runners(selector):
+        for _, runner in runners:
             success, message = runner.weight_updater.load_weights_from_distributed(
                 weights
             )
@@ -281,6 +309,7 @@ class SchedulerWeightUpdaterManager:
                 break
         return success, message
 
+    @weight_update_request()
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
         if self._session is None:
@@ -290,12 +319,16 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("tensor"):
+            runners = self._select_runners(recv_req.selector)
+            error = self._weight_update_unsupported_reason(runners)
+            if error is not None:
+                return UpdateWeightsFromTensorReqOutput(success=False, message=error)
             self.scheduler.wait_for_launched_forward()
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
             success, message = True, "Success"
-            for _, runner in self._select_runners(recv_req.selector):
+            for _, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
@@ -315,13 +348,18 @@ class SchedulerWeightUpdaterManager:
             control_request_barrier()
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
+    @weight_update_request()
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
+            runners = self._select_runners()
+            error = self._weight_update_unsupported_reason(runners)
+            if error is not None:
+                return UpdateWeightsFromIPCReqOutput(success=False, message=error)
             self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_ipc(
                     recv_req
                 )
@@ -368,20 +406,13 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        from sglang.srt.model_executor.model_runner_components.weight_updater import (
-            _unsupported_derived_weight_cache_error,
-        )
-
         runners = self._select_runners(recv_req.selector)
         # Restoring packed weights already mutates storage. Check every runner
         # before touching any of them, including sessions used by P2P/RDMA
         # writers which bypass update_weights_from_tensor/distributed.
-        for _, runner in runners:
-            error = _unsupported_derived_weight_cache_error(
-                runner.weight_updater.get_model()
-            )
-            if error is not None:
-                return BeginWeightUpdateReqOutput(success=False, message=error)
+        error = self._weight_update_unsupported_reason(runners)
+        if error is not None:
+            return BeginWeightUpdateReqOutput(success=False, message=error)
         self.scheduler.wait_for_launched_forward()
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
@@ -416,6 +447,7 @@ class SchedulerWeightUpdaterManager:
             message=" | ".join(dict.fromkeys(group_errors)) or "Success",
         )
 
+    @weight_update_request()
     def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
         """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
         if self._session is None:
@@ -591,8 +623,13 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
+            runners = self._select_runners(recv_req.selector)
+            if recv_req.action == "reset_tensors":
+                error = self._weight_update_unsupported_reason(runners)
+                if error is not None:
+                    return CheckWeightsReqOutput(success=False, message=error)
             role_payloads = []
-            for role, runner in self._select_runners(recv_req.selector):
+            for role, runner in runners:
                 p = runner.check_weights(
                     action=recv_req.action,
                     allow_quant_error=recv_req.allow_quant_error,

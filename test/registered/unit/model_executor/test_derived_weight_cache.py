@@ -1,21 +1,30 @@
 """Online updates must reject model-owned derived buffers before writing."""
 
 import unittest
+from contextvars import copy_context
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.model_executor.model_runner_components.weight_updater import (
-    WeightUpdater,
-)
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+maybe_stub_sgl_kernel()
+
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+    _unsupported_derived_weight_cache_error,
+)
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.weight_sync.refusal import (
+    declare_weight_update_unsupported,
+    weight_update_request,
+)
 
 
-class TestDerivedWeightCache(unittest.TestCase):
+class TestDerivedWeightCache(CustomTestCase):
     def test_nested_model_cache_rejects_updates(self):
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 2, bias=False, device="cpu"),
@@ -62,6 +71,117 @@ class TestDerivedWeightCache(unittest.TestCase):
         with get_parallel().override(tp_rank=0):
             self.assertTrue(update(stub, [], load_format=None)[0])
         self.assertEqual(loaded, [[]])
+
+    def test_clearing_a_public_reason_preserves_a_native_refusal(self):
+        model = torch.nn.Sequential(torch.nn.Module())
+        for public, legacy, expected in (
+            (None, None, None),
+            ("plugin requires restart", None, "plugin requires restart"),
+            (None, "legacy reason", "legacy reason"),
+            ("public reason", "legacy reason", "public reason"),
+            ("", "legacy reason", ""),
+            (None, "legacy reason", "legacy reason"),
+        ):
+            with (
+                self.subTest(public=public, legacy=legacy),
+                patch(
+                    "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                    return_value=False,
+                ),
+            ):
+                declare_weight_update_unsupported(model[0], public)
+                model[0]._derived_weight_cache_error = legacy
+                self.assertEqual(
+                    _unsupported_derived_weight_cache_error(model), expected
+                )
+
+    def test_invalid_declaration_preserves_the_existing_reason(self):
+        model = torch.nn.Module()
+        declare_weight_update_unsupported(model, "already refused")
+        for invalid in (True, 42, ValueError("wrong type")):
+            with self.subTest(reason=invalid):
+                with self.assertRaises(TypeError):
+                    declare_weight_update_unsupported(model, invalid)
+                self.assertEqual(
+                    _unsupported_derived_weight_cache_error(model), "already refused"
+                )
+
+    def test_copied_context_rechecks_model_after_request_ends(self):
+        """A later check in a copied context must see a new native refusal."""
+        model = torch.nn.Module()
+        with (
+            weight_update_request(),
+            patch(
+                "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                return_value=False,
+            ),
+        ):
+            self.assertIsNone(_unsupported_derived_weight_cache_error(model))
+            copied = copy_context()
+
+        model._derived_weight_cache_error = "derived scales require restart"
+        self.assertEqual(
+            copied.run(_unsupported_derived_weight_cache_error, model),
+            "derived scales require restart",
+        )
+
+    def test_child_declaration_invalidates_cached_parent_check(self):
+        """A parent checked earlier in the request must see its child's new refusal."""
+        model = torch.nn.Sequential(torch.nn.Module())
+        reason = "plugin owns relocated weights"
+        with (
+            weight_update_request(),
+            patch(
+                "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                return_value=False,
+            ),
+        ):
+            self.assertIsNone(_unsupported_derived_weight_cache_error(model))
+            declare_weight_update_unsupported(model[0], reason)
+            self.assertEqual(_unsupported_derived_weight_cache_error(model), reason)
+
+    def test_public_declaration_rejects_each_load_path_before_writing(self):
+        model = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False))
+        reason = "plugin owns relocated weights"
+        declare_weight_update_unsupported(model[0], reason)
+        original = model[0].weight.detach().clone()
+        updater = WeightUpdater(
+            tp_rank=0,
+            device="cpu",
+            gpu_id=0,
+            model_config=None,
+            custom_weight_loaders={},
+            get_model=lambda: model,
+            update_model_fields=lambda *args, **kwargs: None,
+            recapture_cuda_graph=lambda: None,
+            get_model_runner=lambda: None,
+        )
+        updates = (
+            lambda: updater.update_weights_from_disk("unused", "auto"),
+            lambda: updater.load_weights_from_distributed([]),
+            lambda: updater.update_weights_from_tensor(
+                [("0.weight", torch.zeros_like(original))], load_format="direct"
+            ),
+            lambda: updater.update_weights_from_ipc(SimpleNamespace()),
+        )
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner_components.weight_updater.get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_components.weight_updater.get_available_gpu_memory",
+                side_effect=AssertionError("disk setup ran despite the refusal"),
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_components.weight_updater.monkey_patch_torch_reductions",
+                side_effect=AssertionError("tensor setup ran despite the refusal"),
+            ),
+        ):
+            for path, update in enumerate(updates):
+                with self.subTest(path=path):
+                    self.assertEqual(update(), (False, reason))
+                    self.assertTrue(torch.equal(model[0].weight, original))
 
 
 if __name__ == "__main__":
