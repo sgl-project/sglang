@@ -64,12 +64,13 @@ class RangePageAllocator:
         self.free_ranges: List[Tuple[int, int]] = (
             [(0, num_pages)] if num_pages > 0 else []
         )
+        self._free_pages: int = max(0, num_pages)
 
     def allocate(self, num_tokens: int, page_size: int) -> Optional[List[PageRun]]:
         required_pages = math.ceil(num_tokens / page_size)
         if required_pages <= 0:
             return []
-        if self.free_pages < required_pages:
+        if self._free_pages < required_pages:
             return None
 
         for idx, (start, length) in enumerate(self.free_ranges):
@@ -82,17 +83,26 @@ class RangePageAllocator:
                         start + required_pages,
                         length - required_pages,
                     )
+                self._free_pages -= required_pages
                 return [run]
 
         runs: List[PageRun] = []
         remaining = required_pages
-        while remaining > 0 and self.free_ranges:
-            start, length = self.free_ranges.pop(0)
+        consumed = 0
+        for idx, (start, length) in enumerate(self.free_ranges):
             take = min(length, remaining)
             runs.append(PageRun(start, take))
             remaining -= take
             if take < length:
-                self.free_ranges.insert(0, (start + take, length - take))
+                self.free_ranges[idx] = (start + take, length - take)
+                break
+            consumed = idx + 1
+            if remaining == 0:
+                break
+
+        if consumed > 0:
+            del self.free_ranges[:consumed]
+        self._free_pages -= required_pages - remaining
 
         if remaining != 0:
             self.free(runs)
@@ -108,21 +118,27 @@ class RangePageAllocator:
         self.free_ranges.sort()
 
         merged: List[Tuple[int, int]] = []
+        free_pages = 0
         for start, length in self.free_ranges:
             if not merged:
                 merged.append((start, length))
+                free_pages = length
                 continue
             prev_start, prev_length = merged[-1]
             prev_end = prev_start + prev_length
             if prev_end >= start:
-                merged[-1] = (prev_start, max(prev_end, start + length) - prev_start)
+                new_length = max(prev_end, start + length) - prev_start
+                merged[-1] = (prev_start, new_length)
+                free_pages += new_length - prev_length
             else:
                 merged.append((start, length))
+                free_pages += length
         self.free_ranges = merged
+        self._free_pages = free_pages
 
     @property
     def free_pages(self) -> int:
-        return sum(length for _, length in self.free_ranges)
+        return self._free_pages
 
 
 class EvictableLRU:
