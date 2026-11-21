@@ -44,6 +44,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_resources,
+    get_schedule,
 )
 from sglang.srt.utils.device import is_flashinfer_available
 from sglang.srt.utils.log_utils import print_info_once
@@ -1550,6 +1552,52 @@ def _run_cuda_mxfp4_decode_moe(
     )
 
 
+_MXFP4_MOE_WORKSPACE = "trtllm_gen_mxfp4_moe_workspace"
+
+
+def reserve_trtllm_mxfp4_moe_workspace(
+    *, layer: Module, hidden_size: int, intermediate_size: int, precision: str
+) -> None:
+    """Grow the scratch buffer the trtllm-gen MXFP4 MoE layers share to fit one
+    prefill step of this layer. Runs at weight load, so KV sizing sees it."""
+    from flashinfer.fused_moe import trtllm_fused_moe_workspace_size
+    from flashinfer.tllm_enums import ActivationType
+
+    schedule = get_schedule()
+    chunk = schedule.chunked_prefill_size
+    step_tokens = (
+        chunk if chunk is not None and chunk > 0 else schedule.max_prefill_tokens
+    )
+    if not step_tokens:
+        return
+    num_bytes = trtllm_fused_moe_workspace_size(
+        # The routed call tunes at next_power_of_2(num_tokens).
+        max_num_tokens=next_power_of_2(step_tokens),
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=layer.num_experts,
+        top_k=layer.top_k,
+        quant_mode="mxfp4_mxfp8" if precision == "default" else "mxfp4_bf16",
+        local_num_experts=layer.num_local_experts,
+        activation_type=ActivationType.Situ.value,
+        gemm1_weights=layer.w13_weight,
+        gemm1_weights_scale=layer.w13_weight_scale,
+        gemm2_weights=layer.w2_weight,
+        gemm2_weights_scale=layer.w2_weight_scale,
+    )
+    buffers = get_resources().buffers
+    current = buffers.get(_MXFP4_MOE_WORKSPACE)
+    if current is not None and current.numel() >= num_bytes:
+        return
+    buffers[_MXFP4_MOE_WORKSPACE] = torch.empty(
+        num_bytes, dtype=torch.uint8, device=layer.w13_weight.device
+    )
+    print_info_once(
+        f"trtllm-gen MXFP4 MoE workspace reserved: {num_bytes / (1 << 30):.2f} GiB "
+        f"for {next_power_of_2(step_tokens)} tokens"
+    )
+
+
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
@@ -1737,6 +1785,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 output=symm_output,
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+                # flashinfer rejects workspace_buffer with do_finalize=False.
+                workspace_buffer=(
+                    None
+                    if defer_finalize
+                    else get_resources().buffers.get(_MXFP4_MOE_WORKSPACE)
+                ),
             )
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result

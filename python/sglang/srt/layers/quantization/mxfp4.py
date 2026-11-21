@@ -942,6 +942,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 cuda_mxfp4_decode_moe_supported,
+                reserve_trtllm_mxfp4_moe_workspace,
             )
 
             layer.use_cuda_mxfp4_decode_moe = cuda_mxfp4_decode_moe_supported(
@@ -952,6 +953,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.with_bias,
                 self.flashinfer_mxfp4_moe_precision,
             )
+            if layer.moe_runner_config.activation == "situ":
+                reserve_trtllm_mxfp4_moe_workspace(
+                    layer=layer,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_size_per_partition,
+                    precision=self.flashinfer_mxfp4_moe_precision,
+                )
             return
         if self.use_aiter_moe:
             if getattr(layer, "w13_weight_bias", None) is not None:
