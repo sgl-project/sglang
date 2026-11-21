@@ -9,6 +9,7 @@ from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -151,6 +152,77 @@ class TestModelOptNvfp4(CustomTestCase):
         self.assertFalse(bf16_shared.can_fuse_shared_expert())
         # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
         self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
+
+    def test_mixed_shared_expert_fusion_requires_matching_precision(self):
+        layer = "model.layers.3.mlp"
+        projections = ("gate_proj", "up_proj", "down_proj")
+        for shared_name, shared_projections, excluded, expected in (
+            ("shared_experts", (), [], False),  # GLM-5.3 keeps shared experts in BF16.
+            ("shared_experts", projections, [], True),
+            ("shared_experts", ("gate_proj", "up_proj"), [], False),
+            ("shared_experts", ("down_proj",), [], False),
+            (
+                "shared_experts",
+                projections,
+                ["model.layers.*.mlp.shared_experts*"],
+                False,
+            ),
+            (
+                "shared_experts",
+                projections,
+                ["model.layers.*.mlp.shared_expert_gate"],
+                True,
+            ),
+            (
+                "shared_experts",
+                projections,
+                [
+                    f"{layer}.shared_experts.gate_proj",
+                    f"{layer}.shared_experts.up_proj",
+                ],
+                False,
+            ),
+            ("shared_expert", (), [], False),
+            ("shared_expert", projections, [], True),
+        ):
+            with self.subTest(
+                name=shared_name, shared=shared_projections, excluded=excluded
+            ):
+                layers = {f"{layer}.experts.0.gate_proj": {"quant_algo": "NVFP4"}}
+                layers.update(
+                    {
+                        f"{layer}.{shared_name}.{proj}": {"quant_algo": "NVFP4"}
+                        for proj in shared_projections
+                    }
+                )
+                config = ModelOptMixedPrecisionConfig.from_config(
+                    {
+                        "quant_algo": "MIXED_PRECISION",
+                        "quantized_layers": layers,
+                        "exclude_modules": excluded,
+                        "packed_modules_mapping": {
+                            "gate_up_proj": ["gate_proj", "up_proj"]
+                        },
+                    }
+                )
+                self.assertEqual(config.can_fuse_shared_expert(), expected)
+
+    def test_mixed_shared_expert_fusion_checks_every_layer(self):
+        layers = {
+            f"model.layers.{layer}.mlp.{part}": {"quant_algo": algo}
+            for layer, algo in ((0, "FP8"), (3, "NVFP4"))
+            for part in (
+                "experts",
+                "shared_experts.gate_up_proj",
+                "shared_experts.down_proj",
+            )
+        }
+        config = ModelOptMixedPrecisionConfig.from_config(
+            {"quant_algo": "MIXED_PRECISION", "quantized_layers": layers}
+        )
+        self.assertTrue(config.can_fuse_shared_expert())
+        del layers["model.layers.3.mlp.shared_experts.down_proj"]
+        self.assertFalse(config.can_fuse_shared_expert())
 
 
 if __name__ == "__main__":
