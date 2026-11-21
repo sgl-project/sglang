@@ -2,8 +2,9 @@
 """
 SGLang CI Auto Bisect
 
-Fetches recent Nvidia scheduled PR Test runs, identifies consistently failing
-tests, and calls Claude to classify each as regression/flaky/hardware/environment.
+Fetches recent scheduled runs of one workflow (default: Nvidia PR Test),
+identifies consistently failing tests, and calls Claude to classify each as
+regression/flaky/hardware/environment.
 
 Self-contained: does its own lightweight GitHub API analysis instead of running
 the full ci_failures_analysis.py, keeping API usage to ~30-40 calls.
@@ -13,7 +14,8 @@ Usage:
         --github-token $GITHUB_TOKEN \
         --anthropic-api-key $ANTHROPIC_API_KEY \
         --output bisect_results.json \
-        --max-failures 10
+        --max-failures 10 \
+        [--workflow-file pr-test-xpu.yml --hardware "Intel XPU"]
 """
 
 import argparse
@@ -50,6 +52,10 @@ EXCLUDED_JOBS = [
 
 # Number of recent scheduled runs to analyze
 SCHEDULED_RUN_LIMIT = 6
+
+# Default scheduled workflow and the hardware label passed to Claude
+DEFAULT_WORKFLOW_FILE = "pr-test.yml"
+DEFAULT_HARDWARE = "Nvidia"
 
 # Compiled regex for stripping ANSI escape codes from CI logs
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -108,7 +114,7 @@ class BisectionResult:
 
 
 # ---------------------------------------------------------------------------
-# Focused GitHub API analysis (Nvidia scheduled only)
+# Focused GitHub API analysis (scheduled runs of one workflow)
 # ---------------------------------------------------------------------------
 
 
@@ -173,10 +179,12 @@ def _gh_get_all_pages(
     return all_items
 
 
-def fetch_nvidia_scheduled_runs(token: str) -> List[dict]:
-    """Fetch recent scheduled PR Test runs on main. ~1 API call."""
-    print(f"Fetching {SCHEDULED_RUN_LIMIT} recent scheduled PR Test (Nvidia) runs...")
-    url = f"{GITHUB_API}/repos/{REPO}/actions/workflows/pr-test.yml/runs"
+def fetch_scheduled_runs(
+    token: str, workflow_file: str = DEFAULT_WORKFLOW_FILE
+) -> List[dict]:
+    """Fetch recent scheduled runs of workflow_file on main. ~1 API call."""
+    print(f"Fetching {SCHEDULED_RUN_LIMIT} recent scheduled {workflow_file} runs...")
+    url = f"{GITHUB_API}/repos/{REPO}/actions/workflows/{workflow_file}/runs"
     data = _gh_get(url, token, {"event": "schedule", "per_page": SCHEDULED_RUN_LIMIT})
     if not data:
         return []
@@ -274,10 +282,14 @@ def _find_last_running_test(logs: str) -> Optional[Dict]:
 
 
 def analyze_scheduled_failures(
-    token: str, min_streak: int = 1, max_failures: int = 10
+    token: str,
+    min_streak: int = 1,
+    max_failures: int = 10,
+    workflow_file: str = DEFAULT_WORKFLOW_FILE,
+    hardware: str = DEFAULT_HARDWARE,
 ) -> Tuple[List[FailureTarget], Dict[int, str]]:
     """
-    Fetch Nvidia scheduled runs, analyze job/test failure streaks, return targets.
+    Fetch scheduled runs, analyze job/test failure streaks, return targets.
 
     Returns (targets, logs_cache) where logs_cache maps job_id -> log text,
     so callers can reuse fetched logs without re-fetching.
@@ -287,7 +299,7 @@ def analyze_scheduled_failures(
     """
     logs_cache: Dict[int, str] = {}
 
-    runs = fetch_nvidia_scheduled_runs(token)
+    runs = fetch_scheduled_runs(token, workflow_file)
     if not runs:
         print("No scheduled runs found")
         return [], logs_cache
@@ -398,7 +410,7 @@ def analyze_scheduled_failures(
             return FailureTarget(
                 job_name=job_name,
                 test_file=test_file,
-                hardware="Nvidia",
+                hardware=hardware,
                 current_streak=data["streak"],
                 first_failure_sha=first_fail.get("head_sha", ""),
                 last_failure_sha=last_fail.get("head_sha", ""),
@@ -1075,6 +1087,8 @@ def run_bisection_analysis(
     min_streak: int = 1,
     output_file: Optional[str] = None,
     dry_run: bool = False,
+    workflow_file: str = DEFAULT_WORKFLOW_FILE,
+    hardware: str = DEFAULT_HARDWARE,
 ) -> dict:
     """Main orchestration: fetch failures, gather context, call Claude, report."""
     print("=" * 80)
@@ -1088,7 +1102,7 @@ def run_bisection_analysis(
 
     # Fetch and analyze failures directly (no external report file needed)
     targets, logs_cache = analyze_scheduled_failures(
-        github_token, min_streak, max_failures
+        github_token, min_streak, max_failures, workflow_file, hardware
     )
     print(f"\n{len(targets)} failure targets to analyze")
 
@@ -1263,6 +1277,16 @@ def main():
         action="store_true",
         help="Skip Claude API calls, only gather context",
     )
+    parser.add_argument(
+        "--workflow-file",
+        default=DEFAULT_WORKFLOW_FILE,
+        help=f"Workflow file whose scheduled runs are analyzed (default: {DEFAULT_WORKFLOW_FILE})",
+    )
+    parser.add_argument(
+        "--hardware",
+        default=DEFAULT_HARDWARE,
+        help=f"Hardware name given to Claude (default: {DEFAULT_HARDWARE})",
+    )
     args = parser.parse_args()
 
     try:
@@ -1273,6 +1297,8 @@ def main():
             min_streak=args.min_streak,
             output_file=args.output,
             dry_run=args.dry_run,
+            workflow_file=args.workflow_file,
+            hardware=args.hardware,
         )
     except Exception as e:
         print(f"Error during bisection analysis: {e}")

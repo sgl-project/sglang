@@ -2,13 +2,21 @@ name: CI Auto Bisect
 
 on:
   workflow_run:
-    workflows: ["PR Test Base"]
+    workflows: ["PR Test Base", "PR Test (XPU)"]
     types: [completed]
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Scheduled workflow to analyze"
+        required: false
+        type: choice
+        options: [nvidia, xpu]
+        default: nvidia
 
 concurrency:
-  group: ci-auto-bisect
+  # One group per source workflow so an XPU bisect never cancels an Nvidia one.
+  group: ci-auto-bisect-${{ github.event.workflow_run.name || inputs.target || 'nvidia' }}
   cancel-in-progress: true
 
 permissions:
@@ -42,6 +50,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests anthropic
 
+      - name: Select workflow
+        id: target
+        env:
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [[ "$RUN_NAME" == "PR Test (XPU)" || "$TARGET" == "xpu" ]]; then
+            echo "workflow_file=pr-test-xpu.yml" >> "$GITHUB_OUTPUT"
+            echo "hardware=Intel XPU" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflow_file=pr-test.yml" >> "$GITHUB_OUTPUT"
+            echo "hardware=Nvidia" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Auto Bisect
         id: bisect
         env:
@@ -49,13 +71,17 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
+          WORKFLOW_FILE: ${{ steps.target.outputs.workflow_file }}
+          HARDWARE: ${{ steps.target.outputs.hardware }}
         run: |
           cd scripts/ci_monitor
           python ci_auto_bisect.py \
             --github-token $GITHUB_TOKEN \
             --anthropic-api-key $ANTHROPIC_API_KEY \
             --output bisect_results.json \
-            --max-failures 10
+            --max-failures 10 \
+            --workflow-file "$WORKFLOW_FILE" \
+            --hardware "$HARDWARE"
 
       - name: Upload Bisect Results
         if: always() && hashFiles('scripts/ci_monitor/bisect_results.json') != ''
@@ -64,3 +90,21 @@ jobs:
           name: ci-auto-bisect-${{ github.run_number }}
           path: scripts/ci_monitor/bisect_results.json
           retention-days: 14
+
+      # Skips with a warning until the XPU_CI_TEAMS_WEBHOOK secret is configured.
+      - name: Notify Teams on XPU scheduled failure
+        if: >-
+          always() &&
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.name == 'PR Test (XPU)' &&
+          github.event.workflow_run.conclusion == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TEAMS_WEBHOOK: ${{ secrets.XPU_CI_TEAMS_WEBHOOK }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NAME: ${{ github.event.workflow_run.name }}
+        run: |
+          python scripts/ci_monitor/teams_notify.py \
+            --run-id "$RUN_ID" \
+            --workflow-name "$RUN_NAME" \
+            --bisect-json scripts/ci_monitor/bisect_results.json
