@@ -49,8 +49,6 @@ class _FakeKVPool:
 
 
 def _reference(q, keys, values, prefix_lens, scaling, causal):
-    """Each request's block attends to its prefix and its own block; causal masks
-    the block's tail."""
     num_q_heads, num_kv_heads = q.shape[1], keys[0].shape[1]
     group = num_q_heads // num_kv_heads
     out = []
@@ -185,8 +183,7 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
         "installed AITER unified_attention has no causal=False (ROCm/aiter#7244)",
     )
     def test_encoder_only_verify_is_bidirectional_within_the_block(self):
-        """An ENCODER_ONLY layer sees its whole block from every row, on the 2D, split-KV
-        and (causal-only) 3d_mtp shapes."""
+        """An ENCODER_ONLY layer sees its whole block, on the 2D, split-KV and 3d_mtp shapes."""
         self._check_against_the_reference(AttentionType.ENCODER_ONLY)
 
 

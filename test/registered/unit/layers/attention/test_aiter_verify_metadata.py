@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp import planner as dcp_planner
@@ -172,8 +173,8 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
         return backend
 
     def test_dspark_draft_skips_the_buffers_unified_verify_never_reads(self):
-        """A DSpark draft runner on unified verify allocates no flat KV-index buffer or
-        custom mask, and its verify replay builds no flat indices."""
+        """A DSpark draft runner on unified verify allocates no flat KV-index buffer,
+        custom mask, or replay flat indices."""
         backend = self._init_graph_state(
             use_unified_verify=True, reads_flat_kv_indices=False
         )
@@ -183,9 +184,8 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
         self.assertEqual(self.kv_index_kernel.launches, 0)
 
     def test_other_runners_keep_their_graph_buffers(self):
-        """Every other runner, unified verify (gpt-oss) or not, keeps the flat KV
-        indices and the custom mask as before, and its unified verify replay still
-        builds the flat indices."""
+        """Every other runner keeps the flat KV indices and custom mask,
+        and its unified verify replay still builds the flat indices."""
         for use_unified_verify in (False, True):
             with self.subTest(use_unified_verify=use_unified_verify):
                 backend = self._init_graph_state(
@@ -197,8 +197,8 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
         self.assertEqual(self.kv_index_kernel.launches, 1)
 
     def test_a_mode_needing_flat_indices_fails_loudly_on_a_dspark_draft(self):
-        """A graph mode other than target_verify on a DSpark draft runner gets a
-        clear error instead of indexing a None buffer."""
+        """Another graph mode on a DSpark draft runner raises,
+        not indexes a None buffer."""
         backend = self._init_graph_state(
             use_unified_verify=True, reads_flat_kv_indices=False
         )
@@ -237,6 +237,7 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
         kv_dtype,
         prefix_lens,
         sliding_window_size=None,
+        muse_verify_kernels=frozenset(),
     ):
         bs, draft_num, page_size, num_kv_heads = len(prefix_lens), 4, 16, 2
         pages = -(-(max(prefix_lens) + draft_num) // page_size)
@@ -246,7 +247,7 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
         backend.kv_cache_dtype = kv_dtype
         backend.page_size = page_size
         backend.use_muse_attention_paths = False
-        backend.muse_verify_kernels = frozenset()
+        backend.muse_verify_kernels = muse_verify_kernels
         backend.k_scale = backend.v_scale = torch.ones(1)
         backend.token_to_kv_pool = _FakeKVPool(
             torch.zeros(bs * pages, page_size, num_kv_heads, head_dim, dtype=kv_dtype)
@@ -258,6 +259,7 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
             max_q_len=draft_num,
             verify_seqused_k=None,
             verify_seqlen_k=None,
+            verify_seqlen_k_i32=None,
         )
         layer = SimpleNamespace(
             layer_id=0,
@@ -292,6 +294,12 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
                 aiter_backend,
                 "unified_attention_3d_mtp_func",
                 lambda **_kw: calls.append(("mtp", None)),
+                create=True,
+            ),
+            patch.object(
+                aiter_backend,
+                "_muse_verify_attention",
+                lambda *_a, **_kw: calls.append(("muse", None)) or True,
                 create=True,
             ),
             patch.object(aiter_backend, "_muse_gfx95_like", lambda: True),
@@ -333,6 +341,19 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
         for (name, attn_type), calls in expected.items():
             with self.subTest(shape=name, attn_type=attn_type.name):
                 self.assertEqual(self._verify(attn_type, **shapes[name]), calls)
+
+    def test_muse_verify_kernels_serve_only_causal_layers(self):
+        shape = dict(
+            num_q_heads=8,
+            head_dim=64,
+            kv_dtype=torch.bfloat16,
+            prefix_lens=(37, 3000),
+            muse_verify_kernels=frozenset({"verify"}),
+        )
+        self.assertEqual(self._verify(AttentionType.DECODER, **shape), [("muse", None)])
+        self.assertEqual(
+            self._verify(AttentionType.ENCODER_ONLY, **shape), [("unified", False)]
+        )
 
     def test_encoder_only_sliding_window_verify_raises(self):
         """unified_attention takes no sliding window with causal=False, so it raises."""
@@ -475,7 +496,12 @@ class _MHAPool:
         return torch.empty(1, 1, 8, 128)
 
 
-def _init_mha_backend(kv_cache_layout):
+def _init_mha_backend(
+    kv_cache_layout,
+    *,
+    spec_algorithm=SpeculativeAlgorithm.NONE,
+    sliding_window_size=None,
+):
     pool = _MHAPool(kv_cache_layout)
     model_config = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -493,8 +519,9 @@ def _init_mha_backend(kv_cache_layout):
         req_to_token_pool=SimpleNamespace(req_to_token=None, size=_BATCH_SIZE),
         runner_ids=None,
         token_to_kv_pool=pool,
-        is_draft_worker=False,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
+        is_draft_worker=spec_algorithm != SpeculativeAlgorithm.NONE,
+        spec_algorithm=spec_algorithm,
+        sliding_window_size=sliding_window_size,
         token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
     )
     spec = SimpleNamespace(
@@ -511,6 +538,11 @@ def _init_mha_backend(kv_cache_layout):
         patch.object(aiter_backend, "get_exec", lambda: exec_config),
         patch.object(aiter_backend, "get_spec", lambda: spec),
         patch.object(aiter_backend, "get_parallel", lambda: parallel),
+        patch.object(
+            aiter_backend,
+            "get_memory",
+            lambda: SimpleNamespace(enable_unified_memory=False),
+        ),
     ):
         return aiter_backend.AiterAttnBackend(model_runner, skip_prefill=True)
 
@@ -525,6 +557,37 @@ class TestAiterDecodeWorkspace(CustomTestCase):
             for layout in ("nhd", "vectorized_5d")
         }
         self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
+
+
+class TestAiterDSparkDraftInit(CustomTestCase):
+    """AiterAttnBackend wires a DSpark draft runner to unified verify, or rejects it."""
+
+    def _draft(self, *, non_causal=True, **kwargs):
+        with (
+            patch(
+                "sglang.srt.utils.aiter.aiter_unified_attention_supports_non_causal",
+                return_value=non_causal,
+            ),
+            envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(False),
+        ):
+            return _init_mha_backend(
+                "nhd", spec_algorithm=SpeculativeAlgorithm.DSPARK, **kwargs
+            )
+
+    def test_draft_runner_uses_unified_verify_without_flat_graph_indices(self):
+        draft = self._draft()
+        self.assertTrue(draft.use_triton_unified_attention)
+        self.assertTrue(draft._use_unified_verify)
+        self.assertFalse(draft._graph_reads_flat_kv_indices)
+        with envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(True):
+            target = _init_mha_backend("nhd")
+        self.assertTrue(target._graph_reads_flat_kv_indices)
+
+    def test_unsupported_draft_raises(self):
+        for case in (dict(sliding_window_size=128), dict(non_causal=False)):
+            with self.subTest(**case):
+                with self.assertRaisesRegex(ValueError, "cannot run this DSpark draft"):
+                    self._draft(**case)
 
 
 if __name__ == "__main__":

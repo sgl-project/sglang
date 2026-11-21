@@ -950,8 +950,8 @@ class AiterAttnBackend(AttentionBackend):
         )
         _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
 
-        # A DSpark draft's layers are ENCODER_ONLY, so its target_verify (the only mode
-        # its runner captures) runs unified_attention with causal=False.
+        # A DSpark draft's layers are ENCODER_ONLY;
+        # its target_verify runs unified_attention with causal=False.
         self._is_dspark_draft = (
             model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
         )
@@ -1018,8 +1018,8 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and envs.SGLANG_AITER_UNIFIED_VERIFY.get()
         )
-        # A DSpark draft runner captures only target_verify; on unified verify that
-        # reads the page table, not the flat CUDA-graph KV indices or custom mask.
+        # A DSpark draft runner captures only target_verify;
+        # unified verify reads the page table, not flat KV indices or a custom mask.
         self._graph_reads_flat_kv_indices = not (
             self._use_unified_verify and self._is_dspark_draft
         )
