@@ -42,48 +42,25 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
             output_ids (torch.Tensor): The output tokens.
+            req_indices (torch.Tensor): The batch row of each token.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
-
-    def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
-        """
-        Apply all penalizers to the logits in-place.
-
-        Args:
-            logits: The logits tensor to apply penalties to.
-            repeat: If set (speculative decoding), per-request penalties are
-                expanded via repeat_interleave to match the draft token layout.
-                Additive penalties are captured into a zeros tensor, expanded,
-                then added; scaling penalties are accumulated, expanded, then
-                applied directly.
-        """
-        if repeat is None:
-            for penalizer in self.penalizers.values():
-                penalizer.apply(logits)
-        else:
-            # Additive: capture into zeros, expand, add
-            bs = logits.shape[0] // repeat
-            additive = torch.zeros(
-                (bs, logits.shape[1]), dtype=torch.float32, device=logits.device
+            penalizer.cumulate_output_tokens(
+                output_ids=output_ids, req_indices=req_indices
             )
-            self.accumulate_additive_penalties(additive)
-            logits.add_(torch.repeat_interleave(additive, repeat, dim=0))
-            # Scaling: accumulate, expand, apply
-            accumulated = self.accumulate_scaling_penalties()
-            if accumulated is not None:
-                from sglang.srt.sampling.penaltylib.repetition_penalty import (
-                    apply_scaling_penalties,
-                )
 
-                expanded = torch.repeat_interleave(accumulated, repeat, dim=0)
-                apply_scaling_penalties(logits, expanded)
+    def apply(self, logits: torch.Tensor):
+        """Apply all penalizers to the logits in-place."""
+        for penalizer in self.penalizers.values():
+            penalizer.apply(logits)
 
     def accumulate_additive_penalties(self, logits: torch.Tensor):
         """Apply only additive (non-multiplicative) penalizers."""
@@ -209,11 +186,13 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        self._cumulate_output_tokens(output_ids=output_ids, req_indices=req_indices)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,9 +230,11 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         """
-        Cumulate the output tokens.
+        Cumulate the output tokens; output_ids[j] belongs to batch row req_indices[j].
         Orchestrator will call this function to feed the output tokens to the penalizer.
         """
         pass
