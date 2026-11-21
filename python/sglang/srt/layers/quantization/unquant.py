@@ -430,14 +430,43 @@ _BF16_SM107_WARP_SPLITK_TUNED_TACTICS = {
 _BF16_SM107_FUSED_A_SPLITK_KEYS = frozenset(
     {(1, 2624, 6144), (4, 2624, 6144), (5, 2624, 6144)}
 )
+# MuseSpark TP4 / TP8 o_proj on SM103, added to the active table on SM103 only. These keys skip the
+# FlashInfer low-M autotune, so o_proj keeps a split-K kernel with a peer-store epilogue.
+_BF16_SM103_WARP_SPLITK_TUNED_TACTICS = {
+    # TP4.
+    (1, 8192, 2048): (16, 8, 256, 4, 2),
+    (2, 8192, 2048): (32, 8, 256, 5, 2),
+    (4, 8192, 2048): (32, 8, 256, 5, 2),
+    (8, 8192, 2048): (32, 8, 128, 9, 2),
+    (12, 8192, 2048): (32, 16, 256, 4, 2),
+    (16, 8192, 2048): (32, 16, 256, 4, 2),
+    # TP8.
+    (1, 8192, 1024): (32, 8, 256, 4, 1),
+    (2, 8192, 1024): (32, 8, 256, 4, 2),
+    (4, 8192, 1024): (32, 8, 256, 4, 2),
+    (8, 8192, 1024): (32, 8, 256, 4, 2),
+    (12, 8192, 1024): (32, 16, 256, 4, 2),
+    (16, 8192, 1024): (32, 16, 256, 4, 2),
+}
 _use_sm107_splitk_tactics = False
 # The warp split-K table in use; rebound by initialize_bf16_gemm_config.
 _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
+# Keys that skip the low-M autotune; rebound by initialize_bf16_gemm_config.
+_low_m_autotune_skip_keys = frozenset()
 
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     key = (m, n, k)
     return key in _BF16_SPLITK_TUNED_TACTICS or key in _active_warp_splitk_tactics
+
+
+def use_bf16_low_m_autotune(m: int, n: int, k: int) -> bool:
+    """Whether a bias-free, graph-captured ``(m, n, k)`` GEMM runs FlashInfer's autotuned low-M kernel."""
+    return (
+        _mm_bf16 is not None
+        and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+        and (m, n, k) not in _low_m_autotune_skip_keys
+    )
 
 
 def prefer_bf16_splitk_over_fused_a(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -482,7 +511,7 @@ def initialize_bf16_gemm_config() -> None:
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
-    global _active_warp_splitk_tactics
+    global _active_warp_splitk_tactics, _low_m_autotune_skip_keys
     global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
 
@@ -544,6 +573,7 @@ def initialize_bf16_gemm_config() -> None:
     _enable_bf16_splitk_gemm = False
     _use_sm107_splitk_tactics = False
     _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
+    _low_m_autotune_skip_keys = frozenset()
     _mm_bf16 = None
     if backend.is_cutedsl():
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
@@ -580,6 +610,12 @@ def initialize_bf16_gemm_config() -> None:
 
             _mm_bf16 = mm_bf16
             _flashinfer_autotuner = AutoTuner.get()
+        if get_platform().device_sm == 103:
+            _active_warp_splitk_tactics = {
+                **_BF16_WARP_SPLITK_TUNED_TACTICS,
+                **_BF16_SM103_WARP_SPLITK_TUNED_TACTICS,
+            }
+            _low_m_autotune_skip_keys = frozenset(_BF16_SM103_WARP_SPLITK_TUNED_TACTICS)
 
     _BF16_GEMM_BACKEND = backend
 
@@ -658,7 +694,7 @@ def _bf16_low_m_autotune(
     m = x.numel() // x.shape[-1]
     taken = (
         bias is None
-        and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+        and use_bf16_low_m_autotune(m, *weight.shape)
         and (
             torch.compiler.is_compiling()
             or get_is_capture_mode()
@@ -745,6 +781,48 @@ def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     return _bf16_gemm_dispatch_impl(x, weight, bias)
+
+
+def bf16_gemm_peer_store(x: torch.Tensor, weight: torch.Tensor, **destinations) -> bool:
+    """``bf16_gemm_dispatch(x, weight, None)``'s split-K or low-latency GEMM and tactic,
+    stored into peer buffers (FlashInfer's ``LamportPeerStoreConfig``: ``destinations``).
+    False, with nothing launched, when the dispatcher picks another kernel."""
+    m, (n, k) = x.shape[0], weight.shape
+    # Low M runs FlashInfer's autotuned GEMM, which has no peer-store epilogue.
+    if use_bf16_low_m_autotune(m, n, k):
+        return False
+    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(m, n, k):
+        warp_tactic = _active_warp_splitk_tactics.get((m, n, k))
+        if warp_tactic is not None:
+            from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+                run_warp_splitk_dense_peer_store as run,
+            )
+
+            tactic = _warp_splitk_tactic(*warp_tactic)
+        # The dispatcher runs the direct GEMM, which has no peer-store epilogue.
+        elif _prefer_direct(m, n, k):
+            return False
+        else:
+            from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+                run_splitk_dense_peer_store as run,
+            )
+
+            tactic = _splitk_tactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
+    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(m, n, k):
+        # FlashInfer's copy of the low-latency GEMM shares tactic ids 0-28.
+        from flashinfer.gemm.kernels.tgv_gemm_cute_ext import (
+            run_tgv_cute_ext_peer_store as run,
+        )
+
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import _pick_tactic
+
+        tactic = _pick_tactic(m, n, k)
+    # Any other kernel (cuBLAS, ...) has no peer-store epilogue.
+    else:
+        return False
+    # The GEMM stores x @ weight.T into the destinations; ``out`` is a shape operand only.
+    run(x, weight.T, x.new_empty(m, n), tactic, **destinations)
+    return True
 
 
 def warmup_bf16_gemms(model: torch.nn.Module, max_m: int) -> None:

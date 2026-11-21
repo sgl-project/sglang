@@ -27,6 +27,10 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
     all_gather_norm_residual,
     all_gather_norm_residual_supported,
 )
+from sglang.kernels.ops.communication.muse_spark_all_reduce_norm_residual import (
+    FusedAllReducePostNormResidualPreNorm,
+    o_proj_push,
+)
 from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
     router_gemv_cute,
     router_gemv_cute_eligible,
@@ -78,7 +82,11 @@ from sglang.srt.layers.muse_spark.muse_spark_layers import (
     QKVOGateParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    bf16_gemm_dispatch,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -188,6 +196,21 @@ _FP32_ROUTER_MAX_TOKENS = 8
 @functools.lru_cache(maxsize=1)
 def _split_bf16_router_supported() -> bool:
     return is_cuda() and get_device_capability()[0] == 9
+
+
+def _o_proj_pushable(o_proj: torch.nn.Module) -> bool:
+    """Whether o_proj's apply is ``bf16_gemm_dispatch`` on its weight alone, which the push GEMM reproduces.
+
+    Checked per call: LoRA replaces the module after construction.
+    """
+    backend = get_bf16_gemm_backend()
+    return (
+        type(o_proj) is RowParallelLinear
+        and type(o_proj.quant_method) is UnquantizedLinearMethod
+        and o_proj.weight.dtype == torch.bfloat16
+        and o_proj.bias is None
+        and (backend.is_cutedsl() or backend.is_gemv())
+    )
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
@@ -409,7 +432,10 @@ class MuseSpark1xAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        skip_all_reduce: bool = False,
+        push_o_proj: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """None when ``push_o_proj`` stored o_proj's output into the attention TP push plane."""
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
@@ -436,7 +462,11 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
         output = self._fused_o_norm_gate(output, o_gate)
-        output, _ = self.o_proj(output)
+        if push_o_proj and o_proj_push(
+            get_parallel().attn_tp_group.ca_comm, output, self.o_proj.weight
+        ):
+            return None
+        output, _ = self.o_proj(output, skip_all_reduce=skip_all_reduce)
         return output
 
 
@@ -997,6 +1027,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.post_attention_residual_gate,
             self.pre_feedforward_layernorm,
         )
+        self._ar_fused_attn_boundary = FusedAllReducePostNormResidualPreNorm(
+            self._fused_attn_boundary,
+            hidden_size=config.hidden_size,
+            branch_dtype=self.operator_dtype,
+        )
         self._fused_ffn_boundary = None
 
     @staticmethod
@@ -1024,11 +1059,28 @@ class MuseSpark1xDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Returns the updated residual stream and the next layer's attention input."""
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        num_tokens = attn_input.shape[0]
+        ar_fused = self._ar_fused_attn_boundary.applicable(num_tokens)
+        # Every rank takes the same branch: same shapes, same GEMM dispatch.
+        push_o_proj = (
+            ar_fused
+            and _o_proj_pushable(self.self_attn.o_proj)
+            and self._ar_fused_attn_boundary.push_applicable(num_tokens)
+        )
+        attn_output = self.self_attn(
+            positions,
+            attn_input,
+            forward_batch,
+            skip_all_reduce=ar_fused,
+            push_o_proj=push_o_proj,
+        )
         router_dtype = self._router_dtype
-        if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
+        if router_dtype is not None and _use_split_bf16_router(num_tokens):
             router_dtype = None
-        ffn_input, stream, router_input = self._fused_attn_boundary(
+        boundary = (
+            self._ar_fused_attn_boundary if ar_fused else self._fused_attn_boundary
+        )
+        ffn_input, stream, router_input = boundary(
             stream,
             attn_output,
             branch_dtype=self.operator_dtype,
