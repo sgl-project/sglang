@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, Response, StatusCode};
+use axum::middleware::Next;
 use bytes::Bytes;
 
 use crate::off_worker;
@@ -84,4 +85,22 @@ async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Resp
             }
         }
     })
+}
+
+/// `/v1/responses`'s body-limit rejection, in its JSON error envelope rather
+/// than the extractor's plain text, so a client decodes every error alike.
+pub(crate) async fn envelope_413(req: Request, next: Next) -> Response<Body> {
+    let resp = next.run(req).await;
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|ct| ct.as_bytes().starts_with(b"application/json"));
+    if resp.status() != StatusCode::PAYLOAD_TOO_LARGE || is_json {
+        return resp;
+    }
+    let (parts, _) = resp.into_parts();
+    rebuild(
+        parts,
+        responses::error_body(413, "request body is too large"),
+    )
 }

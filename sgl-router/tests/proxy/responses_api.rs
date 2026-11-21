@@ -76,6 +76,20 @@ fn captured(mock: &MockWorker) -> Value {
 }
 
 #[tokio::test]
+async fn responses_body_limit_returns_json() {
+    let mock = MockWorker::start(vec![]).await;
+    let app = sgl_router::server::app::build_router_with_body_limit(build_ctx(mock.url.clone()), 8);
+    let req = Request::post("/v1/responses")
+        .body(Body::from(r#"{"input":"hello"}"#))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(res.headers()["content-type"], "application/json");
+    let error: Value = serde_json::from_slice(&collect_body(res.into_body()).await).unwrap();
+    assert_eq!(error["error"]["code"], 413);
+}
+
+#[tokio::test]
 async fn buffered_response_object() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
