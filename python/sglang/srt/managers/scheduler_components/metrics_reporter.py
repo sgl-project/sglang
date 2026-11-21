@@ -7,10 +7,11 @@ import tempfile
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Deque, Dict, List, Optional, Tuple, Union
 
 import msgspec
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
@@ -76,6 +77,8 @@ CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
 GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
 # Update scheduler time counters every 1 second.
 _SCHEDULER_TIME_ACCOUNTING_INTERVAL_NS = 1_000_000_000
+_DEVICE_TIMER_FIFO_MAXLEN = 256
+_DEVICE_TIMER_FIFO_MAX_AGE_S = 5.0
 
 
 class _CacheHitRateWindow:
@@ -323,6 +326,18 @@ class SchedulerMetricsReporter:
         )
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
         self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
+        # FIFO of (wall-clock recorded-at, GPU elapsed seconds) for each
+        # completed "extend" (prefill) forward, populated from the device
+        # timer below and drained by _consume_device_gpu_time -- gives
+        # _prefill_sol_suffix an accurate per-forward duration instead of the
+        # wall-clock gap between log lines. Keyed by category (currently only
+        # "extend" is populated) so a future consumer (e.g. a decode
+        # equivalent) can reuse the same structure without resurrecting the
+        # unbounded-growth bug this avoids: only append for categories
+        # something actually drains.
+        self._device_timer_elapsed_by_category: Dict[str, Deque[Tuple[float, float]]] = defaultdict(
+            lambda: deque(maxlen=_DEVICE_TIMER_FIFO_MAXLEN)
+        )
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
@@ -336,6 +351,24 @@ class SchedulerMetricsReporter:
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
                 self._forward_occupancy_log_window.gpu_seconds += kwargs["t"]
+                # Only "extend" (prefill) is ever drained, via
+                # _consume_device_gpu_time below -- tracking every category
+                # here (decode, idle, eagle_draft, ...) would queue entries
+                # that nothing consumes, growing unboundedly for the life of
+                # the process. Also gate on the same conditions that let
+                # report_prefill_stats() reach _consume_device_gpu_time at all
+                # (mirrors its own early-return check): on TP ranks other than
+                # attn_tp_rank 0 (without --enable-metrics-for-all-schedulers),
+                # or with --enable-mfu-metrics off, report_prefill_stats()
+                # returns before ever draining this queue, so appending here
+                # unconditionally leaks the same way the all-categories
+                # version used to.
+                if kwargs.get("category") == "extend" and self.enable_mfu_metrics and (
+                    self.is_stats_logging_rank or self.current_scheduler_metrics_enabled
+                ):
+                    self._device_timer_elapsed_by_category["extend"].append(
+                        (time.perf_counter(), kwargs["t"])
+                    )
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
@@ -346,9 +379,7 @@ class SchedulerMetricsReporter:
             enabled=self.enable_metrics,
             query_forward_active=(
                 self.forward_pass_device_timer.is_active
-                if self.enable_metrics
-                and self.forward_pass_device_timer is not None
-                and self.scheduler.device == "cuda"
+                if self.enable_metrics and self.forward_pass_device_timer is not None
                 else None
             ),
         )
@@ -564,6 +595,93 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
+        # Per-layer attention/MLP/Mamba split for hybrid architectures. Two
+        # distinct conventions exist across real HF configs:
+        #   - Dedicated-layer (NemotronH): each layer is *exclusively* one of
+        #     "attention"/"mamba"/"mlp"/"moe" -- a "mamba" layer has no MLP of
+        #     its own, since the FFN lives in its own separately-indexed
+        #     layer. Only count the dedicated labels.
+        #   - Bundled-layer (FalconH1's uniform "hybrid" label; Jamba/Bamba's
+        #     "attention"/"mamba" with no separate FFN label at all): every
+        #     layer carries its own attention-or-mamba mixer *and* its own
+        #     MLP together. These vocabularies never contain "mlp"/"moe" at
+        #     all, so detect the convention by that and fall back to
+        #     "every layer pays the FFN cost" instead of silently zeroing it.
+        # `layers_block_type`'s vocabulary is not standardized across hybrid
+        # configs. NemotronH and Jamba/Bamba use sglang's/transformers' own
+        # exclusive {"mamba", "attention", "mlp", "moe"} labels (Jamba/Bamba
+        # never emit "mlp"/"moe" since the FFN is bundled into every mixer
+        # layer -- see has_dedicated_ffn_layers below). But Qwen3-Next/
+        # Qwen3.5, GigaChat3.5, and BailingHybrid's own layers_block_type
+        # returns "full_attention"/"linear_attention" instead -- counting
+        # "attention" against that vocabulary silently finds zero real
+        # attention layers while the generic "not mamba/mlp/moe" fallback
+        # would overcount by treating every linear_attention layer as full
+        # attention too. Only trust literal label-counting when the
+        # vocabulary is actually a subset of the exclusive convention;
+        # otherwise fall back to full_attention_layer_ids, which each of
+        # those config classes computes correctly for its own semantics.
+        layers_block_type = getattr(hf_text_config, "layers_block_type", None)
+        _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
+        if (
+            layers_block_type
+            and set(layers_block_type) <= _EXCLUSIVE_HYBRID_BLOCK_TYPES
+        ):
+            num_attn_layers = float(layers_block_type.count("attention"))
+            has_dedicated_ffn_layers = any(
+                t in ("mlp", "moe") for t in layers_block_type
+            )
+            num_mlp_layers = (
+                float(layers_block_type.count("mlp") + layers_block_type.count("moe"))
+                if has_dedicated_ffn_layers
+                else num_layers
+            )
+        else:
+            # full_attention_layer_ids is usually computed by sglang itself
+            # (ModelConfig.__init__, via get_hybrid_layer_ids()) and stored on
+            # model_config -- NOT on hf_text_config, which only ever has it
+            # when a model's own HF config class defines the field natively
+            # (e.g. KimiLinear/KimiK3). Check both so neither source is
+            # silently ignored.
+            full_attention_layer_ids = getattr(
+                model_config, "full_attention_layer_ids", None
+            )
+            if full_attention_layer_ids is None:
+                full_attention_layer_ids = getattr(
+                    hf_text_config, "full_attention_layer_ids", None
+                )
+            if full_attention_layer_ids is None:
+                logger.warning(
+                    "Could not determine hybrid attention/MLP layer split for "
+                    "model %s (no recognized layers_block_type convention and "
+                    "no full_attention_layer_ids on model_config or "
+                    "hf_text_config); estimated MFU/MBU metrics will assume "
+                    "every layer is a full attention+MLP transformer layer, "
+                    "which may be inaccurate for hybrid architectures.",
+                    getattr(model_config, "model_path", type(model_config).__name__),
+                )
+            num_attn_layers = (
+                float(len(full_attention_layer_ids))
+                if full_attention_layer_ids is not None
+                else num_layers
+            )
+            num_mlp_layers = num_layers
+
+        # Pure Mamba/SSM stacks (FalconMamba, Mamba, Mamba2 -- see
+        # PURE_SSM_ARCHITECTURES in model_config.py) have no MLP sublayer at
+        # all: every layer is just a Mamba mixer. Neither convention above
+        # expresses "zero MLP layers", so without this they fall through to
+        # `num_mlp_layers = num_layers` and get charged a fake FFN cost built
+        # from `hf_text_config.intermediate_size` -- on these configs that
+        # field is the SSM mixer's own inner/expand dimension (d_inner), not
+        # an FFN size, so the fabricated cost has no basis in the real model.
+        # This was inflating FLOPs/weight-bytes enough to push MFU/MBU over
+        # 100% on falcon-mamba-7b(-instruct). The real Mamba-mixer FLOPs/bytes
+        # aren't estimated here (follow-up); zeroing is the honest fallback.
+        if getattr(model_config, "attention_arch", None) == AttentionArch.SSM:
+            num_mlp_layers = 0.0
+            num_attn_layers = 0.0
+
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
             model_config.get_num_attention_heads(get_parallel().tp_size)
@@ -572,7 +690,8 @@ class SchedulerMetricsReporter:
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
-        intermediate_size = float(intermediate_size)
+        raw_intermediate_size = float(intermediate_size)
+        intermediate_size = raw_intermediate_size / max(1, get_parallel().tp_size)
 
         dtype_num_bytes = getattr(model_config.dtype, "itemsize", None)
         if dtype_num_bytes is None:
@@ -583,63 +702,217 @@ class SchedulerMetricsReporter:
         w_bytes = float(dtype_num_bytes)
         cache_bytes = float(dtype_num_bytes)
 
-        # Linear-layer FLOPs per token on one GPU.
-        attn_linear_flops = (
-            2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
-            + 2.0 * hidden_size * head_dim * num_attn_heads
-        )
-        mlp_flops = (
-            6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
-        )
+        # Weight-only quantization (W4A16/W8A16-style: GPTQ/AWQ/compressed-tensors)
+        # stores weights at a narrower width than the activation dtype above, so
+        # charging w_bytes at the activation width overcounts weight-read
+        # bandwidth by roughly (activation_bits / weight_bits) -- e.g. ~4x for a
+        # 4-bit-weight model read as if it were bf16. Prefer the quant config's
+        # own published global_compression_ratio (compressed-tensors) when
+        # present, since it already accounts for group-size scale/zero-point
+        # overhead and any unquantized layers (e.g. lm_head) that a naive
+        # bits-only ratio would miss; fall back to a bits-per-weight ratio for
+        # GPTQ/AWQ-style flat configs that don't publish a ratio.
+        hf_quant_config = getattr(model_config, "hf_quant_config", None) or {}
+        weight_compression_ratio = hf_quant_config.get("global_compression_ratio")
+        if not weight_compression_ratio:
+            weight_bits = (
+                hf_quant_config.get("bits")
+                or hf_quant_config.get("num_bits")
+                or hf_quant_config.get("w_bit")
+            )
+            if weight_bits is None:
+                for group in (hf_quant_config.get("config_groups") or {}).values():
+                    weight_bits = (group or {}).get("weights", {}).get("num_bits")
+                    if weight_bits:
+                        break
+            if weight_bits:
+                weight_compression_ratio = (dtype_num_bytes * 8) / float(weight_bits)
+        if weight_compression_ratio and weight_compression_ratio > 1:
+            w_bytes = float(dtype_num_bytes) / float(weight_compression_ratio)
+
+        # MLA has a shared per-token KV latent (not per-head K/V like GQA).
+        is_mla = getattr(model_config, "attention_arch", None) == AttentionArch.MLA
+        if is_mla and num_attn_heads > 0:
+            kv_lora_rank = float(getattr(model_config, "kv_lora_rank", 0) or 0)
+            qk_rope_head_dim = float(getattr(model_config, "qk_rope_head_dim", 0) or 0)
+            qk_nope_head_dim = getattr(model_config, "qk_nope_head_dim", None)
+            qk_nope_head_dim = (
+                float(qk_nope_head_dim)
+                if qk_nope_head_dim is not None
+                else max(0.0, head_dim - qk_rope_head_dim)
+            )
+            v_head_dim = getattr(model_config, "v_head_dim", None)
+            v_head_dim = (
+                float(v_head_dim)
+                if v_head_dim is not None
+                else hidden_size / num_attn_heads
+            )
+            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            q_lora_rank = float(getattr(hf_text_config, "q_lora_rank", 0) or 0)
+
+            if q_lora_rank > 0:
+                q_proj_flops = 2.0 * hidden_size * q_lora_rank + 2.0 * q_lora_rank * (
+                    num_attn_heads * qk_head_dim
+                )
+                q_proj_weight_elems = hidden_size * q_lora_rank + q_lora_rank * (
+                    num_attn_heads * qk_head_dim
+                )
+            else:
+                q_proj_flops = 2.0 * hidden_size * num_attn_heads * qk_head_dim
+                q_proj_weight_elems = hidden_size * num_attn_heads * qk_head_dim
+
+            kv_a_dim = kv_lora_rank + qk_rope_head_dim
+            kv_a_proj_flops = 2.0 * hidden_size * kv_a_dim
+            kv_a_proj_weight_elems = hidden_size * kv_a_dim
+            kv_b_out_dim = num_attn_heads * (qk_nope_head_dim + v_head_dim)
+            kv_b_proj_flops = 2.0 * kv_lora_rank * kv_b_out_dim
+            kv_b_proj_weight_elems = kv_lora_rank * kv_b_out_dim
+            o_proj_flops = 2.0 * num_attn_heads * v_head_dim * hidden_size
+            o_proj_weight_elems = num_attn_heads * v_head_dim * hidden_size
+
+            attn_linear_flops = (
+                q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+            )
+            attn_linear_weight_elems_per_layer = (
+                q_proj_weight_elems
+                + kv_a_proj_weight_elems
+                + kv_b_proj_weight_elems
+                + o_proj_weight_elems
+            )
+            attn_dot_flops_per_layer = 2.0 * num_attn_heads * (qk_head_dim + v_head_dim)
+            kv_cache_elems_per_token_per_layer = kv_a_dim
+        else:
+            attn_linear_flops = (
+                2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
+                + 2.0 * hidden_size * head_dim * num_attn_heads
+            )
+            attn_linear_weight_elems_per_layer = attn_linear_flops / 2.0
+            attn_dot_flops_per_layer = 4.0 * num_attn_heads * head_dim
+            kv_cache_elems_per_token_per_layer = 2.0 * num_kv_heads * head_dim
+
+        # MoE FFN: num_experts_per_tok routed experts (+ shared experts) at
+        # moe_intermediate_size, not the dense intermediate_size.
+        moe_tp_size = max(1, get_parallel().moe_tp_size)
+        moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+        num_experts_per_tok = getattr(hf_text_config, "num_experts_per_tok", None)
+        if moe_intermediate_size is None and num_experts_per_tok:
+            total_experts = (
+                getattr(hf_text_config, "num_experts", None)
+                or getattr(hf_text_config, "num_local_experts", None)
+                or getattr(hf_text_config, "n_routed_experts", None)
+            )
+            if total_experts:
+                moe_intermediate_size = raw_intermediate_size
+        if moe_intermediate_size and num_experts_per_tok:
+            moe_intermediate_size = float(moe_intermediate_size) / moe_tp_size
+            shared_expert_count = float(
+                getattr(hf_text_config, "n_shared_experts", None)
+                or getattr(hf_text_config, "num_shared_experts", None)
+                or getattr(hf_text_config, "moe_num_shared_experts", None)
+                or 0
+            )
+            active_expert_units = float(num_experts_per_tok) + shared_expert_count
+            # MoE experts are gated (SwiGLU) in every architecture this estimator
+            # currently special-cases (Mixtral/DeepSeek/Qwen-MoE/OLMoE/GraniteMoE),
+            # so mlp_weight_mult stays at the gated 3x multiplier here -- set
+            # explicitly (rather than left to the dense branch below) so
+            # _ffn_act_bytes_per_token's shared reference to it stays correct
+            # regardless of which branch ran.
+            mlp_weight_mult = 3.0
+            mlp_flops = 6.0 * hidden_size * moe_intermediate_size * active_expert_units
+            mlp_weight_elems_per_layer = (
+                mlp_weight_mult
+                * hidden_size
+                * moe_intermediate_size
+                * active_expert_units
+            )
+            ffn_act_intermediate_size = moe_intermediate_size * active_expert_units
+        else:
+            # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
+            # gated (SwiGLU/GeGLU-style: separate gate_proj + up_proj + down_proj,
+            # 3 weight matrices) or a plain 2-matrix FFN (up/fc_in + down/fc_out).
+            # Gating is a property of the architecture, not the activation
+            # function (GeGLU and a plain GELU FFN can share the same hidden_act),
+            # so key off architectures rather than hidden_act. Default to gated
+            # for every unlisted architecture.
+            _NON_GATED_MLP_ARCHITECTURES = {
+                "GPT2LMHeadModel",
+                "GPTBigCodeForCausalLM",
+                "Starcoder2ForCausalLM",
+                "ApertusForCausalLM",
+                "ArceeForCausalLM",
+                "OPTForCausalLM",
+                "PhiForCausalLM",
+            }
+            model_architectures = (
+                getattr(getattr(model_config, "hf_config", None), "architectures", None)
+                or []
+            )
+            is_gated_mlp = not any(
+                arch in _NON_GATED_MLP_ARCHITECTURES for arch in model_architectures
+            )
+            mlp_flop_mult = 6.0 if is_gated_mlp else 4.0
+            mlp_weight_mult = 3.0 if is_gated_mlp else 2.0
+            mlp_flops = (
+                mlp_flop_mult * hidden_size * intermediate_size
+                if intermediate_size > 0
+                else 0.0
+            )
+            mlp_weight_elems_per_layer = (
+                mlp_weight_mult * hidden_size * intermediate_size
+                if intermediate_size > 0
+                else 0.0
+            )
+            ffn_act_intermediate_size = intermediate_size
+
         self._linear_flops_per_token = max(
-            0.0, (attn_linear_flops + mlp_flops) * num_layers
+            0.0, attn_linear_flops * num_attn_layers + mlp_flops * num_mlp_layers
         )
 
         # Attention dot-product FLOPs coefficient to multiply token-context product.
-        # attn_qk + attn_av = 4 * q * TC * d * L
-        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_layers
+        self._attn_dot_flops_coeff = attn_dot_flops_per_layer * num_attn_layers
 
-        # KV cache bytes (write one K and one V vector per generated token).
+        # KV cache bytes per generated token (num_attn_layers, not num_layers).
         self._kv_cache_bytes_per_token = (
-            2.0 * num_layers * num_kv_heads * head_dim * cache_bytes
+            kv_cache_elems_per_token_per_layer * num_attn_layers * cache_bytes
         )
 
         # Weight read bytes per token.
         self._weight_read_bytes_per_token = (
-            hidden_size
-            * head_dim
-            * (num_attn_heads + 2.0 * num_kv_heads)
-            * w_bytes
-            * num_layers
-            + hidden_size * head_dim * num_attn_heads * w_bytes * num_layers
-            + (
-                3.0 * hidden_size * intermediate_size * w_bytes * num_layers
-                if intermediate_size > 0
-                else 0.0
-            )
+            attn_linear_weight_elems_per_layer * w_bytes * num_attn_layers
+            + mlp_weight_elems_per_layer * w_bytes * num_mlp_layers
         )
 
-        # Activation movement bytes per token (coarse approximation).
+        # Activation movement bytes per token (coarse approximation). The
+        # qkv/attention terms scale with the attention layer count; the FFN
+        # term scales with the MLP layer count -- same split as the weight-
+        # read/KV-cache bytes above, not the unsplit total layer count.
         self._qkv_act_bytes_per_token = (
-            hidden_size * act_bytes * num_layers
-            + (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
-            + head_dim * num_attn_heads * act_bytes * num_layers
-            + hidden_size * act_bytes * num_layers
+            hidden_size * act_bytes * num_attn_layers
+            + (num_attn_heads + 2.0 * num_kv_heads)
+            * head_dim
+            * act_bytes
+            * num_attn_layers
+            + head_dim * num_attn_heads * act_bytes * num_attn_layers
+            + hidden_size * act_bytes * num_attn_layers
         )
         self._ffn_act_bytes_per_token = (
-            3.0 * intermediate_size * act_bytes * num_layers
-            if intermediate_size > 0
+            mlp_weight_mult * ffn_act_intermediate_size * act_bytes * num_mlp_layers
+            if ffn_act_intermediate_size > 0
             else 0.0
         )
 
         # Prefill reads Q/K/V activations from on-device memory.
         self._prefill_attn_act_read_per_token = (
-            (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
+            (num_attn_heads + 2.0 * num_kv_heads)
+            * head_dim
+            * act_bytes
+            * num_attn_layers
         )
 
         # Decode reads Q from activation memory; K/V reads are from KV cache.
         self._decode_q_read_bytes_per_token = (
-            num_attn_heads * head_dim * act_bytes * num_layers
+            num_attn_heads * head_dim * act_bytes * num_attn_layers
         )
 
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
@@ -659,7 +932,7 @@ class SchedulerMetricsReporter:
         # prefix KV once per chunk -- not once per query-key pair.
         prefix_kv_tokens = float(sum(batch.prefix_lens))
         read_bytes = (
-            tokens * self._weight_read_bytes_per_token
+            self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._prefill_attn_act_read_per_token
             + prefix_kv_tokens * self._kv_cache_bytes_per_token
@@ -684,7 +957,7 @@ class SchedulerMetricsReporter:
             + self._attn_dot_flops_coeff * total_context
         )
         read_bytes = (
-            tokens * self._weight_read_bytes_per_token
+            self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._decode_q_read_bytes_per_token
             + total_context * self._kv_cache_bytes_per_token
@@ -696,12 +969,51 @@ class SchedulerMetricsReporter:
         )
         return flops, read_bytes, write_bytes
 
+    def _consume_device_gpu_time(self, category: str) -> Optional[float]:
+        """Pop the next not-yet-consumed per-forward GPU elapsed time (seconds)
+        recorded for `category`, FIFO-ordered so it matches 1:1 with however
+        many forwards of that category actually ran before this call -- even
+        if several completed (and got drained by the device timer's internal
+        `_report()`) before either of their stats got reported. Returns None
+        when the device timer is disabled or nothing is queued yet; callers
+        should fall back to a wall-clock estimate in that case. Discards
+        entries older than _DEVICE_TIMER_FIFO_MAX_AGE_S instead of returning
+        them."""
+        if self.forward_pass_device_timer is None:
+            return None
+        # Poll completed events before reading, without synchronizing.
+        self.forward_pass_device_timer._report()
+        queue = self._device_timer_elapsed_by_category.get(category)
+        if not queue:
+            return None
+        now = time.perf_counter()
+        while queue:
+            recorded_at, elapsed = queue.popleft()
+            if now - recorded_at <= _DEVICE_TIMER_FIFO_MAX_AGE_S:
+                return elapsed
+        return None
+
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
-        """Hook: model-specific speed-of-light % suffix for the prefill log line.
-        Call ``_prefill_attention_pairs(batch)`` for the exact causal
-        attention pair-count. No model arch here, so returns "";
-        a subclass may override it."""
-        return ""
+        """Device-timer-based replacement for the wall-clock `est. prefill
+        TFLOPS/s` estimate in report_prefill_stats.
+
+        `elapsed_s` (the wall-clock gap between consecutive "Prefill batch"
+        log lines) is not this forward's own execution time -- under overlap
+        scheduling, two distinct admissions' results can get processed and
+        logged back-to-back, making `elapsed_s` for the second one collapse
+        toward zero even though real GPU work happened, which previously
+        produced physically-impossible TFLOPS/s values (multiples of the
+        hardware's peak). This computes the same FLOPs estimate but divides by
+        this specific forward's own GPU time (SGLANG_ENABLE_METRICS_DEVICE_TIMER's
+        CUDA-event-based "extend" interval), which stays accurate regardless of
+        scheduler-loop logging cadence. Falls back to "" (letting the caller
+        use the wall-clock estimate) when the device timer is unavailable."""
+        device_elapsed_s = self._consume_device_gpu_time("extend")
+        if device_elapsed_s is None or device_elapsed_s <= 0:
+            return ""
+        flops, _, _ = self._estimate_prefill_perf(batch)
+        tflops_per_s = flops / device_elapsed_s / 1e12
+        return f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
     def _decode_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Hook: model-specific speed-of-light % suffix for the decode log line.
