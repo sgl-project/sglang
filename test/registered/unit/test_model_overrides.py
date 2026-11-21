@@ -1815,10 +1815,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("attention_backend", overrides)
         self.assertNotIn("speculative_draft_attention_backend", overrides)
 
-    def test_nemotron_h_omni_uses_inner_text_config(self):
+    def _nemotron_h_omni_args(self, architecture, quant_algo, quantized_layers=None):
+        quantization_config = {"quant_algo": quant_algo}
+        if quantized_layers is not None:
+            quantization_config["quantized_layers"] = quantized_layers
         outer_config = SimpleNamespace(
-            architectures=["NemotronH_Omni_Reasoning_V3"],
-            quantization_config={"quant_algo": "NVFP4"},
+            architectures=[architecture],
+            quantization_config=quantization_config,
         )
         model_config = SimpleNamespace(
             quantization="modelopt",
@@ -1835,15 +1838,172 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             init_expert_location="trivial",
             _model_config=model_config,
         )
+        return server_args, outer_config
 
+    def test_nemotron_h_omni_uses_inner_text_config(self):
+        for architecture in (
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            server_args, outer_config = self._nemotron_h_omni_args(
+                architecture, "NVFP4"
+            )
+            with (
+                self.subTest(architecture=architecture),
+                override_platform(is_blackwell=False),
+                override_platform(is_sm100=False),
+                override_platform(is_cuda=True, device_capability=(12, 0)),
+            ):
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        architecture,
+                        server_args,
+                        outer_config,
+                    ),
+                    [
+                        (
+                            "_nemotron_h_overrides",
+                            {
+                                "quantization": "modelopt_fp4",
+                                "moe_runner_backend": "flashinfer_cutlass",
+                            },
+                        )
+                    ],
+                )
+
+    def test_nemotron_h_bf16_keeps_auto_runner_on_rocm(self):
+        # flashinfer_cutlass is CUDA-only, so BF16 NemotronH on ROCm must keep
+        # the platform's auto MoE runner.
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            server_args, outer_config = self._nemotron_h_omni_args(architecture, None)
+            server_args._model_config.quantization = None
+            with (
+                self.subTest(architecture=architecture),
+                override_platform(is_blackwell=False),
+                override_platform(is_sm100=False),
+                override_platform(is_cuda=False, is_hip=True),
+            ):
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        architecture,
+                        server_args,
+                        outer_config,
+                    ),
+                    [],
+                )
+
+    def test_nemotron_h_bf16_keeps_auto_runner_below_sm89(self):
+        # FlashInfer builds no CUTLASS MoE for SM80/SM86, so BF16 NemotronH
+        # there (e.g. A100) must keep the platform's auto MoE runner.
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            server_args, outer_config = self._nemotron_h_omni_args(architecture, None)
+            server_args._model_config.quantization = None
+            with (
+                self.subTest(architecture=architecture),
+                override_platform(is_blackwell=False),
+                override_platform(is_sm100=False),
+                override_platform(
+                    is_cuda=True, is_hip=False, is_sm90=False, device_capability=(8, 0)
+                ),
+            ):
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        architecture,
+                        server_args,
+                        outer_config,
+                    ),
+                    [],
+                )
+
+    def test_nemotron_h_bf16_runner_on_sm90(self):
+        # On Hopper, unquantized Nano Omni keeps auto (Triton), the runner it
+        # had before it was registered; the other NemotronH architectures keep
+        # flashinfer_cutlass.
+        cutlass = [
+            ("_nemotron_h_overrides", {"moe_runner_backend": "flashinfer_cutlass"})
+        ]
+        for architecture, expected in (
+            ("NemotronH_Nano_Omni_Reasoning_V3", []),
+            ("NemotronHForCausalLM", cutlass),
+            ("NemotronH_Omni_Reasoning_V3", cutlass),
+        ):
+            server_args, outer_config = self._nemotron_h_omni_args(architecture, None)
+            server_args._model_config.quantization = None
+            with (
+                self.subTest(architecture=architecture),
+                override_platform(is_blackwell=False),
+                override_platform(is_sm100=False),
+                override_platform(
+                    is_cuda=True, is_hip=False, is_sm90=True, device_capability=(9, 0)
+                ),
+            ):
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        architecture,
+                        server_args,
+                        outer_config,
+                    ),
+                    expected,
+                )
+
+    def test_nemotron_h_nano_omni_bf16_uses_cutlass_off_sm90(self):
+        # Off Hopper (e.g. SM89), unquantized Nano Omni defaults to
+        # flashinfer_cutlass like the other NemotronH architectures.
+        server_args, outer_config = self._nemotron_h_omni_args(
+            "NemotronH_Nano_Omni_Reasoning_V3", None
+        )
+        server_args._model_config.quantization = None
         with (
             override_platform(is_blackwell=False),
             override_platform(is_sm100=False),
-            override_platform(is_cuda=False),
+            override_platform(
+                is_cuda=True, is_hip=False, is_sm90=False, device_capability=(8, 9)
+            ),
         ):
             self.assertEqual(
                 collect_model_override_declarations(
-                    "NemotronH_Omni_Reasoning_V3",
+                    "NemotronH_Nano_Omni_Reasoning_V3",
+                    server_args,
+                    outer_config,
+                ),
+                [
+                    (
+                        "_nemotron_h_overrides",
+                        {"moe_runner_backend": "flashinfer_cutlass"},
+                    )
+                ],
+            )
+
+    def test_nemotron_h_nano_omni_mixed_nvfp4_pins_trtllm_on_sm100(self):
+        # Nemotron 3 Nano Omni NVFP4 is a MIXED_PRECISION checkpoint with NVFP4
+        # experts. Without this override its runner stayed "auto", and the
+        # NVFP4 MoE method then skipped the TRT-LLM weight preparation that the
+        # kernel it picks needs (sgl-project/sglang#48108).
+        server_args, outer_config = self._nemotron_h_omni_args(
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "MIXED_PRECISION",
+            quantized_layers={
+                "language_model.backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "NVFP4",
+                    "group_size": 16,
+                }
+            },
+        )
+        with (
+            override_platform(is_blackwell=False),
+            override_platform(is_sm100=True),
+        ):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "NemotronH_Nano_Omni_Reasoning_V3",
                     server_args,
                     outer_config,
                 ),
@@ -1851,8 +2011,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     (
                         "_nemotron_h_overrides",
                         {
-                            "quantization": "modelopt_fp4",
-                            "moe_runner_backend": "flashinfer_cutlass",
+                            "quantization": "modelopt_mixed",
+                            "moe_runner_backend": "flashinfer_trtllm",
                         },
                     )
                 ],
@@ -3163,12 +3323,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
                 {"flashinfer_allreduce_fusion_backend": "auto"},
             )
-            self.assertEqual(
-                _flashinfer_allreduce_fusion_auto_enable(
-                    _view(arch="NemotronH_Omni_Reasoning_V3")
-                ),
-                {"flashinfer_allreduce_fusion_backend": "auto"},
-            )
+            for arch in (
+                "NemotronH_Nano_Omni_Reasoning_V3",
+                "NemotronH_Omni_Reasoning_V3",
+            ):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(arch=arch)),
+                    {"flashinfer_allreduce_fusion_backend": "auto"},
+                )
             # guards: unsupported arch / tp==1 / dp attention / a2a backend
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(
@@ -3593,6 +3755,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # not the branch chain — its hook invokes the handler)
         for architecture in (
             "NemotronHForCausalLM",
+            "NemotronH_Nano_Omni_Reasoning_V3",
             "NemotronH_Omni_Reasoning_V3",
         ):
             with self.subTest(architecture=architecture):
