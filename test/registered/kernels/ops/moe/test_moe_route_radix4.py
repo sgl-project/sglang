@@ -897,7 +897,9 @@ def test_sort_tail_declines_on_a_cu_masked_stream():
     import ctypes
 
     hip = ctypes.CDLL("libamdhip64.so")
-    cus = torch.cuda.get_device_properties(0).multi_processor_count
+    from sglang.kernels.arch import current_arch
+
+    cus = current_arch().num_sms
     words = (cus + 31) // 32
     mask = (ctypes.c_uint32 * words)()
     mask[0] = 0xFF  # 8 CUs: fewer than the 16 helpers of a 256-token tail
