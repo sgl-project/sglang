@@ -227,6 +227,16 @@ class TestComputeAxisAlignerPlanFused:
         assert warnings[0].category == "axis_aligner_fused_conflict"
         assert "overlapping fused groups" in warnings[0].message
 
+    def test_reversed_fused_sub_dims_returns_none(self) -> None:
+        """x fuses (a*b), y fuses (b*a): opposite sub-dim order cannot be unflattened → None with warning."""
+        with log_sink.context() as warnings:
+            result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+                Pair(x="(a*b) c", y="(b*a) c")
+            )
+        assert result is None
+        assert len(warnings) == 1
+        assert warnings[0].category == "axis_aligner_fused_conflict"
+
 
 class TestExecuteAxisAlignerPlan:
     def test_rearrange(self) -> None:
@@ -482,6 +492,33 @@ class TestSeqTokenEquivalencePlan:
         )
         assert result is not None
 
+    def test_s_t_equivalence_inside_fused_group_x_fused_y_separate(self) -> None:
+        """'(t*b) h' vs 's b h': s≡t inside fused group flattens y into (s b) h."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="(t*b) h", y="s b h")
+        )
+        assert result is not None
+        assert result.pattern.x is None
+        assert result.pattern.y == "s b h -> (s b) h"
+
+    def test_s_t_equivalence_inside_fused_group_x_separate_y_fused(self) -> None:
+        """'t b h' vs '(s*b) h': s≡t inside fused group flattens x into (t b) h."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="t b h", y="(s*b) h")
+        )
+        assert result is not None
+        assert result.pattern.x == "t b h -> (t b) h"
+        assert result.pattern.y is None
+
+    def test_s_t_equivalence_inside_fused_group_both_fused_reordered(self) -> None:
+        """'h (t*b)' vs '(s*b) h': both fused with s≡t, x reorders."""
+        result: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="h (t*b)", y="(s*b) h")
+        )
+        assert result is not None
+        assert result.pattern.x == "h t___b -> t___b h"
+        assert result.pattern.y is None
+
 
 class TestSeqTokenEquivalenceExecute:
     """Tests for s≡t dimension name equivalence in execute_axis_aligner_plan."""
@@ -547,6 +584,29 @@ class TestEndToEndSeqTokenEquivalence:
         )
 
         assert x_aligned.shape == y_aligned.shape == (4, num_heads * head_dim)
+        assert torch.equal(x_aligned, y_aligned)
+
+    def test_s_t_inside_fused_group_full_pipeline(self) -> None:
+        """x=tensor(12,8) dims='(t*b) h', y=tensor(4,3,8) dims='s b h' → both aligned to (12,8)."""
+        torch.manual_seed(42)
+        s_len, batch, hidden = 4, 3, 8
+        data: torch.Tensor = torch.randn(s_len, batch, hidden)
+        x_tensor: torch.Tensor = data.reshape(s_len * batch, hidden)
+        y_tensor: torch.Tensor = data.clone()
+
+        plan: Optional[AxisAlignerPlan] = compute_axis_aligner_plan(
+            Pair(x="(t*b) h", y="s b h")
+        )
+        assert plan is not None
+
+        x_aligned: torch.Tensor = execute_axis_aligner_plan(
+            tensor=x_tensor, plan=plan, side="x"
+        )
+        y_aligned: torch.Tensor = execute_axis_aligner_plan(
+            tensor=y_tensor, plan=plan, side="y"
+        )
+
+        assert x_aligned.shape == y_aligned.shape == (s_len * batch, hidden)
         assert torch.equal(x_aligned, y_aligned)
 
 

@@ -144,6 +144,12 @@ class TestParseDiffThresholdRules:
         with pytest.raises(ValueError):
             parse_diff_threshold_rules([".*expert.*"], default_predicate="rel <= 0.001")
 
+    @pytest.mark.parametrize("non_finite", ["nan", "inf", "-inf"])
+    def test_single_non_finite_float_raises(self, non_finite: str) -> None:
+        """Non-finite float shorthand ('nan', 'inf', '-inf') is rejected at parse time."""
+        with pytest.raises(ValueError, match="finite"):
+            parse_diff_threshold_rules([non_finite], default_predicate="rel <= 0.001")
+
     def test_pairs_parsed_in_order(self) -> None:
         """Flat regex/predicate tokens parse into ordered rules."""
         assert parse_diff_threshold_rules(

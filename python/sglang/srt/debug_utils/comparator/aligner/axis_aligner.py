@@ -68,6 +68,10 @@ def _normalize_dim_name(name: str) -> str:
     return name
 
 
+def _normalized_sub_dims(spec: DimSpec) -> tuple[str, ...]:
+    return tuple(_normalize_dim_name(name) for name in spec.sub_dims)
+
+
 def _semantic_names_match(specs_pair: Pair[list[DimSpec]]) -> bool:
     """Check that both sides share the same semantic name set (ignoring squeeze dims)."""
     names_pair: Pair[list[str]] = specs_pair.map(_expand_and_skip_squeeze)
@@ -111,19 +115,20 @@ def _build_canonical_order(specs_pair: Pair[list[DimSpec]]) -> Optional[list[str
     Squeeze dims are excluded.
 
     Returns ``None`` if the two sides have overlapping but incompatible fused groups
-    (e.g. x fuses ``(a*b)`` while y fuses ``(b*c)``).
+    (e.g. x fuses ``(a*b)`` while y fuses ``(b*c)``, or ``(a*b)`` vs ``(b*a)``).
     """
-    # Map each sub-dim name → (placeholder, siblings) from both sides
-    fused_lookup: dict[str, tuple[str, frozenset[str]]] = {}
+    # Map each normalized sub-dim name → (normalized_placeholder, raw_placeholder, ordered_sub_dims)
+    fused_lookup: dict[str, tuple[str, str, tuple[str, ...]]] = {}
     for spec in (*specs_pair.x, *specs_pair.y):
         if spec.is_fused:
-            placeholder: str = spec.sanitized_name
-            siblings: frozenset[str] = frozenset(spec.sub_dims)
-            for sub_name in spec.sub_dims:
-                existing: Optional[tuple[str, frozenset[str]]] = fused_lookup.get(
+            siblings: tuple[str, ...] = _normalized_sub_dims(spec)
+            placeholder: str = _FUSED_NAME_SEP.join(siblings)
+            raw_placeholder: str = spec.sanitized_name
+            for sub_name in siblings:
+                existing: Optional[tuple[str, str, tuple[str, ...]]] = fused_lookup.get(
                     sub_name
                 )
-                if existing is not None and existing[1] != siblings:
+                if existing is not None and existing[2] != siblings:
                     from sglang.srt.debug_utils.comparator.output_types import ErrorLog
 
                     log_sink.add(
@@ -131,12 +136,14 @@ def _build_canonical_order(specs_pair: Pair[list[DimSpec]]) -> Optional[list[str
                             category="axis_aligner_fused_conflict",
                             message=(
                                 f"AxisAligner: overlapping fused groups for sub-dim {sub_name!r} "
-                                f"({existing[0]} vs {placeholder}), skipping axis alignment"
+                                f"({existing[1]} vs {raw_placeholder}), skipping axis alignment"
                             ),
                         )
                     )
                     return None
-                fused_lookup.setdefault(sub_name, (placeholder, siblings))
+                fused_lookup.setdefault(
+                    sub_name, (placeholder, raw_placeholder, siblings)
+                )
 
     result: list[str] = []
     consumed: set[str] = set()
@@ -145,13 +152,13 @@ def _build_canonical_order(specs_pair: Pair[list[DimSpec]]) -> Optional[list[str
         if _SingletonDimUtil.is_squeeze(spec):
             continue
 
-        names: list[str] = spec.sub_dims
+        names: tuple[str, ...] = _normalized_sub_dims(spec)
         if any(n in consumed for n in names):
             continue
 
-        entry: Optional[tuple[str, frozenset[str]]] = fused_lookup.get(names[0])
+        entry: Optional[tuple[str, str, tuple[str, ...]]] = fused_lookup.get(names[0])
         if entry is not None:
-            fused_placeholder, sibs = entry
+            fused_placeholder, _, sibs = entry
             result.append(fused_placeholder)
             consumed.update(sibs)
         else:
@@ -174,27 +181,31 @@ def _build_side_pattern(
 
     # Map normalized dim names back to this side's original names so that
     # einops patterns use consistent identifiers on LHS and RHS.
-    norm_to_original: dict[str, str] = {
-        _normalize_dim_name(spec.name): spec.name for spec in specs
+    sub_norm_to_original: dict[str, str] = {
+        _normalize_dim_name(sub_name): sub_name
+        for spec in specs
+        if not _SingletonDimUtil.is_squeeze(spec)
+        for sub_name in spec.sub_dims
+    }
+    fused_norm_to_original: dict[str, str] = {
+        _FUSED_NAME_SEP.join(_normalized_sub_dims(spec)): spec.sanitized_name
+        for spec in specs
+        if spec.is_fused
     }
 
-    def _to_side_name(token: str) -> str:
-        return norm_to_original.get(token, token)
-
-    # Build per-side target: replace fused placeholders with ``(a b)`` only if this side
-    # has the sub-dims as separate (non-fused) names in the source
-    fused_placeholders: set[str] = {
-        spec.sanitized_name for spec in specs if spec.is_fused
-    }
-    translated_order: list[str] = [_to_side_name(t) for t in canonical_order]
-    target_tokens: list[str] = [
-        (
-            f"({t.replace(_FUSED_NAME_SEP, ' ')})"
-            if _FUSED_NAME_SEP in t and t not in fused_placeholders
-            else t
-        )
-        for t in translated_order
-    ]
+    target_tokens: list[str] = []
+    for token in canonical_order:
+        if _FUSED_NAME_SEP in token:
+            if token in fused_norm_to_original:
+                target_tokens.append(fused_norm_to_original[token])
+            else:
+                translated_subs = [
+                    sub_norm_to_original.get(sub, sub)
+                    for sub in token.split(_FUSED_NAME_SEP)
+                ]
+                target_tokens.append(f"({' '.join(translated_subs)})")
+        else:
+            target_tokens.append(sub_norm_to_original.get(token, token))
 
     if source_tokens == target_tokens:
         return None
