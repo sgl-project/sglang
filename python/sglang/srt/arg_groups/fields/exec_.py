@@ -883,7 +883,8 @@ class ExecComm(msgspec.Struct):
         Arg(
             help="Select FFN boundary reduction: ar uses all-reduce then token "
             "redistribution; rs and rsv permit fixed-size and variable-size "
-            "reduce-scatter respectively; rs+rsv permits both (RSv first). "
+            "reduce-scatter respectively; rs+rsv permits both (rs on "
+            "equal-length padded batches, rsv otherwise). "
             "Unsupported paths fall back to ar. The option applies to the FFN "
             "stages of decoders built with stage boundaries, where auto resolves "
             "the model default; other models ignore it. Required attention and "

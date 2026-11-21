@@ -314,6 +314,14 @@ class TestMhcOnTheDeclarations(CustomTestCase):
                 True,
                 transport_ops.dp_reduce_scatter,
             ),
+            # Equal padded rows keep the single fixed-size collective even where
+            # reduce_scatterv is allowed; it would issue one ncclReduce per rank.
+            (
+                "MAX_LEN with reduce_scatterv allowed",
+                True,
+                True,
+                transport_ops.dp_reduce_scatter,
+            ),
         ):
             with self.subTest(name):
                 hc_post = MagicMock(side_effect=lambda h, r, h_res, h_post: h + r)
