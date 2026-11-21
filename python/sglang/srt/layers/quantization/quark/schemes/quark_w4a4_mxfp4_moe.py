@@ -119,8 +119,21 @@ OCP_MX_BLOCK_SIZE = 32
 _arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] if _is_hip else ""
 # gfx120, not gfx12: gfx1250 (MI455) also starts with gfx12 and must stay on AITER.
 _is_consumer_rdna = _arch.startswith(("gfx11", "gfx120"))
-_use_triton_w4a16 = _is_consumer_rdna
+# gfx942 (CDNA3) has no FP4 MoE kernel (FP4 instances are gfx950-only), so it
+# runs the MXFP4 MoE through the same W4A16 upcast path as consumer RDNA.
+_use_triton_w4a16 = _is_consumer_rdna or _arch == "gfx942"
 _TRITON_W4A16_NUM_WARPS = 8
+
+
+def _clamped_swiglu_oai(
+    gate_up: torch.Tensor, intermediate_size: int, alpha: float, limit: float
+) -> torch.Tensor:
+    """Clamped SwiGLU-OAI (gpt-oss / MiniMax-M3) over split gate/up halves.
+    Mirrors aiter.fused_moe.swiglu(); assumes gemm1_beta == 1."""
+    gate_up = gate_up.view(-1, 2 * intermediate_size)
+    gate = gate_up[..., :intermediate_size].clamp(max=limit)
+    up = gate_up[..., intermediate_size:].clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(alpha * gate) * (up + 1)
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -1194,22 +1207,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
-        # silu_and_mul below is plain SwiGLU on split gate/up halves; the clamped /
-        # alpha-scaled variants (e.g. gpt-oss, DeepSeek-V4) would be silently wrong.
+        # Clamped SwiGLU-OAI (gemm1_alpha, gemm1_clamp_limit) is applied in
+        # _apply_triton_w4a16; only gemm1_beta != 1 is unsupported here.
         cfg = self.moe_runner_config
-        unsupported = {
-            name: value
-            for name, value in (
-                ("gemm1_alpha", cfg.gemm1_alpha),
-                ("gemm1_beta", cfg.gemm1_beta),
-                ("gemm1_clamp_limit", cfg.gemm1_clamp_limit),
-                ("swiglu_limit", cfg.swiglu_limit or None),
-            )
-            if value is not None
-        }
-        if unsupported:
+        if cfg.gemm1_beta not in (None, 1, 1.0):
             raise NotImplementedError(
-                f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
+                f"W4A16 triton path supports gemm1_beta=1, got {cfg.gemm1_beta}"
             )
         logger.info_once(
             "Quark MXFP4 MoE on consumer RDNA: no FP4 hardware, running the W4A4 MXFP4 "
@@ -1278,10 +1281,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             gather_indx=gather,
             precision_config=self.w13_precision_config,
         )
-        act = torch.empty(
-            (gate_up.shape[0], self.intermediate_size), dtype=x.dtype, device=x.device
+        clamp_limit = float(
+            self.moe_runner_config.gemm1_clamp_limit
+            or self.moe_runner_config.swiglu_limit
+            or 0.0
         )
-        silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
+        if clamp_limit:
+            alpha = float(self.moe_runner_config.gemm1_alpha or 1.702)
+            act = _clamped_swiglu_oai(
+                gate_up, self.intermediate_size, alpha, clamp_limit
+            ).to(x.dtype)
+        else:
+            act = torch.empty(
+                (gate_up.shape[0], self.intermediate_size),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
         out = matmul(
             act,
             self.w2_triton_weight,
