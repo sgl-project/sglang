@@ -351,8 +351,7 @@ class SoftmaxTemp:
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        # FlashInfer takes float32 only; measured on B300 at 224 x 200k bf16 rows,
-        # cast + FlashInfer is 224 us and the Triton kernel reading bf16 is 191 us.
+        # FlashInfer takes float32 only.
         if _flashinfer_softmax is not None and kwargs["logits"].dtype == torch.float32:
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)

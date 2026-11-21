@@ -310,6 +310,14 @@ class TargetVerifyExecutor:
         processor = self.deferred_logits_processor
         return processor is not None and processor.is_deferred_layout(logits)
 
+    def finish_deferred_layout(self, logits_output: LogitsProcessorOutput) -> None:
+        """Lay deferred vocab shards out as the full logits, in place."""
+        logits = logits_output.next_token_logits
+        if self.is_deferred_layout(logits):
+            logits_output.next_token_logits = (
+                self.deferred_logits_processor.finish_deferred_layout(logits)
+            )
+
     def begin_simulated_step(self) -> None:
         """Draw this step's SGLANG_SIMULATE_ACC_LEN correct length and bonus seed,
         before the target verify, so the folded accept in the graph applies them too."""
@@ -428,11 +436,7 @@ class TargetVerifyExecutor:
             and sampling_info is not None
             and not verify_logits_adjustments_are_noop(sampling_info)
         ):
-            logits_output.next_token_logits = (
-                self.deferred_logits_processor.finish_deferred_layout(
-                    logits_output.next_token_logits
-                )
-            )
+            self.finish_deferred_layout(logits_output)
             deferred = False
         if sampling_info is not None and not deferred:
             apply_dflash_verify_logits_adjustments(
@@ -608,12 +612,7 @@ class TargetVerifyExecutor:
             iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
-        if self.is_deferred_layout(logits_output.next_token_logits):
-            logits_output.next_token_logits = (
-                self.deferred_logits_processor.finish_deferred_layout(
-                    logits_output.next_token_logits
-                )
-            )
+        self.finish_deferred_layout(logits_output)
 
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
             strided_logits = self.verify_epilogue.strided_logits

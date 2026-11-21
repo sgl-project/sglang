@@ -1224,11 +1224,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self.target_worker.model_runner.watermark_state is None
             and not self._observers.reads_target_logits
         ):
-            logits_output.next_token_logits = (
-                self._verify_executor.deferred_logits_processor.finish_deferred_layout(
-                    logits_output.next_token_logits
-                )
-            )
+            self._verify_executor.finish_deferred_layout(logits_output)
             shards_only = False
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
