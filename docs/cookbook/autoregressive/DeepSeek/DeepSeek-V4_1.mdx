@@ -368,3 +368,24 @@ Front the server with `sgl-router --policy cache_aware --dp-aware`, so a multi-t
 | `--prefill-delayer-token-usage-low-watermark` | 0.7 | 0.7 | 0.7 | 0.85 |
 
 In every column, also set `--mem-fraction-static 0.85`, `--swa-prefix-tails 4096`, `--schedule-policy shortest-prefill-first` and `--engram-config '{"placement": "cpu", "replication": "per_node"}'`, and front the server with the same router.
+
+### 3.7 Mega-mHC Prefill on MI355X
+
+Mega-mHC is an experimental, opt-in prefill path for the model's
+manifold-constrained hyper-connections. On MI355X (`gfx950`), enable it with:
+
+```bash
+SGLANG_OPT_DSV41_MEGA_MHC_PREFILL=1 \
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  <other arguments>
+```
+
+This path applies only to the model's `hc_mult=4`, hidden-size-5120
+configuration and is not used with context-parallel prefill. It returns the
+normalized activation in BF16; the following projection performs its existing
+activation quantization. Leave the variable unset to retain the default fused
+HIP mHC boundary.
+
+Mega-mHC replaces the fused HIP mHC boundary on prefill steps only. Decode and
+verify steps keep the fused boundary, with or without `--enable-amd-monokernel`.
