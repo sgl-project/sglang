@@ -1,5 +1,5 @@
-"""Contract tests for the MQA-logits chunk decision shared by the DSA and DSV4
-indexers.
+"""Contract tests for MQA-logits query planning and the chunk decision shared
+by the DSA and DSV4 indexers.
 
 On ROCm the `[num_q x num_k]` fp32 logits tensor goes to aiter's
 `fp8_mqa_logits`, which only compiles below 2 GiB, so the budget that decides
@@ -11,6 +11,8 @@ around its aiter call. Both are stubbed down to CPU-sized inputs.
 
 import sys
 import types
+from bisect import bisect_right
+from itertools import accumulate
 from unittest import mock
 
 import pytest
@@ -18,6 +20,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool  # noqa: E402
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer  # noqa: E402
 from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
     MQA_LOGITS_MAX_BYTES_ROCM,
     mqa_logits_row_bytes,
@@ -56,6 +59,51 @@ def test_a_smaller_memory_budget_still_wins():
 def test_off_rocm_the_budget_is_untouched():
     # Elsewhere the logits go to DeepGEMM, which has no such limit.
     assert _decide(16_384, 32_768, is_hip=False) == (False, HUGE_MEM_BUDGET)
+
+
+@pytest.mark.parametrize(
+    ("lengths", "extend_lens", "tp"),
+    [
+        ([32768 + 117], [117], 8),
+        ([9, 32, 128, 7], [0, 5, 17, 0], 8),
+        ([0, 5], [6, 7], 4),  # preserve the existing per-row clamp
+        ([1048576, 16384], [32768, 512], 8),
+        ([32, 33, 34, 35], [1, 1, 1, 1], 4),
+    ],
+)
+def test_indexer_tp_split_bounds_match_explicit_row_costs(lengths, extend_lens, tp):
+    q_offset = sum(extend_lens)
+    # Independent per-row reference. Exact cost-boundary hits and zero-length
+    # requests must follow searchsorted(right=True), including the final
+    # nonempty-rank clamping.
+    costs = list(
+        accumulate(
+            max(length - ext + pos + 1, 1)
+            for length, ext in zip(lengths, extend_lens)
+            for pos in range(ext)
+        )
+    )
+    expected = [0]
+    for rank in range(1, tp):
+        cut = bisect_right(costs, costs[-1] * rank // tp)
+        expected.append(min(max(cut, expected[-1] + 1), q_offset - (tp - rank)))
+    expected.append(q_offset)
+    assert (
+        Indexer._indexer_tp_split_bounds(
+            torch.tensor(lengths, dtype=torch.int32), extend_lens, q_offset, tp
+        )
+        == expected
+    )
+
+
+def test_indexer_tp_split_bounds_keep_even_fallback():
+    assert Indexer._indexer_tp_split_bounds(torch.tensor([128, 256]), [32], 64, 4) == [
+        0,
+        16,
+        32,
+        48,
+        64,
+    ]
 
 
 def _kpool_mqa_logits(num_q, num_k, cap_bytes):
