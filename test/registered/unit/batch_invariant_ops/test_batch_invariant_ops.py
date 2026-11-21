@@ -6,12 +6,15 @@ import torch
 
 from sglang.srt.batch_invariant_ops import batch_invariant_ops
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
+from sglang.srt.utils.common import calc_diff
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
+# B200 routes BF16 GEMMs through FlashInfer's batch-invariant class.
+register_cuda_ci(est_time=30, stage="nightly", runner_config="4-gpu-b200")
 register_amd_ci(est_time=10, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
@@ -130,6 +133,44 @@ class TestBatchInvariantOps(CustomTestCase):
         finally:
             if original_mode is not None:
                 deep_gemm.use_deterministic_algorithms(original_mode)
+
+    def test_flashinfer_bf16_batch_invariance(self):
+        """On SM100-family parts, mm and addmm in batch-invariant mode run
+        FlashInfer's batch-invariant BF16 class at every M: a row's bits do
+        not depend on the batch it is in, and are the class's bits."""
+        if not batch_invariant_ops._flashinfer_mm_bf16_supported(
+            torch.cuda.current_device()
+        ):
+            self.skipTest("FlashInfer batch-invariant BF16 GEMM is unavailable")
+        from flashinfer import mm_bf16
+
+        generator = torch.Generator(device=device_type).manual_seed(0)
+        # An unsplit weight, and a narrow long-K weight (K >= 32 * N) that
+        # FlashInfer runs with a fixed split-K chunking.
+        for N, K in ((4096, 4096), (128, 8192)):
+            with self.subTest(N=N, K=K):
+                a = torch.randn(257, K, dtype=torch.bfloat16, generator=generator)
+                weight = torch.randn(N, K, dtype=torch.bfloat16, generator=generator)
+                bias = torch.randn(N, dtype=torch.bfloat16, generator=generator)
+                b = weight.T
+                self.assertTrue(
+                    batch_invariant_ops._can_use_flashinfer_mm_bf16(
+                        a, b, torch.bfloat16
+                    )
+                )
+                with set_batch_invariant_mode(True):
+                    ref_mm = torch.mm(a[:1], b)
+                    ref_addmm = torch.addmm(bias, a[:1], b)
+                    for batch_size in (16, 64, 257):
+                        out_mm = torch.mm(a[:batch_size], b)
+                        out_addmm = torch.addmm(bias, a[:batch_size], b)
+                        torch.testing.assert_close(out_mm[:1], ref_mm, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            out_addmm[:1], ref_addmm, rtol=0, atol=0
+                        )
+                expected = mm_bf16(a, b, backend="auto", batch_invariant=True)
+                torch.testing.assert_close(out_mm, expected, rtol=0, atol=0)
+                self.assertLess(calc_diff(out_mm, a.float() @ b.float()), 1e-4)
 
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""
