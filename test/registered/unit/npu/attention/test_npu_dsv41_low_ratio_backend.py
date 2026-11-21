@@ -119,6 +119,14 @@ _real_ds41_ops = dsv4_backend._ds41_ops
 dsv4_backend._ds41_ops = lambda: DS41
 
 
+def setUpModule():
+    # DS41 mocks the packed A5 ABI, regardless of the machine collecting the suite.
+    for module in (dsv4_backend, dsv4_memory_pool):
+        unittest.enterModuleContext(
+            patch.object(module, "is_npu_arch35", return_value=True)
+        )
+
+
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
     backend._dsv4_compress_ratios = (0,) + tuple(ratios)

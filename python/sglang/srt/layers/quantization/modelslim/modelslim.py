@@ -127,7 +127,10 @@ def remap_dspark_weight_name_npu(
             if rest in ("head.weight", "lm_head.weight"):
                 return "lm_head.weight"
         return None
-    if rest.startswith(("markov_head.", "confidence_head.")):
+    if rest.startswith("markov_head."):
+        rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
+        return rest.replace("markov_head.head.", "markov_head.markov_w2.", 1)
+    if rest.startswith("confidence_head."):
         return rest
 
     mapped_rest = rest
@@ -176,7 +179,12 @@ class ModelSlimConfig(QuantizationConfig):
         self.requested_kv_cache_dtype = "auto"
         quant_config = dict(quant_config or {})
         keys = [k for k in quant_config if isinstance(k, str)]
-        is_dsv4 = any(k.startswith("hc_head_") for k in keys)
+        # Some DSV4 ModelSlim exports omit unquantized hc_head_* entries.
+        is_dsv4 = any(
+            k.startswith("hc_head_")
+            or (k.startswith("layers.") and ".ffn.experts." in k)
+            for k in keys
+        )
         if is_dsv4:
             from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
