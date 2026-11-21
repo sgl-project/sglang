@@ -98,6 +98,9 @@ class InstantWriteBackController:
     def __init__(self, host_group: HostPoolGroup, device_allocator):
         self.mem_pool_host = host_group
         self.mem_pool_device_allocator = device_allocator
+        self.write_fence_stream = None
+        self.load_fence_stream = None
+        self.forward_on_fence_stream = False
         self.write_queue = []
         self.ack_write_queue = []
         self.load_queue = []
