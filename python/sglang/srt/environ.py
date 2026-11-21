@@ -1233,8 +1233,8 @@ class Envs:
     SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_AITER_K3_OPT"
     )
-    # Use the radix-4 HIP router for K3 top-k on the AITER path; other routing
-    # shapes keep AITER's kernel.
+    # Use the radix-4 HIP router for K3 top-k on the AITER path;
+    # uncovered routing shapes keep AITER's kernel.
     SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
     )

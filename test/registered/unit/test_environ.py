@@ -234,8 +234,10 @@ class TestOptRenamedEnvAliases(CustomTestCase):
     def test_old_name_forwards_with_warning(self):
         for new_name, old_name, raw, expected in self.RENAMED:
             field = vars(type(envs))[new_name]
-            with self.subTest(new_name=new_name), patch.dict(os.environ):
-                os.environ.pop(new_name, None)
+            with self.subTest(new_name=new_name), field.override(None), patch.dict(
+                os.environ
+            ):
+                field.clear()
                 os.environ[old_name] = raw
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")

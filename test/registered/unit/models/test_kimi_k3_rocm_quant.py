@@ -274,13 +274,17 @@ class TestKimiK31RocmEnvDefaults(CustomTestCase):
     """Kimi-K3.1 turns radix-4 top-k on unless the user set either of its names."""
 
     def _radix4_after_defaults(self, **env):
-        # AITER_CONFIG_GEMM_BF16 and AITER_OPUS_STAGE2_FP8 are preset so the
-        # defaults skip the tuned-table install.
+        # Preset the AITER env vars so defaults skip the tuned-table install.
         names = {"AITER_CONFIG_GEMM_BF16": "x", "AITER_OPUS_STAGE2_FP8": "0", **env}
-        with mock.patch.dict(os.environ, names):
-            for name in ("SGLANG_OPT_HIP_K3_RADIX4_TOPK", "SGLANG_K3_RADIX4_TOPK"):
-                if name not in names:
-                    os.environ.pop(name, None)
+        field = envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK
+        # override() restores the field's explicit-None state, which patch.dict does not.
+        with field.override(None), mock.patch.dict(os.environ, names):
+            field.clear()
+            os.environ.pop("SGLANG_K3_RADIX4_TOPK", None)
+            if "SGLANG_OPT_HIP_K3_RADIX4_TOPK" in names:
+                field.set(names["SGLANG_OPT_HIP_K3_RADIX4_TOPK"])
+            if "SGLANG_K3_RADIX4_TOPK" in names:
+                os.environ["SGLANG_K3_RADIX4_TOPK"] = names["SGLANG_K3_RADIX4_TOPK"]
             env_defaults.apply_kimi_k31_rocm_env_defaults()
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
@@ -288,7 +292,10 @@ class TestKimiK31RocmEnvDefaults(CustomTestCase):
         return value, [w.category for w in caught]
 
     def test_default_is_on_when_neither_name_is_set(self):
-        self.assertTrue(self._radix4_after_defaults()[0])
+        value, categories = self._radix4_after_defaults()
+
+        self.assertTrue(value)
+        self.assertEqual(categories, [])
 
     def test_a_value_set_under_the_old_name_still_wins(self):
         value, categories = self._radix4_after_defaults(SGLANG_K3_RADIX4_TOPK="0")
@@ -297,11 +304,12 @@ class TestKimiK31RocmEnvDefaults(CustomTestCase):
         self.assertIn(FutureWarning, categories)
 
     def test_the_new_name_wins_over_the_old_one(self):
-        value, _ = self._radix4_after_defaults(
+        value, categories = self._radix4_after_defaults(
             SGLANG_OPT_HIP_K3_RADIX4_TOPK="0", SGLANG_K3_RADIX4_TOPK="1"
         )
 
         self.assertFalse(value)
+        self.assertEqual(categories, [])
 
 
 if __name__ == "__main__":
