@@ -1767,6 +1767,13 @@ class MiniCPMV:
             return None
         return getattr(self.minicpmv, name)
 
+    def __setattr__(self, name, value):
+        # eval() returns the inner model, so attributes the loader sets must land on it.
+        if name in ("minicpmv", "config"):
+            super().__setattr__(name, value)
+        else:
+            setattr(self.minicpmv, name, value)
+
     def __call__(self, *args, **kwargs):
         return self.minicpmv(*args, **kwargs)
 
