@@ -92,6 +92,12 @@ class TestLiveScheduleConservativeness(CustomTestCase):
         tracker = self.scheduler.new_token_ratio_tracker
         self.assertEqual(tracker.current, tracker.min)
 
+    def test_same_value_leaves_the_running_ratio_unchanged(self):
+        old = self.scheduler.new_token_ratio_tracker
+        old.current = old.min
+        self.assertTrue(self._set(schedule_conservativeness=1.0))
+        self.assertEqual(self.scheduler.new_token_ratio_tracker.current, old.min)
+
     def test_dp_attention_scales_the_live_value_as_at_startup(self):
         parallel = SimpleNamespace(attn_dp_enabled=True)
         with mock.patch.object(internal_state, "get_parallel", return_value=parallel):

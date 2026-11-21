@@ -212,7 +212,8 @@ class SchedulerInternalStateController:
             )
 
     def _apply_schedule_conservativeness(self, key: str, value: Any) -> Dict[str, Any]:
-        # Re-derive init, min and decay as at startup. A more conservative
+        # Re-derive init, min and decay as at startup. An unchanged value
+        # leaves the running ratio as it is. A more conservative
         # value raises the running ratio to at least the new init at once. A
         # less conservative value keeps the running ratio (e.g. one a retract
         # raised) and lets it decay, never below the new min.
@@ -223,7 +224,7 @@ class SchedulerInternalStateController:
         previous = get_schedule().schedule_conservativeness
         running = self.scheduler.new_token_ratio_tracker.current
         tracker = NewTokenRatioTracker.from_conservativeness(effective)
-        floor = tracker.init if effective >= previous else tracker.min
+        floor = tracker.init if effective > previous else tracker.min
         tracker.current = max(running, floor)
         self.scheduler.new_token_ratio_tracker = tracker
         return {key: effective}
