@@ -105,9 +105,9 @@ class ModelSlimConfig(QuantizationConfig):
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
+                parent, _, _ = prefix.rpartition(".")
+                new_leaf = packed_modules_mapping_subset[proj_name][0]
+                prefix_in_quant_config = f"{parent}.{new_leaf}" if parent else new_leaf
 
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
@@ -175,8 +175,9 @@ class ModelSlimConfig(QuantizationConfig):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
         if proj_name in fused_mapping:
+            parent, _, _ = prefix.rpartition(".")
             shard_prefixes = [
-                prefix.replace(proj_name, shard_proj_name)
+                f"{parent}.{shard_proj_name}" if parent else shard_proj_name
                 for shard_proj_name in fused_mapping[proj_name]
             ]
 
