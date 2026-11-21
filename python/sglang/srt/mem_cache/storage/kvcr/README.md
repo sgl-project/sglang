@@ -54,14 +54,17 @@ Keys and defaults (ports are bases; each rank adds its DP/TP/CP offset):
   fraction of its host pages (bytes split in proportion to host bytes).
 - `local_dram_pool_pages` (`{}`): `{pool name: pages}`, an integer of at least
   1 per named pool, overriding that split.
-- `operation_timeout_ms` (`5000`) and `abandon_timeout_ms` (`30000`): KVCR's
-  deadlines, counted from each deposit or deliver call; KVCR requires
-  abandonment to be at least twice the operation deadline. An operation not
-  started by the operation deadline is a miss, and one in flight then fails. A
-  transfer, local or remote, still in flight at the abandonment deadline is
-  uncertain and ends the worker (see Failure handling). Size both from one
-  HiCache batch (128 pages times the page bytes per rank) over the slowest
-  expected link.
+- `operation_timeout_ms` and `abandon_timeout_ms` (derived): KVCR's deadlines,
+  counted from each deposit or deliver call; KVCR requires abandonment to be
+  at least twice the operation deadline. An operation not started by the
+  operation deadline is a miss, and one in flight then fails. A transfer,
+  local or remote, still in flight at the abandonment deadline is uncertain
+  and ends the worker (see Failure handling). By default the operation
+  deadline is the time one HiCache batch (128 pages of every pool, per rank)
+  takes at 250 MB/s, and at least 5 s; abandonment is three times that, and at
+  least 30 s. Setting only one derives the other, and the startup log prints
+  both. Lower abandonment shortens a dead peer's stall; raise both for links
+  slower than that rate.
 - `enable_remote_hint` and `publish_inventory` (`false`): see below.
 - `extra_backend_tag` (unset): hashed into the storage namespace. The namespace
   keys on the served model name and the KV layout, not on the weights, so

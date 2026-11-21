@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import logging
+import math
 import mmap
 import os
 import threading
@@ -20,6 +21,7 @@ from queue import Empty, SimpleQueue
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorage,
     PoolHitPolicy,
     PoolName,
@@ -64,6 +66,14 @@ _TRAILING_POOLS = frozenset(
         PoolName.DEEPSEEK_V4_C128_STATE,
     )
 )
+
+# Default KVCR deadlines scale with one HiCache storage batch (128 pages of
+# every pool): the operation deadline is that batch at this per-rank rate, and
+# a transfer still in flight at abandonment ends the worker (see README).
+_SLOW_TRANSFER_BYTES_PER_SECOND = 250 * 1000**2
+_MIN_OPERATION_TIMEOUT_MS = 5000
+_MIN_ABANDON_TIMEOUT_MS = 30000
+_ABANDON_PER_OPERATION = 3
 
 # Extra-config keys this backend reads.
 _EXTRA_CONFIG_KEYS = frozenset(
@@ -227,20 +237,22 @@ class KVCRStore(HiCacheStorage):
             or any(type(v) is not int or v < 1 for v in self._pages_by_pool.values())
         ):
             raise ValueError("Invalid KVCR local DRAM budget")
-        # KVCR's own rule, checked here so that it cannot fail the first IO.
-        # Abandonment bounds both a dead peer's stall and how long a slow but
-        # healthy transfer may run before the worker exits (see README).
-        self._operation_timeout_ms = self._extra.get("operation_timeout_ms", 5000)
-        self._abandon_timeout_ms = self._extra.get("abandon_timeout_ms", 30000)
-        if (
-            type(self._operation_timeout_ms) is not int
-            or type(self._abandon_timeout_ms) is not int
-            or self._operation_timeout_ms <= 0
-            or self._abandon_timeout_ms < 2 * self._operation_timeout_ms
+        # Unset deadlines are derived from the pools once they are known
+        # (_timeouts); set ones must already satisfy KVCR's own rule here, so
+        # that it cannot fail the first IO.
+        self._operation_timeout_ms = self._extra.get("operation_timeout_ms")
+        self._abandon_timeout_ms = self._extra.get("abandon_timeout_ms")
+        for name, value in (
+            ("operation_timeout_ms", self._operation_timeout_ms),
+            ("abandon_timeout_ms", self._abandon_timeout_ms),
+        ):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"KVCR {name} must be a positive integer")
+        if self._abandon_timeout_ms is not None and self._abandon_timeout_ms < 2 * (
+            self._operation_timeout_ms or 1
         ):
             raise ValueError(
-                "KVCR operation_timeout_ms must be a positive integer and "
-                "abandon_timeout_ms an integer at least twice it"
+                "KVCR abandon_timeout_ms must be at least twice operation_timeout_ms"
             )
         self._control = control_address(self.config, self._extra)
         port = self._control[1]
@@ -355,6 +367,29 @@ class KVCRStore(HiCacheStorage):
             self._pool_pages()
         self._pools_attached = True
 
+    def _timeouts(self, layouts=None) -> tuple[int, int]:
+        """KVCR's operation and abandonment deadlines, in ms.
+
+        Unset ones scale with one storage batch, so large pages get more time
+        before a slow but healthy transfer counts as uncertain.
+        """
+        layouts = self._layouts if layouts is None else layouts
+        batch_bytes = STORAGE_BATCH_SIZE * sum(
+            component.size
+            for layout in layouts.values()
+            for component in layout.components
+        )
+        derived = max(
+            _MIN_OPERATION_TIMEOUT_MS,
+            math.ceil(batch_bytes * 1000 / _SLOW_TRANSFER_BYTES_PER_SECOND),
+        )
+        operation, abandon = self._operation_timeout_ms, self._abandon_timeout_ms
+        if operation is None:
+            operation = derived if abandon is None else min(derived, abandon // 2)
+        if abandon is None:
+            abandon = max(_MIN_ABANDON_TIMEOUT_MS, _ABANDON_PER_OPERATION * operation)
+        return operation, abandon
+
     def _warn_unmatched_pool_pages(self) -> None:
         """Report local_dram_pool_pages names once registration has closed.
 
@@ -399,6 +434,7 @@ class KVCRStore(HiCacheStorage):
         if not self._layouts:
             raise ValueError("KVCR has no registered physical host pools")
         self._warn_unmatched_pool_pages()
+        operation_timeout_ms, abandon_timeout_ms = self._timeouts()
         self._namespace = storage_namespace(self.config, self._layouts)
         if self._inventory is not None:
             self._inventory.configure(
@@ -446,8 +482,8 @@ class KVCRStore(HiCacheStorage):
                         nixl_agent_name=self._agent_name,
                         nixl_listen_port=self._nixl_port,
                         pool_layouts=layouts,
-                        operation_timeout_ms=self._operation_timeout_ms,
-                        abandon_timeout_ms=self._abandon_timeout_ms,
+                        operation_timeout_ms=operation_timeout_ms,
+                        abandon_timeout_ms=abandon_timeout_ms,
                         startup_timeout_seconds=self._extra.get(
                             "startup_timeout_seconds"
                         ),
@@ -496,11 +532,14 @@ class KVCRStore(HiCacheStorage):
         )
         self._poll_thread.start()
         logger.info(
-            "KVCR L3 ready: endpoint=%s physical_pools=%s bytes=%d namespace=%s",
+            "KVCR L3 ready: endpoint=%s physical_pools=%s bytes=%d namespace=%s "
+            "operation_timeout_ms=%d abandon_timeout_ms=%d",
             channel.endpoint if channel is not None else None,
             layouts,
             sum(size for _, _, size in allocations),
             self._namespace,
+            operation_timeout_ms,
+            abandon_timeout_ms,
         )
 
     @staticmethod

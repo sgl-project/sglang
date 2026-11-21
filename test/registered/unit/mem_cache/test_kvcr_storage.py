@@ -8,6 +8,7 @@ import functools
 import hashlib
 import importlib.util
 import json
+import math
 import mmap
 import re
 import socket
@@ -678,10 +679,15 @@ class TestKVCRStorage(CustomTestCase):
             ({"local_dram_pool_pages": [1]}, "local DRAM budget"),
             ({"local_dram_pool_pages": {"kv": 0}}, "local DRAM budget"),
             ({"local_dram_pool_pages": {"kv": "100"}}, "local DRAM budget"),
-            ({"operation_timeout_ms": 40000}, "at least twice"),
+            (
+                {"operation_timeout_ms": 40000, "abandon_timeout_ms": 60000},
+                "at least twice",
+            ),
             ({"operation_timeout_ms": 0}, "operation_timeout_ms"),
             ({"operation_timeout_ms": "30000"}, "operation_timeout_ms"),
-            ({"abandon_timeout_ms": 1000}, "at least twice"),
+            ({"abandon_timeout_ms": True}, "abandon_timeout_ms"),
+            # Too short to derive an operation deadline from.
+            ({"abandon_timeout_ms": 1}, "at least twice"),
             ({"nixl_listen_port": 70000}, "nixl_listen_port"),
             ({"nixl_listen_port": True}, "nixl_listen_port"),
             ({"control_port": 70000}, "control_port"),
@@ -743,6 +749,34 @@ class TestKVCRStorage(CustomTestCase):
         backend.on_host_pools_registered()
         self.assertIsNone(backend._runner)
         self.assertIsNone(backend._poll_thread)
+
+    def test_default_deadlines_scale_with_one_storage_batch(self):
+        """Large pages get more time before a slow transfer becomes uncertain."""
+
+        def pools(page_bytes):
+            component = SimpleNamespace(size=page_bytes)
+            return {"kv": SimpleNamespace(components=[component])}
+
+        def timeouts(page_bytes, **extra):
+            store = KVCRStore(
+                dataclasses.replace(self.config, extra_config=extra), self.pool
+            )
+            self.addCleanup(store.close)
+            return store._timeouts(pools(page_bytes))
+
+        # The test pool, and 8 MiB pages (1 GiB batches), keep the floors.
+        self.assertEqual(self.backend._timeouts(), (5000, 30000))
+        self.assertEqual(timeouts(8 << 20), (5000, 30000))
+        # 64 MiB pages: an 8 GiB batch at 250 MB/s.
+        operation = math.ceil(128 * (64 << 20) * 1000 / (250 * 1000**2))
+        self.assertEqual(timeouts(64 << 20), (operation, 3 * operation))
+        # Setting one derives the other, within KVCR's 2x rule.
+        self.assertEqual(timeouts(64 << 20, abandon_timeout_ms=20000), (10000, 20000))
+        self.assertEqual(timeouts(64 << 20, operation_timeout_ms=1000), (1000, 30000))
+        self.assertEqual(
+            timeouts(1, operation_timeout_ms=4000, abandon_timeout_ms=9000),
+            (4000, 9000),
+        )
 
     def test_remote_hints_require_one_node(self):
         """Peers address shard k from shard 0's host, so shards cannot span nodes."""
