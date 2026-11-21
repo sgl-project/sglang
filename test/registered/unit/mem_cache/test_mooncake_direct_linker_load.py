@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
+    TransferReady,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -231,6 +232,54 @@ class TestGroupedLoad(CustomTestCase):
         last_get = max(t for kind, t in store.events if kind == "get")
         first_end = min(t for kind, t in store.events if kind == "end")
         self.assertGreater(first_end, last_get)
+
+
+class TestLoadFence(CustomTestCase):
+    def test_locations_resolve_before_the_forward_and_reads_follow_it(self):
+        order = []
+
+        class Event:
+            def __init__(self, name):
+                self.name = name
+
+            def synchronize(self):
+                order.append(self.name)
+
+        class Pool(FakePool):
+            def prepare_locations(self, host_indices):
+                order.append("prepare")
+                return super().prepare_locations(host_indices)
+
+        class Store(FakeStore):
+            def batch_get_session_start(self, keys):
+                order.append("start")
+                return super().batch_get_session_start(keys)
+
+            def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
+                order.append("get")
+                return super().batch_get_into_multi_buffer_ranges(
+                    keys, ptrs, sizes, offsets
+                )
+
+        linker = make_linker(
+            Store(),
+            num_layers=2,
+            layer_group=1,
+            threads=1,
+            pools={PoolName.KV: Pool(), PoolName.INDEXER: Pool()},
+        )
+        self.addCleanup(linker.load_io_executor.shutdown)
+        index = linker.layer_done_counter.update_producer()
+        linker.load_layer_wise(
+            index,
+            [[transfer(PoolName.KV, ["k0", "k1"]), transfer(PoolName.INDEXER, ["i0"])]],
+            TransferReady(Event("indices"), Event("forward")),
+        )
+        self.assertTrue(linker.layer_done_counter.finish(index))
+        # Locations wait only for the indices; sessions and reads wait for the forward.
+        self.assertEqual(order[:3], ["indices", "prepare", "prepare"])
+        forward = order.index("forward")
+        self.assertEqual(order[forward + 1 :], ["start"] + ["get"] * 4)
 
 
 if __name__ == "__main__":
