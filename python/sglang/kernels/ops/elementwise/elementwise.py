@@ -56,12 +56,82 @@ def _fused_sigmoid_mul_kernel(
         tl.store(output_ptr + attn_off, result, mask=mask)
 
 
+@triton.jit
+def _fused_sigmoid_mul_block_fp8_kernel(
+    attn_output_ptr,
+    gate_ptr,
+    q_ptr,
+    s_ptr,
+    gate_stride_row,
+    gate_stride_head,
+    s_stride_tok,
+    s_stride_grp,
+    hidden_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr = False,
+    ROUND_SIGMOID: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
+):
+    """Fuse sigmoid(gate) * attn_output with group-128 blockwise FP8 quantization."""
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    pid_row = tl.program_id(0).to(tl.int64)
+    pid_block = tl.program_id(1)
+
+    grp_ids = pid_block * GROUPS_PER_BLOCK + tl.arange(0, GROUPS_PER_BLOCK)
+    cols = tl.arange(0, 128)
+    offsets = grp_ids[:, None] * 128 + cols[None, :]
+    head = offsets // HEAD_DIM
+    d = offsets - head * HEAD_DIM
+
+    attn_off = pid_row * hidden_dim + offsets
+    attn = tl.load(attn_output_ptr + attn_off).to(tl.float32)
+
+    gate_off = pid_row * gate_stride_row + head * gate_stride_head + d
+    g = tl.load(gate_ptr + gate_off)
+    sig = tl.sigmoid(g.to(tl.float32))
+    if ROUND_SIGMOID:
+        sig = sig.to(gate_ptr.dtype.element_ty).to(tl.float32)
+    y = (attn * sig).to(attn_output_ptr.dtype.element_ty).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
+    raw_s = amax * (1.0 / 448.0)
+    if SCALE_UE8M0:
+        bits = raw_s.to(tl.uint32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        mant = bits & 0x7FFFFF
+        ue8m0_exp = tl.where(mant != 0, exp + 1, exp)
+        inv_s = ((254 - ue8m0_exp) << 23).to(tl.float32, bitcast=True)
+        y_q = tl.clamp(y * inv_s[:, None], -448.0, 448.0).to(q_ptr.dtype.element_ty)
+        tl.store(q_ptr + attn_off, y_q)
+        shifts = (tl.arange(0, 4) * 8).to(tl.uint32)
+        packed = tl.sum((ue8m0_exp.to(tl.uint32) & 0xFF) << shifts, axis=0).to(tl.int32)
+        tl.store(
+            s_ptr + pid_row * s_stride_tok + pid_block.to(tl.int64) * s_stride_grp,
+            packed,
+        )
+    else:
+        quant_scale = 448.0 / amax
+        y_q = tl.clamp(y * quant_scale[:, None], -448.0, 448.0).to(
+            q_ptr.dtype.element_ty
+        )
+        tl.store(q_ptr + attn_off, y_q)
+        tl.store(
+            s_ptr + pid_row * s_stride_tok + grp_ids.to(tl.int64) * s_stride_grp,
+            raw_s,
+        )
+
+
 def fused_sigmoid_mul(
     attn_output: torch.Tensor,
     gate: torch.Tensor,
     inplace: bool = False,
     quant: bool = False,
     round_sigmoid: bool = False,
+    block_fp8_quant: bool = False,
+    scale_ue8m0: bool = False,
+    scale_transposed: bool = False,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -102,6 +172,64 @@ def fused_sigmoid_mul(
         else:
             gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
+
+    if block_fp8_quant:
+        assert not quant, "quant and block_fp8_quant are mutually exclusive"
+        assert hidden_dim % 128 == 0, "block_fp8_quant requires hidden_dim % 128 == 0"
+        assert attn_output.is_contiguous(), (
+            "block_fp8_quant requires contiguous attn_output"
+        )
+        num_groups = hidden_dim // 128
+        assert not (scale_ue8m0 and (not scale_transposed or num_groups % 4 != 0))
+        q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+        )
+
+        s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=(num_tokens, hidden_dim),
+            device=q.device,
+            group_size=128,
+            column_major_scales=scale_transposed,
+            scale_tma_aligned=scale_transposed,
+            scale_ue8m0=scale_ue8m0,
+        )
+        if num_tokens == 0:
+            return (q, s)
+        if scale_ue8m0:
+            groups_per_block = 4
+            num_warps = 2
+        elif num_groups % 8 == 0 and not guard_or_true(num_tokens <= 8):
+            groups_per_block = 8
+            num_warps = 4
+        elif num_groups % 4 == 0 and not guard_or_true(num_tokens <= 8):
+            groups_per_block = 4
+            num_warps = 2
+        else:
+            groups_per_block = 1
+            num_warps = 1
+        grid = (num_tokens, num_groups // groups_per_block)
+        use_pdl = is_arch_support_pdl()
+        pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+        _fused_sigmoid_mul_block_fp8_kernel[grid](
+            attn_output,
+            gate,
+            q,
+            s,
+            gate_stride_row,
+            gate_stride_head,
+            s.stride(0),
+            s.stride(1),
+            hidden_dim,
+            HEAD_DIM=head_dim,
+            GROUPS_PER_BLOCK=groups_per_block,
+            SCALE_UE8M0=scale_ue8m0,
+            ROUND_SIGMOID=round_sigmoid,
+            USE_PDL=use_pdl,
+            num_warps=num_warps,
+            **pdl_kwargs,
+        )
+        return (q, s)
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if guard_or_true(num_tokens < 1024) else 2048
