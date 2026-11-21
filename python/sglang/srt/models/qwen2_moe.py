@@ -243,10 +243,15 @@ class Qwen2MoeMLP(nn.Module):
         half_dim = gate_up.shape[1] // 2
         if not (256 <= half_dim <= 8192 and half_dim % 256 == 0):
             return False
+        from sglang.kernels.fused_op import get_fused_op_backend
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
         from sglang.srt.runtime_context import get_forward, get_lora
 
-        if is_batch_invariant_mode_enabled() or get_forward().sp_active:
+        if (
+            get_fused_op_backend() is not None
+            or is_batch_invariant_mode_enabled()
+            or get_forward().sp_active
+        ):
             return False
         try:
             deterministic = get_exec().deterministic

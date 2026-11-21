@@ -92,6 +92,7 @@ class TestQwen2MoeMlpBlockFp8FusionGating(CustomTestCase):
             rl_target=None,
             lora=False,
             sp=False,
+            forced_backend=None,
         ):
             exec_ctx = SimpleNamespace(
                 deterministic=SimpleNamespace(
@@ -103,6 +104,10 @@ class TestQwen2MoeMlpBlockFp8FusionGating(CustomTestCase):
             fwd_ctx = SimpleNamespace(sp_active=sp)
             with (
                 patch("sglang.srt.models.qwen2_moe._is_cuda", True),
+                patch(
+                    "sglang.kernels.fused_op.get_fused_op_backend",
+                    return_value=forced_backend,
+                ),
                 patch(
                     "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
                     return_value=bi,
@@ -133,7 +138,15 @@ class TestQwen2MoeMlpBlockFp8FusionGating(CustomTestCase):
         lora_wrapped = _make_mlp()
         lora_wrapped.down_proj.base_layer = object()
 
+        from sglang.kernels.spec import KernelBackend
+
         for desc, mod, tensor, kw in [
+            (
+                "forced_backend_torch",
+                _make_mlp(),
+                gate_up,
+                {"forced_backend": KernelBackend.TORCH},
+            ),
             ("batch_invariant", _make_mlp(), gate_up, {"bi": True}),
             ("deterministic", _make_mlp(), gate_up, {"det": True}),
             ("rl_on_policy", _make_mlp(), gate_up, {"rl_target": "ref"}),

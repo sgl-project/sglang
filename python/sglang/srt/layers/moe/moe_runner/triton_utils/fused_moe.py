@@ -765,8 +765,11 @@ def _fused_moe_kernel_sequence(
         )
     except ValueError:
         det_disabled = False
+    from sglang.kernels.fused_op import get_fused_op_backend
+
     use_native_fused_fp8_contig = (
         not use_native_fused_fp8_tail
+        and get_fused_op_backend() is None
         and not torch.compiler.is_compiling()
         and not is_batch_invariant_mode_enabled()
         and not det_disabled
