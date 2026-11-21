@@ -508,10 +508,21 @@ class TestPlacement(CustomTestCase):
                 feasible(chain, demands),
             )
 
-    def _left_grows(self, growth):
+    def _left_grows(self, growth, *, up_page_bytes=1):
         # An up end full against a float of 4 live pages, plenty of room to
-        # the float's right before the down end.
-        up = _band("up", "up", 1, num_pages=100, min_page=0, low=0, high=20, live=20)
+        # the float's right before the down end. The up end's occupied bytes
+        # and demand stay fixed across page sizes.
+        live = 20 // up_page_bytes
+        up = _band(
+            "up",
+            "up",
+            up_page_bytes,
+            num_pages=100 // up_page_bytes,
+            min_page=0,
+            low=0,
+            high=live,
+            live=live,
+        )
         mid = _band(
             "mid", "float", 1, num_pages=100, min_page=1, low=20, high=24, live=4
         )
@@ -519,7 +530,7 @@ class TestPlacement(CustomTestCase):
             "down", "down", 1, num_pages=100, min_page=1, low=90, high=100, live=10
         )
         chain = _chain((up, mid, down), 100)
-        return plan(chain, {"up": 2}, RELAYOUT, growth=growth)
+        return plan(chain, {"up": 2 // up_page_bytes}, RELAYOUT, growth=growth)
 
     def test_the_slack_goes_to_the_side_that_grows(self):
         # 66 pages of slack after the demand; the up end alone grows, so the
@@ -545,6 +556,12 @@ class TestPlacement(CustomTestCase):
         chain = _chain((up, mid, down), 100)
         found = plan(chain, {"down": 3}, RELAYOUT)
         self.assertEqual(found.targets["mid"], (45, 50))
+
+    def test_equal_byte_growth_leaves_the_same_gap_on_different_page_grids(self):
+        """Equal growth in bytes must give the float the same position on either grid."""
+        one_byte = self._left_grows({"up": 8, "down": 8}, up_page_bytes=1)
+        two_byte = self._left_grows({"up": 4, "down": 8}, up_page_bytes=2)
+        self.assertEqual(one_byte.targets["mid"], two_byte.targets["mid"])
 
     def test_a_moved_float_keeps_its_far_edge_and_holes(self):
         # A float of 4 live pages spread over [20, 40), the down end at 50.

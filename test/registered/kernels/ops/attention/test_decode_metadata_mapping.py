@@ -5,7 +5,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
+from sglang.kernels.ops.attention.metadata import (
+    _WIDE_BLOCK_MIN_PAGES,
+    normal_decode_set_metadata,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,7 +30,8 @@ class TestDecodeMetadataMapping(CustomTestCase):
 
     def _check_tables(self, ps, mapped_full, swa_kind, zero_tail):
         device = "cuda"
-        bs, width, delta, sentinel = 3, 300, 3, -17
+        bs, delta, sentinel = 3, 3, -17
+        width = _WIDE_BLOCK_MIN_PAGES + 3 if zero_tail and ps == 1 else 300
         # Use strided inputs/outputs and mappings: graph replay must read the
         # original storage, without materializing a contiguous mapping copy.
         virtual_pages = torch.arange(bs * width, device=device).view(bs, width) % 31
@@ -36,7 +40,9 @@ class TestDecodeMetadataMapping(CustomTestCase):
         ).reshape(bs, width * ps)
         req_to_token = torch.stack((tokens, tokens), dim=-1)[:, :, 0]
         rows = torch.tensor([1, 9, 2, 9, 0, 9], device=device)[::2]
-        lengths = torch.tensor([2 * ps + 1, 1, 0], device=device, dtype=torch.int32)
+        lengths = torch.tensor(
+            [(width - 2) * ps + 1, 1, 0], device=device, dtype=torch.int32
+        )
         seq_lens = torch.stack((lengths - delta, lengths), dim=1)[:, 0]
         full = ((torch.arange(64, device=device, dtype=torch.int32) * 7) % 31)[::2]
         swa = ((torch.arange(64, device=device, dtype=torch.int32) * 11) % 31)[::2]

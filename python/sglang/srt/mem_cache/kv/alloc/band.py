@@ -31,6 +31,7 @@ import bisect
 import contextlib
 import enum
 import functools
+import itertools
 import logging
 import os
 from typing import (
@@ -2195,10 +2196,12 @@ class Band:
     @classmethod
     def _reader_groups(
         cls, srcs: Sequence[int], transfer_sets
-    ) -> List[Tuple[tuple, List[int]]]:
+    ) -> List[Tuple[tuple, Sequence[int]]]:
         """``srcs`` grouped by the release keys of the transfers that still
         read them (`_readers_of`), so a page no transfer reads is not held
         with one that a slow transfer reads."""
+        if not transfer_sets:
+            return [((), srcs)] if srcs else []
         groups: Dict[tuple, List[int]] = {}
         for src in srcs:
             groups.setdefault(cls._readers_of([src], transfer_sets), []).append(src)
@@ -3569,16 +3572,28 @@ class FloatBand(Band):
         # list (`ChainAllocator._relief`).
         self._assert_ready_for_geometry("relocate_into")
         holes = set(self._free_pages_snapshot(after_wait=bool(self._recovery_depth)))
-        live = [p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes]
-        assert len(live) <= end - first, "the block cannot hold the live pages"
-        inside = {p for p in live if first <= p < end}
-        srcs = [p for p in live if p not in inside]
+        low, high = self._span_range()
+        assert not holes or low <= min(holes) <= max(holes) < high, (
+            f"[{self.sub_pool_name}] a free page lies outside the span [{low}, {high})"
+        )
+        assert high - low - len(holes) <= end - first, (
+            "the block cannot hold the live pages"
+        )
+        # Live pages in the overlap stay put. Walk only the edges giving up
+        # pages, even when the overlap contains millions of live KV rows.
+        leaving = itertools.chain(
+            range(low, min(high, first)), range(max(low, end), high)
+        )
+        srcs = [p for p in leaving if p not in holes]
         assert not set(srcs) & self.fixed_pages(), (
             f"[{self.sub_pool_name}] the block [{first}, {end}) leaves a fixed "
             "page behind"
         )
-        # Not live, so never a source: one batched, disjoint move.
-        vacant = [p for p in range(first, end) if p not in inside]
+        # In physical order: new pages below the old span, holes in the
+        # overlap, then new pages above. The unused suffix is the new free list.
+        vacant = list(range(first, min(end, low)))
+        vacant.extend(sorted(p for p in holes if first <= p < end))
+        vacant.extend(range(max(first, high), end))
         dsts = vacant[: len(srcs)]
         # Host reads before the first stream wait.
         if srcs:
@@ -3599,9 +3614,8 @@ class FloatBand(Band):
             # Every source lies outside the block, so outside the new span.
             for readers, group in self._reader_groups(srcs, transfer_sets):
                 self._fence_vacated(group, readers)
-        kept = inside | set(dsts)
         self.low_wm_page, self.high_wm_page = first, end
-        new_holes = [p for p in range(first, end) if p not in kept]
+        new_holes = vacant[len(srcs) :]
         self._set_free_pages(
             torch.empty(0, dtype=torch.int64, device=self.device), host=[]
         )

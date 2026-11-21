@@ -567,6 +567,13 @@ def draft_extend_set_metadata(
     )
 
 
+# Zero-tail tables at least `_WIDE_BLOCK_MIN_PAGES` wide use wider blocks. Tuned
+# by graph replay on H200 over batch 1 to 64, 2048 to 262144 pages and widths
+# 128 to 1024: within 16% of the best width for every shape, 1.3% on average.
+_WIDE_BLOCK_COLS = 512
+_WIDE_BLOCK_MIN_PAGES = 32768
+
+
 def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
@@ -614,6 +621,10 @@ def normal_decode_set_metadata(
         or (page_size == 1 and swa_page_table is None and full_v2p is None)
         else 128
     )
+    # Captured verify tables clear the entire row. Use wider stores for
+    # long rows so the inactive tail costs fewer thread blocks per replay.
+    if zero_tail and not skip_page_table and max_seq_pages >= _WIDE_BLOCK_MIN_PAGES:
+        block_cols = _WIDE_BLOCK_COLS
     grid = (
         (1, 1)
         if skip_page_table or max_seq_pages == 0
@@ -652,7 +663,7 @@ def normal_decode_set_metadata(
         BLOCK_COLS=block_cols,
         SKIP_PAGE_TABLE=skip_page_table,
         ZERO_TAIL=zero_tail,
-        num_warps=block_cols // 32,
+        num_warps=min(block_cols // 32, 8),
         num_stages=3,
     )
 

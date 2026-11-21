@@ -3076,6 +3076,25 @@ class TestFloatBand(CustomTestCase):
         self.assertGreater(fla.relocate_into(hi - live, hi), 0)
         self._check_float_state(fla, kv)
 
+    def test_one_page_relocation_skips_the_dense_overlap(self):
+        """Shifting a dense window one page must only walk its edges on the host."""
+        _, _, window, _, kv = self._build_tri(n_float=4096)
+        rows = window.alloc(2048)
+        self._stamp(window, kv, rows)
+        low, high = window._span_range()
+
+        def bounded_range(*bounds):
+            pages = range(*bounds)
+            self.assertLess(len(pages), rows.numel() - 1, "walked the live overlap")
+            return pages
+
+        with patch(
+            "sglang.srt.mem_cache.kv.alloc.band.range", bounded_range, create=True
+        ):
+            self.assertEqual(window.relocate_into(low + 1, high + 1), 1)
+        self.assertEqual(int(window.ids.physical_to_virtual[low]), -1)
+        self.assertTrue(torch.equal(kv.buf[window.ids.virtual_to_physical[rows]], rows))
+
 
 class TestDcpWidening(unittest.TestCase):
     """`dcp_size > 1`: the alloc surface speaks a widened virtual id space while
