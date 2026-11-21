@@ -447,6 +447,8 @@ async def _wait_for_server_warmup(websocket: WebSocket) -> None:
     warmup_done = getattr(websocket.app.state, "server_warmup_done", None)
     if warmup_done is not None and not warmup_done.is_set():
         await warmup_done.wait()
+    if async_scheduler_client.failure_reason:
+        raise RuntimeError(async_scheduler_client.failure_reason)
 
 
 @router.websocket("/generate")
