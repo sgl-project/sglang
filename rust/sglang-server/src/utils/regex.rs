@@ -92,6 +92,16 @@ fn reject_python_incompatible(pattern: &str) -> Result<(), Error> {
             {
                 return reject("a `(?<name>…)` group (Python spells it `(?P<name>…)`)".into());
             }
+            // Even the shared `(?P<name>...)` spelling has different name rules:
+            // Rust permits `.`, `[` and `]`, while Python requires an identifier.
+            b'(' if b[i..].starts_with(b"(?P<") => {
+                let name = pattern[i + 4..].split('>').next().unwrap_or_default();
+                if name.bytes().any(|c| matches!(c, b'.' | b'[' | b']')) {
+                    return reject("Rust-only punctuation in a capture group name".into());
+                }
+                leading = false;
+                i += 4 + name.len() + 1; // `(?P<` + name + `>`
+            }
             // A flag-setting group. Python 3.11+ reads these as GLOBAL flags: they
             // must sit at position 0, and the clearing form (`(?-i)`) is invalid on
             // its own — it wants `(?-i:…)`. The flag letters also differ: Rust adds
@@ -662,6 +672,29 @@ mod tests {
         let p = RegexPattern::try_from(r"\d{6}").expect("valid");
         assert_eq!(p.pattern(), r"\d{6}");
         assert_eq!(p.max_len(), 6);
+    }
+
+    #[test]
+    fn rust_only_capture_name_punctuation_is_rejected() {
+        for pattern in ["(?P<a.b>x)", "(?P<a[b]>x)", "(?P<a]b>x)"] {
+            assert!(stop_regex_bound(pattern).is_err(), "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn portable_capture_names_and_literal_lookalikes_are_admitted() {
+        for (pattern, bound) in [
+            ("(?P<answer_1>x)", 1),
+            ("(?P<名字>x)", 1),
+            (r"\(\?P<a\.b>x\)", 10),
+            ("[(?P<a.b>]", 1),
+        ] {
+            assert_eq!(
+                stop_regex_bound(pattern).map_err(|e| e.to_string()),
+                Ok(bound),
+                "{pattern:?}"
+            );
+        }
     }
 
     /// The property this whole design rests on: **anything Rust admits, Python can
