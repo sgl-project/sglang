@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -6,6 +7,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import get_tail_row_indices
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -97,6 +99,54 @@ class TestTopkAmongBlocks(CustomTestCase):
         blocks = torch.full((2, 2), -1, dtype=torch.int32)
         picked = topk_among_blocks(scores, torch.tensor([16, 0]), blocks, 4, 8)
         self.assertTrue((picked == -1).all())
+
+
+def candidate_roles(candidate_topk_blocks: int) -> dict:
+    """(is_candidate_source, uses_candidates) of index layers 16, 20, 24 and 36."""
+    config = SimpleNamespace(
+        index_n_heads=2,
+        index_head_dim=16,
+        qk_rope_head_dim=8,
+        index_topk=512,
+        kv_source_layer_ids=[],
+        candidate_source_layer_id=20,
+        candidate_topk_blocks=candidate_topk_blocks,
+        candidate_block_size=8,
+        q_lora_rank=32,
+        hidden_size=32,
+        rms_norm_eps=1e-6,
+    )
+    roles = {}
+    for layer_id in (16, 20, 24, 36):
+        indexer = DeepseekV41Indexer(config, layer_id, 32, None, prefix="")
+        roles[layer_id] = (indexer.is_candidate_source, indexer.uses_candidates)
+    return roles
+
+
+class TestCandidateRoles(CustomTestCase):
+    def test_source_publishes_for_later_index_layers(self):
+        """With candidate blocks, layer 20 publishes them and only the index layers
+        after it consume them."""
+        self.assertEqual(
+            candidate_roles(2048),
+            {
+                16: (False, False),
+                20: (True, False),
+                24: (False, True),
+                36: (False, True),
+            },
+        )
+
+    def test_no_candidate_blocks_turn_the_scheme_off(self):
+        """#49779: with candidate_topk_blocks 0, layer 20 stayed the candidate source
+        and published no block, so every consumer row in layers 24+ selected nothing.
+        Without candidate blocks every index layer takes the full top-k."""
+        for topk_blocks in (0, -1):
+            with self.subTest(candidate_topk_blocks=topk_blocks):
+                self.assertEqual(
+                    candidate_roles(topk_blocks),
+                    dict.fromkeys((16, 20, 24, 36), (False, False)),
+                )
 
 
 class TestBlockIdsTail(CustomTestCase):
