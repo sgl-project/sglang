@@ -1700,6 +1700,13 @@ class Envs:
     # equal torch.topk's; the default on every platform), 2 exact with the same
     # selected set on every run.
     SGLANG_TOPK_V2_MODE = EnvInt(1)
+    # DeepSelect bf16 top-k with more rows than any cluster tier runs in one wave:
+    # off keeps the one-CTA-per-row kernel, whose time follows the longest row. On
+    # runs the cluster tier with the most rows per wave over several waves instead,
+    # whose time follows the total row length. It wins on long-tailed row lengths
+    # (the DSV4.1 decode indexer at mixed contexts) and loses on uniform long ones.
+    # Same values as off; on ties it may pick other columns.
+    SGLANG_DEEP_SELECT_MULTIWAVE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
