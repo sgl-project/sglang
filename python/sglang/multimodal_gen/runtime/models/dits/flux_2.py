@@ -442,6 +442,12 @@ def _flux2_swiglu(x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.
     """
     if out is None:
         return _flux2_swiglu_impl(x, None)
+    if torch.compiler.is_compiling():
+        # data_ptr() below breaks the graph and leaves an eager full-width copy;
+        # a traced copy_ lets Inductor write the SwiGLU result into the slice.
+        half = x.shape[-1] // 2
+        out.copy_(F.silu(x[..., :half]) * x[..., half:])
+        return out
     result = _flux2_swiglu_impl(x, out)
     if result.data_ptr() != out.data_ptr():
         out.copy_(result)
@@ -1023,13 +1029,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             attn_mask = attention_mask
 
         # Parallel in (QKV + MLP in) projection
+        qkv_dim = 3 * self.local_inner_dim
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
-            [
-                3 * self.local_inner_dim,
-                self.local_mlp_hidden_dim * self.mlp_mult_factor,
-            ],
+            [qkv_dim, self.local_mlp_hidden_dim * self.mlp_mult_factor],
             dim=-1,
         )
 
@@ -1054,27 +1058,40 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             cos_sin_cache,
             complex_freqs,
         )
-        hidden_states = self.attn(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            attn_mask_meta=attn_mask_meta,
-            num_replicated_prefix=num_replicated_prefix,
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
-
         # BF16: build the output projection's [attn | mlp] input in place. SwiGLU
-        # writes its columns directly and only the narrower attention output is
-        # copied, instead of a full-width cat; the GEMM input is byte-identical.
-        if not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat):
-            attn_dim = hidden_states.shape[-1]
-            gemm_input = hidden_states.new_empty(
-                (*hidden_states.shape[:-1], attn_dim + mlp_hidden_states.shape[-1] // 2)
+        # writes its columns directly, and the attention kernel writes the
+        # remaining columns itself where it can; the GEMM input is byte-identical.
+        packed_input = not (self._enable_fp8_token_cat or self._enable_nvfp4_token_cat)
+        attn_dim = self.local_inner_dim
+        gemm_input = None
+        if packed_input:
+            gemm_input = query.new_empty(
+                (*query.shape[:-2], attn_dim + mlp_hidden_states.shape[-1] // 2)
             )
             self.mlp_act_fn(mlp_hidden_states, out=gemm_input[..., attn_dim:])
-            gemm_input[..., :attn_dim].copy_(hidden_states)
+
+        attn_out = None
+        if packed_input and attn_mask is None and attn_mask_meta is None:
+            attn_out = gemm_input[..., :attn_dim].unflatten(
+                -1, (self.local_heads, self.head_dim)
+            )
+            if not self.attn.forward_into(query, key, value, attn_out):
+                attn_out = None
+        if attn_out is None:
+            hidden_states = self.attn(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                attn_mask_meta=attn_mask_meta,
+                num_replicated_prefix=num_replicated_prefix,
+            )
+            hidden_states = hidden_states.flatten(2, 3)
+            hidden_states = hidden_states.to(query.dtype)
+            if packed_input:
+                gemm_input[..., :attn_dim].copy_(hidden_states)
+
+        if packed_input:
             hidden_states, _ = self.to_out(gemm_input)
             return hidden_states
 
