@@ -89,6 +89,148 @@ class TestFp8MoEWeightGating(CustomTestCase):
         self.assertEqual(params["w13_weight_scale"].shape, (NUM_EXPERTS, 1))
 
 
+class TestModelOptFp8MoEIntermediatePadding(CustomTestCase):
+    """Padding must preserve projections, including the gate/up half boundary."""
+
+    @staticmethod
+    def _weights(is_gated, intermediate):
+        num_shards = 2 if is_gated else 1
+        w13 = torch.arange(2 * num_shards * intermediate * 16).reshape(
+            2, num_shards * intermediate, 16
+        )
+        w2 = torch.arange(2 * 16 * intermediate).reshape(2, 16, intermediate)
+        return (
+            torch.nn.Parameter(
+                ((w13.remainder(31).float() - 15) / 8).to(torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+            torch.nn.Parameter(
+                ((w2.remainder(17).float() - 8) / 8).to(torch.float8_e4m3fn),
+                requires_grad=False,
+            ),
+        )
+
+    def _assert_padded(self, actual, original, is_gated, padded_size):
+        w13, w2 = original
+        intermediate = w2.shape[2]
+        expected_w13 = torch.zeros(2, (2 if is_gated else 1) * padded_size, 16)
+        expected_w2 = torch.zeros(2, 16, padded_size)
+        # Place the original projections explicitly, independently of F.pad.
+        expected_w13[:, :intermediate] = w13[:, :intermediate].float()
+        if is_gated:
+            expected_w13[:, padded_size : padded_size + intermediate] = w13[
+                :, intermediate:
+            ].float()
+        expected_w2[:, :, :intermediate] = w2.float()
+
+        for result, source, expected in zip(
+            actual, original, (expected_w13, expected_w2)
+        ):
+            torch.testing.assert_close(result.float(), expected, rtol=0, atol=0)
+            self.assertEqual(result.dtype, source.dtype)
+            self.assertEqual(result.device, source.device)
+            self.assertTrue(result.is_contiguous())
+            self.assertFalse(result.requires_grad)
+
+    def test_non_gated_padding_preserves_weights_and_zero_fills_tails(self):
+        self._check_unaligned(is_gated=False)
+
+    def test_gated_padding_preserves_each_half_and_zero_fills_tails(self):
+        self._check_unaligned(is_gated=True)
+
+    def _check_unaligned(self, is_gated):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            _pad_modelopt_fp8_moe_weights,
+        )
+
+        for intermediate, padded_size in ((15, 16), (17, 32), (232, 240)):
+            with self.subTest(intermediate=intermediate):
+                original = self._weights(is_gated, intermediate)
+                snapshots = tuple(weight.float().clone() for weight in original)
+                actual = _pad_modelopt_fp8_moe_weights(
+                    w13=original[0], w2=original[1], is_gated=is_gated
+                )
+                self._assert_padded(actual, original, is_gated, padded_size)
+                for weight, snapshot in zip(original, snapshots):
+                    torch.testing.assert_close(weight.float(), snapshot, rtol=0, atol=0)
+
+    def test_aligned_weights_retain_identity(self):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            _pad_modelopt_fp8_moe_weights,
+        )
+
+        for is_gated in (False, True):
+            for intermediate in (16, 240):
+                with self.subTest(is_gated=is_gated, intermediate=intermediate):
+                    w13, w2 = self._weights(is_gated, intermediate)
+                    actual = _pad_modelopt_fp8_moe_weights(
+                        w13=w13, w2=w2, is_gated=is_gated
+                    )
+                    self.assertIs(actual[0], w13)
+                    self.assertIs(actual[1], w2)
+
+    def test_repeated_padding_retains_identity(self):
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            _pad_modelopt_fp8_moe_weights,
+        )
+
+        for is_gated in (False, True):
+            with self.subTest(is_gated=is_gated):
+                w13, w2 = self._weights(is_gated, 232)
+                padded = _pad_modelopt_fp8_moe_weights(
+                    w13=w13, w2=w2, is_gated=is_gated
+                )
+                repeated = _pad_modelopt_fp8_moe_weights(
+                    w13=padded[0], w2=padded[1], is_gated=is_gated
+                )
+                self.assertIs(repeated[0], padded[0])
+                self.assertIs(repeated[1], padded[1])
+
+    def test_post_load_pads_both_backends_without_changing_scales_or_logical_size(self):
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8MoEMethod
+
+        for backend in (
+            MoeRunnerBackend.TRITON,
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+        ):
+            for is_gated in (False, True):
+                with self.subTest(backend=backend, is_gated=is_gated):
+                    original = self._weights(is_gated, 232)
+                    layer = torch.nn.Module()
+                    layer.moe_runner_config = MoeRunnerConfig(
+                        is_gated=is_gated, activation="silu" if is_gated else "relu2"
+                    )
+                    layer.intermediate_size_per_partition = 232
+                    layer.num_local_experts = 2
+                    layer.w13_weight, layer.w2_weight = original
+                    # Already per-expert scales avoid GPU-only requantization;
+                    # this test exercises the real post-load layout handling.
+                    scales = {
+                        "w13_weight_scale": torch.tensor([0.25, 0.5]),
+                        "w2_weight_scale": torch.tensor([0.125, 0.25]),
+                        "w13_input_scale": torch.tensor([0.5, 0.5]),
+                        "w2_input_scale": torch.tensor([0.25, 0.25]),
+                    }
+                    for name, value in scales.items():
+                        layer.register_parameter(
+                            name, torch.nn.Parameter(value.clone(), requires_grad=False)
+                        )
+                    method = ModelOptFp8MoEMethod.__new__(ModelOptFp8MoEMethod)
+                    method._moe_runner_backend = backend
+                    method.process_weights_after_loading(layer)
+
+                    self._assert_padded(
+                        (layer.w13_weight, layer.w2_weight), original, is_gated, 240
+                    )
+                    self.assertEqual(layer.intermediate_size_per_partition, 232)
+                    for name, value in scales.items():
+                        expected = value.max() if "input" in name else value
+                        torch.testing.assert_close(
+                            layer.get_parameter(name), expected, rtol=0, atol=0
+                        )
+
+
 class TestFallbackWeightPadding(CustomTestCase):
     def setUp(self):
         from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend

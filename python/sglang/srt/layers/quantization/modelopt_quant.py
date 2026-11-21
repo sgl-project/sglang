@@ -1140,6 +1140,36 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         return None
 
 
+def _pad_modelopt_fp8_moe_weights(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    is_gated: bool,
+    alignment: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero-pad the intermediate dimension, preserving gated W13 packing."""
+    num_shards = 2 if is_gated else 1
+    isp = w13.shape[1] // num_shards
+    if isp % alignment == 0:
+        return w13, w2
+
+    pad_amount = round_up(isp, alignment) - isp
+    if is_gated:
+        # W13 is [Up, Gate]; pad each half so the half-split stays aligned.
+        up_weight = w13[:, :isp, :]
+        gate_weight = w13[:, isp:, :]
+        w13 = torch.cat(
+            [
+                torch.nn.functional.pad(up_weight, (0, 0, 0, pad_amount)),
+                torch.nn.functional.pad(gate_weight, (0, 0, 0, pad_amount)),
+            ],
+            dim=1,
+        )
+    else:
+        w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_amount))
+    w2 = torch.nn.functional.pad(w2, (0, pad_amount))
+    return w13, w2
+
+
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     """MoE method for ModelOpt FP8.
     Supports loading FP8 checkpoints with static weight scale and activation scale.
@@ -1338,42 +1368,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
 
-            # flashinfer_cutlass kernel requires intermediate_size to be a
-            # multiple of 16.  Pad weight tensors with zeros after loading.
-            # For gated activations (swiglu), w13 is [Up, Gate] concatenated
-            # along dim 1 — we must split, pad each half separately, and
-            # re-concat so the kernel's half-split stays aligned.
-            num_shards = 2 if layer.moe_runner_config.is_gated else 1
-            isp = layer.w13_weight.shape[1] // num_shards
-            if isp % 16 != 0:
-                pad_amount = round_up(isp, 16) - isp
-                w13_data = layer.w13_weight.data
-                if num_shards == 2:
-                    up_weight = w13_data[:, :isp, :]
-                    gate_weight = w13_data[:, isp:, :]
-                    layer.w13_weight = Parameter(
-                        torch.cat(
-                            [
-                                torch.nn.functional.pad(
-                                    up_weight, (0, 0, 0, pad_amount)
-                                ),
-                                torch.nn.functional.pad(
-                                    gate_weight, (0, 0, 0, pad_amount)
-                                ),
-                            ],
-                            dim=1,
-                        ),
-                        requires_grad=False,
-                    )
-                else:
-                    layer.w13_weight = Parameter(
-                        torch.nn.functional.pad(w13_data, (0, 0, 0, pad_amount)),
-                        requires_grad=False,
-                    )
-                layer.w2_weight = Parameter(
-                    torch.nn.functional.pad(layer.w2_weight.data, (0, pad_amount)),
-                    requires_grad=False,
-                )
+            # flashinfer_cutlass requires intermediate_size to be a multiple of 16.
+            w13, w2 = _pad_modelopt_fp8_moe_weights(
+                layer.w13_weight,
+                layer.w2_weight,
+                is_gated=layer.moe_runner_config.is_gated,
+            )
+            if w13 is not layer.w13_weight:
+                layer.w13_weight = Parameter(w13, requires_grad=False)
+                layer.w2_weight = Parameter(w2, requires_grad=False)
 
             # All-None unless the runner config carries a clamp limit.
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
@@ -1385,6 +1388,16 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 int(layer.num_local_experts),
                 layer.w13_weight.device,
             )
+        elif self._moe_runner_backend.is_triton():
+            # Align FP8 intermediate row strides after TP loading for Triton GEMMs.
+            w13, w2 = _pad_modelopt_fp8_moe_weights(
+                layer.w13_weight,
+                layer.w2_weight,
+                is_gated=layer.moe_runner_config.is_gated,
+            )
+            if w13 is not layer.w13_weight:
+                layer.w13_weight = Parameter(w13, requires_grad=False)
+                layer.w2_weight = Parameter(w2, requires_grad=False)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
