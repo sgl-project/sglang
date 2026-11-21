@@ -125,6 +125,15 @@ class SDPAImpl(AttentionImpl):
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         # Heads of the unsharded layer; set when TP or Ulysses shards them.
         self.global_num_heads = extra_impl_args.get("global_num_heads")
+        # The per-impl half of _unsplit_query_len's eligibility, resolved once.
+        # ROCm SDPA does not use the CUDA flash split heuristic modeled here.
+        self._may_pad_split_queries = (
+            self._pad_flash_split_queries
+            and not self.allow_cudnn_sdp
+            and self.global_num_heads is not None
+            and not self.dropout
+            and torch.version.hip is None
+        )
 
     def _unsplit_query_len(self, query: torch.Tensor, key_len: int) -> int:
         """Query length that keeps sharded heads on the full layer's kernel.
@@ -138,25 +147,21 @@ class SDPAImpl(AttentionImpl):
         """
         batch, heads, query_len, head_dim = query.shape
         if (
-            not self._pad_flash_split_queries
-            or self.allow_cudnn_sdp
-            or self.global_num_heads is None
+            not self._may_pad_split_queries
             or heads >= self.global_num_heads
-            or self.dropout
             or not query.is_cuda
-            # ROCm SDPA does not use the CUDA flash split heuristic modeled here.
-            or torch.version.hip is not None
             or query.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
             or key_len <= _FLASH_UNSPLIT_KEY_LEN
-            or not _request_quality_is_exact()
         ):
             return query_len
         threshold = _FLASH_SPLIT_OCCUPANCY * _multi_processor_count(query.device.index)
         blocks = math.ceil(query_len / _FLASH_QUERY_BLOCK)
+        # The request lookup comes last: only calls that would pad pay for it.
         if (
             batch * heads * blocks >= threshold
             or batch * self.global_num_heads * blocks < threshold
+            or not _request_quality_is_exact()
         ):
             return query_len
         return math.ceil(threshold / (batch * heads)) * _FLASH_QUERY_BLOCK

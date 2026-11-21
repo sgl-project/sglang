@@ -13,6 +13,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.layers.attention.backends import sdpa
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     CudnnSDPAImpl,
     SDPAImpl,
@@ -148,6 +149,15 @@ class TestSDPAShardedHeads(CustomTestCase):
         with self.subTest("rocm"), patch.object(torch.version, "hip", "6.4"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 1025), 1025)
+        with (
+            self.subTest("calls that cannot split skip the request lookup"),
+            patch.object(sdpa, "_request_quality_is_exact", side_effect=AssertionError),
+        ):
+            impl = _impl(heads=6, global_num_heads=24)
+            long_query = torch.empty(
+                1, 6, 8192, 128, device="cuda", dtype=torch.bfloat16
+            )
+            self.assertEqual(impl._unsplit_query_len(long_query, 8192), 8192)
         with self.subTest("short keys never split"):
             impl = _impl(heads=6, global_num_heads=24)
             self.assertEqual(impl._unsplit_query_len(query, 128), 1025)
