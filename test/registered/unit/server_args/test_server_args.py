@@ -5900,5 +5900,19 @@ class TestPagedExpertsNumResident(unittest.TestCase):
                 _paged_experts_num_resident(bad)
 
 
+class TestGCThresholdWithDPAttention(CustomTestCase):
+    def test_a_third_gc_threshold_is_accepted_with_dp_attention(self):
+        # Lockstep full GC stays off then (GCFreezer) instead of rejecting it.
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            device="cpu",
+            chunked_prefill_size=-1,
+            tp_size=2,
+            attn_dp_size=2,
+            gc_threshold=[700, 10, 10],
+        ).check_server_args()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -175,11 +175,14 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # This rank's lockstep GC pause right before this gather (see DPGCPauseColumn).
+    gc_pause_us: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     any_health_check: bool = False
     any_shutting_down: bool = False
+    max_gc_pause_us: int = 0
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
@@ -204,6 +207,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.gc_pause_us,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +229,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # gc_pause_us
             ],
             device=device,
             dtype=dtype,
@@ -238,6 +243,7 @@ class MLPSyncBatchInfo:
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
+        self.max_gc_pause_us = self.gc_pause_us
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -303,7 +309,8 @@ class MLPSyncBatchInfo:
         # tensor is its own stream sync. Copy the whole tensor, not the
         # `[:, 0, :]` slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
-        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        global_info_cpu = global_info_tensor.cpu()
+        tp0_info_cpu = global_info_cpu[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
@@ -315,6 +322,8 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        # Every rank's, not only each DP group's leading rank: all of them pause.
+        self.max_gc_pause_us = int(global_info_cpu[..., 13].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -574,6 +583,23 @@ class DPDrainColumn:
         self.rows: Optional[list[int]] = None
 
 
+class DPGCPauseColumn:
+    """Carries each rank's lockstep GC pause through the MLP-sync gather.
+
+    ``local`` is how long (in microseconds, at least 1) the full collection this
+    rank ran right before the gather took, or 0 if it ran none. ``max`` receives
+    the longest pause across every rank whenever the gather produced metadata,
+    so every rank sizes its next lockstep interval from the same value (see
+    GCFreezer).
+    """
+
+    __slots__ = ("local", "max")
+
+    def __init__(self, local: int) -> None:
+        self.local = local
+        self.max: Optional[int] = None
+
+
 class DPShutdownVoteSent:
     """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
 
@@ -596,6 +622,7 @@ def prepare_mlp_sync_batch_raw(
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
     drain_column: Optional[DPDrainColumn] = None,
+    gc_pause_column: Optional[DPGCPauseColumn] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -713,6 +740,7 @@ def prepare_mlp_sync_batch_raw(
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
+        gc_pause_us=gc_pause_column.local if gc_pause_column is not None else 0,
     )
 
     if num_dp_ranks == 1:
@@ -729,6 +757,8 @@ def prepare_mlp_sync_batch_raw(
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:
         drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
+    if gc_pause_column is not None and metadata_ready:
+        gc_pause_column.max = mlp_sync_info.max_gc_pause_us
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -814,6 +844,13 @@ class SchedulerDPAttnAdapter:
     # iteration (see DPDrainColumn).
     get_drain_state: Callable[[], int] = lambda: 0
     on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    # Lockstep GC (see GCFreezer and DPGCPauseColumn): runs before every
+    # gather, and every rank runs the same number of gathers, so a count of
+    # these calls names the same step on every rank; then this rank's pause,
+    # and what to do with the longest one across ranks.
+    before_gather: Optional[Callable[[], None]] = None
+    get_gc_pause_us: Callable[[], int] = lambda: 0
+    on_gc_pause: Optional[Callable[[int], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
@@ -839,6 +876,8 @@ class SchedulerDPAttnAdapter:
         self.sync_wait_carry.seconds = 0.0
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        if self.before_gather is not None:
+            self.before_gather()
         draft_require_mlp_tp_gather = None
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             draft_moe_a2a_backend = get_spec().speculative_moe_a2a_backend
@@ -850,6 +889,7 @@ class SchedulerDPAttnAdapter:
 
         shutdown_vote = DPShutdownVote(self.get_shutting_down())
         drain_column = DPDrainColumn(self.get_drain_state())
+        gc_pause_column = DPGCPauseColumn(self.get_gc_pause_us())
         batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -863,9 +903,12 @@ class SchedulerDPAttnAdapter:
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
             drain_column=drain_column,
+            gc_pause_column=gc_pause_column,
         )
         if drain_column.rows is not None and self.on_drain_rows is not None:
             self.on_drain_rows(drain_column.rows)
+        if gc_pause_column.max is not None and self.on_gc_pause is not None:
+            self.on_gc_pause(gc_pause_column.max)
         if shutdown_vote.local:
             self.shutdown_vote_sent.value = True
         if (

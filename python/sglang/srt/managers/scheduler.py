@@ -781,12 +781,13 @@ class Scheduler(
 
         self.maybe_init_mm_feature_receive_budget()
 
+        # Before the DP-attention adapter, which runs its lockstep GC hook.
+        self.init_gc_freezer()
         self.init_dp_attn_adapter()
 
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
-        self.init_gc_freezer()
 
         self.init_load_publisher()
 
@@ -2778,6 +2779,7 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
+            **self.gc_freezer.dp_gather_callbacks(),
             **self._dp_drain_column_callbacks(),
         )
 
@@ -2861,9 +2863,14 @@ class Scheduler(
         )
 
     def init_gc_freezer(self) -> None:
-        """Freeze the heap when idle; warn on heap growth and frozen garbage."""
+        """Freeze the heap when idle; warn on heap growth and frozen garbage;
+        with attention-DP batch gathers, run full collections in lockstep."""
+        num_dp_ranks = get_parallel().num_dp_ranks
         self.gc_freezer = GCFreezer(
-            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs,
+            dp_lockstep=num_dp_ranks > 1
+            and not should_skip_scheduler_all_gather(num_dp_ranks),
+            gc_threshold=get_device().gc_threshold,
         )
 
     def init_rank_consensus_checker(self) -> None:
