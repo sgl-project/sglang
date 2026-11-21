@@ -586,7 +586,7 @@ class BaseLayerWithLoRA(nn.Module):
     def cpu_weight(self) -> torch.Tensor:
         if self._cpu_weight is None:
             # Deferred snapshot: the base has not been written yet.
-            self._cpu_weight = self.base_layer.weight.detach().to("cpu").clone()
+            self._cpu_weight = _host_snapshot(self.base_layer.weight.detach())
         return self._cpu_weight
 
     @cpu_weight.setter
@@ -603,6 +603,17 @@ class BaseLayerWithLoRA(nn.Module):
         if self._base_is_view:
             self.cpu_weight = self.cpu_weight.to("cpu", copy=True)
             self._base_is_view = False
+
+    def _restores_to_device_tensor(self) -> bool:
+        """Whether write_dense_weight copies the snapshot into a dense
+        accelerator weight (no offload store or packed CPU view)."""
+        weight = self.base_layer.weight
+        return (
+            weight.device.type not in ("cpu", "meta")
+            and weight.numel() > 1
+            and getattr(self.base_layer, "_packed_weight_cpu", None) is None
+            and getattr(self.base_layer, "_offload_root", None) is None
+        )
 
     @torch.no_grad()
     def _merge_lora_into_data(
@@ -892,8 +903,12 @@ class BaseLayerWithLoRA(nn.Module):
             del old_weight
         else:
             # Update the offload backing store too, not a transient GPU placeholder.
-            # A copy keeps inference-tensor rebinding from aliasing the snapshot.
-            restored = self.cpu_weight.clone()
+            # A copy keeps inference-tensor rebinding from aliasing the snapshot;
+            # a dense accelerator weight gets a fresh device tensor from the
+            # host-to-device copy, so the snapshot needs no host clone first.
+            restored = self.cpu_weight
+            if not self._restores_to_device_tensor():
+                restored = restored.clone()
             write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
 
         self.merged = False
@@ -1106,6 +1121,19 @@ class LinearWithLoRA(BaseLayerWithLoRA):
         if not self.merged and not self.disable_lora:
             out = self._add_lora_delta(out, x, runtime_lora_scale)
         return self._add_lora_output_offset(out)
+
+
+def _host_snapshot(weight: torch.Tensor) -> torch.Tensor:
+    """Copy a device weight to host memory, pinned when possible so restoring
+    it on unmerge is a fast host-to-device copy."""
+    if weight.device.type == "cuda" and not isinstance(weight, DTensor):
+        try:
+            host = torch.empty_like(weight, device="cpu", pin_memory=True)
+            host.copy_(weight)
+            return host
+        except RuntimeError:
+            pass
+    return weight.to("cpu").clone()
 
 
 def _use_owned_base_snapshot(
