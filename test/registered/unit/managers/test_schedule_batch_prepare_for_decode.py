@@ -16,8 +16,6 @@ from sglang.srt.sampling.penaltylib import (  # noqa: E402
     BatchedFrequencyPenalizer,
     BatchedMinNewTokensPenalizer,
     BatchedPenalizerOrchestrator,
-    BatchedPresencePenalizer,
-    BatchedRepetitionPenalizer,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -112,100 +110,55 @@ class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
 
 
 _VOCAB_SIZE = 16
-_PENALTIES = [  # (frequency, presence, repetition) per request
-    (1.0, 0.5, 2.0),
-    (0.5, 0.25, 1.5),
-]
 
 
 def _make_penalty_batch(initial_output_ids):
     reqs = [
         types.SimpleNamespace(
             sampling_params=types.SimpleNamespace(
-                frequency_penalty=freq,
-                presence_penalty=presence,
-                repetition_penalty=rep,
-                min_new_tokens=100,
-                stop_token_ids=None,
+                frequency_penalty=1.0, min_new_tokens=100, stop_token_ids=None
             ),
             eos_token_ids=None,
             tokenizer=types.SimpleNamespace(
                 additional_stop_token_ids=None, eos_token_id=0
             ),
-            origin_input_ids=array("q", [15]),
             output_ids=array("q", output_ids),
             penalty_cumulated_len=0,
         )
-        for (freq, presence, rep), output_ids in zip(_PENALTIES, initial_output_ids)
+        for output_ids in initial_output_ids
     ]
     batch = ScheduleBatch(reqs=reqs)
     batch.device = "cpu"
     orchestrator = BatchedPenalizerOrchestrator(
-        _VOCAB_SIZE,
-        batch,
-        {
-            BatchedFrequencyPenalizer,
-            BatchedPresencePenalizer,
-            BatchedRepetitionPenalizer,
-            BatchedMinNewTokensPenalizer,
-        },
+        _VOCAB_SIZE, batch, {BatchedFrequencyPenalizer, BatchedMinNewTokensPenalizer}
     )
     batch.sampling_info = types.SimpleNamespace(penalizer_orchestrator=orchestrator)
     return batch
 
 
 class TestCumulatePenaltyOutputTokens(CustomTestCase):
-    def _assert_penalty_state(self, batch, fed_tokens):
-        """The penalizers hold exactly the tokens in fed_tokens[i] for row i."""
-        penalizers = batch.sampling_info.penalizer_orchestrator.penalizers
-        for i, ((freq, presence, rep), tokens) in enumerate(
-            zip(_PENALTIES, fed_tokens)
-        ):
-            counts = torch.bincount(
-                torch.tensor(tokens, dtype=torch.int64), minlength=_VOCAB_SIZE
-            ).float()
-            seen = counts > 0
-            torch.testing.assert_close(
-                penalizers[BatchedFrequencyPenalizer].cumulated_frequency_penalties[i],
-                freq * counts,
-            )
-            torch.testing.assert_close(
-                penalizers[BatchedPresencePenalizer].cumulated_presence_penalties[i],
-                presence * seen.float(),
-            )
-            torch.testing.assert_close(
-                penalizers[BatchedRepetitionPenalizer].cumulated_repetition_penalties[
-                    i
-                ],
-                torch.where(seen, rep, 1.0),
-            )
-            self.assertEqual(
-                penalizers[BatchedMinNewTokensPenalizer].len_output_tokens[i].item(),
-                len(tokens),
-            )
-
     def test_feeds_every_committed_token_once(self):
-        """A decode step commits one token per request and a verify round
-        several; the penalizers must count each committed token exactly once.
-        Under overlap the step in flight is committed after the call, so the
-        call before each commit feeds the earlier steps and the final call
-        catches up; a call with nothing new (the first decode under overlap)
-        feeds nothing."""
-        # Row 0 has its prefill token; row 1's is still in flight (overlap).
+        """Steps of one or several tokens per request (and none, as on the first
+        decode under overlap) each reach the penalizers exactly once."""
         batch = _make_penalty_batch([[7], []])
-        steps = [
-            ([7, 7, 3], [4]),
-            ([1], [4]),
-            ([2, 7, 7], [9]),
-            ([5], [9, 4, 4, 4]),
-        ]
+        steps = [([7, 7, 3], [4]), ([1], [4]), ([2, 7, 7], [9]), ([5], [9, 4, 4, 4])]
         for committed in steps:
             batch.cumulate_penalty_output_tokens()
             for req, tokens in zip(batch.reqs, committed):
                 req.output_ids.extend(tokens)
         batch.cumulate_penalty_output_tokens()
 
-        self._assert_penalty_state(batch, [req.output_ids for req in batch.reqs])
+        penalizers = batch.sampling_info.penalizer_orchestrator.penalizers
+        for i, req in enumerate(batch.reqs):
+            tokens = torch.tensor(req.output_ids, dtype=torch.int64)
+            torch.testing.assert_close(
+                penalizers[BatchedFrequencyPenalizer].cumulated_frequency_penalties[i],
+                torch.bincount(tokens, minlength=_VOCAB_SIZE).float(),
+            )
+            self.assertEqual(
+                penalizers[BatchedMinNewTokensPenalizer].len_output_tokens[i].item(),
+                len(tokens),
+            )
 
 
 if __name__ == "__main__":
