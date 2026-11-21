@@ -317,6 +317,20 @@ def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
     )
 
 
+def _block_fp8_tuple_layout(
+    linear: nn.Module, num_tokens: int, hidden_dim: int, input_dtype: torch.dtype
+) -> Optional[Tuple[bool, bool]]:
+    """Return ``(scale_ue8m0, scale_transposed)`` if ``linear`` accepts a fused
+    group-128 block-FP8 ``(q, scale)`` tuple on CUDA, else None."""
+    if not _is_cuda or num_tokens <= 0 or get_forward().sp_active:
+        return None
+    from sglang.srt.layers.quantization.fp8_utils import (
+        get_block_fp8_tuple_input_layout,
+    )
+
+    return get_block_fp8_tuple_input_layout(linear, num_tokens, hidden_dim, input_dtype)
+
+
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
@@ -1097,6 +1111,40 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
+        if (
+            not _is_npu
+            and len(z_shape_og) == 3
+            and z_shape_og[1] == nv
+            and core_attn_out.shape[-1] == 128
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and self.norm.norm_before_gate
+        ):
+            num_tokens = z_shape_og[0]
+            block_fp8_layout = _block_fp8_tuple_layout(
+                self.out_proj, num_tokens, nv * 128, core_attn_out.dtype
+            )
+            if block_fp8_layout is not None:
+                scale_ue8m0, scale_transposed = block_fp8_layout
+                if core_attn_out.stride(-1) != 1:
+                    core_attn_out = core_attn_out.contiguous()
+                if not use_strided_prefill_z and z.stride(-1) != 1:
+                    z = z.contiguous()
+                fp8, _, _ = _layer_norm_fwd(
+                    core_attn_out,
+                    self.norm.weight.contiguous(),
+                    None,
+                    self.norm.eps,
+                    z=z,
+                    is_rms_norm=True,
+                    activation=self.norm.activation,
+                    quant_heads=nv,
+                    block_fp8_quant=True,
+                    scale_ue8m0=scale_ue8m0,
+                    scale_transposed=scale_transposed,
+                )
+                return self.out_proj(fp8)[0]
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1631,7 +1679,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:
-                attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+                block_fp8_layout = (
+                    _block_fp8_tuple_layout(
+                        self.o_proj,
+                        attn_output.shape[0],
+                        attn_output.shape[-1],
+                        attn_output.dtype,
+                    )
+                    if attn_output.ndim == 2 and attn_output.is_contiguous()
+                    else None
+                )
+                if block_fp8_layout is not None:
+                    scale_ue8m0, scale_transposed = block_fp8_layout
+                    attn_output = fused_sigmoid_mul(
+                        attn_output,
+                        gate,
+                        block_fp8_quant=True,
+                        scale_ue8m0=scale_ue8m0,
+                        scale_transposed=scale_transposed,
+                    )
+                else:
+                    attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())

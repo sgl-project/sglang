@@ -137,6 +137,12 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    QUANT_BLOCK: tl.constexpr = False,
+    QUANT_HEADS: tl.constexpr = 1,
+    SCALE_UE8M0: tl.constexpr = False,
+    STORE_RSTD: tl.constexpr = True,
+    stride_s_tok=0,
+    stride_s_grp=0,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -147,15 +153,17 @@ def _layer_norm_fwd_1pass_kernel(
 
     # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
     rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    rows_i64 = rows.to(tl.int64)
     cols = tl.arange(0, BLOCK_N)
 
     # Compute offsets for 2D tile
-    row_offsets = rows[:, None] * stride_x_row
+    row_offsets = rows_i64[:, None] * stride_x_row
     col_offsets = cols[None, :] + group * N
 
     # Base pointers
     X_base = X + row_offsets + col_offsets
-    Y_base = Y + rows[:, None] * stride_y_row + col_offsets
+    if not QUANT_BLOCK:
+        Y_base = Y + rows_i64[:, None] * stride_y_row + col_offsets
 
     # Create mask for valid rows and columns
     row_mask = rows[:, None] < M
@@ -167,11 +175,11 @@ def _layer_norm_fwd_1pass_kernel(
 
     if HAS_Z and not NORM_BEFORE_GATE:
         if Z_IS_3D:
-            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
-                rows[:, None] % Z_HEADS
+            z_row_offsets = (rows_i64[:, None] // Z_HEADS) * stride_z_token + (
+                rows_i64[:, None] % Z_HEADS
             ) * stride_z_head
         else:
-            z_row_offsets = rows[:, None] * stride_z_row
+            z_row_offsets = rows_i64[:, None] * stride_z_row
         Z_base = Z + z_row_offsets + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
@@ -183,7 +191,7 @@ def _layer_norm_fwd_1pass_kernel(
     if not IS_RMS_NORM:
         mean = tl.sum(x, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
         # Store mean for each row
-        mean_offsets = group * M + rows
+        mean_offsets = group * M + rows_i64
         mean_mask = rows < M
         tl.store(Mean + mean_offsets, mean, mask=mean_mask)
         # Broadcast mean back to 2D for subtraction
@@ -197,9 +205,10 @@ def _layer_norm_fwd_1pass_kernel(
     rstd = tl.rsqrt(var + eps)  # Shape: [ROWS_PER_BLOCK]
 
     # Store rstd for each row
-    rstd_offsets = group * M + rows
-    rstd_mask = rows < M
-    tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
+    if STORE_RSTD:
+        rstd_offsets = group * M + rows_i64
+        rstd_mask = rows < M
+        tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
 
     # Load weights and biases (broadcast across rows)
     w_offsets = cols + group * N
@@ -219,11 +228,11 @@ def _layer_norm_fwd_1pass_kernel(
 
     if HAS_Z and NORM_BEFORE_GATE:
         if Z_IS_3D:
-            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
-                rows[:, None] % Z_HEADS
+            z_row_offsets = (rows_i64[:, None] // Z_HEADS) * stride_z_token + (
+                rows_i64[:, None] % Z_HEADS
             ) * stride_z_head
         else:
-            z_row_offsets = rows[:, None] * stride_z_row
+            z_row_offsets = rows_i64[:, None] * stride_z_row
         Z_base = Z + z_row_offsets + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
@@ -231,11 +240,44 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
-    if QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
+    if QUANT_BLOCK:
+        # Each row (head_dim == 128) forms one group-128 blockwise FP8 group.
+        # Match standalone per_token_group_quant_fp8 by rounding to the input
+        # activation dtype before computing the per-group scale.
+        y = tl.where(mask, y.to(X.dtype.element_ty).to(tl.float32), 0.0)
+        amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10)
+        raw_s = amax * (1.0 / 448.0)
+        if SCALE_UE8M0:
+            bits = raw_s.to(tl.uint32, bitcast=True)
+            exp = (bits >> 23) & 0xFF
+            mant = bits & 0x7FFFFF
+            ue8m0_exp = tl.where(mant != 0, exp + 1, exp)
+            inv_s = ((254 - ue8m0_exp) << 23).to(tl.float32, bitcast=True)
+            y_q = tl.clamp(y * inv_s[:, None], -448.0, 448.0).to(Q.dtype.element_ty)
+            tl.store(Q + rows_i64[:, None] * N + col_offsets, y_q, mask=mask)
+            # ROWS_PER_BLOCK == 4 and QUANT_HEADS % 4 == 0 guarantee all 4 rows
+            # belong to the same token and 4 consecutive groups.
+            shifts = (tl.arange(0, 4) * 8).to(tl.uint32)
+            packed = tl.sum((ue8m0_exp.to(tl.uint32) & 0xFF) << shifts, axis=0).to(
+                tl.int32
+            )
+            tok = (row_start // QUANT_HEADS).to(tl.int64)
+            pack_idx = ((row_start % QUANT_HEADS) // 4).to(tl.int64)
+            tl.store(S + tok * stride_s_tok + pack_idx * stride_s_grp, packed)
+        else:
+            quant_scale = 448.0 / amax
+            y_q = tl.clamp(y * quant_scale[:, None], -448.0, 448.0).to(
+                Q.dtype.element_ty
+            )
+            tl.store(Q + rows_i64[:, None] * N + col_offsets, y_q, mask=mask)
+            tok = rows_i64 // QUANT_HEADS
+            grp = rows_i64 % QUANT_HEADS
+            tl.store(S + tok * stride_s_tok + grp * stride_s_grp, raw_s, mask=rows < M)
+    elif QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
         y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
         y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
-        tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
+        tl.store(Q + rows_i64[:, None] * N + col_offsets, y_q, mask=mask)
         tl.store(S + tl.program_id(0), y_s)
     else:
         # Write output
@@ -279,6 +321,9 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    block_fp8_quant: bool = False,
+    scale_ue8m0: bool = False,
+    scale_transposed: bool = False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -300,40 +345,85 @@ def _layer_norm_fwd(
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
     # allocate output
-    if out is not None:
-        assert out.shape == x.shape
-    else:
-        out = torch.empty_like(x)
-    assert out.stride(-1) == 1
-    mean = (
-        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
-    )
-    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
-    if group_size > BLOCK_N:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK_N // 256, 1), 8)
-    # Calculate rows per block based on SM count
-    rows_per_block = calc_rows_per_block(M, x.device)
-    quant = {}
-    # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
-    if quant_heads:
-        assert ngroups == 1 and M % quant_heads == 0
-        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
-        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
-        rows_per_block = quant_heads
-        q = torch.empty(
-            (M // quant_heads, quant_heads * N),
-            dtype=torch.float8_e4m3fn,
-            device=x.device,
+    if block_fp8_quant:
+        assert quant_heads > 0 and ngroups == 1 and N == 128 and M % quant_heads == 0
+        assert not (scale_ue8m0 and (not scale_transposed or quant_heads % 4 != 0))
+        num_tokens = M // quant_heads
+        q_shape = (num_tokens, quant_heads * N)
+        q = torch.empty(q_shape, dtype=torch.float8_e4m3fn, device=x.device)
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
         )
-        s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
-        quant = {"Q": q, "S": s, "QUANT": True}
+
+        s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=q_shape,
+            device=x.device,
+            group_size=128,
+            column_major_scales=scale_transposed,
+            scale_tma_aligned=scale_transposed,
+            scale_ue8m0=scale_ue8m0,
+        )
+        mean = (
+            torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+            if not is_rms_norm
+            else None
+        )
+        rstd = None
+        if M == 0:
+            return (q, s), mean, rstd
+        out = x
+        BLOCK_N = 128
+        if scale_ue8m0:
+            rows_per_block = 4
+            num_warps = 4
+        else:
+            rows_per_block = calc_rows_per_block(M, x.device)
+            num_warps = min(rows_per_block, 4)
+        quant = {
+            "Q": q,
+            "S": s,
+            "QUANT_BLOCK": True,
+            "QUANT_HEADS": quant_heads,
+            "SCALE_UE8M0": scale_ue8m0,
+            "STORE_RSTD": False,
+            "stride_s_tok": s.stride(0),
+            "stride_s_grp": s.stride(1),
+        }
+    else:
+        if out is not None:
+            assert out.shape == x.shape
+        else:
+            out = torch.empty_like(x)
+        assert out.stride(-1) == 1
+        mean = (
+            torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+            if not is_rms_norm
+            else None
+        )
+        rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
+        # Less than 64KB per feature: enqueue fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
+        if group_size > BLOCK_N:
+            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+        # heuristics for number of warps
+        num_warps = min(max(BLOCK_N // 256, 1), 8)
+        # Calculate rows per block based on SM count
+        rows_per_block = calc_rows_per_block(M, x.device)
+        quant = {}
+        # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+        if quant_heads:
+            assert ngroups == 1 and M % quant_heads == 0
+            # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+            num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+            rows_per_block = quant_heads
+            q = torch.empty(
+                (M // quant_heads, quant_heads * N),
+                dtype=torch.float8_e4m3fn,
+                device=x.device,
+            )
+            s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+            quant = {"Q": q, "S": s, "QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -381,7 +471,7 @@ def _layer_norm_fwd(
             **pdl_kwargs,
             **quant,
         )
-    return ((q, s) if quant_heads else out), mean, rstd
+    return ((q, s) if (quant_heads or block_fp8_quant) else out), mean, rstd
 
 
 if _is_npu:

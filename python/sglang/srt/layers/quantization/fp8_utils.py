@@ -1641,6 +1641,112 @@ def _use_fp8_block_gemv(
     )
 
 
+def get_block_fp8_tuple_input_layout(
+    linear: LinearBase,
+    m: int,
+    k: int,
+    input_dtype: torch.dtype,
+) -> Optional[Tuple[bool, bool]]:
+    """Return ``(scale_ue8m0, scale_transposed)`` if ``linear`` can directly
+    consume a pre-quantized group-128 block-FP8 ``(q, scale)`` tuple, else None.
+    """
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec, get_lora
+
+    if (
+        m <= 0
+        or k <= 0
+        or k % 128 != 0
+        or input_dtype != torch.bfloat16
+        or _is_musa
+        or is_batch_invariant_mode_enabled()
+        or torch.compiler.is_compiling()
+        or not getattr(linear, "input_is_parallel", True)
+        or hasattr(linear, "base_layer")
+    ):
+        return None
+
+    try:
+        deterministic = get_exec().deterministic
+        if (
+            deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+        ):
+            return None
+    except ValueError:
+        pass
+    try:
+        if get_lora().enable_lora:
+            return None
+    except ValueError:
+        pass
+
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+    quant_method = getattr(linear, "quant_method", None)
+    if not isinstance(quant_method, Fp8LinearMethod):
+        return None
+    if not (
+        getattr(linear, "input_is_parallel", True)
+        and quant_method.block_quant
+        and not quant_method.use_marlin
+        and not quant_method.use_npu_block_fp8
+        and not quant_method.use_mxfp8
+        and not (
+            quant_method.block_fp8_as_mxfp8
+            and getattr(linear, "block_fp8_mxfp8_ready", False)
+        )
+        and quant_method.w8a8_block_fp8_linear
+        is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and tuple(quant_method.weight_block_size) == (128, 128)
+    ):
+        return None
+
+    weight = getattr(linear, "weight", None)
+    weight_scale = getattr(linear, "weight_scale_inv", None)
+    if weight is None or weight_scale is None or weight.ndim != 2:
+        return None
+    n = weight.shape[0]
+    if not (
+        weight.is_cuda
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.shape[1] == k
+        and weight.is_contiguous()
+        and weight.device == weight_scale.device
+    ):
+        return None
+
+    deepgemm_supported = _deepgemm_block_fp8_supported(
+        weight.shape, quant_method.weight_block_size, input_dtype
+    )
+
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deepgemm_supported and (k // 128) % 4 == 0:
+            return (True, True)
+        return None
+
+    # Keep SM90 UE8M0 checkpoints on their dedicated fp32 power-of-two path.
+    if (
+        isinstance(quant_method.quant_config, Fp8Config)
+        and quant_method.quant_config.scale_fmt == "ue8m0"
+    ):
+        return None
+
+    # Hopper block GEMV consumes contiguous row-major fp32 activation scales.
+    if (
+        weight_scale.dtype == torch.float32
+        and weight_scale.is_contiguous()
+        and weight_scale.shape == ((n + 127) // 128, k // 128)
+        and _fp8_block_gemv_enabled()
+        and use_hopper_fp8_block_gemv(m, n, k, quant_method.weight_block_size)
+    ):
+        return (False, False)
+
+    # SM90 DeepGEMM consumes column-major TMA-aligned fp32 activation scales;
+    # Triton fallback consumes row-major fp32 activation scales.
+    return (False, deepgemm_supported)
+
+
 def can_use_fused_kda_output_quant(
     linear: LinearBase,
     m: int,
