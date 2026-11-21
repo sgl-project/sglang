@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.observability.trace as mod
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import (
     SpanAttributes,
     TraceReqContext,
@@ -20,6 +21,7 @@ from sglang.srt.observability.trace import (
     get_global_trace_level,
     process_tracing_init,
     set_global_trace_level,
+    should_trace_rank,
     trace_set_thread_info,
 )
 
@@ -57,6 +59,28 @@ class TestTraceFunctions(unittest.TestCase):
             self.assertEqual(get_global_trace_level(), 3)
         finally:
             get_resources().trace_level = orig
+
+
+class TestShouldTraceRank(unittest.TestCase):
+    def test_skipping_duplicate_ranks_keeps_the_first_of_each_attention_group(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        for attn_tp_rank, attn_cp_rank, skip_duplicates, traces in [
+            (1, 1, False, True),
+            (0, 0, True, True),
+            (1, 0, True, False),
+            (0, 1, True, False),
+        ]:
+            with (
+                self.subTest(
+                    tp=attn_tp_rank, cp=attn_cp_rank, skip_duplicates=skip_duplicates
+                ),
+                get_parallel().override(
+                    attn_tp_rank=attn_tp_rank, attn_cp_rank=attn_cp_rank
+                ),
+                envs.SGLANG_TRACE_SKIP_DUPLICATE_RANKS.override(skip_duplicates),
+            ):
+                self.assertEqual(should_trace_rank(), traces)
 
 
 class TestSpanAttributes(unittest.TestCase):
