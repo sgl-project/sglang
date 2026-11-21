@@ -753,7 +753,7 @@ def _m3_exec(a2a_backend):
 
 
 class TestMiniMaxM3SpGate(CustomTestCase):
-    def _unsupported(self, a2a_backend, *, cuda=True, **parallel):
+    def _supported(self, a2a_backend, *, cuda=True, **parallel):
         with (
             patch.object(
                 layernorm_sp, "get_parallel", return_value=_m3_parallel(**parallel)
@@ -761,24 +761,24 @@ class TestMiniMaxM3SpGate(CustomTestCase):
             patch.object(layernorm_sp, "get_exec", return_value=_m3_exec(a2a_backend)),
             patch.object(layernorm_sp, "is_cuda", return_value=cuda),
         ):
-            return layernorm_sp._minimax_m3_sp_unsupported(4096)
+            return layernorm_sp._minimax_m3_sp_supported()
 
     def test_tp_moe_is_supported(self):
-        self.assertIsNone(self._unsupported("none"))
+        self.assertTrue(self._supported("none"))
 
     def test_megamoe_over_the_tp_ranks_is_supported(self):
-        self.assertIsNone(self._unsupported("megamoe"))
+        self.assertTrue(self._supported("megamoe"))
 
     def test_megamoe_over_other_ranks_is_rejected(self):
-        self.assertIsNotNone(self._unsupported("megamoe", ep_ranks=(0, 1, 2, 3)))
+        self.assertFalse(self._supported("megamoe", ep_ranks=(0, 1, 2, 3)))
 
     def test_an_a2a_backend_is_rejected_before_the_moe_flags_are_seeded(self):
         """SP must not turn on for an a2a MoE it cannot serve just because the
         MoE runtime flags, seeded later in startup, still read as "none"."""
-        self.assertIsNotNone(self._unsupported("deepep"))
+        self.assertFalse(self._supported("deepep"))
 
     def test_non_cuda_devices_are_rejected(self):
-        self.assertIsNotNone(self._unsupported("none", cuda=False))
+        self.assertFalse(self._supported("none", cuda=False))
 
 
 if __name__ == "__main__":

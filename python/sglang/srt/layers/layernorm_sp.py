@@ -94,29 +94,21 @@ def initialize_layernorm_sp(*, model_config) -> None:
     get_flags().sp.enabled = enabled
     get_flags().sp.min_tokens = m3_min_tokens
     if m3_min_tokens > 0:
-        _init_push_comm(
-            hidden=model_config.hidden_size,
-            min_tokens=m3_min_tokens,
-        )
+        _init_push_comm(hidden=model_config.hidden_size)
 
 
 def _minimax_m3_sp_min_tokens(architecture: Optional[str]) -> int:
-    """The SP threshold for an M3 model, or 0 for off: on only for the validated
-    CUDA TP2 setups (TP MoE, or MegaMoE over the TP ranks)."""
-    if architecture not in MINIMAX_M3_SP_ARCHITECTURES:
-        return 0
-    if _minimax_m3_sp_unsupported(MINIMAX_M3_SP_MIN_TOKENS) is not None:
-        return 0
-    return MINIMAX_M3_SP_MIN_TOKENS
+    """The SP threshold for an M3 model, or 0 for off."""
+    if architecture in MINIMAX_M3_SP_ARCHITECTURES and _minimax_m3_sp_supported():
+        return MINIMAX_M3_SP_MIN_TOKENS
+    return 0
 
 
-def _minimax_m3_sp_unsupported(min_tokens: int) -> Optional[str]:
-    from sglang.srt.layers.layer_boundary import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+def _minimax_m3_sp_supported() -> bool:
+    """CUDA TP2 without attention DP/CP or PP, with TP MoE or MegaMoE over the TP
+    ranks: the setup where SP reproduces the replicated path bitwise."""
     from sglang.srt.model_executor.cuda_graph_config import Backend
 
-    # The push comm is CUDA symmetric memory, and the fallback gathers bf16 tensors.
-    if not is_cuda():
-        return "requires CUDA"
     parallel = get_parallel()
     # The published config, not get_moe_a2a_backend(): the MoE flags are
     # seeded after this runs and would read as the "none" default here.
@@ -125,45 +117,23 @@ def _minimax_m3_sp_unsupported(min_tokens: int) -> Optional[str]:
         a2a_backend == "megamoe"
         and sorted(parallel.moe_ep_group.ranks) == sorted(parallel.tp_group.ranks)
     )
-    if not (
-        parallel.tp_size > 1
+    # A breakable graph captures the whole forward, logits included, so each
+    # bucket decides SP once from its padded size; other captured backends do not.
+    graph_ok = (
+        get_exec().graph.cuda_graph_config.prefill.backend
+        in (Backend.DISABLED, Backend.BREAKABLE)
+        or _max_prefill_bucket() < MINIMAX_M3_SP_MIN_TOKENS
+    )
+    return (
+        is_cuda()
+        and parallel.tp_size == 2
         and parallel.attn_tp_size == parallel.tp_size
         and parallel.attn_cp_size == 1
         and parallel.pp_size == 1
         and parallel.moe_dense_tp_size != 1
         and a2a_supported
-    ):
-        return (
-            "requires TP > 1 without attention DP/CP or PP, and no a2a MoE "
-            "backend other than MegaMoE over the TP ranks"
-        )
-    # Above two ranks the reduce-scatter sums in a different order than the
-    # all-reduce; TP2 is the setup measured bitwise-identical.
-    if parallel.tp_size != 2:
-        return "requires TP2"
-    # A breakable graph captures the whole forward, logits included, so each
-    # bucket decides SP once from its padded size; other captured backends do not.
-    backend = get_exec().graph.cuda_graph_config.prefill.backend
-    if (
-        backend not in (Backend.DISABLED, Backend.BREAKABLE)
-        and _max_prefill_bucket() >= min_tokens
-    ):
-        return (
-            f"must exceed the largest {backend} prefill CUDA graph bucket "
-            f"({_max_prefill_bucket()})"
-        )
-    comm = get_exec().comm
-    # These replace the replicated path's bf16 all-reduce + norm below this size,
-    # so SP there would not reproduce its numerics.
-    if min_tokens <= FUSE_ALLREDUCE_MAX_BATCH_SIZE and (
-        comm.flashinfer_allreduce_fusion_backend is not None
-        or comm.enable_quant_communications
-    ):
-        return (
-            f"must exceed {FUSE_ALLREDUCE_MAX_BATCH_SIZE} with all-reduce fusion "
-            "or quantized communications enabled"
-        )
-    return None
+        and graph_ok
+    )
 
 
 def _max_prefill_bucket() -> int:
@@ -384,6 +354,13 @@ def _sp_exit_tokens(input_ids, forward_mode) -> Optional[int]:
     return input_ids.shape[0]
 
 
+def _peer_store(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Elementwise store into peer-mapped memory; ``copy_`` there takes the slower
+    driver peer memcpy."""
+    dtype = torch.int16 if src.element_size() == 2 else torch.uint8
+    torch.bitwise_or(src.view(dtype), 0, out=dst.view(dtype))
+
+
 class _PushComm:
     """TP2 reduce-scatter / all-gather of ``[tokens, hidden]`` rows through
     symmetric memory: each rank stores the peer's rows straight into the peer's
@@ -450,7 +427,7 @@ class _PushComm:
         rows = partial.shape[0] // 2
         local, peer, handle = self.recv[self.recv_gen]
         self.recv_gen ^= 1
-        peer[:rows].copy_(partial[self.peer * rows : (self.peer + 1) * rows])
+        _peer_store(peer[:rows], partial[self.peer * rows : (self.peer + 1) * rows])
         handle.barrier(channel=0)
         return torch.add(
             partial[self.rank * rows : (self.rank + 1) * rows], local[:rows]
@@ -462,7 +439,7 @@ class _PushComm:
         self.gather_gen ^= 1
         own = slice(self.rank * rows, (self.rank + 1) * rows)
         local[own].copy_(shard)
-        peer[own].copy_(shard)
+        _peer_store(peer[own], shard)
         handle.barrier(channel=0)
         return local[: 2 * rows]
 
@@ -480,9 +457,9 @@ class _PushComm:
         own_sf = slice(self.rank * sf_bytes, (self.rank + 1) * sf_bytes)
         data = data.view(torch.uint8)
         q_local[own].copy_(data)
-        q_peer[own].copy_(data)
+        _peer_store(q_peer[own], data)
         s_local[own_sf].copy_(scales)
-        s_peer[own_sf].copy_(scales)
+        _peer_store(s_peer[own_sf], scales)
         handle.barrier(channel=0)
         return (
             q_local[: 2 * rows].view(torch.float8_e4m3fn),
@@ -501,7 +478,7 @@ def take_partial_sink(like: torch.Tensor) -> Optional[torch.Tensor]:
     return sink
 
 
-def _init_push_comm(*, hidden: int, min_tokens: int) -> None:
+def _init_push_comm(*, hidden: int) -> None:
     """Allocate the TP2 symmetric-memory comm at startup, before the KV pool is
     sized, at the largest prefill the server admits; skipped when that is below
     the SP threshold or the TP2 pair is not in one NVLink domain (NCCL then)."""
@@ -516,7 +493,7 @@ def _init_push_comm(*, hidden: int, min_tokens: int) -> None:
     max_tokens = ceil_align(
         recommended_max_tokens(include_prefill=True, floor=_max_prefill_bucket()), 2
     )
-    if tp_group.world_size != 2 or max_tokens < min_tokens:
+    if max_tokens < MINIMAX_M3_SP_MIN_TOKENS:
         return
     device = torch.device("cuda", torch.cuda.current_device())
     if not in_one_nvlink_domain(tp_group.cpu_group, device):
