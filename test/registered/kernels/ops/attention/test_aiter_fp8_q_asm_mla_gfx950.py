@@ -51,8 +51,9 @@ class TestFp8QAsmMlaNumerics(CustomTestCase):
         # Verify attends the draft tokens, which sit at the end of each request's KV.
         kv_lens = [n + qlen - 1 if qlen > 1 else n for n in KV_LENS]
         total = sum(kv_lens)
-        kv_bf16 = torch.randn(total, HEAD_DIM, device=device)
-        kv = kv_bf16.to(fp8_dtype)
+        # Row 0 is a sentinel the wrapper zeroes in place; real KV starts at row 1.
+        kv_all = torch.randn(total + 1, HEAD_DIM, device=device).to(fp8_dtype)
+        kv_before = kv_all[1:].clone()
         q = (
             torch.randn(bs * qlen, NUM_HEADS, HEAD_DIM, device=device) * q_amp
         ).bfloat16()
@@ -84,7 +85,7 @@ class TestFp8QAsmMlaNumerics(CustomTestCase):
             dtype=torch.int32,
             device=device,
         )
-        kv_indices = torch.arange(total, dtype=torch.int32, device=device)
+        kv_indices = torch.arange(1, total + 1, dtype=torch.int32, device=device)
         last_page = torch.ones(bs, dtype=torch.int32, device=device)
         bufs = be.make_mla_decode_meta_data_buffer(
             qlen,
@@ -114,7 +115,7 @@ class TestFp8QAsmMlaNumerics(CustomTestCase):
         schedule = be._mla_decode_launch_schedule(default_num_kv_splits=None)
         out = be._mla_decode_fwd_with_head_pad(
             q,
-            kv.view(-1, 1, 1, HEAD_DIM),
+            kv_all.view(-1, 1, 1, HEAD_DIM),
             layer,
             qo_indptr=qo_indptr,
             kv_indptr=kv_indptr,
@@ -133,7 +134,9 @@ class TestFp8QAsmMlaNumerics(CustomTestCase):
             kv_scale=torch.ones((), dtype=torch.float32, device=device),
             **schedule,
         )
-        ref = _reference(q_ref, kv, kv_lens, qlen)
+        # The reference reads the KV as it was before the launch, and the launch must not change it.
+        self.assertTrue(torch.equal(kv_all[1:].float(), kv_before.float()))
+        ref = _reference(q_ref, kv_before, kv_lens, qlen)
         return out.float(), ref
 
     def test_decode_and_verify_windows_match_fp32(self):

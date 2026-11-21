@@ -797,8 +797,8 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
                 self.assertIsNone(kwargs["num_kv_splits"])
 
     def test_default_route_launch_is_unchanged(self):
-        """With the opt-in off, PERSIST=1 decode and verify launch with the module's intra_batch_mode
-        and no fast_mode; verify keeps the planned split cap."""
+        """With the opt-in off, PERSIST=1 launches keep the module intra_batch_mode and omit fast_mode;
+        verify keeps the planned split cap."""
         for auto_kv_splits in (False, True):
             for verify, num_kv_splits in (
                 (False, None if auto_kv_splits else 32),

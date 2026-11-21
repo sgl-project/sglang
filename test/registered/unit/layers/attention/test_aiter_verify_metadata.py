@@ -270,9 +270,6 @@ class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
 
         backend.make_mla_decode_meta_data_buffer = make_buffer
         backend.make_mla_meta_data = make_meta
-        backend.init_cuda_graph_state(
-            max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _DRAFT_TOKENS
-        )
         with (
             patch.object(
                 aiter_backend, "create_flashinfer_kv_indices_triton", _NoopKernel()
@@ -281,6 +278,9 @@ class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
             patch.object(aiter_backend, "fast_mode", False),
             patch.object(aiter_backend, "intra_batch_mode", False),
         ):
+            backend.init_cuda_graph_state(
+                max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _DRAFT_TOKENS
+            )
             backend._apply_cuda_graph_metadata(
                 bs=_BATCH_SIZE,
                 req_pool_indices=torch.arange(_BATCH_SIZE, dtype=torch.int32),
