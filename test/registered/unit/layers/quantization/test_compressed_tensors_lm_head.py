@@ -85,8 +85,7 @@ class TestGetLmHeadScheme(CustomTestCase):
 
     def test_module_type_target_is_none(self):
         # llm-compressor emits "Linear" for decoder linears; an unmentioned
-        # head must stay on the unquantized path instead of tripping
-        # find_matched_target's unmatched-layer error.
+        # head must stay on the unquantized path.
         config = _config(["Linear"])
         with patch(_GET_LINEAR_SCHEME) as mock_resolve:
             self.assertIsNone(config.get_lm_head_scheme(_Head(), "lm_head"))
