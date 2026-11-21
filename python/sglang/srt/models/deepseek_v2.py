@@ -757,6 +757,11 @@ class DeepseekV2MoE(nn.Module):
         num_redundant_experts = (
             get_exec().moe.ep_num_redundant_experts if uses_expert_location else 0
         )
+        # forward_normal_dual_stream reads hidden_states for the shared experts on
+        # alt_stream, so the routed runner may reuse that buffer only without overlap.
+        shared_experts_overlap = (
+            self.alt_stream is not None and self.num_fused_shared_experts == 0
+        )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe + num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -772,6 +777,7 @@ class DeepseekV2MoE(nn.Module):
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
             uses_expert_location=uses_expert_location,
+            inplace=not shared_experts_overlap,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):

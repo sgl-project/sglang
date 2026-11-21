@@ -54,7 +54,8 @@ class MoeRunnerConfig:
     activation: str = "silu"
     is_gated: bool = True
     apply_router_weight_on_input: bool = False
-    inplace: bool = True
+    # Opt-in: the runner may overwrite (triton) or free (deep_gemm) the input.
+    inplace: bool = False
     no_combine: bool = False
     # With no_combine: still apply the router weight, leaving only the top-k sum to
     # the caller (triton and marlin runners).

@@ -366,7 +366,10 @@ class FusedMoE(torch.nn.Module):
         reduce_results: Whether to apply all_reduce on the output of the layer
         quant_config: Quantization configuration.
         quant_method: Explicit quant method, overriding selection from quant_config.
-        inplace: suggestion to compute inplace (modify input activation).
+        inplace: let the runner overwrite the input activation with its output
+            (triton) or free it early (deep_gemm, eager only). Off by default: a
+            caller may opt in only when nothing else reads the input, e.g. shared
+            experts overlapped on another stream.
         enable_qwen35_fp8_deferred_finalize: Whether this concrete Qwen3.5
             layer may expose FlashInfer's block-FP8 deferred MoE output.
     """
@@ -396,7 +399,7 @@ class FusedMoE(torch.nn.Module):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         use_presharded_weights: bool = False,
-        inplace: bool = True,
+        inplace: bool = False,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
         gemm1_alpha: Optional[float] = None,
