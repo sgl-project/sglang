@@ -2631,6 +2631,7 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Op=self.forward_metadata.lean_Op,
                 lean_locks=self.forward_metadata.lean_locks,
                 uneven_batch=self.forward_metadata.uneven_batch,
+                stop_at_request_splits=self.enable_deterministic,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -2669,6 +2670,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Op=self.forward_metadata.lean_Op,
             lean_locks=self.forward_metadata.lean_locks,
             uneven_batch=self.forward_metadata.uneven_batch,
+            stop_at_request_splits=self.enable_deterministic,
         )
         return o
 
