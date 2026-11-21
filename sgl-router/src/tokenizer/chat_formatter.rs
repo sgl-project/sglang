@@ -56,6 +56,14 @@ pub struct ChatFormatter {
     prompt_affixes: Option<super::adapter::PromptAffixes>,
 }
 
+/// Ids of the image placeholders `tokenizer` declares (see [`super::MEDIA_TOKENS`]).
+fn media_placeholders(tokenizer: &Tokenizer) -> Vec<u32> {
+    super::MEDIA_TOKENS
+        .iter()
+        .filter_map(|token| tokenizer.token_to_id(token).ok().flatten())
+        .collect()
+}
+
 impl ChatFormatter {
     /// Load model files and select a template or native formatter from dynamo-render.
     pub fn load(model_id: &str, tokenizer_path: &str) -> Result<Option<Self>> {
@@ -445,13 +453,55 @@ impl ChatFormatter {
         Ok((prompt, prefix))
     }
 
+    /// The chat's prompt ids as the engine renders them. A DeepSeek chat with
+    /// images renders with its image placeholders (the engine expands each from
+    /// the image's pixels), so these ids count the prompt without its images.
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
-        if let Some(ids) = self
-            .processor
-            .as_ref()
-            .and_then(|formatter| formatter.encode_request(request.clone(), &self.worker_defaults))
-        {
-            return ids.context("render chat");
+        self.encode_rendered(tokenizer, request).map(|(ids, _)| ids)
+    }
+
+    /// [`Self::encode`] for routing: a chat with images carries, after each
+    /// placeholder, a tag of its image's identity (see [`super::tag_images`]),
+    /// so the prompt up to the first image is the engine's and past it chats
+    /// with different images differ. Routing-only: a chat with media is never
+    /// eligible for input_ids forwarding, and token counts use [`Self::encode`].
+    pub fn encode_for_routing(
+        &self,
+        tokenizer: &Tokenizer,
+        request: &JsonValue,
+    ) -> Result<Vec<u32>> {
+        let (ids, images) = self.encode_rendered(tokenizer, request)?;
+        if images.is_empty() {
+            return Ok(ids);
+        }
+        Ok(super::tag_images(
+            ids,
+            &media_placeholders(tokenizer),
+            &images,
+        ))
+    }
+
+    /// The chat's ids, with the sources of the images its placeholders stand for.
+    fn encode_rendered(
+        &self,
+        tokenizer: &Tokenizer,
+        request: &JsonValue,
+    ) -> Result<(Vec<u32>, Vec<String>)> {
+        if let Some(formatter) = self.processor.as_ref() {
+            // DeepSeek renders once, images included: a text chat's ids are the text
+            // path's exactly, and a chat with images (which that path refuses) keeps
+            // its image placeholders. Video still fails here.
+            let encoded =
+                match formatter.encode_multimodal_request(request.clone(), &self.worker_defaults) {
+                    Some(Ok(encoded)) => Some(Ok((encoded.ids, encoded.images))),
+                    Some(Err(err)) => Some(Err(err)),
+                    None => formatter
+                        .encode_request(request.clone(), &self.worker_defaults)
+                        .map(|ids| ids.map(|ids| (ids, Vec::new()))),
+                };
+            if let Some(encoded) = encoded {
+                return encoded.context("render chat");
+            }
         }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
@@ -479,7 +529,7 @@ impl ChatFormatter {
             }
             ids.extend(suffix);
         }
-        Ok(ids)
+        Ok((ids, Vec::new()))
     }
 
     /// Use `encode` for token ids to preserve continuation boundaries.

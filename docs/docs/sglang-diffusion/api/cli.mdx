@@ -86,7 +86,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.
 - `--lora-alpha {N}`: supply the training alpha when a single-file adapter omits both per-layer alpha tensors and `adapter_config.json`. Do not set it when the adapter already records alpha metadata.
 - PEFT `adapter_config.json` semantics are applied automatically for named adapter slots, RSLoRA, and per-layer `alpha_pattern`. Adapters that require unsupported auxiliary parameters or runtime behavior, such as DoRA, fail before weight injection instead of silently using ordinary LoRA math.
-- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` normally merges regular weights, but keeps FSDP-sharded weights dynamic to avoid full-gather peaks. For a single adapter, it also stays dynamic when an estimate shows that merging would round away more than 50% of the update's norm. `merge` forces merging; `dynamic` applies the adapter at forward time.
+- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` normally merges regular weights, but keeps FSDP-sharded weights and supported packed weights that cannot merge in place dynamic. It also stays dynamic when an estimate shows that merging would round away more than 50% of the update's norm, including with multiple adapters. `merge` forces merging where supported; `dynamic` applies the active adapters at forward time. See [LoRA management](/docs/sglang-diffusion/api/openai_api#lora-management) to activate multiple adapters through the API.
 - `--num-gpus {N}`: number of GPUs to use
 - `--numa-node {N} [N ...]`: NUMA node for each GPU worker, the i-th value for the worker on local GPU i. When unset, each worker binds its CPUs and host memory to its GPU's NUMA node on multi-socket hosts, as srt does (CPUs only without `CAP_SYS_NICE`); set `SGLANG_AUTO_NUMA_BIND=0` to turn that off. Unbound workers on a two-socket host (e.g. GB200/GB300) can drift to the other socket, which slows host-bound steps and makes latency vary run to run.
 - `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and dispatches residency from selected-GPU headroom and workload type: image DiTs stay resident above the 45 GiB threshold, while video DiT placement remains model-specific. It uses FSDP only for validated DiT-offload replacement paths. `speed` keeps `torch.compile` disabled unless a model-specific deployment config opts in after validation; pass `--enable-torch-compile true` to enable it explicitly. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
@@ -106,7 +106,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`. A key may carry a `.self` or `.cross` role suffix to override one kind of attention only, for example `transformer.cross=fa`
-- `--attention-backend-config {CONFIG}`: attention backend configuration
+- `--attention-backend-config {CONFIG}`: attention backend configuration as a JSON/YAML file path, JSON string, or comma-separated `key=value` pairs. See [Attention Backends](/docs/sglang-diffusion/attention_backends#configuration) for backend-specific options.
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
@@ -149,6 +149,8 @@ still use the existing image APIs; encoding is not exposed as a standalone API.
 - `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
+  The default image/video filename is independent of the prompt and input media name.
+  Set `--output-file-name` when a downstream tool needs a predictable filename.
 
 For frame interpolation and upscaling, see [Post-Processing](/docs/sglang-diffusion/api/post_processing).
 
@@ -509,15 +511,22 @@ keep it at `503` for several minutes.
 
 SGLang Diffusion can upload generated images and videos to S3-compatible object storage after generation.
 
+On AWS, assign the serving workload an IAM role scoped to its output bucket.
+Leave both SGLang credential variables unset so [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html)
+can obtain and refresh the role's temporary credentials.
+
 ```bash Command
 export SGLANG_CLOUD_STORAGE_TYPE=s3
 export SGLANG_S3_BUCKET_NAME=my-bucket
-export SGLANG_S3_ACCESS_KEY_ID=your-access-key
-export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
-export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables](/docs/sglang-diffusion/environment_variables) for the full set of storage options.
+For an S3-compatible service such as MinIO, set `SGLANG_S3_ENDPOINT_URL`.
+If the service requires an explicit key pair, supply `SGLANG_S3_ACCESS_KEY_ID`
+and `SGLANG_S3_SECRET_ACCESS_KEY` through your deployment's secret manager.
+See [Environment Variables](/docs/sglang-diffusion/environment_variables) for all options.
+
+The returned object URL is not presigned. For private outputs, keep the bucket
+private and authorize downloads separately from the uploader.
 
 Cancellation waits for active uploads to finish before request cleanup can remove
 their source files. Allow for the storage SDK's timeouts and retries in your

@@ -29,6 +29,7 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
 )
 from sglang.kernels.ops.communication.muse_spark_all_reduce_norm_residual import (
     FusedAllReducePostNormResidualPreNorm,
+    o_proj_push,
 )
 from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
     router_gemv_cute,
@@ -53,6 +54,7 @@ from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.layers.communication.muse_spark_gemm_ag import (
     gemm_ag,
     gemm_local,
+    muse_workspace,
     reserve_projection_workspace,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -80,7 +82,11 @@ from sglang.srt.layers.muse_spark.muse_spark_layers import (
     QKVOGateParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    bf16_gemm_dispatch,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -190,6 +196,21 @@ _FP32_ROUTER_MAX_TOKENS = 8
 @functools.lru_cache(maxsize=1)
 def _split_bf16_router_supported() -> bool:
     return is_cuda() and get_device_capability()[0] == 9
+
+
+def _o_proj_pushable(o_proj: torch.nn.Module) -> bool:
+    """Whether o_proj's apply is ``bf16_gemm_dispatch`` on its weight alone, which the push GEMM reproduces.
+
+    Checked per call: LoRA replaces the module after construction.
+    """
+    backend = get_bf16_gemm_backend()
+    return (
+        type(o_proj) is RowParallelLinear
+        and type(o_proj.quant_method) is UnquantizedLinearMethod
+        and o_proj.weight.dtype == torch.bfloat16
+        and o_proj.bias is None
+        and (backend.is_cutedsl() or backend.is_gemv())
+    )
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
@@ -412,7 +433,9 @@ class MuseSpark1xAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_all_reduce: bool = False,
-    ) -> torch.Tensor:
+        push_o_proj: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """None when ``push_o_proj`` stored o_proj's output into the attention TP push plane."""
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.qkv_proj(hidden_states)
@@ -439,6 +462,10 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
         output = self._fused_o_norm_gate(output, o_gate)
+        if push_o_proj and o_proj_push(
+            get_parallel().attn_tp_group.ca_comm, output, self.o_proj.weight
+        ):
+            return None
         output, _ = self.o_proj(output, skip_all_reduce=skip_all_reduce)
         return output
 
@@ -558,10 +585,7 @@ class MuseSpark1xMoE(nn.Module):
                 or (self.tp_size == 8 and torch.cuda.get_device_capability() == (10, 0))
             )
         ):
-            ca_comm = get_parallel().tp_group.ca_comm
-            reserve_projection_workspace(
-                ca_comm, max(self.expert_hidden_size, self.hidden_size)
-            )
+            reserve_projection_workspace(max(self.expert_hidden_size, self.hidden_size))
         self.pre_expert_norm = MuseSpark1xRMSNorm(
             self.expert_hidden_size,
             eps=config.rms_norm_eps,
@@ -736,7 +760,7 @@ class MuseSpark1xMoE(nn.Module):
             if _is_cpu:
                 output, _ = self.post_expert_proj(output)
                 return output
-            comm = get_parallel().tp_group.ca_comm if self.tp_size > 1 else None
+            comm = muse_workspace()
             if not getattr(get_forward(), "sp_active", False) and gemm_ag_supported(
                 comm, output, self.post_expert_proj.weight
             ):
@@ -816,7 +840,7 @@ class MuseSpark1xMoE(nn.Module):
         elif _is_cpu:
             expert_input, _ = self.pre_expert_proj(hidden_states)
         else:
-            comm = get_parallel().tp_group.ca_comm if self.tp_size > 1 else None
+            comm = muse_workspace()
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
@@ -1035,12 +1059,23 @@ class MuseSpark1xDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Returns the updated residual stream and the next layer's attention input."""
-        ar_fused = self._ar_fused_attn_boundary.applicable(attn_input.shape[0])
+        num_tokens = attn_input.shape[0]
+        ar_fused = self._ar_fused_attn_boundary.applicable(num_tokens)
+        # Every rank takes the same branch: same shapes, same GEMM dispatch.
+        push_o_proj = (
+            ar_fused
+            and _o_proj_pushable(self.self_attn.o_proj)
+            and self._ar_fused_attn_boundary.push_applicable(num_tokens)
+        )
         attn_output = self.self_attn(
-            positions, attn_input, forward_batch, skip_all_reduce=ar_fused
+            positions,
+            attn_input,
+            forward_batch,
+            skip_all_reduce=ar_fused,
+            push_o_proj=push_o_proj,
         )
         router_dtype = self._router_dtype
-        if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
+        if router_dtype is not None and _use_split_bf16_router(num_tokens):
             router_dtype = None
         boundary = (
             self._ar_fused_attn_boundary if ar_fused else self._fused_attn_boundary
@@ -1058,7 +1093,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
         if ffn_output.shape[-1] != stream.shape[-1]:
             next_attn_input, stream = all_gather_norm_residual(
-                get_parallel().tp_group.ca_comm,
+                muse_workspace(),
                 ffn_output,
                 stream,
                 **self._fused_ffn_boundary.jit_kernel_kwargs(),
@@ -1134,6 +1169,8 @@ class MuseSpark1xModel(nn.Module):
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda():
+            # declare the collectives' slot while the TP workspace is still open
+            muse_workspace()
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
                 CustomAllReduceV2,
             )
@@ -1165,23 +1202,24 @@ class MuseSpark1xModel(nn.Module):
                 elif (
                     moe_layers[0].expert_hidden_size <= 0
                     or moe_layers[0].expert_hidden_size % 256
-                    or comm.max_push_size < moe_layers[0].expert_hidden_size * 2
-                    or not 0
-                    < comm.config.num_push_blocks
-                    <= torch.cuda.get_device_properties(
-                        comm.device
-                    ).multi_processor_count
                 ):
                     logger.warning(
-                        "Finalize AR fusion unavailable: unsupported hidden size "
-                        "or push workspace capacity. Using separate finalize and AR."
+                        "Finalize AR fusion unavailable: unsupported hidden size. "
+                        "Using separate finalize and AR."
                     )
                 else:
-                    self._finalize_ar_workspace = FinalizePushWorkspace(
-                        comm,
-                        tp_group.device_group,
-                        hidden_dim=moe_layers[0].expert_hidden_size,
-                        multicast=comm.world_size > 4 and comm.has_multicast,
+                    hidden_dim = moe_layers[0].expert_hidden_size
+                    lease = muse_workspace()
+                    self._finalize_ar_workspace = (
+                        FinalizePushWorkspace(
+                            lease,
+                            comm,
+                            hidden_dim=hidden_dim,
+                            device_group=tp_group.device_group,
+                            multicast=comm.world_size > 4,
+                        )
+                        if lease is not None
+                        else None
                     )
                 for moe_layer in moe_layers:
                     moe_layer.set_finalize_ar_workspace(self._finalize_ar_workspace)

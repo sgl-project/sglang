@@ -11,6 +11,8 @@ class LinearAttnKernelBase(ABC):
     """
 
     uses_state_checkpoints: bool = False
+    # extend() reads query_start_loc_i64, an int64 copy built once per forward.
+    wants_int64_query_start_loc: bool = False
     supports_fused_chain_verify: bool = False
     # Opt in only when target-verify kernels honor non-unit token strides.
     supports_strided_target_verify_qkv: bool = False
@@ -26,6 +28,10 @@ class LinearAttnKernelBase(ABC):
     # unwritten and corrupts prefix-cache restores. Kernels that reject
     # tracked batches loudly (NotImplementedError) keep the default False.
     supports_track_state_snapshot: bool = False
+
+    # True when extend() reads and writes each slot's recurrent state at the
+    # pool's own slot pitch, so an envelope-strided pool needs no packed copy.
+    extend_honors_slot_pitch: bool = False
 
     @abstractmethod
     def decode(

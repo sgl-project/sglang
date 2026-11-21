@@ -370,12 +370,6 @@ class DenoisingStage(PipelineStage):
         self._attn_metadata_head_size = attn_head_size
         self._attention_backend_active_override: AttentionBackendEnum | None = None
         self._skip_softmax_forced_fa = False
-
-        # cfg
-        self.guidance = None
-
-        # misc
-        self.profiler = None
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
@@ -2448,18 +2442,16 @@ class DenoisingStage(PipelineStage):
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
-                raw_latent_shape=batch.raw_latent_shape
+                raw_latent_shape=batch.raw_latent_shape,
+                attention_backend_config=server_args.attention_backend_config,
+                ring_degree=server_args.ring_degree,
             )
         elif self.attn_backend.get_enum() in [
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.ASCEND_SPARSE_ATTN,
         ]:
-            sparse_config = server_args.attention_backend_config
-
-            current_timestep = i
-            skip_first_steps = sparse_config.get("skip_first_steps", 10)
-            sparsity = sparse_config.get("sparsity", 0.2)
-
+            sparse_config = server_args.attention_backend_config or {}
             raw_latent_shape = batch.raw_latent_shape
             patch_size = server_args.pipeline_config.dit_config.patch_size
 
@@ -2472,13 +2464,25 @@ class DenoisingStage(PipelineStage):
                 else:
                     patch_size = (patch_size, patch_size, patch_size)
 
-            attn_metadata = self.attn_metadata_builder.build(
-                current_timestep=current_timestep,
-                skip_first_steps=skip_first_steps,
-                sparsity=sparsity,
-                raw_latent_shape=raw_latent_shape,
-                patch_size=patch_size,
-            )
+            if self.attn_backend.get_enum() == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+                metadata_kwargs = dict(sparse_config)
+                metadata_kwargs.update(
+                    current_timestep=i,
+                    num_steps=None if timesteps is None else len(timesteps),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
+                if metadata_kwargs.get("video_spans") is not None:
+                    metadata_kwargs["raw_latent_shape"] = None
+                attn_metadata = self.attn_metadata_builder.build(**metadata_kwargs)
+            else:
+                attn_metadata = self.attn_metadata_builder.build(
+                    current_timestep=i,
+                    skip_first_steps=sparse_config.get("skip_first_steps", 10),
+                    sparsity=sparse_config.get("sparsity", 0.2),
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=patch_size,
+                )
         else:
             # attn_metadata can be None for SDPA attention backend
             return None
@@ -2638,10 +2642,11 @@ class DenoisingStage(PipelineStage):
         Prepare Sliding Tile Attention (STA) parameters and settings.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
+        configured_mode = server_args.attention_backend_config.STA_mode
         try:
-            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
+            STA_mode = STA_Mode[configured_mode]
         except Exception as e:
-            logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
+            logger.error(f"Passed STA_mode: {configured_mode} doesn't exist")
             raise e
         skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
@@ -2730,8 +2735,6 @@ class DenoisingStage(PipelineStage):
                 timesteps=timesteps_num,
             )
         elif STA_mode == STA_Mode.STA_INFERENCE:
-            import sglang.multimodal_gen.envs as envs
-
             config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
             if config_file is None:
                 raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")

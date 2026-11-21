@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.sampling.penaltylib import (
+from sglang.srt.sampling.penalties import (
     BatchedMinNewTokensPenalizer,
     BatchedPenalizerOrchestrator,
 )
@@ -106,7 +106,8 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
                 expected[0, [1, 2, 3, 4]] = -torch.inf
             self.assert_device_tensor(logits, expected)
             orch.cumulate_output_tokens(
-                torch.ones(3, dtype=torch.long, device=self.device)
+                torch.ones(3, dtype=torch.long, device=self.device),
+                torch.arange(3, device=self.device),
             )
 
     def test_min_tokens_without_any_stop_tokens(self):

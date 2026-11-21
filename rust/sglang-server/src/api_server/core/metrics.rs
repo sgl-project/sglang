@@ -10,18 +10,37 @@
 //! other process's samples: this listener's `/metrics`, another DP rank's
 //! listener (which sums every rank's requests, as Python's single
 //! `TokenizerManager` counts them), and Python's own collector.
+//!
+//! A few families have no Python counterpart: golden signals for parts only
+//! this frontend has (its stage queues and media fetch slots). They carry the
+//! same labels, plus one of their own where noted:
+//!
+//! * `sglang:frontend_queue_depth` (gauge, `stage`): requests waiting in each
+//!   stage queue, read at each flush: `intake` (the request loop's inbox),
+//!   `tokenizer` and `mm` (the worker pools'), `scheduler` (the scheduler's
+//!   request ring);
+//! * `sglang:frontend_queue_full_total` (counter, `stage`): generations failed
+//!   as overloaded (503, or a 503 error item in a stream or batch) because a
+//!   stage queue was full: `tokenizer`, `mm` or `scheduler` (intake waits for
+//!   room instead);
+//! * `sglang:frontend_media_fetch_slot_wait_seconds` (histogram): how long a
+//!   media fetch waited for one of the process's fetch slots.
+//!
+//! The gauge is written as a prometheus_client `livesum` gauge, summed over
+//! processes like the counters.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::message::config::{DisaggregationMode, MetricsConfig};
 use crate::message::finish_reason::FinishReason;
 use crate::message::request::GenerateRequest;
-use crate::message::response::{CachedTokensSplit, ChunkEvent, ResponseItem};
+use crate::message::response::{CachedTokensSplit, ChunkEvent, RequestStats, ResponseItem};
+use crate::utils::error::{Error, QueueStage};
 use crate::utils::prometheus::{self, Entry};
 
 /// How often the frontend's files are rewritten for other readers of the
@@ -51,10 +70,15 @@ const TOKEN_COUNT_BUCKETS: &[f64] = &[
     800000.0, 1000000.0, 1100000.0,
 ];
 const GET_LOADS_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+const FETCH_SLOT_WAIT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
 /// The `cache_source` label of `sglang:cached_tokens_total`, by cache tier.
 const CACHE_SOURCES: [&str; 3] = ["device", "host", "storage"];
 
 type Labels = Vec<(String, String)>;
+/// One family's series: each label set observed so far and its values.
+type Series<T> = RwLock<Vec<(Labels, Arc<T>)>>;
 /// What tells one request's label set from another's: the priority (when it
 /// is a label) and whether it streams.
 type LabelSetKey = (Option<i64>, bool);
@@ -108,7 +132,7 @@ impl Histogram {
 struct CounterFamily {
     name: &'static str,
     help: &'static str,
-    series: Mutex<Vec<(Labels, Arc<Counter>)>>,
+    series: Series<Counter>,
 }
 
 /// One histogram family, its bucket bounds and the label sets observed so far.
@@ -116,7 +140,7 @@ struct HistogramFamily {
     name: &'static str,
     help: &'static str,
     bounds: Arc<[f64]>,
-    series: Mutex<Vec<(Labels, Arc<Histogram>)>>,
+    series: Series<Histogram>,
 }
 
 impl CounterFamily {
@@ -124,25 +148,34 @@ impl CounterFamily {
         Self {
             name,
             help,
-            series: Mutex::new(Vec::new()),
+            series: RwLock::default(),
         }
     }
 
     fn series(&self, labels: &Labels) -> Arc<Counter> {
-        let mut series = self.series.lock().unwrap();
-        if let Some((_, counter)) = series.iter().find(|(l, _)| l == labels) {
-            return counter.clone();
-        }
-        let counter = Arc::new(Counter::default());
-        series.push((labels.clone(), counter.clone()));
-        counter
+        series_or_insert(
+            &self.series,
+            |l| l == labels,
+            || labels.clone(),
+            Counter::default,
+        )
+    }
+
+    /// [`Self::series`] for an extension's labels, in any order.
+    fn extension_series(&self, labels: &[(&str, &str)]) -> Arc<Counter> {
+        series_or_insert(
+            &self.series,
+            |l| same_labels(l, labels),
+            || owned_labels(labels),
+            Counter::default,
+        )
     }
 
     /// prometheus_client's entries: the family name loses its `_total`, the
     /// sample keeps it.
     fn entries(&self, out: &mut Vec<Entry>) {
         let metric_name = self.name.strip_suffix("_total").unwrap_or(self.name);
-        for (labels, counter) in self.series.lock().unwrap().iter() {
+        for (labels, counter) in self.series.read().unwrap().iter() {
             out.push(Entry {
                 key: prometheus::mmap_key(metric_name, self.name, labels, self.help),
                 value: counter.0.load(Ordering::Relaxed) as f64,
@@ -153,10 +186,10 @@ impl CounterFamily {
 }
 
 /// Every [`ExtensionCounter`] registered in this process.
-static EXTENSION_COUNTERS: Mutex<Vec<&'static ExtensionCounter>> = Mutex::new(Vec::new());
+static EXTENSION_COUNTERS: RwLock<Vec<&'static ExtensionCounter>> = RwLock::new(Vec::new());
 
 /// Every [`ExtensionHistogram`] registered in this process.
-static EXTENSION_HISTOGRAMS: Mutex<Vec<&'static ExtensionHistogram>> = Mutex::new(Vec::new());
+static EXTENSION_HISTOGRAMS: RwLock<Vec<&'static ExtensionHistogram>> = RwLock::new(Vec::new());
 
 /// A counter family recorded by code built on this frontend, such as an
 /// external multimodal processor. With metrics enabled, it is written with
@@ -168,8 +201,17 @@ impl ExtensionCounter {
     /// registered again returns the first registration (and its help). The
     /// family lives for the rest of the process.
     pub fn register(name: &'static str, help: &'static str) -> &'static Self {
-        let mut counters = EXTENSION_COUNTERS.lock().unwrap();
-        if let Some(counter) = counters.iter().find(|counter| counter.0.name == name) {
+        let find = |counters: &[&'static Self]| {
+            counters
+                .iter()
+                .find(|counter| counter.0.name == name)
+                .copied()
+        };
+        if let Some(counter) = find(&EXTENSION_COUNTERS.read().unwrap()) {
+            return counter;
+        }
+        let mut counters = EXTENSION_COUNTERS.write().unwrap();
+        if let Some(counter) = find(&counters) {
             return counter;
         }
         let counter: &'static Self = Box::leak(Box::new(Self(CounterFamily::new(name, help))));
@@ -179,14 +221,14 @@ impl ExtensionCounter {
 
     /// Add one to the series with these labels.
     pub fn inc(&self, labels: &[(&str, &str)]) {
-        self.0.series(&owned_labels(labels)).inc(1);
+        self.0.extension_series(labels).inc(1);
     }
 
     /// Create the series with these labels at zero, as prometheus_client's
     /// `labels()` does: a rate over it then starts from a zero series, not a
     /// missing one.
     pub fn init_series(&self, labels: &[(&str, &str)]) {
-        self.0.series(&owned_labels(labels));
+        self.0.extension_series(labels);
     }
 
     /// The count of the series with these labels; `None` when there is no
@@ -210,8 +252,17 @@ impl ExtensionHistogram {
         help: &'static str,
         buckets: &[f64],
     ) -> Result<&'static Self, String> {
-        let mut histograms = EXTENSION_HISTOGRAMS.lock().unwrap();
-        if let Some(histogram) = histograms.iter().find(|histogram| histogram.0.name == name) {
+        let find = |histograms: &[&'static Self]| {
+            histograms
+                .iter()
+                .find(|histogram| histogram.0.name == name)
+                .copied()
+        };
+        if let Some(histogram) = find(&EXTENSION_HISTOGRAMS.read().unwrap()) {
+            return Ok(histogram);
+        }
+        let mut histograms = EXTENSION_HISTOGRAMS.write().unwrap();
+        if let Some(histogram) = find(&histograms) {
             return Ok(histogram);
         }
         let histogram: &'static Self =
@@ -222,7 +273,7 @@ impl ExtensionHistogram {
 
     /// Observe `value` in the series with these labels.
     pub fn observe(&self, labels: &[(&str, &str)], value: f64) {
-        self.0.series(&owned_labels(labels)).observe(value);
+        self.0.extension_series(labels).observe(value);
     }
 
     /// The number of observations in the series with these labels; `None`
@@ -256,18 +307,51 @@ fn owned_labels(labels: &[(&str, &str)]) -> Labels {
     labels
 }
 
+/// Whether `stored` (sorted, as [`owned_labels`] makes it) is `labels` in any
+/// order: the same pairs, each as often. Compares in place, so looking up an
+/// existing series allocates nothing.
+fn same_labels(stored: &Labels, labels: &[(&str, &str)]) -> bool {
+    stored.len() == labels.len()
+        && labels.iter().all(|&pair| {
+            let in_stored = stored
+                .iter()
+                .filter(|(name, value)| (name.as_str(), value.as_str()) == pair)
+                .count();
+            in_stored == labels.iter().filter(|&&other| other == pair).count()
+        })
+}
+
 /// The series with these labels, if there is one.
-fn existing_series<T>(
-    series: &Mutex<Vec<(Labels, Arc<T>)>>,
-    labels: &[(&str, &str)],
-) -> Option<Arc<T>> {
-    let labels = owned_labels(labels);
+fn existing_series<T>(series: &Series<T>, labels: &[(&str, &str)]) -> Option<Arc<T>> {
     series
-        .lock()
+        .read()
         .unwrap()
         .iter()
-        .find(|(l, _)| *l == labels)
+        .find(|(l, _)| same_labels(l, labels))
         .map(|(_, series)| series.clone())
+}
+
+/// The series whose labels `matches`, created with `labels()` and `new()` if
+/// there is none. An existing series is found under the read lock, so
+/// observations never wait on each other or on a flush; only a new label set
+/// takes the write lock.
+fn series_or_insert<T>(
+    series: &Series<T>,
+    matches: impl Fn(&Labels) -> bool,
+    labels: impl FnOnce() -> Labels,
+    new: impl FnOnce() -> T,
+) -> Arc<T> {
+    if let Some((_, found)) = series.read().unwrap().iter().find(|(l, _)| matches(l)) {
+        return found.clone();
+    }
+    let mut series = series.write().unwrap();
+    // Another thread may have created it between the two locks.
+    if let Some((_, found)) = series.iter().find(|(l, _)| matches(l)) {
+        return found.clone();
+    }
+    let created = Arc::new(new());
+    series.push((labels(), created.clone()));
+    created
 }
 
 impl HistogramFamily {
@@ -288,24 +372,33 @@ impl HistogramFamily {
             name,
             help,
             bounds: bounds.into(),
-            series: Mutex::new(Vec::new()),
+            series: RwLock::default(),
         })
     }
 
     fn series(&self, labels: &Labels) -> Arc<Histogram> {
-        let mut series = self.series.lock().unwrap();
-        if let Some((_, histogram)) = series.iter().find(|(l, _)| l == labels) {
-            return histogram.clone();
-        }
-        let histogram = Arc::new(Histogram::new(self.bounds.clone()));
-        series.push((labels.clone(), histogram.clone()));
-        histogram
+        series_or_insert(
+            &self.series,
+            |l| l == labels,
+            || labels.clone(),
+            || Histogram::new(self.bounds.clone()),
+        )
+    }
+
+    /// [`Self::series`] for an extension's labels, in any order.
+    fn extension_series(&self, labels: &[(&str, &str)]) -> Arc<Histogram> {
+        series_or_insert(
+            &self.series,
+            |l| same_labels(l, labels),
+            || owned_labels(labels),
+            || Histogram::new(self.bounds.clone()),
+        )
     }
 
     /// prometheus_client's entries, in its creation order: `_sum`, then one
     /// `_bucket` per bound.
     fn entries(&self, out: &mut Vec<Entry>) {
-        for (labels, histogram) in self.series.lock().unwrap().iter() {
+        for (labels, histogram) in self.series.read().unwrap().iter() {
             let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
             out.push(Entry {
                 key: prometheus::mmap_key(
@@ -342,6 +435,9 @@ struct RequestSeries {
     /// Cached tokens by [`CACHE_SOURCES`], each series registered at its
     /// source's first hit, as Python labels a source only once it counts one.
     cached_tokens: [OnceLock<Arc<Counter>>; 3],
+    /// Registered at the first request that ran a verify step, as Python
+    /// labels it only once it counts one.
+    spec_verify_calls: OnceLock<Arc<Counter>>,
     prompt_tokens_histogram: Arc<Histogram>,
     uncached_prompt_tokens_histogram: Arc<Histogram>,
     generation_tokens_histogram: Arc<Histogram>,
@@ -369,6 +465,7 @@ pub(crate) struct FrontendMetrics {
     num_so_requests: CounterFamily,
     num_aborted_requests: CounterFamily,
     cached_tokens: CounterFamily,
+    spec_verify_calls: CounterFamily,
     prompt_tokens_histogram: HistogramFamily,
     uncached_prompt_tokens_histogram: HistogramFamily,
     generation_tokens_histogram: HistogramFamily,
@@ -377,12 +474,18 @@ pub(crate) struct FrontendMetrics {
     time_per_output_token: HistogramFamily,
     e2e_request_latency: HistogramFamily,
     get_loads_duration: HistogramFamily,
+    queue_full: CounterFamily,
+    fetch_slot_wait: HistogramFamily,
+    /// The stage queues `sglang:frontend_queue_depth` reads at each flush,
+    /// once the runtime installs them (see [`Self::watch_queues`]).
+    queues: OnceLock<Vec<(&'static str, QueueLen)>>,
     by_label_set: RwLock<HashMap<LabelSetKey, Arc<RequestSeries>>>,
     dir: PathBuf,
     /// This process's files, named apart from the ones prometheus_client
     /// writes for the scheduler running in the same process.
     counter_file: String,
     histogram_file: String,
+    gauge_file: String,
     /// The bytes last written per file; an unchanged file is not rewritten.
     written: Mutex<BTreeMap<String, Vec<u8>>>,
     /// When [`Self::flush_or_warn`] last logged a failure.
@@ -398,7 +501,7 @@ impl FrontendMetrics {
             configured.clone().unwrap_or_else(|| default.to_vec())
         };
         let pid = std::process::id();
-        Ok(Self {
+        let metrics = Self {
             labels: config
                 .labels
                 .iter()
@@ -429,6 +532,10 @@ impl FrontendMetrics {
             cached_tokens: CounterFamily::new(
                 "sglang:cached_tokens_total",
                 "Number of cached prompt tokens by source (device/host/storage).",
+            ),
+            spec_verify_calls: CounterFamily::new(
+                "sglang:spec_verify_calls_total",
+                "Number of speculative decoding verification calls.",
             ),
             prompt_tokens_histogram: HistogramFamily::new(
                 "sglang:prompt_tokens_histogram",
@@ -476,13 +583,32 @@ impl FrontendMetrics {
                 "Time spent serving /v1/loads requests (seconds).",
                 GET_LOADS_BUCKETS,
             )?,
+            queue_full: CounterFamily::new(
+                "sglang:frontend_queue_full_total",
+                "Generations the frontend failed as overloaded because a stage queue was full.",
+            ),
+            fetch_slot_wait: HistogramFamily::new(
+                "sglang:frontend_media_fetch_slot_wait_seconds",
+                "Time a media fetch waited for a frontend fetch slot in seconds.",
+                FETCH_SLOT_WAIT_BUCKETS,
+            )?,
+            queues: OnceLock::new(),
             by_label_set: RwLock::new(HashMap::new()),
             dir: PathBuf::from(&config.multiproc_dir),
             counter_file: format!("counter_rust-{pid}.db"),
             histogram_file: format!("histogram_rust-{pid}.db"),
+            gauge_file: format!("gauge_livesum_rust-{pid}.db"),
             written: Mutex::new(BTreeMap::new()),
             last_flush_warning: Mutex::new(None),
-        })
+        };
+        // Rates over these start from a zero series, not a missing one.
+        for stage in QueueStage::ALL {
+            metrics.queue_full(stage);
+        }
+        FETCH_SLOT_WAITS.lock().unwrap().push(Arc::downgrade(
+            &metrics.fetch_slot_wait.series(&metrics.labels),
+        ));
+        Ok(metrics)
     }
 
     /// Start observing one generation request, created at `created_at`.
@@ -548,6 +674,7 @@ impl FrontendMetrics {
             generation_tokens: self.generation_tokens.series(&stream_labels),
             num_so_requests: self.num_so_requests.series(&labels),
             cached_tokens: Default::default(),
+            spec_verify_calls: OnceLock::new(),
             prompt_tokens_histogram: self.prompt_tokens_histogram.series(&labels),
             uncached_prompt_tokens_histogram: self.uncached_prompt_tokens_histogram.series(&labels),
             generation_tokens_histogram: self.generation_tokens_histogram.series(&labels),
@@ -566,7 +693,7 @@ impl FrontendMetrics {
             .clone()
     }
 
-    fn counters(&self) -> [&CounterFamily; 6] {
+    fn counters(&self) -> [&CounterFamily; 7] {
         [
             &self.num_requests,
             &self.prompt_tokens,
@@ -574,6 +701,7 @@ impl FrontendMetrics {
             &self.num_so_requests,
             &self.num_aborted_requests,
             &self.cached_tokens,
+            &self.spec_verify_calls,
         ]
     }
 
@@ -601,19 +729,24 @@ impl FrontendMetrics {
         for family in self.counters() {
             family.entries(&mut counters);
         }
-        for counter in EXTENSION_COUNTERS.lock().unwrap().iter() {
+        for counter in EXTENSION_COUNTERS.read().unwrap().iter() {
             counter.0.entries(&mut counters);
         }
         let mut histograms = Vec::new();
         for family in self.histograms() {
             family.entries(&mut histograms);
         }
-        for histogram in EXTENSION_HISTOGRAMS.lock().unwrap().iter() {
+        for histogram in EXTENSION_HISTOGRAMS.read().unwrap().iter() {
             histogram.0.entries(&mut histograms);
         }
+
+        self.queue_full.entries(&mut counters);
+        self.fetch_slot_wait.entries(&mut histograms);
+        let gauges = self.gauge_entries();
         for (file, entries) in [
             (&self.counter_file, counters),
             (&self.histogram_file, histograms),
+            (&self.gauge_file, gauges),
         ] {
             if entries.is_empty() {
                 continue;
@@ -672,6 +805,10 @@ impl RequestMetrics {
         match item {
             Some(ResponseItem::Frame(chunk)) => self.observe_output(chunk, false),
             Some(ResponseItem::Done(chunk)) => self.observe_output(chunk, true),
+            Some(ResponseItem::Error(Error::QueueFull(stage))) => {
+                self.terminal = true;
+                self.metrics.queue_full(*stage).inc(1);
+            }
             Some(_) | None => self.terminal = true,
         }
     }
@@ -744,6 +881,28 @@ impl RequestMetrics {
                 self.observe_first_token(first_token_at);
             }
             self.observe_finished(finish_type, first_token_at, now);
+            self.observe_spec_verify_calls(extras.and_then(|extras| extras.request_stats.as_ref()));
+        }
+    }
+
+    /// `observe_one_finished_request`'s `spec_verify_ct`: the verify steps a
+    /// finished request ran, which its terminal row's stats report (under
+    /// the `meta_info` key Python's `populate_spec_info` sets).
+    fn observe_spec_verify_calls(&self, stats: Option<&RequestStats>) {
+        let Some(verify_ct) = stats.and_then(|RequestStats(stats)| stats.get("spec_verify_ct"))
+        else {
+            return;
+        };
+        let Some(verify_ct) = verify_ct.as_u64() else {
+            tracing::error!(%verify_ct, "spec_verify_ct is not a count; not recorded");
+            return;
+        };
+        if verify_ct > 0 {
+            let series = &self.series;
+            series
+                .spec_verify_calls
+                .get_or_init(|| self.metrics.spec_verify_calls.series(&series.labels))
+                .inc(verify_ct);
         }
     }
 
@@ -830,6 +989,92 @@ impl RequestMetrics {
     }
 }
 
+/// Each server's `sglang:frontend_media_fetch_slot_wait_seconds` series. The
+/// fetch slots are the process's (see `prefetch`), so each wait is observed in
+/// every live server's series.
+static FETCH_SLOT_WAITS: Mutex<Vec<Weak<Histogram>>> = Mutex::new(Vec::new());
+
+/// A media fetch waited `wait` for a fetch slot.
+pub(crate) fn observe_fetch_slot_wait(wait: Duration) {
+    FETCH_SLOT_WAITS.lock().unwrap().retain(|series| {
+        series
+            .upgrade()
+            .map(|histogram| histogram.observe(wait.as_secs_f64()))
+            .is_some()
+    });
+}
+
+/// Reads how many items one stage queue holds.
+pub(crate) type QueueLen = Box<dyn Fn() -> usize + Send + Sync>;
+
+/// A [`QueueLen`] for the flume queue `sender` feeds. Held weakly, so the
+/// metrics never keep a queue open; a closed queue reads empty.
+pub(crate) fn queue_len<T: Send + 'static>(sender: flume::WeakSender<T>) -> QueueLen {
+    Box::new(move || sender.upgrade().map_or(0, |sender| sender.len()))
+}
+
+/// The Rust-native families (see the module docs).
+impl FrontendMetrics {
+    /// Read these stage queues into `sglang:frontend_queue_depth`, by `stage`
+    /// label, at each flush. The first installation stands.
+    pub(crate) fn watch_queues(&self, queues: Vec<(&'static str, QueueLen)>) {
+        let _ = self.queues.set(queues);
+    }
+
+    /// The `sglang:frontend_queue_full_total` series for `stage`.
+    fn queue_full(&self, stage: QueueStage) -> Arc<Counter> {
+        self.queue_full.series(&self.with_stage(stage.label()))
+    }
+
+    /// The base labels plus `stage`.
+    fn with_stage(&self, stage: &str) -> Labels {
+        let mut labels = self.labels.clone();
+        labels.push(("stage".into(), stage.into()));
+        labels
+    }
+
+    /// The gauge entries: each stage queue's depth, read now.
+    fn gauge_entries(&self) -> Vec<Entry> {
+        const NAME: &str = "sglang:frontend_queue_depth";
+        const HELP: &str = "Requests waiting in a frontend stage queue, by stage.";
+        let queues = self.queues.get().into_iter().flatten();
+        queues
+            .map(|(stage, len)| Entry {
+                key: prometheus::mmap_key(NAME, NAME, &self.with_stage(stage), HELP),
+                value: len() as f64,
+                timestamp: 0.0,
+            })
+            .collect()
+    }
+
+    /// The value `/metrics` renders for the first sample line starting with
+    /// `prefix` (the name, then the labels), after a flush.
+    #[cfg(test)]
+    pub(crate) fn exported(&self, prefix: &str) -> Option<f64> {
+        sample(&rendered(self, &self.dir), prefix)
+    }
+}
+
+/// What `/metrics` renders from `dir` after `metrics` flushes.
+#[cfg(test)]
+fn rendered(metrics: &FrontendMetrics, dir: &std::path::Path) -> String {
+    metrics.flush().unwrap();
+    let files = prometheus::read_dir_files(dir).unwrap();
+    prometheus::render(&prometheus::merge(
+        files
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice())),
+    ))
+}
+
+/// The value of the first sample line in `text` starting with `prefix`.
+#[cfg(test)]
+fn sample(text: &str, prefix: &str) -> Option<f64> {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -859,8 +1104,6 @@ mod tests {
         // Startup phases are reported to the main process, not the frontend.
         "sglang:startup_time_seconds",
         "sglang:startup_cuda_graph_time_seconds",
-        // Speculative verify counts are not on the output frames.
-        "sglang:spec_verify_calls_total",
     ];
 
     fn fixture() -> Fixture {
@@ -975,28 +1218,13 @@ mod tests {
         }
     }
 
-    fn rendered(metrics: &FrontendMetrics, dir: &std::path::Path) -> String {
-        metrics.flush().unwrap();
-        let files = prometheus::read_dir_files(dir).unwrap();
-        prometheus::render(&prometheus::merge(
-            files
-                .iter()
-                .map(|(name, data)| (name.as_str(), data.as_slice())),
-        ))
-    }
-
-    fn sample(text: &str, prefix: &str) -> Option<f64> {
-        text.lines()
-            .find(|line| line.starts_with(prefix))
-            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
-    }
-
     /// The `collect_metrics` sequence: streaming TTFT on the first output,
     /// inter-token latency per new token after it, and the finished-request
     /// families at the end; a non-streaming request's first token is the
     /// terminal output less the scheduler's decode latency; cached tokens count
-    /// as device hits; a dropped call counts an abort, and a finished request
-    /// once it had an output.
+    /// as device hits; verify calls count from the terminal row's stats, and a
+    /// label set with none has no series; a dropped call counts an abort, and
+    /// a finished request once it had an output.
     #[test]
     fn records_request_lifecycles() {
         let dir = temp_dir("lifecycle");
@@ -1019,6 +1247,10 @@ mod tests {
         let mut unary = metrics.start_request(&request(false, None), created);
         let decoded = ChunkExtras {
             decode_latency: Some(0.02),
+            request_stats: Some(RequestStats(serde_json::Map::from_iter([(
+                "spec_verify_ct".to_string(),
+                4.into(),
+            )]))),
             ..Default::default()
         };
         unary.observe(Some(&ResponseItem::Done(ChunkEvent {
@@ -1086,6 +1318,20 @@ mod tests {
                 r#"sglang:cached_tokens_total{cache_source="device",engine_type="unified",model_name="m",priority=""}"#
             ),
             Some(3.0)
+        );
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:spec_verify_calls_total{engine_type="unified",model_name="m",priority=""}"#
+            ),
+            Some(4.0)
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("sglang:spec_verify_calls_total{"))
+                .count(),
+            1,
+            "{text}"
         );
         // The unary request's 7 - 3, and the dropped one's 7.
         assert_eq!(
@@ -1191,7 +1437,7 @@ mod tests {
                 let counted: serde_json::Map<String, serde_json::Value> = metrics
                     .cached_tokens
                     .series
-                    .lock()
+                    .read()
                     .unwrap()
                     .iter()
                     .map(|(labels, counter)| {
@@ -1384,5 +1630,44 @@ mod tests {
             ),
             Some(3.0)
         );
+    }
+
+    /// A stage queue's depth is read at each flush, without keeping the queue
+    /// open, and a generation refused on a full queue counts under its stage,
+    /// every stage from zero.
+    #[test]
+    fn queue_depth_and_full_queue_refusals() {
+        let dir = temp_dir("queues");
+        let metrics = Arc::new(
+            FrontendMetrics::new(&config(&dir, BTreeMap::new()), DisaggregationMode::Null).unwrap(),
+        );
+        let (tx, rx) = flume::bounded::<u8>(4);
+        metrics.watch_queues(vec![("intake", queue_len(tx.downgrade()))]);
+        let depth = r#"sglang:frontend_queue_depth{stage="intake"}"#;
+        assert_eq!(metrics.exported(depth), Some(0.0));
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(metrics.exported(depth), Some(2.0));
+        rx.recv().unwrap();
+        assert_eq!(metrics.exported(depth), Some(1.0));
+        drop(tx);
+        assert!(rx.is_disconnected());
+
+        let refused = || {
+            QueueStage::ALL.map(|stage| {
+                metrics.exported(&format!(
+                    r#"sglang:frontend_queue_full_total{{stage="{}"}}"#,
+                    stage.label()
+                ))
+            })
+        };
+        assert_eq!(refused(), [Some(0.0); 3]);
+        let mut call = metrics.start_request(&request(false, None), Instant::now());
+        call.observe(Some(&ResponseItem::Error(Error::Disconnected)));
+        assert_eq!(refused(), [Some(0.0); 3]);
+        let mut call = metrics.start_request(&request(true, None), Instant::now());
+        call.observe(Some(&ResponseItem::Error(Error::QueueFull(QueueStage::Mm))));
+        assert_eq!(refused(), [Some(0.0), Some(1.0), Some(0.0)]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

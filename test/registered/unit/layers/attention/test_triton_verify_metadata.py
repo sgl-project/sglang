@@ -38,6 +38,7 @@ class _RunnerIds:
         out,
         kv_start_idx=None,
         kind=IdSpaceKind.FULL,
+        num_token_blocks=1,
     ):
         out.zero_()
         return False
