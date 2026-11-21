@@ -107,7 +107,7 @@ from sglang.test.tree_slots import (
 )
 
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=24, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=24, suite="base-b-test-1-gpu-small-amd")
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
@@ -265,7 +265,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                     with (
                         mock.patch.object(cache, "cache_controller", mock.Mock()),
                         mock.patch.object(
-                            cache, "_execute_and_commit_kv_backup", return_value=0
+                            cache, "_execute_and_commit_kv_backup", return_value=None
                         ) as backup,
                     ):
                         cache._evict_components({ComponentType.FULL: 0, ct: 2}, tracker)

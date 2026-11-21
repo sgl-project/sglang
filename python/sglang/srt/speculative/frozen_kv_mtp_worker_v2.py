@@ -462,8 +462,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
-        # NOTE: per-iter bookkeeping (penalty cumulation, maybe_evict_swa,
-        # decode_batch_idx tick) is done by the scheduler-driven
+        # NOTE: per-iter bookkeeping (maybe_evict_swa, decode_batch_idx
+        # tick) is done by the scheduler-driven
         # eagle_utils.eagle_prepare_for_decode (see
         # ScheduleBatch.prepare_for_decode), not here -- matching EAGLE v2.
         # Repeating evict/tick here would double-run them: the idx clock

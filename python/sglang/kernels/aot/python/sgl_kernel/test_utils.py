@@ -108,9 +108,14 @@ def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
         count_tiny_diff = (diff_u8 == 1).sum().item()
         count_large_diff = (diff_u8 >= 2).sum().item()
     elif a.dtype == torch.int8:
-        diff = (a.to(torch.int16) - a.to(torch.int16)).abs()
+        a_i16 = a.to(torch.int16)
+        b_i16 = b.to(torch.int16)
+        diff = (a_i16 - b_i16).abs()
+        # Both sides truncate, so 127 / absmax against 1 / (absmax / 127) moves a
+        # group's absmax element between 126 and 127; that step is not counted.
+        at_absmax = torch.maximum(a_i16.abs(), b_i16.abs()) == 127
         count_diff_sign = ((a >= 0) & (b < 0)).sum().item()
-        count_tiny_diff = (diff == 1).sum().item()
+        count_tiny_diff = ((diff == 1) & ~at_absmax).sum().item()
         count_large_diff = (diff >= 2).sum().item()
     else:
         raise NotImplementedError

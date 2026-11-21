@@ -230,7 +230,6 @@ class TestMediaIdentity(unittest.TestCase):
                 ServerArgs(
                     model_path="dummy",
                     revision="model-revision",
-                    disable_fast_image_processor=False,
                     mm_process_config=mm_process_config,
                 ),
                 role="test",

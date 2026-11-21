@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
+    KVArgsRegisterInfo,
     MooncakeKVManager,
     TransferInfo,
 )
@@ -560,6 +561,7 @@ class TestDisaggregationWire(unittest.TestCase):
             num_draft_entries=0,
             kv_layer_ids=[],
             kv_item_lens=[],
+            draft_kv_ring_paged=False,
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -587,6 +589,51 @@ class TestDisaggregationWire(unittest.TestCase):
             )
         self.assertTrue(fully_checked)
         self.assertIsNone(reason)
+
+    def test_mooncake_mha_draft_kv_ring_needs_the_same_attn_tp(self):
+        for paged, dst_tp, rejected in ((True, 2, False), (True, 4, True)):
+            with self.subTest(paged=paged, dst_tp=dst_tp):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+                    state_data_ptrs=[[1000, 1100], [1200]],
+                    state_item_lens=[[256, 256], [4]],
+                    state_layer_ids=[[], []],
+                    num_draft_entries=0,
+                    kv_layer_ids=[],
+                    kv_item_lens=[],
+                    draft_kv_ring_paged=paged,
+                )
+                manager.is_mla_backend = False
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.state_tp_size = 2
+                manager.attn_tp_size = 2
+                registration_info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_attn_tp_size=dst_tp,
+                    dst_draft_rows_dcp_collapsed=False,
+                    dst_kv_layer_ids=[],
+                    dst_kv_item_lens=[],
+                    dst_state_data_ptrs=[[2000, 2100], [3000]],
+                    dst_state_item_lens=[[256, 256], [4]],
+                    dst_state_layer_ids=[[], []],
+                    dst_dcp_size=1,
+                    requires_dcp_relayout=False,
+                )
+                with get_context().override_server_args(
+                    enable_unified_memory=False,
+                    speculative_algorithm="DFLASH",
+                ):
+                    fully_checked, reason = manager._validate_peer_state_layout(
+                        registration_info
+                    )
+                if rejected:
+                    self.assertFalse(fully_checked)
+                    self.assertIn("same attention TP size", reason)
+                else:
+                    self.assertTrue(fully_checked)
+                    self.assertIsNone(reason)
 
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
@@ -1416,6 +1463,7 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
 
     def test_a_ring_registers_its_rows_and_floor_last(self):
         ring = SimpleNamespace(
+            paged=False,
             ring_buf_infos=lambda: ([0x2000, 0x3000], [5760, 5760], [576, 576]),
             floor_buf_infos=lambda: ([0x4000], [136], [4]),
         )
@@ -1426,6 +1474,10 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
         )
         self.assertEqual(kv_args.state_data_ptrs[1:], [[0x2000, 0x3000], [0x4000]])
         self.assertEqual(kv_args.state_item_lens[1:], [[576, 576], [4]])
+        self.assertFalse(kv_args.draft_kv_ring_paged)
+        ring.paged = True
+        self.assertTrue(self._register(ring).draft_kv_ring_paged)
+        self.assertFalse(self._register(None).draft_kv_ring_paged)
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
@@ -2635,6 +2687,140 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
                         (3100, dst_ptrs[-1] + 2100, 200),
                     ],
                 )
+
+    def test_non_last_pp_stage_takes_boundary_from_destination(self):
+        """A PP stage with no draft runner must use the receiver's boundary.
+
+        Only the last prefill PP stage owns a draft runner, so a non-last
+        stage registers num_draft_entries=0 while the destination's
+        registration still appends draft buffers.
+        """
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=None,
+            prefill_start_layer=0,
+            prefill_end_layer=2,
+            kv_data_ptrs=[1000, 2000],
+            kv_item_lens=[100, 100],
+            kv_layer_ids=[],
+            num_draft_entries=0,
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager.pp_size = 2
+        manager._transfer_data = Mock(return_value=0)
+        # Decode registered 4 target entries plus 1 draft entry.
+        dst_ptrs = [10000, 20000, 30000, 40000, 50000]
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            status = manager.send_kvcache(
+                mooncake_session_id="session",
+                prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                dst_kv_ptrs=dst_ptrs,
+                dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                dst_device_kv_indices=np.array([21, 22], dtype=np.int32),
+                executor=None,
+                dst_num_draft_entries=1,
+            )
+
+        self.assertEqual(status, 0)
+        blocks = manager._transfer_data.call_args.args[1]
+        self.assertEqual(
+            blocks,
+            [
+                (1100, 10000 + 700, 200),
+                (2100, 20000 + 700, 200),
+            ],
+        )
+
+    def test_non_last_pp_stage_without_peer_count_still_rejected(self):
+        """A pre-field peer leaves the boundary unknown; keep the loud error."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=None,
+            prefill_start_layer=0,
+            prefill_end_layer=2,
+            kv_data_ptrs=[1000, 2000],
+            kv_item_lens=[100, 100],
+            kv_layer_ids=[],
+            num_draft_entries=0,
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager.pp_size = 2
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "device-only"):
+                manager.send_kvcache(
+                    mooncake_session_id="session",
+                    prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                    dst_kv_ptrs=[10000, 20000, 30000, 40000, 50000],
+                    dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                    dst_device_kv_indices=np.array([21, 22], dtype=np.int32),
+                    executor=None,
+                )
+
+
+class TestMooncakeRegistrationDraftCount(CustomTestCase):
+    """The decode's registration carries its draft-entry count so a PP>1
+    prefill stage without a draft runner can locate the device-only suffix."""
+
+    def _manager(self, num_draft_entries):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000, 0x2000],
+            aux_data_ptrs=[0x3000],
+            aux_item_lens=[],
+            state_data_ptrs=[[0x4000]],
+            state_item_lens=[[8]],
+            state_dim_per_tensor=[[1]],
+            state_layer_ids=[[0]],
+            kv_layer_ids=[0, 1],
+            engine_rank=0,
+            kv_item_lens=[64, 64],
+            num_draft_entries=num_draft_entries,
+            draft_rows_dcp_collapsed=False,
+        )
+        manager.attn_tp_size = 1
+        manager.dcp_size = 1
+        manager.dcp_rank = 0
+        manager.enable_staging = False
+        manager.exchange_aux_item_lens = False
+        manager.customized_info_enabled = False
+        manager.local_ip = "127.0.0.1"
+        manager.rank_port = 1234
+        manager.get_session_id = lambda: "session"
+        return manager
+
+    def test_registration_carries_draft_entry_count(self):
+        msg = self._manager(2).build_receiver_registration_message()
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.num_draft_entries, 2)
+        self.assertEqual(info.dst_kv_ptrs, [0x1000, 0x2000])
+
+    def test_registration_without_the_field_parses_none(self):
+        msg = self._manager(2).build_receiver_registration_message()[:-1]
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertIsNone(info.num_draft_entries)
+
+    def test_zero_draft_entries_round_trips(self):
+        msg = self._manager(0).build_receiver_registration_message()
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.num_draft_entries, 0)
 
 
 class TestHiSparseStagedSpecRelay(CustomTestCase):

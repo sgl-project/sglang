@@ -99,6 +99,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -864,7 +865,11 @@ def _minimax_h3_pipelined_dense_attention(
     of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups in (0, 1) or torch.compiler.is_compiling():
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or torch.compiler.is_compiling()
+    ):
         return None
     if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
@@ -965,7 +970,8 @@ def _minimax_h3_collective_pipelined_attention(
         groups = 2
     world_size, _ = get_ulysses_ctx()
     if (
-        groups in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
         or attention._attention_backend_enum
         not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
         or q.shape[1] % (world_size * groups)
@@ -1010,7 +1016,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
@@ -1119,6 +1126,10 @@ def _minimax_h3_attention_core_impl(
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            vsa_h3_fold_gate,
+        )
+
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
@@ -1364,7 +1375,12 @@ class MiniMaxH3Attention(nn.Module):
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
             and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.ASCEND_SPARSE_ATTN
+            and "token_refiner" in self.prefix.split(".")
         ):
+            # The text-only refiner has its own packed sequence and stays on
+            # dense FA; Ascend sparse attention applies to multimodal DiT blocks.
             backend = get_attn_backend(
                 self.head_dim,
                 _BF16_DTYPE,
@@ -1430,6 +1446,21 @@ class MiniMaxH3Attention(nn.Module):
             weight.weight_loader = _weight_loader
         # rank-local FSDP must reorder grouped QKV before selecting each shard
         weight.rank_local_weight_transform = _reorder_checkpoint_weight
+
+        if isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod):
+            # Heads are contiguous in the grouped checkpoint. Read only this
+            # TP rank's heads, then pack its local Q/K/V on CPU before H2D.
+            # This differs from FSDP, which slices the globally reordered tensor.
+            def _reorder_tp_slice(local_weight: torch.Tensor) -> torch.Tensor:
+                return _reorder_grouped_qkv_to_qkv(
+                    local_weight,
+                    num_query_groups=arch.num_attention_heads // self.tp_size,
+                    heads_per_group=1,
+                    head_dim=arch.attention_head_dim,
+                )
+
+            weight.rank_local_tp_shard_dim = 0
+            weight.rank_local_tp_weight_transform = _reorder_tp_slice
 
         # A quantized checkpoint stores metadata indexed by output row next to the
         # rows themselves (NVFP4 block scales, fp8 per-channel scales). Those rows
@@ -2413,10 +2444,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             b = adapter[b_key]
             a64 = a.to(torch.float64)
             b64 = b.to(device=work_device, dtype=torch.float64)
-            projected[a_key] = (a64 @ work_basis.T).to(torch.float32)
+            # Keep the adapter dtype: the folded linear runs the LoRA delta with
+            # the raw activation dtype and rejects a float32 operand.
+            projected[a_key] = (a64 @ work_basis.T).to(a.dtype)
             projected[a_key[: -len("lora_A")] + "lora_output_offset"] = (
                 b64 @ (a64 @ work_mean)
-            ).to(torch.float32)
+            ).to(b.dtype)
 
         logger.info(
             "Projected %d MiniMax H3 AdaLN LoRA modules from width %d to %d",

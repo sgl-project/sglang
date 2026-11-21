@@ -1,4 +1,4 @@
-"""A per-request ring of draft KV rows for an all-sliding-window MLA DFLASH draft.
+"""A per-request ring of draft KV rows for an all-sliding-window DFLASH draft.
 
 The draft reads only the last ``window_left + 1`` positions, and a position's
 draft KV depends on its own target hidden state alone, so each request keeps
@@ -15,9 +15,17 @@ compute this layout and change together.
 ``min_pos`` floors each request's window at its prefix-cache hit, whose draft
 KV the ring never had.
 
+An MHA draft reads its keys through a page table, which has no per-request
+start. Its ring is paged instead: ``sink_rows = page_size``, ``rows_per_req`` a
+whole number of pages, no DCP, and positions taken relative to ``min_pos``, so
+the draft attends ``seq_len - min_pos`` keys from page ``j`` at ring page
+``1 + req * pages_per_req + j % pages_per_req``.
+
 Under PD disaggregation prefill sends a request's last window of ring rows
 (``transfer_rows``, positionally matched like the SWA_RING state) and its
-``min_pos`` row; a decode rank keeps the positions it owns.
+``min_pos`` row; a decode rank keeps the positions it owns. A paged ring sends
+its request's whole row block in ring order instead: decode learns the floor
+its rows are relative to only from that transfer.
 """
 
 from contextlib import nullcontext
@@ -28,7 +36,30 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
+    get_schedule,
+    get_spec,
+)
+
+DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa4")
+
+
+def dflash_dcp_mla_draft_backend() -> str:
+    """The draft backend of a DFLASH MLA draft under DCP; on gfx950, triton's
+    rank-local MLA window verify."""
+    return "triton" if get_platform().is_gfx95 else "cutedsl_mla"
+
+
+def dflash_draft_reads_rows_by_position(
+    draft_backend: Optional[str], dcp_size: int
+) -> bool:
+    """Whether an MLA draft on ``draft_backend`` reads its ``req_to_token`` rows by
+    absolute position, as the MLA-only backends do."""
+    return draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS or (
+        dcp_size > 1 and draft_backend == dflash_dcp_mla_draft_backend()
+    )
 
 
 def draft_kv_ring_unsupported_reason(
@@ -40,7 +71,10 @@ def draft_kv_ring_unsupported_reason(
     disaggregation_decode_host_receive_threshold: float = 1.0,
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
+    attn_cp_size: int = 1,
+    enable_dp_attention: bool = False,
     draft_window_size: Optional[int] = None,
+    is_cuda: bool = True,
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
@@ -53,7 +87,17 @@ def draft_kv_ring_unsupported_reason(
         return "decode host KV buffering receives only SWA state"
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
-    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if draft_backend in DFLASH_MHA_RING_DRAFT_BACKENDS:
+        return _mha_ring_unsupported_reason(
+            load_draft_hf_config,
+            draft_backend=draft_backend,
+            dcp_size=dcp_size,
+            attn_cp_size=attn_cp_size,
+            enable_dp_attention=enable_dp_attention,
+            draft_window_size=draft_window_size,
+            is_cuda=is_cuda,
+        )
+    if not dflash_draft_reads_rows_by_position(draft_backend, dcp_size):
         return f"draft backend {draft_backend!r} has no window index path"
     if draft_window_size is not None:
         return "--speculative-draft-window-size keeps the compact draft table"
@@ -78,6 +122,45 @@ def draft_kv_ring_unsupported_reason(
     return None
 
 
+def _mha_ring_unsupported_reason(
+    load_draft_hf_config: Callable[[], Any],
+    *,
+    draft_backend: str,
+    dcp_size: int,
+    attn_cp_size: int,
+    enable_dp_attention: bool,
+    draft_window_size: Optional[int],
+    is_cuda: bool,
+) -> Optional[str]:
+    if not is_cuda:
+        return f"draft backend {draft_backend!r} reads a paged ring only on CUDA"
+    if dcp_size > 1 or attn_cp_size > 1:
+        return "an MHA draft's ring has no context-parallel layout"
+    if enable_dp_attention:
+        return "an MHA draft's ring is not supported with DP attention"
+    if draft_window_size is not None:
+        return "--speculative-draft-window-size keeps its own compact draft table"
+
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_layer_types,
+        parse_dflash_draft_config,
+    )
+
+    draft_hf_config = load_draft_hf_config()
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        return f"not every draft layer is sliding_attention ({layer_types})"
+    if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
+        return f"draft backend {draft_backend!r} does not serve an MLA draft"
+    return None
+
+
+def draft_kv_ring_is_paged(draft_hf_config) -> bool:
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+    return not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+
+
 def draft_kv_ring_rows_per_req(
     *, window_left: int, block_size: int, dcp_size: int
 ) -> int:
@@ -87,6 +170,14 @@ def draft_kv_ring_rows_per_req(
     return -(-span // dcp_size) + 1
 
 
+def draft_kv_ring_paged_rows_per_req(
+    *, window_left: int, block_size: int, page_size: int
+) -> int:
+    """A spare page keeps a mid-page read from aliasing the verify block."""
+    span = window_left + 1 + block_size
+    return (-(-span // page_size) + 1) * page_size
+
+
 def draft_kv_ring_rows_per_req_from_config(draft_hf_config) -> int:
     """For this launch's draft, block size and DCP; the draft pool's size and
     the ring's locs both take it from here."""
@@ -94,9 +185,17 @@ def draft_kv_ring_rows_per_req_from_config(draft_hf_config) -> int:
         get_dflash_attention_sliding_window_size,
     )
 
+    window_left = get_dflash_attention_sliding_window_size(draft_hf_config)
+    block_size = int(get_spec().speculative_num_draft_tokens)
+    if draft_kv_ring_is_paged(draft_hf_config):
+        return draft_kv_ring_paged_rows_per_req(
+            window_left=window_left,
+            block_size=block_size,
+            page_size=int(get_schedule().page_size),
+        )
     return draft_kv_ring_rows_per_req(
-        window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
-        block_size=int(get_spec().speculative_num_draft_tokens),
+        window_left=window_left,
+        block_size=block_size,
         dcp_size=get_parallel().attn_dcp_size,
     )
 
@@ -131,12 +230,22 @@ class DFlashDraftKVRing:
         window_left: int,
         dcp_rank: int,
         pool,
+        page_size: Optional[int] = None,
     ):
         self.rows_per_req = rows_per_req
         self.dcp_size = dcp_size
         self.window_left = window_left
         self.dcp_rank = dcp_rank
         self.pool = pool
+        self.paged = page_size is not None
+        self.sink_rows = page_size if self.paged else 1
+        if self.paged:
+            if dcp_size != 1 or rows_per_req % page_size != 0:
+                raise ValueError(
+                    f"A paged DFLASH draft KV ring needs DCP 1 and whole pages, got "
+                    f"dcp={dcp_size}, rows_per_req={rows_per_req}, page={page_size}."
+                )
+            self.pages_per_req = rows_per_req // page_size
         # Positions a ring holds without wrapping onto each other.
         self.span = rows_per_req * dcp_size
         # PD writes min_pos rows remotely; Mooncake's NVLink transport only
@@ -154,8 +263,10 @@ class DFlashDraftKVRing:
     ) -> torch.Tensor:
         """Ring locs of ``positions``, ``req_pool_indices`` given per row."""
         positions = positions.to(torch.int64)
+        if self.paged:
+            positions = positions - self.min_pos[req_pool_indices].to(torch.int64)
         local = (
-            1
+            self.sink_rows
             + req_pool_indices.to(torch.int64) * self.rows_per_req
             + torch.remainder(positions // self.dcp_size, self.rows_per_req)
         )
@@ -166,13 +277,47 @@ class DFlashDraftKVRing:
     ) -> torch.Tensor:
         """Ring locs of a draft block: ``block_size`` positions per request, in
         one launch (bitwise equal to ``locs`` on the repeated indices)."""
-        return dflash_ring_block_locs(
+        if self.paged:
+            positions = (
+                positions.reshape(-1, block_size)
+                - self.min_pos[req_pool_indices].to(positions.dtype)[:, None]
+            ).reshape(-1)
+        locs = dflash_ring_block_locs(
             req_pool_indices,
             positions,
             block_size=block_size,
             rows_per_req=self.rows_per_req,
             dcp_size=self.dcp_size,
         )
+        # The kernel's sink is one row.
+        return locs + (self.sink_rows - 1) if self.paged else locs
+
+    def warm_block_locs(self, max_bs: int, block_size: int) -> None:
+        device = self.min_pos.device
+        req_pool_indices = torch.zeros(max_bs, dtype=torch.int64, device=device)
+        positions = torch.zeros(max_bs * block_size, dtype=torch.int64, device=device)
+        # Precompile every batch size to avoid first-request JIT stalls.
+        for bs in range(1, max_bs + 1):
+            self.block_locs(
+                req_pool_indices[:bs], positions[: bs * block_size], block_size
+            )
+
+    def relative_seq_lens(
+        self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        rel = seq_lens - self.min_pos[req_pool_indices].to(seq_lens.dtype)
+        # A padded row's slot may carry another request's floor.
+        return torch.clamp_min(rel, 0)
+
+    def fill_page_table(
+        self,
+        req_pool_indices: torch.Tensor,
+        page_cols: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        # page_cols is arange(out.shape[1]) % pages_per_req in int32.
+        base = req_pool_indices.to(torch.int32) * self.pages_per_req + 1
+        torch.add(page_cols, base[:, None], out=out)
 
     def extend_locs(
         self,
@@ -213,7 +358,12 @@ class DFlashDraftKVRing:
 
     def transfer_rows(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """This rank's ring rows of the last window before ``seq_len``, in
-        position order; row 0 (the sink) for a position another rank owns."""
+        position order; row 0 (the sink) for a position another rank owns. A
+        paged ring sends its whole block because decode learns its floor on
+        transfer."""
+        if self.paged:
+            start = self.sink_rows + req_pool_idx * self.rows_per_req
+            return np.arange(start, start + self.rows_per_req, dtype=np.int32)
         positions = torch.arange(
             max(0, seq_len - self.window_left - 1), seq_len, dtype=torch.int64
         )
