@@ -98,3 +98,5 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simopus_sdk.py tools/sglang-simulator/test/test_simopus_predictor.py tools/sglang-simulator/test/test_predictor_contract.py tools/sglang-simulator/test/test_prepared_batch.py tools/sglang-simulator/test/test_scheduler_predictor_hooks.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simopus_e2e.py
