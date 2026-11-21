@@ -57,7 +57,11 @@ With pip, use `pip install "sglang[diffusion]" --pre` in your activated environm
 
 Use source installation to develop SGLang or try changes that are not in a published image. Follow the [Python and CUDA prerequisites](/docs/get-started/install). The commands below install the current `main`; check out a release tag or commit before installation when you need a fixed revision.
 
+A source build compiles SGLang's Rust extensions, so `cargo` must be on `PATH`. Without it the editable install stops with `cargo is required to discover the Rust extension modules`. The first two commands below install a minimal Rust toolchain; skip them if `cargo --version` already works.
+
 ```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 pip install uv
