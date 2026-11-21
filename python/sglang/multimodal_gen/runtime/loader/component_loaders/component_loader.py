@@ -626,17 +626,12 @@ class ComponentLoader(ABC):
             return
 
         package_dir = os.path.dirname(__file__)
-        package_name = (
-            __package__
-            or "sglang.multimodal_gen.runtime.loader.component_loaders.component_loaders"
-        )
-
         for _, name, _ in pkgutil.iter_modules([package_dir]):
             # skip importing self to avoid circular dependency issues
             if name == "component_loader":
                 continue
             try:
-                importlib.import_module(f".{name}", package=package_name)
+                importlib.import_module(f".{name}", package=__package__)
             except ImportError as e:
                 logger.warning(f"Failed to import loader component {name}: {e}")
 
@@ -1023,7 +1018,6 @@ class GenericComponentLoader(ComponentLoader):
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
         super().__init__()
-        self.library = library
         self.component_architecture = component_architecture
 
     def component_attention_backend_context(

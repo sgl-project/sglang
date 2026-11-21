@@ -120,10 +120,13 @@ def covered(
 
 
 def bias_layout_ok(*biases: Optional[torch.Tensor]) -> bool:
-    """Whether every given bias has the layout the kernel loads: contiguous and
-    16-byte aligned (the widest bias vector). Other views stay on Triton."""
+    """Whether every bias is CUDA-resident, contiguous, and 16-byte aligned.
+
+    CPU-offloaded biases and unsupported views stay on the Triton router.
+    """
     return all(
-        b is None or (b.is_contiguous() and b.data_ptr() % 16 == 0) for b in biases
+        b is None or (b.is_cuda and b.is_contiguous() and b.data_ptr() % 16 == 0)
+        for b in biases
     )
 
 

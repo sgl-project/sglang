@@ -165,7 +165,8 @@ def resolve_load_pub_range(
     ``page_size`` <= 0 `describe_kv_events_publisher` suppresses the whole
     block, so the range binds unadvertised; and with DP-attention across
     ``nnodes`` > 1 the single advertised base is paired with one worker-URL
-    host, so ranks on other nodes are unreachable at that host.
+    host, so ranks on other nodes are unreachable at that host
+    (`warn_multi_node_kv_events` says so at startup).
     """
     # Opt-in: off unless the operator sets `auto` (derive) or an address, so an
     # upgrade never claims a port a co-hosted neighbor's KV publisher binds.
@@ -293,6 +294,10 @@ class BlockStored(KVCacheEvent):
     # Public adapter name for router lookup. Published hashes are opaque IDs
     # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
+    # Dynamo format only. Per block (aligned with block_hashes): [start, length,
+    # label] runs of multimodal tokens whose item carried a caller routing
+    # label. Labels are routing metadata only and never affect hashes or reuse.
+    mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
 
 
 class BlockRemoved(KVCacheEvent):
@@ -726,7 +731,8 @@ class KVEventsConfig(BaseModel):
     format: Literal["default", "dynamo"] = "default"
     """The event format. "default" is the SGLang format. "dynamo" is the format
     the Dynamo KV router reads: block hashes also depend on extra_key and
-    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name.
+    cache_salt (see ``namespaced_block_hash``), and BlockStored has lora_name
+    and, for requests with mm_routing_labels, mm_routing_spans.
     """
 
     @classmethod

@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import functools
-import gc
 import json
 import logging
 import os
 import re
 import socket
 import sys
-import time
 import warnings
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import parent_process
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional, Union
 
 import orjson
 import torch
@@ -38,10 +36,6 @@ __all__ = [
     "print_info_once",
     "log_info_on_rank0",
     "log_debug_on_rank0",
-    "gc_object_counts",
-    "configure_gc_warning",
-    "freeze_gc",
-    "configure_gc_logger",
 ]
 
 
@@ -312,70 +306,3 @@ def log_debug_on_rank0(logger, msg):
                 logger.debug(f"{msg} (rank-check failed: {e})")
         else:
             logger.debug(f"{msg} (rank-check failed: {e})")
-
-
-def gc_object_counts():
-    import gc
-
-    g0 = len(gc.get_objects(0))
-    g1 = len(gc.get_objects(1))
-    g2 = len(gc.get_objects(2))
-    return g0, g1, g2
-
-
-def configure_gc_warning(warn_threshold_secs):
-    import gc
-
-    gc_start_time = {}
-
-    def gc_callback(phase, info):
-        gen = info.get("generation", "?")
-        if phase == "start":
-            gc_start_time[gen] = time.time()
-        elif phase == "stop":
-            duration = time.time() - gc_start_time.get(gen, time.time())
-            if duration > warn_threshold_secs:
-                g0, g1, g2 = gc_object_counts()
-                logger.warn(
-                    f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
-                    f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
-                )
-
-    gc.callbacks.append(gc_callback)
-
-
-def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
-    if gc_threshold is not None:
-        gc.set_threshold(*gc_threshold)
-    g0_before, g1_before, g2_before = gc_object_counts()
-    gc.freeze()
-    g0_after, g1_after, g2_after = gc_object_counts()
-    logger.debug(
-        f"Freezing GC in {context} process. "
-        f"gen0: {g0_before}->{g0_after}, "
-        f"gen1: {g1_before}->{g1_after}, "
-        f"gen2: {g2_before}->{g2_after}"
-    )
-
-
-def configure_gc_logger():
-    logger.info("Enable GC Logger")
-
-    gc_start_time = {}
-
-    def gc_callback(phase, info):
-        gen = info.get("generation", "?")
-        if phase == "start":
-            gc_start_time[gen] = time.time()
-            logger.info(f"GC start: Time {time.time()} | Generation {gen}")
-        elif phase == "stop":
-            duration = time.time() - gc_start_time.get(gen, time.time())
-            collected = info.get("collected", "?")
-            uncollectable = info.get("uncollectable", "?")
-            logger.info(
-                f"GC end: Time {time.time()} | Generation {gen} | "
-                f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-                f"{'(LONG GC)' if duration > 0.1 else ''}"
-            )
-
-    gc.callbacks.append(gc_callback)

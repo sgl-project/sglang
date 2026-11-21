@@ -1569,7 +1569,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
     ) -> None:
         """
         Test /v1/models endpoint returns OpenAI-compatible response.
-        This endpoint is required for sgl-model-gateway router compatibility.
         """
         base_url = f"http://localhost:{ctx.port}"
 

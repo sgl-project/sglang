@@ -1220,11 +1220,6 @@ class LoRAPipeline(ComposedPipelineBase):
             first_effective_merge_weights = self._should_merge_lora_for_layers(
                 first_module_name, first_lora_layers_dict, merge_mode
             )
-            if not first_effective_merge_weights and len(tgt_nicknames) > 1:
-                raise ValueError(
-                    "Dynamic LoRA currently supports only one adapter per target. "
-                    "Use merge_mode='merge' for multiple adapters."
-                )
 
             merge_weights_by_module = {}
             for module_name, lora_layers_dict in target_modules:
@@ -1245,7 +1240,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     # auto already kept this adapter unmerged; that state matches
                     and not (
                         merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,
@@ -1279,7 +1273,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     if (
                         effective_merge_weights
                         and merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,
@@ -1541,7 +1534,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         if layer.merged:
                             layer.unmerge_lora_weights()
                         layer.disable_lora = False
-                        layer.strength = strength
+                        layer.set_dynamic_strength(strength)
                     self.is_lora_merged[module_name] = False
                     self._record_merge_strength(module_name, strength)
                     logger.info(

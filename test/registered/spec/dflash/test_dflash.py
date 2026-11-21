@@ -145,12 +145,17 @@ class TestDFlashServerPage256(TestDFlashServerBase):
         assert self.process.poll() is None
 
 
+class TestDFlashServerPage256OverlapHeadroom4(TestDFlashServerPage256):
+    disable_overlap = False
+    extra_env_overrides = ((envs.SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES, 4),)
+
+
 class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
     other_launch_args = ["--chunked-prefill-size", "4"]
 
 
 class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
-    other_launch_args = ["--disable-cuda-graph"]
+    other_launch_args = ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
 
 
 class TestDFlashServerOverlap(TestDFlashServerBase):

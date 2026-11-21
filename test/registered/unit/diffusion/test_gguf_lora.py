@@ -219,11 +219,21 @@ class TestGGUFLoRA(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "dynamic"):
             pipeline.set_lora("second", merge_mode="merge")
         torch.testing.assert_close(wrapper(x)[0], expected)
-        with self.assertRaisesRegex(ValueError, "one adapter"):
-            pipeline.set_lora(
-                ["first", "second"], lora_path=[None, None], merge_mode="dynamic"
+        pipeline.set_lora(
+            ["first", "second"],
+            lora_path=[None, None],
+            merge_mode="dynamic",
+            strength=[0.4, -0.3],
+        )
+        both = baseline + sum(
+            2 * strength * (x @ adapter["proj.lora_A"].T @ adapter["proj.lora_B"].T)
+            for adapter, strength in (
+                (pipeline.lora_adapters["first"], 0.4),
+                (pipeline.lora_adapters["second"], -0.3),
             )
-        torch.testing.assert_close(wrapper(x)[0], expected)
+        )
+        torch.testing.assert_close(wrapper(x)[0], both)
+        torch.testing.assert_close(base.qweight, before, atol=0, rtol=0)
 
     def test_merge_rejected_before_adapter_or_storage_mutation(self):
         base = _layer()

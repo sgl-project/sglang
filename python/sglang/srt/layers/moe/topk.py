@@ -35,62 +35,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-if TYPE_CHECKING:
-    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
-
-from sglang.srt.configs.shared_experts import SharedExpertsConfig
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_flags,
-    get_forward,
-    get_lora,
-    get_model,
-    get_parallel,
-    get_server_args,
-)
-
-try:
-    from triton_kernels.tensor import make_ragged_tensor_metadata
-    from triton_kernels.topk import topk as triton_kernels_topk
-
-    def routing(
-        logits,
-        n_expts_act,
-        sm_first=False,
-        expt_indx=None,
-        simulated_ep=1,
-        n_rows=None,
-    ):
-        if simulated_ep != 1:
-            raise NotImplementedError(
-                "simulated_ep routing is not supported with triton_kernels"
-            )
-
-        if sm_first:
-            logits = torch.softmax(logits, dim=-1)
-
-        sparse_logits = triton_kernels_topk(
-            logits,
-            n_expts_act,
-            apply_softmax=not sm_first,
-            y_indx=expt_indx,
-            n_rows=n_rows,
-        )
-        dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
-        combine_indx = sparse_logits.mask_metadata.col_sorted_indx
-        gather_indx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
-        scatter_indx = combine_indx
-        ragged_metadata = make_ragged_tensor_metadata(
-            sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
-        )
-        gate_scal = sparse_logits.vals.flatten()[combine_indx]
-        return ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act
-
-except ImportError:
-    pass
-
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -116,6 +63,15 @@ from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_lora,
+    get_model,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -124,6 +80,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -141,6 +98,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
+_is_gfx942 = is_gfx942_supported()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -195,8 +153,11 @@ def _use_rocm_triton_softmax_topk(
 
 _use_aiter_topk_gating = not envs.SGLANG_ROCM_DISABLE_AITER_TOPK_GATING.get()
 
-# Above this, topk_gating is slower than fused_topk on GPU time.
+# Above this, topk_gating is slower than fused_topk on GPU time. On gfx942 aiter's
+# shared-memory kernel (used above 1024 rows) already loses: 17.0 vs 13.5 us at 4096
+# rows, while the E=512 kernel wins at 1024 (6.5 vs 10.8 us).
 _AITER_TOPK_GATING_MAX_ROWS = 4096
+_AITER_TOPK_GATING_MAX_ROWS_GFX942 = 1024
 
 
 def _use_aiter_topk_gating_softmax(
@@ -208,19 +169,22 @@ def _use_aiter_topk_gating_softmax(
     packed_out: Optional[torch.Tensor],
 ) -> bool:
     # fused_topk has no ASM router for (512, 10); topk_gating has an E=512
-    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8) and 2560
-    # (Qwen3.8-Flash-Next) limit this to those two models.
+    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8), 2560
+    # (Qwen3.8-Flash-Next) and 4096 (Qwen3.5-397B-A17B) limit this to those models.
+    max_rows = (
+        _AITER_TOPK_GATING_MAX_ROWS if _is_gfx95 else _AITER_TOPK_GATING_MAX_ROWS_GFX942
+    )
     return (
         _use_aiter
         and _use_aiter_topk_gating
-        and _is_gfx95
-        and hidden_states.shape[1] in (2560, 8192)
+        and (_is_gfx95 or _is_gfx942)
+        and hidden_states.shape[1] in (2560, 4096, 8192)
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[1] == 512
         and gating_output.dtype == torch.bfloat16
         and topk == 10
         and gating_output.is_contiguous()
-        and gating_output.shape[0] <= _AITER_TOPK_GATING_MAX_ROWS
+        and gating_output.shape[0] <= max_rows
         and correction_bias is None
         and num_fused_shared_experts == 0
         and packed_out is None
@@ -362,12 +326,6 @@ class TopKOutputChecker:
         return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
-    def format_is_triton_kernels(
-        topk_output: TopKOutput,
-    ) -> TypeGuard[TritonKernelTopKOutput]:
-        return isinstance(topk_output, TritonKernelTopKOutput)
-
-    @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
         return isinstance(topk_output, BypassedTopKOutput)
 
@@ -378,7 +336,6 @@ class TopKOutputChecker:
 
 class TopKOutputFormat(IntEnum):
     STANDARD = auto()
-    TRITON_KERNEL = auto()
     BYPASSED = auto()
     PACKED = auto()
 
@@ -416,20 +373,6 @@ class StandardTopKOutputPacked(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
-
-
-class TritonKernelTopKOutput(NamedTuple):
-    """Triton kernel top-k output format."""
-
-    a_ragged_metadata: RaggedTensorMetadata
-    gather_indx: torch.Tensor
-    scatter_indx: torch.Tensor
-    gate_scal: torch.Tensor
-    n_expts_act: int
-
-    @property
-    def format(self) -> TopKOutputFormat:
-        return TopKOutputFormat.TRITON_KERNEL
 
 
 class BypassedTopKOutput(NamedTuple):
@@ -846,9 +789,7 @@ class TopK(BaseFusedOp):
         )
         if self.topk_config.output_format is not None:
             return
-        if runner_backend is not None and runner_backend.is_triton_kernels():
-            output_format = TopKOutputFormat.TRITON_KERNEL
-        elif runner_backend is not None and (
+        if runner_backend is not None and (
             runner_backend.is_flashinfer_trtllm()
             and _can_bypass_trtllm_routing(self.topk_config)
             or runner_backend.is_flashinfer_mxfp4()
@@ -948,12 +889,6 @@ class TopK(BaseFusedOp):
             or is_expert_remapping_enabled()
             or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
         )
-        if output_format == TopKOutputFormat.TRITON_KERNEL and requires_remapping:
-            raise NotImplementedError(
-                "Expert placement remapping requires a MoE runner with standard TopK routing; "
-                f"got {output_format.name}."
-            )
-
         if (
             router_logits_partials is not None
             and output_format != TopKOutputFormat.STANDARD
@@ -961,28 +896,7 @@ class TopK(BaseFusedOp):
             rocm_router_reduce_partials(router_logits_partials, router_logits)
             router_logits_partials = None
 
-        if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # renormalize=True is equivalent to sm_first=False
-            (
-                a_ragged_metadata,
-                gather_idx,
-                scatter_idx,
-                gate_scal,
-                n_expts_act,
-            ) = routing(
-                router_logits,
-                self.topk_config.top_k,
-                sm_first=not self.topk_config.renormalize,
-                n_rows=num_token_non_padded,
-            )
-            return TritonKernelTopKOutput(
-                a_ragged_metadata,
-                gather_idx,
-                scatter_idx,
-                gate_scal,
-                n_expts_act,
-            )
-        elif output_format == TopKOutputFormat.BYPASSED:
+        if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 raw_router_logits=router_logits,
@@ -2006,6 +1920,8 @@ def _mask_topk_ids_padded_region(
     fill_value: int = -1,
 ) -> None:
     if num_token_non_padded is None:
+        return
+    if topk_ids.shape[0] == 0:
         return
     if not topk_ids.is_cuda:
         if _is_npu:

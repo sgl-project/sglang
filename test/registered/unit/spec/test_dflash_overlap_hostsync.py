@@ -19,7 +19,10 @@ _HAS_CUDA = torch.cuda.is_available()
 
 def _compact_lens_exact(seq_lens, window, page):
     fake_self = SimpleNamespace(
-        device=seq_lens.device, draft_window_size=window, page_size=page
+        device=seq_lens.device,
+        draft_window_size=window,
+        page_size=page,
+        _draft_compact_page_size=page,
     )
     from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -27,7 +30,9 @@ def _compact_lens_exact(seq_lens, window, page):
 
 
 def _compact_lens_host(seq_lens, window, page):
-    fake_self = SimpleNamespace(draft_window_size=window, page_size=page)
+    fake_self = SimpleNamespace(
+        draft_window_size=window, page_size=page, _draft_compact_page_size=page
+    )
     out = torch.empty(seq_lens.numel(), dtype=torch.int32)
     from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -52,7 +57,9 @@ class TestCompactSeqLensHostBound(CustomTestCase):
 
         seq = torch.arange(16385)
         for page in (1, 64):
-            worker = SimpleNamespace(draft_window_size=2048, page_size=page)
+            worker = SimpleNamespace(
+                draft_window_size=2048, page_size=page, _draft_compact_page_size=page
+            )
             bound = torch.empty(seq.numel(), dtype=torch.int32)
             DFlashWorkerV2._fill_compact_seq_lens_cpu_bound(
                 worker, batch_seq_lens_cpu=None, nxt_kv_lens_cpu=None, out=bound

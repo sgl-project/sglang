@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -55,7 +56,7 @@ NO_EXTRAS = dict.fromkeys(
 )
 
 
-class _StreamedReq:
+class _StreamedReq(FakeReq):
     """A request as `SchedulerOutputStreamer` reads it, in either egress mode:
     retracted, waiting on the cache and verifying drafts as the arguments say."""
 
@@ -392,7 +393,9 @@ def build_rust_frame_metadata_fixture() -> dict:
                 send_to_detokenizer=send_to_detokenizer,
                 tree_cache=None,
                 server_args=SimpleNamespace(
-                    enable_hierarchical_cache=False, enable_lmcache=False
+                    enable_hierarchical_cache=False,
+                    enable_lmcache=False,
+                    enable_unified_cache_external_linker=False,
                 ),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.EAGLE,
@@ -667,7 +670,14 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module,
             "get_serving",
-            return_value=SimpleNamespace(host="::", port=30000),
+            return_value=SimpleNamespace(
+                host="::", port=30000, warmups=None, api_key=None
+            ),
+        ),
+        patch.object(
+            server_module,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="null"),
         ),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
@@ -1082,9 +1092,7 @@ class TestRustServerExtension(CustomTestCase):
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
 
-        req = SimpleNamespace(
-            origin_input_ids=[1, 2, 3], cached_tokens=2, reasoning_tokens=1
-        )
+        req = FakeReq(origin_input_ids=[1, 2, 3], cached_tokens=2, reasoning_tokens=1)
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
         scheduler = SimpleNamespace(
@@ -1103,6 +1111,7 @@ class TestRustServerExtension(CustomTestCase):
         scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
+        req.send_via = None  # The same request, sent again by the other path.
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req
