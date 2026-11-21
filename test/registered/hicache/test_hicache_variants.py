@@ -96,7 +96,11 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
 
     model_name = DEFAULT_TARGET_MODEL_EAGLE3
     needs_tokenizer = True
-    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
+    server_env = {
+        "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+        # The EAGLE3 draft derives a shorter context than the target.
+        "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+    }
     hicache_args = [
         "--enable-hierarchical-cache",
         "--hicache-ratio",

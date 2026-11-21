@@ -22,8 +22,8 @@ class TestCalcRelDiff:
 
     def test_zero_vectors(self) -> None:
         z: torch.Tensor = torch.zeros(5)
-        # 0 / 0 gives NaN; the case only has to not raise.
-        _calc_rel_diff(z, z)
+        # Identical all-zero tensors must report no diff, not NaN or a full diff.
+        assert _calc_rel_diff(z, z).item() == 0.0
 
 
 class TestArgmaxCoord:
