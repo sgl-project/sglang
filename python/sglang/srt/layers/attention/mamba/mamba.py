@@ -631,68 +631,68 @@ class MambaMixer2(torch.nn.Module):
             # NOTE: final output is an in-place update of out tensor
             if is_cpu():
                 cpu_scan_ret = mamba_chunk_scan_combined_cpu(
-                        hidden_states_p.view(
-                            1, num_prefill_tokens, local_num_heads, self.head_dim
-                        ),
-                        dt_p.unsqueeze(0),
-                        self.A,
-                        B_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                        C_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                        chunk_size=mixed_metadata.chunk_size,
-                        D=self.D,
-                        z=None,
-                        dt_bias=self.dt_bias,
-                        seq_idx=mixed_metadata.seq_idx,
-                        chunk_indices=mixed_metadata.chunk_indices,
-                        chunk_offsets=mixed_metadata.chunk_offsets,
-                        cu_seqlens=query_start_loc_p,
-                        initial_states=initial_states,
-                        return_varlen_states=True,
-                        return_final_states=False,
-                        return_track_states=True,
-                        track_seq_idx=metadata.track_ssm_seq_idx,
-                        track_end_locs=metadata.track_ssm_end_locs,
-                        dt_softplus=True,
-                        dt_limit=(0.0, float("inf")),
-                        out=preallocated_ssm_out_p.view(
-                            1, num_prefill_tokens, -1, self.head_dim
-                        ),
-                        state_dtype=ssm_state.dtype,
-                    )
+                    hidden_states_p.view(
+                        1, num_prefill_tokens, local_num_heads, self.head_dim
+                    ),
+                    dt_p.unsqueeze(0),
+                    self.A,
+                    B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    chunk_size=mixed_metadata.chunk_size,
+                    D=self.D,
+                    z=None,
+                    dt_bias=self.dt_bias,
+                    seq_idx=mixed_metadata.seq_idx,
+                    chunk_indices=mixed_metadata.chunk_indices,
+                    chunk_offsets=mixed_metadata.chunk_offsets,
+                    cu_seqlens=query_start_loc_p,
+                    initial_states=initial_states,
+                    return_varlen_states=True,
+                    return_final_states=False,
+                    return_track_states=True,
+                    track_seq_idx=metadata.track_ssm_seq_idx,
+                    track_end_locs=metadata.track_ssm_end_locs,
+                    dt_softplus=True,
+                    dt_limit=(0.0, float("inf")),
+                    out=preallocated_ssm_out_p.view(
+                        1, num_prefill_tokens, -1, self.head_dim
+                    ),
+                    state_dtype=ssm_state.dtype,
+                )
                 intermediate_states, varlen_state, track_states = cast(
                     Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
                     cpu_scan_ret,
                 )
             else:
                 triton_scan_ret = mamba_chunk_scan_combined(
-                        hidden_states_p.view(
-                            1, num_prefill_tokens, local_num_heads, self.head_dim
-                        ),
-                        dt_p.unsqueeze(0),
-                        self.A,
-                        B_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                        C_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                        chunk_size=mixed_metadata.chunk_size,
-                        D=self.D,
-                        z=None,
-                        dt_bias=self.dt_bias,
-                        seq_idx=mixed_metadata.seq_idx,
-                        chunk_indices=mixed_metadata.chunk_indices,
-                        chunk_offsets=mixed_metadata.chunk_offsets,
-                        cu_seqlens=query_start_loc_p,
-                        initial_states=initial_states,
-                        return_varlen_states=True,
-                        return_final_states=False,
-                        return_track_states=True,
-                        track_seq_idx=metadata.track_ssm_seq_idx,
-                        track_end_locs=metadata.track_ssm_end_locs,
-                        dt_softplus=True,
-                        dt_limit=(0.0, float("inf")),
-                        out=preallocated_ssm_out_p.view(
-                            1, num_prefill_tokens, -1, self.head_dim
-                        ),
-                        state_dtype=ssm_state.dtype,
-                    )
+                    hidden_states_p.view(
+                        1, num_prefill_tokens, local_num_heads, self.head_dim
+                    ),
+                    dt_p.unsqueeze(0),
+                    self.A,
+                    B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                    chunk_size=mixed_metadata.chunk_size,
+                    D=self.D,
+                    z=None,
+                    dt_bias=self.dt_bias,
+                    seq_idx=mixed_metadata.seq_idx,
+                    chunk_indices=mixed_metadata.chunk_indices,
+                    chunk_offsets=mixed_metadata.chunk_offsets,
+                    cu_seqlens=query_start_loc_p,
+                    initial_states=initial_states,
+                    return_varlen_states=True,
+                    return_final_states=False,
+                    return_track_states=True,
+                    track_seq_idx=metadata.track_ssm_seq_idx,
+                    track_end_locs=metadata.track_ssm_end_locs,
+                    dt_softplus=True,
+                    dt_limit=(0.0, float("inf")),
+                    out=preallocated_ssm_out_p.view(
+                        1, num_prefill_tokens, -1, self.head_dim
+                    ),
+                    state_dtype=ssm_state.dtype,
+                )
                 intermediate_states, varlen_state, track_states = cast(
                     Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
                     triton_scan_ret,

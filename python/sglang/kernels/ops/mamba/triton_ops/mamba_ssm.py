@@ -435,8 +435,6 @@ def selective_state_update(
             z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
-    if out is None:
-        out = torch.empty_like(x)
     if out.dim() == 2:
         out = out.unsqueeze(1)
     if out.dim() == 3:
