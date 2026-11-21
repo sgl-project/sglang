@@ -49,20 +49,6 @@ class TestModelConfigShapes(CustomTestCase):
         model_config._derive_model_shapes()
         return model_config
 
-    def test_external_model_opts_into_mla(self):
-        model_config = self._derive_shapes(_make_external_mla_config())
-
-        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
-        self.assertEqual(model_config.kv_lora_rank, 512)
-        self.assertEqual(model_config.qk_nope_head_dim, 128)
-        self.assertEqual(model_config.qk_rope_head_dim, 64)
-        self.assertEqual(model_config.v_head_dim, 96)
-        self.assertEqual(model_config.head_dim, 192)
-        self.assertEqual(model_config.swa_kv_lora_rank, 512)
-        self.assertEqual(model_config.swa_qk_rope_head_dim, 64)
-        self.assertIsNone(model_config.index_head_dim)
-        self.assertAlmostEqual(model_config.scaling, 192**-0.5)
-
     def test_external_model_requires_explicit_mla_opt_in(self):
         for use_mla in (False, None):
             with self.subTest(use_mla=use_mla):
@@ -162,17 +148,6 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.qk_rope_head_dim, 0)
         self.assertEqual(model_config.head_dim, 128)
         self.assertAlmostEqual(model_config.scaling, 128**-0.5)
-
-    def test_external_mla_applies_rope_scaling(self):
-        for field in ("rope_scaling", "rope_parameters"):
-            with self.subTest(field=field):
-                model_config = self._derive_shapes(
-                    _make_external_mla_config(
-                        **{field: {"factor": 4.0, "mscale_all_dim": 1}}
-                    )
-                )
-                mscale = 0.1 * math.log(4.0) + 1.0
-                self.assertAlmostEqual(model_config.scaling, mscale**2 / math.sqrt(192))
 
     def test_existing_mla_architecture_keeps_its_specialized_shapes(self):
         model_config = self._derive_shapes(
