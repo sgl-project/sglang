@@ -174,6 +174,16 @@ class SiluAndMul(BaseFusedOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_mps(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.activation.silu_and_mul_mps import (
+            silu_and_mul_mps,
+            silu_and_mul_mps_supported,
+        )
+
+        if silu_and_mul_mps_supported(x):
+            return silu_and_mul_mps(x)
+        return self.forward_native(x)
+
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             return self.forward_native(x)
