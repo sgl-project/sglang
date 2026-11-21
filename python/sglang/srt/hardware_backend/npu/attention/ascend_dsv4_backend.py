@@ -2530,6 +2530,8 @@ class DeepseekV4AscendAttnBackend(
     CompressorAscendBackendMixin,
     LowRatioCompressAscendBackendMixin,
 ):
+    supports_prefill_cuda_graph_max_context_size = True
+
     _DSV4_CP_LOCAL_FIELDS = (
         "actual_seq_lengths_q",
         "actual_seq_lengths_q_pa",
@@ -4120,6 +4122,7 @@ class DeepseekV4AscendAttnBackend(
             backend=self,
             seed=self.forward_metadata,
             num_tokens=int(forward_batch.positions.shape[0]),
+            max_context_len=forward_batch.max_seq_len_override,
         ).metadata
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
