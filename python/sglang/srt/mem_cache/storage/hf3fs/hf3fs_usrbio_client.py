@@ -3,6 +3,7 @@ import logging
 import multiprocessing
 import os
 import threading
+import time
 from functools import wraps
 from pathlib import Path
 from typing import List
@@ -157,35 +158,56 @@ class Hf3fsUsrBioClient(Hf3fsClient):
     def batch_write(self, offsets: List[int], tensors: List[torch.Tensor]) -> List[int]:
         self.check(offsets, tensors)
         results = [0] * len(offsets)
-        # prepare
-        hf3fs_utils.write_shm(tensors, self.shm_w_tensor)
+        # Copy, prepare and submit page by page so the copy of page i+1 overlaps
+        # the I/O of page i; 3FS may start an I/O as soon as it is prepared.
+        # check() bounds the batch by `entries`, so every page has its own ring
+        # slot and shm region and nothing has to complete before the last prepare.
+        num_prepared = 0
         current = 0
-        for offset, tensor in zip(offsets, tensors):
-            size = tensor.numel() * tensor.itemsize
-            try:
-                self.ior_w.prepare(
-                    self.iov_w[current : current + size], False, self.file, offset
-                )
-                current += size
-            except Exception as e:
-                logger.error(f"Error preparing batch write: {e}")
-                return results
-
-        # submit
-        ionum = len(offsets)
         try:
-            resv = self.ior_w.submit().wait(
-                min_results=ionum,
-                timeout=datetime.timedelta(seconds=self.client_timeout),
-            )
+            for offset, tensor in zip(offsets, tensors):
+                size = tensor.numel() * tensor.itemsize
+                hf3fs_utils.write_shm(
+                    [tensor], self.shm_w_tensor[current : current + size]
+                )
+                self.ior_w.prepare(
+                    self.iov_w[current : current + size],
+                    False,
+                    self.file,
+                    offset,
+                    userdata=num_prepared,
+                )
+                num_prepared += 1
+                self.ior_w.submit()
+                current += size
         except Exception as e:
-            logger.error(f"Error submitting batch write: {e}")
-            return results
+            logger.error(f"Error preparing batch write: {e}")
 
-        # results
-        results = [res.result for res in resv]
-
+        self._wait_all(self.ior_w, num_prepared, results, "write")
         return results
+
+    def _wait_all(self, ior, num_ios: int, results: List[int], op: str) -> None:
+        # Returning with I/O in flight would let the next call overwrite its shm
+        # region and ring slot, so wait out every prepared I/O, even past the timeout.
+        # Completions arrive in completion order; userdata is the page index.
+        timeout = datetime.timedelta(seconds=self.client_timeout)
+        done = 0
+        while done < num_ios:
+            try:
+                resv = ior.wait(min_results=num_ios - done, timeout=timeout)
+            except Exception as e:
+                logger.error(f"Error waiting for batch {op}: {e}")
+                resv = []
+                # Avoid a hot loop if wait() fails immediately.
+                time.sleep(0.1)
+            for res in resv:
+                results[res.userdata] = res.result
+            done += len(resv)
+            if done < num_ios:
+                logger.warning(
+                    f"[Hf3fsUsrBioClient] batch {op}: {num_ios - done} I/O(s) "
+                    f"still outstanding after {self.client_timeout}s, waiting"
+                )
 
     def check(self, offsets: List[int], tensors: List[torch.Tensor]) -> None:
         sizes = [t.numel() * t.itemsize for t in tensors]
