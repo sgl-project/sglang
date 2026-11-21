@@ -125,7 +125,13 @@ def _mamba_chunk_scan_combined_fwd(
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
     dA_cumsum, dt = _chunk_cumsum_fwd(
-        dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
+        dt,
+        A,
+        chunk_size,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        sanitize_nonfinite=seq_idx is not None,
     )
 
     # 2. Compute the state for each intra-chunk

@@ -67,6 +67,7 @@ def _chunk_cumsum_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr = 16,
+    SANITIZE_NONFINITE: tl.constexpr = False,
 ):
     pid_b = tl.program_id(axis=0)
 
@@ -116,6 +117,15 @@ def _chunk_cumsum_fwd_kernel(
         mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size),
     )
     A = tl.load(A_ptrs, mask=offs_h < nheads, other=0.0).to(tl.float32)
+    if SANITIZE_NONFINITE:
+        # With packed sequences the cumsum below runs over the whole chunk, so one
+        # request's non-finite dt would make the dA_cumsum of every later token in
+        # the chunk, including other requests', non-finite. Leave it out of the
+        # cumsum. dt_out above keeps the original dt, so a request's own non-finite
+        # dt still shows up where dt is used as a multiplier. This selects on dt, not
+        # on the product dt * A, so the arithmetic for finite values is unchanged
+        # (a select between the multiply and the cumsum would stop them fusing).
+        dt = tl.where(tl.abs(dt) < float("inf"), dt, 0.0)
     dA = dt * A[:, None]
     dA_cs = tl.cumsum(dA, axis=1)
     tl.store(
@@ -338,6 +348,15 @@ def _chunk_state_fwd_kernel(
             scale = tl.where(
                 seq_idx_k == seq_idx_last, tl.exp(dA_cs_last - dA_cs_k) * dt_k, 0.0
             )
+            # This chunk's state belongs to the sequence at its last position. The
+            # rows of any other sequence have scale 0, but 0 * inf (or 0 * nan) is
+            # still nan, and tl.dot would sum it into every output. Zero those rows
+            # of x and b themselves. The owning sequence's rows are untouched, so
+            # its own non-finite input still shows up in its state, and for a chunk
+            # of a single sequence this is a no-op.
+            owned = seq_idx_k == seq_idx_last
+            x = tl.where(owned[None, :], x, 0.0)
+            b = tl.where(owned[:, None], b, 0.0)
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
         acc += tl.dot(x, b)
@@ -632,7 +651,13 @@ def _chunk_state_varlen_kernel(
 
 
 def _chunk_cumsum_fwd(
-    dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
+    dt,
+    A,
+    chunk_size,
+    dt_bias=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    sanitize_nonfinite=False,
 ):
     batch, seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
@@ -679,6 +704,7 @@ def _chunk_cumsum_fwd(
             dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+            SANITIZE_NONFINITE=sanitize_nonfinite,
         )
     return dA_cumsum, dt_out
 
