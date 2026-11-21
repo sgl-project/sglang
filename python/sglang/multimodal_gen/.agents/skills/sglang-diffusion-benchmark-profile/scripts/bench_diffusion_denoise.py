@@ -533,7 +533,7 @@ MODELS = {
         ],
     },
     "stable-diffusion-3.5-medium": {
-        "path": "stabilityai/stable-diffusion-3.5-medium-diffusers",
+        "path": "stabilityai/stable-diffusion-3.5-medium",
         "prompt": "A red panda reading a book beside a sunlit window.",
         "extra_args": [
             "--width=1024",

@@ -11,7 +11,7 @@ import time
 import weakref
 from collections import defaultdict
 from functools import lru_cache
-from typing import Union
+from typing import Callable, Union
 
 import torch
 
@@ -481,20 +481,36 @@ def _uses_hip_owned_host_memory(
     )
 
 
-def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    # Not torch pin_memory: its host allocator rounds each block up to a power of
-    # two, so a 180 GB pool would pin 256 GiB of GTT.
+def alloc_owned_host_tensor(
+    dims: tuple,
+    dtype: torch.dtype,
+    alloc: Callable[[int], int],
+    free: Callable[[int], None],
+) -> torch.Tensor:
+    """A host tensor over ``alloc(nbytes)`` memory, released by ``free(ptr)``.
+
+    Unlike torch pin_memory, whose host allocator rounds each block up to a
+    power of two, the allocation has exactly the tensor's size.
+    """
     numel = math.prod(dims)
     nbytes = numel * dtype.itemsize
-    ptr = _hip_host_malloc(nbytes)
+    ptr = alloc(nbytes)
     try:
         array = (ctypes.c_uint8 * nbytes).from_address(ptr)
         buffer = torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
     except BaseException:
-        _hip_host_free(ptr)
+        free(ptr)
         raise
     # Freed with the tensor's last view; at interpreter exit the driver reclaims it.
-    weakref.finalize(array, _hip_host_free, ptr).atexit = False
+    weakref.finalize(array, free, ptr).atexit = False
+    return buffer
+
+
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory: a 180 GB pool would pin 256 GiB of GTT.
+    buffer = alloc_owned_host_tensor(
+        dims=dims, dtype=dtype, alloc=_hip_host_malloc, free=_hip_host_free
+    )
     # Not host-registered, so HostKVCache.destroy() must not cudaHostUnregister it.
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer

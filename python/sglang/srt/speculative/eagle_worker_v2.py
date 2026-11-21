@@ -5,7 +5,6 @@ from typing import Callable, List, Optional
 
 import torch
 
-from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -99,6 +98,7 @@ from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
     build_eagle_verify_input,
+    check_draft_branch_tail_copy,
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
@@ -108,7 +108,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_sample,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -117,6 +116,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     simulated_acc_len_generator,
     spec_stage_span,
+    use_fused_draft_sample,
 )
 from sglang.srt.utils.async_probe import (
     maybe_assert_async,
@@ -200,6 +200,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
+        # Decided in alloc_memory_pool, once init_lm_head has fixed the draft logits width.
+        self.use_fused_draft_sample = False
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -245,6 +247,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        self.target_embed_and_head_shared = False
+        self._maybe_share_embed_before_pool_sizing()
+
+    def _maybe_share_embed_before_pool_sizing(self):
+        """Under embedding replication the draft loads its own full embedding table on
+        every rank. Share the target's now, so that copy is freed before the scheduler
+        sizes the KV pool instead of after."""
+        if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+            self._share_target_embed_and_head()
+
+    def _share_target_embed_and_head(self):
+        self.init_token_map()
+        self.init_lm_head()
+        self.target_embed_and_head_shared = True
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -259,9 +276,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        check_draft_branch_tail_copy(
+            self.draft_runner.token_to_kv_pool, self.topk, get_schedule().page_size
+        )
+        if not self.target_embed_and_head_shared:
+            self._share_target_embed_and_head()
         self._init_draft_probs_vocab_scatter()
+        # The draft samples over its own logits: a hot-token map narrows them below the
+        # target vocabulary, to widths the fused kernel may not take.
+        self.use_fused_draft_sample = (
+            get_spec().speculative_use_rejection_sampling
+            and use_fused_draft_sample(self.draft_probs_vocab_size)
+        )
 
         if get_spec().speculative_use_rejection_sampling:
             if (
@@ -710,11 +736,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
         )
+        # A rank-local eager fallback can deadlock draft MoE collectives
+        # across attention-DP ranks.
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
+            and not get_parallel().attn_dp_enabled
         ):
             can_run_decode_cuda_graph = False
         self.draft_runtime.begin_draft_round(
@@ -924,6 +953,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         sampling_seed=forward_batch.sampling_info.sampling_seed,
                         positions=forward_batch.positions + 1,
                         draft_step=i + 1,
+                        fused=self.use_fused_draft_sample,
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
@@ -1168,19 +1198,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(
-                probs,
-                num_samples=1,
+            probs, topk_p, topk_index = sample_draft_proposal(
+                logits_output.next_token_logits,
+                batch.sampling_info.temperatures,
+                # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                batch.sampling_info.top_ks if self.use_fused_draft_sample else None,
                 sampling_seed=batch.sampling_info.sampling_seed,
                 positions=batch.seq_lens,
+                fused=self.use_fused_draft_sample,
             )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits, batch.sampling_info, False
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1352,6 +1383,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     batch.sampling_info.top_ks,
                     sampling_seed=batch.sampling_info.sampling_seed,
                     positions=batch_result.new_seq_lens,
+                    fused=self.use_fused_draft_sample,
                 )
             if self.topk == 1 and _is_hip:
                 ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
@@ -1360,14 +1392,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             elif self.topk == 1:
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
-                if envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.get():
-                    ret_topk_index = sampling_argmax(
-                        draft_logits_output.next_token_logits
-                    ).unsqueeze(-1)
-                else:
-                    ret_topk_index = torch.argmax(
-                        draft_logits_output.next_token_logits, dim=-1, keepdim=True
-                    )
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
                 ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
@@ -1534,8 +1561,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
-        if envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
-            self._post_verify_graphs.enable_pool_presize()
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
