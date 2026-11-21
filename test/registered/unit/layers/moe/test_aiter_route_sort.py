@@ -104,7 +104,7 @@ def _patch_cfg_api(lookup):
     )
 
 
-def _route(consumer, m, registrations):
+def _route(consumer, m, registrations, tail_fits=True):
     """One routing call of a layer that staged consumer, with the kernel stubbed."""
     ids = torch.zeros((m, TOPK), dtype=torch.int32)
     weights = torch.zeros((m, TOPK))
@@ -116,6 +116,9 @@ def _route(consumer, m, registrations):
         patch.object(route_sort, "get_buffer", return_value=sort_ws),
         patch.object(
             route_sort.moe_route_radix4, "route_radix4_with_sort", route_with_sort
+        ),
+        patch.object(
+            route_sort.moe_route_radix4, "sort_tail_fits", return_value=tail_fits
         ),
         route_sort.scope(consumer),
     ):
@@ -221,8 +224,7 @@ class TestSortTailResidency(CustomTestCase):
     def test_routing_declines_without_launching_when_the_tail_cannot_fit(self):
         consumer = aiter_route_sort.AiterRouteSortConsumer()
         consumer.takes_sort = lambda m: True
-        with self._device_with(8):
-            hit, launches = _route(consumer, 1024, [])
+        hit, launches = _route(consumer, 1024, [], tail_fits=False)
         self.assertIsNone(hit)
         self.assertEqual(launches, 0)
 
