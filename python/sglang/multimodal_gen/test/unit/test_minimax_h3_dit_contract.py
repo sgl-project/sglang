@@ -699,7 +699,7 @@ def test_npu_falls_back_from_pipelined_attention(monkeypatch):
     from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformBase
 
     monkeypatch.setattr(envs, "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", 2)
-    monkeypatch.setattr(platforms, "current_platform", NPUPlatformBase())
+    monkeypatch.setattr(platforms, "_current_platform", NPUPlatformBase())
     monkeypatch.setattr(
         parallel_state, "get_sp_group", lambda: SimpleNamespace(ulysses_group=object())
     )
