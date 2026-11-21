@@ -141,6 +141,12 @@ def prepare_mha_write_back_staging(
 
 
 class MHATokenToKVPoolHost(HostKVCache):
+    @property
+    def storage_format_tag(self) -> str:
+        # These layouts flatten a page in the same layer/token/head order.
+        layout = "layer_first" if self.layout == "page_first_direct" else self.layout
+        return f"mha-{layout}-v1"
+
     def __init__(
         self,
         buffer_info: MHABufferInfo,
