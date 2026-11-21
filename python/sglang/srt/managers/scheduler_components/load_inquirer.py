@@ -143,6 +143,12 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        # A chunked request is in no queue, so count the part of its prompt not yet
+        # in num_used_tokens; prefix_len lags the chunk just run until the next pass.
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            held = max(chunked_req.prefix_len, chunked_req.kv.kv_allocated_len)
+            num_total_tokens += max(0, chunked_req.seqlen - held)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
