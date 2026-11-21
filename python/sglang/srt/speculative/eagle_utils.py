@@ -1188,21 +1188,7 @@ def eagle_sample(
     # name no longer flips semantics mid-function (naming doc C2).
     if accept_lens is None:
         accept_lens = num_correct_drafts + 1
-    if watermark is not None:
-        watermark.record(accept_index, accept_lens)
     return predict, accept_lens, accept_index
-
-
-def commit_accept_tokens_to_penalties(
-    sampling_info: SamplingBatchInfo,
-    predict: torch.Tensor,
-    accept_index: torch.Tensor,
-) -> None:
-    if sampling_info.step_penalties is not None:
-        # Guarded here: building the arguments launches device work.
-        sampling_info.step_penalties.commit(
-            predict[accept_index.clamp(min=0)], accept_mask=accept_index >= 0
-        )
 
 
 def _chain_accept_applies(

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 
 def _as_signed_int32(value: int) -> int:
@@ -195,15 +196,6 @@ class GumbelEngine:
             return None
         return GumbelVerify(self.state, rows, full_mask)
 
-    def append_accept_tokens(
-        self,
-        rows: GumbelRows,
-        req_pool_indices: torch.Tensor,
-        accept_tokens: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> None:
-        self.state.append_speculative(req_pool_indices, accept_tokens, accept_lens)
-
     def _prompt_tails(
         self, batch: ScheduleBatch
     ) -> Optional[list[Optional[list[int]]]]:
@@ -366,17 +358,19 @@ class GumbelVerify:
         self._forced = (req_pool_indices, context_hashes, selected)
         return logits, sampling_info
 
-    def record(
-        self, accept_index: Optional[torch.Tensor], accept_lens: torch.Tensor
-    ) -> None:
+    def commit(self, accept: VerifyAccept) -> None:
         req_pool_indices, context_hashes, selected = self._forced
+        accept_index = accept.accept_index
         if accept_index is None:
             assert self._chain_width is not None
             accept_index = torch.arange(
                 selected.numel(), dtype=torch.int32, device=selected.device
             ).view(-1, self._chain_width)
         self.record_speculative(
-            req_pool_indices, context_hashes, selected, accept_index, accept_lens
+            req_pool_indices, context_hashes, selected, accept_index, accept.accept_lens
+        )
+        self.state.append_speculative(
+            req_pool_indices, accept.accept_tokens(), accept.accept_lens
         )
 
     # Provider ABI v2 WatermarkStateView: the state's operations on these rows.

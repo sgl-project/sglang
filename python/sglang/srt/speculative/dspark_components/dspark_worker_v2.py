@@ -26,11 +26,11 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.verify_accept import VerifyAccept, commit_verify_accept
 from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.dflash_utils import commit_block_accept_tokens_to_penalties
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
 )
@@ -1266,8 +1266,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-        commit_block_accept_tokens_to_penalties(
-            batch.sampling_info, accept.out_tokens, accept.commit_lens
+        commit_verify_accept(
+            batch.sampling_info,
+            VerifyAccept(tokens=accept.out_tokens, accept_lens=accept.commit_lens),
+            watermark=watermark,
         )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
@@ -1277,14 +1279,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)
-        if watermark is not None:
-            watermark.record(None, accept.commit_lens)
-            self.target_worker.model_runner.watermark.append_accept_tokens(
-                sampling_info.watermark,
-                batch.req_pool_indices,
-                accept.out_tokens,
-                accept.commit_lens,
-            )
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
         ) or (
