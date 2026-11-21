@@ -7,6 +7,8 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
+from dataclasses import replace
+from itertools import chain
 from queue import Empty, Queue
 
 import numpy as np
@@ -19,6 +21,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_key_identity import (
+    build_linker_unified_layout,
+)
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
@@ -30,8 +35,10 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
+    get_memory,
     get_model,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -40,6 +47,7 @@ device_module = get_device_module()
 
 DEFAULT_LOAD_LAYER_GROUP = 8
 DEFAULT_LOAD_THREADS = 4
+_MAX_BATCH_RANGES = 256 * 1024
 
 
 def _storage_suffix(
@@ -139,6 +147,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        model_name = get_model().model_path
+        unified_layout = None
+        if get_memory().hicache_storage_key_scheme == "unified":
+            unified_layout = build_linker_unified_layout(
+                kvcache,
+                self.pool_group,
+                model_name=get_serving().served_model_name or model_name,
+                params=params,
+            )
+            model_name = unified_layout.model_name
+            self.pools = unified_layout.entries
 
         tp_rank = 0
         tp_size = get_parallel().tp_size
@@ -170,7 +189,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_mla_model=rank_replicated,
             enable_storage_metrics=False,
             is_page_first_layout=False,
-            model_name=get_model().model_path,
+            model_name=model_name,
             extra_config=extra_config,
         )
         if storage is None:
@@ -183,6 +202,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
+        if unified_layout is not None:
+            self.storage.linker_pool_suffixes = unified_layout.suffixes
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
@@ -328,7 +349,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return future
 
     def load_all_layers(self, transfers: list[PoolTransfer]) -> bool:
-        for transfer in transfers:
+        for transfer in chain.from_iterable(self._transfer_batches(transfers)):
             keys, multiplier = self.storage._get_hybrid_page_component_keys(
                 list(transfer.keys), transfer
             )
@@ -345,6 +366,36 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if list(received) != [sum(s) if isinstance(s, list) else s for s in sizes]:
                 return False
         return True
+
+    def _transfer_batches(
+        self, transfers: list[PoolTransfer]
+    ) -> Iterator[list[PoolTransfer]]:
+        # Bound pointer metadata for split-head pages before building it.
+        batch = []
+        for transfer in transfers:
+            entry = self.pools[transfer.name]
+            if entry.packed:
+                batch.append(transfer)
+                continue
+            step = max(1, _MAX_BATCH_RANGES // len(entry.kv_buffer))
+            if len(transfer.keys) <= step:
+                batch.append(transfer)
+                continue
+            for start in range(0, len(transfer.keys), step):
+                end = start + step
+                batch.append(
+                    replace(
+                        transfer,
+                        keys=transfer.keys[start:end],
+                        host_indices=transfer.host_indices[
+                            start * entry.page_size : end * entry.page_size
+                        ],
+                    )
+                )
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
     def cancel_queued_load(self, rid: str) -> bool:
         return self.pending_loads.pop(rid, None) is not None
@@ -503,6 +554,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 group_futures = []
                 futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
+                    entry = self.pools[name]
+                    if not entry.packed:
+                        # Build split-head metadata inside the worker so queued
+                        # reads hold only keys and locations.
+                        objects = len(entry.components)
+                        step = max(1, _MAX_BATCH_RANGES // len(entry.kv_buffer))
+                        for start in range(0, len(locations), step):
+                            group_futures.append(
+                                self.load_io_executor.submit(
+                                    self._get_group_ranges,
+                                    name,
+                                    keys[start * objects : (start + step) * objects],
+                                    locations[start : start + step],
+                                    group,
+                                )
+                            )
+                        continue
                     meta = self._group_range_meta(name, locations, group)
                     if meta is not None:
                         group_futures.extend(self._submit_range_gets(name, keys, *meta))
@@ -527,6 +595,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _get_group_ranges(
+        self, name: PoolName, keys: list[str], locations: np.ndarray, group: range
+    ) -> None:
+        meta = self._group_range_meta(name, locations, group)
+        if meta is not None:
+            self._range_get(name, keys, *meta)
 
     def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
         merged = None
@@ -646,8 +721,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if session_id
                     else None
                 )
-                results = self.storage.batch_set_v2(expanded, extra_info)
-                success = all(all(pool_results) for pool_results in results.values())
+                success = True
+                for batch in self._transfer_batches(expanded):
+                    results = self.storage.batch_set_v2(batch, extra_info)
+                    if not all(all(pool_results) for pool_results in results.values()):
+                        success = False
+                        break
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:

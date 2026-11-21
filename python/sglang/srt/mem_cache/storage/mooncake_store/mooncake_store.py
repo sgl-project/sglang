@@ -468,6 +468,8 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+    linker_pool_suffixes: Mapping[PoolName, list[str]] | None = None
+
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -1065,6 +1067,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
+        if self.linker_pool_suffixes is not None:
+            suffixes = self.linker_pool_suffixes[transfer.name]
+            return [f"{key}_{suffix}" for key in page_keys for suffix in suffixes], len(
+                suffixes
+            )
         if self.unified_suffixes is not None:
             # Rank-suffixed sidecar keys would break the topology-free contract.
             raise NotImplementedError(
