@@ -10,11 +10,12 @@ from huggingface_hub import snapshot_download
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=360, stage="nightly", runner_config="2-gpu-large")
 
-MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+# Its attention splits heads by attn_tp_size, as DP attention needs; Llama splits by tp_size.
+MODEL = "Qwen/Qwen3-0.6B"
 PROMPT = "The capital of France is"
 SAMPLING = {"temperature": 0, "max_new_tokens": 8}
 
