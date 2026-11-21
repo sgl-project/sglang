@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.device import is_gfx95_supported
 
 _is_npu = is_npu()
 
@@ -738,14 +739,18 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        # The tilelang decode MQA kernel needs query heads in multiples of 8.
+        q_heads_padded = ((self.index_n_heads + 7) // 8) * 8
+        if is_gfx95_supported():
+            # Pad to the kernel's 16-wide MFMA here so the decode wrapper need not copy Q.
+            q_heads_padded = ((self.index_n_heads + 15) // 16) * 16
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
-                ((self.index_n_heads + 7) // 8) * 8
+                q_heads_padded
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
