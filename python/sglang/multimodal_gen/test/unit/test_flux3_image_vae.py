@@ -11,12 +11,15 @@ from unittest import mock
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.flux3_image import Flux3ImageVAEConfig
+from sglang.multimodal_gen.runtime.models.vaes import flux3_image_vae
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     use_vae_fast_path,
 )
 from sglang.multimodal_gen.runtime.models.vaes.flux3_image_vae import (
     AttnBlock,
+    AutoEncoder,
+    AutoEncoderParams,
     Encoder,
     Flux3ImageVAE,
     Upsample,
@@ -88,6 +91,45 @@ class TestFlux3ImageVAE(unittest.TestCase):
         with use_vae_fast_path(vae, True):
             self.assertTrue(vae.decoder.mid.attn_1.fast_path_gate.enabled)
         self.assertFalse(vae.decoder.mid.attn_1.fast_path_gate.enabled)
+
+    def test_group_norm_silu_fusion_is_off_at_exact(self):
+        """The fused GroupNorm+SiLU kernel is not bit-identical to the eager
+        chain, so encode and decode launch it only while the VAE's fast-path
+        gate is on; with the gate off (quality="exact") they run the eager
+        chain."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch.manual_seed(0)
+        vae = AutoEncoder(
+            AutoEncoderParams(
+                resolution=32, ch=32, ch_mult=[1, 2], num_res_blocks=1, z_channels=4
+            )
+        )
+        vae = vae.to(device).eval()
+        image = torch.randn(1, 3, 32, 32, device=device)
+
+        def eager(x, norm, act):
+            return act(norm(x))
+
+        with torch.inference_mode():
+            with mock.patch.object(
+                flux3_image_vae,
+                "apply_group_norm_silu",
+                wraps=flux3_image_vae.apply_group_norm_silu,
+            ) as fused:
+                latent = vae.encode(image)
+                exact = vae.decode(latent)
+                self.assertEqual(fused.call_count, 0)
+                with use_vae_fast_path(vae, True):
+                    vae.decode(vae.encode(image))
+                self.assertGreater(fused.call_count, 0)
+            with (
+                use_vae_fast_path(vae, True),
+                mock.patch.object(
+                    flux3_image_vae, "apply_group_norm_silu", side_effect=eager
+                ),
+            ):
+                reference = vae.decode(vae.encode(image))
+        self.assertTrue(torch.equal(exact, reference))
 
     def test_height_sharded_decode_is_opt_in(self):
         """A decode-parallel group alone keeps the serial decoder (vae_sp false)."""
