@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -109,6 +109,8 @@ class IndexKeyCache:
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         buf = self.get_buffer(layer_id)
         return dsa_index_k_cache.GetKAndS.execute(
@@ -118,6 +120,7 @@ class IndexKeyCache:
             seq_len_tensor=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def store_quantized(

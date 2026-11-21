@@ -444,6 +444,10 @@ class DSAMetadata:
     indexer_seq_lens_cpu: Optional[torch.Tensor] = None
     # seq lens for each batch.
     indexer_seq_lens: Optional[torch.Tensor] = None
+    # Offsets for the actual ragged index-K gather, shared by all layers.
+    indexer_gather_cu_seqlens: Optional[torch.Tensor] = None
+    # When index-K is DCP-sharded, the gather uses rank-local lengths.
+    indexer_gather_local_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
     # Prefill CP (interleave): the rows are this rank's token shard.
@@ -1867,6 +1871,26 @@ class DeepseekSparseAttnBackend(
                 forward_batch.batch_size,
             )
 
+        indexer_gather_cu_seqlens = None
+        indexer_gather_local_lens = None
+        if (
+            is_cuda()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not use_kpool
+        ):
+            if self.dsa_shards_index_k:
+                parallel = get_parallel()
+                indexer_gather_local_lens = get_dcp_lens(
+                    indexer_seq_lens, parallel.attn_dcp_size, parallel.attn_dcp_rank
+                )
+                indexer_gather_cu_seqlens = compute_cu_seqlens(
+                    indexer_gather_local_lens.to(torch.int32)
+                )
+            else:
+                # In ragged prefill the indexer selects the same requests as
+                # cu_seqlens_k (including prefill-CP's request filtering).
+                indexer_gather_cu_seqlens = cu_seqlens_k
+
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1914,6 +1938,8 @@ class DeepseekSparseAttnBackend(
             indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
+            indexer_gather_cu_seqlens=indexer_gather_cu_seqlens,
+            indexer_gather_local_lens=indexer_gather_local_lens,
             token_to_batch_idx=token_to_batch_idx,
             prefill_cp_sharded=bs_idx_cpu is not None,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),

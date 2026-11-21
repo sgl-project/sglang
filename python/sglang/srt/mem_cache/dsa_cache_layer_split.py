@@ -103,6 +103,8 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         buf = self.get_buffer(layer_id)
         self.pool.prefetch_kv_buffer(layer_id)
@@ -113,6 +115,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             seq_len_tensor=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def store_quantized(

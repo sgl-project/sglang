@@ -316,10 +316,17 @@ class RoutedKVCache(KVCache):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        *,
+        cu_seq_lens: Optional[torch.Tensor] = None,
     ):
         route = self.layer_router.read(layer_id, INDEX_K_PART)
         return route.view.get_index_k_scale_buffer(
-            route.view_layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+            route.view_layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
+            cu_seq_lens=cu_seq_lens,
         )
 
     def set_index_k_scale_buffer(
