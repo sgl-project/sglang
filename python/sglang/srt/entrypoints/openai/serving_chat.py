@@ -3654,10 +3654,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
                 toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
+                # Read the same env default as the parse-side _thinking_requested
+                # so the grammar gate and the output parser agree on the
+                # thinking state. Without this, SGLANG_DEFAULT_THINKING=1 gives
+                # a thinking prompt with a from-first-token JSON grammar that
+                # can never emit the think-end token: the forced JSON is then
+                # streamed as one unterminated reasoning block.
+                default_thinking = (
+                    envs.SGLANG_DEFAULT_THINKING.get()
+                    if toggle == "thinking"
+                    else False
                 )
+                return (
+                    request.chat_template_kwargs or {}
+                ).get(toggle, default_thinking) is True
             logger.warning(
                 "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
                 mode,
