@@ -36,7 +36,7 @@ from sglang.srt.models.deepseek_common.moe_transport import (
     MoeRowTransport,
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -146,6 +146,15 @@ class HcRead:
             output = output.pieces
         elif isinstance(output, UnreducedOutput):
             if not update.attention:
+                return None
+            # The new Hopper path only absorbs an ordinary, BF16 partial on
+            # the full TP group. Declining here asks the boundary to complete
+            # its original sum before the ordinary mHC update/read.
+            if get_platform().is_sm90 and (
+                not mhc.sm90_attn_mhc_enabled()
+                or output.group is not get_parallel().tp_group
+                or not mhc.sm90_attn_mhc_inputs_ok(output.partial, state.streams)
+            ):
                 return None
             output = mhc.AttnOutput(output.partial)
         else:
@@ -485,8 +494,25 @@ class AttentionTransport(ComputeTransport):
         self.defers_sum = (
             layer.boundary_mhc_fusions
             and layer.boundary_pre_from_prev
-            and layer._can_fuse_attn_mhc
-            and can_fuse_all_reduce(hidden_states.shape[0], layer.hc_cfg.hidden)
+            and (
+                (
+                    layer._can_fuse_attn_mhc
+                    and can_fuse_all_reduce(self.num_rows, layer.hc_cfg.hidden)
+                )
+                or (
+                    mhc.sm90_attn_mhc_enabled()
+                    and layer._can_fuse_sm90_attn_mhc
+                    and not call.tbo
+                    and not rows.source.sharded
+                    and rows.decode_group is None
+                    and mhc.sm90_attn_mhc_batch_ok(hidden_states, batch)
+                    and can_fuse_all_reduce(
+                        self.num_rows,
+                        layer.hc_cfg.hidden,
+                        group=get_parallel().tp_group,
+                    )
+                )
+            )
         )
 
     def release(self):

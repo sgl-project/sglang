@@ -2150,6 +2150,8 @@ class Envs:
 
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # Experimental Hopper TP8 attention-only mHC all-reduce epilogue.
+    SGLANG_OPT_DSV41_SM90_ATTN_MHC_AR = EnvBool(False)
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)

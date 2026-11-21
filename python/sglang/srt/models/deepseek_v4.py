@@ -3453,6 +3453,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # The fuse gates and boundaries snapshot load-time facts; weight updates
         # re-run this, so drop them and re-resolve on the next forward.
         self.__dict__.pop("_can_fuse_attn_mhc", None)
+        self.__dict__.pop("_can_fuse_sm90_attn_mhc", None)
         self.__dict__.pop("_can_fuse_ffn_mhc", None)
 
     def _input_norm(
@@ -3807,6 +3808,24 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             and mhc.fused_mhc_tp_ok(self.self_attn.attn_tp_size)
             and boundary.norm_fusable
             and mhc.can_fuse_post(self.hc_cfg)
+        )
+
+    @functools.cached_property
+    def _can_fuse_sm90_attn_mhc(self) -> bool:
+        """Load-time geometry for the separate, opt-in Hopper attention path."""
+        cfg = self.hc_cfg
+        return (
+            self.config.model_type == "deepseek_v41"
+            and self.self_attn.attn_tp_size == 8
+            and cfg.pre_from_prev
+            and cfg.mult == 4
+            and cfg.hidden == 5120
+            and not cfg.cp_prefill
+            and mhc.make_boundary(
+                self.post_attention_layernorm,
+                accepts_mxfp8=False,
+                hc=self.ffn_hc,
+            ).norm_fusable
         )
 
     def op_mhc_prepare_attn(
@@ -5349,7 +5368,9 @@ class DeepseekV4ForCausalLM(
 
         # The only deployments whose fused-collective gates can fire; registration
         # must happen eagerly here, before graph capture.
-        if get_platform().is_blackwell and mhc.fused_mhc_tp_ok(get_parallel().tp_size):
+        if (
+            get_platform().is_blackwell and mhc.fused_mhc_tp_ok(get_parallel().tp_size)
+        ) or (self.config.model_type == "deepseek_v41" and mhc.sm90_attn_mhc_enabled()):
             from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                 register_fused_all_reduce_comm,
             )
