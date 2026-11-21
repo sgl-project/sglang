@@ -11,6 +11,12 @@ from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 
+from sglang.srt.configs.hy_v4 import HYV4VLVisionConfig
+from sglang.srt.configs.hy_v4_vl_processing import HYV4VLProcessor
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    register_customized_processor,
+)
+
 SPARSE_ATTENTION = "deepseek_sparse_attention"
 SLIDING_ATTENTION = "sliding_attention"
 _SPARSE_ALIASES = {
@@ -260,8 +266,14 @@ class HYV4FlashTextConfig(PretrainedConfig):
         self.indexer_types = indexer_types or ["full"] * num_hidden_layers
         # Per-layer-type rope; ``rope_parameters`` stays flat (the sparse layers'
         # values) for engine helpers that expect a single rope config.
+        self.mrope_section, self.mrope_interleaved = self._mrope_settings(
+            rope_parameters
+        )
         self.layer_rope_parameters = self._normalize_rope(rope_parameters)
         self.rope_parameters = dict(self.rope_for_layer_type(SPARSE_ATTENTION))
+        if self.mrope_section is not None:
+            self.rope_parameters["mrope_section"] = list(self.mrope_section)
+            self.rope_parameters["mrope_interleaved"] = self.mrope_interleaved
         self.rope_theta = self.rope_parameters["rope_theta"]
         self.rope_interleave = True
         self.indexer_rope_interleave = True
@@ -296,6 +308,24 @@ class HYV4FlashTextConfig(PretrainedConfig):
             value.pop("mrope_section", None)
             value.pop("mrope_interleaved", None)
         return nested
+
+    def _mrope_settings(self, rope: Optional[dict]):
+        rope = rope or {}
+        values = [rope, *(v for v in rope.values() if isinstance(v, dict))]
+        sections = {tuple(v["mrope_section"]) for v in values if "mrope_section" in v}
+        interleaved = {
+            v["mrope_interleaved"] for v in values if "mrope_interleaved" in v
+        }
+        if len(sections) > 1 or len(interleaved) > 1:
+            raise ValueError("MRoPE sections and interleaving must agree across layers")
+        if not sections:
+            return None, False
+        section = next(iter(sections))
+        if len(section) != 3 or 2 * sum(section) != self.qk_rope_head_dim:
+            raise ValueError(f"mrope_section must cover the rope dimension: {section}")
+        if False in interleaved:
+            raise ValueError("Hy4-Flash supports only interleaved MRoPE")
+        return section, True
 
     def rope_for_layer_type(self, layer_type: str) -> dict:
         return self.layer_rope_parameters[layer_type]
@@ -337,15 +367,27 @@ class HYV4FlashTextConfig(PretrainedConfig):
                 raise ValueError("engram_layer_ids are 1-based decoder layer numbers")
 
 
+@register_customized_processor(HYV4VLProcessor)
 class HYV4FlashConfig(PretrainedConfig):
     model_type = "hy_v4_flash"
-    sub_configs = {"text_config": HYV4FlashTextConfig}
+    sub_configs = {
+        "text_config": HYV4FlashTextConfig,
+        "vision_config": HYV4VLVisionConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
         text_config: Any = None,
         vision_config: Optional[dict] = None,
+        image_start_token_id: int = 120118,
+        image_end_token_id: int = 120119,
+        image_token_id: int = 120120,
+        image_newline_token_id: int = 120121,
+        video_start_token_id: int = 120122,
+        video_end_token_id: int = 120123,
+        video_token_id: int = 120124,
+        language_model_only: bool = False,
         **kwargs,
     ):
         if isinstance(text_config, dict):
@@ -360,8 +402,15 @@ class HYV4FlashConfig(PretrainedConfig):
             self.text_config = HYV4FlashTextConfig(**top_level)
         else:
             self.text_config = text_config
-        # The engine reads this to serve the text model without multimodal setup.
-        self.language_model_only = True
+        self.vision_config = self._build_vision_config(vision_config)
+        self.image_start_token_id = image_start_token_id
+        self.image_end_token_id = image_end_token_id
+        self.image_token_id = image_token_id
+        self.image_newline_token_id = image_newline_token_id
+        self.video_start_token_id = video_start_token_id
+        self.video_end_token_id = video_end_token_id
+        self.video_token_id = video_token_id
+        self.language_model_only = language_model_only
         quant = getattr(self.text_config, "quantization_config", None)
         if quant is not None:
             kwargs["quantization_config"] = quant
@@ -371,6 +420,21 @@ class HYV4FlashConfig(PretrainedConfig):
                 setattr(self, key, getattr(self.text_config, key))
         if self.architectures:
             self.text_config.architectures = list(self.architectures)
+
+    def _build_vision_config(self, vision_config) -> Optional[HYV4VLVisionConfig]:
+        if vision_config is None:
+            return None
+        if not isinstance(vision_config, HYV4VLVisionConfig):
+            vision_config = HYV4VLVisionConfig(**vision_config)
+        hidden_size = self.text_config.hidden_size
+        if vision_config.out_hidden_size is None:
+            vision_config.out_hidden_size = hidden_size
+        if vision_config.out_hidden_size != hidden_size:
+            raise ValueError("Hy4-Flash projector output must match text hidden_size")
+        if vision_config.cat_extra_token:
+            raise ValueError("Hy4-Flash vision does not support cat_extra_token")
+        vision_config.text_hidden_size = hidden_size
+        return vision_config
 
     def get_text_config(self, *args, **kwargs):
         return self.text_config
