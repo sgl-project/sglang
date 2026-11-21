@@ -1781,10 +1781,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         List loaded LoRA adapters and current application status per module.
         """
-        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
-            LoRAPipeline,
-        )
-
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
