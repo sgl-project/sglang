@@ -282,6 +282,74 @@ def test_fp8_marlin_plans_replay_mixed_adapter_ranks(
     )
 
 
+def test_marlin_down_gemm_is_enqueued_before_the_overlapped_lora_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_unless_supported()
+    from sglang.kernels.ops.moe import moe_wna16_marlin as marlin_ops
+    from sglang.srt.lora.moe.plan import DownOverlap
+    from sglang.srt.lora.moe.runner import MoeLoraRunner
+
+    device = torch.device("cuda")
+    architecture = architecture_for_capability(
+        torch.cuda.get_device_capability(device)[0]
+    )
+    g = torch.Generator(device="cpu").manual_seed(37)
+    tokens, slots, rank = 6, 2, 16
+    quant_info, w13_eff, w2_eff = _marlin_layer(
+        "fp8", _rand(g, _E, 2 * _I, _H), _rand(g, _E, _H, _I)
+    )
+    selected = resolve_plans(
+        architecture=architecture,
+        is_shared_outer=False,
+        physical_rank=rank,
+        activation=ActivationFn.SILU,
+        hidden_size=_H,
+        num_local_experts=_E,
+        quant_family="fp8",
+        vendor="marlin",
+    )[Phase.DECODE]
+    assert selected.plan.down_overlap is not DownOverlap.NONE
+    provider = select_provider_cls(selected.base_gemm_rows, "fp8", "marlin")(quant_info)
+
+    launches: list[str] = []
+    gemm = marlin_ops.moe_wna16_marlin_gemm
+    run_a = MoeLoraRunner._run_a
+
+    def recorded_gemm(*args, **kwargs):
+        launches.append("down" if kwargs["size_k"] == _I else "gate_up")
+        return gemm(*args, **kwargs)
+
+    def recorded_a(self, launch_config, spec, input, weight, routes, name, **kwargs):
+        launches.append(name)
+        return run_a(self, launch_config, spec, input, weight, routes, name, **kwargs)
+
+    monkeypatch.setattr(marlin_ops, "moe_wna16_marlin_gemm", recorded_gemm)
+    monkeypatch.setattr(MoeLoraRunner, "_run_a", recorded_a)
+    batch = MoeLoraBatch(
+        gate_up_lora_a=_rand(g, slots, _E, 2 * rank, _H, scale=0.1),
+        gate_up_lora_b=_rand(g, slots, _E, 2 * _I, rank, scale=0.1),
+        down_lora_a=_rand(g, slots, _E, rank, _I, scale=0.1),
+        down_lora_b=_rand(g, slots, _E, _H, rank, scale=0.1),
+        token_lora_mapping=torch.tensor(
+            [0, 1, -1] * (tokens // 3), dtype=torch.int32, device=device
+        ),
+        is_prefill=False,
+    )
+    check_marlin_lora_replay(
+        monkeypatch,
+        selected,
+        provider,
+        _rand(g, tokens, _H, scale=0.2),
+        _route(g, tokens),
+        batch,
+        w13_eff,
+        w2_eff,
+        tol=_MARLIN_TOL,
+    )
+    assert launches[:4] == ["gate_up_a", "gate_up", "down", "down_a"]
+
+
 @pytest.mark.parametrize(
     "hidden_size, intermediate, group_size", ((256, 128, 32), (512, 256, 128))
 )

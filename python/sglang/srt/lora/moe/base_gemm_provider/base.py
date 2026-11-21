@@ -80,6 +80,7 @@ class MoeBaseProvider:
     contract: MoeBaseProviderContract
     # What binding derives from base weights; if set, online weight updates are refused.
     derived_base_weights: str | None = None
+    down_gemm_first: bool = False
 
     @property
     def num_local_experts(self) -> int:
