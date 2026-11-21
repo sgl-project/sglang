@@ -31,6 +31,7 @@ from typing import Any, Optional, Union, cast
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
+from huggingface_hub import HfApi
 from huggingface_hub.errors import (
     EntryNotFoundError,
     LocalEntryNotFoundError,
@@ -52,7 +53,10 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
-from sglang.multimodal_gen.runtime.weights.source import resolve_weight
+from sglang.multimodal_gen.runtime.weights.source import (
+    _WEIGHT_SUFFIXES,
+    resolve_weight,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
@@ -885,6 +889,53 @@ def _download_overlay_manifest(repo_id: str, filename: str) -> str:
     return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
+class MissingModelConfigError(ValueError):
+    """A Hub repo with neither ``model_index.json`` nor ``config.json``."""
+
+
+def _reject_remote_repo_without_config(repo_id: str) -> None:
+    """Fail before downloading a Hub repo that has no root ``config.json``.
+
+    Without ``model_index.json`` the repo is treated as a single model, which
+    is downloaded in full and then rejected for the missing ``config.json``.
+    Community checkpoint repos (single-file fine-tunes, GGUF, LoRA) hit this
+    after downloading up to hundreds of GB. Listing the files is one request;
+    if it fails, the download proceeds as before.
+    """
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        return
+    try:
+        info = HfApi().model_info(repo_id)
+    except Exception as e:
+        logger.debug("Could not list files of %s before download: %s", repo_id, e)
+        return
+    files = sorted(sibling.rfilename for sibling in info.siblings or ())
+    if "config.json" in files:
+        return
+
+    weights = [f for f in files if f.lower().endswith(_WEIGHT_SUFFIXES)]
+    message = (
+        f"'{repo_id}' has neither model_index.json nor config.json, so it is not "
+        "a Diffusers pipeline or a single model and was not downloaded."
+    )
+    if weights:
+        shown = ", ".join(weights[:5])
+        if len(weights) > 5:
+            shown += f", ... ({len(weights)} weight files)"
+        message += (
+            f" It contains {shown}. To use a fine-tuned or quantized transformer, "
+            "pass the base model as --model-path and one file as "
+            f"--component-weights-paths.transformer {repo_id}/<file>; for a LoRA, "
+            f"use --lora-path {repo_id}."
+        )
+    base_model = (info.card_data or {}).get("base_model")
+    if base_model:
+        if not isinstance(base_model, str):
+            base_model = ", ".join(base_model)
+        message += f" The model card lists the base model as {base_model}."
+    raise MissingModelConfigError(message)
+
+
 def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     Download and extract just the model_index.json for a Hugging Face model.
@@ -950,6 +1001,8 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
         )
         # Hub unreachable: use only the cache.
         offline = isinstance(e, LocalEntryNotFoundError)
+        if not offline:
+            _reject_remote_repo_without_config(model_name_or_path)
         local_path = maybe_download_model(
             model_name_or_path, download=not offline, skip_overlay_resolution=offline
         )

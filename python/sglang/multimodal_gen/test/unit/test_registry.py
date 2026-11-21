@@ -146,3 +146,20 @@ def test_model_discovery_preserves_nested_declarations(tmp_path, monkeypatch, en
     discovered = model_registry._discover_and_register_models.__wrapped__()
     assert discovered == {"Model": ("dits", "example", "Model")}
     assert aliases == {"external.Model": "Model"}
+
+
+def test_repo_without_model_config_is_not_sent_to_diffusers_backend(monkeypatch):
+    # The diffusers backend would download the whole repo and then fail on the
+    # missing model_index.json as well.
+    def missing(model_path):
+        raise registry.MissingModelConfigError("no config")
+
+    monkeypatch.setattr(registry, "maybe_download_model_index", missing)
+    monkeypatch.setattr(
+        registry,
+        "_get_diffusers_model_info",
+        lambda **kwargs: pytest.fail("fell back to the diffusers backend"),
+    )
+
+    with pytest.raises(registry.MissingModelConfigError):
+        registry.get_model_info("org/community-checkpoint")
