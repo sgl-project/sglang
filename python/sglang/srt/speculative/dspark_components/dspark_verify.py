@@ -369,6 +369,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                verify_tokens=verify_ids_2d,
             )
 
         return result
@@ -575,6 +576,13 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            # Built only for penalties, the one adjustment that reads them.
+            verify_tokens=(
+                torch.cat((draft_block_ids[:, :1], draft_tokens), dim=1)
+                if sampling_info is not None
+                and sampling_info.step_penalties is not None
+                else None
+            ),
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided

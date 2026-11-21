@@ -265,8 +265,7 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
     # capture round's values.
     assert slot.is_all_greedy or "temperatures" in staged
     sampling_info = SimpleNamespace(
-        acc_additive_penalties=None,
-        acc_scaling_penalties=None,
+        step_penalties=None,
         logit_bias=None,
         sampling_seed=None,
         watermark=None,

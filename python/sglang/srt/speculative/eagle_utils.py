@@ -767,7 +767,6 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -805,11 +804,13 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    apply_acc_penalties(
-        next_token_logits, sampling_info, rows_per_request=verify_input.draft_token_num
-    )
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(
+            next_token_logits,
+            verify_input.draft_token.view(bs, verify_input.draft_token_num),
+            verify_input.retrieve_next_token,
+            verify_input.retrieve_next_sibling,
+        )
     if sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(

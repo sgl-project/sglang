@@ -21,8 +21,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.utils.device import async_h2d, get_compiler_backend, is_npu
+from sglang.srt.utils.device import async_h2d, get_compiler_backend, is_cuda, is_npu
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
@@ -123,6 +124,14 @@ class PenaltyStatusPool:
                 torch.ones(len(replay_indices), dtype=torch.int32, device=self.device),
                 accumulate=True,
             )
+
+    def history(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The (counts, lens) tables with every queued write applied, or None
+        when no index is live."""
+        self._flush()
+        if self.num_indices == 0:
+            return None
+        return self.counts, self.lens
 
     def gather_counts(self, indices: torch.Tensor) -> torch.Tensor:
         self._flush()
@@ -248,44 +257,22 @@ class StepPenalties:
         return self._tables
 
     def _build_tables(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        counts = self.pool.gather_counts(self.penalty_indices)
-        vocab_size = self.pool.vocab_size
-        device = counts.device
-        present = (
-            counts > 0
-            if self.presence is not None or self.repetition is not None
-            else None
+        additive, scaling = _penalty_tables(
+            self.pool.gather_counts(self.penalty_indices),
+            (
+                self.pool.gather_lens(self.penalty_indices)
+                if self.min_new_tokens is not None
+                else None
+            ),
+            self.frequency,
+            self.presence,
+            self.repetition,
+            self.min_new_tokens,
+            self.stop_token_ids,
         )
-
-        additive = None
-        if (
-            self.frequency is not None
-            or self.presence is not None
-            or self.min_new_tokens is not None
-        ):
-            additive = torch.zeros(counts.shape, dtype=torch.float32, device=device)
-            if self.frequency is not None:
-                additive.addcmul_(counts, self.frequency, value=-1)
-            if self.presence is not None:
-                additive.addcmul_(present, self.presence, value=-1)
-            if self.min_new_tokens is not None:
-                lens = self.pool.gather_lens(self.penalty_indices)
-                stop_penalties = torch.zeros(
-                    (counts.shape[0], vocab_size + 1),
-                    dtype=torch.float32,
-                    device=device,
-                ).scatter_(1, self.stop_token_ids, float("-inf"))[:, :vocab_size]
-                # torch.where, not a boolean index: no host sync, no -inf * 0.
-                additive.add_(
-                    torch.where(
-                        lens.unsqueeze(1) < self.min_new_tokens, stop_penalties, 0.0
-                    )
-                )
+        if additive is not None:
             additive = self._to_batch(additive, 0.0)
-
-        scaling = None
-        if self.repetition is not None:
-            scaling = torch.where(present, self.repetition, 1.0)
+        if scaling is not None:
             scaling = self._to_batch(scaling, 1.0)
         return additive, scaling
 
@@ -301,6 +288,114 @@ class StepPenalties:
         out[self.batch_indices] = values
         return out
 
+    def apply_verify(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        next_child: Optional[torch.Tensor] = None,
+        next_sibling: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Apply each speculative verify row's own penalties to `logits` in place.
+
+        `logits` holds `width` consecutive verify rows per request and
+        `draft_tokens` [batch_size, width] their input tokens, column 0 the
+        root, which the history already counts. A row's history adds the tokens
+        from the root, exclusive, to its own node, inclusive: along the tree
+        given by `next_child` and `next_sibling` ([batch_size, width], -1 for
+        none), or along the columns when they are None.
+        """
+        history = self.pool.history()
+        if history is None:
+            # Every request of the step has exited; nothing reads these rows.
+            return
+        counts, lens = history
+        if _is_cuda and logits.is_cuda:
+            from sglang.kernels.ops.sampling.verify_penalties import (
+                apply_verify_penalties,
+            )
+
+            apply_verify_penalties(
+                logits,
+                draft_tokens,
+                next_child,
+                next_sibling,
+                self.batch_indices,
+                self.penalty_indices,
+                counts,
+                lens,
+                self.frequency,
+                self.presence,
+                self.repetition,
+                self.min_new_tokens,
+                self.stop_token_ids,
+            )
+        else:
+            self._apply_verify_torch(
+                logits, draft_tokens, next_child, next_sibling, counts, lens
+            )
+
+    def _apply_verify_torch(
+        self,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        next_child: Optional[torch.Tensor],
+        next_sibling: Optional[torch.Tensor],
+        counts: torch.Tensor,
+        lens: torch.Tensor,
+    ) -> None:
+        vocab_size = self.pool.vocab_size
+        num_requests = self.penalty_indices.numel()
+        width = draft_tokens.shape[1]
+        device = logits.device
+        tokens = draft_tokens[self.batch_indices].long()
+        if next_child is None:
+            parents = (torch.arange(width, device=device) - 1).expand_as(tokens)
+        else:
+            parents = _tree_parents(
+                next_child[self.batch_indices], next_sibling[self.batch_indices]
+            )
+        in_vocab = (tokens >= 0) & (tokens < vocab_size)
+        tokens = tokens.clamp(0, vocab_size - 1)
+
+        # Every row walks up its path at once, one node per step; a node counts
+        # while it has a parent, so the root never does.
+        row_counts = counts[self.penalty_indices].repeat_interleave(width, dim=0)
+        row_lens = lens[self.penalty_indices].repeat_interleave(width)
+        rows = torch.arange(num_requests * width, device=device)
+        node = torch.arange(width, device=device).repeat(num_requests, 1)
+        for _ in range(width):
+            parent = parents.gather(1, node)
+            counted = ((parent >= 0) & in_vocab.gather(1, node)).view(-1)
+            row_counts.index_put_(
+                (rows, tokens.gather(1, node).view(-1)),
+                counted.to(torch.int32),
+                accumulate=True,
+            )
+            row_lens += counted
+            node = torch.where(parent >= 0, parent, node)
+
+        def per_row(values: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return None if values is None else values.repeat_interleave(width, dim=0)
+
+        additive, scaling = _penalty_tables(
+            row_counts,
+            row_lens,
+            per_row(self.frequency),
+            per_row(self.presence),
+            per_row(self.repetition),
+            per_row(self.min_new_tokens),
+            per_row(self.stop_token_ids),
+        )
+        row_indices = (
+            self.batch_indices[:, None] * width + torch.arange(width, device=device)
+        ).view(-1)
+        penalized = logits[row_indices]
+        if additive is not None:
+            penalized.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(penalized, scaling)
+        logits[row_indices] = penalized
+
     def commit(
         self, token_ids: torch.Tensor, accept_mask: Optional[torch.Tensor] = None
     ) -> None:
@@ -314,6 +409,61 @@ class StepPenalties:
             if accept_mask is not None:
                 accept_mask = accept_mask[self.batch_indices]
         self.pool.accumulate(self.penalty_indices, token_ids, accept_mask)
+
+
+def _penalty_tables(
+    counts: torch.Tensor,
+    lens: Optional[torch.Tensor],
+    frequency: Optional[torch.Tensor],
+    presence: Optional[torch.Tensor],
+    repetition: Optional[torch.Tensor],
+    min_new_tokens: Optional[torch.Tensor],
+    stop_token_ids: Optional[torch.Tensor],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """(additive, scaling) [m, vocab] penalties of m histories, each None if unused."""
+    vocab_size = counts.shape[1]
+    device = counts.device
+    present = counts > 0 if presence is not None or repetition is not None else None
+
+    additive = None
+    if frequency is not None or presence is not None or min_new_tokens is not None:
+        additive = torch.zeros(counts.shape, dtype=torch.float32, device=device)
+        if frequency is not None:
+            additive.addcmul_(counts, frequency, value=-1)
+        if presence is not None:
+            additive.addcmul_(present, presence, value=-1)
+        if min_new_tokens is not None:
+            stop_penalties = torch.zeros(
+                (counts.shape[0], vocab_size + 1), dtype=torch.float32, device=device
+            ).scatter_(1, stop_token_ids, float("-inf"))[:, :vocab_size]
+            # torch.where, not a boolean index: no host sync, no -inf * 0.
+            additive.add_(
+                torch.where(lens.unsqueeze(1) < min_new_tokens, stop_penalties, 0.0)
+            )
+
+    scaling = None
+    if repetition is not None:
+        scaling = torch.where(present, repetition, 1.0)
+    return additive, scaling
+
+
+def _tree_parents(next_child: torch.Tensor, next_sibling: torch.Tensor) -> torch.Tensor:
+    """[n, width] parent of each tree node, -1 at the root and off the tree."""
+    num_trees, width = next_child.shape
+    device = next_child.device
+
+    def links(targets: torch.Tensor) -> torch.Tensor:
+        # Column `width` absorbs the writes of missing links.
+        return torch.where((targets >= 0) & (targets < width), targets, width)
+
+    parents = torch.full((num_trees, width + 1), -1, dtype=torch.int64, device=device)
+    nodes = torch.arange(width, device=device).expand(num_trees, width)
+    parents.scatter_(1, links(next_child), nodes)
+    # A node's next sibling shares its parent; k siblings need k - 1 steps.
+    siblings = links(next_sibling)
+    for _ in range(width - 1):
+        parents.scatter_(1, siblings, parents[:, :width].clone())
+    return parents[:, :width]
 
 
 def _stop_token_ids(req, vocab_size: int) -> List[int]:

@@ -25,10 +25,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.sampling.penalties import uses_penalty
-from sglang.srt.sampling.sampling_batch_info import (
-    SamplingBatchInfo,
-    apply_acc_penalties,
-)
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -230,11 +227,13 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    verify_tokens: Optional[torch.Tensor],
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    Per-request penalties are broadcast over the verify block instead of
-    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    `verify_tokens` [bs, draft_token_num] are the block's input tokens: the
+    anchor, then the drafts each row's penalties count up to its own position.
+    Only penalties read them; they may be None when the step has none.
     """
     if sampling_info is None:
         return
@@ -270,9 +269,9 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
-    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
-    apply_acc_penalties(next_token_logits, sampling_info, draft_token_num)
+    # Same order as SamplingBatchInfo.apply_logits_bias.
+    if sampling_info.step_penalties is not None:
+        sampling_info.step_penalties.apply_verify(next_token_logits, verify_tokens)
 
     if grammar_mask is not None:
         vocab_mask_bias = torch.zeros(

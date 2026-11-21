@@ -5335,8 +5335,8 @@ class Scheduler(
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
            only need sampling_info restored - V1 carries spec_info forward as
            next-iter draft input.
-        2. Substitute sampling_info with a forward-only copy that carries this
-           step's logit penalties, built on the forward stream.
+        2. Substitute sampling_info with a forward-only copy, so the forward's
+           edits to it do not reach the scheduler's.
         3. (overlap=True only) Pin (batch, snapshot) into batch_record_buf
            for 2 iters so GPU tensors in the snapshot survive the caching
            allocator past the forward stream. Must run AFTER the sampling_info
