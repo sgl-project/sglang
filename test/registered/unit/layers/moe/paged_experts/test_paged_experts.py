@@ -3156,7 +3156,7 @@ class TestReplay(CustomTestCase):
         pool = SimpleNamespace(
             mamba_pool=SimpleNamespace(
                 mamba_cache=SimpleNamespace(
-                    conv=[conv], temporal=temporal, replayssm_d=None
+                    conv=[conv], temporal=temporal, replayssm_g=None
                 ),
                 _slot_siblings=(),
             ),
@@ -3402,7 +3402,7 @@ class TestSaveRecurrentState(CustomTestCase):
         cache = SimpleNamespace(
             conv=[torch.randn(2, slots + 1, 3, 5)],
             temporal=torch.randn(2, slots + 1, 2, 2),
-            replayssm_d=torch.zeros(1) if replayssm else None,
+            replayssm_g=torch.zeros(1) if replayssm else None,
         )
         conv = ShortConvPool(
             size=slots,

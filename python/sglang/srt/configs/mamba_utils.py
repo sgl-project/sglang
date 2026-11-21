@@ -128,7 +128,7 @@ class BaseLinearStateParams(ABC):
         """ReplaySSM spec-verify scratch bytes across all layers.
 
         GDN keeps compact d/k/g plus low parts for the activation-dtype d/k
-        rings. KDA keeps its raw-input fold window and d/k rings.
+        rings. KDA keeps its raw-input fold window.
         """
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
@@ -140,8 +140,6 @@ class BaseLinearStateParams(ABC):
                 + h_k * record_len * k_dim * conv_b  # rawk
                 + hv * record_len * fp32_b  # beta
                 + hv * record_len * k_dim * fp32_b  # vector g
-                + hv * record_len * v_dim * conv_b  # d
-                + h_k * record_len * k_dim * conv_b  # k
             )
         else:
             per_layer = (

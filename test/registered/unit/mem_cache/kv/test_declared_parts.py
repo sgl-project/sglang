@@ -1813,6 +1813,22 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(view.replayssm_spec_write_pos.stride(0) * 4, entry)
         self.assertEqual(view.replayssm_is_flush.stride(0), entry)
 
+    def test_kda_spec_ring_is_request_memory(self):
+        """The KDA speculative ring is request memory holding only its fold window."""
+        storage, plan, _ = _build(
+            state=True,
+            gamma=4,
+            replay=StateReplay(
+                decode=False, speculative=True, is_kda=True, cache_len=8, key_heads=1
+            ),
+        )
+        (request,) = plan.requests()
+        self.assertEqual(
+            {p.name for p in request.geometry.parts},
+            {f"mamba.replayssm_{name}" for name in ("g", "rawv", "rawk", "beta")},
+        )
+        self.assertTrue(storage.view("mamba").replayssm_request_ring)
+
     def test_decode_replay_records_and_cursor_move_together(self):
         """The decode ring and its cursor lag the slot's state, so they are the
         slot's: copied, cleared and backed up with its entry."""
