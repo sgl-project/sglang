@@ -1078,12 +1078,11 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         Args:
             input_ids: Flattened (concatenated) input_ids corresponding to a
                 batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
+            position_ids: Flattened (concatenated) position ids corresponding to
+                a batch.
                 **NOTE**: If mrope is enabled (default setting for Qwen2-VL
                 opensource models), the shape will be `(3, seq_len)`,
                 otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
         """
         output_attentions = False
         output_hidden_states = (
