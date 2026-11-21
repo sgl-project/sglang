@@ -18,6 +18,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+#include <cstdint>
+
 #ifndef USE_ROCM
 
 #include <flashinfer/activation.cuh>
@@ -82,7 +84,25 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
   return detail::from_f32<T>(f32_val * cdf);
 }
 
+namespace {
+
+inline void check_act_and_mul_inputs(const at::Tensor& out, const at::Tensor& input) {
+  TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+  TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 16 == 0,
+      "input pointer must be a multiple of 16 bytes");
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(out.data_ptr()) % 16 == 0,
+      "out pointer must be a multiple of 16 bytes");
+}
+
+}  // namespace
+
 void silu_and_mul(at::Tensor& out, at::Tensor& input) {
+  check_act_and_mul_inputs(out, input);
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -105,6 +125,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
 }
 
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
+  check_act_and_mul_inputs(out, input);
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -127,6 +148,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
 }
 
 void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
+  check_act_and_mul_inputs(out, input);
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
