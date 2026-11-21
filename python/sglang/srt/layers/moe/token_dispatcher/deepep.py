@@ -212,6 +212,13 @@ class DeepEPBuffer:
     ):
         state = cls._state()
         if state.buffer is not None:
+            # The buffer is process-wide; a mismatched num_experts (e.g. a
+            # draft model with different expert counts reusing this rank's
+            # buffer) would silently misroute, so fail fast instead.
+            assert state.num_experts == num_experts, (
+                f"DeepEP buffer was created with num_experts={state.num_experts} "
+                f"but is now requested with num_experts={num_experts}"
+            )
             return state.buffer
 
         state.hidden_size = hidden_size
