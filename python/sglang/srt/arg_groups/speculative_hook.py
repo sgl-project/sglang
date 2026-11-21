@@ -747,11 +747,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "_handle_dspark",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_dspark",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_dspark",
+                    speculative_draft_model_revision=cfg.revision,
+                )
             logger.info(
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
@@ -1345,11 +1346,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "_handle_eagle_family",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_eagle_family",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_eagle_family",
+                    speculative_draft_model_revision=cfg.revision,
+                )
         else:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",

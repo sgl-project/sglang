@@ -103,6 +103,20 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             resolution_result(server_args, "speculative_num_draft_tokens"), 6
         )
 
+    def test_bundled_checkpoint_keeps_an_explicit_draft_revision(self):
+        for draft_revision, expected in ((None, "target"), ("draft", "draft")):
+            with self.subTest(draft_revision=draft_revision):
+                server_args = _make_dspark_server_args(
+                    model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+                )
+                server_args.revision = "target"
+                server_args.speculative_draft_model_revision = draft_revision
+                _handle_dspark(server_args)
+                self.assertEqual(
+                    resolution_result(server_args, "speculative_draft_model_revision"),
+                    expected,
+                )
+
     def test_plain_target_without_draft_path_raises(self):
         server_args = _make_dspark_server_args(
             model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
