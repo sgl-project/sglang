@@ -110,7 +110,7 @@ def _aiter_runner() -> MagicMock:
 
 
 class _MoeOnRunner(kimi_k3_amd_moe.KimiK3MoEHipMixin):
-    """A MoE layer whose route-sort consumer comes from the mixin's own lookup."""
+    # A MoE layer whose route-sort consumer comes from the mixin's own lookup.
 
     def __init__(self, runner):
         self.experts = SimpleNamespace(runner=runner)
@@ -202,6 +202,20 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
                     self.assertIsNone(route_sort.staged())
         runner.route_sort_consumer.assert_called_once_with()
         self.assertEqual(consumer.drop.call_count, 2)
+
+    def test_scope_resolves_no_consumer_while_tracing_fullgraph(self):
+        """Tracing a layer keeps the unfused router and never asks its runner."""
+        runner = _aiter_runner()
+        moe = _MoeOnRunner(runner)
+
+        def forward(x):
+            with moe._route_sort_scope():
+                return x + 1
+
+        with _radix4_on_rocm():
+            traced = torch.compile(forward, fullgraph=True, backend="eager")
+            self.assertEqual(traced(torch.zeros(1)).item(), 1.0)
+        runner.route_sort_consumer.assert_not_called()
 
     def test_nested_layer_scope_restores_the_outer_request(self):
         """The SP pass re-enters the layer's forward inside its own scope: the

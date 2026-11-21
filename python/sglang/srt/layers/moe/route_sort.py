@@ -5,10 +5,10 @@ expert spends one or two launches on that sort, which also zeroes its output.
 route_radix4_with_sort emits both from the routing launch, and the runner that
 consumes the sort is handed it for its next experts call.
 
-A MoE runner declares that it consumes a router-written sort by returning a
-RouteSortConsumer from MoeRunnerCore.route_sort_consumer(); that consumer says
-per batch size whether the runner's next experts call takes the sort. A model
-layer asks its experts' runner for one and stages it in a consume-once handoff
+AITER's runner declares that it consumes a router-written sort by returning a
+RouteSortConsumer from AiterRunnerCore.route_sort_consumer(); that consumer says
+per batch size whether the runner's next experts call takes the sort. The K3 ROCm
+mixin finds it on the layer's experts and stages it in a consume-once handoff
 on the per-forward tier (ForwardFlags.route_sort_handoff), so the shared routing
 functions keep their signatures:
 
@@ -177,9 +177,6 @@ def try_route_sort_fused(
     Caller must have checked moe_route_radix4.covered().
     """
     consumer, num_token_non_padded = _take()
-    # Past SORT_MAX_TOKENS AITER's own sort is the faster pipeline.
-    if scores.shape[0] > moe_route_radix4.SORT_MAX_TOKENS:
-        return None
     if consumer is None or not consumer.takes_sort(scores.shape[0]):
         return None
     # The tail sort's helper CTAs wait on each other, so a partition too small to hold them

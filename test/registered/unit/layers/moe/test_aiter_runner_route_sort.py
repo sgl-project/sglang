@@ -3,6 +3,7 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe import route_sort
@@ -107,3 +108,7 @@ def test_aiter_runner_shows_its_staged_route_sort_consumer_its_fused_moe_call(
     # Shown its own layer's call only, not another staged layer's.
     assert len(calls) == 1 and calls[0].keys() == captured[0].keys()
     assert all(calls[0][name] is value for name, value in captured[0].items())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

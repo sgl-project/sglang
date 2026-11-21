@@ -66,7 +66,7 @@ def _fake_cfg_api(get_2stage_cfgs):
 
 
 def _fused_moe_call(m, **overrides):
-    """The keyword arguments the AITER runner passes fused_moe for a K3 layer."""
+    # The keyword arguments the AITER runner passes fused_moe for a K3 layer.
     call = dict(
         hidden_states=torch.zeros((m, MODEL_DIM), dtype=torch.bfloat16),
         w1=torch.zeros((NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 2)),
@@ -105,7 +105,7 @@ def _patch_cfg_api(lookup):
 
 
 def _route(consumer, m, registrations, tail_fits=True):
-    """One routing call of a layer that staged consumer, with the kernel stubbed."""
+    # One routing call of a layer that staged consumer, with the kernel stubbed.
     ids = torch.zeros((m, TOPK), dtype=torch.int32)
     weights = torch.zeros((m, TOPK))
     aux = {"M": m, "topk_ids_ptr": ids.data_ptr()}
@@ -205,11 +205,12 @@ class TestHandoffUnderCompile(CustomTestCase):
 
 class TestSortTailResidency(CustomTestCase):
     def _device_with(self, compute_units):
-        props = SimpleNamespace(multi_processor_count=compute_units)
-        return patch.object(torch.cuda, "get_device_properties", return_value=props)
+        return patch.object(
+            route_sort.moe_route_radix4, "_enabled_cus", return_value=compute_units
+        )
 
     def test_tail_needs_its_ctas_resident_together(self):
-        """The tail's helper CTAs wait on each other, so a device with fewer CUs
+        """The tail's helper CTAs wait on each other, so a stream with fewer CUs
         than helpers keeps the unfused router; the leader sort never waits."""
         radix4 = route_sort.moe_route_radix4
         cpu = torch.device("cpu")
@@ -227,19 +228,6 @@ class TestSortTailResidency(CustomTestCase):
         hit, launches = _route(consumer, 256, [], tail_fits=False)
         self.assertIsNone(hit)
         self.assertEqual(launches, 0)
-
-    def test_routing_declines_past_the_batch_size_where_aiters_sort_wins(self):
-        consumer = aiter_route_sort.AiterRouteSortConsumer()
-        consumer.takes_sort = lambda m: True
-        radix4 = route_sort.moe_route_radix4
-        for m, launched in (
-            (radix4.SORT_MAX_TOKENS, 1),
-            (radix4.SORT_MAX_TOKENS + 1, 0),
-        ):
-            with self.subTest(m=m):
-                hit, launches = _route(consumer, m, [])
-                self.assertEqual(launches, launched)
-                self.assertEqual(hit is not None, bool(launched))
 
 
 class TestAiterRouteSortConsumerAiterAnswers(CustomTestCase):

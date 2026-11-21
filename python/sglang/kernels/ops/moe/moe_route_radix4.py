@@ -12,6 +12,7 @@ CTAs share the sort, one chunk each, up to 32 tokens at M = 1024.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -26,9 +27,6 @@ if TYPE_CHECKING:
 _NUM_EXPERTS = 896
 _TOPK = 16
 _SORT_BLOCK_M = 16
-# The largest batch the dispatcher fuses the sort for: bench_moe_route_radix4_sort.py (fp32, cold L2) has
-# the fused launch ahead of AITER's route + moe_sorting up to 256 tokens and behind it from 512.
-SORT_MAX_TOKENS = 256
 # Mirrors kRadix4LeaderSortMaxTokens, kRadix4TailChunk and kRadix4MaxTailCtas in route_radix4_hip.cuh.
 _LEADER_SORT_MAX_TOKENS = 64
 _TAIL_CHUNK = 16
@@ -153,17 +151,57 @@ def route_radix4(
     return out_w, out_i
 
 
+_enabled_cus_by_stream: dict[tuple[int, int], int] = {}
+
+
+def _enabled_cus(device: torch.device) -> Optional[int]:
+    # CUs the current stream may run on: its CU mask (hipExtStreamGetCUMask) where HIP
+    # answers, else the device's. Asked once per stream; None inside a graph capture
+    # that has not seen the stream, since the query cannot run there.
+    stream = torch.cuda.current_stream(device).cuda_stream
+    key = (torch.device(device).index or 0, stream)
+    count = _enabled_cus_by_stream.get(key)
+    if count is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        count = torch.cuda.get_device_properties(device).multi_processor_count
+        try:
+            hip = ctypes.CDLL("libamdhip64.so")
+            words = (count + 31) // 32
+            mask = (ctypes.c_uint32 * words)()
+            hip.hipExtStreamGetCUMask.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            if hip.hipExtStreamGetCUMask(ctypes.c_void_p(stream), words, mask) == 0:
+                count = sum(bin(word).count("1") for word in mask)
+        except (OSError, AttributeError):
+            logger.warning(
+                "hipExtStreamGetCUMask unavailable; assuming the whole device"
+            )
+        _enabled_cus_by_stream[key] = count
+    return count
+
+
+def _tail_ctas(num_tokens: int) -> int:
+    if num_tokens <= _LEADER_SORT_MAX_TOKENS:
+        return 0
+    return min(-(-num_tokens // _TAIL_CHUNK), _MAX_TAIL_CTAS)
+
+
 def sort_tail_fits(num_tokens: int, device: torch.device) -> bool:
-    """Whether the sort tail of an M-token launch can never hang on this device.
+    """Whether the sort tail of an M-token launch can never hang on the current stream.
 
     The last tail CTAs to arrive spin until every CTA has arrived, so all of them
-    must be resident together; one CTA per CU is the least the kernel guarantees.
-    A stream restricted to fewer CUs (a CU mask) is not visible here.
+    must be resident together; one CTA per enabled CU is the least the kernel
+    guarantees. A stream whose CU mask enables fewer CUs than tail CTAs does not fit.
     """
-    if num_tokens <= _LEADER_SORT_MAX_TOKENS:
+    tail_ctas = _tail_ctas(num_tokens)
+    if tail_ctas == 0:
         return True
-    tail_ctas = min(-(-num_tokens // _TAIL_CHUNK), _MAX_TAIL_CTAS)
-    return torch.cuda.get_device_properties(device).multi_processor_count >= tail_ctas
+    cus = _enabled_cus(device)
+    return cus is not None and cus >= tail_ctas
 
 
 def new_sort_workspace(device: torch.device) -> torch.Tensor:
@@ -209,6 +247,12 @@ def route_radix4_with_sort(
     """
     M = scores.shape[0]
     device = scores.device
+    # Unknown (a capture on a stream not seen eagerly) is allowed; a known short mask is not.
+    cus = _enabled_cus(device) if _tail_ctas(M) else None
+    if cus is not None and cus < _tail_ctas(M):
+        raise RuntimeError(
+            f"route_radix4_with_sort: the current stream has too few CUs for the {M}-token sort tail"
+        )
     capacity = _sorted_capacity(M)
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
