@@ -319,7 +319,10 @@ class AiterRunnerCore(MoeRunnerCore):
         if (
             quant_info.fp8_activations
             and is_gfx95
-            and runner_input.hidden_states.dtype == torch.bfloat16
+            and (
+                runner_input.hidden_states.dtype == torch.bfloat16
+                or runner_input.a1_scale is not None
+            )
         ):
             from aiter import dtypes
             from aiter.ops.flydsl.moe_common import GateMode
@@ -383,11 +386,21 @@ def pre_permute_standard_to_aiter(
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
+    # MXFP8 rows (fp8 + group-32 e8m0 scales) take aiter's activation passthrough.
+    mxfp8_scale = dispatch_output.hidden_states_scale
+    mxfp8_rows = (
+        mxfp8_scale is not None
+        and quant_info.quant_type == AiterQuantType.PER_1X32
+        and hidden_states.element_size() == 1
+        and mxfp8_scale.dtype == torch.float8_e8m0fnu
+    )
     return AiterRunnerInput(
         hidden_states=hidden_states,
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        a1_scale=mxfp8_scale if mxfp8_rows else None,
+        output_dtype=torch.bfloat16 if mxfp8_rows else None,
     )
 
 

@@ -39,6 +39,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
+    GatheredMxfp8Scale,
     StandardDispatcher,
 )
 from sglang.srt.layers.moe.topk import (
@@ -1800,6 +1801,8 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        if isinstance(pre_quant_input, GatheredMxfp8Scale):
+            return dispatch_output._replace(hidden_states_scale=pre_quant_input.scale)
         if (
             pre_quant_input is not None
             and dispatch_output.format.is_standard()

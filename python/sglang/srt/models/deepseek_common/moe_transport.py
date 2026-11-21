@@ -12,6 +12,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
+    dp_gather_replicate_zero_pad,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
     dp_scatter,
@@ -32,6 +33,11 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_ascend_ops_config,
     should_use_dp_reduce_scatterv,
+)
+from sglang.srt.models.deepseek_common.amd.routed_mxfp8_gather import (
+    gather_routed_mxfp8,
+    gather_routed_mxfp8_varlen,
+    routed_mxfp8_gather_applies,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -185,13 +191,34 @@ class MoeRowTransport(ComputeTransport):
             )
             if do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = moe._forward_shared_experts(local_hidden_states)
+            if routed_mxfp8_gather_applies(
+                moe,
+                local_hidden_states,
+                forward_batch,
+                hidden_states.shape[0],
+                do_shared_local,
+            ):
+                gather = (
+                    gather_routed_mxfp8
+                    if forward_batch.dp_padding_mode.is_max_len()
+                    else gather_routed_mxfp8_varlen
+                )
+                routed = gather(moe, local_hidden_states, forward_batch, input_ids)
+                hidden_states = routed.hidden_q
+                moe._routed_prequant = routed
             # Pad rows are not refreshed during graph replay. Stale bf16-max
             # values can overflow the MoE and contaminate the combine output.
-            if _is_hip:
-                _mask_dp_pad_rows(local_hidden_states, forward_batch)
             # self_attn has already reduced across attention TP, so these hidden
             # states are replicated and must not be summed by a partial gather.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            elif not (
+                _is_hip
+                and dp_gather_replicate_zero_pad(
+                    hidden_states, local_hidden_states, forward_batch
+                )
+            ):
+                if _is_hip:
+                    _mask_dp_pad_rows(local_hidden_states, forward_batch)
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
