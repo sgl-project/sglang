@@ -398,6 +398,16 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.fused_kpool_q_hadamard_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_q:fused_kpool_q_hadamard_quant",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 1))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fused_rope_wo_a_bf16",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
