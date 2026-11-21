@@ -917,6 +917,8 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Blocks for the HiCache KV gather kernel; unset keeps each caller's default.
+    SGLANG_HICACHE_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

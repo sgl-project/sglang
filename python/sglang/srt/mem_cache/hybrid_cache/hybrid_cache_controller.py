@@ -57,13 +57,17 @@ from sglang.srt.observability.trace import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.memory.host_backing import (
+        _SharedPageEnvelopeHostBacking,
+    )
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.utils import broadcast_pyobj
+from sglang.srt.utils import broadcast_pyobj, is_cuda
 
 logger = logging.getLogger(__name__)
+_is_cuda = is_cuda()
 
 # Pool boundaries are nonnegative; an omitted rank must dominate MIN so
 # a peer cannot establish presence of that rank's storage shard.
@@ -841,6 +845,16 @@ class HybridCacheController(BaseHiCacheController):
             and entry.host_pool.shared_allocation_domain is domain
         )
 
+        if _is_cuda:
+            allocated = self._reclaim_each_pool_for_itself(
+                entries=entries,
+                requests=requests,
+                domain=domain,
+                domain_requests=domain_requests,
+                requested_bytes=requested_bytes,
+            )
+            if allocated is not None:
+                return allocated
         # alloc_many compacts the shared layout before reporting failure. Reclaim
         # only the remaining byte or per-side logical-slot shortfall, retrying
         # after every successful eviction. The callbacks release only evictable
@@ -869,6 +883,39 @@ class HybridCacheController(BaseHiCacheController):
                 if evicted <= 0:
                     continue
                 made_progress = True
+                allocated = domain.alloc_many(domain_requests)
+                if allocated is not None:
+                    return allocated
+            if not made_progress:
+                return None
+
+    def _reclaim_each_pool_for_itself(
+        self,
+        *,
+        entries: list[PoolEntry],
+        requests: list[tuple[PoolName, int]],
+        domain: _SharedPageEnvelopeHostBacking,
+        domain_requests: list[tuple[str, int]],
+        requested_bytes: int,
+    ) -> Optional[list[torch.Tensor]]:
+        if requested_bytes <= 0:
+            return None
+        while True:
+            made_progress = False
+            for entry, (_, need_size) in zip(entries, requests, strict=True):
+                if entry.host_evict_fn is None or need_size <= 0:
+                    continue
+                pool = entry.host_pool
+                page_bytes = pool.page_size * pool.size_per_token
+                # Preserve each host pool's byte share despite their shared backing.
+                shortfall = max(page_bytes, requested_bytes - domain.free_bytes())
+                share = shortfall * need_size * pool.size_per_token // requested_bytes
+                pages = -(-max(share, page_bytes) // page_bytes)
+                if entry.host_evict_fn(pages * pool.page_size) <= 0:
+                    continue
+                made_progress = True
+                # A FULL leaf may also free window bytes;
+                # retry admission after each eviction.
                 allocated = domain.alloc_many(domain_requests)
                 if allocated is not None:
                     return allocated

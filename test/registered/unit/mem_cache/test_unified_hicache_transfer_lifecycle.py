@@ -40,12 +40,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -957,6 +959,192 @@ class TestWritePolicySwitch(_UnifiedHiCacheCase):
         attach_backend.assert_not_called()
         self.assertEqual(self._policy_state(), before)
         self.cache.sanity_check()
+
+
+class TestSharedHostReclaim(_UnifiedHiCacheCase):
+    def _fill_host(self, *, free_bytes: int):
+        self._cache(write_policy="write_through", tokens=64)
+        domain = self.controller.mem_pool_host.entry_map[
+            PoolName.KV
+        ].host_pool.shared_allocation_domain
+        filler = 1000
+        while domain.free_bytes() >= free_bytes:
+            self._insert(list(range(filler, filler + 4 * PAGE)), filler)
+            self.cache.flush_pending_backups()
+            self.cache.writing_check()
+            self.cache.evict(EvictParams(num_tokens=4 * PAGE))
+            filler += 100
+        return domain
+
+    def _reclaim(self, requests, *, cuda: bool):
+        evict_host = self.cache.evict_host
+        calls = []
+
+        def recorded(num_tokens, component):
+            freed = evict_host(num_tokens, component)
+            calls.append((component == FULL, num_tokens, freed))
+            return freed
+
+        with (
+            mock.patch.object(self.cache, "evict_host", side_effect=recorded),
+            mock.patch.object(hybrid_cache_controller, "_is_cuda", cuda),
+        ):
+            allocated = self.controller._alloc_shared_host_requests_with_reclaim(
+                requests
+            )
+        self.cache.sanity_check()
+        return allocated, calls
+
+    def test_full_leaf_eviction_that_frees_the_window_stops_reclaim(self):
+        self._fill_host(free_bytes=512)
+        allocated, calls = self._reclaim(
+            [(PoolName.KV, 4 * PAGE), (self.window_pool, 2 * PAGE)], cuda=True
+        )
+        self.assertIsNotNone(allocated)
+        self.assertEqual([(full, n) for full, n, _ in calls], [(True, 2 * PAGE)])
+
+    def test_window_pool_that_cannot_evict_leaves_reclaim_to_full(self):
+        self._fill_host(free_bytes=512)
+        window = self.controller.mem_pool_host.entry_map[self.window_pool]
+        with mock.patch.object(window, "host_evict_fn", return_value=0) as locked:
+            allocated, calls = self._reclaim(
+                [(PoolName.KV, PAGE), (self.window_pool, 8 * PAGE)], cuda=True
+            )
+        self.assertIsNotNone(allocated)
+        locked.assert_called()
+        self.assertTrue(calls)
+        self.assertTrue(all(full and freed > 0 for full, _, freed in calls))
+
+    def test_request_larger_than_the_pool_ends_without_allocating(self):
+        for cuda in (True, False):
+            with self.subTest(cuda=cuda):
+                domain = self._fill_host(free_bytes=512)
+                page_num = domain.sides[next(iter(domain.sides))].page_num
+                allocated, calls = self._reclaim(
+                    [(PoolName.KV, page_num * PAGE), (self.window_pool, PAGE)],
+                    cuda=cuda,
+                )
+                self.assertIsNone(allocated)
+                self.assertTrue(any(freed > 0 for _, _, freed in calls))
+                self.assertEqual(calls[-1][2], 0)
+                self.doCleanups()
+
+    def test_without_cuda_the_window_pool_reclaims_first(self):
+        self._fill_host(free_bytes=512)
+        allocated, calls = self._reclaim(
+            [(PoolName.KV, 4 * PAGE), (self.window_pool, 2 * PAGE)], cuda=False
+        )
+        self.assertIsNotNone(allocated)
+        self.assertFalse(calls[0][0])
+
+
+FULL_TOKEN_BYTES = 8
+SWA_TOKEN_BYTES = 24
+
+
+class _Arena:
+    def __init__(self, capacity_bytes, token_bytes):
+        self.capacity_bytes = capacity_bytes
+        self.token_bytes = token_bytes
+        self.used_bytes = 0
+
+    def free_bytes(self):
+        return self.capacity_bytes - self.used_bytes
+
+    def alloc_many(self, requests):
+        need = sum(size * self.token_bytes[label] for label, size in requests)
+        if need > self.free_bytes():
+            return None
+        self.used_bytes += need
+        return [torch.arange(size) for _, size in requests]
+
+
+class _HostTree:
+    def __init__(self, arena, *, full_leaves, window_only, leaves_per_call=None):
+        self.arena = arena
+        self.full_leaves = full_leaves
+        self.window_only = window_only
+        self.leaves_per_call = leaves_per_call
+        self.calls = []
+
+    def evict_full(self, tokens):
+        self.calls.append(("full", tokens))
+        leaves = min(self.full_leaves, -(-tokens // PAGE))
+        if self.leaves_per_call is not None:
+            leaves = min(leaves, self.leaves_per_call)
+        self.full_leaves -= leaves
+        self.arena.used_bytes -= leaves * PAGE * FULL_TOKEN_BYTES
+        return leaves * PAGE
+
+    def evict_window(self, tokens):
+        self.calls.append(("swa", tokens))
+        freed = min(tokens, self.window_only)
+        self.window_only -= freed
+        self.arena.used_bytes -= freed * SWA_TOKEN_BYTES
+        return freed
+
+
+class TestSharedHostReclaimShares(unittest.TestCase):
+    def _reclaim(self, *, full_leaves, window_only, free_bytes, requests, **tree):
+        arena = _Arena(0, {"full": FULL_TOKEN_BYTES, "swa": SWA_TOKEN_BYTES})
+        tree = _HostTree(
+            arena, full_leaves=full_leaves, window_only=window_only, **tree
+        )
+        arena.used_bytes = (
+            full_leaves * PAGE * FULL_TOKEN_BYTES + window_only * SWA_TOKEN_BYTES
+        )
+        arena.capacity_bytes = arena.used_bytes + free_bytes
+        entries = [
+            PoolEntry(
+                name=name,
+                host_pool=SimpleNamespace(
+                    page_size=PAGE,
+                    size_per_token=token_bytes,
+                    pool_label=name,
+                    shared_allocation_domain=arena,
+                ),
+                device_pool=None,
+                layer_mapper=lambda layer_id: layer_id,
+                host_evict_fn=evict,
+            )
+            for name, token_bytes, evict in (
+                ("full", FULL_TOKEN_BYTES, tree.evict_full),
+                ("swa", SWA_TOKEN_BYTES, tree.evict_window),
+            )
+        ]
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={entry.name: entry for entry in entries}, entries=entries
+        )
+        with mock.patch.object(hybrid_cache_controller, "_is_cuda", True):
+            allocated = controller._alloc_shared_host_requests_with_reclaim(requests)
+        return allocated, tree.calls
+
+    def test_each_pool_frees_its_own_share(self):
+        """Each pool evicts its byte share of the remaining gap in whole pages."""
+        allocated, calls = self._reclaim(
+            full_leaves=8,
+            window_only=8 * PAGE,
+            free_bytes=64,
+            requests=[("full", 4 * PAGE), ("swa", 2 * PAGE)],
+        )
+        self.assertIsNotNone(allocated)
+        self.assertEqual(calls, [("full", 4 * PAGE), ("swa", PAGE), ("full", PAGE)])
+
+    def test_reclaim_keeps_going_while_any_requested_pool_frees_space(self):
+        """Reclaim continues through ten one-page eviction rounds."""
+        allocated, calls = self._reclaim(
+            full_leaves=12,
+            window_only=0,
+            free_bytes=PAGE * SWA_TOKEN_BYTES,
+            requests=[("full", 10 * PAGE), ("swa", PAGE)],
+            leaves_per_call=1,
+        )
+        self.assertIsNotNone(allocated)
+        full_calls = [tokens for kind, tokens in calls if kind == "full"]
+        self.assertEqual(len(full_calls), 10)
+        self.assertEqual(full_calls, sorted(full_calls, reverse=True))
+        self.assertEqual(full_calls[-1], PAGE)
 
 
 if __name__ == "__main__":
