@@ -2614,7 +2614,9 @@ class AiterAttnBackend(AttentionBackend):
                 raise RuntimeError(
                     "aiter mla_decode_fwd(return_lse=True) returned no LSE"
                 )
-            return self._zero_dcp_rows_without_kv(out, lse, bs, num_heads)
+            return self._zero_dcp_rows_without_kv(
+                out=out, lse=lse, bs=bs, num_heads=num_heads
+            )
 
         out, lse = mla_gluon_decode(
             q=q.view(bs, num_heads, layer.qk_head_dim),
@@ -2627,9 +2629,11 @@ class AiterAttnBackend(AttentionBackend):
             min_kv_seq_len=1,
             return_lse=True,
         )
-        return self._zero_dcp_rows_without_kv(out, lse, bs, num_heads)
+        return self._zero_dcp_rows_without_kv(
+            out=out, lse=lse, bs=bs, num_heads=num_heads
+        )
 
-    def _zero_dcp_rows_without_kv(self, out, lse, bs, num_heads):
+    def _zero_dcp_rows_without_kv(self, *, out, lse, bs, num_heads):
         # The asm and Gluon decode kernels write nothing for a row with no KV on this rank; the merge reads it.
         fm = self.forward_metadata
         empty = fm.kv_indptr[1 : bs + 1] == fm.kv_indptr[:bs]

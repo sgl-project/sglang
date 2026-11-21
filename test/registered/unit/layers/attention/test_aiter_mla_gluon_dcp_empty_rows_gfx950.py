@@ -20,7 +20,7 @@ SCALING = HEAD_DIM**-0.5
 
 
 def _reference(q, kv, kv_lens, offsets):
-    """fp32 attention of one row over its local KV -> (out, natural-log lse)."""
+    # fp32 attention over each row's local KV -> (out, natural-log lse).
     out = torch.zeros(len(kv_lens), NUM_HEADS, KV_LORA, device=q.device)
     lse = torch.full((len(kv_lens), NUM_HEADS), -1e30, device=q.device)
     for i, n in enumerate(kv_lens):
@@ -34,9 +34,10 @@ def _reference(q, kv, kv_lens, offsets):
 
 
 def _poison_cached_blocks(bs, device):
-    """Leave NaN in the cached blocks that the kernels' uninitialized out/lse buffers are allocated from."""
-    for _ in range(4):
-        poison = [
+    # Leave NaN in cached blocks of the sizes the kernels' uninitialized out/lse buffers use;
+    # holding several pairs at once keeps a stray allocation from taking the only one.
+    poison = [
+        (
             torch.full(
                 (bs, NUM_HEADS, KV_LORA),
                 float("nan"),
@@ -44,8 +45,10 @@ def _poison_cached_blocks(bs, device):
                 device=device,
             ),
             torch.full((bs, 1, NUM_HEADS), float("nan"), device=device),
-        ]
-        del poison
+        )
+        for _ in range(4)
+    ]
+    del poison
 
 
 def _kv_lens(bs):
@@ -82,7 +85,7 @@ class TestMlaDcpDecodeEmptyRowsGfx950(CustomTestCase):
         torch.testing.assert_close(
             out[~empty].float(), ref_out[~empty], atol=atol, rtol=atol
         )
-        torch.testing.assert_close(lse[~empty], ref_lse[~empty], atol=atol, rtol=atol)
+        torch.testing.assert_close(lse[~empty], ref_lse[~empty], atol=1e-3, rtol=1e-3)
 
     @unittest.skipUnless(_gluon_fn() is not None, "needs Triton with Gluon cga_layout")
     def test_gluon_rows_without_local_kv_return_a_zero_partial_with_no_weight(self):
