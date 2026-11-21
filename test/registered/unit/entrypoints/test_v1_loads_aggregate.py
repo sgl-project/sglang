@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import msgspec.msgpack
+from fastapi import HTTPException
 
 from sglang.srt.entrypoints import v1_loads
 from sglang.srt.entrypoints.v1_loads import get_loads
@@ -234,6 +235,82 @@ class TestGetLoads(CustomTestCase):
             writer.close()
             if os.path.exists(path):
                 os.unlink(path)
+
+
+class TestUnknownIncludeSection(CustomTestCase):
+    """An unknown `include` section is a client error, not a server error.
+
+    ``LoadSnapshot.to_dict`` was the only place that rejected a section name,
+    and ``get_loads`` never reads ``include``, so the check ran after the route
+    and the ``ValueError`` escaped as HTTP 500. It also could not fire at all
+    when ``all`` was present or when no snapshot was read. The handler now
+    validates the query itself, matching the Rust frontend of this endpoint.
+    """
+
+    @staticmethod
+    def _manager(loads=None):
+        if loads is None:
+            loads = [LoadSnapshot(dp_rank=0, num_running_reqs=1)]
+        return _FakeHttpTokenizerManager(loads)
+
+    def test_json_format_rejects_an_unknown_section(self):
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(get_loads(include="core,bogus", tokenizer_manager=manager))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("bogus", caught.exception.detail)
+
+    def test_prometheus_format_rejects_an_unknown_section(self):
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(
+                get_loads(
+                    include="core,bogus",
+                    format="prometheus",
+                    tokenizer_manager=manager,
+                )
+            )
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("bogus", caught.exception.detail)
+
+    def test_all_still_means_every_section(self):
+        # Parity with the Rust ``parse_include``: once ``all`` is present the
+        # other names are not inspected, so this answers rather than 400.
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        response = asyncio.run(
+            get_loads(include="all,bogus", tokenizer_manager=manager)
+        )
+
+        self.assertEqual(len(response["loads"]), 1)
+
+    def test_rejected_even_when_no_snapshot_is_read(self):
+        # An empty snapshot set (out-of-range ``dp_rank``, or shared memory not
+        # attached yet) never reached ``to_dict`` at all. The query is still
+        # invalid, so it is still a 400.
+        manager = self._manager([])
+        self.addCleanup(manager.restore)
+
+        with self.assertRaises(HTTPException) as caught:
+            asyncio.run(get_loads(include="bogus", tokenizer_manager=manager))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("bogus", caught.exception.detail)
+
+    def test_a_valid_section_still_answers(self):
+        manager = self._manager()
+        self.addCleanup(manager.restore)
+
+        response = asyncio.run(get_loads(include="core", tokenizer_manager=manager))
+
+        self.assertEqual(len(response["loads"]), 1)
 
 
 if __name__ == "__main__":
