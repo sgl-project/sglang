@@ -1,8 +1,16 @@
-"""gfx950 host-pool budgets: the amdgpu driver pins host memory only up to its TTM
-page limit, past which hipHostMalloc fails while RAM is still free.
+"""ROCm host-pool budgets: on gfx950 the amdgpu driver pins host memory only up to its
+TTM page limit, past which hipHostMalloc fails while RAM is still free.
 
 The shared HiCache sizing code calls the helpers below unconditionally; each one
-leaves main's behavior unchanged off gfx950."""
+leaves main's behavior unchanged off ROCm, and the TTM clamps unchanged off gfx950.
+
+With explicit HiCache sizes on ROCm, ``explicit_size_scope`` books every host pool of a
+rank against one host memory snapshot. Per-pool sampling charges a late rank for the
+pools its peers already pinned, so ranks sharing a host sample once, together (a CPU
+barrier), before any pins. On gfx950 with a visible TTM limit the snapshot is the
+pinnable share with no hugetlb credit, so the ratio-sized Mamba pool built last clamps
+to what the others left. A lone rank off gfx950 keeps per-pool sampling, which also
+sees other replicas' pools."""
 
 from __future__ import annotations
 
@@ -15,6 +23,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host import base
+from sglang.srt.mem_cache.pool_host.common import (
+    get_allocator_class_from_storage,
+    get_allocator_type,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
@@ -64,16 +76,7 @@ def _snapshot_scope(*, allocator, device, barrier: bool):
         yield
 
 
-def explicit_size_scope(
-    enabled: bool, *, allocator=None, device=None
-) -> ContextManager:
-    """With explicit HiCache sizes on ROCm, book every host pool of a rank against one
-    host memory snapshot. Per-pool sampling charges a late rank for the pools its peers
-    already pinned, so ranks sharing a host sample once, together (a CPU barrier), before
-    any pins. On gfx950 the snapshot is the pinnable share, with no hugetlb credit, so the
-    ratio-sized Mamba pool built last clamps to what the others left. A nullcontext when
-    HiCache is off, off ROCm, or for a lone rank off gfx950 (it keeps per-pool sampling,
-    which also sees other replicas' pools)."""
+def explicit_size_scope(*, enabled: bool, params) -> ContextManager:
     if not enabled or not is_hip():
         return contextlib.nullcontext()
     if rocm_pinnable_share_bytes() is not None:
@@ -82,7 +85,11 @@ def explicit_size_scope(
         )
     if base.ranks_per_host() == 1:
         return contextlib.nullcontext()
-    return _snapshot_scope(allocator=allocator, device=device, barrier=True)
+    return _snapshot_scope(
+        allocator=get_allocator_class_from_storage(get_allocator_type()),
+        device=params.token_to_kv_pool_allocator.get_kvcache().device,
+        barrier=True,
+    )
 
 
 def mamba_host_ratio(hicache_ratio: float) -> float:

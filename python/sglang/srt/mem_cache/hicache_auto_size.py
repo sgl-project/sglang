@@ -123,13 +123,7 @@ def auto_size_hicache(
         from sglang.srt.mem_cache.pool_host.rocm_budget import explicit_size_scope
 
         # ROCm: book explicit sizes against one snapshot (gfx950: its TTM share); else no-op
-        allocator = device = None
-        if enabled:
-            allocator = get_allocator_class_from_storage(get_allocator_type())
-            device = getattr(
-                params.token_to_kv_pool_allocator.get_kvcache(), "device", None
-            )
-        with explicit_size_scope(enabled, allocator=allocator, device=device):
+        with explicit_size_scope(enabled=enabled, params=params):
             yield
         return
     requested = get_memory().hicache_ratio
