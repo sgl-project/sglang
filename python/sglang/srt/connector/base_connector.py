@@ -46,7 +46,7 @@ class BaseConnector(ABC):
         raise NotImplementedError()
 
     def close(self):
-        if self.closed:
+        if getattr(self, "closed", True):
             return
 
         self.closed = True
@@ -66,7 +66,7 @@ class BaseConnector(ABC):
 
         def new_handler(signum, frame):
             self.close()
-            if existing_handler:
+            if callable(existing_handler):
                 existing_handler(signum, frame)
 
         return new_handler
