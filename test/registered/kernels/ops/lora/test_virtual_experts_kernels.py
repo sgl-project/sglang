@@ -12,6 +12,7 @@ test_virtual_experts_kernels_matrix.py.
 import collections
 import unittest
 from itertools import product
+from unittest import mock
 
 import torch
 
@@ -35,7 +36,58 @@ from sglang.kernels.ops.lora.moe.virtual_experts import (
     _align_block_size_jit,
     _align_block_size_torch,
     _fused_virtual_topk_ids,
+    merged_experts_fused_moe_lora_add,
 )
+
+
+class TestVirtualExpertRank(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = _require_accelerator_device()
+
+    def test_configured_tiles(self):
+        self._check_ranks()
+
+    def test_fallback_tiles(self):
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config,
+        )
+
+        with mock.patch.object(
+            fused_moe_triton_config,
+            "try_get_optimal_moe_config",
+            side_effect=ValueError,
+        ):
+            self._check_ranks()
+
+    def _check_ranks(self):
+        for rank, slices in product((12, 16, 24, 40, 48), (1, 2)):
+            with self.subTest(rank=rank, slices=slices):
+                tokens, width, experts = 5, 64, 4
+                kwargs = {"device": self.device, "dtype": torch.float16}
+                x = torch.ones(tokens, width, **kwargs)
+                a = torch.ones(1, experts, slices * rank, width, **kwargs)
+                a[:, :, rank:] *= 2
+                b = torch.ones(1, experts, width, rank, **kwargs)
+                out = torch.zeros(tokens, 1, width, **kwargs)
+                route = torch.zeros(tokens, 1, dtype=torch.int32, device=self.device)
+                merged_experts_fused_moe_lora_add(
+                    out,
+                    x,
+                    a,
+                    b,
+                    route,
+                    torch.ones_like(route, dtype=torch.float32),
+                    route.view(-1),
+                    mul_routed_weight=slices == 1,
+                    experts_shared_outer_loras_a=False,
+                    experts_shared_outer_loras_b=False,
+                    a_output_slices=slices,
+                )
+                expected = torch.full_like(out, width * rank)
+                if slices == 2:
+                    expected[..., width // 2 :] *= 2
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
