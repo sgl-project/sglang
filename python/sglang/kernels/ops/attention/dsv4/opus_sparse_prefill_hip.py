@@ -1,11 +1,13 @@
-"""DeepSeek-V4 sparse prefill attention on gfx950 through aiter's OPUS kernel.
+"""Sparse MLA prefill attention on gfx950 through aiter's OPUS kernel.
 
 OPUS attends over two bf16 row sources, each addressed by a CSR index list. The
-caller dequantizes rows into bf16 workspaces and builds padded per-query lists
-(``SparsePrefillChunkCache``); this module turns those lists into CSR and runs
-the kernel.
+DeepSeek-V4 caller dequantizes rows into bf16 workspaces and builds padded
+per-query lists (``SparsePrefillChunkCache``); the DSA backend passes its
+page-size-1 top-k table. This module turns those lists into CSR and runs the
+kernel.
 """
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -69,20 +71,72 @@ def combined_to_csr(
     return csr, indptr
 
 
+@functools.cache
+def opus_sparse_prefill_available() -> bool:
+    try:
+        from aiter.ops.pa_sparse_prefill_opus import (  # noqa: F401
+            pa_sparse_prefill_opus,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+@functools.cache
+def _mla_sparse_prefill():
+    """aiter's sink-optional entry (aiter >= 0.1.28), else None."""
+    try:
+        from aiter.ops.mla_sparse_prefill import mla_sparse_prefill
+    except ImportError:
+        return None
+    return mla_sparse_prefill
+
+
+@functools.cache
+def _no_sink(num_heads: int, device: torch.device) -> torch.Tensor:
+    # exp(-1e30 - max) is 0, so the sink adds nothing to the softmax denominator
+    return torch.full((num_heads,), -1e30, dtype=torch.float32, device=device)
+
+
 def opus_sparse_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
     csr: Csr,
-    attn_sink: torch.Tensor,
+    attn_sink: Optional[torch.Tensor],
     softmax_scale: float,
     extend_kv: Optional[torch.Tensor] = None,
     extend_csr: Optional[Csr] = None,
 ) -> torch.Tensor:
     """Attention of q [T, H, 512] bf16 over the bf16 rows of kv [R, 512] named by
-    csr, then those of extend_kv named by extend_csr, with a per-head sink."""
+    csr, then those of extend_kv named by extend_csr, with a per-head sink, or
+    none when attn_sink is None. A row with no keys gives zeros."""
+    indices, indptr = csr
+    splits = {}
+    if attn_sink is None:
+        # Rows with no keys (the DSA caller's padding rows) must give zeros;
+        # aiter's split-key kernel can leave them non-finite.
+        splits = {"num_kv_splits": 1}
+        mla_sparse_prefill = _mla_sparse_prefill()
+        if mla_sparse_prefill is not None:
+            if extend_kv is None:
+                # an empty extend list, so aiter may pick a single-source kernel
+                extend_kv = kv[:1]
+                extend_csr = (indices[:0], torch.zeros_like(indptr))
+            return mla_sparse_prefill(
+                q.contiguous(),
+                kv,
+                indices,
+                indptr,
+                extend_kv,
+                *extend_csr,
+                None,
+                softmax_scale,
+                **splits,
+            )
+        attn_sink = _no_sink(q.shape[1], q.device)
+
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
-    indices, indptr = csr
     if extend_kv is None:
         # every query reads an empty row of the unused extend source
         extend_kv = kv[:1]
@@ -98,4 +152,5 @@ def opus_sparse_prefill(
         extend_indptr,
         attn_sink,
         softmax_scale,
+        **splits,
     )
