@@ -15,7 +15,6 @@ import torch.distributed as dist
 from sglang.srt.layers.communication.kda_dwdp.layout import UnitLayout
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmReservation,
-    align_up,
     check_drv,
     exchange_shareable_handles,
     get_device_granularity,
@@ -24,6 +23,7 @@ from sglang.srt.utils.cuda_vmm_utils import (
     release_mappings,
     tensor_from_pointer,
 )
+from sglang.srt.utils.vmm_common import align_up
 
 logger = logging.getLogger(__name__)
 
