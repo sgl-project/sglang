@@ -9,7 +9,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -18,7 +18,14 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
@@ -259,8 +266,9 @@ class TestPrefillCompleteResult(CustomTestCase):
 
 
 class TestEarlySentLastChunkResult(CustomTestCase):
-    """SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND: a PP stage already sent the last chunk when
-    its forward ended; the result sends nothing and never waits for it."""
+    """SGLANG_ENABLE_PP_PD_PREFILL_EARLY_SEND: a PP stage may have sent the last chunk
+    when its forward ended; the result never waits for it, and every stage holds the
+    checkpoint's frees alike whether or not it sent early itself."""
 
     def setUp(self):
         super().setUp()
@@ -270,11 +278,12 @@ class TestEarlySentLastChunkResult(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-    def _process_result(self, status, tree_cache=None):
+    def _process_result(self, early_sent, tree_cache=None, early_send_on=True):
         scheduler = _Scheduler()
         del scheduler.send_kv_chunk  # the real one, over a stub transfer
         scheduler._send_kv_chunk = Mock()
         scheduler.kv_checksum_computer = None
+        scheduler.disagg_prefill_early_send_on = early_send_on
         scheduler.disagg_prefill_early_send_stats = {"deferred": 0}
         scheduler.disagg_prefill_deferred_frees = {}
         if tree_cache is not None:
@@ -282,65 +291,128 @@ class TestEarlySentLastChunkResult(CustomTestCase):
         req = _Req()
         req.to_finish = None
         req.pending_bootstrap = False
+        req.return_sampling_mask = False
+        req.bootstrap_host = "10.0.0.1"
+        req.disagg_kv_sender = SimpleNamespace(
+            supports_host_tensor_indices=True,
+            kv_mgr=SimpleNamespace(
+                kv_shard_size=1, enable_all_cp_ranks_for_transfer=False
+            ),
+        )
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
-        if status is not None:
-            req.bootstrap_room = 5
-            req.disagg_kv_sender.kv_mgr = SimpleNamespace(request_status={5: status})
+        if early_sent:
             scheduler.disagg_prefill_early_sent_rids = {req.rid}
         move([req], scheduler.prefill_launched_reqs)
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertIn(req, scheduler.disagg_prefill_transfer_queue)
-        self.assertEqual(scheduler._send_kv_chunk.called, status is None)
+        # A stage that did not send early sends the last chunk from the result.
+        self.assertEqual(scheduler._send_kv_chunk.called, not early_sent)
         self.assertFalse(scheduler.disagg_prefill_early_sent_rids)
         return scheduler, req
 
-    @staticmethod
-    def _cache(storage):
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache._deferred_free_sink = None
-        cache.cache_controller = None
-        cache.kv_storage = lambda: storage
-        return cache
-
     @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
-    def test_early_sent_result_skips_its_checkpoint_on_every_stage(self, checkpoint):
-        # A cache that cannot hold frees: the release after the transfer publishes
-        # the KV. Early-send membership decides, not this stage's transfer status,
-        # so a stage whose transfer already ended skips like the others.
-        for status, checkpointed in (
-            (KVPoll.Transferring, False),
-            (KVPoll.Success, False),
-            (None, True),  # not early-sent: the result sends the last chunk
+    def test_every_stage_skips_the_checkpoint_on_a_cache_that_cannot_hold(
+        self, checkpoint
+    ):
+        # The release after the transfer publishes the KV. Whether this stage sent
+        # early does not matter, so a stage that kept the result path skips too.
+        for early_sent, early_send_on, checkpointed in (
+            (True, True, False),
+            (False, True, False),
+            (False, False, True),  # flag off: the regular path
         ):
-            with self.subTest(status=status):
+            with self.subTest(early_sent=early_sent, early_send_on=early_send_on):
                 checkpoint.reset_mock()
-                self._process_result(status)
+                self._process_result(early_sent, early_send_on=early_send_on)
                 self.assertEqual(checkpoint.called, checkpointed)
 
-    def test_early_sent_result_checkpoints_now_and_holds_its_frees(self):
+    def test_stages_that_disagree_on_early_send_hold_and_free_alike(self):
+        # Stage A sent the last chunk early, stage B kept the result path (e.g. a
+        # PP-matched decode). Both checkpoint now, hold the dedup's frees, and free
+        # them at the same release.
         dup = torch.arange(4)
 
         def checkpoint(req, tree_cache):  # the insert found the prefix: free the copy
             tree_cache._apply_cache_actions([FreeDeviceKV(indices=[dup])])
 
-        for status in (KVPoll.Transferring, KVPoll.Success):
-            with (
-                self.subTest(status=status),
-                patch(
-                    "sglang.srt.disaggregation.prefill.checkpoint_kv_cache", checkpoint
-                ),
-            ):
+        stages = []
+        with patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache", checkpoint):
+            for early_sent in (True, False):
                 storage = SimpleNamespace(free_token_rows=Mock())
-                scheduler, req = self._process_result(status, self._cache(storage))
-                # The transfer may still read the duplicate pages.
-                storage.free_token_rows.assert_not_called()
-                self.assertIn(req.rid, scheduler.disagg_prefill_deferred_frees)
-                scheduler._apply_deferred_frees(req)
-                storage.free_token_rows.assert_called_once_with(dup)
-                self.assertFalse(scheduler.disagg_prefill_deferred_frees)
-                # Outside the deferral, frees go straight to the pool.
-                scheduler.tree_cache._apply_cache_actions([FreeDeviceKV(indices=[dup])])
-                self.assertEqual(storage.free_token_rows.call_count, 2)
+                cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+                cache.cache_controller = None
+                cache.kv_storage = lambda storage=storage: storage
+                scheduler, req = self._process_result(early_sent, cache)
+                stages.append((scheduler, req, storage))
+        for scheduler, req, storage in stages:
+            storage.free_token_rows.assert_not_called()
+            self.assertIn(req, scheduler.disagg_prefill_deferred_frees)
+        for scheduler, req, storage in stages:  # the consensus release
+            scheduler._apply_deferred_frees(req)
+            storage.free_token_rows.assert_called_once_with(dup)
+            self.assertFalse(scheduler.disagg_prefill_deferred_frees)
+
+    def test_release_after_a_skipped_checkpoint_matches_the_regular_path(self):
+        # A real RadixCache cannot hold frees, so a held result skips the checkpoint
+        # and the release after the transfer publishes the KV. A sibling inserted
+        # this request's last token meanwhile, so the release dedups it. Tree and
+        # freed pages end as on the regular path (checkpoint, then release).
+        ends = {}
+        for held in (False, True):
+            freed = []
+            allocator = Mock(device=torch.device("cpu"), page_size=1)
+            allocator.free_segment.side_effect = lambda idx, start_pos=0: freed.extend(
+                idx.tolist()
+            )
+            cache = RadixCache.create_simulated(mock_allocator=allocator)
+            req_to_token = torch.zeros(2, 8, dtype=torch.int64)
+            cache.req_to_token_pool = SimpleNamespace(
+                req_to_token=req_to_token,
+                write=lambda idx, values: req_to_token.__setitem__(idx, values),
+            )
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", [1, 2, 3])),
+                    value=torch.tensor([10, 20, 30]),
+                )
+            )
+            match = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3])))
+            )
+            req_to_token[0, :4] = torch.tensor([10, 20, 30, 40])
+            req = _RadixReq([1, 2, 3, 4], match.last_device_node, cache)
+            cache.insert(  # the sibling's copy of token 4
+                InsertParams(
+                    key=RadixKey(array("q", [1, 2, 3, 4])),
+                    value=torch.tensor([10, 20, 30, 41]),
+                )
+            )
+            scheduler = SimpleNamespace(
+                tree_cache=cache,
+                disagg_prefill_early_send_stats={"deferred": 0},
+                disagg_prefill_deferred_frees={},
+            )
+            scheduler.checkpoint_disagg_prefill = lambda r: (
+                SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                    scheduler, r
+                )
+            )
+            if held:
+                SchedulerDisaggregationPrefillMixin._checkpoint_holding_frees(
+                    scheduler, req
+                )
+            else:
+                scheduler.checkpoint_disagg_prefill(req)
+            req.finished_reason = FINISH_LENGTH(length=0)
+            SchedulerDisaggregationPrefillMixin._apply_deferred_frees(scheduler, req)
+            release_kv_cache(req, cache, checkpoint=True)
+            ends[held] = (
+                cache.evictable_size(),
+                cache.protected_size(),
+                sorted(freed),
+            )
+        self.assertEqual(ends[True], ends[False])
+        self.assertEqual(ends[False], (4, 0, [40]))
 
     def test_inflight_release_applies_held_frees_first(self):
         for poll in (KVPoll.Success, KVPoll.Failed):
@@ -365,7 +437,7 @@ class TestEarlySentLastChunkResult(CustomTestCase):
                 req.finished_reason = FINISH_ABORT()
                 req.time_stats.set_prefill_kv_transfer_finish_time = Mock()
                 frees = [FreeDeviceKV(indices=[torch.arange(4)])]
-                scheduler.disagg_prefill_deferred_frees = {req.rid: frees}
+                scheduler.disagg_prefill_deferred_frees = {req: frees}
                 move([req], scheduler.disagg_prefill_transfer_queue)
                 self.assertEqual(
                     scheduler.process_disagg_prefill_transfer_queue(), [req]
@@ -379,32 +451,64 @@ class TestEarlySentLastChunkResult(CustomTestCase):
                     names[1:],
                 )
 
-    def test_eviction_inside_a_deferral_frees_at_once(self):
-        # An allocation inside the checkpoint may evict to make room; evicted nodes
-        # are unlocked, so their frees must not wait.
-        storage = SimpleNamespace(free_token_rows=Mock())
-        cache = self._cache(storage)
-        evicted = torch.arange(4)
-        cache.disable = False
-        cache.tree_components = [0]
-        cache.evicts_by_joint_lru = False
-        cache._evict_request_by_type = Mock(return_value={})
-        cache._evict_components = lambda *a, **k: cache._apply_cache_actions(
-            [FreeDeviceKV(indices=[evicted])]
+    def test_eviction_runs_outside_a_deferral(self):
+        # Eviction frees only unlocked nodes, so it must not join the held frees.
+        class _Cache(UnifiedRadixCache):
+            def __init__(self):
+                self.sinks_seen = []
+
+            @property
+            def disable(self):  # read first by the eviction body
+                self.sinks_seen.append(self._deferred_free_sink)
+                return True
+
+        cache, held = _Cache(), []
+        with cache.defer_device_frees(held):
+            cache._evict(EvictParams(num_tokens=1))
+            self.assertIs(cache._deferred_free_sink, held)
+        self.assertEqual(cache.sinks_seen, [None])
+
+
+class _RadixReq(FakeReq):
+    """A request over a real RadixCache: matched prefix locked, all of
+    ``fill_ids`` in its req_to_token row 0."""
+
+    def __init__(self, fill_ids, last_node, cache):
+        super().__init__(
+            rid="radix",
+            origin_input_ids=array("q", fill_ids),
+            output_ids=array("q"),
+            full_untruncated_fill_ids=array("q", fill_ids),
+            extend_end=len(fill_ids),
+            last_node=last_node,
+            lock=cache.lock(last_node),
+            extra_key=None,
+            cache_salt=None,
+            prefix_len=0,
+            priority=0,
+            pending_bootstrap=False,
+            kv=ReqKvInfo(
+                req_pool_idx=0,
+                kv_committed_len=len(fill_ids),
+                kv_allocated_len=len(fill_ids),
+                cache_protected_len=3,
+            ),
+            kv_rotation_base=None,
+            skip_radix_cache_insert=False,
+            finished_reason=None,
         )
-        cache.update_eviction_metrics = Mock()
-        cache.slot_id = Mock(return_value=None)
-        cache._window_sub_pools_by_slot = Mock(return_value={})
-        held = []
-        with (
-            patch("sglang.srt.mem_cache.unified_radix_cache.BASE_COMPONENT_TYPE", 0),
-            cache.defer_device_frees(held),
-        ):
-            cache._evict(SimpleNamespace())
-            cache._apply_cache_actions([FreeDeviceKV(indices=[torch.arange(4, 8)])])
-        storage.free_token_rows.assert_called_once_with(evicted)
-        self.assertEqual(len(held), 1)
-        self.assertIsNone(cache._deferred_free_sink)
+
+    def get_fill_ids(self):
+        return self.full_untruncated_fill_ids[: self.extend_end]
+
+    def finished(self):
+        return self.finished_reason is not None
+
+    def refresh_fill_ids(self):
+        pass
+
+    def owned_kv_len(self):
+        return self.kv.kv_committed_len
 
 
 class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
