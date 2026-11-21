@@ -1414,6 +1414,12 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    if not input_requests:
+        raise ValueError(
+            f"No requests to benchmark for dataset {args.dataset_name!r}. "
+            "Check the dataset, its filters, and --num-prompts."
+        )
+
     is_mooncake = args.dataset_name == "mooncake"
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
