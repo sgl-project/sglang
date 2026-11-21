@@ -352,7 +352,7 @@ class TestHiCacheAutoSize(CustomTestCase):
             ),
             patch.object(base, "ranks_per_host", return_value=ranks),
             patch.object(sizing, "ranks_per_host", return_value=ranks),
-            patch.object(torch.distributed, "barrier"),
+            patch.object(torch.distributed, "barrier") as barrier,
             get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
             patch.object(base, "available_host_memory_bytes", return_value=available),
             patch.object(base, "hugepage_size_requested", return_value=2 << 20),
@@ -375,6 +375,11 @@ class TestHiCacheAutoSize(CustomTestCase):
         ):
             scope = base._host_memory_budget.get()
             result = base.host_memory_preflight(mappings, HostTensorAllocator, "cuda")
+        # Only ranks sharing a host meet at the barrier; a lone rank has no process group to wait on.
+        if ranks > 1:
+            barrier.assert_called_once_with(group="cpu")
+        else:
+            barrier.assert_not_called()
         return scope, result
 
     def test_explicit_size_admits_a_hugepage_pool_when_plain_ram_is_below_the_reserve(

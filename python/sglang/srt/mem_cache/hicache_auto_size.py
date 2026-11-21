@@ -127,6 +127,7 @@ def _explicit_size_budget(params: CacheInitParams):
     if ranks_per_host() == 1 and not gfx950_ttm:
         # A lone rank has no peer to race;
         # sampling per pool still sees other engines' pools on this host, which a snapshot would not.
+        # It sees only pools already pinned: replicas that start together or span several ranks per host stay unaware.
         yield
         return
     allocator, kvcache_device = _host_allocator_and_device(params)
