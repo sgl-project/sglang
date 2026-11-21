@@ -12,6 +12,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.arg_groups.model_overrides.minimax_m3 import _minimax_m3_overrides
+from sglang.srt.arg_groups.moe_hook import (
+    _validate_flashinfer_cutile_config,
+    handle_moe_kernel_config,
+)
 from sglang.srt.configs.minimax_vl import (
     MiniMaxM3VLConfig,
     configure_minimax_m3_dspark,
@@ -121,6 +125,25 @@ def server_args(**kwargs):
     return SimpleNamespace(**(args | kwargs))
 
 
+def cutile_server_args(**kwargs):
+    """Start from a supported opt-in configuration, then vary one contract."""
+    defaults = dict(
+        moe_runner_backend="flashinfer_cutile",
+        quantization="minimax_m3_nvfp4",
+        ep_size=1,
+        enable_lora=False,
+        enable_paged_experts=False,
+        paged_experts_enable_disk=False,
+        paged_experts_host_memory_gb=None,
+        cpu_offload_gb=0,
+        offload_group_size=-1,
+        enable_memory_saver=False,
+        enable_weights_cpu_backup=False,
+        load_format="auto",
+    )
+    return server_args(**(defaults | kwargs))
+
+
 def packed_moe_hf(**quant_overrides):
     quant = {
         "quant_method": "mxfp8",
@@ -134,6 +157,232 @@ def packed_moe_hf(**quant_overrides):
 
 
 class TestMiniMaxM31ConfigResolution(CustomTestCase):
+    def test_marlin_preserves_explicit_settings_on_sm12x(self):
+        for device_sm in (120, 121):
+            for checkpoint in (NVFP4, packed_moe_hf()):
+                with (
+                    self.subTest(
+                        sm=device_sm, checkpoint=checkpoint.quantization_config
+                    ),
+                    override_platform(
+                        device_sm=device_sm, is_blackwell=True, is_hip=False
+                    ),
+                ):
+                    args = server_args(
+                        moe_runner_backend="marlin",
+                        attention_backend="flashinfer",
+                        kv_cache_dtype="bf16",
+                    )
+                    overrides = _minimax_m3_overrides(args, checkpoint)
+                    self.assertEqual(
+                        overrides,
+                        dict(quantization="minimax_m3_nvfp4", page_size=128),
+                    )
+                    self.assertEqual(args.moe_runner_backend, "marlin")
+                    self.assertEqual(args.moe_a2a_backend, "none")
+                    self.assertEqual(args.attention_backend, "flashinfer")
+                    self.assertEqual(args.kv_cache_dtype, "bf16")
+
+    def test_marlin_sm12x_rejects_unsupported_model_modes(self):
+        cases = (
+            (dict(moe_a2a_backend="megamoe"), "moe-a2a-backend none"),
+            (dict(moe_a2a_backend="deepep"), "moe-a2a-backend none"),
+            (dict(page_size=64), "page-size 128"),
+            (dict(speculative_algorithm="DSPARK"), "speculative decoding"),
+            (dict(speculative_algorithm="DFLASH"), "speculative decoding"),
+        )
+        for device_sm in (120, 121):
+            for settings, error in cases:
+                with (
+                    self.subTest(sm=device_sm, settings=settings),
+                    override_platform(
+                        device_sm=device_sm, is_blackwell=True, is_hip=False
+                    ),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    _minimax_m3_overrides(
+                        server_args(moe_runner_backend="marlin", **settings), NVFP4
+                    )
+
+    def test_cutile_preserves_explicit_backend_on_sm12x(self):
+        for device_sm in (120, 121):
+            for checkpoint in (NVFP4, packed_moe_hf()):
+                with (
+                    self.subTest(
+                        sm=device_sm, checkpoint=checkpoint.quantization_config
+                    ),
+                    override_platform(
+                        device_sm=device_sm, is_blackwell=True, is_hip=False
+                    ),
+                ):
+                    args = server_args(moe_runner_backend="flashinfer_cutile")
+                    overrides = _minimax_m3_overrides(args, checkpoint)
+                    self.assertEqual(
+                        overrides,
+                        dict(quantization="minimax_m3_nvfp4", page_size=128),
+                    )
+                    self.assertEqual(args.moe_runner_backend, "flashinfer_cutile")
+                    self.assertEqual(args.moe_a2a_backend, "none")
+
+    def test_cutile_keeps_explicit_attention_and_kv_settings(self):
+        with override_platform(device_sm=120, is_blackwell=True, is_hip=False):
+            args = server_args(
+                moe_runner_backend="flashinfer_cutile",
+                attention_backend="flashinfer",
+                kv_cache_dtype="bf16",
+            )
+            overrides = _minimax_m3_overrides(args, NVFP4)
+        self.assertNotIn("attention_backend", overrides)
+        self.assertNotIn("kv_cache_dtype", overrides)
+        self.assertEqual(args.attention_backend, "flashinfer")
+        self.assertEqual(args.kv_cache_dtype, "bf16")
+
+    def test_cutile_rejects_unsupported_hardware(self):
+        for device_sm in (0, 90, 100, 110):
+            with (
+                self.subTest(sm=device_sm),
+                override_platform(device_sm=device_sm, is_hip=False),
+                self.assertRaisesRegex(ValueError, "SM120 or SM121"),
+            ):
+                _minimax_m3_overrides(
+                    server_args(moe_runner_backend="flashinfer_cutile"), NVFP4
+                )
+
+    def test_cutile_rejects_unsupported_model_modes(self):
+        cases = (
+            (dict(moe_a2a_backend="megamoe"), "moe-a2a-backend none"),
+            (dict(moe_a2a_backend="deepep"), "moe-a2a-backend none"),
+            (dict(page_size=64), "page-size 128"),
+            (dict(speculative_algorithm="DSPARK"), "speculative decoding"),
+            (dict(speculative_algorithm="DFLASH"), "speculative decoding"),
+        )
+        for settings, error in cases:
+            with (
+                self.subTest(settings=settings),
+                override_platform(device_sm=120, is_blackwell=True, is_hip=False),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                _minimax_m3_overrides(
+                    server_args(moe_runner_backend="flashinfer_cutile", **settings),
+                    NVFP4,
+                )
+
+    def test_cutile_opt_in_keeps_existing_auto_defaults(self):
+        with override_platform(device_sm=120, is_blackwell=True, is_hip=False):
+            overrides = _minimax_m3_overrides(server_args(), NVFP4)
+        self.assertEqual(
+            overrides,
+            dict(
+                quantization="minimax_m3_nvfp4",
+                page_size=128,
+                moe_a2a_backend="megamoe",
+                moe_runner_backend="deep_gemm",
+                kv_cache_dtype="fp8_e4m3",
+                attention_backend="trtllm_mha",
+            ),
+        )
+
+    def test_cutile_config_accepts_sm12x_bf16(self):
+        for device_sm in (120, 121):
+            for dtype in ("auto", "bfloat16"):
+                with (
+                    self.subTest(sm=device_sm, dtype=dtype),
+                    override_platform(device_sm=device_sm),
+                ):
+                    _validate_flashinfer_cutile_config(cutile_server_args(dtype=dtype))
+        # The new validation does not inspect unrelated backend configurations.
+        _validate_flashinfer_cutile_config(SimpleNamespace(moe_runner_backend="auto"))
+
+    def test_cutile_memory_saver_requires_recoverable_weights(self):
+        """Reject unsafe configuration before memory release can discard weights."""
+        # This covers the startup guard; GPU release/resume and CPU-backup
+        # restoration need a separate runtime integration test.
+        cases = (
+            (False, False, None),
+            (False, True, None),
+            (True, False, "enable-weights-cpu-backup"),
+            (True, True, None),
+        )
+        for enable_memory_saver, enable_weights_cpu_backup, error in cases:
+            with (
+                self.subTest(
+                    memory_saver=enable_memory_saver,
+                    cpu_backup=enable_weights_cpu_backup,
+                ),
+                override_platform(device_sm=120),
+            ):
+                args = cutile_server_args(
+                    enable_memory_saver=enable_memory_saver,
+                    enable_weights_cpu_backup=enable_weights_cpu_backup,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _validate_flashinfer_cutile_config(args)
+                else:
+                    _validate_flashinfer_cutile_config(args)
+
+    def test_cutile_lifecycle_constraints_do_not_restrict_other_backends(self):
+        for backend in ("auto", "marlin"):
+            with self.subTest(backend=backend):
+                _validate_flashinfer_cutile_config(
+                    cutile_server_args(
+                        moe_runner_backend=backend,
+                        enable_memory_saver=True,
+                        enable_weights_cpu_backup=False,
+                        load_format="presharded",
+                    )
+                )
+
+    def test_cutile_config_rejects_unsupported_combinations(self):
+        cases = (
+            (dict(quantization="mxfp8"), "minimax_m3_nvfp4"),
+            (dict(ep_size=2), "ep-size 1"),
+            (dict(moe_a2a_backend="deepep"), "moe-a2a-backend none"),
+            (dict(enable_lora=True), "LoRA"),
+            (dict(dtype="float16"), "BF16"),
+            (dict(speculative_algorithm="DSPARK"), "speculative decoding"),
+            (dict(enable_paged_experts=True), "paged experts"),
+            (dict(cpu_offload_gb=1), "cpu-offload-gb"),
+            (dict(offload_group_size=2), "offload-group-size"),
+            (dict(load_format="presharded"), "load-format presharded"),
+        )
+        for settings, error in cases:
+            with (
+                self.subTest(settings=settings),
+                override_platform(device_sm=120),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                _validate_flashinfer_cutile_config(cutile_server_args(**settings))
+        for device_sm in (0, 90, 100, 110):
+            with (
+                self.subTest(sm=device_sm),
+                override_platform(device_sm=device_sm),
+                self.assertRaisesRegex(ValueError, "SM120 or SM121"),
+            ):
+                _validate_flashinfer_cutile_config(cutile_server_args())
+
+    def test_cutile_rejects_incompatible_modes_before_backend_rewrite(self):
+        # An explicit unsupported cuTile request must fail before the common
+        # post-processing path can silently replace the selected backend.
+        cases = (
+            (dict(quantization="mxfp8"), "minimax_m3_nvfp4"),
+            (dict(enable_memory_saver=True), "enable-weights-cpu-backup"),
+            (dict(load_format="presharded"), "load-format presharded"),
+        )
+        for settings, error in cases:
+            args = cutile_server_args(**settings)
+            with (
+                self.subTest(settings=settings),
+                override_platform(device_sm=120),
+                patch(
+                    "sglang.srt.arg_groups.moe_hook.run_post_process_pass",
+                    side_effect=AssertionError("backend rewrite must not run"),
+                ),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                handle_moe_kernel_config(args)
+            self.assertEqual(args.moe_runner_backend, "flashinfer_cutile")
+
     def test_nvfp4_defaults_on_blackwell_and_portable_fallback(self):
         base = dict(quantization="minimax_m3_nvfp4", page_size=128)
         portable = base | dict(moe_runner_backend="marlin", attention_backend="fa3")
