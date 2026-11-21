@@ -187,13 +187,17 @@ pub async fn send(
     let start = Instant::now();
     output.start_time = start.duration_since(base).as_secs_f64();
 
-    let response = match http
-        .post(&template.api_url)
-        .headers(template.headers.clone())
-        .json(&body)
-        .send()
-        .await
-    {
+    // A pooled keep-alive connection can be closed by the server just before
+    // the request is written on it, and hyper does not resend a request it has
+    // already written. Retry once: the closed connection never goes back into
+    // the pool, so the retry leaves on a fresh one. This can duplicate a
+    // request the server had already answered, which is cheaper for a benchmark
+    // than recording a client failure the server never caused.
+    let mut response = post(http, template, &body).await;
+    if matches!(&response, Err(error) if error.is_connect() || error.is_request()) {
+        response = post(http, template, &body).await;
+    }
+    let response = match response {
         Ok(response) => response,
         Err(error) => {
             output.error = error.to_string();
@@ -230,6 +234,19 @@ pub async fn send(
         }
     }
     output
+}
+
+/// POST one request body, leaving the retry decision to the caller.
+async fn post(
+    http: &reqwest::Client,
+    template: &RequestTemplate,
+    body: &Value,
+) -> Result<reqwest::Response, reqwest::Error> {
+    http.post(&template.api_url)
+        .headers(template.headers.clone())
+        .json(body)
+        .send()
+        .await
 }
 
 /// One request over the api.v1 gRPC service. Each streamed frame is the typed
@@ -639,6 +656,54 @@ mod tests {
             output.error = error;
         }
         output
+    }
+
+    /// A pooled keep-alive connection can be closed by the server just as the
+    /// next request is written on it, and hyper does not resend a request it
+    /// has already written. Without the retry that request is reported as a
+    /// client failure; with it, the retry answers on a fresh connection.
+    #[tokio::test]
+    async fn retries_once_when_the_connection_was_closed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const REPLY: &str = concat!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n",
+            "connection: close\r\n\r\n",
+            "data: {\"text\":\"a\",\"meta_info\":{\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if socket.read(&mut buf).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    // The first connection dies without an answer, the way one
+                    // the server had already closed does.
+                    if attempt == 0 {
+                        return;
+                    }
+                    let _ = socket.write_all(REPLY.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut template = template(Api::SglangGenerate);
+        template.api_url = format!("http://{addr}/generate");
+        let http = reqwest::Client::new();
+        let prompt = row(Prompt::Text("hi".into()));
+        let output = send(&http, &template, &prompt, Instant::now()).await;
+        assert!(output.success, "{}", output.error);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     /// `/generate` sends `text` and `sampling_params`, and the token-id form
