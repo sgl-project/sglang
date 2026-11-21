@@ -185,9 +185,8 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
         "installed AITER unified_attention has no causal=False (ROCm/aiter#7244)",
     )
     def test_encoder_only_verify_is_bidirectional_within_the_block(self):
-        """An ENCODER_ONLY draft (DSpark) must see its whole block from every row,
-        on the 2D and split-KV kernels and on the shape the causal-only
-        unified_attention_3d_mtp serves; the backend used to mask the block."""
+        """An ENCODER_ONLY layer sees its whole block from every row, on the 2D, split-KV
+        and (causal-only) 3d_mtp shapes."""
         self._check_against_the_reference(AttentionType.ENCODER_ONLY)
 
 

@@ -57,9 +57,8 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
             "--speculative-draft-attention-backend to trtllm_mha."
         )
 
-    # A target attention backend that declared NonCausalDraftAttention also runs the
-    # DSpark draft (8 Q / 2 KV heads, head dim 64, no window) where it declares itself
-    # the default (aiter: gfx950 only); elsewhere the draft keeps triton.
+    # A backend that declared NonCausalDraftAttention also runs the DSpark draft where
+    # it is the default on this device and accepts the draft checkpoint; else triton.
     if (
         cfg.speculative_algorithm == "DSPARK"
         and cfg.speculative_draft_attention_backend is None
@@ -67,13 +66,17 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
         from sglang.srt.layers.attention.attention_registry import (
             NONCAUSAL_DRAFT_ATTENTION_BACKENDS,
         )
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            draft_attention_traits_of_args,
+        )
 
         target_backend = attention_backends_of(resolved_view(server_args))[0]
         noncausal_draft = NONCAUSAL_DRAFT_ATTENTION_BACKENDS.get(target_backend)
         if noncausal_draft is not None and noncausal_draft.default_on_this_device():
+            draft_is_mla, draft_has_sliding_window = draft_attention_traits_of_args(cfg)
             reject_reason = noncausal_draft.reject_reason(
-                draft_is_mla=False,
-                draft_has_sliding_window=False,
+                draft_is_mla=draft_is_mla,
+                draft_has_sliding_window=draft_has_sliding_window,
                 enable_unified_memory=cfg.enable_unified_memory,
                 enable_deterministic_inference=cfg.enable_deterministic_inference,
             )

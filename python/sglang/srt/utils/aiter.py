@@ -82,9 +82,7 @@ def aiter_unified_attention_supports_non_causal() -> bool:
 
 
 def aiter_dspark_draft_default_on_this_device() -> bool:
-    """Whether a model hook may pick aiter for a DSpark draft unasked here: the aiter
-    DSpark draft was validated on gfx950 only, so other gfx95x and gfx942
-    keep their default draft backend."""
+    """Whether a hook may pick aiter for a DSpark draft unasked: validated on gfx950 only."""
     from sglang.kernels.arch import current_arch
 
     hip = current_arch().hip

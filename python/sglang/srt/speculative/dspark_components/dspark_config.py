@@ -55,17 +55,33 @@ def builds_confidence_head(draft_hf_config: Any) -> bool:
     return True
 
 
-def _draft_hf_config() -> Optional[Any]:
+def _load_draft_hf_config(
+    *,
+    draft_model_path: Optional[str],
+    trust_remote_code: bool,
+    revision: Optional[str],
+    json_model_override_args: str,
+    model_config_parser: Any,
+) -> Optional[Any]:
     from sglang.srt.hf_transformers import get_config
 
-    draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
         return None
     return get_config(
         draft_model_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        model_override_args=json.loads(json_model_override_args),
+        model_config_parser=model_config_parser,
+    )
+
+
+def _draft_hf_config() -> Optional[Any]:
+    return _load_draft_hf_config(
+        draft_model_path=get_spec().speculative_draft_model_path,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_spec().speculative_draft_model_revision,
-        model_override_args=json.loads(get_model().json_model_override_args),
+        json_model_override_args=get_model().json_model_override_args,
         model_config_parser=get_model().model_config_parser,
     )
 
@@ -77,28 +93,38 @@ def draft_uses_compressed_kv_attention() -> bool:
     return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
 
 
-def _translated_draft_hf_config() -> Optional[Any]:
+def _attention_traits(draft_hf_config: Optional[Any]) -> tuple[bool, bool]:
+    """(draft_is_mla, draft_has_sliding_window) of a DSpark draft checkpoint config."""
     from sglang.srt.configs.model_config import translated_dspark_draft_config
 
-    draft_hf_config = _draft_hf_config()
     if draft_hf_config is None:
-        return None
-    return translated_dspark_draft_config(draft_hf_config)
-
-
-def draft_is_mla() -> bool:
-    draft_hf_config = _translated_draft_hf_config()
+        return False, False
+    draft_hf_config = translated_dspark_draft_config(draft_hf_config)
     return (
-        draft_hf_config is not None
-        and parse_dspark_draft_config(draft_hf_config=draft_hf_config).is_mla
+        parse_dspark_draft_config(draft_hf_config=draft_hf_config).is_mla,
+        get_dflash_attention_sliding_window_size(draft_hf_config) is not None,
     )
 
 
+def draft_is_mla() -> bool:
+    return _attention_traits(_draft_hf_config())[0]
+
+
 def draft_has_sliding_window() -> bool:
-    draft_hf_config = _translated_draft_hf_config()
-    return (
-        draft_hf_config is not None
-        and get_dflash_attention_sliding_window_size(draft_hf_config) is not None
+    return _attention_traits(_draft_hf_config())[1]
+
+
+def draft_attention_traits_of_args(cfg: Any) -> tuple[bool, bool]:
+    """draft_attention_traits() for arg resolution, which runs before the runtime
+    context is published: reads the draft checkpoint named by the config view."""
+    return _attention_traits(
+        _load_draft_hf_config(
+            draft_model_path=cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            json_model_override_args=cfg.json_model_override_args,
+            model_config_parser=cfg.model_config_parser,
+        )
     )
 
 

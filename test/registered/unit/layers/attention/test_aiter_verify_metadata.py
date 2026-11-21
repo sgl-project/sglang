@@ -172,9 +172,8 @@ class TestUnifiedVerifyGraphBuffers(CustomTestCase):
         return backend
 
     def test_dspark_draft_skips_the_buffers_unified_verify_never_reads(self):
-        """A DSpark draft runner on unified verify allocated a max_bs x context flat
-        KV-index buffer and a max_tokens x context mask its target_verify graph never
-        reads, and its verify replay must not build flat indices."""
+        """A DSpark draft runner on unified verify allocates no flat KV-index buffer or
+        custom mask, and its verify replay builds no flat indices."""
         backend = self._init_graph_state(
             use_unified_verify=True, reads_flat_kv_indices=False
         )
@@ -226,11 +225,19 @@ class _FakeKVPool:
 
 
 class TestUnifiedVerifyCausalFlag(CustomTestCase):
-    """aiter target verify ran ENCODER_ONLY layers with a causal mask, and sent the
-    mtp shape to the causal-only 3d_mtp kernel; the registered AITER has no
-    causal=False, so the GPU reference cannot see this."""
+    """aiter unified verify masks causally only for non-ENCODER_ONLY layers; the GPU
+    reference cannot see this on an AITER without causal=False."""
 
-    def _verify(self, attn_type, *, num_q_heads, head_dim, kv_dtype, prefix_lens):
+    def _verify(
+        self,
+        attn_type,
+        *,
+        num_q_heads,
+        head_dim,
+        kv_dtype,
+        prefix_lens,
+        sliding_window_size=None,
+    ):
         bs, draft_num, page_size, num_kv_heads = len(prefix_lens), 4, 16, 2
         pages = -(-(max(prefix_lens) + draft_num) // page_size)
         backend = object.__new__(aiter_backend.AiterAttnBackend)
@@ -256,7 +263,7 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
             layer_id=0,
             attn_type=attn_type,
             is_cross_attention=False,
-            sliding_window_size=None,
+            sliding_window_size=sliding_window_size,
             tp_q_head_num=num_q_heads,
             tp_k_head_num=num_kv_heads,
             tp_v_head_num=num_kv_heads,
@@ -326,6 +333,18 @@ class TestUnifiedVerifyCausalFlag(CustomTestCase):
         for (name, attn_type), calls in expected.items():
             with self.subTest(shape=name, attn_type=attn_type.name):
                 self.assertEqual(self._verify(attn_type, **shapes[name]), calls)
+
+    def test_encoder_only_sliding_window_verify_raises(self):
+        """unified_attention takes no sliding window with causal=False, so it raises."""
+        with self.assertRaisesRegex(ValueError, "no sliding window"):
+            self._verify(
+                AttentionType.ENCODER_ONLY,
+                num_q_heads=8,
+                head_dim=64,
+                kv_dtype=torch.bfloat16,
+                prefix_lens=(37, 3000),
+                sliding_window_size=128,
+            )
 
 
 _DCP_SIZE = 8

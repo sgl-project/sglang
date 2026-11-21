@@ -61,10 +61,7 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
             return draft_worker_common.resolve_draft_worker_attention_backend()
 
     def test_named_aiter_serves_a_dspark_mha_draft_or_raises(self):
-        """A DSpark draft verifies its block bidirectionally. A named aiter that
-        cannot run it (an AITER without causal=False, an MLA or sliding-window
-        draft, a SHUFFLE 5D pool, unified verify off, unified memory,
-        deterministic inference) is an unmet explicit request and raises."""
+        """A named aiter that cannot run the non-causal DSpark draft raises, not falls back."""
         self.assertEqual(self._resolve(), "aiter")
         for case in (
             dict(aiter_non_causal=False),
@@ -80,9 +77,8 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
                     self._resolve(**case)
 
     def test_aiter_is_taken_only_when_named_for_a_dspark_draft(self):
-        """An --attention-backend aiter the draft merely inherits, or aiter named
-        for another algorithm's draft, keeps the platform fallback as before:
-        triton on a HIP build, flashinfer elsewhere."""
+        """An inherited aiter, or aiter named for another algorithm's draft, keeps the
+        platform fallback: triton on HIP, flashinfer elsewhere."""
         for hip_version, fallback in (("7.2", "triton"), (None, "flashinfer")):
             with (
                 self.subTest(hip=hip_version),
@@ -94,7 +90,13 @@ class TestDraftWorkerAttentionBackend(CustomTestCase):
 
 class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
     def _declared_draft_backend(
-        self, *, is_gfx950=True, aiter_non_causal=True, declared=None, **server_args
+        self,
+        *,
+        is_gfx950=True,
+        aiter_non_causal=True,
+        declared=None,
+        draft_traits=(False, False),
+        **server_args,
     ):
         server_args = (
             dict(
@@ -121,20 +123,25 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
             patch.dict(
                 attention_registry.NONCAUSAL_DRAFT_ATTENTION_BACKENDS, declared or {}
             ),
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_config."
+                "draft_attention_traits_of_args",
+                return_value=draft_traits,
+            ),
         ):
             apply_kimi_k3_spec_backend_defaults(args)
         return resolution_result(args, "speculative_draft_attention_backend")
 
     def test_kimi_k3_names_aiter_for_its_dspark_draft_on_gfx950(self):
-        """The Kimi-K3 hook is the allowlist entry for the aiter DSpark draft, which
-        was validated on gfx950 only. Another HIP arch (gfx942), an AITER without
-        causal=False, deterministic inference, an operator-named draft backend, a
-        non-aiter prefill backend or another algorithm must not get it."""
+        """The hook names aiter for the DSpark draft on gfx950 only, and not for a draft
+        the worker would reject or an operator-named backend."""
         self.assertEqual(self._declared_draft_backend(), "aiter")
         for case in (
             dict(is_gfx950=False),
             dict(aiter_non_causal=False),
             dict(enable_deterministic_inference=True),
+            dict(draft_traits=(True, False)),
+            dict(draft_traits=(False, True)),
             dict(speculative_draft_attention_backend="triton"),
             dict(prefill_attention_backend="triton"),
             dict(speculative_algorithm="EAGLE"),
@@ -143,9 +150,8 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
                 self.assertNotEqual(self._declared_draft_backend(**case), "aiter")
 
     def test_hook_asks_the_declared_capability_not_the_backend_name(self):
-        """The hook defaults the draft to whichever target backend declared
-        NonCausalDraftAttention and passes its checks; one that declared nothing,
-        is not the default here, or rejects the draft keeps the draft unset."""
+        """The hook defaults the draft to a target backend that declared the capability
+        and accepts the draft; any other leaves it unset."""
         reasons = []
 
         def declared(*, default_here=True, reject_reason=None):
@@ -169,6 +175,11 @@ class TestKimiK3DSparkDraftBackendDefault(CustomTestCase):
             "fake_noncausal",
         )
         self.assertFalse(reasons[-1]["draft_is_mla"])
+        self._declared_draft_backend(
+            declared=declared(), draft_traits=(True, True), **fake_target
+        )
+        self.assertTrue(reasons[-1]["draft_is_mla"])
+        self.assertTrue(reasons[-1]["draft_has_sliding_window"])
         for case in (
             dict(default_here=False),
             dict(reject_reason="cannot"),
@@ -221,6 +232,29 @@ class TestAiterDSparkDraftDefault(CustomTestCase):
             declared.default_on_this_device,
             aiter_utils.aiter_dspark_draft_default_on_this_device,
         )
+
+
+class TestTranslatedDSparkDraftConfig(CustomTestCase):
+    def test_bundled_drafts_are_read_as_the_draft_model_is_built(self):
+        """Checks on a draft checkpoint read the config ModelConfig builds the draft from."""
+        from sglang.srt.configs.model_config import translated_dspark_draft_config
+
+        for arch, module in (
+            (
+                "DSparkMiniMaxDraftModel",
+                "sglang.srt.configs.minimax_vl.configure_minimax_m3_dspark",
+            ),
+            (
+                "Inkling2ForConditionalGeneration",
+                "sglang.srt.configs.inkling2.Inkling2MTPConfig.from_target",
+            ),
+        ):
+            config = SimpleNamespace(architectures=[arch])
+            with self.subTest(arch=arch), patch(module, return_value="built") as build:
+                self.assertEqual(translated_dspark_draft_config(config), "built")
+                build.assert_called_once_with(config)
+        plain = SimpleNamespace(architectures=["DSparkDraftModel"])
+        self.assertIs(translated_dspark_draft_config(plain), plain)
 
 
 if __name__ == "__main__":

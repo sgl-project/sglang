@@ -338,6 +338,12 @@ def translated_dspark_draft_config(config):
         from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
 
         return configure_minimax_m3_dspark(config)
+    if _hf_arch(config) == "Inkling2ForConditionalGeneration":
+        from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
+
+        if isinstance(config, dict):
+            config = Inkling2MMConfig(**config)
+        return Inkling2MTPConfig.from_target(config)
     return config
 
 

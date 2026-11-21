@@ -60,19 +60,17 @@ def register_attention_backend(name):
 
 
 class NonCausalDraftAttention(msgspec.Struct, frozen=True):
-    """An attention backend's declaration that it can run a DSpark draft, whose MHA
-    verify reads the draft block bidirectionally (non-causal)."""
+    """A backend's declaration that it can run a DSpark draft's non-causal MHA verify."""
 
-    # Why the backend cannot run this draft, or None when it can. Keyword-only
-    # arguments: draft_is_mla, draft_has_sliding_window, enable_unified_memory,
-    # enable_deterministic_inference.
+    # Why the backend cannot run the draft, or None; keyword-only draft_is_mla,
+    # draft_has_sliding_window, enable_unified_memory, enable_deterministic_inference.
     reject_reason: Callable[..., Optional[str]]
     # Whether a model hook may pick the backend for the draft unasked on this device.
     default_on_this_device: Callable[[], bool]
 
 
-# Backends that declared NonCausalDraftAttention. They serve a DSpark draft only when
-# --speculative-draft-attention-backend names them (resolve_draft_worker_attention_backend).
+# Backends that declared NonCausalDraftAttention; they serve a DSpark draft only when
+# --speculative-draft-attention-backend names them.
 NONCAUSAL_DRAFT_ATTENTION_BACKENDS: dict[str, NonCausalDraftAttention] = {}
 
 
