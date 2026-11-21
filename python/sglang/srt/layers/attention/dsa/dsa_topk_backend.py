@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_context, get_exec, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -59,6 +59,8 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _deterministic_inference():
+            return _deterministic_topk(score, lengths, topk, row_starts=row_starts)
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
@@ -310,6 +312,53 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _deterministic_inference() -> bool:
+    # Kernel tests and tools can call this module without publishing a server
+    # configuration. Production DSA calls always have the exec bag published.
+    return (
+        get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def _tie_free_topk(score: torch.Tensor, topk: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select top-k with equal scores preferring the lower column."""
+    if score.shape[-1] <= 4096:
+        values, indices = torch.sort(score, dim=-1, descending=True, stable=True)
+        return values[:, :topk], indices[:, :topk]
+
+    # Build a distinct int64 key from every fp32 score and its column. The
+    # order-preserving int32 transform keeps larger scores first; the low bits
+    # make the lower column win a tie without sorting the full wide row.
+    bits = score.contiguous().view(torch.int32)
+    key = torch.where(bits >= 0, bits, bits ^ 0x7FFFFFFF).to(torch.int64)
+    columns = torch.arange(score.shape[-1], device=score.device, dtype=torch.int64)
+    key = (key << 32) | (0xFFFFFFFF - columns)
+    indices = torch.topk(key, topk, dim=-1).indices
+    return score.gather(-1, indices), indices
+
+
+def _deterministic_topk(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    selected = _topk_unfused(
+        score,
+        lengths,
+        topk,
+        row_starts=row_starts,
+        topk_op=_tie_free_topk,
+    )
+
+    # Sparse attention reduces KV rows in the order returned here. Canonicalize
+    # that order independently of scores, with unused slots kept at the end.
+    padding = torch.iinfo(selected.dtype).max
+    selected = torch.sort(selected.masked_fill(selected < 0, padding), dim=-1).values
+    return selected.masked_fill(selected == padding, -1)
 
 
 def _topk_transform_v2_paged(
