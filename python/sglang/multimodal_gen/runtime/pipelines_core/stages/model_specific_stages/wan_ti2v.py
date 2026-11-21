@@ -63,8 +63,9 @@ def prepare_wan_ti2v_latents(
     latent_model_input = latents.to(target_dtype)
     assert latent_model_input.ndim == 5
 
-    latent_for_mask = latent_model_input.squeeze(0)
-    reserved_frames_masks = [torch.ones_like(latent_for_mask)]
+    # One per-sample mask over [C, T, H, W]; it broadcasts across the outputs of
+    # an n > 1 request, which share the conditioning image.
+    reserved_frames_masks = [torch.ones_like(latent_model_input[0])]
     reserved_frames_masks[0][:, 0] = 0
     reserved_frames_mask = reserved_frames_masks[0].unsqueeze(0)
 
