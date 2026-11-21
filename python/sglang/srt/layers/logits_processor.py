@@ -277,6 +277,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    # Per sequence, the [rows, k] float32 host spans of its input candidate
+    # selector's weights; None when the batch has no such request.
+    input_top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -370,6 +373,10 @@ class LogitsMetadata:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
+    # Per request, ReqLogprob.input_candidate_selector; the prefix lens give
+    # the position of a selector's first row.
+    input_candidate_selectors: Optional[List[Optional[Any]]] = None
+    extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
@@ -456,6 +463,8 @@ class LogitsMetadata:
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            input_candidate_selectors=forward_batch.input_candidate_selectors,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
@@ -508,6 +517,10 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
+    # Override point: a subclass serving input candidate selectors names its
+    # InputLogprobProcessor subclass here.
+    input_logprob_processor_cls = InputLogprobProcessor
+
     def __init__(
         self,
         config,
@@ -601,7 +614,7 @@ class LogitsProcessor(nn.Module):
                 parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
             )
             chunking_group = group.cpu_group
-        self.input_logprob_processor = InputLogprobProcessor(
+        self.input_logprob_processor = self.input_logprob_processor_cls(
             self.vocab_size, chunking_group=chunking_group
         )
 
@@ -709,6 +722,15 @@ class LogitsProcessor(nn.Module):
         if self.expected_aux_hidden_states is not None:
             self._check_aux_hidden_states(
                 aux_hidden_states, hidden_states, logits_metadata
+            )
+
+        if logits_metadata.input_candidate_selectors is not None and (
+            token_indices_to_pool is not None
+            or multi_item_delimiter_indices is not None
+        ):
+            # The two scoring paths below read top_logprobs_nums only.
+            raise NotImplementedError(
+                "Position scoring serves no input candidate selector"
             )
 
         # Setwise scoring (CausalLM): read label-token logprobs AT each anchor

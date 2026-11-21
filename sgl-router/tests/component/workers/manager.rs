@@ -6,6 +6,9 @@ use clap::Parser;
 use serde_json::{json, Value};
 use sgl_router::config::Cli;
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::workers::control::{
+    ExternalWorkerSource, OperationState, WorkerControlService, WorkerInput,
+};
 use sgl_router::workers::{manager, WireProtocol, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -78,6 +81,147 @@ async fn wait_until(condition: impl Fn() -> bool, description: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
+}
+
+fn control_input(url: &str, mode: WorkerMode) -> WorkerInput {
+    WorkerInput {
+        url: url.into(),
+        mode,
+        model_ids: Vec::new(),
+        bootstrap_port: None,
+        version_group: None,
+        services: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn manager_processes_control_create_replace_and_remove() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (discovery_tx, discovery_rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let (control, control_rx) =
+        WorkerControlService::new(registry.clone(), ExternalWorkerSource::Static);
+    let metrics = sgl_router::server::metrics::MetricsRegistry::new();
+    let manager = tokio::spawn(manager::run_with_config_and_control(
+        discovery_rx,
+        control_rx,
+        control.clone(),
+        None,
+        None,
+        None,
+        Some(metrics.clone()),
+    ));
+
+    let created = control
+        .create(control_input(&url, WorkerMode::Plain))
+        .expect("create accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation
+                    .is_some_and(|operation| operation.state == OperationState::Succeeded)
+                    && view.runtime.is_some()
+            })
+        },
+        "control create to complete",
+    )
+    .await;
+
+    let mut replacement = control_input(&url, WorkerMode::Plain);
+    replacement.version_group = Some("v2".into());
+    let replaced = control
+        .replace(&created.worker_id, replacement, created.revision)
+        .expect("replace accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.revision == Some(replaced.revision)
+                    && view.version_group.as_deref() == Some("v2")
+                    && view
+                        .operation
+                        .is_some_and(|operation| operation.state == OperationState::Succeeded)
+            })
+        },
+        "control replace to complete",
+    )
+    .await;
+
+    let removed = control
+        .remove(&created.worker_id, replaced.revision)
+        .expect("remove accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.revision == Some(removed.revision)
+                    && view.deleted
+                    && view
+                        .operation
+                        .is_some_and(|operation| operation.state == OperationState::Succeeded)
+            })
+        },
+        "control remove to complete",
+    )
+    .await;
+    assert!(registry.get(&created.worker_id).is_none());
+    let rendered = metrics.render();
+    assert!(rendered.contains(
+        r#"sgl_router_worker_control_operations_total{action="create",outcome="succeeded"} 1"#
+    ));
+    assert!(rendered.contains(
+        r#"sgl_router_worker_control_operations_total{action="replace",outcome="succeeded"} 1"#
+    ));
+    assert!(rendered.contains(
+        r#"sgl_router_worker_control_operations_total{action="remove",outcome="succeeded"} 1"#
+    ));
+
+    drop(discovery_tx);
+    manager.abort();
+}
+
+#[tokio::test]
+async fn manager_records_control_registration_failure() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (discovery_tx, discovery_rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    registry
+        .add(WorkerSpec {
+            id: WorkerId("plain".into()),
+            url: "http://plain:30000".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("m".into())],
+            ..Default::default()
+        })
+        .expect("plain worker");
+    let (control, control_rx) =
+        WorkerControlService::new(registry.clone(), ExternalWorkerSource::Static);
+    let manager = tokio::spawn(manager::run_with_config_and_control(
+        discovery_rx,
+        control_rx,
+        control.clone(),
+        None,
+        None,
+        None,
+        None,
+    ));
+
+    let created = control
+        .create(control_input(&url, WorkerMode::Prefill))
+        .expect("create accepted");
+    wait_until(
+        || {
+            control.get(&created.worker_id).is_some_and(|view| {
+                view.operation
+                    .is_some_and(|operation| operation.state == OperationState::Failed)
+            })
+        },
+        "failed control create to be recorded",
+    )
+    .await;
+    assert!(registry.get(&created.worker_id).is_none());
+    assert!(registry.get(&WorkerId("plain".into())).is_some());
+
+    drop(discovery_tx);
+    manager.abort();
 }
 
 #[tokio::test]
@@ -416,7 +560,11 @@ async fn mode_changed_preserves_active_requests_and_breaker() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until(
+        || registry.get(&WorkerId("w1".into())).is_some(),
+        "worker to register before mutating live state",
+    )
+    .await;
 
     // Grab a handle, bump active_requests, and open the breaker.
     let w = registry.get(&WorkerId("w1".into())).unwrap();
@@ -562,6 +710,49 @@ async fn manager_handles_duplicate_added_as_upsert() {
         "w1 still serves m1 after the second Added",
     );
 
+    drop(tx);
+    h.await.unwrap();
+}
+
+#[tokio::test]
+async fn manager_preserves_same_url_identity_rollover() {
+    let (url, _shutdown) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, Arc::clone(&registry)));
+    let old_id = WorkerId("old".into());
+    let new_id = WorkerId("new".into());
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        &old_id.0,
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    wait_until(
+        || registry.get(&old_id).is_some(),
+        "original discovery identity",
+    )
+    .await;
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        &new_id.0,
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    tx.send(DiscoveryEvent::Removed { id: old_id.clone() })
+        .await
+        .unwrap();
+    wait_until(
+        || registry.get(&old_id).is_none() && registry.get(&new_id).is_some(),
+        "replacement discovery identity",
+    )
+    .await;
+
+    assert_eq!(registry.all().len(), 1);
     drop(tx);
     h.await.unwrap();
 }
