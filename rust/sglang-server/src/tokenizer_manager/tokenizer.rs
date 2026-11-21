@@ -20,6 +20,7 @@ use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
+use crate::utils::environ::env_i64;
 use crate::utils::{error::Error, fsm::Event};
 
 /// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
@@ -38,7 +39,13 @@ pub fn load_tokenizer(
     let path = tokenizer_path.ok_or_else(|| {
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
-    DynamoTokenizer::load(path, revision).map(Some)
+    let tokenizer = DynamoTokenizer::load(path, revision)?;
+    let cache_mb = env_i64("SGLANG_RUST_INCREMENTAL_ENCODE_CACHE_MB", 0);
+    Ok(Some(if cache_mb > 0 {
+        tokenizer.with_incremental_encode(path, revision, (cache_mb as usize) << 20)
+    } else {
+        tokenizer
+    }))
 }
 
 /// Widened once here, in the parallel pool: the scheduler's `array("q")` is
