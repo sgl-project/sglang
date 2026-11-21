@@ -25,7 +25,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_utils import (
+    commit_accept_tokens_to_penalties,
+    eagle_sample,
+)
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     bind_eagle_runtime_hooks,
@@ -477,6 +480,14 @@ class NGRAMWorker(BaseSpecWorker):
             maybe_detect_inf(
                 logits_output.next_token_logits, "verify: target model logits"
             )
+            # NGRAM watermark contexts use the full-mask layout.
+            watermark = (
+                self.model_runner.watermark.bind_verify(
+                    batch.sampling_info.watermark, full_mask=True
+                )
+                if self.model_runner.watermark is not None
+                else None
+            )
             if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
                 post_verify_output = self._speculative_runtime_hooks.post_verify(
                     make_post_verify_io(
@@ -487,8 +498,7 @@ class NGRAMWorker(BaseSpecWorker):
                         device=batch.device,
                         logits_output=logits_output,
                         grammar_mask=grammar_mask,
-                        watermark=self.model_runner.watermark_state,
-                        # NGRAM watermark contexts use the full-mask layout.
+                        watermark=watermark,
                         watermark_full_mask=True,
                         return_logprob=batch.return_logprob,
                         is_idle=batch.forward_mode.is_idle(),
@@ -507,8 +517,11 @@ class NGRAMWorker(BaseSpecWorker):
                     batch,
                     logits_output,
                     grammar_mask,
-                    watermark_state=self.model_runner.watermark_state,
+                    watermark=watermark,
                 )
+            commit_accept_tokens_to_penalties(
+                batch.sampling_info, predict, accept_index
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -518,11 +531,9 @@ class NGRAMWorker(BaseSpecWorker):
                 self.draft_token_num,
             )
             accept_tokens = predict[accept_index]
-            if (
-                self.model_runner.watermark_state is not None
-                and batch.sampling_info.has_watermark_candidates
-            ):
-                self.model_runner.watermark_state.append_speculative(
+            if watermark is not None:
+                self.model_runner.watermark.append_accept_tokens(
+                    batch.sampling_info.watermark,
                     batch.req_pool_indices,
                     accept_tokens,
                     accept_lens,

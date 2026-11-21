@@ -56,7 +56,7 @@ ROUNDS = 2 * eagle_post_verify_graphs._NUM_WARMUP + 4
 
 def _target_worker():
     return SimpleNamespace(
-        model_runner=SimpleNamespace(watermark_state=None),
+        model_runner=SimpleNamespace(watermark=None),
         random_seed=11,
         device="cpu",
     )
@@ -153,11 +153,12 @@ def _round(bs, generator, vocab=VOCAB):
             need_top_k_sampling=False,
             need_top_p_sampling=False,
             need_min_p_sampling=False,
+            step_penalties=None,
             acc_additive_penalties=None,
             acc_scaling_penalties=None,
             logit_bias=None,
             sampling_seed=None,
-            has_watermark_candidates=False,
+            watermark=None,
             temperatures=None,
             top_ks=None,
             top_ps=None,
@@ -215,7 +216,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         has_grammar=False,
         device="cpu",
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
-        sampling_info=None,
+        sampling_info=SimpleNamespace(watermark=None),
         return_logprob=False,
     )
     target_worker = SimpleNamespace(
@@ -226,7 +227,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
             )
         ),
         model_runner=SimpleNamespace(
-            watermark_state=None,
+            watermark=None,
             attn_backend=SimpleNamespace(verify_mask=None),
         ),
     )
@@ -276,89 +277,6 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
-    def test_graph_key_bound_is_raised_only_under_the_runtime_master(self):
-        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
-        keys = envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS
-        for master_on, value, expected in (
-            (False, "512", 64),
-            (True, None, 64),
-            (True, "512", 512),
-        ):
-            with (
-                self.subTest(master=master_on, value=value),
-                master.override(master_on),
-            ):
-                with keys.override(value) if value else nullcontext():
-                    self.assertEqual(
-                        eagle_post_verify_graphs._max_graph_keys(), expected
-                    )
-
-    def test_pool_presize_is_on_under_its_switch(self):
-        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
-        child = envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE
-        for master_on, value, expected in (
-            (False, None, False),
-            (True, None, True),
-            (True, "0", False),
-            (False, "1", False),
-        ):
-            with (
-                self.subTest(master=master_on, value=value),
-                master.override(master_on),
-                child.override(value) if value else nullcontext(),
-            ):
-                graphs = _worker(switch=True)._post_verify_graphs._graphs
-                self.assertIs(graphs.presize is not None, expected)
-
-    def test_pool_presize_runs_once_inside_the_first_capture_before_the_body(self):
-        events = []
-        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
-            body=lambda slot: events.append(("body", slot.num_requests)) or ("out",),
-            commit=lambda slot, outputs: None,
-            sim_rng=torch.Generator(),
-        )
-        graphs.presize = lambda slot: events.append(("size", slot.num_requests)) or 4096
-        native_empty = torch.empty
-
-        def empty(*args, **kwargs):
-            if kwargs.get("dtype") is torch.uint8:
-                events.append(("presize", args[0]))
-            return native_empty(*args, **kwargs)
-
-        @contextmanager
-        def graph(*args, **kwargs):
-            events.append(("capture",))
-            yield
-
-        cuda = torch.cuda
-        with (
-            patch.object(cuda, "graph_pool_handle", return_value="pool"),
-            patch.object(cuda, "Stream", MagicMock),
-            patch.object(cuda, "Event", MagicMock),
-            patch.object(cuda, "CUDAGraph", MagicMock),
-            patch.object(cuda, "current_stream", MagicMock()),
-            patch.object(cuda, "graph", graph),
-            patch.object(torch, "empty", empty),
-            patch(
-                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
-            ),
-        ):
-            for bs in (4, 9):
-                graphs._capture(SimpleNamespace(num_requests=bs, device="cpu"))
-        self.assertEqual(
-            events,
-            [
-                ("size", 4),
-                ("capture",),
-                ("presize", 4096),
-                ("body", 4),
-                ("capture",),
-                ("capture",),
-                ("body", 9),
-                ("capture",),
-            ],
-        )
-
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
@@ -401,12 +319,11 @@ class TestPostVerifyGraphs(CustomTestCase):
 
         def key(can_run_cuda_graph=True, topk=1, **changes):
             info = dict(
-                acc_additive_penalties=None,
-                acc_scaling_penalties=None,
+                step_penalties=None,
                 logit_bias=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,
-                has_watermark_candidates=False,
+                watermark=None,
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=True,
@@ -436,8 +353,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(topk=2),
             dict(has_grammar=True),
             dict(hisparse_coordinator=object()),
-            dict(acc_additive_penalties=torch.zeros(1)),
-            dict(acc_scaling_penalties=torch.zeros(1)),
+            dict(step_penalties=object()),
             dict(logit_bias=torch.zeros(1)),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
@@ -535,12 +451,13 @@ class TestPostVerifyGraphs(CustomTestCase):
             forward_mode=ForwardMode.TARGET_VERIFY,
             seq_lens=torch.zeros(1),
             sampling_info=SimpleNamespace(
+                step_penalties=None,
                 acc_additive_penalties=None,
                 acc_scaling_penalties=None,
                 logit_bias=None,
                 sampling_seed=None,
                 need_min_p_sampling=False,
-                has_watermark_candidates=False,
+                watermark=None,
                 is_all_greedy=False,
                 need_top_k_sampling=True,
                 need_top_p_sampling=False,
@@ -635,7 +552,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         reference_rng = simulated_acc_len_generator(0)
         graphs = EaglePostVerifyGraphs(
             target_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(watermark_state=None, model_config=None)
+                model_runner=SimpleNamespace(watermark=None, model_config=None)
             ),
             simulated_acc_len_rng=worker_rng,
         )

@@ -4,8 +4,12 @@
 import json
 import os
 import shlex
+import subprocess
 import sys
+import tempfile
 from importlib import resources
+from pathlib import Path
+from typing import NoReturn
 
 from sglang.srt.utils.device import get_device_count, get_device_name, is_hip
 
@@ -23,25 +27,31 @@ NO_MATCH_MESSAGE = (
     "launching it with the default flags. To pick fewer GPUs, set {devices_env}."
 )
 EDIT_PROMPT = (
-    'Change a flag ("--port 8000"), remove one ("!--port"), or press Enter to launch: '
+    'Change a flag ("--port 8000"), remove one ("!--port"), '
+    'edit the whole command in your editor ("e"), or press Enter to launch: '
 )
+EDITOR_HEADER = "# Edit, save and quit; lines starting with # are ignored.\n"
 
-# Cookbook hardware ids by device name, most specific first;
+# Cookbook hardware ids by device name, most specific first; some pages
+# spell the same GPU differently.
 _HARDWARE = (
-    ("GB300", "gb300"),
-    ("B300", "b300"),
-    ("GB200", "gb200"),
-    ("B200", "b200"),
-    ("GB10", "dgx-spark"),
-    ("RTX PRO 6000", "rtx6000"),
-    ("GH200", None),
-    ("H200", "h200"),
-    ("H100", "h100"),
-    ("H800", "h800"),
-    ("MI355X", "mi355x"),
-    ("MI350X", "mi350x"),
-    ("MI325X", "mi325x"),
-    ("MI300X", "mi300x"),
+    ("GB300", ("gb300",)),
+    ("B300", ("b300",)),
+    ("GB200", ("gb200",)),
+    ("B200", ("b200",)),
+    ("GB10", ("dgx-spark",)),
+    ("RTX PRO 6000", ("rtx6000", "rtx-pro-6000")),
+    ("RTX 5090", ("rtx5090",)),
+    ("GH200", ()),
+    ("H20-3E", ("h20-3e",)),
+    ("H200", ("h200",)),
+    ("H100", ("h100",)),
+    ("H800", ("h800",)),
+    ("L20", ("l20",)),
+    ("MI355X", ("mi355x",)),
+    ("MI350X", ("mi350x",)),
+    ("MI325X", ("mi325x",)),
+    ("MI300X", ("mi300x",)),
 )
 
 
@@ -52,8 +62,8 @@ def recipes_for_this_machine(model: str) -> list[dict]:
         _log(NO_RECIPE_MESSAGE.format(model=model))
         return []
     device_name, gpus = _detect_gpus()
-    hw = _hardware_id(device_name)
-    matching = [r for r in recipes if r["hw"] == hw and r["gpus"] == gpus]
+    hardware = _hardware_ids(device_name)
+    matching = [r for r in recipes if r["hw"] in hardware and r["gpus"] == gpus]
     if not matching:
         machine = f"{gpus}x {device_name}" if gpus else "this machine (no GPU)"
         available = ", ".join(sorted({f"{r['gpus']}x {r['hw']}" for r in recipes}))
@@ -84,7 +94,7 @@ def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
         print(recipe["command"])
         return
     if interactive:
-        argv = _ask_flag_edits(env=env, argv=argv, command=recipe["command"])
+        env, argv = _ask_edits(env=env, argv=argv, command=recipe["command"])
     else:
         print(recipe["command"])
     yours = [key for key in env if os.environ.get(key, env[key]) != env[key]]
@@ -92,8 +102,8 @@ def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
         _log(f"Using your exported {', '.join(yours)} instead of the Cookbook's.")
 
     _log(
-        f'To change flags, run "sglang serve {model} --dry-run", '
-        "edit the command without running."
+        f'To change flags: run "sglang serve {model} --dry-run" to print the '
+        "command, edit it, then run it."
     )
     sys.stdout.flush()
     sys.stderr.flush()
@@ -106,15 +116,14 @@ def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
 
 def command_argv(command: str) -> list[str]:
     """Arguments after `sglang serve` in a Cookbook command."""
-    lines = [line.rstrip(" \\") for line in command.strip().splitlines()]
-    lines = [line for line in lines if line and not line.startswith("#")]
-    start = next(i for i, line in enumerate(lines) if line.startswith("sglang serve"))
-    return shlex.split(" ".join(lines[start:]))[2:]
+    return _split_command(command)[1]
 
 
 def format_command(env: dict[str, str], argv: list[str]) -> str:
     """Render a command in the Cookbook's one-flag-per-line style."""
-    lines = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
+    lines = [
+        f"{key}={shlex.quote(value) if value else ''}" for key, value in env.items()
+    ]
     lines.append("sglang serve")
     lines += [f"  {shlex.join(group)}" for group in _flag_groups(argv)]
     return " \\\n".join(lines)
@@ -146,6 +155,30 @@ def edit_flags(argv: list[str], edits: str) -> list[str]:
         else:
             raise ValueError(f'Expected a flag such as "--port 8000", got {flag!r}.')
     return [token for group in groups for token in group]
+
+
+def _split_command(command: str) -> tuple[list[str], list[str]]:
+    """Shell words before `sglang serve`, and the arguments after it."""
+    lines = [line.rstrip(" \\") for line in command.strip().splitlines()]
+    words = shlex.split(
+        " ".join(line for line in lines if not line.lstrip().startswith("#"))
+    )
+    for i in range(len(words) - 1):
+        if words[i : i + 2] == ["sglang", "serve"]:
+            return words[:i], words[i + 2 :]
+    raise ValueError('No "sglang serve" in the command')
+
+
+def _parse_command(command: str) -> tuple[dict[str, str], list[str]]:
+    """Env and arguments of a `KEY=VALUE ... sglang serve ...` command."""
+    words, argv = _split_command(command)
+    env = {}
+    for word in words:
+        key, sep, value = word.partition("=")
+        if not (sep and key.isidentifier()):
+            raise ValueError(f'Expected KEY=VALUE before "sglang serve", got {word!r}')
+        env[key] = value
+    return env, argv
 
 
 def _flag_groups(argv: list[str]) -> list[list[str]]:
@@ -183,26 +216,54 @@ def _pick_mode(recipes: list[dict], interactive: bool) -> dict:
         _log(f"Pick 1-{len(modes)} or a mode name.")
 
 
-def _ask_flag_edits(env: dict[str, str], argv: list[str], command: str) -> list[str]:
+def _ask_edits(
+    env: dict[str, str], argv: list[str], command: str
+) -> tuple[dict[str, str], list[str]]:
     print(command)
     while True:
-        edits = _ask(EDIT_PROMPT)
-        if not edits.strip():
-            return argv
+        answer = _ask(EDIT_PROMPT).strip()
+        if not answer:
+            return env, argv
         try:
-            argv = edit_flags(argv=argv, edits=edits)
+            if answer == "e":
+                env, argv = _edit_in_editor(env=env, argv=argv)
+            else:
+                argv = edit_flags(argv=argv, edits=answer)
         except ValueError as e:
             _log(str(e))
             continue
         print(format_command(env=env, argv=argv))
 
 
+def _edit_in_editor(
+    env: dict[str, str], argv: list[str]
+) -> tuple[dict[str, str], list[str]]:
+    """Open the command in $VISUAL or $EDITOR, then parse what the user saved."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "command.sh"
+        path.write_text(EDITOR_HEADER + format_command(env=env, argv=argv) + "\n")
+        try:
+            code = subprocess.call([*shlex.split(editor), str(path)])
+            if code:
+                raise ValueError(f"{editor} exited with code {code}")
+            return _parse_command(path.read_text())
+        except (OSError, ValueError) as e:
+            raise ValueError(f"{e}; the command is unchanged.")
+        except KeyboardInterrupt:
+            _cancel()
+
+
 def _ask(prompt: str) -> str:
     try:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
-        _log("\nCancelled; nothing launched.")
-        raise SystemExit(130)
+        _cancel()
+
+
+def _cancel() -> NoReturn:
+    _log("\nCancelled; nothing launched.")
+    raise SystemExit(130)
 
 
 def _is_terminal() -> bool:
@@ -221,11 +282,11 @@ def _detect_gpus() -> tuple[str | None, int]:
     return (get_device_name() if count else None), count
 
 
-def _hardware_id(device_name: str | None) -> str | None:
-    for name, hw in _HARDWARE:
+def _hardware_ids(device_name: str | None) -> tuple[str, ...]:
+    for name, hardware in _HARDWARE:
         if device_name and name in device_name.upper():
-            return hw
-    return None
+            return hardware
+    return ()
 
 
 def _log(message: str) -> None:

@@ -59,3 +59,15 @@ class AutoResidencyReq(msgspec.Struct, frozen=True):
     """
 
     action: str = "apply"  # "apply" | "validate" | "rollback"
+
+
+class StartProfileReq(msgspec.Struct):
+    output_dir: str | None = None
+    profile_id: str | None = None
+    activities: list[str] | None = None
+    with_stack: bool | None = None
+    record_shapes: bool | None = None
+
+
+class StopProfileReq(msgspec.Struct):
+    export_trace: bool = True
