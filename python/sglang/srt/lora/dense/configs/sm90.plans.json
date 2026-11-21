@@ -790,7 +790,7 @@
      "BLOCK_SIZE_N": 64,
      "BLOCK_SIZE_K": 128,
      "GROUP_SIZE_M": 8,
-     "num_warps": 4,
+     "num_warps": 8,
      "num_stages": 3,
      "SPLIT_K": 16
     },

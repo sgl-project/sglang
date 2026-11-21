@@ -62,11 +62,13 @@ def test_shared_decode_plan_respects_vendor_and_family():
     for family in ("nvfp4", "mxfp4", "fp8", "fp8_channel", "fp8_tensor", "mxfp8"):
         assert row(family, "marlin").name == "decode.shared.marlin", family
     assert row("fp8", "cutedsl").name == "decode.shared"
-    large_fp8 = row("fp8", "marlin", experts=512)
-    assert (large_fp8.name, large_fp8.base_gemm_rows) == (
-        "decode.shared.fp8.e_ge512",
-        "expert_major",
-    )
+    assert row("fp8", "marlin", experts=512).name == "decode.shared.marlin"
+    for vendor in ("cutedsl", "triton"):
+        large_fp8 = row("fp8", vendor, experts=512)
+        assert (large_fp8.name, large_fp8.base_gemm_rows) == (
+            "decode.shared.fp8.e_ge512",
+            "expert_major",
+        )
 
 
 @pytest.mark.parametrize(
