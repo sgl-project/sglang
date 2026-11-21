@@ -247,16 +247,26 @@ pub(crate) fn error_body(status: u16, message: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({ "error": error })).expect("serialize error")
 }
 
-/// Any non-2xx body in the `{"error": {...}}` envelope. The router's own
-/// envelope is kept; engine text is scrubbed.
-pub(crate) fn wrap_error_body(body: &[u8], status: u16) -> Vec<u8> {
+/// Any non-2xx body in the `{"error": {...}}` envelope. `from_router` (the
+/// reply carries `x-router-error-code`, which only the router's own errors
+/// do) keeps the router's envelope as is. Anything else is the engine's,
+/// whatever its shape, nested `{"error": {...}}` included: its message is
+/// scrubbed by status, and only its scalar `param` and `code` are kept.
+pub(crate) fn wrap_error_body(body: &[u8], status: u16, from_router: bool) -> Vec<u8> {
     let v: Option<Value> = serde_json::from_slice(body).ok();
-    if v.as_ref()
-        .is_some_and(|v| v.get("error").is_some_and(Value::is_object))
-    {
+    let nested = v
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .filter(|e| e.is_object());
+    if from_router && nested.is_some() {
         return body.to_vec();
     }
-    let field = |k: &str| v.as_ref().and_then(|v| v.get(k)).filter(|f| !f.is_null());
+    let source = nested.or(v.as_ref());
+    let field = |k: &str| {
+        source
+            .and_then(|v| v.get(k))
+            .filter(|f| f.is_string() || f.is_number())
+    };
     let message = field("message")
         .and_then(Value::as_str)
         .map_or_else(|| String::from_utf8_lossy(body).into_owned(), str::to_owned);
@@ -334,16 +344,31 @@ mod tests {
     }
 
     #[test]
-    fn wraps_flat_sglang_errors_only() {
+    fn wraps_worker_errors_and_preserves_router_errors() {
         let flat = br#"{"object":"error","message":"bad schema","type":"BadRequestError","param":null,"code":400}"#;
-        let w: Value = serde_json::from_slice(&wrap_error_body(flat, 400)).unwrap();
+        let w: Value = serde_json::from_slice(&wrap_error_body(flat, 400, false)).unwrap();
         assert_eq!(w["error"]["message"], "bad schema");
         assert_eq!(w["error"]["code"], 400);
         assert_eq!(w["error"]["type"], "invalid_request_error");
         let own = br#"{"error":{"message":"x"}}"#;
-        assert_eq!(wrap_error_body(own, 503), own);
+        assert_eq!(wrap_error_body(own, 503, true), own);
+        // The engine can answer in the same nested shape: that is no proof
+        // the router wrote it, so its 5xx text is scrubbed, while a scalar
+        // code survives.
+        let engine =
+            br#"{"error":{"message":"worker diagnostic","type":"x","param":{"a":1},"code":"oom"}}"#;
+        let w: Value = serde_json::from_slice(&wrap_error_body(engine, 503, false)).unwrap();
+        assert_eq!(w["error"]["message"], "Internal server error");
+        assert_eq!(w["error"]["type"], "server_error");
+        assert_eq!(w["error"]["code"], "oom");
+        assert_eq!(w["error"]["param"], Value::Null, "only scalars are kept");
+        let engine_4xx = br#"{"error":{"message":"bad tool","code":400}}"#;
+        let w: Value = serde_json::from_slice(&wrap_error_body(engine_4xx, 400, false)).unwrap();
+        assert_eq!(w["error"]["message"], "bad tool");
+        assert_eq!(w["error"]["code"], 400);
         // Non-JSON bodies are wrapped too; 5xx text never reaches the client.
-        let w: Value = serde_json::from_slice(&wrap_error_body(b"Traceback: /srv", 500)).unwrap();
+        let w: Value =
+            serde_json::from_slice(&wrap_error_body(b"Traceback: /srv", 500, false)).unwrap();
         assert_eq!(w["error"]["message"], "Internal server error");
         assert_eq!(w["error"]["type"], "server_error");
     }

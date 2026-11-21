@@ -17,7 +17,7 @@ use crate::protocol::responses::{
 };
 use crate::protocol::sse::transduce_body;
 use crate::server::app_context::AppContext;
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, X_ROUTER_ERROR_CODE};
 use crate::server::routes::chat::chat_completions;
 use crate::server::routes::reply::{
     is_sse, model_supports_inline_system, rebuild, MAX_REPLY_BYTES,
@@ -65,7 +65,11 @@ async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Resp
         }
     };
     if !parts.status.is_success() {
-        return rebuild(parts, responses::wrap_error_body(&bytes, status));
+        let from_router = parts.headers.contains_key(X_ROUTER_ERROR_CODE);
+        return rebuild(
+            parts,
+            responses::wrap_error_body(&bytes, status, from_router),
+        );
     }
     // A non-streaming reply can be as large as a request body.
     off_worker::run_for_body(bytes.len(), || {
