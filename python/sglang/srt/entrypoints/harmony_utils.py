@@ -5,6 +5,7 @@
 import datetime
 import logging
 from collections.abc import Iterable
+from importlib.metadata import PackageNotFoundError, version
 from typing import Optional, Union
 
 import orjson
@@ -73,6 +74,22 @@ _harmony_encoding = None
 def get_encoding():
     global _harmony_encoding
     if _harmony_encoding is None:
+        try:
+            legacy_version = version("openai-harmony")
+        except PackageNotFoundError:
+            pass
+        else:
+            logger.warning(
+                "openai-harmony %s is installed and shares the openai_harmony "
+                "module with SGLang's required oss-harmony package. This can "
+                "overwrite the offline vocabulary loader or remove shared files "
+                "on uninstall. Run `python -m pip uninstall openai-harmony`, then "
+                "`python -m pip install --force-reinstall --no-deps "
+                "oss-harmony==0.0.12` to repair the environment. "
+                "See the GPT-OSS cookbook for installing the demo tool without "
+                "reintroducing openai-harmony.",
+                legacy_version,
+            )
         _harmony_encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     return _harmony_encoding
 
