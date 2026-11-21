@@ -271,6 +271,20 @@ class TestMlxAttentionPatching(unittest.TestCase):
         ):
             MlxModelRunner._get_attn_config(runner)
 
+    def test_get_head_dim_uses_num_heads_for_gqa_hidden_size_fallback(self):
+        from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+            get_head_dim,
+        )
+
+        # GQA module without explicit .head_dim: hidden_size = num_heads * head_dim.
+        gqa_attn = SimpleNamespace(
+            hidden_size=4096,
+            num_heads=32,
+            num_k_heads=8,
+            k_proj=SimpleNamespace(weight=SimpleNamespace(shape=(8 * 128, 4096))),
+        )
+        self.assertEqual(get_head_dim(gqa_attn), 128)
+
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
