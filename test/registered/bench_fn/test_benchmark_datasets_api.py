@@ -539,6 +539,40 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows_text))
         self.assertTrue(all(isinstance(row.prompt, list) for row in rows_ids))
 
+    def test_random_sampler_recovers_from_invalid_dataset_files(self):
+        fallback_path = self._write_sharegpt_json()
+        valid_data = Path(fallback_path).read_bytes()
+        dataset_path = self.tmpdir_path / "cached.json"
+        for name, content in (
+            ("valid", valid_data),
+            ("invalid_json", b"[{"),
+            ("invalid_utf8", b'["\xff"]'),
+            ("truncated_utf8", b'["\xe4\xb8'),
+        ):
+            with self.subTest(name=name):
+                dataset_path.write_bytes(content)
+                with patch(
+                    "sglang.benchmark.datasets.random.download_and_cache_hf_file",
+                    return_value=fallback_path,
+                ) as download:
+                    rows = sample_random_requests(
+                        input_len=8,
+                        output_len=4,
+                        num_prompts=2,
+                        range_ratio=1.0,
+                        tokenizer=self.tokenizer,
+                        dataset_path=str(dataset_path),
+                        random_sample=True,
+                        return_text=False,
+                    )
+                if name == "valid":
+                    download.assert_not_called()
+                else:
+                    download.assert_called_once()
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(len(row.prompt) == 8 for row in rows))
+                self.assertTrue(all(row.output_len == 4 for row in rows))
+
     def test_custom_sampler(self):
         dataset_path = self._write_custom_jsonl()
         rows = sample_custom_requests(
