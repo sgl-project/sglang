@@ -99,7 +99,9 @@ class HumanEval(Eval):
                 find_code(sampler(prompt_messages))
                 for _ in range(self._num_samples_per_task)
             ]
-            results = evaluate_functional_correctness(sample, completions)
+            results = evaluate_functional_correctness(
+                sample, completions, timeout=self._timeout
+            )
             total = len(results)
             correct = sum(results)
             score = sum(results) / len(results)
