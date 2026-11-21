@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -56,6 +57,10 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+# aiter's fused MLA RoPE + concat + KV-write Triton kernels ship gfx942 and gfx95 configs.
+_use_aiter_fused_mla_rope = _use_aiter and (
+    _is_gfx95_supported or is_gfx942_supported()
+)
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
