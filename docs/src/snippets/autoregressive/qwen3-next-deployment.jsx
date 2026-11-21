@@ -11,6 +11,7 @@ export const Qwen3NextDeployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
+        { id: 'a3', label: 'A3', default: false },
         { id: 'xeon', label: 'Xeon', default: false }
       ]
     },
@@ -24,32 +25,42 @@ export const Qwen3NextDeployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      items: [
-        { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
-        { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false }
-      ]
+      getDynamicItems: (values) => values.hardware === 'a3'
+        ? [{ id: 'w8a8', label: 'W8A8', subtitle: 'ModelSlim', default: true }]
+        : [
+            { id: 'bf16', label: 'BF16', subtitle: 'Full Weights', default: true },
+            { id: 'fp8', label: 'FP8', subtitle: 'High Throughput', default: false }
+          ]
     },
     thinking: {
       name: 'thinking',
       title: 'Thinking Capabilities',
-      items: [
-        { id: 'instruct', label: 'Instruct', subtitle: 'General Purpose', default: true },
-        { id: 'thinking', label: 'Thinking', subtitle: 'Reasoning / CoT', default: false }
-      ],
+      getDynamicItems: (values) => values.hardware === 'a3'
+        ? [{ id: 'instruct', label: 'Instruct', subtitle: 'General Purpose', default: true }]
+        : [
+            { id: 'instruct', label: 'Instruct', subtitle: 'General Purpose', default: true },
+            { id: 'thinking', label: 'Thinking', subtitle: 'Reasoning / CoT', default: false }
+          ],
       commandRule: (value) => value === 'thinking' ? '--reasoning-parser qwen3' : null
     },
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled', label: 'Enabled', default: false }
-      ],
+      getDynamicItems: (values) => values.hardware === 'a3'
+        ? [
+            { id: 'disabled', label: 'Disabled', default: false },
+            { id: 'enabled', label: 'Enabled', subtitle: 'qwen3_coder', default: true }
+          ]
+        : [
+            { id: 'disabled', label: 'Disabled', default: true },
+            { id: 'enabled', label: 'Enabled', default: false }
+          ],
       commandRule: (value) => value === 'enabled' ? '--tool-call-parser qwen' : null
     },
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -61,7 +72,7 @@ export const Qwen3NextDeployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3',
       items: [
         { id: 'v1', label: 'V1', default: true },
         { id: 'v2', label: 'V2', default: false }
@@ -81,6 +92,7 @@ export const Qwen3NextDeployment = () => {
       mi300x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 2, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 2, ep: 0, bf16: true, fp8: true },
+      a3: { tp: 2, ep: 0, w8a8: true },
       xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     }
   };
@@ -97,6 +109,97 @@ export const Qwen3NextDeployment = () => {
     const hwConfig = modelSizeConfig[hardware];
     if (!hwConfig) {
       return `# Error: Unknown hardware platform: ${hardware}`;
+    }
+
+    if (hardware === 'a3') {
+      if (quantization !== 'w8a8' || thinking !== 'instruct') {
+        return '# A3 supports the W8A8 Instruct recipe only';
+      }
+
+      const npuEnv = [
+        'ASCEND_USE_FIA=1',
+        'DEEPEP_HCCL_BUFFSIZE=2000',
+        'DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048',
+        'DEEPEP_NORMAL_LONG_SEQ_ROUND=10',
+        'FORCE_DRAFT_MODEL_NON_QUANT=1',
+        'GLOO_SOCKET_IFNAME="<gloo-network-interface>"',
+        'HCCL_OP_EXPANSION_MODE=AIV',
+        'HCCL_SOCKET_IFNAME="<hccl-network-interface>"',
+        'PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
+        'SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400',
+        'SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1',
+        'SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0',
+        'SGLANG_NPU_USE_MULTI_STREAM=0',
+        'SGLANG_SET_CPU_AFFINITY=1',
+        'SGLANG_WARMUP_TIMEOUT=3600',
+        'STREAMS_PER_DEVICE=32',
+        'TASK_QUEUE_ENABLE=1',
+        'ZBCCL_BOOTSTRAP_URL=tcp://127.0.0.1:24669',
+        'ZBCCL_ENABLE_GRAPH=1',
+        'ZBCCL_LOCAL_MEM_SIZE=60416',
+        'ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True',
+      ].filter((env) => values.speculative === 'enabled' || !env.startsWith('FORCE_DRAFT_MODEL_NON_QUANT='));
+      const npuFlags = [
+        '--model-path "$MODEL_PATH"',
+        '--host 127.0.0.1 --port 6688',
+        '--trust-remote-code',
+        '--attention-backend ascend',
+        '--device npu',
+        '--quantization modelslim',
+        '--page-size 128',
+        '--tp-size 2',
+        '--watchdog-timeout 9000',
+        '--mem-fraction-static 0.85',
+        '--disable-radix-cache',
+        '--max-prefill-tokens 28672',
+        '--context-length 26384',
+        '--max-total-tokens 122304',
+        '--speculative-algorithm NEXTN',
+        '--speculative-num-steps 3',
+        '--speculative-eagle-topk 1',
+        '--speculative-num-draft-tokens 4',
+        '--speculative-draft-model-quantization unquant',
+        '--chunked-prefill-size -1',
+        '--max-running-requests 2',
+        '--cuda-graph-bs-decode 2',
+        '--mamba-ssm-dtype bfloat16',
+        '--speculative-draft-model-path "$DRAFT_MODEL_PATH"',
+        '--reasoning-parser qwen3',
+        '--tool-call-parser qwen3_coder',
+      ].filter((flag) => {
+        if (flag.startsWith('--speculative-')) {
+          return values.speculative === 'enabled';
+        }
+        if (flag.startsWith('--tool-call-parser')) {
+          return values.toolcall === 'enabled';
+        }
+        return true;
+      });
+      const npuSetup = [
+        '# Run inside quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3.',
+        '# Before running, set MODEL_PATH, GLOO_SOCKET_IFNAME',
+        '# and HCCL_SOCKET_IFNAME for your host.',
+        ...(values.speculative === 'enabled' ? ['# Set DRAFT_MODEL_PATH for NEXTN speculative decoding.'] : []),
+        'MODEL_PATH="/path/to/Qwen3-Next-80B-A3B-Instruct-W8A8"',
+        ...(values.speculative === 'enabled'
+          ? ['DRAFT_MODEL_PATH="/path/to/Qwen3-Next-80B-A3B-Instruct"']
+          : []),
+        '',
+        'echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor',
+        'sysctl -w vm.swappiness=0',
+        'sysctl -w kernel.numa_balancing=0',
+        'sysctl -w kernel.sched_migration_cost_ns=50000',
+        '',
+        'unset https_proxy',
+        'unset http_proxy',
+        'unset HTTPS_PROXY',
+        'unset HTTP_PROXY',
+        'unset ASCEND_LAUNCH_BLOCKING',
+        '',
+        'source /usr/local/Ascend/ascend-toolkit/set_env.sh',
+        'source /usr/local/Ascend/nnal/atb/set_env.sh',
+      ];
+      return `${npuSetup.join('\n')}\n\n${npuEnv.map((env) => `export ${env}`).join('\n')}\n\npython3 -m sglang.launch_server \\\n${npuFlags.map((flag) => `  ${flag}`).join(' \\\n')}`;
     }
 
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
@@ -156,10 +259,6 @@ export const Qwen3NextDeployment = () => {
           .map((item) => item.id);
         return;
       }
-      if (option.type === 'text') {
-        initialState[key] = option.default || '';
-        return;
-      }
       let items = option.items || [];
       if (option.getDynamicItems) {
         const defaultValues = {};
@@ -168,8 +267,6 @@ export const Qwen3NextDeployment = () => {
             defaultValues[innerKey] = (innerOption.items || [])
               .filter((item) => item.default)
               .map((item) => item.id);
-          } else if (innerOption.type === 'text') {
-            defaultValues[innerKey] = innerOption.default || '';
           } else if (innerOption.items && innerOption.items.length > 0) {
             const defaultItem = innerOption.items.find((item) => item.default);
             defaultValues[innerKey] = defaultItem ? defaultItem.id : innerOption.items[0].id;
@@ -205,7 +302,19 @@ export const Qwen3NextDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      if (optionName !== 'hardware') {
+        return { ...prev, [optionName]: value };
+      }
+      return {
+        ...prev,
+        hardware: value,
+        quantization: value === 'a3' ? 'w8a8' : 'bf16',
+        thinking: 'instruct',
+        toolcall: value === 'a3' ? 'enabled' : prev.hardware === 'a3' ? 'disabled' : prev.toolcall,
+        speculative: value === 'a3' ? 'enabled' : prev.hardware === 'a3' ? 'disabled' : prev.speculative,
+      };
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -219,10 +328,6 @@ export const Qwen3NextDeployment = () => {
         [optionName]: currentValues.filter((id) => id !== itemId),
       };
     });
-  };
-
-  const handleTextChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const command = generateCommand(values);
@@ -294,15 +399,6 @@ export const Qwen3NextDeployment = () => {
     lineHeight: '1.1',
     opacity: 0.7,
   };
-  const textInputStyle = {
-    flex: 1,
-    padding: '8px 10px',
-    borderRadius: '4px',
-    border: `1px solid ${isDark ? '#4b5563' : '#d1d5db'}`,
-    background: isDark ? '#111827' : '#fff',
-    color: isDark ? '#e5e7eb' : '#111827',
-    fontSize: '13px',
-  };
   const commandDisplayStyle = {
     flex: 1,
     padding: '12px 16px',
@@ -329,15 +425,7 @@ export const Qwen3NextDeployment = () => {
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
             <div style={itemsStyle}>
-              {option.type === 'text' ? (
-                <input
-                  type="text"
-                  value={values[option.name] || ''}
-                  placeholder={option.placeholder || ''}
-                  onChange={(event) => handleTextChange(option.name, event.target.value)}
-                  style={textInputStyle}
-                />
-              ) : option.type === 'checkbox' ? (
+              {option.type === 'checkbox' ? (
                 (option.items || []).map((item) => {
                   const isChecked = (values[option.name] || []).includes(item.id);
                   const isDisabled =
