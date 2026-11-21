@@ -339,6 +339,7 @@ class TestReceiverControlMessages(CustomTestCase):
             for states in (None, [], [[3, 5]]):
                 with self.subTest(backend=backend, states=states):
                     receiver, sent = self._make_receiver(backend)
+                    receiver.prompt_fingerprint = "0123456789abcdef"
                     receiver.send_metadata(
                         np.array([2, 4], dtype=np.int32),
                         aux_index=9,
@@ -364,6 +365,7 @@ class TestReceiverControlMessages(CustomTestCase):
                                 b"3",
                                 b"2",
                                 b"",
+                                b"0123456789abcdef",
                             ]
                         elif backend == "nixl":
                             expected = (
@@ -377,6 +379,7 @@ class TestReceiverControlMessages(CustomTestCase):
                                     state,
                                     b"2",
                                     b"1" if dummy else b"0",
+                                    b"0123456789abcdef",
                                 ]
                             )
                         else:
@@ -402,7 +405,7 @@ class TestReceiverControlMessages(CustomTestCase):
             device_kv_indices=np.array([11, 13], dtype=np.int32),
         )
         self.assertEqual(
-            [frames[-1] for _, frames in sent],
+            [frames[9] for _, frames in sent],
             [struct.pack("<ii", 11, 13), b"", struct.pack("<ii", 11, 13)],
         )
 

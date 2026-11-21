@@ -130,6 +130,7 @@ class TransferInfo:
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
     dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None
+    prompt_fingerprint: Optional[str] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -162,6 +163,9 @@ class TransferInfo:
                 np.frombuffer(msg[9], dtype=np.int32)
                 if len(msg) > 9 and msg[9] != b""
                 else None
+            ),
+            prompt_fingerprint=(
+                msg[10].decode("ascii") if len(msg) > 10 and msg[10] != b"" else None
             ),
         )
 
@@ -290,6 +294,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    verifies_bootstrap_room_owner = True
 
     def __init__(
         self,
@@ -3314,7 +3319,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return True
         room = notification.room
         status = self.request_status.get(room)
-        room_active = status is not None and status != KVPoll.Success
+        # Another request's abort leaves the room's own request running.
+        room_active = (
+            status is not None
+            and status != KVPoll.Success
+            and not self._is_foreign_abort(notification)
+        )
 
         if self.enable_deferred_decode_kv_release:
             self._handle_deferred_abort_notification(notification, room_active)
@@ -3438,25 +3448,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._reject_decode_without_fan_in(
                             mooncake_session_id, required_dst_info_num
                         )
-                    room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    self._add_transfer_info(
+                        bootstrap_room=int(room),
+                        peer=mooncake_session_id,
+                        info=TransferInfo.from_zmq(waiting_req_bytes),
                     )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                        self.update_status(room, KVPoll.WaitingForInput)
 
         t = threading.Thread(target=bootstrap_thread, daemon=True)
         t.start()
@@ -3726,6 +3722,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         decode_prefix_len: Optional[int],
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        prompt_fingerprint: Optional[str] = None,
     ) -> List[bytes]:
         return [
             str(bootstrap_room).encode("ascii"),
@@ -3742,6 +3739,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             np.asarray(device_kv_indices, dtype=np.int32).tobytes()
             if not is_dummy and device_kv_indices is not None
             else b"",
+            (prompt_fingerprint or "").encode("ascii"),
         ]
 
 

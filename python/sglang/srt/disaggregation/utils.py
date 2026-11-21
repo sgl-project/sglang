@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import time
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
@@ -334,6 +335,14 @@ def _is_fake_transfer(req: Req) -> bool:
 def pre_alloc_fill_len(req: Req) -> int:
     """The last output id is the pending decode input, so its KV is not written."""
     return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+
+def kv_transfer_fingerprint(*token_id_runs: Sequence[int]) -> str:
+    """Digest of the ids a PD request fills KV for; prefill and decode must agree."""
+    digest = hashlib.blake2b(digest_size=8)
+    for token_ids in token_id_runs:
+        digest.update(array("q", token_ids))
+    return digest.hexdigest()
 
 
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:

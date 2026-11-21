@@ -44,6 +44,7 @@ class FakeKVSender(BaseKVSender):
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        prompt_fingerprint: Optional[str] = None,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -148,6 +149,7 @@ class FakeKVReceiver(BaseKVReceiver):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        prompt_fingerprint: Optional[str] = None,
     ):
         self.kv_mgr = mgr
         self.abort_notified: bool = False
