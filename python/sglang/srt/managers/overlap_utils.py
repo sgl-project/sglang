@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -343,11 +344,15 @@ class FutureMap:
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-        # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
-        # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
-        # recovers occupancy lost to the WAR barrier (also CUDA-only); other
-        # platforms have no barrier and use the plain .cpu() bootstrap path.
-        if _is_cuda:
+        # Gate the host mirror on publish rather than synchronizing all scheduled work.
+        use_npu_d2h = (
+            _is_npu
+            and torch.device(device).type == "npu"
+            and needs_cpu_seq_lens
+            and spec_algo.is_eagle()
+            and os.getenv("SGLANG_NPU_SPEC_PINNED_LENGTHS", "0") == "1"
+        )
+        if _is_cuda or use_npu_d2h:
             self.new_seq_lens_cpu_pinned = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, pin_memory=True
             )

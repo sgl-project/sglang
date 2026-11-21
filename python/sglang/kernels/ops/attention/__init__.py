@@ -19,6 +19,15 @@ from sglang.kernels.spec import (
     KernelSpec,
 )
 
+register_kernel(
+    KernelSpec(
+        op="attention.qsa_prefill_attention",
+        backend=KernelBackend.TORCH_NPU,
+        target="sglang.kernels.ops.attention.qsa_prefill_attention:qsa_prefill_attention",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
 if TYPE_CHECKING:
     import torch
 

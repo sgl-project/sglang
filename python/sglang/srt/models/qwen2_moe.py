@@ -19,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -622,6 +623,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            if (
+                _is_npu
+                and not trace_e2e
+                and os.getenv("SGLANG_NPU_QWEN_MOE_STAGED", "0") == "1"
+            ):
+                from sglang.srt.hardware_backend.npu.moe.qwen_shared_overlap import (
+                    staged_shared_forward,
+                    supports_staged_shared,
+                )
+
+                if supports_staged_shared(self, hidden_states, forward_batch):
+                    return staged_shared_forward(self, hidden_states, router_logits)
             if enable_dual_stream:
                 from sglang.srt.hardware_backend.npu.cmo import (
                     shared_expert_on_independent_stream,

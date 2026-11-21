@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -22,6 +24,7 @@ def _qwen4_ngram_hash_kernel(
     HEADS_PER_NGRAM: tl.constexpr,
     NGRAM_HEADS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    NORMALIZE_REMAINDER: tl.constexpr,
 ):
     output_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = output_idx < num_outputs
@@ -49,7 +52,10 @@ def _qwen4_ngram_hash_kernel(
 
     vocab_size = tl.load(vocab_sizes_ptr + head_idx, mask=mask, other=1)
     offset = tl.load(offsets_ptr + head_idx, mask=mask, other=0)
-    tl.store(output_ptr + output_idx, mixed % vocab_size + offset, mask=mask)
+    remainder = mixed % vocab_size
+    if NORMALIZE_REMAINDER:
+        remainder = tl.where(remainder < 0, remainder + vocab_size, remainder)
+    tl.store(output_ptr + output_idx, remainder + offset, mask=mask)
 
 
 def can_fuse_qwen4_ngram_hash(
@@ -61,18 +67,25 @@ def can_fuse_qwen4_ngram_hash(
     """Return whether inputs match the fixed Qwen4 PLE hash contract."""
 
     return (
-        contexts.is_cuda
+        (
+            contexts.is_cuda
+            or (
+                contexts.device.type == "npu"
+                and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
+            )
+        )
         and contexts.dtype == torch.long
         and contexts.dim() == 2
         and contexts.shape[1] == _QWEN4_NGRAM_SIZE
         and contexts.is_contiguous()
-        and multipliers.is_cuda
+        and all(t.is_contiguous() for t in (multipliers, vocab_sizes, offsets))
+        and multipliers.device == contexts.device
         and multipliers.dtype == torch.long
         and multipliers.numel() == _QWEN4_NGRAM_SIZE
-        and vocab_sizes.is_cuda
+        and vocab_sizes.device == contexts.device
         and vocab_sizes.dtype == torch.long
         and vocab_sizes.numel() == _QWEN4_NGRAM_HEADS
-        and offsets.is_cuda
+        and offsets.device == contexts.device
         and offsets.dtype == torch.long
         and offsets.numel() == _QWEN4_NGRAM_HEADS
     )
@@ -109,6 +122,7 @@ def fused_qwen4_ngram_hash(
             HEADS_PER_NGRAM=_QWEN4_HEADS_PER_NGRAM,
             NGRAM_HEADS=_QWEN4_NGRAM_HEADS,
             BLOCK_SIZE=block_size,
+            NORMALIZE_REMAINDER=contexts.device.type == "npu",
             num_warps=4,
         )
     return output

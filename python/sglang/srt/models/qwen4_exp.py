@@ -115,6 +115,9 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if _is_npu:
+    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+        fused_sigmoid_mul as npu_fused_sigmoid_mul,
+    )
     from sgl_kernel_npu.operators.mamba import short_conv as ple_short_conv
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -607,6 +610,17 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") == "1"
+            and self.group_size == 2560
+            and x.ndim == 2 and x.shape[1] == 10240
+            and x.dtype == self.weight.dtype == torch.bfloat16
+            and x.is_contiguous() and self.weight.is_contiguous()
+        ):
+            from sgl_kernel_npu.operators.norm import grouped_gemma_rmsnorm
+
+            return grouped_gemma_rmsnorm(x, self.weight, self.group_size, self.eps)
+        if (
             not _is_npu
             and x.is_cuda
             and self._jit_group_size is not None
@@ -715,6 +729,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ),
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
+                use_npu_ple_lookup=(
+                    _is_npu and not offload_embedding
+                    and os.getenv("SGLANG_NPU_PLE_HBM_LOOKUP", "0") == "1"
+                ),
             )
         # weight_scale stays a real device tensor.
         ngram_embedding.register_buffer(
@@ -828,7 +846,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self, contexts: torch.Tensor, *, decode_sized: bool = False
     ) -> torch.Tensor:
         contexts = contexts.to(torch.long)
-        if self.enable_ple_fusion and decode_sized:
+        if (self.enable_ple_fusion and decode_sized) or (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_NGRAM_HASH", "0") == "1"
+            and contexts.shape[0] <= 512
+        ):
             from sglang.kernels.ops.embeddings.qwen4_ngram import (
                 can_fuse_qwen4_ngram_hash,
                 fused_qwen4_ngram_hash,
@@ -919,6 +941,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def compute_ngram_ids(self, batch: _PLEBatch) -> torch.Tensor:
         assert batch.ngram_context is not None
+        if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_WINDOW_IDS", "0") == "1"
+            and self.enable_ple_fusion
+            and batch.mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and self.ngram_size == 3 and self.heads_per_ngram == 8
+            and batch.ngram_context.dtype in (torch.int32, torch.int64)
+            and batch.ngram_context.ndim == 2 and batch.ngram_context.stride(1) == 1
+            and batch.req_indices.is_contiguous() and batch.token_offsets.is_contiguous()
+            and self.layer_multipliers.numel() == 3
+            and self.ngram_heads_vocab_sizes.numel() == self.ngram_heads_offsets.numel() == 16
+            and all(t.is_contiguous() and t.dtype == torch.int64 for t in (
+                self.layer_multipliers, self.ngram_heads_vocab_sizes, self.ngram_heads_offsets
+            ))
+        ):
+            from sglang.kernels.ops.embeddings.qwen4_ple_window_hash_npu import ple_window_ids
+
+            return ple_window_ids(batch.ngram_context, batch.req_indices, batch.token_offsets,
+                                 self.layer_multipliers, self.ngram_heads_vocab_sizes,
+                                 self.ngram_heads_offsets, self.eos_token_id)
         pool = get_req_to_token_pool()
         cached = pool.ple_window_cache
         if cached is not None and cached[0] is batch:
@@ -1367,48 +1409,65 @@ class Qwen4ExpPLELayer(nn.Module):
                 short_conv.view_layer_id
             )
             if intermediate_cache is not None:
-                if self.short_conv_state_len:
-                    intermediate_state = (
-                        conv_input.unfold(2, self.short_conv_state_len, 1)[
-                            :, :, 1 : batch.row_width + 1
-                        ]
-                        .permute(0, 2, 1, 3)
-                        .contiguous()
-                    )
-                else:
-                    intermediate_state = x.new_empty(
-                        (
-                            batch.lengths.shape[0],
-                            batch.row_width,
-                            self.conv_channels,
-                            0,
-                        )
-                    )
-                valid_steps = batch.valid_tokens.reshape(
-                    batch.lengths.shape[0], batch.row_width, 1, 1
-                )
-                intermediate_state = torch.where(
-                    valid_steps,
-                    intermediate_state,
-                    torch.zeros_like(intermediate_state),
-                )
-                intermediate_state = intermediate_state.to(
-                    dtype=intermediate_cache.dtype
-                )
                 dst_indices_raw = select_verify_intermediate_state_indices(
                     None,
                     forward_batch.req_pool_indices,
                     batch.lengths.ne(0),
                     get_req_to_token_pool().size,
                 )
-                if dst_indices_raw is None:
-                    intermediate_cache[
-                        : batch.lengths.shape[0], : batch.row_width
-                    ].copy_(intermediate_state)
+                if (
+                    _is_npu and os.getenv("SGLANG_NPU_PLE_VERIFY_STATE", "0") == "1"
+                    and self.short_conv_state_len == 9 and batch.row_width == 4
+                    and intermediate_cache.shape[1] >= batch.row_width
+                    and (dst_indices_raw is not None or intermediate_cache.shape[0] >= batch.lengths.shape[0])
+                    and self.conv_channels == 10240 and conv_input.dtype == torch.bfloat16
+                    and intermediate_cache.dtype in (torch.bfloat16, torch.float32)
+                    and batch.valid_tokens.is_contiguous() and conv_input.is_contiguous()
+                    and intermediate_cache.stride(-1) == 1
+                    and intermediate_cache.stride(-2) == self.short_conv_state_len
+                    and (dst_indices_raw is None or dst_indices_raw.is_contiguous())
+                ):
+                    from sglang.kernels.ops.mamba.qwen4_verify_windows_npu import store_verify_windows
+
+                    store_verify_windows(conv_input, batch.valid_tokens, intermediate_cache,
+                                         batch.row_width, dst_indices_raw)
                 else:
-                    intermediate_cache[
-                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
-                    ] = intermediate_state
+                    if self.short_conv_state_len:
+                        intermediate_state = (
+                            conv_input.unfold(2, self.short_conv_state_len, 1)[
+                                :, :, 1 : batch.row_width + 1
+                            ]
+                            .permute(0, 2, 1, 3)
+                            .contiguous()
+                        )
+                    else:
+                        intermediate_state = x.new_empty(
+                            (
+                                batch.lengths.shape[0],
+                                batch.row_width,
+                                self.conv_channels,
+                                0,
+                            )
+                        )
+                    valid_steps = batch.valid_tokens.reshape(
+                        batch.lengths.shape[0], batch.row_width, 1, 1
+                    )
+                    intermediate_state = torch.where(
+                        valid_steps,
+                        intermediate_state,
+                        torch.zeros_like(intermediate_state),
+                    )
+                    intermediate_state = intermediate_state.to(
+                        dtype=intermediate_cache.dtype
+                    )
+                    if dst_indices_raw is None:
+                        intermediate_cache[
+                            : batch.lengths.shape[0], : batch.row_width
+                        ].copy_(intermediate_state)
+                    else:
+                        intermediate_cache[
+                            dst_indices_raw.to(dtype=torch.long), : batch.row_width
+                        ] = intermediate_state
         else:
             state_cols = torch.arange(
                 self.short_conv_state_len, device=x.device, dtype=torch.long
@@ -1523,33 +1582,42 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_state = None
         return embeddings
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        batch: _PLEBatch,
-    ) -> torch.Tensor:
-        sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
-        hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
-        hidden_states = hidden_states[:hidden_rows]
-        if self._prefetch_state is not None:
-            embeddings = self._consume_prefetched_embeddings(forward_batch)
-        else:
-            embeddings = self.ple_embedding(batch, forward_batch)
-        if sp_active:
-            embeddings = _pad_token_rows(embeddings, batch.physical_tokens)
-            embeddings = layernorm_sp.shard_token_rows(
-                embeddings, group=get_parallel().tp_group
-            )
-        key, _ = self.key_proj(embeddings)
-        value, _ = self.value_proj(embeddings)
+    def _gate_values(self, key, value, hidden_states, batch, *, full_token_count=None):
         token_count = hidden_states.shape[0]
         hidden_size = self.hidden_size
         hc_count = self.hc_count
+        gate_rows = token_count if full_token_count is None else full_token_count
         if hidden_states.shape[-1] != hc_count * hidden_size:
             raise RuntimeError(
                 "PLE hidden size does not match its hyper-connection layout: "
                 f"expected {hc_count * hidden_size}, got {hidden_states.shape[-1]}"
+            )
+        if (
+            _is_npu
+            and os.getenv("SGLANG_NPU_PLE_VA_GATE", "0") == "1"
+            and (gate_rows <= 512 or os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") != "1")
+            and (hc_count, hidden_size) == (4, 2560)
+            and hidden_states.is_contiguous()
+            and key.shape == hidden_states.shape
+            and value.shape == (token_count, hidden_size)
+            and key.device == value.device == hidden_states.device
+            and key.stride(1) == value.stride(1) == 1
+            and key.dtype == value.dtype == hidden_states.dtype == torch.bfloat16
+            and all(
+                norm.group_size == hidden_size
+                and norm.eps == self.norm_key.eps
+                and norm.weight.is_contiguous()
+                and norm.weight.device == key.device
+                and norm.weight.dtype == key.dtype
+                and norm.weight.numel() == hc_count * hidden_size
+                for norm in (self.norm_key, self.norm_query, self.norm_conv)
+            )
+        ):
+            from sglang.kernels.ops.elementwise.qwen4_ple_gate_npu import ple_gate
+
+            return ple_gate(
+                key, value, hidden_states, self.norm_key.weight,
+                self.norm_query.weight, self.norm_conv.weight, self.norm_key.eps,
             )
         key = key.reshape(token_count, hc_count, hidden_size)
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
@@ -1585,8 +1653,73 @@ class Qwen4ExpPLELayer(nn.Module):
                 gate = torch.sigmoid(gate)
                 gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
-        gated_value = gated_value.flatten(-2)
-        gated_value_normed = gated_value_normed.flatten(-2)
+        return gated_value.flatten(-2), gated_value_normed.flatten(-2)
+
+    def _can_shard_gate_rows(self, batch, sp_active):
+        if not _is_npu or os.getenv("SGLANG_NPU_PLE_SHARD_GATE_ROWS", "0") != "1":
+            return False
+        if batch.mode != ForwardMode.EXTEND or batch.processed_tokens != 4096:
+            return False
+        table = self.ple_embedding.ngram_embedding
+        return (
+            not sp_active
+            and not is_dp_attention_enabled()
+            and not get_attn_tp_context().input_scattered
+            and (self.hc_count, self.hidden_size) == (4, 2560)
+            and isinstance(table, VocabParallelEmbedding)
+            and table.use_npu_ple_lookup
+            and not table.use_attn_tp_group
+            and table.tp_size == get_parallel().tp_group.world_size == 8
+            and table.weight.dtype == torch.bfloat16
+            and os.getenv("SGLANG_NPU_PLE_GROUPED_NORM", "0") == "1"
+        )
+
+    def _sharded_gate_values(self, key, value, hidden_states, batch, group):
+        # The full-size projections preserve the BF16 checkpoint path's rounding.
+        # Their token-local outputs can be sharded before the gate and three norms.
+        gated, conv_input = self._gate_values(
+            layernorm_sp.shard_token_rows(key, group=group),
+            layernorm_sp.shard_token_rows(value, group=group),
+            layernorm_sp.shard_token_rows(hidden_states, group=group),
+            batch,
+            full_token_count=batch.processed_tokens,
+        )
+        joined = layernorm_sp.all_gather_token_rows(
+            torch.cat((gated, conv_input), dim=-1),
+            total_rows=batch.processed_tokens,
+            group=group,
+        )
+        gated, conv_input = joined.chunk(2, dim=-1)
+        return gated, conv_input.contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        batch: _PLEBatch,
+    ) -> torch.Tensor:
+        sp_active = layernorm_sp.runs_sp(_get_ple_forward_mode(forward_batch))
+        hidden_rows = hidden_states.shape[0] if sp_active else batch.processed_tokens
+        hidden_states = hidden_states[:hidden_rows]
+        if self._prefetch_state is not None:
+            embeddings = self._consume_prefetched_embeddings(forward_batch)
+        else:
+            embeddings = self.ple_embedding(batch, forward_batch)
+        if sp_active:
+            embeddings = _pad_token_rows(embeddings, batch.physical_tokens)
+            embeddings = layernorm_sp.shard_token_rows(
+                embeddings, group=get_parallel().tp_group
+            )
+        key, _ = self.key_proj(embeddings)
+        value, _ = self.value_proj(embeddings)
+        if self._can_shard_gate_rows(batch, sp_active):
+            gated_value, gated_value_normed = self._sharded_gate_values(
+                key, value, hidden_states, batch, get_parallel().tp_group
+            )
+        else:
+            gated_value, gated_value_normed = self._gate_values(
+                key, value, hidden_states, batch
+            )
         if (
             not _is_npu
             and self.ple_embedding.enable_ple_fusion
@@ -1806,6 +1939,14 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
+        self._npu_prefill_combine_norm = (
+            _is_npu
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and get_bool_env_var("SGLANG_NPU_HC_PREFILL_COMBINE_NORM")
+        )
+        self._prefill_norm_pair = None
+        self._prefill_norm_active = False
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
@@ -1834,7 +1975,7 @@ class Qwen4ExpLayerExtensionMixin:
         self._decode_moe_comm = _prepare_decode_moe_comm(self.mlp)
 
     @contextmanager
-    def hc_norms(self, normalized_input, next_norm):
+    def hc_norms(self, normalized_input, next_norm, mode):
         norms = _HCNorms(normalized_input, next_norm)
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
@@ -1846,9 +1987,12 @@ class Qwen4ExpLayerExtensionMixin:
             and get_moe_a2a_backend().is_none()
             else None
         )
+        self._prefill_norm_active = self._npu_prefill_combine_norm and mode == ForwardMode.EXTEND
         try:
             yield norms
         finally:
+            self._prefill_norm_active = False
+            self._prefill_norm_pair = None
             self._hc_norms = None
 
     def _widen_streams(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1875,6 +2019,23 @@ class Qwen4ExpLayerExtensionMixin:
         )
 
     def _attn_combine(self, hidden_states, residuals):
+        if (
+            self._prefill_norm_active
+            and hidden_states.shape[0] >= 128
+            and hidden_states.dtype == torch.bfloat16
+        ):
+            from sgl_kernel_npu.operators.hyper_conn import hc_prefill_combine_norm
+
+            residual, normed, _ = residuals
+            gate_weight = self.attn_hyper_connection.block_inject_weight.weight
+            logits = torch.mm(normed, gate_weight.T, out_dtype=torch.float32)
+            norm = self.mlp_hyper_connection.hc_norm
+            combined, normalized = hc_prefill_combine_norm(
+                residual, hidden_states, logits, norm.weight, norm.variance_epsilon, 4,
+            )
+            # Consume only if the boundary passes these exact rows to the FFN.
+            self._prefill_norm_pair = (combined, normalized)
+            return combined
         if self._hc_norms is None:
             return self.attn_hyper_connection.combine(hidden_states, residuals)
         hidden_states, self._hc_norms.ffn_input = (
@@ -1888,6 +2049,14 @@ class Qwen4ExpLayerExtensionMixin:
         normalized_input = (
             self._hc_norms.ffn_input if self._hc_norms is not None else None
         )
+        pair = self._prefill_norm_pair
+        if pair is not None:
+            self._prefill_norm_pair = None
+            if residual is pair[0]:
+                normalized_input = pair[1]
+                if not getattr(self, "_reported_prefill_norm", False):
+                    logger.info("Reused fused Qwen HC prefill norm before FFN at layer %s", self.layer_id)
+                    self._reported_prefill_norm = True
         return self.mlp_hyper_connection.mix(
             residual, normalized_input=normalized_input
         )
@@ -2216,7 +2385,12 @@ class Qwen4ExpAttentionDecoderLayer(
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
-            if attn_output.is_cuda:
+            if _is_npu:
+                # transfer_to_npu makes NPU tensors report is_cuda=True.
+                # Select the NPU tiling before the CUDA row-wise kernel.
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                attn_output = npu_fused_sigmoid_mul(attn_output, gate_val)
+            elif attn_output.is_cuda:
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
@@ -2388,7 +2562,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_norm = self.hyper_connection_mixer.hc_norm
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
-                layer.hc_norms(normalized_input, next_norm) as norms,
+                layer.hc_norms(normalized_input, next_norm, forward_batch.forward_mode) as norms,
             ):
                 hidden_states = layer(
                     positions=positions,

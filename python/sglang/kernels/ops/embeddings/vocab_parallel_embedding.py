@@ -62,10 +62,10 @@ def vocab_parallel_embedding(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> torch.Tensor:
-    assert input_.is_cuda
+    assert input_.is_cuda or input_.device.type == "npu"
     assert input_.is_contiguous()
     assert input_.dtype in (torch.int32, torch.int64)
-    assert weight.is_cuda
+    assert weight.device == input_.device
     assert weight.ndim == 2
     assert weight.stride(1) == 1
 

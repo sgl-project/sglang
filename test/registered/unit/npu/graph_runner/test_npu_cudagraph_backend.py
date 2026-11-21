@@ -32,7 +32,9 @@ def _make_backend(runner=None):
     # a white-box runner to exercise a specific replay() branch.
     if runner is None:
         runner = SimpleNamespace(
-            device_module=_device_module_stub(), enable_torch_compile=False
+            device_module=_device_module_stub(),
+            enable_torch_compile=False,
+            model_runner=SimpleNamespace(is_draft_worker=False),
         )
     with (
         get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
@@ -89,6 +91,43 @@ def _make_decode_runner(raw_bs=2, bs=2):
 
 
 class TestNPUCudaGraphBackend(unittest.TestCase):
+    def test_capture_respects_attention_host_update_policy(self):
+        static_attention = SimpleNamespace(npu_graph_auto_dispatch_capture=False)
+        cases = (
+            (SimpleNamespace(), True),
+            (static_attention, False),
+            (SimpleNamespace(full_attn_backend=static_attention), False),
+        )
+        for attention, expected in cases:
+            with self.subTest(attention=attention):
+                backend, runner = _make_backend()
+                runner.attn_backend = attention
+                with (
+                    mock.patch.object(torch.npu, "NPUGraph"),
+                    mock.patch.object(torch.npu, "graph") as graph_context,
+                ):
+                    backend.capture_one(ShapeKey(size=32), lambda: "output")
+                self.assertEqual(
+                    graph_context.call_args.kwargs["auto_dispatch_capture"], expected
+                )
+                backend.cleanup()
+
+    def test_static_attention_skips_host_update_in_hybrid_runner(self):
+        backend, runner = _make_backend()
+        # Linear attention can need CPU lengths while QSA's captured FIA does not.
+        runner.attn_backend = SimpleNamespace(
+            needs_cpu_seq_lens=True,
+            full_attn_backend=SimpleNamespace(npu_graph_auto_dispatch_capture=False),
+        )
+        graph = mock.Mock()
+        shape_key = ShapeKey(size=32)
+        backend._graphs[shape_key] = graph
+        backend._outputs[shape_key] = "output"
+        self.assertEqual(backend.replay(shape_key, SimpleNamespace()), "output")
+        graph.replay.assert_called_once_with()
+        graph.update.assert_not_called()
+        backend.cleanup()
+
     def test_replay_update_converts_legacy_sequence_lengths_to_int32_tensor(self):
         backend, runner = _make_backend()
         graph = mock.Mock()

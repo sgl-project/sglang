@@ -1,4 +1,4 @@
-"""GPU builders for QSA CUDA-graph replay metadata.
+"""Device builders for QSA graph replay metadata.
 
 Compressed addressing is pure arithmetic over the page-aligned full-KV cache:
 a group's compressed slot is any of its raw slots floor-divided by the compress ratio,
@@ -148,11 +148,13 @@ def _qsa_graph_row_metadata_kernel(
 
 
 def supports_graph_metadata_kernels(pool, device) -> bool:
-    """Whether the CUDA fast path can serve this pool/device pair."""
+    """Whether replay kernels support this pool/device pair."""
 
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-    return torch.device(device).type == "cuda" and isinstance(pool, QSATokenToKVPool)
+    return torch.device(device).type in ("cuda", "npu") and isinstance(
+        pool, QSATokenToKVPool
+    )
 
 
 def launch_graph_metadata(

@@ -1,6 +1,7 @@
 """Config-time override declarations for qwen4_exp."""
 
 import logging
+import os
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -89,9 +90,14 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     if profile is not None:
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
-        overrides["page_size"] = 64
+        native_gbsa = (
+            cfg.device == "npu"
+            and os.getenv("SGLANG_NPU_QSA_PREFILL_GBSA", "0") == "1"
+        )
+        overrides["page_size"] = 128 if native_gbsa else 64
         logger.info(
-            "Setting page size to 64 for compressed QSA "
-            "(full//ratio compressed addressing)."
+            "Setting page size to %s for compressed QSA "
+            "(full//ratio compressed addressing).",
+            overrides["page_size"],
         )
     return overrides

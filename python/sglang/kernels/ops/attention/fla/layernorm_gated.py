@@ -6,6 +6,7 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
+import os
 from contextlib import nullcontext
 from functools import lru_cache
 
@@ -426,29 +427,19 @@ def rms_norm_gated(
         bias = bias.contiguous()
     if _is_npu:
         if activation == "sigmoid":
-            # Qwen3.8-Flash-Next needs output = RMSNorm(x) * sigmoid(z).
-            #
-            # The current NPU _layer_norm_fwd computes the following, where
-            # norm is RMSNorm if is_rms_norm=True, otherwise LayerNorm:
-            #   z provided, norm_before_gate=True:  y = norm(x) * swish(z)
-            #   z provided, norm_before_gate=False: y = norm(x * swish(z))
-            #   z=None, either order:               y = norm(x)
-            # Its activation argument is currently ignored: with z provided,
-            # the gate is always swish(z) = z * sigmoid(z), not sigmoid(z).
-            # With z=None, gating is skipped entirely, so even specifying
-            # activation="swish" would not apply swish to anything.
-            #
-            # We therefore pass z=None and omit activation to use only the
-            # kernel's normalization, then apply sigmoid(z) ourselves:
-            #   norm_before_gate=True:
-            #     norm_input = x; y = norm(x); output = y * sigmoid(z).
-            #   norm_before_gate=False:
-            #     norm_input = x * sigmoid(z); output = y = norm(norm_input).
-            # For this model, the first case gives RMSNorm(x) * sigmoid(z).
-            #
-            # TODO: Replace this adapter with a fused sgl-kernel-npu kernel
-            # once it supports sigmoid gating and passes accuracy and NPU
-            # graph tests for both gate orders and supported layouts.
+            if (
+                os.getenv("SGLANG_NPU_GDN_FUSED_SIGMOID", "0") == "1"
+                and getattr(_layer_norm_fwd, "supports_sigmoid_gate", False)
+                and z is not None and x.dtype == z.dtype == torch.bfloat16
+            ):
+                y, _, _ = _layer_norm_fwd(
+                    x, weight, bias, eps, z=z.reshape_as(x), group_size=group_size,
+                    norm_before_gate=norm_before_gate, is_rms_norm=is_rms_norm,
+                    activation="sigmoid",
+                )
+                return y.reshape(x_shape_og)
+            # Older NPU providers apply swish when given z. Pass only the
+            # norm input to them and apply sigmoid in FP32 around the norm.
             gate = None
             if z is not None:
                 gate = torch.sigmoid(z.reshape_as(x).float())
