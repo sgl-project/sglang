@@ -325,6 +325,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req.set_finish_with_abort(ERROR_MSG)
         sched = SimpleNamespace(
             uocr_runtime=None,
+            admission=None,
             disaggregation_mode=DisaggregationMode.NULL,
             waiting_queue=IndexedReqList(ListKind.WAITING),
             processed_tokens_counter=0,

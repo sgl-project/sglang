@@ -712,6 +712,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.num_early_rejected_reqs = Counter(
+            name="sglang:num_early_rejected_requests_total",
+            documentation="The number of requests rejected on arrival by early reject.",
+            labelnames=labels.keys(),
+        )
         self.num_bootstrap_failed_reqs = Counter(
             name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
@@ -1491,6 +1496,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
+
+    def increment_early_rejected_reqs(self) -> None:
+        self.num_early_rejected_reqs.labels(**self.labels).inc(1)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
