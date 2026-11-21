@@ -75,8 +75,11 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         ]
         return torch.cat(parts, dim=0)
 
-    def _run_device_to_host_indexer_copy(
-        self, io_backend: str, use_fp4_indexer: bool = False
+    def _make_pools(
+        self,
+        io_backend: str,
+        use_fp4_indexer: bool = False,
+        layout: str = "layer_first",
     ):
         page_size = 1 if is_hip() else 64
         layer_num = 2
@@ -101,7 +104,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=page_size,
-            layout="layer_first",
+            layout=layout,
             pin_memory=pin_memory,
             device="cpu",
             allocator_type="default",
@@ -131,6 +134,14 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
 
         self.addCleanup(mla_host.destroy)
         self.addCleanup(indexer_host.destroy)
+        return device_pool, mla_host, indexer_host, page_size, layer_num
+
+    def _run_device_to_host_indexer_copy(
+        self, io_backend: str, use_fp4_indexer: bool = False
+    ):
+        device_pool, mla_host, indexer_host, page_size, layer_num = self._make_pools(
+            io_backend, use_fp4_indexer
+        )
         for layer_id in range(layer_num):
             buf = device_pool.index_k_with_scale_buffer[layer_id]
             data = torch.arange(
@@ -222,6 +233,52 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         for fp4 in (False, True):
             with self.subTest(fp4=fp4):
                 self._run_device_to_host_indexer_copy("direct", fp4)
+
+    @unittest.skipIf(
+        is_hip(),
+        "DSATokenToKVPool with page_size=1 (used on HIP) trips the ROCm "
+        "HIP-preshuffle assert during pool construction; see "
+        "test_device_to_host_indexer_direct.",
+    )
+    def test_empty_indexer_transfer_is_a_no_op(self):
+        # Without the guard, an empty index list reaches the kvcacheio launcher,
+        # whose grid computation divides by zero and kills the process (SIGFPE).
+        for io_backend, layout in (
+            ("kernel", "layer_first"),
+            ("kernel", "page_first"),
+            ("direct", "layer_first"),
+        ):
+            with self.subTest(io_backend=io_backend, layout=layout):
+                device_pool, _, indexer_host, _, layer_num = self._make_pools(
+                    io_backend, layout=layout
+                )
+                device_indices = torch.empty(0, device="cuda", dtype=torch.int64)
+                host_indices = torch.empty(
+                    0,
+                    device="cuda" if io_backend == "kernel" else "cpu",
+                    dtype=torch.int64,
+                )
+                device_before = [
+                    buffer.clone() for buffer in device_pool.index_k_with_scale_buffer
+                ]
+                host_before = indexer_host.index_k_with_scale_buffer.clone()
+
+                for layer_id in range(layer_num):
+                    indexer_host.load_to_device_per_layer(
+                        device_pool, host_indices, device_indices, layer_id, io_backend
+                    )
+                indexer_host.backup_from_device_all_layer(
+                    device_pool, host_indices, device_indices, io_backend
+                )
+                torch.cuda.synchronize()
+
+                for buffer, before in zip(
+                    device_pool.index_k_with_scale_buffer, device_before, strict=True
+                ):
+                    self.assertTrue(torch.equal(buffer, before))
+                self.assertTrue(
+                    torch.equal(indexer_host.index_k_with_scale_buffer, host_before)
+                )
 
 
 if __name__ == "__main__":
