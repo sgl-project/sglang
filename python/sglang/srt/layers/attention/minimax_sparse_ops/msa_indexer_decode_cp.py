@@ -84,10 +84,9 @@ class MSAV1IndexerDecodeCP:
         self.tile = torch.empty(
             max_rows * NUM_INDEX_HEADS * _HEAD_DIM, dtype=torch.uint8, device=device
         )
-        self.stage_slot_bytes = self.tile.numel()
         # Peers write into these; keep the tensors referenced for the process.
         self.stage, self.stage_ptrs = _symmetric_empty(
-            2 * self.stage_slot_bytes,
+            2 * self.tile.numel(),
             dtype=torch.uint8,
             device=device,
             group_name=name,
@@ -216,7 +215,6 @@ class MSAV1IndexerDecodeCPPlan:
         exchange_index_q(
             q=q,
             stage_ptrs=cp.stage_ptrs,
-            stage_slot_bytes=cp.stage_slot_bytes,
             tile=cp.tile,
             epoch=cp.epoch,
             cp_size=cp.cp_size,
