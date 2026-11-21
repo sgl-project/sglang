@@ -13,6 +13,7 @@ pub mod inkling;
 pub mod pipeline;
 pub mod qwen_vl;
 pub mod registry;
+pub mod step3_vl;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -24,5 +25,6 @@ fn _multimodal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     inkling::register(m)?;
     dsv41::register(m)?;
     qwen_vl::register(m)?;
+    step3_vl::register(m)?;
     Ok(())
 }

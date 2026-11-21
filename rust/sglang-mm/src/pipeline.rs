@@ -49,6 +49,7 @@ pub enum DecodedMedia {
         rgb: Vec<u8>,
         height: usize,
         width: usize,
+        jpeg: bool,
     },
 }
 
@@ -59,6 +60,7 @@ pub enum DecodedMedia {
 pub enum Geometry {
     /// `[t, h, w]` patch grid (`t` = 1 for still images).
     Grid([u32; 3]),
+    Tiles(Vec<bool>),
 }
 
 /// One processed media item, mirroring Python's `MultimodalDataItem`: the
