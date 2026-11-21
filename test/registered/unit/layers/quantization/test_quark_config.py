@@ -12,6 +12,7 @@ import unittest
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -27,6 +28,9 @@ from sglang.srt.layers.quantization.quark.quark import (
     _build_mixed_precision_layer_quant_config,
     _mixed_precision_layer_map,
     _parse_nvfp4_excludes,
+)
+from sglang.srt.layers.quantization.quark.schemes import (
+    QuarkW4A16Uint4MoE,
 )
 from sglang.srt.layers.quantization.quark.schemes import (
     quark_w4a4_mxfp4_moe as quark_moe,
@@ -84,6 +88,132 @@ class TestCheckSchemeSupportedError(CustomTestCase):
         with patch(_GET_CAP, return_value=None):
             ok = _bare_config()._check_scheme_supported(min_capability=70)
         self.assertFalse(ok)
+
+
+class TestQuarkUint4MoeGate(CustomTestCase):
+    """The packed uint4 MoE loader was validated with one checkpoint layout only:
+    int32 words of asymmetric codes, grouped along the input axis, "reorder" packing."""
+
+    _WEIGHT = {
+        "dtype": "uint4",
+        "qscheme": "per_group",
+        "ch_axis": -1,
+        "group_size": 128,
+        "symmetric": False,
+        "is_dynamic": False,
+        "zero_point_type": "int32",
+    }
+
+    def _config(
+        self,
+        *,
+        pack_method: str,
+        weight_format: str,
+        weight: dict,
+        input_tensors: Optional[dict] = None,
+        is_prequantized: bool = True,
+    ):
+        quark_config = _bare_config()
+        quark_config.quant_config = {
+            "global_quant_config": {
+                "weight": weight,
+                "input_tensors": input_tensors,
+                "output_tensors": None,
+                "bias": None,
+            },
+            "layer_quant_config": {},
+            "layer_type_quant_config": {},
+            "export": {"weight_format": weight_format, "pack_method": pack_method},
+        }
+        quark_config.exclude_layers = []
+        quark_config.packed_modules_mapping = {}
+        quark_config.is_prequantized = is_prequantized
+        quark_config.pack_method = pack_method
+        quark_config.dequantization_config = None
+        return quark_config
+
+    def _scheme(
+        self,
+        *,
+        pack_method: str = "reorder",
+        weight_format: str = "real_quantized",
+        input_tensors: Optional[dict] = None,
+        is_prequantized: bool = True,
+        **overrides,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        quark_config = self._config(
+            pack_method=pack_method,
+            weight_format=weight_format,
+            weight={**self._WEIGHT, **overrides},
+            input_tensors=input_tensors,
+            is_prequantized=is_prequantized,
+        )
+        with patch.object(quark_config_mod, "is_gfx115_supported", return_value=True):
+            return quark_config.get_moe_scheme(
+                MagicMock(spec=FusedMoE),
+                "model.layers.0.mlp.experts",
+                quantize_shared_expert_online=False,
+            )
+
+    def test_the_validated_layout_reaches_the_uint4_scheme(self):
+        self.assertIsInstance(self._scheme(), QuarkW4A16Uint4MoE)
+        # The same layout with the input axis spelled 1, or a smaller group.
+        for overrides in (dict(ch_axis=1), dict(group_size=64), dict(group_size=32)):
+            with self.subTest(**overrides):
+                scheme = self._scheme(**overrides)
+                self.assertIsInstance(scheme, QuarkW4A16Uint4MoE)
+                self.assertEqual(scheme.group_size, overrides.get("group_size", 128))
+
+    def test_any_other_layout_stays_unsupported(self):
+        rejected = (
+            dict(symmetric=True),
+            dict(dtype="int4", symmetric=True),
+            dict(dtype="int4"),
+            dict(pack_method="order"),
+            dict(weight_format="fake_quantized"),
+            dict(zero_point_type="float32"),
+            dict(ch_axis=0),
+            dict(is_dynamic=True),
+            dict(qscheme="per_channel"),
+            dict(group_size=16),
+            dict(group_size=256),
+            dict(is_prequantized=False),
+            # Quantized activations: not a weight-only checkpoint.
+            dict(input_tensors={"dtype": "fp8_e4m3", "qscheme": "per_tensor"}),
+        )
+        for overrides in rejected:
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(RuntimeError, "Unsupported FusedMoe"):
+                    self._scheme(**overrides)
+
+    def test_off_gfx115x_the_layout_stays_unsupported(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        quark_config = self._config(
+            pack_method="reorder", weight_format="real_quantized", weight=self._WEIGHT
+        )
+        # Another ROCm architecture, and no ROCm at all.
+        for hip in (True, False):
+            with (
+                self.subTest(is_hip=hip),
+                patch.object(
+                    quark_config_mod, "is_gfx115_supported", return_value=False
+                ),
+                patch.object(quark_config_mod, "is_hip", return_value=hip),
+            ):
+                self.assertFalse(
+                    quark_config._is_uint4_w4a16_moe(
+                        weight_quant=self._WEIGHT, input_quant=None
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "Unsupported FusedMoe"):
+                    quark_config.get_moe_scheme(
+                        MagicMock(spec=FusedMoE),
+                        "model.layers.0.mlp.experts",
+                        quantize_shared_expert_online=False,
+                    )
 
 
 class TestMixedPrecisionLayerConfig(CustomTestCase):
