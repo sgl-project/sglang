@@ -1,0 +1,35 @@
+{#- Llama-3 chat scaffolding plus the audio placeholder Ultravox needs.
+
+     The stock template shipped with the checkpoint takes only string content, so
+     SGLang detects the "string" content format and drops audio parts. Iterating
+     over the content parts here makes detection report "openai" format, which is
+     what routes audio_url parts through to the multimodal processor. -#}
+{{- bos_token }}
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content'] %}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set system_message = false %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{%- if system_message %}
+    {{- '<|start_header_id|>system<|end_header_id|>\n\n' + system_message | trim + '<|eot_id|>' }}
+{%- endif %}
+{%- for message in loop_messages %}
+    {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' }}
+    {%- if message['content'] is string %}
+        {{- message['content'] | trim }}
+    {%- else %}
+        {%- for part in message['content'] %}
+            {%- if part['type'] == 'audio' %}
+                {{- '<|audio|>\n' }}
+            {%- elif part['type'] == 'text' %}
+                {{- part['text'] | trim }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+    {{- '<|eot_id|>' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+{%- endif %}
