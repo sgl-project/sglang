@@ -42,15 +42,20 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
             output_ids (torch.Tensor): The output tokens.
+            req_indices (torch.Tensor): The batch row of each token.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+            penalizer.cumulate_output_tokens(
+                output_ids=output_ids, req_indices=req_indices
+            )
 
     def apply(self, logits: torch.Tensor):
         """Apply all penalizers to the logits in-place."""
@@ -181,11 +186,13 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        self._cumulate_output_tokens(output_ids=output_ids, req_indices=req_indices)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -223,9 +230,11 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, req_indices: torch.Tensor
+    ):
         """
-        Cumulate the output tokens.
+        Cumulate the output tokens; output_ids[j] belongs to batch row req_indices[j].
         Orchestrator will call this function to feed the output tokens to the penalizer.
         """
         pass
