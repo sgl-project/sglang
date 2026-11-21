@@ -14,11 +14,34 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#ifdef USE_ROCM
+#include <hip/hip_fp8.h>
+#else
 #include <cuda_fp8.h>
+#endif
 #include <type_traits>
 
 namespace sglang {
 
+#ifdef USE_ROCM
+using fp8x2_storage_t = __hip_fp8x2_storage_t;
+#if HIP_FP8_TYPE_FNUZ
+constexpr __hip_fp8_interpretation_t kFp8E4M3Interp = __HIP_E4M3_FNUZ;
+constexpr float kFp8E4M3Max = 224.0f;
+#else
+constexpr __hip_fp8_interpretation_t kFp8E4M3Interp = __HIP_E4M3;
+constexpr float kFp8E4M3Max = 448.0f;
+#endif
+SGL_DEVICE fp8x2_storage_t cvt_f32x2_to_fp8x2_e4m3(float2 v) {
+  return __hip_cvt_float2_to_fp8x2(v, __HIP_SATFINITE, kFp8E4M3Interp);
+}
+#else
+using fp8x2_storage_t = __nv_fp8x2_storage_t;
+constexpr float kFp8E4M3Max = 448.0f;
+SGL_DEVICE fp8x2_storage_t cvt_f32x2_to_fp8x2_e4m3(float2 v) {
+  return __nv_cvt_float2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
+}
+#endif
 constexpr float LOCAL_ABSMAX_ABS = 1e-10f;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
@@ -82,8 +105,8 @@ struct DtypeInfo<int8_t> {
 };
 template <>
 struct DtypeInfo<fp8_e4m3_t> {
-  static constexpr float MIN = -448;
-  static constexpr float MAX = 448;
+  static constexpr float MIN = -kFp8E4M3Max;
+  static constexpr float MAX = kFp8E4M3Max;
 };
 
 template <bool ROUND_SCALE, typename dtype_info>
@@ -322,14 +345,14 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 
         int4 output_buf;
         if constexpr (std::is_same_v<DST_DTYPE, fp8_e4m3_t>) {
-          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+          const auto output_buf_ptr = reinterpret_cast<fp8x2_storage_t*>(&output_buf);
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
             float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
             float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
             outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
             outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            output_buf_ptr[j / 2] = cvt_f32x2_to_fp8x2_e4m3(outputx2);
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
