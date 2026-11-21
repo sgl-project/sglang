@@ -4,6 +4,7 @@ from sglang.srt.utils.field_validators import (
     validate_list_i64_1d,
     validate_optional_list_i64_1d_2d,
 )
+from sglang.srt.utils.flatten import flatten_hidden
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -95,6 +96,33 @@ class TestValidateOptionalListI64_1d_2d(CustomTestCase):
     def test_reject_overflow_in_2d_reports_index(self):
         with self.assertRaisesRegex(ValueError, "row 0:.*non-int64"):
             validate_optional_list_i64_1d_2d([[2**63], [1, 2]])
+
+
+class TestFlattenHidden(CustomTestCase):
+    def test_flatten_hidden_shapes_and_mixed_fallback(self):
+        self.assertEqual(flatten_hidden(None), ([], []))
+        self.assertEqual(flatten_hidden([]), ([], []))
+        # 2D per-position hidden vectors (common fast path)
+        self.assertEqual(
+            flatten_hidden([[1, 2.5, 3], [4.0, 5.0]]),
+            ([1.0, 2.5, 3.0, 4.0, 5.0], [3, 2]),
+        )
+        # 3D nested chunks, empty rows, scalar rows, and mixed-depth fallback
+        # where row[0] is numeric but a later element is a nested list.
+        vals, lens = flatten_hidden(
+            [
+                [[1.0, 2], [3.5, 4.0]],
+                [],
+                5,
+                [6.0, [7, 8.5], 9.0],
+                [[10, [11.0, 12.0]], []],
+            ]
+        )
+        self.assertEqual(
+            vals,
+            [1.0, 2.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.5, 9.0, 10.0, 11.0, 12.0],
+        )
+        self.assertEqual(lens, [4, 0, 1, 4, 3])
 
 
 if __name__ == "__main__":
