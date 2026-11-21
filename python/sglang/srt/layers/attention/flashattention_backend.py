@@ -1643,16 +1643,6 @@ class FlashAttentionBackend(AttentionBackend):
             return output.squeeze(1), lse.squeeze(-1).T, *rest
         return result
 
-    def _uses_image_mask(self, layer: RadixAttention) -> bool:
-        metadata = self.forward_metadata
-        if metadata.image_token_ranges is None:
-            return False
-        if metadata.image_mask_sliding_layers_only and (
-            layer.sliding_window_size is None or layer.sliding_window_size < 0
-        ):
-            return False
-        return True
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1677,7 +1667,12 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_decode_epilogue=None,
         rel_bias_presheared: bool = False,
     ):
-        use_image_mask = self._uses_image_mask(layer)
+        use_image_mask = self.forward_metadata.image_token_ranges is not None and (
+            not self.forward_metadata.image_mask_sliding_layers_only
+            or (
+                layer.sliding_window_size is not None and layer.sliding_window_size >= 0
+            )
+        )
         ver = self._ver_for(layer, needs_fa4=use_image_mask)
         if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
