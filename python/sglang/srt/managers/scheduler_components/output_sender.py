@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import zmq
 
@@ -8,6 +8,18 @@ from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq, sock_send
 class SenderWrapper:
     def __init__(self, socket: zmq.Socket):
         self.socket = socket
+        self._pending_output: Optional[Callable[[], BaseBatchReq]] = None
+
+    def defer_output(self, build_output: Callable[[], BaseBatchReq]) -> None:
+        """Keep at most one builder, which must own all of its output state."""
+        if self.socket is not None:
+            self.flush_output()
+            self._pending_output = build_output
+
+    def flush_output(self) -> None:
+        if self._pending_output is not None:
+            sock_send(self.socket, self._pending_output())
+            self._pending_output = None
 
     def send_output(
         self,
@@ -17,6 +29,9 @@ class SenderWrapper:
         if self.socket is None:
             return
 
+        # Terminal outputs, state releases and control replies must not overtake
+        # the previous token delta, even before the scheduler's next forward.
+        self.flush_output()
         http_worker_ipc = getattr(recv_obj, "http_worker_ipc", None)
         if (
             isinstance(output, BaseReq)
