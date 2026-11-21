@@ -24,6 +24,11 @@ pub(crate) trait ToolDetector: Send + Sync {
     fn parse_non_stream(&self, text: &str) -> Parsed;
     /// `parse_stream_chunk`, plus `parse_stream_end` when `flush`.
     fn parse_stream(&mut self, text: &str, flush: bool) -> Parsed;
+    /// Whether a streamed call is still open (`incomplete_tool_call_indices`),
+    /// so a stop does not finish as `tool_calls`.
+    fn has_incomplete_call(&self) -> bool {
+        false
+    }
 }
 
 /// Python's `call_` id: 24 hex digits of a UUID4.
