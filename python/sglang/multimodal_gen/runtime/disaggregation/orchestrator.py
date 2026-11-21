@@ -125,9 +125,6 @@ class _EncoderTTAEntry:
 class _TransferRequestState:
     sender_role: RoleType = RoleType.ENCODER
     receiver_role: RoleType = RoleType.DENOISER
-    sender_session_id: str = ""
-    sender_pool_ptr: int = 0
-    sender_slot_offset: int = 0
     data_size: int = 0
     manifest: dict = None
     scalar_fields: dict = None
@@ -184,7 +181,6 @@ class DiffusionServer:
         encoder_capacity: int = 4,
         denoiser_capacity_per_worker: int = 2,
         decoder_capacity: int = 4,
-        p2p_mode: bool = True,
         server_args=None,
         glm_distributed_mode_enabled: bool = False,
         prompt_encoder_work_endpoints: list[str] | None = None,
@@ -253,7 +249,6 @@ class DiffusionServer:
         self._denoiser_tta: deque[_RoleTTAEntry] = deque()
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
 
-        self._transfer_mode = p2p_mode
         self._glm_distributed_state: _GlmDistributedModeState | None = None
 
         if glm_distributed_mode_enabled:
@@ -1115,7 +1110,7 @@ class DiffusionServer:
     def _handle_transfer_result(self, frames: list, role: RoleType) -> None:
         try:
             msg = decode_transfer_msg(frames)
-        except (ValueError, Exception) as e:
+        except Exception as e:
             logger.error("DiffusionServer: failed to decode transfer message: %s", e)
             return
 
@@ -1214,9 +1209,6 @@ class DiffusionServer:
         p2p = _TransferRequestState(
             sender_role=role,
             receiver_role=next_role,
-            sender_session_id=msg.get("session_id", ""),
-            sender_pool_ptr=msg.get("pool_ptr", 0),
-            sender_slot_offset=msg.get("slot_offset", 0),
             data_size=msg.get("data_size", 0),
             manifest=msg.get("manifest", {}),
             scalar_fields=msg.get("scalar_fields", {}),
@@ -1442,9 +1434,6 @@ class DiffusionServer:
 
             if p2p is not None and msg.get("staged_for_decoder"):
                 # Denoiser slot freed later in _handle_transfer_pushed
-                p2p.sender_session_id = msg.get("session_id", "")
-                p2p.sender_pool_ptr = msg.get("pool_ptr", 0)
-                p2p.sender_slot_offset = msg.get("slot_offset", 0)
                 p2p.data_size = msg.get("data_size", 0)
                 p2p.manifest = msg.get("manifest", {})
                 p2p.scalar_fields = msg.get("scalar_fields", {})
@@ -1509,7 +1498,6 @@ class DiffusionServer:
             pending_count = len(self._pending)
         stats = {
             "role": "diffusion_server",
-            "transfer_mode": self._transfer_mode,
             "num_encoders": self._num_encoders,
             "num_denoisers": self._num_denoisers,
             "num_decoders": self._num_decoders,

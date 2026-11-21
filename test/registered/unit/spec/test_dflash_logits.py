@@ -316,6 +316,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         device="cpu",
         _selector_sampling_enabled=True,
         _acceptance_estimator=None,
+        _runtime=None,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
@@ -551,11 +552,7 @@ def _sparse_verify_support(
         dict(sampling_fields={"need_top_p_sampling": True}),
         dict(sampling_fields={"need_min_p_sampling": True}),
         dict(sampling_fields={"has_custom_logit_processor": True}),
-        dict(
-            sampling_fields={
-                "penalizer_orchestrator": SimpleNamespace(is_required=True)
-            }
-        ),
+        dict(sampling_fields={"step_penalties": object()}),
         dict(sampling_fields={"logit_bias": torch.zeros(1)}),
         dict(sampling_fields={"grammar_mask": object()}),
         dict(sampling_fields={"sampling_mask_batch_indices": torch.zeros(1)}),
@@ -630,8 +627,7 @@ def test_sparse_verify_needs_a_softcapped_target_and_tp(
     assert enabled is expected
 
 
-@pytest.mark.parametrize("bcast_on", [None, False, True])
-def test_sparse_support_samples_even_with_a_resolved_argmax(bcast_on, monkeypatch):
+def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
     """The sparse path also hands over the support's argmax as target_predict, which
     alone means a greedy accept; the support must still route to the sampled accept,
     whose decision syncs like the dense selector accept's."""
@@ -643,15 +639,6 @@ def test_sparse_support_samples_even_with_a_resolved_argmax(bcast_on, monkeypatc
     worker._selector_sample = ("ids", "q")
     syncs = []
     worker._tp_sync = SimpleNamespace(sync=lambda site, tensor: syncs.append(site))
-    bcasts = []
-
-    def fake_bcast(accept_len, bonus):
-        bcasts.append((accept_len.shape, bonus.shape))
-        return bcast_on
-
-    worker._megakernel_bcast = (
-        None if bcast_on is None else SimpleNamespace(rank0_broadcast=fake_bcast)
-    )
     worker.block_size = block
     sparse_calls = []
 
@@ -674,10 +661,7 @@ def test_sparse_support_samples_even_with_a_resolved_argmax(bcast_on, monkeypatc
     )
     assert sparse_calls == ["support"]
     assert accept_len.tolist() == [1, 1]
-    assert len(bcasts) == (0 if bcast_on is None else 1)
-    assert syncs == (
-        [] if bcast_on else [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR] * 2
-    )
+    assert syncs == [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR] * 2
 
 
 if __name__ == "__main__":

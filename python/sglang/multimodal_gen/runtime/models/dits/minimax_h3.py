@@ -865,7 +865,11 @@ def _minimax_h3_pipelined_dense_attention(
     of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups in (0, 1) or torch.compiler.is_compiling():
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or torch.compiler.is_compiling()
+    ):
         return None
     if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
@@ -966,7 +970,8 @@ def _minimax_h3_collective_pipelined_attention(
         groups = 2
     world_size, _ = get_ulysses_ctx()
     if (
-        groups in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
         or attention._attention_backend_enum
         not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
         or q.shape[1] % (world_size * groups)
@@ -1011,7 +1016,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None
@@ -1120,6 +1126,10 @@ def _minimax_h3_attention_core_impl(
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            vsa_h3_fold_gate,
+        )
+
         attn_metadata = (
             get_forward_context().attn_metadata
             if attention.prefix.startswith("blocks.")
@@ -1365,7 +1375,12 @@ class MiniMaxH3Attention(nn.Module):
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
             and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.ASCEND_SPARSE_ATTN
+            and "token_refiner" in self.prefix.split(".")
         ):
+            # The text-only refiner has its own packed sequence and stays on
+            # dense FA; Ascend sparse attention applies to multimodal DiT blocks.
             backend = get_attn_backend(
                 self.head_dim,
                 _BF16_DTYPE,

@@ -24,7 +24,11 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.penalties import uses_penalty
+from sglang.srt.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+    apply_acc_penalties,
+)
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -224,10 +228,9 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
 def dflash_verify_needs_logits_adjustment(sampling_info: SamplingBatchInfo) -> bool:
     # apply_dflash_verify_logits_adjustments is a no-op unless this holds; verify
     # paths that skip it (argmax-only, sparse support) rely on that to stay exact.
-    penalizer = sampling_info.penalizer_orchestrator
     return (
         sampling_info.has_custom_logit_processor
-        or (penalizer is not None and penalizer.is_required)
+        or sampling_info.step_penalties is not None
         or sampling_info.grammar_mask is not None
         or sampling_info.logit_bias is not None
     )
@@ -239,7 +242,11 @@ def apply_dflash_verify_logits_adjustments(
     sampling_info: Optional[SamplingBatchInfo],
     draft_token_num: int,
 ) -> None:
-    """Apply sampling-time logit adjustments for DFlash verify in place."""
+    """Apply sampling-time logit adjustments for DFlash verify in place.
+
+    Per-request penalties are broadcast over the verify block instead of
+    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    """
     if sampling_info is None:
         return
     if next_token_logits.ndim != 2:
@@ -266,7 +273,6 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    penalizer = sampling_info.penalizer_orchestrator
     grammar_mask = sampling_info.grammar_mask
     logit_bias = sampling_info.logit_bias
 
@@ -278,17 +284,20 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    if (penalizer is not None and penalizer.is_required) or grammar_mask is not None:
-        linear_penalty = torch.zeros(
+    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
+    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
+    apply_acc_penalties(next_token_logits, sampling_info, draft_token_num)
+
+    if grammar_mask is not None:
+        vocab_mask_bias = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        grammar_mask.apply(vocab_mask_bias)
         get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
         )
-        return
 
     if logit_bias is not None:
         if (
@@ -300,6 +309,19 @@ def apply_dflash_verify_logits_adjustments(
                 dtype=next_token_logits.dtype,
             )
         get_logits_3d().add_(logit_bias[:, None, :])
+
+
+def commit_block_accept_tokens_to_penalties(
+    sampling_info: SamplingBatchInfo,
+    out_tokens: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    if sampling_info.step_penalties is not None:
+        # Guarded here: building the mask launches device work.
+        positions = torch.arange(out_tokens.shape[1], device=out_tokens.device)
+        sampling_info.step_penalties.commit(
+            out_tokens, accept_mask=positions < commit_lens[:, None]
+        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -1311,8 +1333,18 @@ def build_speculative_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, bound_runtime: bool
+) -> Optional[str]:
+    """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if bound_runtime and uses_penalty(req.sampling_params):
+        return (
+            "DFLASH speculative decoding with the megakernel decode runtime does "
+            "not support sampling penalties (frequency_penalty, presence_penalty, "
+            "repetition_penalty, min_new_tokens)."
+        )
 
     return None
