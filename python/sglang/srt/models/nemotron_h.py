@@ -18,6 +18,7 @@
 """Inference-only NemotronH model."""
 
 import logging
+import time
 from collections.abc import Iterable
 from functools import lru_cache, partial
 
@@ -35,6 +36,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.attention.mamba.mamba2_precompile import (
+    precompile_mamba2_prefill_kernels,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1240,6 +1244,23 @@ class NemotronHForCausalLM(nn.Module):
 
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = {layer_id + 1 for layer_id in layer_ids}
+
+    def precompile_kernels_after_loading(self) -> None:
+        # NemotronH does not capture prefill CUDA graphs, so without this the
+        # Mamba2 prefill kernels compile on the first live requests instead.
+        start = time.perf_counter()
+        cases = precompile_mamba2_prefill_kernels(
+            self,
+            chunk_size=self.config.mamba_chunk_size,
+            cache_params=self.config.mamba2_cache_params,
+            use_triton_causal_conv=True,
+        )
+        if cases:
+            logger.info(
+                "Precompiled Mamba2 prefill kernels (%d cases) in %.1f s",
+                cases,
+                time.perf_counter() - start,
+            )
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
