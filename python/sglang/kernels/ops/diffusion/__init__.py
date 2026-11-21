@@ -30,12 +30,18 @@ from __future__ import annotations
 from typing import Any
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    DeviceType,
+    KernelBackend,
+    KernelSpec,
+)
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
+_CPU = frozenset({CapabilityRequirement(device=DeviceType.CPU)})
 _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 
 # ---------------------------------------------------------------------------
@@ -68,6 +74,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         KernelBackend.TRITON,
         "rope.matrix_rope:apply_matrix_rope",
         _CUDA,
+    ),
+    (
+        "diffusion.apply_rotary_embedding",
+        KernelBackend.AOT,
+        "rope.rotary_triton:diffusion_apply_rotary_embedding_cpu",
+        _CPU,
     ),
     (
         "diffusion.fp8_rowwise",

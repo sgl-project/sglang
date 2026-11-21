@@ -125,9 +125,59 @@ def apply_rotary_embedding(
     return output
 
 
+def diffusion_apply_rotary_embedding_cpu(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    interleaved: bool = False,
+) -> torch.Tensor:
+    supported_dtypes = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    }
+
+    fallback = lazy_fallback("torch", "apply_rotary_embedding_native")
+
+    if (
+        x.dtype not in supported_dtypes
+        or cos.dtype not in supported_dtypes
+        or sin.dtype not in supported_dtypes
+        or cos.dtype != sin.dtype
+    ):
+        return fallback(x, cos, sin, interleaved)
+
+    # CPU kernel supports 3D/4D input with contiguous last dimension.
+    if x.ndim not in (3, 4) or x.stride(-1) != 1:
+        return fallback(x, cos, sin, interleaved)
+
+    head_size = x.shape[-1]
+    num_tokens = x.shape[0] if x.ndim == 3 else x.shape[1]
+
+    assert head_size % 2 == 0, "head_size must be divisible by 2"
+
+    # CPU kernel expects 2D [S, D/2] cos/sin.
+    if cos.ndim != 2 or sin.ndim != 2:
+        return fallback(x, cos, sin, interleaved)
+
+    if interleaved and cos.shape[-1] == head_size:
+        cos = cos[..., ::2].contiguous()
+        sin = sin[..., ::2].contiguous()
+    else:
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+
+    # Validate the exact cache shape expected by the CPU kernel.
+    expected_shape = (num_tokens, head_size // 2)
+    if cos.shape != expected_shape or sin.shape != expected_shape:
+        return fallback(x, cos, sin, interleaved)
+
+    return torch.ops.sgl_kernel.diffusion_apply_rotary_embedding_cpu(x, cos, sin)
+
+
 apply_rotary_embedding = select_impl(
     apply_rotary_embedding,
     npu=lazy_fallback("npu", "apply_rotary_embedding_native"),
     mps=lazy_fallback("torch", "apply_rotary_embedding_native"),
-    cpu=lazy_fallback("torch", "apply_rotary_embedding_native"),
+    cpu=diffusion_apply_rotary_embedding_cpu,
 )
