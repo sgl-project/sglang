@@ -198,5 +198,61 @@ class TestSpark25DetectorStreaming(CustomTestCase):
         )
 
 
+class TestSpark25NumericArguments(CustomTestCase):
+    def test_numeric_arguments_preserve_precision_and_fallbacks(self):
+        cases = [
+            ("9007199254740993", 9007199254740993),
+            ("-9007199254740993", -9007199254740993),
+            ("9223372036854775807", 9223372036854775807),
+            ("18446744073709551615", 18446744073709551615),
+            ("1700000000000000001", 1700000000000000001),
+            (" 9007199254740993 ", 9007199254740993),
+            ("9007199254740992", 9007199254740992),
+            ("42", 42),
+            ("+42", 42),
+            ("1.25", 1.25),
+            ("-2.5", -2.5),
+            ("42.0", 42),
+            ("1e3", 1000),
+            ("not-a-number", "not-a-number"),
+            ("null", None),
+        ]
+        for param_type in ("number", "float"):
+            tools = _tools()
+            tools[0].function.parameters["properties"]["ratio"]["type"] = param_type
+            for raw_value, expected in cases:
+                text = _xml("set_state", [("ratio", raw_value)])
+                for chunk_size in (None, 1, 7, len(text)):
+                    with self.subTest(
+                        param_type=param_type,
+                        raw_value=raw_value,
+                        chunk_size=chunk_size,
+                    ):
+                        parser = FunctionCallParser(tools, "spark25")
+                        if chunk_size is None:
+                            normal_text, calls = parser.parse_non_stream(text)
+                        else:
+                            normal_parts = []
+                            calls = []
+                            for start in range(0, len(text), chunk_size):
+                                normal, emitted = parser.parse_stream_chunk(
+                                    text[start : start + chunk_size]
+                                )
+                                normal_parts.append(normal)
+                                calls.extend(emitted)
+                            normal, emitted = parser.parse_stream_end()
+                            normal_parts.append(normal)
+                            calls.extend(emitted)
+                            normal_text = "".join(normal_parts)
+
+                        self.assertEqual(normal_text, "")
+                        self.assertEqual(len(calls), 1)
+                        self.assertEqual(calls[0].name, "set_state")
+                        self.assertEqual(calls[0].tool_index, 0)
+                        arguments = json.loads(calls[0].parameters)
+                        self.assertEqual(arguments, {"ratio": expected})
+                        self.assertIs(type(arguments["ratio"]), type(expected))
+
+
 if __name__ == "__main__":
     unittest.main()
