@@ -1,4 +1,7 @@
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -40,6 +43,38 @@ class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def _generate_with_logprobs(self, idx: int) -> dict:
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                # Prompts longer than the chunk size prefill while earlier
+                # requests decode, so they run in mixed batches.
+                "text": f"Request {idx}: " + "I have a very good idea on this. " * idx,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 32,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "logprob_start_len": 0,
+                "top_logprobs_num": 5,
+            },
+            timeout=600,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def test_logprobs(self):
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(self._generate_with_logprobs, range(32)))
+        for res in results:
+            meta = res["meta_info"]
+            self.assertEqual(len(meta["input_token_logprobs"]), meta["prompt_tokens"])
+            self.assertEqual(len(meta["input_top_logprobs"]), meta["prompt_tokens"])
+            self.assertEqual(meta["completion_tokens"], 32)
+            self.assertEqual(len(meta["output_token_logprobs"]), 32)
+            self.assertEqual(len(meta["output_top_logprobs"]), 32)
 
 
 class TestMixedChunkedPrefillNoRadixCache(TestMixedChunkedPrefill):
