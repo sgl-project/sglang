@@ -894,16 +894,24 @@ class SchedulerDisaggregationPrefillMixin:
             self.last_batch = batch
             self.invariant_checker.run(CheckPhase.BUSY, batch)
 
-    def _supports_result_wait_polling(self: Scheduler) -> bool:
+    def _supports_result_wait_polling(
+        self: Scheduler, allow_speculation: bool = False
+    ) -> bool:
         """Whether the overlap loop can wait for a result without blocking.
 
         The wait runs only collectives within one attention-DP shard, so shards may
         leave it on different passes; attention CP peers sit outside the shard.
+
+        A speculative prefill records its `copy_done` like a plain one, so a wait
+        that only polls that event is safe under speculation. Taking new input
+        during the wait is not: it pipelines a second forward behind a result
+        whose draft state the next batch relays, so callers that do so keep the
+        non-speculative requirement.
         """
         parallel = get_parallel()
         return (
             parallel.attn_cp_size == 1
-            and self.spec_algorithm.is_none()
+            and (allow_speculation or self.spec_algorithm.is_none())
             and self.is_generation
             and self.dllm_config is None
         )
@@ -926,11 +934,11 @@ class SchedulerDisaggregationPrefillMixin:
         """Check support once on entry to the prefill overlap loop."""
         if not envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.get():
             return False
-        enabled = self._supports_result_wait_polling()
+        enabled = self._supports_result_wait_polling(allow_speculation=True)
         if not enabled:
             logger.warning(
                 "Polling KV transfers while a forward result is pending requires "
-                "attention CP=1 and non-speculative autoregressive generation; "
+                "attention CP=1 and autoregressive generation; "
                 "finished transfers retire between forwards."
             )
         return enabled
