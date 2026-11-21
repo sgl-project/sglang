@@ -4,19 +4,25 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
+
+def _on_gfx950():
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
+
+
 NUM_HEADS, NUM_HEADS_PADDED, KV_LORA, ROPE = 12, 16, 512, 64
 HEAD_DIM = KV_LORA + ROPE
 SCALING = HEAD_DIM**-0.5
 KV_LENS = [37, 200, 1, 513]
-# Measured max abs error on MI355X (aiter 0.1.29.dev157) is 0.031 at decode and 0.050-0.060 at windows
-# 5-8 (the kernel casts P to fp8), on outputs up to ~4; 0.1 keeps about 1.7x margin.
+# Measured max abs error on MI355X (aiter 0.1.29.dev157): 0.031 at decode, 0.050-0.060 at qlen 5-8;
+# the kernel casts P to fp8, and 0.1 keeps about 1.7x margin on outputs up to ~4.
 ATOL = 0.1
 
 
@@ -34,9 +40,7 @@ def _reference(q, kv, kv_lens, qlen):
     return out
 
 
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "fp8-Q ASM MLA needs gfx950 and aiter"
-)
+@unittest.skipUnless(_on_gfx950(), "fp8-Q ASM MLA needs gfx950 and aiter")
 class TestFp8QAsmMlaNumerics(CustomTestCase):
     def _run(self, *, qlen, auto_kv_splits, q_scale_value=1.0, q_amp=1.0):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend

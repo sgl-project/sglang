@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.dcp import layout as dcp_layout
@@ -248,8 +247,8 @@ class TestAiterDcpVerifyGraphReplay(CustomTestCase):
 
 
 class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
-    """With SGLANG_AITER_MLA_PERSIST=0 the module modes are off, so the opt-in's verify
-    metadata must be planned with the modes its launch passes."""
+    """With SGLANG_AITER_MLA_PERSIST=0 the module modes are off,
+    so the opt-in's verify metadata must be planned with the modes its launch passes."""
 
     def _planned_modes(self, use_mla_auto_kv_splits):
         recorded = {}

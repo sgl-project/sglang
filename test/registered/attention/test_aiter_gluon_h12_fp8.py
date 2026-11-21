@@ -8,7 +8,6 @@ import unittest
 from unittest import mock
 
 import torch
-
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_mla_gluon as mod
@@ -727,8 +726,8 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
             return_value=torch.zeros(qlen, 12, 512)
         )
         q = torch.zeros(qlen, 12, 576, dtype=torch.bfloat16)
-        # The opt-in runs under PERSIST=0 (module modes off); the default route
-        # needs PERSIST=1, whose modes the auto KV split block sets.
+        # The opt-in runs under PERSIST=0 (module modes off);
+        # the default route needs PERSIST=1, whose modes the auto KV split block sets.
         module_fast_mode, module_intra_batch_mode = (
             (False, False)
             if fp8_q_asm
@@ -767,8 +766,8 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
         return be._mla_decode_fwd_with_head_pad.call_args.kwargs
 
     def test_opt_in_launches_with_the_planned_schedule(self):
-        """Under PERSIST=0 the module modes are off, but the opt-in plans with
-        the PERSIST=1 schedule; the launch must take the same modes."""
+        """Under PERSIST=0 the module modes are off, but the opt-in plans with the PERSIST=1 schedule;
+        the launch must take the same modes."""
         for verify in (False, True):
             for auto_kv_splits, planned in (
                 (False, (False, True)),
@@ -798,8 +797,8 @@ class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
                 self.assertIsNone(kwargs["num_kv_splits"])
 
     def test_default_route_launch_is_unchanged(self):
-        """With the opt-in off, PERSIST=1 decode and verify launch with the module
-        intra_batch_mode and no fast_mode; verify keeps the planned split cap."""
+        """With the opt-in off, PERSIST=1 decode and verify launch with the module's intra_batch_mode
+        and no fast_mode; verify keeps the planned split cap."""
         for auto_kv_splits in (False, True):
             for verify, num_kv_splits in (
                 (False, None if auto_kv_splits else 32),
@@ -885,8 +884,8 @@ class TestFp8QAsmQueryCast(CustomTestCase):
                 quant.assert_called_once()
 
     def test_default_wide_window_keeps_plain_cast(self):
-        """With the opt-in off, a >4-token window keeps the plain fp8 cast, at a fresh
-        unit scale as before the opt-in; the quant kernel is not called."""
+        """With the opt-in off, a >4-token window keeps the plain fp8 cast at a fresh unit scale,
+        as before the opt-in; the quant kernel is not called."""
         q, q_in, scale, _, be, quant = self._run_decode(enabled=False, qlen=8)
         quant.assert_not_called()
         self.assertTrue(
