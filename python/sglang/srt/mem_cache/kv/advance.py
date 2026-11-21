@@ -68,10 +68,13 @@ def retire_window_rows(
     retain_floor: int | None = None,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    defer_release: bool = False,
 ) -> None:
     """Free the rows of a request's ``window_sub_pool`` that fell out of its
     window since its cursor, keeping what a prefix-sharing cache needs and
-    nothing past ``retain_floor``; the cursor moves to the new boundary."""
+    nothing past ``retain_floor``; the cursor moves to the new boundary.
+    With ``defer_release`` the rows are released once the forward in flight is
+    processed (`defer_swa_segment`)."""
     if not req.kv.holds_kv:
         return
 
@@ -131,5 +134,10 @@ def retire_window_rows(
 
             free_slots = get_cp_sharded_padded_cache_indices(free_slots)
             evicted_seqlen = get_cp_sharded_padded(evicted_seqlen)
-        free_segment(free_slots, start_pos=evicted_seqlen)
+        if defer_release:
+            token_to_kv_pool_allocator.defer_swa_segment(
+                free_slots, start_pos=evicted_seqlen, owner=req.kv.req_pool_idx
+            )
+        else:
+            free_segment(free_slots, start_pos=evicted_seqlen)
         req.kv.set_evicted_seqlen(window_sub_pool, new_evicted_seqlen)

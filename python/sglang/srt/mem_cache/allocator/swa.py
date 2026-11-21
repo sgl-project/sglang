@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -8,6 +8,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
@@ -34,6 +35,85 @@ _SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTr
 _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 
 
+class _DeferredSegment(NamedTuple):
+    step: int
+    event: object
+    owner: int
+    full_page_representatives: torch.Tensor
+
+
+class _DeferredWindowReleases:
+    """Window segments a static pool retired while a forward that may still
+    resolve them through the full -> SWA mapping was in flight. A segment is
+    released once the result of the newest forward recorded before its
+    retirement is processed."""
+
+    def __init__(self, release, wait_event) -> None:
+        self._release = release
+        self._wait_event = wait_event
+        self._segments: List[_DeferredSegment] = []
+        self.forward_steps: Optional[ForwardSteps] = None
+
+    def __len__(self) -> int:
+        return len(self._segments)
+
+    def add(self, owner: int, full_page_representatives: torch.Tensor) -> bool:
+        """False when no forward is in flight: the caller releases at once."""
+        key = self.forward_steps.pending_key()
+        if key is None:
+            return False
+        self._segments.append(_DeferredSegment(*key, owner, full_page_representatives))
+        return True
+
+    def release_through(self, processed_step: int) -> None:
+        ready = [s for s in self._segments if s.step <= processed_step]
+        self._segments = [s for s in self._segments if s.step > processed_step]
+        for segment in ready:
+            self._release(segment.full_page_representatives)
+
+    def settle(self, owner: Optional[int] = None) -> None:
+        """Release now what waits (only ``owner``'s when given). The scheduler's
+        stream first waits for the forwards, on the device without blocking the
+        host."""
+        taken = [s for s in self._segments if owner is None or s.owner == owner]
+        if not taken:
+            return
+        self._segments = [
+            s for s in self._segments if owner is not None and s.owner != owner
+        ]
+        # The forwards share a stream: the newest one's event covers the others.
+        self._wait_event(taken[-1].event)
+        for segment in taken:
+            self._release(segment.full_page_representatives)
+
+    def clear(self) -> None:
+        self._segments = []
+
+
+class _WindowForwardSteps(ForwardSteps):
+    """The forward steps of a static window pool. A processed step retires every
+    recorded forward up to it: they share the forward stream, so all have ended."""
+
+    def __init__(self, window: _DeferredWindowReleases) -> None:
+        super().__init__((window,))
+        self._window = window
+
+    def forward_recorded(self, event) -> None:
+        super().forward_recorded(event)
+        if not len(self._window):
+            # Only a deferred segment names an older forward.
+            self._events = {self._launched: event}
+
+    def forward_processed(self, launch) -> None:
+        if launch is None:
+            return
+        if self._open == launch.seq:
+            self._open = None
+        for seq in [seq for seq in self._events if seq <= launch.seq]:
+            del self._events[seq]
+        self._window.release_through(launch.seq)
+
+
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""
 
@@ -41,9 +121,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # subclasses that bypass this __init__ read False.
     _swa_req_ring = False
 
+    _deferred_window: Optional[_DeferredWindowReleases] = None
+
     @property
     def has_window_pool(self) -> bool:
         return True
+
+    @property
+    def defers_swa_release(self) -> bool:
+        return self._deferred_window is not None
+
+    def defer_window_releases(self, wait_event) -> None:
+        """Release a window segment retired with `defer_swa_segment` once the
+        forward in flight is processed, for a scheduler whose stream is not
+        ordered behind that forward. ``wait_event`` orders that stream behind an
+        event, for a release that cannot wait."""
+        if (
+            type(self) is SWATokenToKVPoolAllocator
+            and not self._swa_req_ring
+            and self._deferred_window is None
+        ):
+            self._deferred_window = _DeferredWindowReleases(
+                self._free_swa_page_reps, wait_event
+            )
+            self.forward_steps = _WindowForwardSteps(self._deferred_window)
 
     def __init__(
         self,
@@ -296,6 +397,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():
             return None
+        self._settle_deferred_if_short(need_size)
         if need_size > self.swa_attn_allocator.available_size():
             return None
 
@@ -315,6 +417,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self._swa_req_ring:
             # SWA ring rows are pre-allocated per slot; no per-token SWA paging.
             return full_ok
+        if full_ok:
+            self._settle_deferred_if_short(num_swa_pages * self.page_size)
         return full_ok and (
             num_swa_pages <= self.swa_attn_allocator.available_size() // self.page_size
         )
@@ -457,6 +561,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         assert self.page_size > 1
+        self._settle_deferred_if_short(len(seq_lens_cpu) * self.page_size)
         if req_to_token_write is not None:
             return self.full_attn_allocator.alloc_decode(
                 seq_lens,
@@ -560,12 +665,40 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
+    def defer_swa_segment(
+        self, free_index: torch.Tensor, *, start_pos: int, owner: int
+    ) -> None:
+        """free_swa_segment() once the result of the forward in flight is
+        processed: that forward may still resolve these rows through the mapping.
+        ``owner`` is the request row of the segment, whose slots nothing reuses
+        before `settle_deferred_swa_frees`."""
+        if self._swa_req_ring or free_index.numel() == 0:
+            return
+        ps = self.page_size
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        pending = self._deferred_window
+        if pending is None or not pending.add(owner, free_index[::ps].clone()):
+            self._free_swa_pages(free_index, start_pos=start_pos)
+
+    def settle_deferred_swa_frees(self, *, owner: Optional[int] = None) -> None:
+        if self._deferred_window:
+            self._deferred_window.settle(owner)
+
+    def _settle_deferred_if_short(self, num_swa_tokens: int) -> None:
+        if (
+            self._deferred_window
+            and num_swa_tokens > self.swa_attn_allocator.available_size()
+        ):
+            self._deferred_window.settle()
+
     def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
-        full_page_representatives = free_index[::ps]
+        self._free_swa_page_reps(free_index[::ps])
+
+    def _free_swa_page_reps(self, full_page_representatives: torch.Tensor):
         # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
-        if not _is_npu and free_index.is_cuda:
+        if not _is_npu and full_page_representatives.is_cuda:
             swa_pages = self._free_swa_pages_cuda(full_page_representatives)
         else:
             swa_pages = self._free_swa_pages_none_cuda(full_page_representatives)
@@ -736,6 +869,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = None
         self.swa_free_group = []
         self.swa_page_ids_group = []
+        if self._deferred_window is not None:
+            self._deferred_window.clear()
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(

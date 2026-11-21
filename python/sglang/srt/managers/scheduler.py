@@ -2167,6 +2167,19 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
+        if (
+            not self._war_barrier_enabled
+            and envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get()
+        ):
+            # Nothing orders the stash's window retirement behind the forward
+            # that is still storing the stashed chunk.
+            defer = getattr(
+                getattr(self, "token_to_kv_pool_allocator", None),
+                "defer_window_releases",
+                None,
+            )
+            if defer is not None:
+                defer(self.schedule_stream.wait_event)
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -5382,6 +5395,13 @@ class Scheduler(
         self._on_step_forward_recorded(forward_done)
         return forward_done
 
+    def _record_static_forward(self, stream) -> None:
+        """Record a forward just launched on ``stream`` for a static window pool
+        that defers its releases (`defer_window_releases`)."""
+        forward_done = self.device_module.Event()
+        forward_done.record(stream=stream)
+        self._on_step_forward_recorded(forward_done)
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -5487,6 +5507,8 @@ class Scheduler(
                                     written_tokens=batch.out_cache_loc,
                                 )
                             )
+                        elif forward_steps_of(self.token_to_kv_pool_allocator):
+                            self._record_static_forward(self.forward_stream)
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
@@ -5655,6 +5677,12 @@ class Scheduler(
                     stream=self.device_module.current_stream(),
                     written_tokens=batch.out_cache_loc,
                 )
+            elif (
+                not self.enable_overlap
+                and get_parallel().pp_size > 1
+                and forward_steps_of(self.token_to_kv_pool_allocator)
+            ):
+                self._record_static_forward(self.device_module.current_stream())
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -5695,6 +5723,8 @@ class Scheduler(
                             stream=self.forward_stream,
                             written_tokens=batch.out_cache_loc,
                         )
+                    elif forward_steps_of(self.token_to_kv_pool_allocator):
+                        self._record_static_forward(self.forward_stream)
                     ret.copy_to_cpu()
             else:
                 self.resolve_forward_inputs(batch, self.future_map)
