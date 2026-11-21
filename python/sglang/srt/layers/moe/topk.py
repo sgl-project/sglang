@@ -2140,7 +2140,6 @@ def biased_grouped_topk_gpu(
         )
 
     elif _use_aiter:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
         assert hidden_states.shape[0] == gating_output.shape[0], (
