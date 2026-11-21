@@ -21,9 +21,10 @@ def compute_token_aligner_plan(
         seqs=Pair(x=seqs_info_pair.x.sequences, y=seqs_info_pair.y.sequences)
     )
 
-    _empty = TokenLocator(steps=[], token_index_in_step=[])
-    locator_x: TokenLocator = _empty
-    locator_y: TokenLocator = _empty
+    steps_x: list[int] = []
+    token_index_x: list[int] = []
+    steps_y: list[int] = []
+    token_index_y: list[int] = []
 
     for seq_id_x, seq_id_y in matched_pairs:
         rec: Pair[TokenAlignerSeqInfo] = Pair(
@@ -39,14 +40,13 @@ def compute_token_aligner_plan(
         y_ids = rec.y.input_ids[:common_len]
         assert x_ids == y_ids, f"{seq_id_x=} {seq_id_y=} {x_ids=} {y_ids=}"
 
-        locator_x = locator_x + TokenLocator(
-            steps=rec.x.locator.steps[:common_len],
-            token_index_in_step=rec.x.locator.token_index_in_step[:common_len],
-        )
-        locator_y = locator_y + TokenLocator(
-            steps=rec.y.locator.steps[:common_len],
-            token_index_in_step=rec.y.locator.token_index_in_step[:common_len],
-        )
+        steps_x.extend(rec.x.locator.steps[:common_len])
+        token_index_x.extend(rec.x.locator.token_index_in_step[:common_len])
+        steps_y.extend(rec.y.locator.steps[:common_len])
+        token_index_y.extend(rec.y.locator.token_index_in_step[:common_len])
+
+    locator_x = TokenLocator(steps=steps_x, token_index_in_step=token_index_x)
+    locator_y = TokenLocator(steps=steps_y, token_index_in_step=token_index_y)
 
     return TokenAlignerPlan(
         locators=Pair(x=locator_x, y=locator_y),
@@ -65,8 +65,14 @@ def _match_sequences(
     Two-pass: exact match first, then prefix match for remaining.
     """
     x_lookup: dict[tuple[int, ...], list[SeqId]] = defaultdict(list)
+    x_first_token_lookup: dict[int, list[SeqId]] = defaultdict(list)
+    empty_x_ids: list[SeqId] = []
     for seq_id, rec in seqs.x.items():
         x_lookup[tuple(rec.input_ids)].append(seq_id)
+        if rec.input_ids:
+            x_first_token_lookup[rec.input_ids[0]].append(seq_id)
+        else:
+            empty_x_ids.append(seq_id)
 
     claimed_x_ids: set[SeqId] = set()
     matched_seq_id_pairs: list[tuple[SeqId, SeqId]] = []
@@ -79,7 +85,11 @@ def _match_sequences(
         )
         if matched_x is None:
             matched_x = _find_matching_x_prefix(
-                seq_y=seq_y, x_seqs=seqs.x, claimed_x_ids=claimed_x_ids
+                seq_y=seq_y,
+                x_seqs=seqs.x,
+                claimed_x_ids=claimed_x_ids,
+                x_first_token_lookup=x_first_token_lookup,
+                empty_x_ids=empty_x_ids,
             )
 
         if matched_x is not None:
@@ -114,19 +124,30 @@ def _find_matching_x_prefix(
     seq_y: TokenAlignerSeqInfo,
     x_seqs: dict[SeqId, TokenAlignerSeqInfo],
     claimed_x_ids: set[SeqId],
+    x_first_token_lookup: dict[int, list[SeqId]] | None = None,
+    empty_x_ids: list[SeqId] | None = None,
 ) -> Optional[SeqId]:
     """Find the x sequence with the longest prefix relationship to y."""
     ids_y: list[int] = seq_y.input_ids
-    candidates: list[_PrefixCandidate] = [
-        _PrefixCandidate(
-            seq_id_x=seq_id_x, overlap_len=min(len(seq_x.input_ids), len(ids_y))
-        )
-        for seq_id_x, seq_x in x_seqs.items()
-        if seq_id_x not in claimed_x_ids and _is_prefix_pair(seq_x.input_ids, ids_y)
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda c: c.overlap_len).seq_id_x
+    if x_first_token_lookup is not None and ids_y:
+        candidate_x_ids: list[SeqId] = list(x_first_token_lookup.get(ids_y[0], ()))
+        if empty_x_ids:
+            candidate_x_ids.extend(empty_x_ids)
+    else:
+        candidate_x_ids = list(x_seqs.keys())
+
+    best_seq_id: SeqId | None = None
+    best_overlap_len: int = -1
+    len_y = len(ids_y)
+    for seq_id_x in candidate_x_ids:
+        if seq_id_x in claimed_x_ids:
+            continue
+        ids_x = x_seqs[seq_id_x].input_ids
+        shorter_len = min(len(ids_x), len_y)
+        if shorter_len > best_overlap_len and _is_prefix_pair(ids_x, ids_y):
+            best_seq_id = seq_id_x
+            best_overlap_len = shorter_len
+    return best_seq_id
 
 
 def _is_prefix_pair(a: list[int], b: list[int]) -> bool:
