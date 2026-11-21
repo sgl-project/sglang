@@ -135,6 +135,19 @@ class TestLagunaPerLayerAttentionDims(CustomTestCase):
 
 
 class TestBeamLoraConstruction(CustomTestCase):
+    def test_beam_admits_the_runner_auto_resolves_to(self):
+        from sglang.srt.lora.moe.families import default_vendor
+        from sglang.srt.models.beam import get_beam_supported_moe_runners
+
+        for scheme, family in (
+            ("bf16", "bf16"),
+            ("fp8", "fp8_channel"),
+            ("nvfp4", "nvfp4"),
+        ):
+            self.assertIn(
+                f"lora_{default_vendor(family)}", get_beam_supported_moe_runners(scheme)
+            )
+
     def test_lora_keeps_wrappable_projections_and_expert_dispatch(self):
         """Packed projections hide adapter targets; deferred sums bypass LoRA.
 
