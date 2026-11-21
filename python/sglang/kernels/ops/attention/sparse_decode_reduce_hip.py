@@ -63,7 +63,10 @@ def _gfx_sparse_decode_reduce_kernel(
         w = tl.exp2(m_s - m_final)
         # gluon contracts l + w * l_s into one fma; Triton leaves the scalar chain as mul + add
         l_final = tl.fma(w, l_s, l_final)
-        acc_s = tl.load(part_acc_ptr + pa_base + s * pa_stride_s + d)
+        # aiter retires surplus splits with m = -inf and leaves their part_acc unwritten
+        acc_s = tl.load(
+            part_acc_ptr + pa_base + s * pa_stride_s + d, mask=m_s > neg_inf, other=0.0
+        )
         acc = tl.fma(w, acc_s, acc)
     if HAS_SINK:
         l_final = l_final + tl.exp2(sink * RCP_LN2 - m_final)
