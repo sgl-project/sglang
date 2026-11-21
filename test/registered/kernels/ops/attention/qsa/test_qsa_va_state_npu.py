@@ -1,13 +1,7 @@
-"""Existing QSA state orchestration with reused VA compression/store primitives.
+"""Compare native and fused QSA cache updates for live and padded rows."""
 
-Compare against the unchanged R05a methods. In particular, keep the existing
-raw-ring writers and padded live-slot aliases; only compressed slot0 is inert.
-"""
-
-import ast
 import os
-import textwrap
-from pathlib import Path
+from functools import partial
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -17,10 +11,8 @@ if os.getenv("SGLANG_TEST_CANN930_QSA_NATIVE") != "1":
 
 from test_qsa_va_norm_npu import make_case, runtime_context  # noqa: F401
 import torch
-from sglang.srt.layers.attention.qsa.kernel import average_pool_qsa_keys
-from sglang.srt.layers.attention.qsa.metadata import (
-    build_rope_position_matrix, build_pending_ring_slots, build_group_ring_slots,
-)
+from sglang.srt.layers.attention.qsa import qsa_indexer
+from sglang.srt.layers.attention.qsa.metadata import build_rope_position_matrix
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
@@ -60,14 +52,6 @@ def indexer_pair(rows, axes):
         c.obj.rotary_emb.get_cos_sin_with_position(c.positions)
         for name in names:
             setattr(c.obj, name, MethodType(getattr(QSAIndexer, name), c.obj))
-    source = (Path(os.environ["RUN_ROOT"]) / "framework_reuse_va/python/sglang/srt/layers/attention/qsa/qsa_indexer.py").read_text()
-    cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "QSAIndexer")
-    ns = {"torch": torch, "average_pool_qsa_keys": average_pool_qsa_keys,
-          "build_rope_position_matrix": build_rope_position_matrix}
-    for node in cls.body:
-        if isinstance(node, ast.FunctionDef) and node.name in ("_compress_decode_cuda_graph", "update_key_state_and_compress"):
-            exec("from __future__ import annotations\n" + textwrap.dedent(ast.get_source_segment(source, node)), ns)
-            setattr(cases[0].obj, node.name, MethodType(ns[node.name], cases[0].obj))
     return cases
 
 
@@ -96,9 +80,7 @@ def assert_live_equal(pools, cases):
 @pytest.mark.parametrize("raw_state", ["unique_target", "shared_native_state"])
 @pytest.mark.parametrize("batch", [1, 32])
 @pytest.mark.parametrize("axes", [1, 3])
-def test_actual_graph_state_acceptance_padding_and_slot_reuse(batch, axes, raw_state):
-    from sglang.srt.layers.attention.qsa import qsa_indexer as module
-    assert module._use_va_compress
+def test_actual_graph_state_acceptance_padding_and_slot_reuse(monkeypatch, batch, axes, raw_state):
     rows = batch * 4
     cases = indexer_pair(rows, axes)
     pools = [Pool(), Pool()]
@@ -123,9 +105,16 @@ def test_actual_graph_state_acceptance_padding_and_slot_reuse(batch, axes, raw_s
     ) for pool in pools]
     token_k = cases[0].qk[:, -128:].reshape(rows, 1, 128)
     rope = cases[0].positions
-    graphs = [capture(lambda i=i: cases[i].obj.update_key_state_and_compress(
-        token_k, position, rope, metadata[i], state_slots=state_slots,
-        state_stored=raw_state == "shared_native_state")) for i in range(2)]
+    graphs = []
+    for use_fused, case, meta in zip((False, True), cases, metadata):
+        monkeypatch.setattr(qsa_indexer, "_use_va_compress", use_fused)
+        update = partial(
+            case.obj.update_key_state_and_compress,
+            token_k, position, rope, meta,
+            state_slots=state_slots,
+            state_stored=raw_state == "shared_native_state",
+        )
+        graphs.append(capture(update))
     for pool in pools:
         pool.key_state.zero_()
         pool.qsa_rope_position_buffer.zero_()
@@ -169,7 +158,7 @@ def test_actual_graph_state_acceptance_padding_and_slot_reuse(batch, axes, raw_s
 
 
 @pytest.mark.parametrize("rows", [4, 128, 4096])
-def test_actual_eager_prefill_compression(rows):
+def test_actual_eager_prefill_compression(monkeypatch, rows):
     cases = indexer_pair(rows, 3)
     pools = [Pool(request_slots=35, context=4096), Pool(request_slots=35, context=4096)]
     groups = rows // 4
@@ -192,6 +181,7 @@ def test_actual_eager_prefill_compression(rows):
                 m.extend_rope_matrix.copy_(build_rope_position_matrix(rope, rows))
         with torch.no_grad():
             for i in range(2):
+                monkeypatch.setattr(qsa_indexer, "_use_va_compress", bool(i))
                 cases[i].obj.update_key_state_and_compress(source, logical, rope, metadata[i], state_slots=state_slots)
         torch.npu.synchronize()
         # Raw reserved ring writes can race; none of these slots is live.

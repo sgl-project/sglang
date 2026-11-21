@@ -1,9 +1,6 @@
 """Main QKV must retain token positions across indexer compression/RoPE."""
 
-import ast
 import os
-import textwrap
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,19 +10,8 @@ if os.getenv("SGLANG_TEST_CANN930_QSA_NATIVE") != "1":
 
 from test_qsa_va_norm_npu import make_case, runtime_context  # noqa: F401
 import torch
-from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkvgate_gemma_rmsnorm_rope
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-
-
-def actual_main_prepare():
-    source = (Path(os.environ["QSA_FRAMEWORK"]) / "python/sglang/srt/models/qwen3_5.py").read_text()
-    cls = next(n for n in ast.parse(source).body
-               if isinstance(n, ast.ClassDef) and n.name == "Qwen3_5AttentionDecoderLayer")
-    node = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
-                and n.name == "forward_prepare_npu")
-    ns = {"split_qkvgate_gemma_rmsnorm_rope": split_qkvgate_gemma_rmsnorm_rope}
-    exec(textwrap.dedent(ast.get_source_segment(source, node)), ns)
-    return ns["forward_prepare_npu"]
+from sglang.srt.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
 
 
 @pytest.mark.parametrize("use_va", [False, True])
@@ -47,7 +33,7 @@ def test_two_main_layers_with_indexer_between(monkeypatch, use_va, rows, axes):
                           refreshes_rope_cos_sin=True, q_size=768, kv_size=256,
                           head_dim=256, partial_rotary_factor=0.25,
                           q_norm=norms[0], k_norm=norms[1])
-    prepare = actual_main_prepare()
+    prepare = Qwen3_5AttentionDecoderLayer.forward_prepare_npu
 
     def chain():
         obj.refreshes_rope_cos_sin = True

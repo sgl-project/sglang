@@ -1,11 +1,7 @@
-"""Reused VA prep through real QSAIndexer methods, checked against retained Q04."""
+"""Check QSA normalization and rotary embedding against the unfused NPU path."""
 
-import ast
 import copy
-import json
 import os
-import textwrap
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -15,7 +11,6 @@ if os.getenv("SGLANG_TEST_CANN930_QSA_NATIVE") != "1":
 
 import sgl_kernel_npu  # noqa: F401
 import torch
-from safetensors import safe_open
 from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
 init_npu_backend()
@@ -37,18 +32,6 @@ def runtime_context():
         reset_context()
 
 
-def legacy_methods():
-    root = Path(os.environ["RUN_ROOT"])
-    source = (root / "framework_q01_q03_q04/python/sglang/srt/layers/attention/qsa/qsa_indexer.py").read_text()
-    cls = next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == "QSAIndexer")
-    from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-    ns = {"torch": torch, "apply_rotary_emb": apply_rotary_emb}
-    for node in cls.body:
-        if isinstance(node, ast.FunctionDef) and node.name in ("project_qk", "normalize_compressed_keys", "apply_rope"):
-            exec("from __future__ import annotations\n" + textwrap.dedent(ast.get_source_segment(source, node)), ns)
-    return ns
-
-
 def make_case(rows, axes, cache_dtype, neox=True):
     torch.manual_seed(931)
     rotary = MRotaryEmbedding(
@@ -58,13 +41,10 @@ def make_case(rows, axes, cache_dtype, neox=True):
     ).to(device="npu")
     rotary.cos_sin_cache = rotary.cos_sin_cache.to(cache_dtype)
     norms = [GemmaRMSNorm(128, eps=1e-6).to(device="npu", dtype=torch.bfloat16) for _ in range(2)]
-    model = Path(os.environ["MODEL_PATH"])
-    mapping = json.loads((model / "model.safetensors.index.json").read_text())["weight_map"]
-    for label, norm in zip(("q", "k"), norms):
-        key = f"model.language_model.layers.3.self_attn.indexer.{label}_layernorm.weight"
-        with safe_open(model / mapping[key], framework="pt", device="cpu") as handle:
-            norm.weight.data.copy_(handle.get_tensor(key))
-        norm.requires_grad_(False)
+    with torch.no_grad():
+        for norm in norms:
+            norm.weight.copy_(torch.empty(128, device="cpu").uniform_(-0.25, 0.25))
+            norm.requires_grad_(False)
     qk = torch.randn(rows, 640, device="npu", dtype=torch.bfloat16)
     nkeys = rows // 4 if rows >= 1024 else rows
     keys = torch.randn(nkeys, 1, 128, device="npu", dtype=torch.bfloat16)
@@ -84,36 +64,30 @@ def make_case(rows, axes, cache_dtype, neox=True):
     (1, 3, torch.bfloat16), (32, 3, torch.bfloat16), (128, 3, torch.bfloat16),
     (4096, 3, torch.bfloat16), (128, 1, torch.bfloat16), (128, 3, torch.float32),
 ])
-def test_real_methods_weights_and_graph(rows, axes, cache_dtype):
+def test_normalization_and_rope_graph_replay(monkeypatch, rows, axes, cache_dtype):
     from sglang.srt.layers.attention.qsa import qsa_indexer as module
 
-    assert module._use_va_norm_rope
     c = make_case(rows, axes, cache_dtype)
-    old = legacy_methods()
-    reference = copy.copy(c.obj)
-    reference.rotary_emb = copy.deepcopy(c.obj.rotary_emb)
-    reference.rotary_emb.cos_sin_cache = c.obj.rotary_emb.cos_sin_cache
-    reference.apply_rope = MethodType(old["apply_rope"], reference)
+    reference_rotary = copy.deepcopy(c.obj.rotary_emb)
+    reference_rotary.cos_sin_cache = c.obj.rotary_emb.cos_sin_cache
 
-    def native():
-        q, k, stored = old["project_qk"](reference, None, c.positions, pool=c.pool)
+    def project():
+        q, k, stored = c.obj.project_qk(None, c.positions, pool=c.pool)
         assert not stored
-        compressed = old["normalize_compressed_keys"](reference, c.keys, c.key_positions)
-        return q, k, compressed
+        return q, k, c.obj.normalize_compressed_keys(c.keys, c.key_positions)
 
     def candidate():
         c.obj.rotary_emb.get_cos_sin_with_position(c.positions)
         before = (c.obj.rotary_emb.position_cos, c.obj.rotary_emb.position_sin)
-        q, k, stored = c.obj.project_qk(None, c.positions, pool=c.pool)
-        assert not stored
-        compressed = c.obj.normalize_compressed_keys(c.keys, c.key_positions)
+        outputs = project()
         assert c.obj.rotary_emb.position_cos is before[0]
         assert c.obj.rotary_emb.position_sin is before[1]
-        return q, k, compressed
+        return outputs
 
     graphs, outputs, shared = {}, {}, {}
     with torch.no_grad():
-        for name, fn in (("native", native), ("va", candidate)):
+        for name, fn in (("native", project), ("va", candidate)):
+            monkeypatch.setattr(module, "_use_va_norm_rope", name == "va")
             for _ in range(2):
                 fn()
                 torch.npu.synchronize()
@@ -136,19 +110,22 @@ def test_real_methods_weights_and_graph(rows, axes, cache_dtype):
             torch.npu.synchronize()
             for i, (a, b) in enumerate(zip(outputs["va"], outputs["native"])):
                 torch.testing.assert_close(a, b, atol=0 if i == 1 else 0.02, rtol=0 if i == 1 else 0.02)
-            reference.rotary_emb.get_cos_sin_with_position(c.positions)
-            expected_main = (reference.rotary_emb.position_cos, reference.rotary_emb.position_sin)
+            reference_rotary.get_cos_sin_with_position(c.positions)
+            expected_main = (reference_rotary.position_cos, reference_rotary.position_sin)
             for a, b in zip(shared["va"], expected_main):
                 torch.testing.assert_close(a, b, atol=0, rtol=0)
                 assert a.dtype == b.dtype == cache_dtype
 
 
-def test_unsupported_rotary_keeps_native_path():
+def test_unsupported_rotary_keeps_native_path(monkeypatch):
+    from sglang.srt.layers.attention.qsa import qsa_indexer as module
+
     c = make_case(33, 3, torch.bfloat16, neox=False)
-    old = legacy_methods()
     with torch.no_grad():
+        monkeypatch.setattr(module, "_use_va_norm_rope", True)
         a = c.obj.project_qk(None, c.positions, pool=c.pool)
-        b = old["project_qk"](c.obj, None, c.positions, pool=c.pool)
+        monkeypatch.setattr(module, "_use_va_norm_rope", False)
+        b = c.obj.project_qk(None, c.positions, pool=c.pool)
         torch.testing.assert_close(a[0], b[0], atol=0, rtol=0)
         torch.testing.assert_close(a[1], b[1], atol=0, rtol=0)
         assert a[2] is b[2] is False

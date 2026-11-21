@@ -54,8 +54,7 @@ class TargetVerifyLightningInputs:
             raise ValueError("Prepared LI expects the qualified BF16 QSA indexer shape")
         if k_cache.ndim != 4 or k_cache.shape[2:] != (1, 128):
             raise ValueError("Prepared LI requires paged [P,S,1,128] index keys")
-        # On arch22 the loaded ops930 kernel does not consume opaque metadata;
-        # source review and Q06's eight updated-input graph cases qualify None.
+        # The ARCH22 indexer reads the sequence tensors directly with metadata=None.
         indices, _ = lightning_indexer_v2(
             q.contiguous(), k_cache, self.weights, 512,
             block_table=self.table, metadata=None,
