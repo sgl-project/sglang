@@ -1766,6 +1766,105 @@ class TestHicacheMambaSize(CustomTestCase):
         self.assertEqual(kv_host.call_args.kwargs["host_size"], 122)
         self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
 
+    def test_both_stacks_build_the_pinned_mamba_host_pool_at_its_pin(self):
+        """Both builders hand the pin to a real Mamba host pool, which holds floor(pin / slot bytes) + 1 slots,
+        and give the KV host pool the rest of --hicache-size."""
+        mamba_pool = MambaPool(
+            size=4,
+            spec_state_size=4,
+            cache_params=InklingConvCacheParams(
+                shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                layers=[0, 1],
+                dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+            ),
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+        )
+        kv = MHATokenToKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
+        params = SimpleNamespace(
+            page_size=1,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                swa_attn_allocator=allocator, state_slots=allocator
+            ),
+            tp_cache_group=None,
+            pp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+        )
+
+        def meta_alloc(dims, *, dtype, **_):
+            return torch.empty(dims, dtype=dtype, device="meta")
+
+        for swa in (False, True):
+            with (
+                self.subTest(swa=swa),
+                self._hicache_args(hicache_size=192, mamba_size=70),
+                host_memory_budget_scope(1 << 40),
+                patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "MambaPoolHost",
+                    partial(MambaPoolHost, pin_memory=False),
+                ),
+                patch.object(hybrid_pool_assembler, "HybridCacheController"),
+                patch.object(
+                    hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "build_kv_host_pool",
+                    return_value=SimpleNamespace(
+                        layer_num=1,
+                        layout="page_first_direct",
+                        page_size=1,
+                        device="cpu",
+                        size=17,
+                        logical_size=17,
+                        can_use_write_back_jit=False,
+                    ),
+                ) as build_kv_host_pool,
+            ):
+                common = dict(
+                    params=params,
+                    mamba_pool=mamba_pool,
+                    full_layer_mapping={0: 0},
+                    start_layer=0,
+                    load_cache_event=None,
+                    storage_backend=None,
+                )
+                if swa:
+                    group, _ = hybrid_pool_assembler.build_hybrid_mamba_swa_stack(
+                        **common,
+                        full_kv_pool=kv,
+                        swa_kv_pool=kv,
+                        swa_layer_mapping={1: 0},
+                    )
+                    kv_shares = sum(
+                        call.kwargs["host_size"]
+                        for call in build_kv_host_pool.call_args_list
+                    )
+                else:
+                    group, _, _ = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                        **common, kv_pool=kv
+                    )
+                    kv_shares = build_kv_host_pool.call_args.kwargs["host_size"]
+                host = group.entry_map[PoolName.MAMBA].host_pool
+                self.addCleanup(host.destroy)
+                self.assertEqual(host.size, int(70 * 1e9 // host.size_per_token) + 1)
+                self.assertAlmostEqual(kv_shares, 122)
+
     def test_pin_below_one_mamba_slot_is_rejected(self):
         """Host sizing pads by one slot,
         so a pin smaller than one state slot would silently build a one-slot pool."""
