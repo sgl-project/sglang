@@ -119,14 +119,14 @@ def _host_allocator_and_device(params: CacheInitParams):
 
 @contextmanager
 def _explicit_size_budget(params: CacheInitParams):
-    # Sampling per pool charges a late rank for its peers' pools, so ranks sharing a host take one
-    # snapshot each; on gfx950 it is clamped to the rank's TTM pinnable share.
+    # Sampling per pool charges a late rank for its peers' pools,
+    # so ranks sharing a host take one snapshot each (clamped to the TTM pinnable share on gfx950).
     from sglang.srt.mem_cache.pool_host.rocm_budget import rocm_pinnable_share_bytes
 
     gfx950_ttm = rocm_pinnable_share_bytes() is not None
     if ranks_per_host() == 1 and not gfx950_ttm:
-        # A lone rank has no peer to race; sampling per pool still sees the pools of other engines
-        # on this host, which a snapshot would not.
+        # A lone rank has no peer to race;
+        # sampling per pool still sees other engines' pools on this host, which a snapshot would not.
         yield
         return
     allocator, kvcache_device = _host_allocator_and_device(params)

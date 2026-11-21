@@ -340,8 +340,7 @@ class TestHiCacheAutoSize(CustomTestCase):
     def _explicit_size_scope(
         self, *, mode, available, hugetlb, gfx950, mappings, ranks
     ):
-        """Snapshot an explicit-size scope on a mocked host; return its budget
-        and the preflight (allocation, available) for the given mappings."""
+        # Returns the scope budget (None without a snapshot) and the preflight for the mappings.
         params = SimpleNamespace(
             token_to_kv_pool_allocator=SimpleNamespace(
                 get_kvcache=lambda: SimpleNamespace(device="cuda")
