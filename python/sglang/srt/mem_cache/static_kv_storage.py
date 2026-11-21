@@ -1107,7 +1107,9 @@ def _static_state_entries(
                     tail_ptrs = list(tail_ptrs) + list(draft_tail_ptrs)
                     tail_lens = list(tail_lens) + list(draft_tail_lens)
                     tail_item_lens = list(tail_item_lens) + list(draft_tail_item_lens)
-                add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
+                # NPU includes index buffers in its main KV entries.
+                if not isinstance(dsa_pool, NPUMLATokenToKVPool):
+                    add(StateType.DSA, dsa_ptrs, dsa_lens, dsa_item_lens)
                 if tail_ptrs:
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):

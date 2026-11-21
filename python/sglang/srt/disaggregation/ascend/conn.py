@@ -127,23 +127,6 @@ class AscendKVManager(MooncakeKVManager):
             disaggregation_mode=self.disaggregation_mode,
         )
 
-    def register_buffer_to_engine(self):
-        # MemFabric aligns registered buffers to 2 MiB. Register everything in
-        # one batch so overlapping aligned ranges from small tensors are merged
-        # before they are published to the peer.
-        ptrs = list(self.kv_args.kv_data_ptrs)
-        lens = list(self.kv_args.kv_data_lens)
-        ptrs.extend(self.kv_args.aux_data_ptrs)
-        lens.extend(self.kv_args.aux_data_lens)
-        for component_ptrs, component_lens in zip(
-            self.kv_args.state_data_ptrs or [],
-            self.kv_args.state_data_lens or [],
-        ):
-            ptrs.extend(component_ptrs)
-            lens.extend(component_lens)
-        if ptrs:
-            self.engine.batch_register(ptrs, lens)
-
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._uses_page_interleaved_dcp() and self.dcp_size != dst_dcp_size:
             if self.dcp_size == 1 and dst_dcp_size > 1:
