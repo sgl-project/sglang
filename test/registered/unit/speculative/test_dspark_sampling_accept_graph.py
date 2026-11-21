@@ -40,7 +40,7 @@ def _sampling_info(**overrides):
         has_custom_logit_processor=False,
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
-        penalizer_orchestrator=None,
+        step_penalties=None,
         grammar_mask=None,
         logit_bias=None,
     )

@@ -10,7 +10,7 @@ use crate::workers::control::{
 };
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{AUTHORIZATION, IF_MATCH, LOCATION};
+use axum::http::header::{AUTHORIZATION, IF_MATCH, LOCATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -104,7 +104,11 @@ fn mutation_auth_rejection(context: &AppContext, headers: &HeaderMap) -> Option<
         return Some(ApiError::from(WorkerControlError::Unavailable).into_response());
     };
     if headers.get(AUTHORIZATION) != Some(expected) {
-        return Some(StatusCode::UNAUTHORIZED.into_response());
+        let mut response = ApiError::from(WorkerControlError::Unauthorized).into_response();
+        response
+            .headers_mut()
+            .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return Some(response);
     }
     None
 }
@@ -515,10 +519,15 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
+        let response = app.clone().oneshot(missing).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["www-authenticate"], "Bearer");
         assert_eq!(
-            app.clone().oneshot(missing).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
+            response.headers()["x-router-error-code"],
+            "worker_management_unauthorized"
         );
+        let envelope = body_json(response).await;
+        assert_eq!(envelope["error"]["code"], "worker_management_unauthorized");
 
         let wrong = Request::builder()
             .method(Method::POST)

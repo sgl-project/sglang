@@ -183,6 +183,8 @@ pub enum WorkerControlError {
     MissingRevision,
     #[error("invalid If-Match worker revision")]
     InvalidRevision,
+    #[error("missing or invalid worker management credential")]
+    Unauthorized,
     #[error("worker {0} not found")]
     NotFound(WorkerId),
     #[error("{message}")]
@@ -197,6 +199,7 @@ impl WorkerControlError {
             Self::Invalid(_) => "invalid_worker_spec",
             Self::MissingRevision => "missing_worker_revision",
             Self::InvalidRevision => "invalid_worker_revision",
+            Self::Unauthorized => "worker_management_unauthorized",
             Self::NotFound(_) => "worker_not_found",
             Self::Conflict { code, .. } => code,
             Self::Unavailable => "worker_control_unavailable",
