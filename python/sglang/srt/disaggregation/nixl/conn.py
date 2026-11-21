@@ -2378,7 +2378,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # the paired entries must have identical layouts.
                 if dst_item_lens is not None:
                     for i, j in pairs:
-                        if is_elided_entry(item_lens[i], dst_item_lens, j):
+                        if is_elided_entry(
+                            item_lens[i],
+                            dst_item_lens,
+                            j,
+                            allow_dst_elision=state_type == StateType.DSA,
+                        ):
                             # A shared-topk layer carries no index-K. One peer
                             # may elide it while the other does not -- HiSparse
                             # runs decode-side only -- and neither reads it.
@@ -2396,7 +2401,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i])
                     for i, j in pairs
-                    if not is_elided_entry(item_lens[i], dst_item_lens, j)
+                    if not is_elided_entry(
+                        item_lens[i],
+                        dst_item_lens,
+                        j,
+                        allow_dst_elision=state_type == StateType.DSA,
+                    )
                 ]
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -2417,7 +2427,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     for layer_id in range(layers_current_pp_stage)
                     if not is_elided_entry(
-                        item_lens[layer_id], mapped_dst_lens, layer_id
+                        item_lens[layer_id],
+                        mapped_dst_lens,
+                        layer_id,
+                        allow_dst_elision=state_type == StateType.DSA,
                     )
                 ]
         else:
