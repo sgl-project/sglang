@@ -1,4 +1,4 @@
-"""A device-resident LoRA layer takes its unmerge snapshot only when first merged."""
+"""A device-resident LoRA layer takes its unmerge snapshot (pinned) only when first merged."""
 
 import pytest
 import torch
@@ -32,6 +32,9 @@ def test_dynamic_lora_takes_no_snapshot_and_merge_restores_base(device):
     assert layer.merged
     assert layer._cpu_weight is not None
     assert layer.cpu_weight.device.type == "cpu"
+    if device == "cuda":
+        # Pinned, so the unmerge restore is a fast host-to-device copy.
+        assert layer.cpu_weight.is_pinned()
     torch.testing.assert_close(layer.cpu_weight, original.cpu(), rtol=0, atol=0)
     expected = original.float() + B.float() @ A.float()
     torch.testing.assert_close(base.weight.float(), expected, rtol=2e-2, atol=2e-2)
