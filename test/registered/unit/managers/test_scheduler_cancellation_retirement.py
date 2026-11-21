@@ -452,6 +452,95 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self._cancel(scheduler, req)
         self.assertEqual([out.status for out, _ in self.outputs][-1], "retired")
 
+    def test_pending_retirement_preserves_distinct_control_replies(self):
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        batch = ScheduleBatch(reqs=[req])
+        batch.add_inflight_step()
+        scheduler.running_batch = batch
+        move([req], scheduler.running_reqs)
+
+        def wait(correlation_rid):
+            scheduler.handle_cancellation_retirement(
+                CancellationRetirementReq(
+                    rid=correlation_rid,
+                    target_rid=req.rid,
+                    request_instance_id=req.request_instance_id,
+                    cancellation_id="operation-a",
+                )
+            )
+
+        with patch(
+            "sglang.srt.managers.scheduler.CANCELLATION_RETIREMENT_MAX_ROUTES", 2
+        ):
+            wait("receipt-a")
+            wait("receipt-a")  # A duplicate of the same route uses one slot.
+            wait("receipt-b")
+            self.assertEqual(self.outputs, [])
+            wait("receipt-c")
+        self.assertEqual(len(self.outputs), 1)
+        self.assertEqual(self.outputs.pop()[0].reason, "too_many_waiters")
+
+        req.finish_outside_step(FINISH_ABORT())
+        scheduler.request_retirer.release(req, checkpoint=True)
+        scheduler._on_step_processed(batch, None)
+        self.assertEqual(
+            [(out.rid, out.status) for out, _ in self.outputs],
+            [("receipt-a", "retired"), ("receipt-b", "retired")],
+        )
+
+    def test_failed_completed_receipt_replay_keeps_bounded_retry_routes(self):
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        move([req], scheduler.waiting_queue)
+        control = self._cancel(scheduler, req)
+        entry = scheduler._cancellation_retirements[control.cancellation_id]
+        self.assertEqual(entry.status, "retired")
+        self.outputs.clear()
+        expires_at = entry.expires_at
+
+        def replay(correlation_rid):
+            scheduler.handle_cancellation_retirement(
+                CancellationRetirementReq(
+                    rid=correlation_rid,
+                    target_rid=req.rid,
+                    request_instance_id=req.request_instance_id,
+                    cancellation_id=control.cancellation_id,
+                )
+            )
+
+        with patch(
+            "sglang.srt.managers.scheduler.CANCELLATION_RETIREMENT_MAX_ROUTES", 1
+        ):
+            self.drop_receipt_sends = 1
+            replay("retry-a")
+            self.assertEqual(self.outputs, [])
+            self.assertEqual(len(entry.replies), 1)
+            deadline = entry.next_retry_at
+            self.drop_receipt_sends = 1
+            replay("retry-b")
+            self.assertEqual(len(entry.replies), 1)
+            self.assertEqual(entry.next_retry_at, deadline)
+            self.assertEqual(entry.expires_at, expires_at)
+
+        entry.next_retry_at = 0
+        scheduler._check_cancellation_retirements()
+        self.assertEqual(
+            [(out.rid, out.status) for out, _ in self.outputs],
+            [("retry-a", "retired")],
+        )
+        self.assertEqual(entry.replies, {})
+
+        # An explicit retry that succeeds also clears its queued delivery.
+        self.outputs.clear()
+        self.drop_receipt_sends = 1
+        replay("retry-c")
+        replay("retry-c")
+        entry.next_retry_at = 0
+        scheduler._check_cancellation_retirements()
+        self.assertEqual([out.rid for out, _ in self.outputs], ["retry-c"])
+        self.assertEqual(entry.replies, {})
+
     def test_legacy_prefix_abort_and_targeted_chunk_retry_remain_separate(self):
         scheduler = self._scheduler()
         old = self._req(scheduler)

@@ -487,8 +487,8 @@ class _CancellationRetirement:
     request_instance_id: str
     expires_at: float
     req: Optional[Req] = None
-    replies: Dict[Optional[str], CancellationRetirementReq] = dataclasses.field(
-        default_factory=dict
+    replies: Dict[Tuple[Optional[str], Optional[str]], CancellationRetirementReq] = (
+        dataclasses.field(default_factory=dict)
     )
     status: Optional[str] = None
     reason: str = ""
@@ -6811,6 +6811,8 @@ class Scheduler(
         target_rid = (
             recv_req.rid if recv_req.target_rid is None else recv_req.target_rid
         )
+        # An IPC worker may have multiple concurrent control correlations.
+        route = (recv_req.http_worker_ipc, recv_req.rid)
         if (entry := entries.get(recv_req.cancellation_id)) is not None:
             if (entry.rid, entry.request_instance_id) != (
                 target_rid,
@@ -6820,14 +6822,26 @@ class Scheduler(
                     recv_req, "unknown", "operation_conflict"
                 )
             elif entry.status is not None:
-                self._reply_cancellation_retirement(
+                if self._reply_cancellation_retirement(
                     recv_req, entry.status, entry.reason
-                )
+                ):
+                    entry.replies.pop(route, None)
+                elif (
+                    route in entry.replies
+                    or len(entry.replies) < CANCELLATION_RETIREMENT_MAX_ROUTES
+                ):
+                    # Reuse the existing retry queue without extending the
+                    # receipt TTL or postponing other outstanding deliveries.
+                    if not entry.replies:
+                        entry.next_retry_at = (
+                            time.monotonic() + CANCELLATION_RETIREMENT_RETRY_S
+                        )
+                    entry.replies[route] = recv_req
             elif (
-                recv_req.http_worker_ipc in entry.replies
+                route in entry.replies
                 or len(entry.replies) < CANCELLATION_RETIREMENT_MAX_ROUTES
             ):
-                entry.replies[recv_req.http_worker_ipc] = recv_req
+                entry.replies[route] = recv_req
             else:
                 self._reply_cancellation_retirement(
                     recv_req, "unknown", "too_many_waiters"
@@ -6841,7 +6855,7 @@ class Scheduler(
             rid=target_rid,
             request_instance_id=recv_req.request_instance_id,
             expires_at=time.monotonic() + CANCELLATION_RETIREMENT_TTL_S,
-            replies={recv_req.http_worker_ipc: recv_req},
+            replies={route: recv_req},
         )
         entries[recv_req.cancellation_id] = entry
         if scope_error := self._cancellation_retirement_scope_error():
