@@ -35,6 +35,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.window_params import (
     KEY_PAGE_BASE,
     KEY_REUSE,
 )
+from sglang.srt.sampling.penalties import uses_penalty
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
@@ -533,6 +534,21 @@ def _doc_params(req) -> Optional[dict]:
     if not isinstance(cp, dict) or not cp.get(KEY_DOC_ID):
         return None
     return cp
+
+
+def validate_reuse_request(req: Req) -> Optional[str]:
+    cp = _doc_params(req)
+    if cp is None or not cp.get(KEY_REUSE):
+        return None
+    if uses_penalty(req.sampling_params):
+        return (
+            "Unlimited-OCR document reuse does not support sampling penalties "
+            "(frequency_penalty, presence_penalty, repetition_penalty, "
+            "min_new_tokens): a follow-up window's first output tokens are "
+            "copied from the previous window, not sampled, so no penalty can "
+            "count them. Remove the penalties from multi-window documents."
+        )
+    return None
 
 
 def _stop_ids(req) -> set:
