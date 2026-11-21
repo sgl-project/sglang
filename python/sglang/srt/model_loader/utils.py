@@ -264,7 +264,12 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
 
 
 def should_deepgemm_weight_requant_ue8m0(
-    weight_block_size, output_dtype=None, weight_shape=None, *, grouped_moe=False
+    weight_block_size,
+    output_dtype=None,
+    weight_shape=None,
+    *,
+    grouped_moe=False,
+    dense_on_deepgemm=False,
 ):
     """Should we requant fp8 weights into UE8M0 format when loading the model.
 
@@ -273,6 +278,9 @@ def should_deepgemm_weight_requant_ue8m0(
     K a multiple of the block for grouped MoE). Without these checks, scales
     would be converted to UE8M0 but the GEMM would fall back to triton which
     expects float32 scales, causing wrong results.
+
+    dense_on_deepgemm: the caller runs this dense layer on the DeepGEMM runner
+    even on SM120, where dense layers otherwise run on CUTLASS/Triton.
     """
     if not (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -281,8 +289,9 @@ def should_deepgemm_weight_requant_ue8m0(
     ):
         return False
     # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
-    # only the grouped MoE GEMM consumes DeepGEMM layouts there.
-    if get_device_sm() == 120 and not grouped_moe:
+    # only the grouped MoE GEMM consumes DeepGEMM layouts there, unless the
+    # caller runs a dense layer on DeepGEMM itself (diffusion's auto dispatch).
+    if get_device_sm() == 120 and not (grouped_moe or dense_on_deepgemm):
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False

@@ -97,6 +97,23 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertTrue(experts_fired)
         requant.assert_called_once_with(*experts, BLOCK_SIZE)
 
+    def test_sm120_requants_dense_weights_the_caller_runs_on_deepgemm(self):
+        """Diffusion's auto FP8 dispatch picks DeepGEMM for dense layers on SM120,
+        whose kernel faults on FP32 block scales (CUDA error 719, Xid 43)."""
+        with (
+            self._enabled_deepgemm_ue8m0(),
+            patch.object(model_loader_utils, "get_device_sm", return_value=120),
+        ):
+            default = model_loader_utils.should_deepgemm_weight_requant_ue8m0(
+                BLOCK_SIZE
+            )
+            on_deepgemm = model_loader_utils.should_deepgemm_weight_requant_ue8m0(
+                BLOCK_SIZE, dense_on_deepgemm=True
+            )
+
+        self.assertFalse(default)
+        self.assertTrue(on_deepgemm)
+
     def test_helper_skips_non_bf16_output(self):
         weight, weight_scale = _make_params()
 

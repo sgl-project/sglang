@@ -408,15 +408,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     should_deepgemm_weight_requant_ue8m0,
                 )
 
+                uses_deepgemm = (
+                    self.w8a8_block_fp8_linear
+                    is deepgemm_w8a8_block_fp8_linear_with_fallback
+                )
                 if (
-                    should_deepgemm_weight_requant_ue8m0(
+                    uses_deepgemm
+                    and should_deepgemm_weight_requant_ue8m0(
                         weight_block_size=getattr(
                             self.quant_config, "weight_block_size", None
                         ),
-                    )
-                    and (
-                        self.w8a8_block_fp8_linear
-                        is deepgemm_w8a8_block_fp8_linear_with_fallback
+                        dense_on_deepgemm=True,
                     )
                     and (not layer.weight_scale_inv.format_ue8m0)
                 ):
