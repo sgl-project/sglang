@@ -6,8 +6,9 @@ which imports this mixin. ROCm keeps the multicast all-reduce fusion disabled.
 
 from __future__ import annotations
 
+import contextlib
 from functools import cache, cached_property
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, ContextManager, Optional
 
 import msgspec
 import torch
@@ -25,6 +26,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
+from sglang.srt.layers.moe import route_sort
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -35,7 +37,9 @@ from sglang.srt.utils.common import cdiv, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.communication.k3_ll_comm_hip import LLComm
+    from sglang.srt.layers.moe.route_sort import RouteSortConsumer
 
+_is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _use_aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER")
 if _is_gfx95:
@@ -149,6 +153,22 @@ class KimiK3MoEHipMixin:
             and self.routed_expert_up_proj is not None
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
         )
+
+    # Resolved on first use, not in _prepare_hip_paths: that runs on gfx95 only
+    # while the radix-4 router also covers gfx942.
+    @cached_property
+    def _route_sort_consumer(self) -> Optional[RouteSortConsumer]:
+        if not (_is_hip and envs.SGLANG_K3_RADIX4_TOPK.get()):
+            return None
+        runner = self.experts.runner
+        return None if runner is None else runner.route_sort_consumer()
+
+    def _route_sort_scope(self) -> ContextManager[None]:
+        consumer = self._route_sort_consumer
+        if consumer is None:
+            return contextlib.nullcontext()
+        # A sort that no experts call consumed must not outlive this layer.
+        return route_sort.scope(consumer)
 
     def _select_prefill_up_proj_columns(self) -> None:
         """Prefill-sized batches compute only this rank's 1/tp columns of the

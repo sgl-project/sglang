@@ -735,6 +735,11 @@ class ForwardFlags:
         "attn_tp_sequence_sharded": False,
         # Physical token rows in TP rank order for the current Ascend MoE call.
         "ascend_allgather_row_sizes": None,
+        # The radix-4 route+sort request of the MoE layer in scope (set by
+        # layers/moe/route_sort.scope). Eager-only: prefill and decode graphs
+        # capture without torch.compile, and the opt-in --enable-torch-compile
+        # decode trace is not fullgraph, so there a read only graph-breaks.
+        "route_sort_handoff": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,

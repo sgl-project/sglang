@@ -53,6 +53,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     is_moe_input_scattered_across_dp_ranks,
+    route_sort,
 )
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
@@ -2165,6 +2166,15 @@ def biased_grouped_topk_gpu(
             if moe_route_radix4.available() and moe_route_radix4.covered(
                 route_logits, route_bias, topk, num_expert_group, topk_group
             ):
+                routed = route_sort.try_route_sort_fused(
+                    route_logits,
+                    route_bias,
+                    topk=topk,
+                    renormalize=renormalize,
+                    routed_scaling_factor=scaling,
+                )
+                if routed is not None:
+                    return routed
                 return moe_route_radix4.route_radix4(
                     route_logits, route_bias, topk, renormalize, scaling
                 )
@@ -2976,13 +2986,16 @@ def select_experts(
         else:
             from sglang.srt.layers.moe import route_quant_handoff
 
+            fused_routing_ok = (
+                expert_location_dispatch_info is None
+                and not routing_overridden
+                and num_shared_topk_slots == 0
+            )
             route_quant_handoff.bind_select_experts(
-                num_token_non_padded,
-                fused_routing_ok=(
-                    expert_location_dispatch_info is None
-                    and not routing_overridden
-                    and num_shared_topk_slots == 0
-                ),
+                num_token_non_padded, fused_routing_ok=fused_routing_ok
+            )
+            route_sort.bind_select_experts(
+                num_token_non_padded, fused_routing_ok=fused_routing_ok
             )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,

@@ -1606,8 +1606,10 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            # The fused route+sort launch zeroes the published latent for the
+            # experts, so route inside the block too.
             with zero_copy_context.set_moe_output(latent):
+                topk_output = self.topk(hidden_states, router_logits)
                 expert_output = self.experts(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1948,20 +1950,23 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # the FFN read already ran the front on this rank's rows (shard_front)
             return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
-        if get_forward().sp_active:
-            return self._forward_sp_rows(hidden_states, prefix_sum, valid_token_count)
-        if cp_shard_rows:
-            return self._forward_cp_shard_rows(hidden_states)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            if _is_gfx95:  # its row-sharded tail may return this rank's rows
-                return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
-        else:
-            out = self._forward_unfused(
-                hidden_states,
-                prefix_sum=prefix_sum,
-                valid_token_count=valid_token_count,
-            )
+        with self._route_sort_scope():
+            if get_forward().sp_active:
+                return self._forward_sp_rows(
+                    hidden_states, prefix_sum, valid_token_count
+                )
+            if cp_shard_rows:
+                return self._forward_cp_shard_rows(hidden_states)
+            if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+                if _is_gfx95:  # its row-sharded tail may return this rank's rows
+                    return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
+                out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            else:
+                out = self._forward_unfused(
+                    hidden_states,
+                    prefix_sum=prefix_sum,
+                    valid_token_count=valid_token_count,
+                )
         return out.view(num_tokens, hidden_size)
 
 

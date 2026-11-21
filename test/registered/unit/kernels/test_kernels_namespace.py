@@ -79,6 +79,15 @@ def test_gguf_vector_registry_is_cuda_local_jit():
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def test_radix4_router_refuses_to_build_off_its_target_devices():
+    from sglang.kernels.ops.moe import moe_route_radix4
+
+    with patch.object(moe_route_radix4, "load_jit") as load_jit:
+        with pytest.raises(RuntimeError):
+            moe_route_radix4.build()
+    load_jit.assert_not_called()
+
+
 def test_unknown_op_or_backend_raises():
     with pytest.raises(KeyError):
         K.select_kernel("does_not.exist")
@@ -352,6 +361,7 @@ def test_minicpm_sala_package_exports_the_function_after_its_submodule():
     [
         ("activation.situ_and_mul", KernelBackend.JIT, "cuda"),
         ("moe.situ_and_mul_masked_post_quant", KernelBackend.JIT, "cuda"),
+        ("moe.route_radix4_with_sort", KernelBackend.JIT, "hip"),
         ("attention.attn_res_fused_tma", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
         ("elementwise.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),

@@ -9,6 +9,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     DispatchMoeRunnerCore,
     FusedOpPool,
     MoeRunnerConfig,
+    MoeRunnerCore,
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
@@ -24,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
+    from sglang.srt.layers.moe.route_sort import RouteSortConsumer
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
 
@@ -188,6 +190,16 @@ class MoeRunner:
                 "SGLANG_CI_DISABLE_MOE_FUSED_FUNC is set to 1, disabling fused func"
             )
             self.fused_func = None
+
+    def route_sort_consumer(self) -> Optional[RouteSortConsumer]:
+        """The runner core's consumer for a router-written MoE sort
+        (MoeRunnerCore.route_sort_consumer); None on a fused func or a dispatch
+        core, which never run it."""
+        if self.fused_func is not None or not isinstance(
+            self.runner_core, MoeRunnerCore
+        ):
+            return None
+        return self.runner_core.route_sort_consumer()
 
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
