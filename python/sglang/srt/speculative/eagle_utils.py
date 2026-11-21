@@ -804,10 +804,11 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     if sampling_info.step_penalties is not None:
         sampling_info.step_penalties.apply_verify(
             next_token_logits,
-            verify_input.draft_token.view(bs, verify_input.draft_token_num),
+            candidates,
             verify_input.retrieve_next_token,
             verify_input.retrieve_next_sibling,
         )
@@ -835,7 +836,6 @@ def eagle_sample(
             keep_logits=batch.return_logprob,
         )
 
-    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     greedy = _verify_uses_greedy(

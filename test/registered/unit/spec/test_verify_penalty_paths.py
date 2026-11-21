@@ -7,7 +7,7 @@ import torch
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.speculative import eagle_utils
+from sglang.srt.speculative import dflash_utils, eagle_utils
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,6 +34,22 @@ def _step(num_reqs):
     pool.alloc(reqs)
     pool.reset_history(reqs)
     return StepPenalties.build(reqs, pool)
+
+
+def _sampling_info(bs):
+    return SamplingBatchInfo(
+        temperatures=torch.ones(bs, 1),
+        top_ps=torch.ones(bs),
+        top_ks=torch.ones(bs, dtype=torch.int32),
+        min_ps=torch.zeros(bs),
+        is_all_greedy=True,
+        is_any_greedy=True,
+        need_top_p_sampling=False,
+        need_top_k_sampling=False,
+        need_min_p_sampling=False,
+        vocab_size=VOCAB_SIZE,
+        device="cpu",
+    )
 
 
 def _row_counts(logits, tokens):
@@ -78,19 +94,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
 
     def test_dflash_block_verify_feeds_the_chain(self):
         bs, width = 2, 3
-        info = SamplingBatchInfo(
-            temperatures=torch.ones(bs, 1),
-            top_ps=torch.ones(bs),
-            top_ks=torch.ones(bs, dtype=torch.int32),
-            min_ps=torch.zeros(bs),
-            is_all_greedy=True,
-            is_any_greedy=True,
-            need_top_p_sampling=False,
-            need_top_k_sampling=False,
-            need_min_p_sampling=False,
-            vocab_size=VOCAB_SIZE,
-            device="cpu",
-        )
+        info = _sampling_info(bs)
         info.step_penalties = _step(bs)
         logits = torch.zeros(bs * width, VOCAB_SIZE)
         apply_dflash_verify_logits_adjustments(
@@ -103,6 +107,47 @@ class TestVerifyPenaltyPaths(CustomTestCase):
             _row_counts(logits, [5, 6, 9]),
             [[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]],
         )
+
+    def test_dflash_block_verify_applies_the_custom_processor_last(self):
+        """In decoding's order: the penalties, the grammar mask, the logit bias,
+        whose fp32 sum with the bf16 logits rounds once, then the custom logit
+        processor."""
+        bs, width = 2, 3
+        verify_tokens = torch.tensor([[9, 5, 5], [9, 6, 5]])
+        banned = torch.zeros(bs, VOCAB_SIZE, dtype=torch.bool)
+        banned[0, 4] = banned[1, 6] = True
+        info = _sampling_info(bs)
+        info.step_penalties = _step(bs)
+        info.grammar_mask = SimpleNamespace(
+            apply=lambda t: t.masked_fill_(banned, float("-inf"))
+        )
+        generator = torch.Generator().manual_seed(0)
+        info.logit_bias = torch.randn(bs, VOCAB_SIZE, generator=generator)
+        info.has_custom_logit_processor = True
+        logits = (torch.randn(bs * width, VOCAB_SIZE, generator=generator) * 4).to(
+            torch.bfloat16
+        )
+
+        expected = logits.clone()
+        info.step_penalties.apply_verify(expected, verify_tokens)
+        by_request = expected.view(bs, width, VOCAB_SIZE)
+        by_request.masked_fill_(banned[:, None, :], float("-inf"))
+        by_request.add_(info.logit_bias[:, None, :])
+
+        seen = []
+        with patch.object(
+            dflash_utils,
+            "apply_custom_logit_processor",
+            side_effect=lambda t, *_, **__: seen.append(t.clone()),
+        ):
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits,
+                sampling_info=info,
+                draft_token_num=width,
+                verify_tokens=verify_tokens,
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(torch.equal(seen[0], expected))
 
 
 if __name__ == "__main__":

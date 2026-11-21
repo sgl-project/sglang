@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
 
 # bumped on any breaking change to the contracts in this module
-MEGAKERNEL_API_VERSION = 2
+MEGAKERNEL_API_VERSION = 3
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"

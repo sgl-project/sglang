@@ -46,10 +46,12 @@ def apply_verify_penalties(
     Penalized request ``i`` sits at batch position ``batch_indices[i]`` and keeps
     its history in row ``penalty_indices[i]`` of ``counts`` and ``lens``. A verify
     row counts that history plus the in-vocab tokens from the root, exclusive, to
-    its own node, inclusive, then takes the formulas of ``StepPenalties``' tables.
+    its own node, inclusive, and gets the logits non-speculative decoding gives
+    for that history, bit for bit.
     The tree is ``next_child`` and ``next_sibling`` (``[bs, width]``, -1 for none),
-    or a chain when both are None. The per-request parameters are as
-    ``StepPenalties`` holds them; the launcher checks every shape.
+    or a chain when both are None. The penalty parameters are
+    ``PenaltyStatusPool``'s per-row tables, each None when no request of the
+    step uses that penalty; the launcher checks every shape.
     """
     _jit_verify_penalties_module(logits.dtype).apply_verify_penalties(
         logits,

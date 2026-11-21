@@ -251,13 +251,6 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits,
-            sampling_info,
-            num_tokens_in_batch=draft_token_num,
-        )
-
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -285,15 +278,16 @@ def apply_dflash_verify_logits_adjustments(
         )
 
     if logit_bias is not None:
-        if (
-            logit_bias.device != next_token_logits.device
-            or logit_bias.dtype != next_token_logits.dtype
-        ):
-            logit_bias = logit_bias.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(logit_bias[:, None, :])
+        # In the bias's own dtype, so the sum rounds once to the logits dtype.
+        get_logits_3d().add_(logit_bias.to(device=next_token_logits.device)[:, None, :])
+
+    # Last, as Sampler applies it after ModelRunner._preprocess_logits.
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
 
 
 def commit_block_accept_tokens_to_penalties(
