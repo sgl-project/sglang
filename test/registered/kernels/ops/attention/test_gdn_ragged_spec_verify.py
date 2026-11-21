@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -583,3 +584,7 @@ def test_gdn_dispatcher_flashinfer_falls_back_to_triton_for_ragged_layout():
         seq_len=5,
         draft_token_num=4,
     ).tolist() == [0, 1, 4, 8, 8]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
