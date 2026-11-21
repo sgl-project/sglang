@@ -81,6 +81,22 @@ impl Finish {
         }
     }
 
+    /// An interrupted generation may leave several interleaved calls unfinished.
+    pub(crate) fn call_status(self, args: &str, last_item: bool) -> &'static str {
+        match self {
+            Finish::Completed => "completed",
+            Finish::Aborted => "incomplete",
+            Finish::Incomplete(_) if last_item => "incomplete",
+            Finish::Incomplete(_) => {
+                if serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok() {
+                    "completed"
+                } else {
+                    "incomplete"
+                }
+            }
+        }
+    }
+
     /// The terminal stream event.
     pub(crate) fn event(self) -> &'static str {
         match self {

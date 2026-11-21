@@ -396,16 +396,11 @@ impl ResponsesStream {
         self.item_done(index, item, out);
     }
 
-    /// Only the last call can have been cut off; earlier ones are complete.
     fn close_calls(&mut self, finish: Finish, out: &mut Vec<u8>) {
         let calls = std::mem::take(&mut self.calls);
         let last = calls.len().saturating_sub(1);
         for (i, c) in calls.into_iter().enumerate() {
-            let status = if i == last {
-                finish.item_status()
-            } else {
-                "completed"
-            };
+            let status = finish.call_status(&c.args, i == last && !self.last_held);
             let item = call_item(
                 &c.id,
                 &c.call_id,
@@ -455,12 +450,12 @@ impl ResponsesStream {
         let finish = Finish::from_chat(Some(&reason));
         self.close_open(finish, out);
         // Only the item generated last can have been cut off.
-        let (calls_finish, held_finish) = if self.last_held {
-            (Finish::Completed, finish)
+        let held_finish = if self.last_held {
+            finish
         } else {
-            (finish, Finish::Completed)
+            Finish::Completed
         };
-        self.close_calls(calls_finish, out);
+        self.close_calls(finish, out);
         self.flush_held(out);
         self.close_open(held_finish, out);
         let mut resp = self.response(finish.status());
@@ -863,6 +858,27 @@ mod tests {
         assert_framing(&evs);
         let fc = |n: &str, a: &str| ("function_call".into(), n.into(), a.into());
         assert_eq!(items(&evs), [fc("a", r#"{"x":1}"#), fc("b", r#"{"y":2}"#)]);
+    }
+
+    #[test]
+    fn unfinished_parallel_calls_are_incomplete() {
+        for end in [None, Some("abort"), Some("length")] {
+            let evs = run(&[
+                chunk(indexed(0, Some("a"), "{"), None),
+                chunk(indexed(1, Some("b"), "{"), None),
+                chunk(indexed(0, None, r#""x":"#), end),
+            ]);
+            assert_framing(&evs);
+            let done = &evs.last().unwrap().1["response"]["output"];
+            assert_eq!(done[0]["status"], "incomplete");
+            assert_eq!(done[1]["status"], "incomplete");
+            for (_, event) in evs
+                .iter()
+                .filter(|(kind, _)| kind == "response.output_item.done")
+            {
+                assert_eq!(event["item"]["status"], "incomplete");
+            }
+        }
     }
 
     #[test]
