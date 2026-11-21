@@ -109,9 +109,6 @@ class PrefillBudget:
     # True when admission prices each demand on the allocator rather than
     # against a remaining token count; such a budget has no `remaining_total`.
     prices_by_demand = False
-    # Commit a chunked request's unfinished tail in the total budget, so later
-    # requests cannot take the KV it still needs (shortest-prefill-first).
-    reserve_unfinished_tail = False
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
@@ -297,11 +294,13 @@ class PrefillBudget:
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        commit_unfinished: bool = False,
     ) -> None:
         """Charge one admitted chunk or request. ``unfinished_input_len`` and
         ``deferred_max_new_tokens`` describe the rest of a request this chunk
-        does not finish; a budget that commits whole requests charges them,
-        at the chunk limit admission chose (``admitted_chunk_limit``)."""
+        does not finish; a budget that commits whole requests always charges
+        them, at the chunk limit admission chose (``admitted_chunk_limit``),
+        and this one charges them only with ``commit_unfinished``."""
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
         immediate = (
             extend_input_len
@@ -311,8 +310,8 @@ class PrefillBudget:
         )
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
-        if self.reserve_unfinished_tail and unfinished_input_len > 0:
-            # Allocated by later passes, so only the total budget carries it.
+        if commit_unfinished:
+            # Later passes allocate the rest, so only the total carries it.
             self.total_offset += (
                 self.ceil_paged_tokens(unfinished_input_len) + deferred_max_new_tokens
             )
@@ -530,9 +529,12 @@ class SWAPrefillBudget(PrefillBudget):
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        commit_unfinished: bool = False,
     ) -> None:
         # Charges only this chunk, already cut to the admitted limit; the
         # static estimate keeps ``chunk_limit`` (see `can_allocate_prefill`).
+        # A committed rest goes whole to the FULL pool; a window pool, and the
+        # total of a pure-SWA pool, take one more chunk's peak (`swa_tokens`).
         super().reserve(
             extend_input_len,
             max_new_tokens,
@@ -540,6 +542,7 @@ class SWAPrefillBudget(PrefillBudget):
             state_slots=state_slots,
             unfinished_input_len=unfinished_input_len,
             deferred_max_new_tokens=deferred_max_new_tokens,
+            commit_unfinished=commit_unfinished and not self.all_swa,
         )
         # A continuation already owns its ring slot.
         if not (self.req_ring and is_chunked_continuation):
@@ -548,6 +551,15 @@ class SWAPrefillBudget(PrefillBudget):
                 max_new_tokens,
                 chunk_limit=chunk_limit,
             )
+        if commit_unfinished and not self.req_ring:
+            window_rest = self.swa_tokens(
+                self.ceil_paged_tokens(unfinished_input_len),
+                deferred_max_new_tokens,
+                chunk_limit=chunk_limit,
+            )
+            self.swa_offset += window_rest
+            if self.all_swa:
+                self.total_offset += window_rest
 
 
 class ChainPrefillBudget(PrefillBudget):
@@ -1174,9 +1186,11 @@ class ChainPrefillBudget(PrefillBudget):
         deferred_max_new_tokens: int = 0,
         admitted_chunk_limit: int | None = None,
         cached_tokens: int = 0,
+        commit_unfinished: bool = False,
     ) -> None:
         """Charge an admitted chunk now and commit its whole request (the rest of
-        the prompt and its decode stay pending), priced as admission priced it."""
+        the prompt and its decode stay pending), priced as admission priced it;
+        ``commit_unfinished`` changes nothing here."""
         if admitted_chunk_limit is not None:
             chunk_limit = admitted_chunk_limit
         extend_input_len = self.ceil_paged_tokens(extend_input_len)

@@ -251,7 +251,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
@@ -1562,10 +1561,6 @@ class Scheduler(
             uniboost_rank_invariant=get_parallel().tp_size > 1
             or get_parallel().pp_size > 1,
             uniboost_step_clock=lambda: self.forward_ct,
-        )
-        self.spf_reserve_chunked_tail = (
-            self.policy.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
-            and envs.SGLANG_SPF_RESERVE_CHUNKED_TAIL.get()
         )
         self.policy._on_bounded_state_change = lambda active: (
             self.waiting_queue.set_on_leave(
@@ -4707,7 +4702,6 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
-            reserve_chunked_tail=self.spf_reserve_chunked_tail,
         )
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.

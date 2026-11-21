@@ -268,51 +268,39 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
-    def test_shortest_prefill_tail_reservation_keeps_short_requests_out(self):
-        """A short request that would take the KV the chunked request's tail
-        still needs is not admitted beside it."""
+    def test_capped_chunk_holds_its_rest_from_later_requests(self):
+        """A request admitted beside a capped chunk may not take the KV the
+        chunk's rest needs next pass; an uncapped chunk holds only itself."""
         self.create_shortest_prefill_adder()
-        # 512-token chunk + 4608-token tail fit; with a 256-token request, not.
-        self.mock_token_allocator.available_size.return_value = 5400
-        for reserve_tail, admitted in ((False, ["long", "short"]), (True, ["long"])):
-            with self.subTest(reserve_tail=reserve_tail):
+        # Capped: a 512-token chunk + a page, and the 4564-token rest paged to
+        # 4608 + 1 decode token, hold 5185; a 256-token request needs 256 + a
+        # page + 1 = 321 more. Uncapped: a 1024-token chunk + a page = 1088,
+        # and the spent chunk budget turns the request away.
+        for cap, available, held, admitted in (
+            (512, 5400, 5185, ["long"]),
+            (512, 5600, 5185, ["long", "short"]),
+            (None, 5400, 1088, ["long"]),
+        ):
+            with self.subTest(cap=cap, available=available):
+                self.mock_token_allocator.available_size.return_value = available
                 long_req = self.create_mock_req("long", priority=0, max_new_tokens=1)
-                long_req.full_untruncated_fill_ids = list(range(6144))
+                long_req.full_untruncated_fill_ids = list(range(6100))
                 long_req.prefix_len = 1024
                 short = self.create_mock_req("short", priority=0, max_new_tokens=1)
                 short.full_untruncated_fill_ids = list(range(256))
                 adder = self.create_adder(
-                    self.create_running_batch(),
-                    page_size=64,
-                    rem_chunk_tokens=1024,
-                    reserve_chunked_tail=reserve_tail,
+                    self.create_running_batch(), page_size=64, rem_chunk_tokens=1024
                 )
-                adder.chunked_req_limit = 512
+                adder.chunked_req_limit = cap
+                before = adder.memory_budget.total_offset
                 self.assertIs(adder.add_chunked_req(long_req), long_req)
+                self.assertEqual(adder.memory_budget.total_offset - before, held)
                 result = adder.add_one_req(
                     short, has_chunked_req=True, truncation_align_size=None
                 )
                 self.assertEqual([r.rid for r in adder.can_run_list], admitted)
-                if reserve_tail:
+                if cap is not None and admitted == ["long"]:
                     self.assertEqual(result, AddReqResult.NO_TOKEN)
-
-    def test_tail_reservation_charges_only_the_total_budget(self):
-        self.create_shortest_prefill_adder()
-        for reserve_tail in (False, True):
-            adder = self.create_adder(
-                self.create_running_batch(),
-                page_size=64,
-                rem_chunk_tokens=1024,
-                reserve_chunked_tail=reserve_tail,
-            )
-            budget = adder.memory_budget
-            total, current = budget.total_offset, budget.current_offset
-            budget.reserve(
-                1024, 0, unfinished_input_len=1000, deferred_max_new_tokens=1
-            )
-            tail = (1024 + 1) if reserve_tail else 0
-            self.assertEqual(budget.total_offset - total, 1024 + 64 + tail)
-            self.assertEqual(budget.current_offset - current, 1024 + 64)
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()
