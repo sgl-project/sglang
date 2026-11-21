@@ -101,14 +101,11 @@ def test_cutedsl_gdn_precision(B: int, varlen: bool, pool_view: str):
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton kernel not available")
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dt_bias_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("B", [16, 64])
-def test_cutedsl_gdn_state_and_dt_bias_dtypes(
-    B: int, varlen: bool, dt_bias_dtype: torch.dtype, state_dtype: torch.dtype
-):
-    """Support BF16/FP16 state pools and FP32/BF16 dt_bias without silent corruption."""
+def test_cutedsl_gdn_dt_bias_dtypes(B: int, varlen: bool, dt_bias_dtype: torch.dtype):
+    """Support both BF16 and FP32 dt_bias without silent bit reinterpretation."""
     torch.manual_seed(2026)
     T, H, K, V, HV = 1, 16, 128, 128, 32
     scale = K**-0.5
@@ -124,7 +121,7 @@ def test_cutedsl_gdn_state_and_dt_bias_dtypes(
     cu_seqlens = (
         torch.arange(B + 1, dtype=torch.int32, device="cuda") if varlen else None
     )
-    state_cutedsl = torch.randn(pool_size, HV, V, K, dtype=state_dtype, device="cuda")
+    state_cutedsl = torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
     state_triton = state_cutedsl.clone()
     untouched_mask = torch.ones(pool_size, dtype=torch.bool, device="cuda")
     untouched_mask[indices[valid].long()] = False
@@ -160,32 +157,28 @@ def test_cutedsl_gdn_state_and_dt_bias_dtypes(
         torch.testing.assert_close(
             state_cutedsl[untouched_mask], untouched_ref, atol=0, rtol=0
         )
-        atol = 2e-2 if state_dtype == torch.bfloat16 else 5e-3
-        rtol = 2e-2 if state_dtype == torch.bfloat16 else 1e-2
         torch.testing.assert_close(
             out_cutedsl.reshape(B, HV, V)[valid].float(),
             out_triton.reshape(B, HV, V)[valid].float(),
-            atol=atol,
-            rtol=rtol,
+            atol=1e-3,
+            rtol=1e-2,
         )
-        torch.testing.assert_close(
-            state_cutedsl.float(), state_triton.float(), atol=atol, rtol=rtol
-        )
+        torch.testing.assert_close(state_cutedsl, state_triton, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton kernel not available")
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_cutedsl_gdn_strided_pool_and_split_ab(state_dtype: torch.dtype):
+@pytest.mark.parametrize("B", [8, 64])
+def test_cutedsl_gdn_strided_pool_and_split_ab(B: int):
     """Envelope-strided state pools and non-contiguous split a/b must match Triton."""
     torch.manual_seed(2027)
-    B, H, K, V, HV = 8, 16, 128, 128, 32
+    H, K, V, HV = 16, 128, 128, 32
     scale = K**-0.5
-    pool_size = 20
+    pool_size = B + 12
     extra_pad = 128  # extra elements per slot so stride(0) > HV * V * K
 
     raw_backing = torch.randn(
-        pool_size, HV * V * K + extra_pad, dtype=state_dtype, device="cuda"
+        pool_size, HV * V * K + extra_pad, dtype=torch.float32, device="cuda"
     )
     pad_ref = raw_backing[:, HV * V * K :].clone()
     state_cutedsl = raw_backing[:, : HV * V * K].view(pool_size, HV, V, K)
@@ -212,14 +205,10 @@ def test_cutedsl_gdn_strided_pool_and_split_ab(state_dtype: torch.dtype):
     )
 
     torch.testing.assert_close(raw_backing[:, HV * V * K :], pad_ref, atol=0, rtol=0)
-    atol = 2e-2 if state_dtype == torch.bfloat16 else 1e-3
-    rtol = 2e-2 if state_dtype == torch.bfloat16 else 1e-2
     torch.testing.assert_close(
-        out_cutedsl.float(), out_triton.float(), atol=atol, rtol=rtol
+        out_cutedsl.float(), out_triton.float(), atol=1e-3, rtol=1e-2
     )
-    torch.testing.assert_close(
-        state_cutedsl.float(), state_triton.float(), atol=atol, rtol=rtol
-    )
+    torch.testing.assert_close(state_cutedsl, state_triton, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
@@ -243,7 +232,7 @@ def test_cutedsl_gdn_fp16_inputs_and_cuda_graph():
     b = torch.randn(B, HV, dtype=torch.float16, device="cuda")
 
     state_init = (
-        torch.randn(pool_size, HV, V, K, dtype=torch.bfloat16, device="cuda") * 0.2
+        torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda") * 0.2
     )
     state_cutedsl = state_init.clone()
     state_triton = state_init.clone()
@@ -277,11 +266,9 @@ def test_cutedsl_gdn_fp16_inputs_and_cuda_graph():
         A_log, dt_bias, q, k, v, a, b, state_triton, indices, scale, cu_seqlens
     )
     torch.testing.assert_close(
-        out_graph.float(), out_triton.float(), atol=2e-2, rtol=2e-2
+        out_graph.float(), out_triton.float(), atol=1e-3, rtol=1e-2
     )
-    torch.testing.assert_close(
-        state_cutedsl.float(), state_triton.float(), atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(state_cutedsl, state_triton, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
@@ -307,9 +294,7 @@ def test_cutedsl_gdn_indices_dtype(indices_dtype: torch.dtype):
     a = torch.randn(B, HV, dtype=torch.bfloat16, device="cuda")
     b = torch.randn(B, HV, dtype=torch.bfloat16, device="cuda")
 
-    state_cutedsl = torch.randn(
-        pool_size, HV, V, K, dtype=torch.bfloat16, device="cuda"
-    )
+    state_cutedsl = torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
     state_triton = state_cutedsl.clone()
     untouched = torch.ones(pool_size, dtype=torch.bool, device="cuda")
     untouched[indices[valid].long()] = False
@@ -326,16 +311,16 @@ def test_cutedsl_gdn_indices_dtype(indices_dtype: torch.dtype):
     torch.testing.assert_close(
         out_cutedsl.reshape(B, HV, V)[valid].float(),
         out_triton.reshape(B, HV, V)[valid].float(),
-        atol=2e-2,
-        rtol=2e-2,
+        atol=1e-3,
+        rtol=1e-2,
     )
-    torch.testing.assert_close(
-        state_cutedsl.float(), state_triton.float(), atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(state_cutedsl, state_triton, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
-def test_cutedsl_gdn_rejects_unsupported_state_dtype():
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float64])
+def test_cutedsl_gdn_rejects_unsupported_state_dtype(state_dtype: torch.dtype):
+    """Non-FP32 state pools must raise ValueError instead of silent OOB corruption."""
     B, H, K, V, HV = 2, 16, 128, 128, 32
     bf16 = dict(dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="initial_state_source dtypes"):
@@ -348,7 +333,7 @@ def test_cutedsl_gdn_rejects_unsupported_state_dtype():
             a=torch.zeros(B, 1, HV, **bf16),
             b=torch.zeros(B, 1, HV, **bf16),
             initial_state_source=torch.zeros(
-                B, HV, V, K, dtype=torch.float64, device="cuda"
+                B, HV, V, K, dtype=state_dtype, device="cuda"
             ),
             initial_state_indices=torch.arange(B, dtype=torch.int32, device="cuda"),
         )
