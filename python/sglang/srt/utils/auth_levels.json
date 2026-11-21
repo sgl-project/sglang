@@ -34,6 +34,7 @@
   "/init_weights_send_group_for_remote_instance": "admin_force",
   "/init_weights_update_group": "admin_force",
   "/internal/peer": "admin_optional",
+  "/internal/weight_update": "admin_optional",
   "/invocations": "normal",
   "/is_scaling_elastic_ep": "admin_optional",
   "/list_external_corpora": "admin_optional",

@@ -432,6 +432,15 @@ async fn update_weight_version(
     }
 }
 
+/// Whether a listener-to-listener request presents this launch's peer token
+/// for this listener ([`PEER_TOKEN_HEADER`]), which only its own peers know.
+pub(super) fn from_peer(state: &AppState, headers: &HeaderMap) -> bool {
+    let presented = headers.get(PEER_TOKEN_HEADER).map(|value| value.as_bytes());
+    own_peer_token(&state.server_args.deployment_info).is_some_and(|token| {
+        presented.is_some_and(|presented| super::auth::secret_matches(presented, token))
+    })
+}
+
 /// `POST /internal/peer` — the body is a control message's wire bytes,
 /// encoded by another DP rank's listener; the reply body is this scheduler's
 /// encoded output. Errors are plain text so the relaying side can carry the
@@ -446,11 +455,7 @@ async fn forward_control_req(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let presented = headers.get(PEER_TOKEN_HEADER).map(|value| value.as_bytes());
-    let from_peer = own_peer_token(&state.server_args.deployment_info).is_some_and(|token| {
-        presented.is_some_and(|presented| super::auth::secret_matches(presented, token))
-    });
-    if !from_peer {
+    if !from_peer(&state, &headers) {
         return (StatusCode::FORBIDDEN, "not a request from a peer listener").into_response();
     }
     let Some(routes) = forwarded_tag(&body).and_then(|tag| relayed_by(&tag)) else {

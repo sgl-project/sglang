@@ -15,6 +15,7 @@ mod parsers;
 #[cfg(test)]
 mod test_utils;
 mod tokenize;
+mod weight_coordinator;
 #[cfg(test)]
 mod weight_update_relay_tests;
 mod weights;
@@ -27,6 +28,7 @@ pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata, GRACEFUL_CLOSE_TIM
 pub(crate) use hicache::{ADMIN_KEY_MISSING, HiCacheError, HiCacheManager};
 pub(crate) use info::ElasticEpState;
 pub(crate) use parsers::{ToolSpec, parse_function_call, separate_reasoning};
+pub(crate) use weight_coordinator::coordinated_route;
 pub(crate) use weights::{
     DiskUpdateOutcome, LORA_DISABLED, PluginUpdateOutcome, WeightGroupOutcome, WeightUpdateOutcome,
 };

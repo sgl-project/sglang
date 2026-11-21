@@ -9,13 +9,14 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Declared routes neither imported app has: the dumper's (registered under
 # DUMPER_SERVER_PORT=reuse), the metrics mount (added at launch) and the Rust
-# server's routes under it, and the Rust server's relay.
+# server's routes under it, and the Rust server's listener-to-listener routes.
 SERVED_ELSEWHERE = {
     "/dumper/{method}",
     "/metrics",
     "/metrics/",
     "/metrics/{path:path}",
     "/internal/peer",
+    "/internal/weight_update",
 }
 
 
