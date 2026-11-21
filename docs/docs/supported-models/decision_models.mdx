@@ -24,9 +24,9 @@ For deployment and request examples, see the [Nemotron Decision cookbook](/cookb
 
 [NVIDIA-Nemotron-3.5-Decision-8B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Decision-8B-BF16)
 uses a trained prompt and fully bidirectional attention. Serve it through
-`/v1/systemone` or `/v1/decisions`. The default prefill budget is 32K tokens
-(16K on GPUs below 60 GiB), bounded by the configured context and checkpoint
-input limit. Set `--max-prefill-tokens` to
+`/v1/systemone` or `/v1/decisions`. The default prefill budget is 128K tokens on GPUs with at least 60 GiB
+of memory, or 16K when memory is smaller or unknown, bounded by the configured context and
+checkpoint input limit. Set `--max-prefill-tokens` to
 change that budget.
 
 ```bash Command
