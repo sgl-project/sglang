@@ -8,6 +8,7 @@ from unittest.mock import patch
 import requests
 
 from sglang.srt.multimodal.media_io import (
+    _assert_media_url_allowed,
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
@@ -177,6 +178,53 @@ class TestMediaURLSecurity(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "not allowed"):
                         loader("https://blocked.example/media")
             self.assertEqual(download.call_count, 3)
+
+    def test_glob_entry_matches_oss_region_endpoints(self):
+        configure_media_url_security(
+            ["mybucket.oss-cn-*-internal.aliyuncs.com"], max_file_size_mb=64
+        )
+        for host in (
+            "mybucket.oss-cn-hangzhou-internal.aliyuncs.com",
+            "mybucket.oss-cn-beijing-internal.aliyuncs.com",
+        ):
+            with self.subTest(host=host):
+                _assert_media_url_allowed(f"http://{host}/media")
+        for host in (
+            "otherbucket.oss-cn-hangzhou-internal.aliyuncs.com",
+            "mybucket.oss-cn-hangzhou.aliyuncs.com",
+            "mybucket.oss-cn-hangzhou-internal.aliyuncs.com.evil.com",
+        ):
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(ValueError, "not allowed"):
+                    _assert_media_url_allowed(f"http://{host}/media")
+
+    def test_question_mark_matches_exactly_one_character(self):
+        configure_media_url_security(["img?.cdn.example.com"], max_file_size_mb=64)
+        _assert_media_url_allowed("http://img1.cdn.example.com/media")
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            _assert_media_url_allowed("http://img12.cdn.example.com/media")
+
+    def test_star_cap_rejects_four_star_entry(self):
+        with self.assertRaisesRegex(ValueError, "at most 3"):
+            configure_media_url_security(["a*b*c*d*example.com"], max_file_size_mb=64)
+
+    def test_glob_boundary_rejects_similar_domains(self):
+        configure_media_url_security(["*.example.com"], max_file_size_mb=64)
+        for host in ("a.example.com", "a.b.example.com"):
+            with self.subTest(host=host):
+                _assert_media_url_allowed(f"http://{host}/media")
+        for host in ("example.com", "evilexample.com", "example.com.evil.org"):
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(ValueError, "not allowed"):
+                    _assert_media_url_allowed(f"http://{host}/media")
+
+    def test_glob_end_to_end_with_local_server(self):
+        configure_media_url_security(["127.0.0.*"], max_file_size_mb=64)
+        self.assertEqual(
+            download_remote_media(self._url("/media"), timeout=5), b"remote-media"
+        )
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            download_remote_media(self._url("/media", host="localhost"), timeout=5)
 
 
 if __name__ == "__main__":
