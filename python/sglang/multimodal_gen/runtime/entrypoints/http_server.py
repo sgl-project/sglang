@@ -125,7 +125,6 @@ async def _run_server_warmup_after_http_live(
         await run_async_client_warmup(
             server_args,
             async_scheduler_client.forward,
-            fail_open=server_args.warmup_resolutions is None,
         )
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
@@ -133,6 +132,10 @@ async def _run_server_warmup_after_http_live(
         raise
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        # /health stays 503 while uvicorn shuts down, and requests held for the
+        # warmup are refused instead of keeping the shutdown waiting
+        async_scheduler_client.mark_failed(f"Server warmup failed: {e}")
+        warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -691,18 +694,19 @@ def create_app(
 
     @app.middleware("http")
     async def wait_for_server_warmup(request: Request, call_next):
-        # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
-            return orjson_response(
-                {"error": async_scheduler_client.failure_reason}, status_code=503
-            )
         warmup_done = getattr(request.app.state, "server_warmup_done", None)
         if (
             warmup_done is not None
             and not warmup_done.is_set()
             and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
+            and not async_scheduler_client.failure_reason
         ):
             await warmup_done.wait()
+        # Keep GETs available for completed results and failure diagnostics.
+        if request.method == "POST" and async_scheduler_client.failure_reason:
+            return orjson_response(
+                {"error": async_scheduler_client.failure_reason}, status_code=503
+            )
         return await call_next(request)
 
     app.include_router(health_router)

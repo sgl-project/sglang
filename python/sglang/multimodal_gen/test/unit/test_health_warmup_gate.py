@@ -6,6 +6,7 @@
 
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -158,6 +159,57 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await http.post("/v1/videos")).status_code, 503)
                 self.assertEqual(
                     (await http.get("/completed")).json(), {"result": "saved"}
+                )
+
+    async def test_failed_warmup_reports_the_error_and_refuses_held_posts(self):
+        client = AsyncSchedulerClient()
+        args = SimpleNamespace(
+            enable_metrics=False,
+            pipeline_config=mock.Mock(
+                supports_action_endpoint=lambda: False,
+                supports_openpi_endpoint=lambda: False,
+            ),
+        )
+        with (
+            mock.patch.object(http_server, "async_scheduler_client", client),
+            mock.patch.object(http_server, "_wait_until_http_live", mock.AsyncMock()),
+            mock.patch.object(
+                http_server, "should_run_synthetic_server_warmup", return_value=True
+            ),
+            mock.patch.object(
+                http_server,
+                "run_async_client_warmup",
+                mock.AsyncMock(side_effect=RuntimeError("injected failure")),
+            ),
+            mock.patch.object(http_server.os, "kill") as kill,
+        ):
+            app = http_server.create_app(args)
+            warmup_done = app.state.server_warmup_done = asyncio.Event()
+            async with http_server.httpx.AsyncClient(
+                transport=http_server.httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as http:
+                held = asyncio.create_task(http.post("/v1/videos"))
+                await asyncio.sleep(0.05)
+                self.assertFalse(held.done())
+
+                await http_server._run_server_warmup_after_http_live(args, warmup_done)
+
+                kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+                # held requests are released, to be refused, so shutdown can finish
+                response = await asyncio.wait_for(held, 5)
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    response.json(), {"error": "Server warmup failed: injected failure"}
+                )
+                response = await http.get("/health")
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    response.json(),
+                    {
+                        "status": "unhealthy",
+                        "error": "Server warmup failed: injected failure",
+                    },
                 )
 
     async def test_liveness_returns_200_before_warmup(self):
