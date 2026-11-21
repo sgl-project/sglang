@@ -86,6 +86,7 @@ from sglang.srt.utils.device import (
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
+    from sglang.srt.layers.quantization.mxfp8_lm_head import Mxfp8LmHead
 
 logger = logging.getLogger(__name__)
 
@@ -540,6 +541,9 @@ class LogitsProcessor(nn.Module):
         self.use_fp32_lm_head_output = getattr(
             config, "enable_lm_head_output_fp32", False
         )
+        self.lm_head_dtype = get_exec().features.lm_head_dtype
+        # Built by prepare_lm_head_dtype, which only target models call.
+        self._mxfp8_lm_head: Optional[Mxfp8LmHead] = None
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -617,6 +621,53 @@ class LogitsProcessor(nn.Module):
         self.input_logprob_processor = self.input_logprob_processor_cls(
             self.vocab_size, chunking_group=chunking_group
         )
+
+    def prepare_lm_head_dtype(self, lm_head: nn.Module) -> None:
+        """Build the ``--lm-head-dtype`` copy of ``lm_head`` that this processor's
+        logits read, or re-quantize it after a weight reload.
+
+        Only a target model calls this, from its ``post_load_weights``, so a
+        draft's logits keep the lm_head's own dtype even when the draft shares
+        the target's lm_head.
+        """
+        if self.lm_head_dtype is None:
+            return
+        weight = getattr(lm_head, "weight", None)
+        if self._mxfp8_lm_head is not None and self._mxfp8_lm_head.weight is weight:
+            self._mxfp8_lm_head.rebuild()
+            return
+        self._mxfp8_lm_head = None
+        reason = self._lm_head_dtype_unsupported_reason(lm_head)
+        if reason is not None:
+            logger.warning(
+                f"--lm-head-dtype {self.lm_head_dtype} is ignored and the lm_head "
+                f"keeps its own dtype: {reason}."
+            )
+            return
+        from sglang.srt.layers.quantization.mxfp8_lm_head import Mxfp8LmHead
+
+        self._mxfp8_lm_head = Mxfp8LmHead(weight)
+        logger.info(
+            f"lm_head logits run in MXFP8: weight copy {tuple(weight.shape)}, "
+            f"{self._mxfp8_lm_head.nbytes / 2**20:.0f} MiB."
+        )
+
+    def _lm_head_dtype_unsupported_reason(self, lm_head: nn.Module) -> Optional[str]:
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            return "the lm_head is LoRA-wrapped"
+        if should_apply_lm_head_quant_method(
+            lm_head, getattr(lm_head, "quant_method", None)
+        ):
+            return "the lm_head is already quantized"
+        if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
+            return "the model computes its logits in FP32"
+        if self.rl_on_policy_target is not None:
+            return "--rl-on-policy-target keeps the BF16 lm_head"
+        from sglang.srt.layers.quantization.mxfp8_lm_head import (
+            mxfp8_lm_head_unsupported_reason,
+        )
+
+        return mxfp8_lm_head_unsupported_reason(getattr(lm_head, "weight", None))
 
     def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
         """Opt in a verify consumer that understands vocab-shard outputs.
@@ -1493,6 +1544,10 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif self._mxfp8_lm_head is not None and self._mxfp8_lm_head.applies(
+                hidden_states, lm_head.weight
+            ):
+                logits = self._mxfp8_lm_head(hidden_states)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:

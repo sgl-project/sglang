@@ -138,6 +138,25 @@ def _configure_rocm_fp8_wo_a_gemm(model_config: Any, download_dir: str | None) -
         logger.info("Disabled ROCm fp8 wo_a GEMM for checkpoint dtype %s", dtype)
 
 
+def _validate_lm_head_dtype(cfg: Any, model_arch: str) -> None:
+    if cfg.lm_head_dtype is None:
+        return
+    from sglang.srt.layers.quantization.mxfp8_lm_head import (
+        LM_HEAD_DTYPE_SUPPORTED_ARCHS,
+    )
+
+    flag = f"--lm-head-dtype {cfg.lm_head_dtype}"
+    if model_arch not in LM_HEAD_DTYPE_SUPPORTED_ARCHS:
+        raise ValueError(
+            f"{flag} is only supported for {sorted(LM_HEAD_DTYPE_SUPPORTED_ARCHS)}; "
+            f"got {model_arch}."
+        )
+    if not get_platform().is_blackwell:
+        raise ValueError(f"{flag} requires a Blackwell GPU.")
+    if cfg.enable_fp32_lm_head:
+        raise ValueError(f"{flag} cannot be combined with --enable-fp32-lm-head.")
+
+
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -189,6 +208,8 @@ def handle_model_specific_adjustments(server_args: Any):
             raise ValueError(
                 "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
             )
+
+    _validate_lm_head_dtype(cfg, model_arch)
 
     if cfg.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
         raise ValueError(
