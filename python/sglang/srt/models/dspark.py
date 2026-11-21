@@ -183,6 +183,22 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
+    def step_fold(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """(weight, bias) when step_bias is torch.addmm(bias, latents, weight.T)
+        over the rank's vocab shard, with the latents from step_latent; for the
+        sampling kernel to compute it. None otherwise."""
+        return None
+
+    def step_latent(
+        self,
+        prev_tokens: torch.Tensor,
+        *,
+        hidden_states: Optional[torch.Tensor],
+        state: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The latents step_fold's weight folds, and the next step's state."""
+        raise NotImplementedError
+
     # Step logits = softcap(base + bias), masked from step_vocab_limit on.
     step_softcap: Optional[float] = None
     step_vocab_limit: Optional[int] = None

@@ -27,6 +27,12 @@ import triton
 import triton.language as tl
 
 
+def score_mod_band(score_mod) -> bool:
+    """Whether score_mod leaves qk unchanged for q_pos - kv_pos >= aux0_len, so the
+    kernels may skip it on tiles entirely that far apart."""
+    return score_mod is relative_bias_score_mod
+
+
 def unpack_aux_tensors(score_mod, aux_tensors):
     if score_mod is None:
         return None, 0, 0, 0
