@@ -66,11 +66,14 @@ class FlashinferNvFp4OnlineMoeBackendBase:
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.90)
+        server_info = requests.get(self.base_url + "/server_info").json()
+        internal_state = server_info["internal_states"][0]
+        # Zero means startup fell back to eager prefill instead of capturing.
+        prefill_graph_gb = internal_state["memory_usage"]["graph"]["prefill"]
+        print(f"{prefill_graph_gb=}")
+        self.assertGreater(prefill_graph_gb, 0)
         if self.spec_accept_length_threshold is not None:
-            server_info = requests.get(self.base_url + "/server_info").json()
-            avg_spec_accept_length = server_info["internal_states"][0][
-                "avg_spec_accept_length"
-            ]
+            avg_spec_accept_length = internal_state["avg_spec_accept_length"]
             print(f"{avg_spec_accept_length=}")
             self.assertGreater(
                 avg_spec_accept_length, self.spec_accept_length_threshold
@@ -101,6 +104,9 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
     backend = "flashinfer_cutedsl"
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
     extra_args = [
+        # Nemotron-H prefill CUDA graphs are opt-in on SM100.
+        "--cuda-graph-backend-prefill",
+        "breakable",
         "--reasoning-parser",
         "nemotron_3",
         "--tool-call-parser",
@@ -121,6 +127,7 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_AUTOTUNE_EXTEND": "1",
     }
 
 
@@ -130,6 +137,9 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
     backend = "flashinfer_cutedsl"
     model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"
     extra_args = [
+        # Nemotron-H prefill CUDA graphs are opt-in on SM100.
+        "--cuda-graph-backend-prefill",
+        "breakable",
         "--reasoning-parser",
         "nemotron_3",
         "--tool-call-parser",
@@ -147,8 +157,6 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
         "flashinfer_nvlink_one_sided",
-        "--cuda-graph-backend-prefill",
-        "disabled",
     ]
     eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
     spec_accept_length_threshold = 2.5
@@ -157,6 +165,7 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
         "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
+        "SGLANG_FLASHINFER_AUTOTUNE_EXTEND": "1",
         "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
         "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
@@ -179,8 +188,6 @@ class TestFlashinferMegaMoeBackendNvFp4OnlineW4A16(
         "--enable-dp-lm-head",
         "--moe-a2a-backend",
         "flashinfer_megamoe",
-        "--cuda-graph-backend-prefill",
-        "disabled",
     ]
     eval_args = {"api": "completion", "max_tokens": 512}
     extra_env = {

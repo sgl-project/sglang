@@ -60,8 +60,9 @@ def _make_req(
     stop=None,
     eos_token_ids=frozenset({EOS_ID}),
     vocab_size=10_000,
+    ignore_eos=False,
 ):
-    sp = SamplingParams(max_new_tokens=max_new_tokens, stop=stop)
+    sp = SamplingParams(max_new_tokens=max_new_tokens, stop=stop, ignore_eos=ignore_eos)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())
     req = Req(
         rid="t",
@@ -209,6 +210,84 @@ class TestSpecOvershootCacheLen(CustomTestCase):
         self.assertIsNone(req.finished_len)
         with get_context().override_server_args(strip_thinking_cache=False):
             self.assertEqual(req.owned_kv_len(), req.kv.kv_committed_len)
+
+
+def _commit_steps(steps, *, max_new_tokens, ignore_eos):
+    """Commit each step's accepted tokens until the request finishes."""
+    req = _make_req([], max_new_tokens=max_new_tokens, ignore_eos=ignore_eos)
+    for step in steps:
+        req.output_ids.extend(step)
+        req.update_finish_state(new_accepted_len=len(step))
+        if req.finished():
+            break
+    return req
+
+
+class TestIgnoreEosStopTokenLen(CustomTestCase):
+    """ignore_eos decodes past stop tokens and reports the finished_len that
+    the same request without ignore_eos ends with on its first one."""
+
+    def test_reports_the_finished_len_of_the_same_request_without_ignore_eos(self):
+        for name, steps, max_new_tokens, expected_finished_len, expected_output in (
+            # The first EOS lands mid-run in a spec step; a second EOS follows.
+            (
+                "a stop token mid-run, then another",
+                [[10], [11, EOS_ID, 12], [EOS_ID, 13]],
+                6,
+                3,
+                [10, 11, EOS_ID, 12, EOS_ID, 13],
+            ),
+            (
+                "a stop token at max_new_tokens",
+                [[10, 11], [12, EOS_ID]],
+                4,
+                4,
+                [10, 11, 12, EOS_ID],
+            ),
+        ):
+            with self.subTest(name):
+                stopped = _commit_steps(
+                    steps, max_new_tokens=max_new_tokens, ignore_eos=False
+                )
+                padded = _commit_steps(
+                    steps, max_new_tokens=max_new_tokens, ignore_eos=True
+                )
+
+                expected_finish_reason = {
+                    "type": "length",
+                    "length": max_new_tokens,
+                    "ignored_stop": {"position": expected_finished_len},
+                }
+                self.assertIsInstance(stopped.finished_reason, FINISH_MATCHED_TOKEN)
+                self.assertEqual(stopped.finished_len, expected_finished_len)
+                self.assertEqual(list(padded.output_ids_through_stop), expected_output)
+                self.assertEqual(
+                    padded.finished_reason.to_json(), expected_finish_reason
+                )
+
+    def test_reports_null_when_no_stop_token_would_have_ended_the_output(self):
+        for name, steps, expected_output in (
+            ("no stop token", [[10, 11], [12, 13]], [10, 11, 12, 13]),
+            (
+                "a stop token past max_new_tokens",
+                [[10, 11], [12, 20, EOS_ID]],
+                [10, 11, 12, 20],
+            ),
+        ):
+            with self.subTest(name):
+                stopped = _commit_steps(steps, max_new_tokens=4, ignore_eos=False)
+                padded = _commit_steps(steps, max_new_tokens=4, ignore_eos=True)
+
+                expected_finish_reason = {
+                    "type": "length",
+                    "length": 4,
+                    "ignored_stop": None,
+                }
+                self.assertIsInstance(stopped.finished_reason, FINISH_LENGTH)
+                self.assertEqual(list(padded.output_ids_through_stop), expected_output)
+                self.assertEqual(
+                    padded.finished_reason.to_json(), expected_finish_reason
+                )
 
 
 if __name__ == "__main__":

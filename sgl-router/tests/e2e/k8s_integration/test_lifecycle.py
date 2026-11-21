@@ -6,9 +6,9 @@ Covers:
 3. Router restart — after the router pod is killed, the Deployment restarts
    it and it re-lists the existing EndpointSlice entries without duplicates.
 
-These tests DO NOT use a /workers admin API (sgl-router does not expose
-one). They verify behaviour through /v1/chat/completions responses and
-by driving the deployment scale.
+These tests intentionally exercise Kubernetes discovery rather than the
+/workers admin API. They verify behaviour through /v1/chat/completions
+responses and by driving the deployment scale.
 """
 
 from __future__ import annotations

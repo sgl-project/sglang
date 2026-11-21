@@ -6,7 +6,7 @@ import logging
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
-from sgl_kernel_npu.sparsity_driven_kv_offload import (
+from sgl_kernel_npu.operators.mem_cache import (
     create_shm_tensor,
     slot_map_lookup,
     unidex_copy_inplace,

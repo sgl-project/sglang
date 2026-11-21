@@ -4,10 +4,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/cpu_communicator.py
 
-import os
-
 import torch
-from torch.distributed import ProcessGroup
 
 from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 
@@ -15,34 +12,12 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 
 class CpuCommunicator(DeviceCommunicatorBase):
-    def __init__(
-        self,
-        cpu_group: ProcessGroup,
-        device: torch.device | None = None,
-        device_group: ProcessGroup | None = None,
-        unique_name: str = "",
-    ):
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-        from sglang.multimodal_gen.runtime.platforms.interface import CpuArchEnum
-
-        super().__init__(cpu_group, device, device_group, unique_name)
-        self.dist_module = torch.distributed
-        self._all_gather_single = all_gather_single
-
-        if (
-            (current_platform.get_cpu_architecture() == CpuArchEnum.X86)
-            and hasattr(torch.ops._C, "init_shm_manager")
-            and unique_name.startswith("tp")
-        ):
-            self.dist_module = _CPUSHMDistributed(self)
-            self._all_gather_single = self.dist_module.all_gather_single
-
     def all_reduce(
         self,
         input_: torch.Tensor,
         op: torch.distributed.ReduceOp | None = torch.distributed.ReduceOp.SUM,
     ) -> torch.Tensor:
-        self.dist_module.all_reduce(input_, group=self.device_group, op=op)
+        torch.distributed.all_reduce(input_, group=self.device_group, op=op)
         return input_
 
     def gather(
@@ -68,7 +43,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             gather_list = None
 
         # Gather.
-        self.dist_module.gather(
+        torch.distributed.gather(
             input_, gather_list, dst=self.ranks[dst], group=self.device_group
         )
 
@@ -92,7 +67,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        self._all_gather_single(output_tensor, input_, group=self.device_group)
+        all_gather_single(output_tensor, input_, group=self.device_group)
 
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
@@ -103,60 +78,3 @@ class CpuCommunicator(DeviceCommunicatorBase):
             + input_size[dim + 1 :]
         )
         return output_tensor
-
-
-class _CPUSHMDistributed:
-    def __init__(self, communicator: CpuCommunicator):
-        instance_identifier = os.environ["VLLM_DIST_IDENT"]
-        unique_name = communicator.unique_name
-        instance_identifier = f"{instance_identifier}-{unique_name}"
-        self.communicator = communicator
-
-        group_ranks = [str(rank) for rank in self.communicator.ranks]
-        shm_group_identifier = f"[{'-'.join(group_ranks)}]"
-        self.group_name = f"{instance_identifier}-{shm_group_identifier}-cpushm"
-
-        self.handle = self._init_cpu_shm()
-
-    def _init_cpu_shm(self) -> int:
-        handle = torch.ops._C.init_shm_manager(
-            self.group_name,
-            self.communicator.world_size,
-            self.communicator.rank,
-        )
-        torch.distributed.barrier(self.communicator.device_group)
-        torch.ops._C.join_shm_manager(
-            handle,
-            self.group_name,
-        )
-        torch.distributed.barrier(self.communicator.device_group)
-
-        return int(handle)
-
-    def all_reduce(
-        self, input: torch.Tensor, group: ProcessGroup | None = None
-    ) -> None:
-        torch.ops._C.shm_allreduce(self.handle, input)
-
-    def gather(
-        self,
-        input: torch.Tensor,
-        gather_list: list[torch.Tensor] | None,
-        dst: int = -1,
-        group: ProcessGroup | None = None,
-    ) -> None:
-        # Note: different from the torch gather, here we use local dst rank.
-        torch.ops._C.shm_gather(
-            self.handle,
-            input,
-            gather_list,
-            torch.distributed.get_group_rank(group, dst),
-        )
-
-    def all_gather_single(
-        self,
-        output: torch.Tensor,
-        input: torch.Tensor,
-        group: ProcessGroup | None = None,
-    ) -> None:
-        torch.ops._C.shm_all_gather(self.handle, input, output)

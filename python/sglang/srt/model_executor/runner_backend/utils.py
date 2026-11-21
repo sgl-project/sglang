@@ -54,8 +54,12 @@ def _needs_hicache_event_capture(model_runner: ModelRunner) -> bool:
     # Captured metadata in unrelated backends (e.g. DeepSeek V4) does not mean
     # they capture KDA state reads and need this mechanism.
     backend = model_runner.attn_backend
+    memory = get_memory()
+    loads_layer_wise = (
+        memory.enable_hierarchical_cache or memory.enable_unified_cache_external_linker
+    )
     if not (
-        get_memory().enable_hierarchical_cache
+        loads_layer_wise
         and backend.use_captured_forward_metadata_for_breakable_cuda_graph
     ):
         return False

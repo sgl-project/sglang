@@ -2642,10 +2642,11 @@ class DenoisingStage(PipelineStage):
         Prepare Sliding Tile Attention (STA) parameters and settings.
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
+        configured_mode = server_args.attention_backend_config.STA_mode
         try:
-            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
+            STA_mode = STA_Mode[configured_mode]
         except Exception as e:
-            logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
+            logger.error(f"Passed STA_mode: {configured_mode} doesn't exist")
             raise e
         skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
@@ -2734,8 +2735,6 @@ class DenoisingStage(PipelineStage):
                 timesteps=timesteps_num,
             )
         elif STA_mode == STA_Mode.STA_INFERENCE:
-            import sglang.multimodal_gen.envs as envs
-
             config_file = envs.SGLANG_DIFFUSION_ATTENTION_CONFIG
             if config_file is None:
                 raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")

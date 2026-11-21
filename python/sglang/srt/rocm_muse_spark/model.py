@@ -3,7 +3,8 @@
 
 BF16 checkpoints run a plain ``torch.nn.functional.linear`` expert loop on CUDA
 and a fused grouped GEMM on ROCm (``ops/muse_moe_triton.py``, or
-``ops/muse_moe_flydsl.py`` when ``MUSE_MOE_BACKEND=flydsl``).
+``ops/muse_moe_flydsl.py`` when ``MUSE_MOE_BACKEND=flydsl``, or the vendored
+``tlx.ops.moe`` in ``sglang.kernels.ops.moe.tlx`` when ``MUSE_MOE_BACKEND=tlx``).
 Serialized ModelOpt NVFP4 expert weights stay packed and are executed by the
 public FlashInfer TRT-LLM MoE kernel via the public ModelOpt quant method. Muse
 applies its post-expert norm between GEMM2 and the top-k combine, which that
@@ -49,12 +50,16 @@ from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
     quantize_weight as quantize_fp8w_weight,
 )
 from sglang.kernels.ops.gemm.router_gemm_fp32 import (
+    router_gemm_tlx,
+    router_gemm_tlx_supported,
     router_gemm_tuned,
     router_gemv_fp32,
     router_gemv_fp32_supported,
 )
 from sglang.kernels.ops.gemm.unpool_gemm_norm_residual import (
     unpool_gemm_norm_residual,
+    unpool_gemm_norm_residual_tlx,
+    unpool_gemm_norm_residual_tlx_supported,
 )
 from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
@@ -173,9 +178,9 @@ def _is_rocm() -> bool:
 
 def _moe_backend() -> str:
     backend = os.environ.get("MUSE_MOE_BACKEND", "auto").lower()
-    if backend not in {"auto", "native", "triton", "flydsl"}:
+    if backend not in {"auto", "native", "triton", "flydsl", "tlx"}:
         raise ValueError(
-            "MUSE_MOE_BACKEND must be one of auto, native, triton, or flydsl; "
+            "MUSE_MOE_BACKEND must be one of auto, native, triton, flydsl, or tlx; "
             f"got {backend!r}"
         )
     if backend == "auto":
@@ -194,8 +199,55 @@ def _want_triton_moe() -> bool:
 
 
 def _want_fused_moe() -> bool:
-    """Grouped GEMM expert path that keeps Triton weight layouts (Triton or FlyDSL)."""
-    return _moe_backend() in {"triton", "flydsl"}
+    """Grouped GEMM expert path that keeps Triton weight layouts (Triton, FlyDSL or TLX)."""
+    return _moe_backend() in {"triton", "flydsl", "tlx"}
+
+
+@functools.cache
+def _warn_tlx_moe_fallback(reason: str) -> None:
+    logger.warning("MUSE_MOE_BACKEND=tlx: %s; using FlyDSL", reason)
+
+
+def _run_tlx_moe(
+    hidden_states: torch.Tensor,
+    topk_scores: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    local_expert_start: int,
+    post_expert_norm: nn.Module | None,
+    quantized: bool,
+) -> torch.Tensor | None:
+    """BF16 experts through the vendored ``tlx.ops.moe``; None (after a one-time warning) when unsupported."""
+    from sglang.kernels.ops.moe.tlx import moe_supported
+
+    weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
+    if quantized:
+        reason = "MXFP4 experts are not supported"
+    # tlx.ops.moe reads a None weight as "no post-norm", not as an unweighted norm.
+    elif has_norm and weight is None:
+        reason = "post-expert norm without a weight"
+    elif not moe_supported(hidden_states, topk_ids, w13, w2):
+        reason = f"unsupported shapes w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
+    else:
+        from sglang.kernels.jit.utils.tlx_runtime import add_missing_hip_options
+        from sglang.kernels.tlx_ops.kernels.moe.gfx950 import moe
+
+        add_missing_hip_options()
+        return moe(
+            x=hidden_states,
+            topk_weights=topk_scores,
+            topk_ids=topk_ids,
+            w13=w13,
+            w2=w2,
+            expert_start=local_expert_start,
+            post_norm_weight=weight,
+            post_norm_eps=float(post_expert_norm.eps) if has_norm else 0.0,
+            post_norm_gain=gain,
+            out=None,
+        )
+    _warn_tlx_moe_fallback(reason)
+    return None
 
 
 def _run_fused_moe(
@@ -209,7 +261,20 @@ def _run_fused_moe(
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if _moe_backend() == "flydsl":
+    if _moe_backend() == "tlx":
+        out = _run_tlx_moe(
+            hidden_states=hidden_states,
+            topk_scores=topk_scores,
+            topk_ids=topk_ids,
+            w13=w13,
+            w2=w2,
+            local_expert_start=local_expert_start,
+            post_expert_norm=post_expert_norm,
+            quantized=w13_scale is not None or w2_scale is not None,
+        )
+        if out is not None:
+            return out
+    if _moe_backend() in {"flydsl", "tlx"}:
         from sglang.srt.rocm_muse_spark.muse_moe_flydsl import (
             muse_moe_flydsl as fused_moe,
         )
@@ -427,6 +492,10 @@ _DENSE_TILED = envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+# The fused unpooler + FFN boundary on the TLX mm and norm_residual_norm (gfx950).
+_TLX_BOUNDARY_NORM = envs.SGLANG_USE_TLX_BOUNDARY_NORM.get()
+# FP32 router logits on tlx.ops.router_gemm, ahead of the GEMV / tuned / torch paths it beats at every M.
+_TLX_ROUTER_GEMM = envs.SGLANG_USE_TLX_ROUTER_GEMM.get()
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
@@ -1007,7 +1076,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             return hidden_states
         if not _want_fused_moe():
             raise RuntimeError(
-                "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton or flydsl"
+                "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton, flydsl, or tlx"
             )
         return _run_fused_moe(
             hidden_states,
@@ -1071,6 +1140,8 @@ class MuseSpark1xMoE(nn.Module):
         # Routed rows per expert in SP prefill / verify-SP, read by expert_placement (set in post_load_weights).
         self.register_buffer("expert_load", None, persistent=False)
         self.register_buffer("expert_load_verify", None, persistent=False)
+        # [num_experts, hidden] contiguous copy of the FP32 router weight for router_gemm_tlx, made after loading.
+        self.register_buffer("router_weight_ek", None, persistent=False)
         self.pre_expert_proj = (
             nn.Linear(self.hidden_size, self.expert_hidden_size, bias=False)
             if self.expert_hidden_size != self.hidden_size
@@ -1316,6 +1387,26 @@ class MuseSpark1xMoE(nn.Module):
             return output
         return self.unpool(output, prefill_fp8=prefill_fp8)
 
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.router_weight_ek is not None and router_gemm_tlx_supported(
+            hidden_states, self.router_weight_ek
+        ):
+            return router_gemm_tlx(hidden_states, self.router_weight_ek)
+        if (
+            _USE_ROUTER_GEMV
+            and self.router_in_fp32
+            and router_gemv_fp32_supported(hidden_states, self.router.weight)
+        ):
+            # bf16 -> fp32 conversion happens inside the kernel (exact), IEEE fp32 accumulate
+            return router_gemv_fp32(hidden_states, self.router.weight)
+        if _DENSE_TUNED and self.router_in_fp32:
+            router_logits = router_gemm_tuned(hidden_states, self.router.weight)
+            if router_logits is not None:
+                _log_dense_tuned("router", hidden_states.shape[0])
+                return router_logits
+        router_input = hidden_states.float() if self.router_in_fp32 else hidden_states
+        return self.router(router_input)
+
     def route(
         self,
         hidden_states: torch.Tensor,
@@ -1348,24 +1439,7 @@ class MuseSpark1xMoE(nn.Module):
             return router_pooler.route_with_shared_pooler(
                 self, hidden_states, quant_out=quant_out, x_fp8=x_fp8
             )
-        if (
-            _USE_ROUTER_GEMV
-            and self.router_in_fp32
-            and router_gemv_fp32_supported(hidden_states, self.router.weight)
-        ):
-            # bf16 -> fp32 conversion happens inside the kernel (exact), IEEE fp32 accumulate
-            router_logits = router_gemv_fp32(hidden_states, self.router.weight)
-        else:
-            router_logits = None
-            if _DENSE_TUNED and self.router_in_fp32:
-                router_logits = router_gemm_tuned(hidden_states, self.router.weight)
-                if router_logits is not None:
-                    _log_dense_tuned("router", hidden_states.shape[0])
-            if router_logits is None:
-                router_input = (
-                    hidden_states.float() if self.router_in_fp32 else hidden_states
-                )
-                router_logits = self.router(router_input)
+        router_logits = self._router_logits(hidden_states)
         topk_scores, topk_ids = self._routing_op().forward(
             None, router_logits, self.top_k, True
         )
@@ -1648,6 +1722,22 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 x_fp8=ffn_input_fp8,
             )
             ffn_boundary._ensure_cached_weights(torch.bfloat16)
+            if _TLX_BOUNDARY_NORM and unpool_gemm_norm_residual_tlx_supported(
+                expert_output, self.mlp.post_expert_proj.weight
+            ):
+                next_attn_input, stream = unpool_gemm_norm_residual_tlx(
+                    expert_output,
+                    self.mlp.post_expert_proj.weight,
+                    stream,
+                    ffn_boundary._cc_post_weight,
+                    ffn_boundary._cc_pre_weight,
+                    ffn_boundary._cc_alpha,
+                    ffn_boundary._cc_beta,
+                    ffn_boundary._post_norm.eps,
+                    ffn_boundary._pre_norm.eps,
+                    pre_bf16=pre_norm_dtype is torch.bfloat16,
+                )
+                return stream, next_attn_input, None
             next_attn_input, stream = unpool_gemm_norm_residual(
                 expert_output,
                 self.mlp.post_expert_proj.weight,
@@ -2423,6 +2513,10 @@ class MuseSparkTextForCausalLM(nn.Module):
         if router_pooler.JOINT_ROUTER_POOLER:
             for moe in moe_layers:
                 router_pooler.prepare_joint_router_pooler(moe)
+        if _TLX_ROUTER_GEMM:
+            for moe in moe_layers:
+                if moe.router_in_fp32:
+                    moe.router_weight_ek = moe.router.weight.data.t().contiguous()
         if mxfp4_moe.GFX1250_A8W4:
             for moe in moe_layers:
                 if isinstance(moe.experts, MuseSpark1xMxfp4Experts):

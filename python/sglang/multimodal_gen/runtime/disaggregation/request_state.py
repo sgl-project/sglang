@@ -73,14 +73,10 @@ class RequestRecord:
     request_id: str
     state: RequestState = RequestState.PENDING
     submit_time: float = field(default_factory=time.monotonic)
-    last_transition_time: float = field(default_factory=time.monotonic)
     encoder_instance: int | None = None
     denoiser_instance: int | None = None
     decoder_instance: int | None = None
     error: str | None = None
-
-    def elapsed_s(self) -> float:
-        return time.monotonic() - self.submit_time
 
     def is_terminal(self) -> bool:
         return self.state in _TERMINAL_STATES
@@ -137,7 +133,6 @@ class RequestTracker:
                 )
 
             record.state = new_state
-            record.last_transition_time = time.monotonic()
             if self._metrics is not None:
                 if new_state == RequestState.ENCODER_RUNNING:
                     self._metrics.dispatch(request_id)

@@ -7,7 +7,9 @@ import triton.language as tl
 # one request as at many. ``_split_*`` below run that same arithmetic on a
 # (requests x vocabulary tiles) grid instead. The launcher picks it only when the
 # one-program-per-request grid cannot fill the device; see
-# ``_should_split_final_sampling``.
+# ``_should_split_final_sampling``. Block verification also scans a row per drafted
+# prefix for its residual mass; ``_block_split_*`` tile those scans and the final-token
+# pass the same way, with no scratch kept between calls.
 _SPLIT_SCRATCH: dict = {}
 
 
@@ -328,6 +330,7 @@ def _split_residual_tile(
     pid,
     cur_prob_row,
     all_drafts_accepted,
+    residual_scale,
     v_start,
     stride_tp_b,
     stride_tp_s,
@@ -340,7 +343,6 @@ def _split_residual_tile(
 ):
     """One tile of the residual distribution, identical to the tile body of both
     full-vocabulary passes above, including the non-probability guard on q."""
-    residual_scale = 1.0
     tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
     v_offsets = v_start + tl.arange(0, BLOCK_V)
@@ -426,6 +428,7 @@ def _split_sum_kernel(
         pid,
         cur_prob_row,
         all_drafts_accepted,
+        1.0,
         tile * BLOCK_V,
         stride_tp_b,
         stride_tp_s,
@@ -517,6 +520,7 @@ def _split_cdf_kernel(
         pid,
         cur_prob_row,
         all_drafts_accepted,
+        1.0,
         v_start,
         stride_tp_b,
         stride_tp_s,
@@ -661,6 +665,465 @@ def _chain_speculative_sampling_split(
     return True
 
 
+@triton.jit
+def _block_prefix_prob(
+    Candidates,
+    TargetProbs,
+    DraftProbs,
+    pid,
+    prefix_prob,
+    stride_cand_b,
+    stride_cand_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    STEP: tl.constexpr,
+):
+    """r_STEP from r_(STEP - 1): one step of the classic block-verification recurrence."""
+    draft_token = tl.load(Candidates + pid * stride_cand_b + STEP * stride_cand_s)
+    p = tl.load(
+        TargetProbs
+        + pid * stride_tp_b
+        + (STEP - 1) * stride_tp_s
+        + draft_token * stride_tp_v
+    )
+    q = tl.load(
+        DraftProbs
+        + pid * stride_dp_b
+        + (STEP - 1) * stride_dp_s
+        + draft_token * stride_dp_v
+    )
+    q_is_prob = (q > 0.0) & (q <= 1.0)
+    return tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
+
+
+@triton.jit
+def _block_accept(
+    Candidates,
+    UniformSamples,
+    TargetProbs,
+    DraftProbs,
+    Mass,
+    pid,
+    stride_cand_b,
+    stride_cand_s,
+    stride_uni_b,
+    stride_uni_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    NUM_SLOTS: tl.constexpr,
+    MASS_TILES: tl.constexpr,
+):
+    """The classic kernel's block-verification accept, reading each residual mass as
+    the in-order sum of its ``_block_split_mass_kernel`` tiles. Returns the accepted
+    length, the residual scale and the reusable normalizer (-1 when there is none)."""
+    prefix_prob = 1.0
+    prefix_probs = ()
+    for step in tl.static_range(1, NUM_SLOTS):
+        prefix_prob = _block_prefix_prob(
+            Candidates,
+            TargetProbs,
+            DraftProbs,
+            pid,
+            prefix_prob,
+            stride_cand_b,
+            stride_cand_s,
+            stride_tp_b,
+            stride_tp_s,
+            stride_tp_v,
+            stride_dp_b,
+            stride_dp_s,
+            stride_dp_v,
+            step,
+        )
+        prefix_probs += (prefix_prob,)
+
+    num_accept = 0
+    residual_scale = 1.0
+    norm_sum = -1.0
+    for step in tl.static_range(NUM_SLOTS - 1, 0, -1):
+        if num_accept == 0:
+            prefix_prob = prefix_probs[step - 1]
+            coin = tl.load(
+                UniformSamples + pid * stride_uni_b + (step - 1) * stride_uni_s
+            )
+            if coin < prefix_prob:
+                accept_prob = prefix_prob
+                residual_mass = -1.0
+                if (step < NUM_SLOTS - 1) & (prefix_prob > 0.0) & (prefix_prob < 1.0):
+                    residual_mass = 0.0
+                    # From 0.0 in vocabulary order, as the classic BLOCK_REDUCE loop adds.
+                    for tile in range(MASS_TILES):
+                        residual_mass += tl.load(
+                            Mass
+                            + (pid * (NUM_SLOTS - 2) + step - 1) * MASS_TILES
+                            + tile
+                        )
+                    accept_prob = residual_mass / (residual_mass + 1.0 - prefix_prob)
+                if coin < accept_prob:
+                    num_accept = step
+                    residual_scale = prefix_prob
+                    norm_sum = residual_mass
+    return num_accept, residual_scale, norm_sum
+
+
+@triton.jit
+def _block_split_mass_kernel(
+    Candidates,
+    TargetProbs,
+    DraftProbs,
+    Mass,
+    stride_cand_b,
+    stride_cand_s,
+    stride_idx_b,
+    stride_idx_s,
+    stride_uni_b,
+    stride_uni_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    NUM_SLOTS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_REDUCE: tl.constexpr,
+    MASS_TILES: tl.constexpr,
+):
+    """One BLOCK_REDUCE tile of the residual mass sum(max(r_i * p_i - q_i, 0)) of one
+    prefix i, as one iteration of the classic kernel's reduction loop computes it."""
+    pid = tl.program_id(0)
+    prefix = tl.program_id(1) + 1
+    tile = tl.program_id(2)
+    v_offsets = tile * BLOCK_REDUCE + tl.arange(0, BLOCK_REDUCE)
+    mask = v_offsets < VOCAB_SIZE
+    prefix_prob = 1.0
+    for step in tl.static_range(1, NUM_SLOTS - 1):
+        prefix_prob = _block_prefix_prob(
+            Candidates,
+            TargetProbs,
+            DraftProbs,
+            pid,
+            prefix_prob,
+            stride_cand_b,
+            stride_cand_s,
+            stride_tp_b,
+            stride_tp_s,
+            stride_tp_v,
+            stride_dp_b,
+            stride_dp_s,
+            stride_dp_v,
+            step,
+        )
+        # A constexpr row keeps the classic address form, whose alignment picks the
+        # register layout and with it the summation order of tl.sum.
+        if prefix == step:
+            p_next = tl.load(
+                TargetProbs
+                + pid * stride_tp_b
+                + step * stride_tp_s
+                + v_offsets * stride_tp_v,
+                mask=mask,
+                other=0.0,
+            )
+            q_next = tl.load(
+                DraftProbs
+                + pid * stride_dp_b
+                + step * stride_dp_s
+                + v_offsets * stride_dp_v,
+                mask=mask,
+                other=0.0,
+            )
+            tl.store(
+                Mass + (pid * (NUM_SLOTS - 2) + step - 1) * MASS_TILES + tile,
+                tl.sum(tl.maximum(prefix_prob * p_next - q_next, 0.0)),
+            )
+
+
+@triton.jit
+def _block_split_tile_kernel(
+    Candidates,
+    UniformSamples,
+    TargetProbs,
+    DraftProbs,
+    Mass,
+    TileStats,
+    stride_cand_b,
+    stride_cand_s,
+    stride_idx_b,
+    stride_idx_s,
+    stride_uni_b,
+    stride_uni_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    NUM_SLOTS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    MASS_TILES: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+):
+    """Per BLOCK_V tile of the selected row: its sum, and the largest element of its
+    prefix sum."""
+    pid = tl.program_id(0)
+    tile = tl.program_id(1)
+    num_accept, residual_scale, _ = _block_accept(
+        Candidates,
+        UniformSamples,
+        TargetProbs,
+        DraftProbs,
+        Mass,
+        pid,
+        stride_cand_b,
+        stride_cand_s,
+        stride_uni_b,
+        stride_uni_s,
+        stride_tp_b,
+        stride_tp_s,
+        stride_tp_v,
+        stride_dp_b,
+        stride_dp_s,
+        stride_dp_v,
+        NUM_SLOTS,
+        MASS_TILES,
+    )
+    val = _split_residual_tile(
+        TargetProbs,
+        DraftProbs,
+        pid,
+        num_accept,
+        num_accept == NUM_SLOTS - 1,
+        residual_scale,
+        tile * BLOCK_V,
+        stride_tp_b,
+        stride_tp_s,
+        stride_tp_v,
+        stride_dp_b,
+        stride_dp_s,
+        stride_dp_v,
+        VOCAB_SIZE,
+        BLOCK_V,
+    )
+    stats = TileStats + (pid * NUM_TILES + tile) * 2
+    tl.store(stats, tl.sum(val))
+    # The scan's last element need not round like tl.sum; and since fp32 addition is
+    # monotonic, base + max(scan) > u exactly when some base + scan element is.
+    tl.store(stats + 1, tl.max(tl.cumsum(val, axis=0), axis=0))
+
+
+@triton.jit
+def _block_split_final_kernel(
+    Predicts,
+    AcceptIndex,
+    AcceptTokenNum,
+    Candidates,
+    RetriveIndex,
+    UniformSamples,
+    UniformSamplesFinal,
+    TargetProbs,
+    DraftProbs,
+    Mass,
+    TileStats,
+    stride_cand_b,
+    stride_cand_s,
+    stride_idx_b,
+    stride_idx_s,
+    stride_uni_b,
+    stride_uni_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    NUM_SLOTS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    MASS_TILES: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+):
+    """The classic kernel's stores and CDF walk, stepping over whole tiles by their
+    sums and rescanning only the tile where the CDF crosses the coin."""
+    pid = tl.program_id(0)
+    num_accept, residual_scale, norm_sum = _block_accept(
+        Candidates,
+        UniformSamples,
+        TargetProbs,
+        DraftProbs,
+        Mass,
+        pid,
+        stride_cand_b,
+        stride_cand_s,
+        stride_uni_b,
+        stride_uni_s,
+        stride_tp_b,
+        stride_tp_s,
+        stride_tp_v,
+        stride_dp_b,
+        stride_dp_s,
+        stride_dp_v,
+        NUM_SLOTS,
+        MASS_TILES,
+    )
+    idx_ptr_base = RetriveIndex + pid * stride_idx_b
+    last_accepted_global_idx = tl.load(idx_ptr_base)
+    tl.store(AcceptIndex + pid * stride_idx_b, last_accepted_global_idx)
+    for step in range(1, num_accept + 1):
+        draft_token = tl.load(Candidates + pid * stride_cand_b + step * stride_cand_s)
+        tl.store(Predicts + last_accepted_global_idx, draft_token)
+        last_accepted_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
+        tl.store(
+            AcceptIndex + pid * stride_idx_b + step * stride_idx_s,
+            last_accepted_global_idx,
+        )
+    tl.store(AcceptTokenNum + pid, num_accept)
+
+    stats = TileStats + pid * NUM_TILES * 2
+    # Tile sums from 0.0 in tile order, as the classic passes 1 and 2 add them.
+    if norm_sum < 0.0:
+        norm_sum = 0.0
+        for t in range(NUM_TILES):
+            norm_sum += tl.load(stats + t * 2)
+    target_u = tl.load(UniformSamplesFinal + pid) * norm_sum
+    cum_sum = 0.0
+    match_tile = -1
+    match_base = 0.0
+    for t in range(NUM_TILES):
+        if match_tile < 0:
+            if cum_sum + tl.load(stats + t * 2 + 1) > target_u:
+                match_tile = t
+                match_base = cum_sum
+            cum_sum += tl.load(stats + t * 2)
+
+    # The classic fallback when no tile matches (degenerate residual).
+    final_token = VOCAB_SIZE - 1
+    if match_tile >= 0:
+        val = _split_residual_tile(
+            TargetProbs,
+            DraftProbs,
+            pid,
+            num_accept,
+            num_accept == NUM_SLOTS - 1,
+            residual_scale,
+            match_tile * BLOCK_V,
+            stride_tp_b,
+            stride_tp_s,
+            stride_tp_v,
+            stride_dp_b,
+            stride_dp_s,
+            stride_dp_v,
+            VOCAB_SIZE,
+            BLOCK_V,
+        )
+        candidates_mask = match_base + tl.cumsum(val, axis=0) > target_u
+        final_token = match_tile * BLOCK_V + tl.argmax(
+            candidates_mask.to(tl.int32), axis=0
+        )
+    tl.store(Predicts + last_accepted_global_idx, final_token)
+
+
+def _chain_speculative_sampling_block_split(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    uniform_samples,
+    uniform_samples_for_final_sampling,
+    target_probs,
+    draft_probs,
+    *,
+    block_reduce,
+    block_v,
+    num_warps,
+):
+    """Same outputs as ``speculative_sampling_classic_kernel`` with
+    ``BLOCK_VERIFICATION``, launched with the same ``block_reduce``, ``block_v`` and
+    ``num_warps``; those fix the summation order the bitwise equality rests on."""
+    batch_size, num_slots = candidates.shape
+    vocab_size = target_probs.shape[-1]
+    mass_tiles = triton.cdiv(vocab_size, block_reduce)
+    num_tiles = triton.cdiv(vocab_size, block_v)
+    # Written in full before they are read in each call, so allocating them inside a
+    # CUDA graph capture is safe; nothing carries over between calls.
+    mass = torch.empty(
+        (batch_size, max(num_slots - 2, 0), mass_tiles),
+        dtype=torch.float32,
+        device=target_probs.device,
+    )
+    tile_stats = torch.empty(
+        (batch_size, num_tiles, 2), dtype=torch.float32, device=target_probs.device
+    )
+    strides = (
+        candidates.stride(0),
+        candidates.stride(1),
+        retrive_index.stride(0),
+        retrive_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        draft_probs.stride(0),
+        draft_probs.stride(1),
+        draft_probs.stride(2),
+    )
+    consts = dict(NUM_SLOTS=num_slots, VOCAB_SIZE=vocab_size, MASS_TILES=mass_tiles)
+    # Only prefixes 1 .. num_slots - 2 have a residual mass; the last accepts on r alone.
+    if num_slots > 2:
+        _block_split_mass_kernel[(batch_size, num_slots - 2, mass_tiles)](
+            candidates,
+            target_probs,
+            draft_probs,
+            mass,
+            *strides,
+            **consts,
+            BLOCK_REDUCE=block_reduce,
+            num_warps=num_warps,
+        )
+    _block_split_tile_kernel[(batch_size, num_tiles)](
+        candidates,
+        uniform_samples,
+        target_probs,
+        draft_probs,
+        mass,
+        tile_stats,
+        *strides,
+        **consts,
+        BLOCK_V=block_v,
+        NUM_TILES=num_tiles,
+        num_warps=num_warps,
+    )
+    _block_split_final_kernel[(batch_size,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        mass,
+        tile_stats,
+        *strides,
+        **consts,
+        BLOCK_V=block_v,
+        NUM_TILES=num_tiles,
+        num_warps=num_warps,
+    )
+
+
 def chain_speculative_sampling_triton(
     predicts,
     accept_index,
@@ -685,6 +1148,32 @@ def chain_speculative_sampling_triton(
     block_reduce = min(triton.next_power_of_2(vocab_size), 32768)
     num_warps = 8 if block_verification and block_reduce > 4096 else 4
     block_v = 4096
+
+    # The split path keeps partial sums in fp32 scratch, which is the classic kernel's
+    # accumulation type, and so its result bit for bit, only for fp32 p and q.
+    # From 128 requests the split path stops paying off; measured
+    # split/classic kernel time at batch 128 on GB300, cold L2, vocab 129280-163840,
+    # was 0.82-1.65 at 5 slots and 1.39-3.47 at 9 slots (random to all-accept coins).
+    if (
+        block_verification
+        and target_probs.dtype == draft_probs.dtype == torch.float32
+        and batch_size < 128
+    ):
+        _chain_speculative_sampling_block_split(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            uniform_samples,
+            uniform_samples_for_final_sampling,
+            target_probs,
+            draft_probs,
+            block_reduce=block_reduce,
+            block_v=block_v,
+            num_warps=num_warps,
+        )
+        return
 
     if not block_verification:
         num_tiles = triton.cdiv(vocab_size, block_v)

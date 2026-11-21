@@ -59,8 +59,12 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+from sglang.srt.managers.req_types import TokenIdRows
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
@@ -247,8 +251,9 @@ class LogitsProcessorOutput:
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    # A per-row list, or one [#seq, k] tensor when every row has the same k.
+    next_token_top_logprobs_val: Optional[Union[List, torch.Tensor]] = None
+    next_token_top_logprobs_idx: Optional[Union[List, torch.Tensor]] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
@@ -272,6 +277,9 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
+    # Per sequence, the [rows, k] float32 host spans of its input candidate
+    # selector's weights; None when the batch has no such request.
+    input_top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
@@ -365,10 +373,14 @@ class LogitsMetadata:
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
+    # Per request, ReqLogprob.input_candidate_selector; the prefix lens give
+    # the position of a selector's first row.
+    input_candidate_selectors: Optional[List[Optional[Any]]] = None
+    extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
     sample_indices_cpu: Optional[List[int]] = None
     input_logprob_indices_cpu: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # logits and logprobs post processing
     temperature: torch.Tensor = None
@@ -451,6 +463,8 @@ class LogitsMetadata:
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            input_candidate_selectors=forward_batch.input_candidate_selectors,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
@@ -503,6 +517,10 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
+    # Override point: a subclass serving input candidate selectors names its
+    # InputLogprobProcessor subclass here.
+    input_logprob_processor_cls = InputLogprobProcessor
+
     def __init__(
         self,
         config,
@@ -596,7 +614,7 @@ class LogitsProcessor(nn.Module):
                 parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
             )
             chunking_group = group.cpu_group
-        self.input_logprob_processor = InputLogprobProcessor(
+        self.input_logprob_processor = self.input_logprob_processor_cls(
             self.vocab_size, chunking_group=chunking_group
         )
 
@@ -627,7 +645,7 @@ class LogitsProcessor(nn.Module):
 
         return (
             not (info.grammars and any(g is not None for g in info.grammars))
-            and not info.has_watermark_candidates
+            and info.watermark is None
             and sampling_allows_vocab_shards(
                 info,
                 return_logprob=forward_batch.return_logprob,
@@ -653,6 +671,19 @@ class LogitsProcessor(nn.Module):
                 and get_capture_logits_variant() == VERIFY_VOCAB_SHARDS
             )
         return self.verify_uses_vocab_shards(forward_batch)
+
+    @property
+    def logits_gatherer_pending(self) -> bool:
+        return self._logits_gatherer.prebuild_pending
+
+    def prebuild_logits_gatherer(self, *, shard_width: int, dtype: torch.dtype) -> bool:
+        """Build the TP logits all-gather state; True when built.
+        ``dtype`` is the lm_head output dtype unless _compute_lm_head forces one."""
+        if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
+            dtype = torch.float32
+        elif self.rl_on_policy_target is not None:
+            dtype = torch.bfloat16
+        return self._logits_gatherer.prebuild(hidden_size=shard_width, dtype=dtype)
 
     def forward(
         self,
@@ -691,6 +722,15 @@ class LogitsProcessor(nn.Module):
         if self.expected_aux_hidden_states is not None:
             self._check_aux_hidden_states(
                 aux_hidden_states, hidden_states, logits_metadata
+            )
+
+        if logits_metadata.input_candidate_selectors is not None and (
+            token_indices_to_pool is not None
+            or multi_item_delimiter_indices is not None
+        ):
+            # The two scoring paths below read top_logprobs_nums only.
+            raise NotImplementedError(
+                "Position scoring serves no input candidate selector"
             )
 
         # Setwise scoring (CausalLM): read label-token logprobs AT each anchor
@@ -1921,3 +1961,28 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def prebuild_logits_gatherers(model: nn.Module, *, dtype: torch.dtype) -> int:
+    """Returns how many LogitsProcessors got their state;
+    logits dtype is known only at forward, so ``dtype`` is the model (lm_head) dtype."""
+    processors = [
+        module
+        for module in model.modules()
+        if isinstance(module, LogitsProcessor) and module.logits_gatherer_pending
+    ]
+    heads = [module for module in model.modules() if isinstance(module, ParallelLMHead)]
+    if not heads:
+        # Tied word embeddings project through the input embedding.
+        heads = [
+            module
+            for module in model.modules()
+            if isinstance(module, VocabParallelEmbedding)
+        ]
+    if not processors or not heads:
+        return 0
+    shard_width = max(head.num_embeddings_per_partition for head in heads)
+    return sum(
+        processor.prebuild_logits_gatherer(shard_width=shard_width, dtype=dtype)
+        for processor in processors
+    )

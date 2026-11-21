@@ -134,11 +134,12 @@ _MODALITIES = _ModalityTable()
 def settle_shm_buffers(buffers, *, admitted: bool) -> None:
     """Decide the unlink duty for every segment a drained request parked in
     POSIX shm (any buffer that is not an inline numpy array is the Rust
-    extension's ``ShmBuffer``, whatever its name). Admitted: Rust hands the
-    duty to the ``ShmPointerMMData`` stubs, which unlink after the
-    post-broadcast open on every rank. Rejected: unlink now. Both are
-    idempotent on the Rust side. This is the drain loop's job, never a
-    wrapper's, so a package's own ``_wrap_mm_result`` needs no knowledge of it."""
+    extension's ``ShmBuffer``, whatever its name, or a processor's external
+    buffer, which settles the same way). Admitted: Rust hands the duty to the
+    ``ShmPointerMMData`` stubs, which unlink after the post-broadcast open on
+    every rank. Rejected: unlink now. Both are idempotent on the Rust side.
+    This is the drain loop's job, never a wrapper's, so a package's own
+    ``_wrap_mm_result`` needs no knowledge of it."""
     import numpy as np
 
     for value in buffers.values():
@@ -153,16 +154,20 @@ def settle_shm_buffers(buffers, *, admitted: bool) -> None:
 class MmTransportStats:
     """Zero-copy accounting at the Rust-to-Python multimodal hand-off.
 
-    A feature tensor crosses in one of two shapes: ``inline`` -- a numpy array
-    that owns the Rust vector, viewed by ``torch.from_numpy`` -- or ``shm`` -- a
-    POSIX segment the worker wrote, named in the request so every TP rank maps
-    it after the broadcast."""
+    A feature tensor crosses in one of three shapes: ``inline`` -- a numpy
+    array that owns the Rust vector, viewed by ``torch.from_numpy`` -- ``shm``
+    -- a POSIX segment the worker wrote, named in the request so every TP rank
+    maps it after the broadcast -- or ``external`` -- a buffer the processor
+    published in its own transport (``MmProcessor::publish_features``), which
+    the package that wraps it records."""
 
     __slots__ = (
         "inline_features",
         "inline_bytes",
         "shm_features",
         "shm_bytes",
+        "external_features",
+        "external_bytes",
         "copies",
     )
 
@@ -171,6 +176,8 @@ class MmTransportStats:
         self.inline_bytes = 0
         self.shm_features = 0
         self.shm_bytes = 0
+        self.external_features = 0
+        self.external_bytes = 0
         self.copies = 0
 
     def record_inline(self, array, tensor) -> None:
@@ -184,6 +191,10 @@ class MmTransportStats:
 
         self.shm_features += 1
         self.shm_bytes += int(np.prod(stub.shape)) * np.dtype(stub.dtype).itemsize
+
+    def record_external(self, nbytes: int) -> None:
+        self.external_features += 1
+        self.external_bytes += nbytes
 
     def snapshot(self) -> Dict[str, int]:
         return {name: getattr(self, name) for name in self.__slots__}

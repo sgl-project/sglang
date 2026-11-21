@@ -29,6 +29,12 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "AndyDai-nv": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "model express expert"
+    },
     "AniZpZ": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -105,12 +111,6 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override"
-    },
-    "DevashishLal-CB": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "Edwardf0t1": {
@@ -603,6 +603,12 @@
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
+    "dlal-sgl": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
     "dongjiyingdjy": {

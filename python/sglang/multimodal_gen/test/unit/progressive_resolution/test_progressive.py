@@ -9,6 +9,10 @@ from unittest import mock
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
@@ -20,6 +24,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     pack_2x2_latent,
     reset_scheduler_at_step,
     unpack_2x2_latent,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux import (
+    FluxProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
     Flux2ProgressiveDenoisingStage,
@@ -339,6 +346,79 @@ class TestProgressiveStageHelpers(unittest.TestCase):
             )
 
         self.assertIs(base_init.call_args.kwargs["transformer_2"], transformer_2)
+
+
+class _OneRowPerIdRotaryEmb:
+    def forward(self, ids):
+        rows = ids[:, :1].float()
+        return rows, rows
+
+
+class _RotaryDiT(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rotary_emb = _OneRowPerIdRotaryEmb()
+
+
+def _freqs_cis_rows_after_resolution_change(stage, pipeline_config, batch) -> int:
+    branch = SimpleNamespace(kwargs={"freqs_cis": None})
+    ctx = SimpleNamespace(
+        cfg_policy=SimpleNamespace(branches=[branch]),
+        pos_cond_kwargs={},
+        target_dtype=torch.float32,
+        latents=torch.zeros(1, device=stage.device),
+    )
+    # Derives vae_scale_factor, as loading the VAE does.
+    pipeline_config.vae_config.post_init()
+    server_args = SimpleNamespace(pipeline_config=pipeline_config)
+    stage._on_resolution_change(ctx, batch, server_args, batch.height, batch.width)
+    return branch.kwargs["freqs_cis"][0].shape[0]
+
+
+class TestFluxResolutionChange(unittest.TestCase):
+    """The RoPE table installed at a stage transition must match the request:
+    one stage instance serves requests whose text length or condition image
+    differ at the same latent size."""
+
+    def test_flux_table_follows_each_request_text_length(self):
+        stage = FluxProgressiveDenoisingStage(_RotaryDiT(), scheduler=None)
+        config = FluxPipelineConfig()
+
+        def rows(text_len: int) -> int:
+            batch = SimpleNamespace(
+                prompt_embeds=[None, torch.zeros(1, text_len, 4)],
+                prompt_seq_lens=[None, [text_len]],
+                pooled_embeds=None,
+                extra={},
+                height=64,
+                width=64,
+            )
+            return _freqs_cis_rows_after_resolution_change(stage, config, batch)
+
+        image_rows = (64 // 16) ** 2
+        self.assertEqual(rows(8), 8 + image_rows)
+        self.assertEqual(rows(5), 5 + image_rows)
+
+    def test_flux2_table_follows_each_request_condition_image(self):
+        stage = Flux2ProgressiveDenoisingStage(_RotaryDiT(), scheduler=None)
+        config = Flux2PipelineConfig()
+
+        def rows(condition_tokens: int) -> int:
+            batch = SimpleNamespace(
+                prompt_embeds=[torch.zeros(1, 8, 4)],
+                prompt_seq_lens=[[8]],
+                image_latent=torch.zeros(1) if condition_tokens else None,
+                condition_image_latent_ids=torch.zeros(
+                    condition_tokens, 4, device=stage.device
+                ),
+                height=64,
+                width=64,
+            )
+            return _freqs_cis_rows_after_resolution_change(stage, config, batch)
+
+        image_rows = (64 // 16) ** 2
+        self.assertEqual(rows(0), 8 + image_rows)
+        self.assertEqual(rows(6), 8 + image_rows + 6)
 
 
 class TestLatentAdapters(unittest.TestCase):

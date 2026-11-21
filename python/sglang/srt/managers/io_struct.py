@@ -286,6 +286,8 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
+    # Like token_ids_logprob, but one list of token ids per scored input position.
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
@@ -423,8 +425,9 @@ class GenerateReqInput:
 
     # Versioned KV-hint envelope, set by a trusted orchestrator after worker
     # selection and never by an application client. Passed through untouched to
-    # the HiCache storage backends, each of which reads only the action types it
-    # implements. Accepts a plain dict from HTTP/gRPC; normalization converts it
+    # HiCache storage backends that opt in via HiCacheStorage.consumes_kv_hints(),
+    # each of which reads only the action types it implements. Other backends
+    # never see it. Accepts a plain dict from HTTP/gRPC; normalization converts it
     # to KvHintsEnvelope. A hint describes one request's prefix, so a batch
     # carries one envelope per request.
     kv_hints: Optional[
@@ -673,6 +676,10 @@ class GenerateReqInput:
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
+        if self.token_ids_logprob_rows is not None:
+            raise ValueError(
+                "token_ids_logprob_rows scores one input_ids sequence per request."
+            )
         # Calculate expanded batch size
         if self.parallel_sample_num == 1:
             num = self.batch_size
@@ -1315,6 +1322,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
+    # See GenerateReqInput.token_ids_logprob_rows.
+    token_ids_logprob_rows: Optional[List[List[int]]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -1750,8 +1759,9 @@ OutputHiddenStates = Optional[
     List[Optional[List[Optional[Union[float, HiddenStateChunk]]]]]
 ]
 CachedTokensDetails = Dict[str, Union[int, str]]
-# Serialized form of BaseFinishReason.to_json() — all values are primitives.
-FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
+# Serialized form of BaseFinishReason.to_json() — all values are primitives,
+# except a length finish's ignored_stop object.
+FinishReasonDict = Dict[str, Optional[Union[str, int, List[int], Dict[str, int]]]]
 
 
 class RequestOutputStats(
@@ -1916,6 +1926,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    # float32 [rows, k] weights of the prompt top logprob candidates of
+    # requests with an input candidate selector: one row per non-null entry.
+    # None when no request in the batch has a selector.
+    input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
 
 class DetokenizeReleaseReq(BaseReq, kw_only=True):
@@ -2001,6 +2015,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+    input_top_logprobs_weights: Optional[List[Optional[np.ndarray]]] = None
 
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:
@@ -2488,8 +2503,8 @@ class ChecksumInfo(msgspec.Struct, kw_only=True):
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    # One ChecksumInfo per TP rank. The producer wraps the tp==1 result in a
-    # one-element list so the shape is always a list.
+    # One ChecksumInfo per rank that ran the request in the same step: the TP
+    # group, or the DP shard under local control broadcast. Always a list.
     payload: Optional[List[ChecksumInfo]] = None
 
 

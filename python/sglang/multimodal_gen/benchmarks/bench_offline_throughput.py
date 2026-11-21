@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
@@ -67,7 +68,6 @@ class BatchOutput:
     """Container for batch generation results."""
 
     latency: float = 0.0
-    latency_per_sample: float = 0.0
     num_samples: int = 0
     total_frames: int = 0
     peak_memory_mb: float = 0.0
@@ -98,7 +98,6 @@ class BenchArgs:
     num_inference_steps: int = 20
     guidance_scale: float = 7.5
     seed: int = 42
-    disable_safety_checker: bool = False
 
     # Output Configuration
     width: int = 32
@@ -147,8 +146,8 @@ class BenchArgs:
         parser.add_argument("--seed", type=int, default=42, help="Random seed")
         parser.add_argument(
             "--disable-safety-checker",
-            action="store_true",
-            help="Disable NSFW detection",
+            action=DeprecatedAction,
+            help="(Deprecated) No effect: generation runs no safety checker.",
         )
 
         # Output Configuration
@@ -288,7 +287,6 @@ def initialize_engine(server_args: ServerArgs) -> DiffGenerator:
 
 def generate_batch(
     engine: DiffGenerator,
-    bench_args: BenchArgs,
     prompts: List[str],
     user_sampling_params: List[Dict[str, Any]],
     request_ids: Optional[List[str]] = None,
@@ -364,7 +362,6 @@ def generate_batch(
             )
 
     output.latency = time.perf_counter() - start_time
-    output.latency_per_sample = output.latency / len(prompts) if prompts else 0.0
     output.success = output.num_samples > 0
     output.peak_memory_mb = torch.get_device_module().max_memory_allocated() / (
         1024 * 1024
@@ -502,8 +499,6 @@ def throughput_test(
         "num_profiled_timesteps": bench_args.num_profiled_timesteps,
         "profile_all_stages": bench_args.profile_all_stages,
     }
-    if bench_args.disable_safety_checker:
-        _sampling_params["safety_checker"] = None
 
     if manifest is None:
         all_prompts = [request.prompt for request in dataset_requests]
@@ -557,7 +552,6 @@ def throughput_test(
         ]
         generate_batch(
             engine,
-            bench_args,
             warmup_prompts,
             warmup_sampling_params,
             request_ids=[
@@ -585,7 +579,6 @@ def throughput_test(
 
         batch_output = generate_batch(
             engine,
-            bench_args,
             batch_prompts,
             batch_sampling_params,
             request_ids=batch_request_ids,

@@ -162,6 +162,7 @@ class ComponentResidencyManager:
         # phase key -> peak allocated bytes
         self._warmup_phase_peaks: dict[str, int] = {}
         self._completed_warmup_phase_peaks: dict[str, int] = {}
+        self._debug_requests_seen = 0
 
     @property
     def host_pin_budget(self) -> HostPinBudget:
@@ -670,9 +671,9 @@ class ComponentResidencyManager:
                     log_host_memory_breakdown,
                 )
 
-                self._debug_requests_seen = getattr(self, "_debug_requests_seen", 0) + 1
+                self._debug_requests_seen += 1
                 log_host_memory_breakdown(
-                    self.placement_modules(),
+                    self.pipeline.modules,
                     label=f"after request {self._debug_requests_seen}",
                 )
         self._prefetch_next_request()

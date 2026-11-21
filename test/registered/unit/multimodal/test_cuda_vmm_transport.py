@@ -23,6 +23,7 @@ from sglang.srt.multimodal.transport.cuda_vmm import (
     CudaVmmFeatureTransport,
     CudaVmmMemoryPool,
     CudaVmmPackedTensorTransportProxy,
+    CudaVmmPoolRegion,
     _imported_pool_cache_clear,
     _PosixFdBroker,
 )
@@ -537,6 +538,98 @@ class TestCudaVmmTransport(CustomTestCase):
 
         close_fd_broker.assert_called_once()
         release_pool.assert_called_once()
+
+
+class TestCudaVmmExternalPublisher(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available() or torch.version.cuda is None:
+            raise unittest.SkipTest("An NVIDIA CUDA GPU is required")
+
+    def test_handed_over_pool_round_trips_what_the_external_publisher_copied(self):
+        pool = CudaVmmMemoryPool(4 << 20, 60, 0, 1, allow_posix_fallback=True)
+        proxies = reconstructed = None
+        try:
+            region = pool.hand_over()
+            self.assertEqual(
+                region,
+                CudaVmmPoolRegion(
+                    device_index=0,
+                    base=pool.memory_pool.data_ptr(),
+                    size=pool.allocation_size,
+                    control_size=pool.control_size,
+                    alignment=256,
+                    consumer_count=1,
+                ),
+            )
+            pool._recycle_thread.join(timeout=5)
+            self.assertFalse(pool._recycle_thread.is_alive())
+            # The pool keeps no chunk: what it would still publish stays on CPU.
+            self.assertTrue(pool.wrap_tensor(torch.ones(4)).is_cpu)
+            self.assertIsNone(pool.wrap_tensors([torch.ones(4), torch.ones(4)]))
+            with self.assertRaisesRegex(RuntimeError, "only an unused"):
+                pool.hand_over()
+
+            # As an external publisher lays them out: an f32 and a bf16 packed
+            # into the chunk at 0 (the bf16 at its element alignment), and an
+            # int64 alone in the chunk at 512.
+            sources = [
+                torch.arange(6, dtype=torch.float32).reshape(2, 3),
+                torch.arange(5, dtype=torch.bfloat16),
+                torch.arange(3, dtype=torch.int64),
+            ]
+            memory, control = pool.memory_pool, pool.control_size
+            for chunk, relative_offset, source in ((0, 0, 0), (0, 24, 1), (512, 0, 2)):
+                data = chunk + control + relative_offset
+                source_bytes = sources[source].reshape(-1).view(torch.uint8)
+                memory[chunk : chunk + control].zero_()
+                memory[data : data + source_bytes.numel()].copy_(source_bytes)
+            torch.cuda.synchronize(0)
+            proxies = pool.external_proxies(
+                0,
+                [
+                    (0, sources[0].shape, sources[0].dtype),
+                    (24, sources[1].shape, sources[1].dtype),
+                ],
+            ) + pool.external_proxies(512, [(0, sources[2].shape, sources[2].dtype)])
+            self.assertIs(proxies[0]._packed_owner, proxies[1]._packed_owner)
+            self.assertEqual(proxies[0]._packed_owner.data_nbytes, 34)
+            self.assertNotIsInstance(proxies[2], CudaVmmPackedTensorTransportProxy)
+
+            proxies = pickle.loads(pickle.dumps(proxies))
+            with get_parallel().override(
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+            ):
+                reconstructed = [
+                    proxy.reconstruct_on_target_device(0, consumer_count=1)
+                    for proxy in proxies
+                ]
+            torch.cuda.synchronize(0)
+            for actual, wanted in zip(reconstructed, sources, strict=True):
+                self.assertTrue(torch.equal(actual.cpu(), wanted))
+            # Each chunk's consumer acknowledged it, for the publisher to free.
+            for chunk in (0, 512):
+                self.assertNotEqual(
+                    memory[chunk : chunk + 4].view(torch.int32).item(), 0
+                )
+
+            with self.assertRaisesRegex(ValueError, "starts the chunk's data"):
+                pool.external_proxies(512, [(8, (1,), torch.int64)])
+            with self.assertRaisesRegex(ValueError, "not a chunk of this"):
+                pool.external_proxies(
+                    pool.allocation_size - 256, [(0, (64,), torch.float32)]
+                )
+            # A failed pool or POSIX FD broker fails publication loudly.
+            with patch.object(pool, "_pool_error", RuntimeError("injected")):
+                with self.assertRaisesRegex(RuntimeError, "pool failed"):
+                    pool.external_proxies(512, [(0, (3,), torch.int64)])
+        finally:
+            del reconstructed, proxies
+            _imported_pool_cache_clear()
+            pool.shutdown()
 
 
 class TestReceiveFeatureBudget(CustomTestCase):

@@ -31,10 +31,6 @@ class FlashAttention2Backend(AttentionBackend):
         return FlashAttention2Impl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError
 

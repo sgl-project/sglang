@@ -958,6 +958,7 @@
               "docs/advanced_features/hybrid_cache_checkpoints",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/text_watermarking",
+              "docs/advanced_features/synthid_text_watermarking",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/speculative_decoding",
@@ -1003,6 +1004,7 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
+              "docs/advanced_features/cuda_graph_persistence",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
@@ -1550,6 +1552,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/autoregressive/Tencent/Hy4",
                       "cookbook/autoregressive/Tencent/Hy4-flash",
                       "cookbook/autoregressive/Tencent/Hy4-Preview",
                       "cookbook/autoregressive/Tencent/Hy3",
@@ -1559,6 +1562,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Mini",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"

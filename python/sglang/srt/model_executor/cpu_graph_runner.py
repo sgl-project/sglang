@@ -1606,6 +1606,9 @@ class CPUGraphRunner:
             dynamic_forward_batch.top_logprobs_nums = copy.copy(
                 forward_batch.top_logprobs_nums
             )
+            dynamic_forward_batch.input_candidate_selectors = copy.copy(
+                forward_batch.input_candidate_selectors
+            )
             dynamic_forward_batch.token_ids_logprobs = copy.copy(
                 forward_batch.token_ids_logprobs
             )

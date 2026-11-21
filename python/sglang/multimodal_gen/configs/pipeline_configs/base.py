@@ -142,7 +142,9 @@ def maybe_unpad_latents(latents, batch):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
-    native_only_components: ClassVar[tuple[str, ...]] = ()
+    # Components that cannot fall back to a native Transformers/Diffusers
+    # implementation because their pipeline requires SGLang-specific behavior.
+    native_only_components: tuple[str, ...] = ()
     # Default task; supported_task_types is a model capability, not a user knob.
     task_type: ModelTaskType = ModelTaskType.I2I
     supported_task_types: ClassVar[tuple[ModelTaskType, ...] | None] = None
@@ -150,9 +152,6 @@ class PipelineConfig:
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
     supports_auto_residency: bool = True
-    # Components that cannot fall back to a native Transformers/Diffusers
-    # implementation because their pipeline requires SGLang-specific behavior.
-    native_only_components: tuple[str, ...] = ()
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -199,6 +198,10 @@ class PipelineConfig:
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
     image_encoder_precision: str = "fp32"
     image_encoder_extra_args: dict = field(default_factory=lambda: {})
+
+    # Audio encoder configuration
+    audio_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
+    audio_encoder_precision: str = "fp32"
 
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
@@ -574,6 +577,10 @@ class PipelineConfig:
         slices[dim] = slice(orig_len)
         return tensor[tuple(slices)]
 
+    def prepare_decoding_latents(self, batch, server_args=None, vae=None):
+        del server_args, vae
+        return batch.latents
+
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         return self._gather_sp_tensor(latents, dim=2)
@@ -780,6 +787,10 @@ class PipelineConfig:
         return latents
 
     def post_decoding(self, frames, server_args):
+        return frames
+
+    def postprocess_decoded_batch(self, frames, batch, server_args):
+        del batch, server_args
         return frames
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -996,11 +1007,6 @@ class PipelineConfig:
         from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
-
-        # Add T5 configuration arguments
-        from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
-
-        T5Config.add_cli_args(parser, prefix=f"{prefix_with_dot}t5-config")
 
         return parser
 

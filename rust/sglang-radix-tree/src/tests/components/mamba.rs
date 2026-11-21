@@ -1224,30 +1224,53 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
 
     tc.evict_device_start(MAMBA, 1);
     let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
-    tc.evict_device_end(MAMBA);
     assert_eq!(next, None);
-    assert_eq!(step.mamba_backup_node_id, None);
-    assert_eq!(
-        step.tracker.get(&MAMBA).copied().unwrap_or(0),
-        usize::from(!pin_ancestor)
-    );
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
     assert!(step.host_frees.is_empty());
     if pin_ancestor {
-        assert!(step.device_frees.is_empty());
+        assert_eq!(step.mamba_backup_node_id, None);
+        tc.evict_device_end(MAMBA);
+        tc.sanity_check(&active, &[]);
+        tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+        tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
     } else {
-        assert_eq!(step.device_frees.len(), 1);
+        // A's new Mamba state has no host copy, so the walk asks for its backup.
+        assert_eq!(step.mamba_backup_node_id, Some(a_id));
+        tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+        tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
+        let (full, mut transfers) = tc.build_backup_spec(a_id).unwrap();
+        assert_eq!(full.numel(), 0);
+        assert!(
+            transfers[&MAMBA][0]
+                .device_indices
+                .as_ref()
+                .unwrap()
+                .equal(&Tensor::from_slice(&[201i64]))
+        );
+        transfers.retain(|ct, _| *ct == MAMBA);
+        transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[1201i64]));
+        tc.commit_backup(a_id, full, transfers).unwrap();
+        tc.mark_write_through_pending(vec![a_id], a_id).unwrap();
+        tc.finish_write_through(vec![a_id], a_id).unwrap();
+        let step = tc.finish_mamba_state_eviction(a_id);
+        tc.evict_device_end(MAMBA);
+        assert_eq!(step.tracker[&MAMBA], 1);
         assert_eq!(step.device_frees[&MAMBA].len(), 1);
         assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[201i64])));
+        assert!(
+            tc.arena
+                .host_value(a, MAMBA)
+                .equal(&Tensor::from_slice(&[1201i64]))
+        );
+        active.retain(|&(_, id)| id != b_id);
+        tc.sanity_check(&active, &[]);
     }
     assert!(
         tc.arena
             .device_value(b, MAMBA)
             .equal(&Tensor::from_slice(&[202i64]))
     );
-    tc.sanity_check(&active, &[]);
-
-    tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
-    tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
     tc.evict_device_start(MAMBA, 1);
     let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
     tc.evict_device_end(MAMBA);

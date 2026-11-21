@@ -253,6 +253,20 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
     return per_block if any_span else None
 
 
+def event_namespace_seed(
+    extra_key: Optional[str],
+    cache_salt: Optional[str],
+    dynamo_format: bool,
+    lora_names: KvEventLoraNames,
+) -> Optional[bytes]:
+    if dynamo_format:
+        return kv_event_namespace_seed(extra_key=extra_key, cache_salt=cache_salt)
+    return kv_event_namespace_seed(
+        extra_key=extra_key if lora_names.get(extra_key) is not None else None,
+        cache_salt=None,
+    )
+
+
 class KVCacheEventRecorder:
     """Collects KV placement events for one cache.
 
@@ -343,19 +357,15 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def _namespace_seed(self, node: Any) -> Optional[bytes]:
-        if not self.dynamo_format:
-            return kv_event_namespace_seed(
-                extra_key=(
-                    node.key.extra_key
-                    if self.lora_names.get(node.key.extra_key) is not None
-                    else None
-                ),
-                cache_salt=None,
-            )
-        return kv_event_namespace_seed(
-            extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
+    def namespace_seed(
+        self, extra_key: Optional[str], cache_salt: Optional[str]
+    ) -> Optional[bytes]:
+        return event_namespace_seed(
+            extra_key, cache_salt, self.dynamo_format, self.lora_names
         )
+
+    def _namespace_seed(self, node: Any) -> Optional[bytes]:
+        return self.namespace_seed(node.key.extra_key, node.key.cache_salt)
 
     def record_store(
         self, node: Any, medium=None, *, session_id: Optional[str] = None

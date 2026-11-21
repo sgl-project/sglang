@@ -5,19 +5,6 @@ from enum import Enum
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
-class LTXModelType(Enum):
-    """
-    Model type enum mirroring upstream `LTXModelType`.
-
-    Upstream reference:
-      - `LTX-2/packages/ltx-core/src/ltx_core/model/transformer/model.py::LTXModelType`
-    """
-
-    AudioVideo = "ltx av model"
-    VideoOnly = "ltx video only model"
-    AudioOnly = "ltx audio only model"
-
-
 class LTX2RopeType(str, Enum):
     """
     Minimal RoPE type enum mirroring LTX-2 upstream `LTXRopeType`.
@@ -28,17 +15,6 @@ class LTX2RopeType(str, Enum):
 
     INTERLEAVED = "interleaved"
     SPLIT = "split"
-
-
-class LTX2AttentionFunction(str, Enum):
-    """
-    Placeholder enum for upstream `AttentionFunction.DEFAULT`.
-
-    Upstream reference:
-      - `LTX-2/packages/ltx-core/src/ltx_core/model/transformer/attention.py`
-    """
-
-    DEFAULT = "default"
 
 
 # HF checkpoint key -> SGLang module name (SGLang follows upstream naming).
@@ -99,17 +75,7 @@ class LTX2ArchConfig(DiTArchConfig):
         default_factory=lambda: dict(LTX2_REVERSE_PARAM_NAMES_MAPPING)
     )
 
-    lora_param_names_mapping: dict = field(
-        default_factory=lambda: {
-            # LoRA parameter name mappings from official repo format to HF format.
-            # This is applied before param_names_mapping when loading LoRA adapters.
-            # Will be populated if LoRA adapters use different naming conventions.
-        }
-    )
-
-    # Model type and attention configuration
-    model_type: LTXModelType = LTXModelType.AudioVideo
-    attention_type: LTX2AttentionFunction = LTX2AttentionFunction.DEFAULT
+    # Attention configuration
     rope_type: LTX2RopeType = LTX2RopeType.INTERLEAVED
     double_precision_rope: bool = False
     quantize_video_rope_coords_to_hidden_dtype: bool = False

@@ -249,6 +249,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        """Whether an auxiliary component has device data missing from host."""
+        ...
+
+    @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...

@@ -9,7 +9,7 @@ from typing import List, Optional, Union
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.sampling.watermarking.core import (
+from sglang.srt.sampling.watermarking.redaction import (
     WATERMARK_CONTAINER_FIELD_NAMES,
     redact_watermark_secrets,
 )

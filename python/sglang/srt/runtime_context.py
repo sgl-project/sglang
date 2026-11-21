@@ -520,6 +520,17 @@ def is_scheduler_io_rank() -> bool:
     )
 
 
+def is_control_broadcast_local() -> bool:
+    """Whether each attention-DP group leader receives control requests from
+    the DP controller and broadcasts them within its group, instead of the
+    first leader broadcasting them over the whole TP group."""
+    parallel = get_parallel()
+    return parallel.attn_dp_enabled and (
+        parallel.enable_dp_attention_local_control_broadcast
+        or get_exec().moe.is_ep_scale_joiner
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 

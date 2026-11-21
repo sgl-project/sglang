@@ -258,6 +258,16 @@ def register_sp_collective_comm() -> bool:
     return True
 
 
+def extend_rows(x: torch.Tensor, rows: int) -> Optional[torch.Tensor]:
+    """The first ``rows`` rows of the named buffer ``x`` starts, or None when
+    ``x`` does not start one or it reserves fewer rows."""
+    ptr = int(x.data_ptr())
+    for buf in _BUFS:
+        if buf.base == ptr and x.shape[1] == buf.width and rows <= buf.max_rows:
+            return buf.region[:rows]
+    return None
+
+
 def try_symm_buffer(
     name: str, rows: int, width: int, dtype: torch.dtype
 ) -> Optional[torch.Tensor]:

@@ -26,6 +26,7 @@ class ModelTaskType(Enum):
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
+    S2V = auto()  # Speech and Image to Video
 
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
@@ -75,6 +76,9 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2V
             or self == ModelTaskType.V2V
             or self == ModelTaskType.F2V
+            # Omitting S2V skipped _adjust_visual_fields when served, costing the
+            # output extension, sequence-shard resolution and resolution checks.
+            or self == ModelTaskType.S2V
         )
 
     def is_visual_gen(self) -> bool:
@@ -85,6 +89,7 @@ class ModelTaskType(Enum):
             self == ModelTaskType.I2V
             or self == ModelTaskType.I2I
             or self == ModelTaskType.I2M
+            or self == ModelTaskType.S2V
         )
 
     def accepts_image_input(self) -> bool:
@@ -95,7 +100,14 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2V
             or self == ModelTaskType.I2M
             or self == ModelTaskType.VLA_ACTION
+            or self == ModelTaskType.S2V
         )
+
+    def requires_audio_input(self) -> bool:
+        return self == ModelTaskType.S2V
+
+    def accepts_audio_input(self) -> bool:
+        return self == ModelTaskType.S2V
 
     def data_type(self) -> DataType:
         if self.is_action_gen():

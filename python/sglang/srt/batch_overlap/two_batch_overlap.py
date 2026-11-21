@@ -852,6 +852,7 @@ class TboForwardBatchPreparer:
                 top_p=None,
                 mm_inputs=None,
                 top_logprobs_nums=None,
+                input_candidate_selectors=None,
                 token_ids_logprobs=None,
                 extend_input_logprob_token_ids_gpu=None,
                 next_token_logits_buffer=None,
@@ -1188,6 +1189,14 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     @property
     def expert_mask_gpu(self):
         return self._inners[0].expert_mask_gpu
+
+    @property
+    def prebuild_pending(self) -> bool:
+        return any(inner.prebuild_pending for inner in self._inners)
+
+    def prebuild(self) -> None:
+        for inner in self._inners:
+            inner.prebuild()
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
         return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)

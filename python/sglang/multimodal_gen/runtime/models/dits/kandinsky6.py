@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from torch.utils.checkpoint import checkpoint
 
 from sglang.kernels.ops.diffusion import apply_matrix_rope, residual_gate_fp32
 from sglang.multimodal_gen.configs.models.dits.kandinsky6 import (
@@ -1012,7 +1011,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             for i in range(arch.num_visual_blocks)
         )
 
-        self.gradient_checkpointing = False
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.num_channels_latents
@@ -1072,8 +1070,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # each text tower has its own head dimension and RoPE table
         text_rope = rope_embeddings(text_rope_pos).unsqueeze(dim=0)
         for block in blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                block = partial(checkpoint, block, use_reentrant=False)
             te = block(te, tm, text_rope)
         return te, tm
 
@@ -1164,8 +1160,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             audio_embed = self.audio_embeddings(hidden_states_audio)
             audio_rope = self.audio_rope_embeddings(audio_rope_pos).unsqueeze(dim=0)
             for block in self.visual_transformer_blocks:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    block = partial(checkpoint, block, use_reentrant=False)
                 visual_embed, audio_embed = block(
                     visual_embed,
                     audio_embed,
@@ -1181,8 +1175,6 @@ class Kandinsky6Transformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 )
         else:
             for block in self.visual_transformer_blocks:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    block = partial(checkpoint, block, use_reentrant=False)
                 visual_embed = block(
                     visual_embed, video_te, video_tm, visual_rope, attn_meta
                 )

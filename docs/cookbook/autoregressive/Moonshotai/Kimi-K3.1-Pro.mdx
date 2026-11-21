@@ -149,8 +149,8 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
   - `Balanced (DCP8 · EP2)` is TP8 · DCP8 · EP2.
   - `High-Throughput (DCP8)` is the capacity-first decode: TP8 · DCP8, measured on B300 without speculation.
 - **Attention Backend** (B300, GB300, B200, GB200; in the Advanced Features Playground)
-  - `FlashMLA` is the default DSA kernel and keeps the reference FP8 KV format.
-  - `TRT-LLM` and `Prims-TS` add `--dsa-prefill-backend` / `--dsa-decode-backend`. They store the KV as plain FP8 and also run the query in FP8, so the numerics differ slightly from FlashMLA.
+  - `Prims-TS` is the default DSA kernel on these GPUs. It stores the KV as plain FP8 and also runs the query in FP8, so the numerics differ slightly from FlashMLA.
+  - `FlashMLA` and `TRT-LLM` add `--dsa-prefill-backend` / `--dsa-decode-backend`. FlashMLA keeps the reference FP8 KV format and is the default on other GPUs and with HiSparse; TRT-LLM stores plain FP8 like Prims-TS.
   - With PD disaggregation, launch the prefill and decode roles with the same backend.
 - **MoE Runner** (B300, GB300, B200, GB200; in the Advanced Features Playground)
   - `TRT-LLM` is the default: the FlashInfer trtllm-gen fused MXFP4 MoE, with no extra flag.

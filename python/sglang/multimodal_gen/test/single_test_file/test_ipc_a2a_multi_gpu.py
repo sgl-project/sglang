@@ -16,6 +16,8 @@ import os
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -404,8 +406,6 @@ class TestAutoPipelineGroups(CustomTestCase):
     def test_group_counts_at_known_shapes(self):
         """148 SMs: MiniMax-H3 at Ulysses 4 runs 7 two-head groups at 1280x704
         and 1344x768; Wan 1.3B at Ulysses 4 (one head per group) stays sequential."""
-        from unittest import mock
-
         from sglang.multimodal_gen.runtime.distributed.device_communicators import (
             ipc_a2a_multi,
         )
@@ -430,6 +430,46 @@ class TestAutoPipelineGroups(CustomTestCase):
             self.assertEqual(groups(33024, 56), 7)
             self.assertEqual(groups(37120, 56), 7)
             self.assertEqual(groups(32768, 12), 0)
+
+
+class TestPlainExchangeTransport(CustomTestCase):
+    def test_unset_switch_picks_the_copy_engine_where_it_measured_faster(self):
+        """Unset: three- and four-rank groups on Blackwell from the payload each
+        measured ahead at. Set: the switch decides for every exchange."""
+        from sglang.multimodal_gen import envs
+        from sglang.multimodal_gen.runtime import platforms
+        from sglang.multimodal_gen.runtime.distributed.device_communicators import (
+            ipc_a2a_multi,
+        )
+
+        mib = 1 << 20
+
+        def takes_copy_engine(world, nbytes, switch=None, blackwell=True):
+            platform = SimpleNamespace(is_blackwell=lambda: blackwell)
+            with (
+                mock.patch.object(envs, "SGLANG_DIFFUSION_IPC_A2A_MULTI", switch),
+                mock.patch.object(platforms, "current_platform", platform),
+                mock.patch.object(
+                    ipc_a2a_multi.dist, "get_world_size", return_value=world
+                ),
+                mock.patch.object(
+                    ipc_a2a_multi,
+                    "ipc_a2a_multi_ready",
+                    side_effect=lambda group, enabled: enabled,
+                ),
+            ):
+                return ipc_a2a_multi.plain_exchange_ready(None, nbytes)
+
+        self.assertTrue(takes_copy_engine(4, 128 * mib))
+        self.assertFalse(takes_copy_engine(4, 128 * mib - 1))
+        self.assertTrue(takes_copy_engine(3, 48 * mib))
+        self.assertFalse(takes_copy_engine(3, 48 * mib - 1))
+        # pairs have their own transport; larger groups are not measured
+        self.assertFalse(takes_copy_engine(2, 1024 * mib))
+        self.assertFalse(takes_copy_engine(8, 1024 * mib))
+        self.assertFalse(takes_copy_engine(4, 1024 * mib, blackwell=False))
+        self.assertTrue(takes_copy_engine(2, 1, switch=True, blackwell=False))
+        self.assertFalse(takes_copy_engine(4, 1024 * mib, switch=False))
 
 
 if __name__ == "__main__":

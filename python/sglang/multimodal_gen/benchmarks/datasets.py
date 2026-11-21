@@ -40,7 +40,6 @@ class RequestFuncOutput:
     latency: float = 0.0
     error: str = ""
     start_time: float = 0.0
-    response_body: Dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: Optional[bool] = None
     output_count: int = 0

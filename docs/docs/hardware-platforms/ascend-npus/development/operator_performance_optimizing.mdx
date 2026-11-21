@@ -113,7 +113,7 @@ Below is the field-by-field breakdown of the operator performance record, aligne
 | aic_mac_time(us) / aic_mac_ratio | 0 / 0 | Latency and cycle ratio of cube (matrix multiplication) instructions. |
 | aic_scalar_time(us) / aic_scalar_ratio | 0 / 0 | Latency and cycle ratio of scalar instructions. |
 | aic_mte1_time(us) / aic_mte1_ratio | 0 / 0 | Latency and cycle ratio of L1→L0A/L0B data move instructions. |
-| aic_mte2_time(us) / aic_mte2_ratio | 0 / 0 | Latency and cycle ratio of DDR→AICORE read move instructions. |
+| aic_mte2_time(us) / aic_mte2_ratio | 0 / 0 | Latency and cycle ratio of DDR→AI Core read move instructions. |
 | aic_fixpipe_time(us) / aic_fixpipe_ratio | 0 / 0 | Latency and cycle ratio of L0C→OUT/L1 move instructions. |
 | aic_icache_miss_rate | 0 | Instruction cache miss rate of AI Core. |
 

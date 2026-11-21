@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+import itertools
 import time
 import unittest
 from array import array
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import numpy as np
 from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,6 +43,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
+    _add_sampling_mask_to_meta_info,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
     CudaIpcTensorTransportProxy,
@@ -49,7 +52,10 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.observability.request_logger import RequestLogger  # noqa: E402
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskChunk  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -194,6 +200,7 @@ def _make_req_state(rid: str = "test_rid") -> ReqState:
     obj.stream = False
     obj.return_logprob = False
     obj.return_routed_experts = False
+    obj.return_sampling_mask = False
     obj.lora_path = None
     obj.log_metrics = False
     return ReqState(
@@ -489,6 +496,42 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 class TestAbortOutputPayload(CustomTestCase):
     """An abort chunk is often the only thing a client sees;
     it must carry the same optional fields as a normal finish chunk."""
+
+    def test_abort_returns_the_sampling_masks_of_the_tokens_so_far(self):
+        """A retracted request aborted from the waiting queue still has output tokens."""
+        chunk = SamplingMaskChunk(
+            lengths=np.asarray([3, 1], dtype=np.int32),
+            token_ids=np.asarray([5, 7, 9, 2], dtype=np.int32),
+            logprobs=np.asarray([-0.5, -1.0], dtype=np.float32),
+        )
+        for flat, routed_experts in itertools.product((False, True), repeat=2):
+            with self.subTest(flat=flat, routed_experts=routed_experts):
+                tm = _make_tokenizer_manager(self)
+                obj = GenerateReqInput(
+                    text="hi",
+                    return_sampling_mask=True,
+                    return_flat_raw_sampling_mask=flat,
+                    return_routed_experts=routed_experts,
+                )
+                obj.normalize_batch_and_arguments()
+                state = ReqState(
+                    out_list=[],
+                    finished=False,
+                    event=asyncio.Event(),
+                    obj=obj,
+                    time_stats=APIServerReqTimeStats(),
+                )
+                state.output_ids = [5, 2]
+                _add_sampling_mask_to_meta_info({}, state, chunk, finished=False)
+                tm.rid_to_state[obj.rid] = state
+
+                tm._handle_abort_req(_make_abort_req(obj.rid))
+
+                meta_info = state.out_list[-1]["meta_info"]
+                self.assertEqual(
+                    meta_info["output_token_sampling_mask_length"],
+                    len(state.out_list[-1]["output_ids"]),
+                )
 
     def test_abort_includes_prompt_token_ids_only_when_requested(self):
         """The abort chunk carries prompt_token_ids captured at tokenization,
@@ -1093,7 +1136,12 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
-    tm.request_logger = Mock()
+    tm.request_logger = RequestLogger(
+        log_requests=False,
+        log_requests_level=2,
+        log_requests_format="text",
+        log_requests_target=None,
+    )
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
@@ -1738,7 +1786,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
                 input_ids=[1],
                 mm_inputs=None,
                 time_stats=tm.rid_to_state[req.rid].time_stats,
-                sampling_params=SimpleNamespace(max_new_tokens=4),
+                sampling_params=SamplingParams(max_new_tokens=4),
             )
         )
         sent = asyncio.Queue()
@@ -2174,6 +2222,87 @@ class TestChatStreamDisconnect(CustomTestCase):
             self.assertFalse(live.abort_sent)
 
         asyncio.run(drive())
+
+
+class TestReadsInputIdsLate(CustomTestCase):
+    def _manager(self, *, log=False, level=2, exporter=False, dump="", crash=None):
+        return SimpleNamespace(
+            request_logger=RequestLogger(
+                log_requests=log,
+                log_requests_level=level,
+                log_requests_format="text",
+                log_requests_target=None,
+            ),
+            request_metrics_exporter_manager=Mock(
+                exporter_enabled=Mock(return_value=exporter)
+            ),
+            dump_requests_folder=dump,
+            crash_dump_folder=crash,
+        )
+
+    def test_prompt_is_kept_only_while_something_reads_it(self):
+        cases = [
+            ({}, False),
+            ({"log": True, "level": 0}, False),
+            ({"log": True, "level": 1}, False),
+            ({"log": True, "level": 2}, True),
+            ({"log": True, "level": 3}, True),
+            ({"exporter": True}, True),
+            ({"dump": "/tmp/dump"}, True),
+            ({"crash": "/tmp/crash"}, True),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                manager = self._manager(**kwargs)
+                self.assertEqual(
+                    TokenizerManager._reads_input_ids_late(manager), expected
+                )
+
+    def test_generate_request_releases_prompt_after_dispatch(self):
+        for dump, released in (("", True), ("/tmp/dump", False)):
+            with self.subTest(dump=dump):
+                tm = _make_tm_for_generate(self)
+                tm.dump_requests_folder = dump
+                obj = GenerateReqInput(input_ids=[1, 2, 3], rid="r", sampling_params={})
+                tokenized = MagicMock(input_ids=[1, 2, 3], mm_inputs=None)
+                tm._tokenize_one_request = AsyncMock(return_value=tokenized)
+                tm._send_one_request = AsyncMock()
+
+                async def wait_one_response(obj, request):
+                    state = tm.rid_to_state[obj.rid]
+                    yield {
+                        "input_ids": obj.input_ids,
+                        "released": state.prompt_released,
+                    }
+
+                tm._wait_one_response = wait_one_response
+
+                async def drive():
+                    return await tm.generate_request(obj).__anext__()
+
+                out = asyncio.run(drive())
+                tm._send_one_request.assert_awaited_once()
+                self.assertEqual(out["input_ids"] is None, released)
+                self.assertEqual(out["released"], released)
+
+    def test_dumps_turned_on_later_skip_released_prompts(self):
+        """Dumps enabled at runtime must not record a request whose prompt is gone."""
+        for released in (False, True):
+            with self.subTest(released=released):
+                tm = _make_tokenizer_manager(self)
+                tm.dump_requests_folder = "/tmp/dump"
+                tm.crash_dump_folder = "/tmp/crash"
+                tm.dump_requests = Mock()
+                tm.record_request_for_crash_dump = Mock()
+                state = _make_req_state("released_rid")
+                state.obj.log_metrics = True
+                state.prompt_released = released
+                tm.rid_to_state["released_rid"] = state
+                asyncio.run(
+                    tm._handle_batch_output(_make_batch_str_output("released_rid"))
+                )
+                self.assertEqual(tm.dump_requests.called, not released)
+                self.assertEqual(tm.record_request_for_crash_dump.called, not released)
 
 
 if __name__ == "__main__":

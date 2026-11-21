@@ -181,3 +181,48 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
     explicit = server_args(True, "merge")
     PikaH3FlexPipelineConfig().validate_server_args(explicit)
     assert explicit.lora_merge_mode == "merge"
+
+
+def test_keyframes_center_crop_before_resize() -> None:
+    from PIL import Image
+
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.canvas import (
+        minimax_h3_center_crop_keyframe_canvas,
+    )
+
+    assert PikaH3FlexPipelineConfig().keyframe_fit == "source_crop"
+    assert MiniMaxH3PipelineConfig().keyframe_fit == "stretch"
+    # 4:3 source onto a 16:9 canvas: crop 400x225 from the middle, then resize.
+    source = Image.new("RGB", (400, 300), (255, 0, 0))
+    source.paste((0, 0, 255), (0, 37, 400, 263))
+    out = minimax_h3_center_crop_keyframe_canvas(
+        source, target_width=160, target_height=90
+    )
+    assert out.size == (160, 90)
+    expected = source.crop((0, 37, 400, 262)).resize(
+        (160, 90), Image.Resampling.LANCZOS
+    )
+    assert out.tobytes() == expected.tobytes()
+
+
+def test_audio_trimmed_to_video_duration() -> None:
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+        _trim_audio_to_video_duration,
+    )
+
+    assert PikaH3FlexPipelineConfig().trim_audio_to_video
+    assert not MiniMaxH3PipelineConfig().trim_audio_to_video
+    # 124 frames at 24 fps and 32 kHz last 165333 samples; the decoder emits 165600.
+    audio = torch.randn(1, 2, 165600)
+    batch = SimpleNamespace(num_frames=124, fps=24)
+    trimmed = _trim_audio_to_video_duration(audio, batch, 32000)
+    assert trimmed.shape == (1, 2, 165333)
+    torch.testing.assert_close(trimmed, audio[..., :165333])
+    unresolved = SimpleNamespace(num_frames=None, fps=24)
+    assert _trim_audio_to_video_duration(audio, unresolved, 32000) is audio

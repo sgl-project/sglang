@@ -84,6 +84,7 @@ class TestKimiK31B300(GSM8KMixin, CustomTestCase):
                 "page_first_direct",
                 "--mamba-max-states-per-path",
                 "1",
+                "--enable-layernorm-sp",
             ],
             env=SERVER_ENV,
         )

@@ -552,7 +552,7 @@ def _rank_consensus_worker(rank, rendezvous):
 def _hicache_scheduler(scheduler, storage):
     scheduler.enable_hierarchical_cache = True
     scheduler.enable_hicache_storage = storage
-    scheduler.tree_cache = Mock(spec=UnifiedRadixCache)
+    scheduler.tree_cache = Mock(spec=UnifiedRadixCache, buffer_pipeline=None)
 
 
 def _attention_dp_worker(rank, rendezvous, attn_tp_size):
@@ -647,6 +647,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     return radix_cache.match_prefix(params)
 
                 scheduler.tree_cache = SimpleNamespace(
+                    buffer_pipeline=None,
                     check_hicache_events=Mock(),
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,

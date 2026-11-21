@@ -129,6 +129,7 @@ class TestHy4DecodeKernels(CustomTestCase):
             (3, 4100),
             (31, 6144),
             (64, 6144),
+            (1024, 6144),
         ):
             with self.subTest(num_tokens=num_tokens, hidden_size=hidden_size):
                 hc_mult = 4
@@ -160,8 +161,17 @@ class TestHy4DecodeKernels(CustomTestCase):
                         x, hc_fn, hc_scale, hc_base, 2.0, 1e-6, 1e-6
                     )
 
-                self.assertTrue(torch.equal(actual[0], expected[0]))
-                self.assertTrue(torch.equal(actual[1], expected[1]))
+                if num_tokens < hy4_ihc._IHC_TOKEN_BLOCKED_MIN_T:
+                    self.assertTrue(torch.equal(actual[0], expected[0]))
+                    self.assertTrue(torch.equal(actual[1], expected[1]))
+                else:
+                    # The token-blocked prefill path reorders the fp32 reduction.
+                    torch.testing.assert_close(
+                        actual[0], expected[0], atol=1e-2, rtol=1e-2
+                    )
+                    torch.testing.assert_close(
+                        actual[1], expected[1], atol=1e-5, rtol=1e-5
+                    )
 
     def test_fused_ihc_failure_disables_each_path(self):
         class TupleLinear(nn.Module):

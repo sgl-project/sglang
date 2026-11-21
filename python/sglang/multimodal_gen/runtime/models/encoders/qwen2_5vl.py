@@ -466,7 +466,6 @@ class Qwen2_5_VLTextModel(nn.Module):
         )
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
-        self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         # self.post_init()
 
@@ -1025,24 +1024,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     _fsdp_forward_methods = ("generate",)
 
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_up_proj.",
-        ".down_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
-
     def __init__(
         self,
         config: Qwen2_5VLConfig,
@@ -1069,9 +1050,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         self.generation_config = generation_config
 
         self.config = config
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -1342,9 +1320,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
 
 
 EntryClass = Qwen2_5_VLForConditionalGeneration

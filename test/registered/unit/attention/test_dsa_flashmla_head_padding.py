@@ -52,6 +52,7 @@ class TestFlashMLASparseHeadPadding(CustomTestCase):
         backend = SimpleNamespace(
             device_sm_major=10,
             sparse_prefill_small_heads=enabled,
+            dsa_index_topk=topk,
             _sink_pad_cache={},
             _call_flash_mla_sparse_fwd_small_heads=small,
             _call_flash_mla_sparse_fwd=native,

@@ -692,7 +692,6 @@ def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
     """
     receiver = SchedulerRequestReceiver(
         recv_from_tokenizer=None,
-        recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
@@ -720,10 +719,8 @@ def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
                 ),
             ),
             patch(
-                _RECEIVER + "get_exec",
-                return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
-                ),
+                _RECEIVER + "is_control_broadcast_local",
+                return_value=local_control,
             ),
             patch(
                 _RECEIVER + "attn_cp_tp_broadcast_pyobj",

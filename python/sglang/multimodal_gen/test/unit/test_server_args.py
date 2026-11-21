@@ -23,6 +23,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
@@ -181,6 +184,35 @@ class TestExplicitCliArgs(unittest.TestCase):
                 self.assertEqual(
                     ServerArgs.get_provided_args(parsed, unknown), {field: value}
                 )
+
+    def test_abbreviated_flags_keep_their_value(self):
+        """argparse accepts an unambiguous prefix of a flag (--tp 2 sets tp_size);
+        the value must count as provided instead of being dropped for the default."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--tp", "2"], "tp_size", 2),
+            (["--num-gpu=4"], "num_gpus", 4),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(getattr(parsed, field), value)
+                self.assertEqual(unknown, [])
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+    def test_full_flag_registered_later_is_not_taken_for_an_abbreviation(self):
+        """A flag another module adds to the same parser is matched exactly by
+        argparse; it must not be resolved to a server flag it happens to prefix."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parser.add_argument("--tp", type=int)
+        argv = ["--tp", "2"]
+        with patch.object(sys, "argv", ["sglang", *argv]):
+            parsed, unknown = parser.parse_known_args(argv)
+            self.assertIsNone(parsed.tp_size)
+            self.assertEqual(ServerArgs.get_provided_args(parsed, unknown), {"tp": 2})
 
 
 class _CudaPlatformTestCase(unittest.TestCase):
@@ -3212,19 +3244,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            available_memory_gb={1: 50, 2: 80},
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
-                "num_gpus": 2,
-                "performance_mode": "auto",
-            },
-        )
+        # num_gpus counts every node, but each node probes only its own GPUs;
+        # probing past them fails with an invalid device id on node rank > 0.
+        multi_node = {
+            "num_gpus": 4,
+            "nnodes": 2,
+            "node_rank": 1,
+            "dist_init_addr": "127.0.0.1:5000",
+        }
+        for nodes_kwargs in ({"num_gpus": 2}, multi_node):
+            with self.subTest(**nodes_kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    available_memory_gb={1: 50, 2: 80},
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image",
+                        "base_gpu_id": 1,
+                        "performance_mode": "auto",
+                        **nodes_kwargs,
+                    },
+                )
 
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
+                self.assertFalse(args.use_fsdp_inference)
+                self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
@@ -4111,6 +4153,28 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+    def test_enable_torch_compile_reaches_server_args_for_joy_image_edit(self):
+        """A pipeline config attribute named like a server flag takes the value
+        and removes it from the server args, so the flag does nothing."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+            "--enable-torch-compile",
+            "true",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertIsInstance(server_args.pipeline_config, JoyImageEditPipelineConfig)
+        self.assertTrue(server_args.enable_torch_compile)
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):

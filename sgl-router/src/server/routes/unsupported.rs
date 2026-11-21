@@ -9,9 +9,10 @@ use crate::server::error::ApiError;
 use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
 
-/// The OpenAI Responses and Conversations APIs, and the engine's `/v1/loads`.
+/// The stored-response routes of the OpenAI Responses API (the router is
+/// stateless; `POST /v1/responses` itself is served), the Conversations API,
+/// and the engine's `/v1/loads`.
 pub(crate) const UNSUPPORTED_PATHS: &[&str] = &[
-    "/v1/responses",
     "/v1/responses/{*rest}",
     "/v1/conversations",
     "/v1/conversations/{*rest}",
