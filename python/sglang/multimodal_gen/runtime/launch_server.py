@@ -296,6 +296,10 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     return processes
 
 
+def _result_endpoint(host: str, base_port: int, role: RoleType) -> str:
+    return f"tcp://{host}:{base_port + ServerArgs.DISAGG_RESULT_PORT_OFFSETS[role]}"
+
+
 def launch_pool_disagg_server(
     server_args: ServerArgs,
     encoder_gpus: list[list[int]],
@@ -367,11 +371,11 @@ def launch_pool_disagg_server(
         port_cursor = p + 1
 
     # Per-role-type result endpoints (DS binds PULL, instances connect PUSH)
-    # Use deterministic convention: scheduler_port + {1,2,3}
+    # Deterministic convention: scheduler_port + DISAGG_RESULT_PORT_OFFSETS[role]
     base_port = server_args.scheduler_port
-    encoder_result_ep = f"tcp://{host}:{base_port + 1}"
-    denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
-    decoder_result_ep = f"tcp://{host}:{base_port + 3}"
+    encoder_result_ep = _result_endpoint(host, base_port, RoleType.ENCODER)
+    denoiser_result_ep = _result_endpoint(host, base_port, RoleType.DENOISER)
+    decoder_result_ep = _result_endpoint(host, base_port, RoleType.DECODER)
 
     logger.info(
         "Pool endpoints allocated: %d work + 3 result endpoints",
@@ -562,9 +566,9 @@ def launch_disagg_server(server_args: ServerArgs):
     denoiser_work_endpoints = parse_url_string(server_args.denoiser_urls)
     decoder_work_endpoints = parse_url_string(server_args.decoder_urls)
 
-    encoder_result_ep = f"tcp://{host}:{base_port + 1}"
-    denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
-    decoder_result_ep = f"tcp://{host}:{base_port + 3}"
+    encoder_result_ep = _result_endpoint(host, base_port, RoleType.ENCODER)
+    denoiser_result_ep = _result_endpoint(host, base_port, RoleType.DENOISER)
+    decoder_result_ep = _result_endpoint(host, base_port, RoleType.DECODER)
 
     frontend_endpoint = f"tcp://{host}:{base_port}"
 
@@ -577,13 +581,11 @@ def launch_disagg_server(server_args: ServerArgs):
         (RoleType.DECODER, decoder_work_endpoints),
     ):
         if endpoints:
-            offset = ServerArgs.DISAGG_RESULT_PORT_OFFSETS[role]
             logger.info(
-                "  %s: work=%s result=tcp://%s:%d",
+                "  %s: work=%s result=%s",
                 role.value,
                 endpoints,
-                host,
-                base_port + offset,
+                _result_endpoint(host, base_port, role),
             )
 
     denoiser_options = (
@@ -604,8 +606,12 @@ def launch_disagg_server(server_args: ServerArgs):
         glm_distributed_mode_enabled=glm_distributed_mode_enabled,
         prompt_encoder_work_endpoints=parse_url_string(server_args.prompt_encoder_urls),
         image_encoder_work_endpoints=parse_url_string(server_args.image_encoder_urls),
-        prompt_encoder_result_endpoint=f"tcp://{host}:{base_port + 4}",
-        image_encoder_result_endpoint=f"tcp://{host}:{base_port + 5}",
+        prompt_encoder_result_endpoint=_result_endpoint(
+            host, base_port, RoleType.PROMPT_ENCODER
+        ),
+        image_encoder_result_endpoint=_result_endpoint(
+            host, base_port, RoleType.IMAGE_ENCODER
+        ),
         **denoiser_options,
     )
     diffusion_server.start()
