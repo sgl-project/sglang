@@ -420,6 +420,9 @@ class HiCacheStorage(ABC):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
+    def configure_sidecars(self, specs: tuple[SidecarPoolSpec, ...]) -> None:
+        """Publish the current sidecar topology after host pool registration."""
+
     def on_host_pools_registered(self) -> None:
         """The initial host-pool registration burst is over: the anchor pool
         (``register_mem_pool_host``) and every host pool group entry
@@ -699,6 +702,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         self._backend.register_mem_host_pool_v2(host_pool, host_pool_name)
+
+    def configure_sidecars(self, specs: tuple[SidecarPoolSpec, ...]) -> None:
+        self._backend.configure_sidecars(specs)
 
     def on_host_pools_registered(self) -> None:
         self._backend.on_host_pools_registered()

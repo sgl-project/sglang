@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    SidecarPoolSpec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -287,6 +288,146 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_v41_full_bundle_layout_and_independent_swa(self):
+        bundle_keys = set()
+        scale1 = PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE
+        scale2 = PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE
+        for scales in ((), (scale1,), (scale2,), (scale1, scale2)):
+            with self.subTest(scales=scales):
+                store, fake = _make_store(is_mla_model=True)
+                store.mem_pool_host = types.SimpleNamespace(kv_buffer=None)
+                store.pack_component_pools = True
+                full = [
+                    PoolName.DEEPSEEK_V4_C1,
+                    PoolName.DEEPSEEK_V4_C1_INDEXER,
+                    PoolName.DEEPSEEK_V4_C2,
+                    PoolName.DEEPSEEK_V4_C2_INDEXER,
+                ]
+                if scale1 in scales:
+                    full.insert(2, scale1)
+                if scale2 in scales:
+                    full.append(scale2)
+                transfers = []
+                addresses = []
+                for name in [*full, PoolName.SWA]:
+                    pool = FakeIndexerPool()
+                    pool.storage_page_span = 2
+                    pool.gpu_device = "cuda:0"
+                    pool.layer_num = 1
+                    pool.get_size_per_token = lambda: 8
+                    address = pool.buffer.data_ptr()
+                    addresses.append(address)
+                    pool.get_page_buffer_meta = lambda indices, addr=address: (
+                        [addr],
+                        [8],
+                    )
+                    store.register_mem_host_pool_v2(pool, name)
+                    transfers.append(
+                        PoolTransfer(
+                            name, host_indices=torch.tensor([0, 1]), keys=["page"]
+                        )
+                    )
+                specs = tuple(
+                    SidecarPoolSpec(name, PoolName.KV) for name in reversed(full)
+                )
+                store.configure_sidecars(specs)
+                store.batch_set_v2(transfers[::-1])
+                call = fake.batch_put_calls[-1]
+                self.assertEqual(call["ptrs"], [addresses[:-1], addresses[-1:]])
+                bundle_key, swa_key = call["keys"]
+                layout = store.describe_l3_object_layout(
+                    sidecar_pool_specs=specs,
+                    window_trailing_pages={PoolName.SWA: 1},
+                    page_size=2,
+                )
+                self.assertTrue(layout["enabled"])
+                for pool in layout["hicache_object_layout"]["pools"]:
+                    self.assertEqual(
+                        store._tag_keys(["page" + pool["suffixes"][0]]),
+                        [swa_key if pool["pool"] == PoolName.SWA else bundle_key],
+                    )
+                bundle_keys.add(bundle_key)
+                fake.existing_keys.remove(swa_key)
+                self.assertEqual(
+                    store.batch_exists_v2(["page"], transfers).restorable_prefix_pages,
+                    [],
+                )
+                self.assertEqual(
+                    store.batch_exists_v2(
+                        ["page"], transfers[:1]
+                    ).restorable_prefix_pages,
+                    [1],
+                )
+                with patch.object(
+                    fake,
+                    "batch_get_into_multi_buffers",
+                    create=True,
+                    return_value=[8 * len(full), 8],
+                ):
+                    self.assertEqual(
+                        store.batch_get_v2(transfers),
+                        {t.name: [True] for t in transfers},
+                    )
+                with self.assertRaisesRegex(ValueError, "Incomplete"):
+                    store.batch_get_v2(transfers[:1])
+                store.pack_component_pools = False
+                store.configure_sidecars(specs)
+                self.assertEqual(
+                    store.batch_exists_v2(
+                        ["page"], transfers[:1]
+                    ).restorable_prefix_pages,
+                    [],
+                )
+        self.assertEqual(len(bundle_keys), 4)
+
+    def test_packed_swa_tail_and_partial_read(self):
+        store, fake = _make_store(is_mla_model=True)
+        store.mem_pool_host = types.SimpleNamespace(kv_buffer=None)
+        store.pack_component_pools = True
+        transfers = []
+        for name in (
+            PoolName.INDEXER,
+            PoolName.SWA,
+            PoolName.DRAFT_INDEXER,
+        ):
+            pool = FakeIndexerPool() if name == PoolName.SWA else FakeMultiBufferPool()
+            pool.gpu_device = "cuda:0"
+            pool.layer_num = 1
+            pool.get_size_per_token = lambda: 8
+            store.register_mem_host_pool_v2(pool, name)
+            transfers.append(
+                PoolTransfer(
+                    name,
+                    host_indices=torch.tensor([0]),
+                    keys=["b"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            )
+        specs = tuple(
+            SidecarPoolSpec(t.name, PoolName.SWA, t.hit_policy)
+            for t in transfers
+            if t.name != PoolName.SWA
+        )
+        store.configure_sidecars(
+            (specs[0], SidecarPoolSpec(specs[1].pool_name, PoolName.SWA))
+        )
+        self.assertEqual(len(list(store._object_groups(transfers))), 3)
+        store.configure_sidecars(specs)
+        store.batch_set_v2(transfers)
+        call = fake.batch_put_calls[-1]
+        self.assertEqual(call["sizes"], [[8, 8, 16, 8, 16]])
+        self.assertEqual(
+            store.batch_exists_v2(["a", "b", "c"], transfers).restorable_prefix_pages,
+            [2],
+        )
+        with patch.object(
+            fake, "batch_get_into_multi_buffers", create=True, return_value=[55]
+        ):
+            self.assertEqual(
+                store.batch_get_v2(transfers),
+                {transfer.name: [False] for transfer in transfers},
+            )
+
     def test_c128_query_restores_only_complete_block_boundaries(self):
         for pages, endpoints, expected in (
             (0, (), []),
