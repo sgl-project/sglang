@@ -16,7 +16,12 @@ import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
-from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
+from sglang.srt.configs.qwen4_exp import (
+    PLE_EMBEDDING_MODE_NGRAM,
+    PLE_EMBEDDING_MODE_PER_TOKEN,
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
+)
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -197,6 +202,8 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     query_start_loc: torch.Tensor | None
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    # The tokens of this forward, in hidden-state row order (per-token lookup).
+    token_ids: Optional[torch.Tensor] = None
 
 
 class _BreakablePLEBatch:
@@ -431,6 +438,7 @@ def _prepare_ple_batch(
         query_start_loc=packed_query_start_loc,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        token_ids=tokens,
     )
 
 
@@ -938,6 +946,97 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
 
 
+class Qwen4ExpPerTokenEmbedding(nn.Module):
+    """ple_embedding_mode="per_token": one [vocab_size, ple_embed_dim] row per token id,
+    replicated on every rank, in place of the hashed n-gram table."""
+
+    def __init__(self, config: Qwen4ExpTextConfig, embedding_dim: int) -> None:
+        super().__init__()
+        self.vocab_size = int(config.vocab_size)
+        self.embedding_dim = int(embedding_dim)
+        if self.vocab_size <= 0 or self.embedding_dim <= 0:
+            raise ValueError(
+                "per_token PLE needs positive vocab_size and ple_embed_dim, got "
+                f"{self.vocab_size} and {self.embedding_dim}"
+            )
+        self.enable_ple_fusion = envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+        # In the model dtype, like the projections that read its rows.
+        self.per_token_table = nn.Embedding(
+            self.vocab_size,
+            self.embedding_dim,
+            _weight=torch.zeros(self.vocab_size, self.embedding_dim),
+            _freeze=True,
+        )
+        # Set once a load_weights call has copied the table.
+        self.table_loaded = False
+
+    def forward_idle(self, forward_batch: ForwardBatch) -> None:
+        return
+
+    def forward(self, batch: _PLEBatch, forward_batch: ForwardBatch) -> torch.Tensor:
+        assert batch.token_ids is not None
+        # Clamped rather than checked: a range check would sync with the device.
+        ids = batch.token_ids.reshape(-1).long().clamp(0, self.vocab_size - 1)
+        return F.embedding(ids, self.per_token_table.weight)
+
+
+_PER_TOKEN_TABLE_SUFFIX = ".per_token_table.weight"
+_NGRAM_ONLY_PLE_BUFFERS = frozenset(
+    {"layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes"}
+)
+
+
+def _is_ngram_only_ple_tensor(name: str) -> bool:
+    """A tensor of the hashed n-gram table, which the per-token lookup does not use."""
+    _, found, leaf = name.rpartition(".ple.ple_embedding.")
+    return bool(found) and (
+        leaf.startswith("ngram_embedding.") or leaf in _NGRAM_ONLY_PLE_BUFFERS
+    )
+
+
+def _check_per_token_table(
+    *,
+    name: str,
+    loaded_weight: torch.Tensor,
+    per_token_tables: dict[str, "Qwen4ExpPerTokenEmbedding"],
+) -> None:
+    if name not in per_token_tables:
+        raise ValueError(
+            f"the checkpoint has a per-token PLE table ({name}) but "
+            "text_config.ple_embedding_mode is not 'per_token'"
+        )
+    table = per_token_tables[name].per_token_table.weight
+    # Plain values, converted to the model dtype at the copy; fp8 codes are
+    # floating-point too but mean nothing without a scale.
+    if loaded_weight.shape != table.shape or loaded_weight.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ):
+        raise ValueError(
+            f"{name}: expected a bf16, fp16 or fp32 {tuple(table.shape)} table, "
+            f"got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+        )
+
+
+def _note_per_token_tables(
+    *,
+    per_token_tables: dict[str, "Qwen4ExpPerTokenEmbedding"],
+    loaded_params: Set[str],
+) -> None:
+    """After one load_weights call. The call may be one bucket of a staged load or
+    a partial update, so a table that is absent from it is not an error."""
+    for name, embedding in per_token_tables.items():
+        if name in loaded_params:
+            embedding.table_loaded = True
+        elif not embedding.table_loaded:
+            logger.warning(
+                "ple_embedding_mode='per_token': %s has not been loaded by "
+                "load_weights; unless it was written directly, its rows are zeros",
+                name,
+            )
+
+
 @triton.jit
 def _gather_ple_embedding_from_pinned_kernel(
     weight_ptr,
@@ -1185,14 +1284,21 @@ class Qwen4ExpPLELayer(nn.Module):
         self.conv_kernel_size = config.ple_conv_kernel_size
         self.hc_count = config.hc_count
         self.hc_hidden_size = self.hidden_size * self.hc_count
-        self.ple_embedding = Qwen4ExpNGramEmbedding(
-            config,
-            self.ple_embed_dim,
-            ple_layer_index=ple_layer_index,
-            quant_config=quant_config,
-            prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
-        )
-        self.short_conv_dilation = self.ple_embedding.ngram_size
+        self.per_token = config.ple_embedding_mode == PLE_EMBEDDING_MODE_PER_TOKEN
+        if self.per_token:
+            self.ple_embedding = Qwen4ExpPerTokenEmbedding(
+                config, embedding_dim=self.ple_embed_dim
+            )
+        else:
+            self.ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                self.ple_embed_dim,
+                ple_layer_index=ple_layer_index,
+                quant_config=quant_config,
+                prefix=f"{prefix}.ple_embedding" if prefix else "ple_embedding",
+            )
+        # The short convolution keeps the dilation it was trained with in both modes.
+        self.short_conv_dilation = int(config.ngram_size)
         self.short_conv_state_len = (
             self.conv_kernel_size - 1
         ) * self.short_conv_dilation
@@ -1238,8 +1344,11 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
         nn.init.zeros_(self.conv1d.weight)
+        # The per-token table is small and stays on the device: nothing to prefetch.
         self._prefetch_stream = (
-            torch.get_device_module().Stream() if config.ple_offload_embedding else None
+            torch.get_device_module().Stream()
+            if config.ple_offload_embedding and not self.per_token
+            else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -2294,7 +2403,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
         )
-        self.ple_ngram_size = int(config.ngram_size) if self.has_ple else None
+        # No n-gram history is built or committed for the per-token lookup.
+        self.ple_ngram_size = (
+            int(config.ngram_size)
+            if self.has_ple and config.ple_embedding_mode == PLE_EMBEDDING_MODE_NGRAM
+            else None
+        )
         self.ple_ngram_eos_token_id = (
             int(config.eos_token_id) if self.ple_ngram_size is not None else None
         )
@@ -2771,6 +2885,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 getattr(self.config, "split_ngram_parts", 512),
             )
         )
+        per_token_tables = {
+            f"{mod_name}{_PER_TOKEN_TABLE_SUFFIX}": mod
+            for mod_name, mod in self.named_modules()
+            if isinstance(mod, Qwen4ExpPerTokenEmbedding)
+        }
         loaded_params: Set[str] = set()
         loaded_buffers: Set[str] = set()
         loaded_shard_params: Set[str] = set()
@@ -2797,6 +2916,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if layer_id is not None and (
                 layer_id < self.start_layer or layer_id >= self.end_layer
             ):
+                continue
+
+            if name.endswith(_PER_TOKEN_TABLE_SUFFIX):
+                _check_per_token_table(
+                    name=name,
+                    loaded_weight=loaded_weight,
+                    per_token_tables=per_token_tables,
+                )
+            elif per_token_tables and _is_ngram_only_ple_tensor(name):
                 continue
 
             if self._load_qwen4_exp_ple_buffer(
@@ -2951,6 +3079,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
+
+        _note_per_token_tables(
+            per_token_tables=per_token_tables, loaded_params=loaded_params
+        )
 
         if skipped_visual_count > 0:
             logger.info(

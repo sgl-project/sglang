@@ -221,6 +221,25 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.architectures, ["NemotronHForCausalLMMTP"])
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
 
+    def test_qwen4_exp_ple_embedding_mode_is_validated(self):
+        self.assertEqual(Qwen4ExpTextConfig().ple_embedding_mode, "ngram")
+        # Only an absent field means n-gram: an empty one must not build that table.
+        for invalid in ("per_tokens", "", False):
+            with self.assertRaises(ValueError):
+                Qwen4ExpTextConfig(ple_embedding_mode=invalid)
+        # The per-token table is not indexed by PLE layer, so it serves only one.
+        with self.assertRaises(ValueError):
+            Qwen4ExpTextConfig(ple_embedding_mode="per_token", ple_layer_ids=[2, 6])
+        # The per-token lookup keeps no n-gram history; the n-gram table does.
+        layers = dict(ple_layer_ids=[2], ngram_size=3)
+        self.assertEqual(Qwen4ExpTextConfig(**layers).ngram_context_len, 2)
+        per_token = Qwen4ExpTextConfig(ple_embedding_mode="per_token", **layers)
+        self.assertEqual(per_token.ngram_context_len, 0)
+        # The short convolution keeps its state in both modes.
+        ngram_state = Qwen4ExpTextConfig(**layers).short_conv_state_shape
+        self.assertIsNotNone(ngram_state)
+        self.assertEqual(per_token.short_conv_state_shape, ngram_state)
+
     def test_qwen4_exp_spec_hidden_size_keeps_hc_width(self):
         """Qwen4-Exp's MTP draft consumes the hc-flattened target stream,
         so spec_hidden_size must stay hidden_size * hc_mult; hy_v4 collapses first."""
