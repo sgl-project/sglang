@@ -77,6 +77,8 @@ class TestAmdPartitionModel(CustomTestCase):
             [
                 "not a metric",
                 timing_line(filename=root + "outside.py", elapsed=999),
+                "2026-11-13T07:46:22Z ========== TIMINGS BEGIN ==========",
+                timing_line(filename=root + "unterminated.py", elapsed=99),
                 timing_log(
                     timing_line(filename=root + "failed.py", elapsed=12, passed=False),
                     timing_line(filename=root + "example.py", elapsed=8),
@@ -188,6 +190,7 @@ class TestAmdPartitionModel(CustomTestCase):
         self.assertEqual(result, {"test/registered/example.py": 42})
 
     def test_runs_from_before_the_suite_rename_are_collected(self):
+        """Successful AMD runs with pre-rename job names must remain valid timing sources."""
         jobs = [
             {
                 "id": 1,
