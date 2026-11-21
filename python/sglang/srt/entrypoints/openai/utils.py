@@ -1,7 +1,9 @@
+import json
 import logging
 from typing import Any, Literal
 
 import torch
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
@@ -23,7 +25,7 @@ _BYTE_DECODER: dict[str, int] = {}
 
 # Tokenizer-level cache: once verified, we know whether *all* tokens from a
 # given tokenizer can safely use the byte decoder. Avoids per-token checks.
-_BYTE_LEVEL_TOKENIZERS: set = set()
+_BYTE_LEVEL_VERDICTS: dict[int, bool] = {}
 
 
 def _build_byte_decoder() -> dict[str, int]:
@@ -43,29 +45,45 @@ def _build_byte_decoder() -> dict[str, int]:
     return dict(zip(cs, bs))
 
 
+def _is_byte_level_decoder(decoder) -> bool:
+    while isinstance(decoder, dict) and decoder.get("type") == "Sequence":
+        steps = decoder.get("decoders", [])
+        if len(steps) != 1:
+            return False
+        decoder = steps[0]
+    return isinstance(decoder, dict) and decoder.get("type") == "ByteLevel"
+
+
 def _is_byte_level_tokenizer(tokenizer) -> bool:
-    """Heuristically determine whether *tokenizer* uses GPT-2 byte-level BPE.
+    """Determine whether *tokenizer* uses GPT-2 byte-level BPE.
 
     Only GPT-2 family (GPT2Tokenizer, Llama, Qwen, etc.) store vocabulary
     tokens as the ``bytes_to_unicode`` printable-char mapping. SentencePiece
     tokenizers (Mistral, Gemma, T5) store raw Unicode pieces, so applying the
     byte decoder to them corrupts multi-byte characters.
 
-    We probe by checking ``is_byte_level`` (HuggingFace fast tokenizers) or
-    by verifying that a known multi-byte character (é, U+00E9) round-trips:
-    GPT-2 encodes it as a single byte-level piece ``chr(233)`` whose byte
-    decoder output [233] does NOT form valid UTF-8, while SentencePiece stores
-    the full character ``é`` whose UTF-8 is [195, 169].
+    A tokenizer's own ``is_byte_level`` decides first. A HuggingFace fast
+    tokenizer then answers with its declared decoder; other tokenizers are
+    probed on a few sampled vocabulary pieces.
     """
     tid = id(tokenizer)
-    if tid in _BYTE_LEVEL_TOKENIZERS:
-        return True
+    if tid in _BYTE_LEVEL_VERDICTS:
+        return _BYTE_LEVEL_VERDICTS[tid]
 
-    # Fast path: HuggingFace fast tokenizers expose is_byte_level.
     is_bl = getattr(tokenizer, "is_byte_level", None)
     if isinstance(is_bl, bool):
-        if is_bl:
-            _BYTE_LEVEL_TOKENIZERS.add(tid)
+        _BYTE_LEVEL_VERDICTS[tid] = is_bl
+        return is_bl
+
+    if isinstance(tokenizer, PreTrainedTokenizerFast):
+        # fastokens backs the tokenizer with a shim whose decoder carries no type
+        try:
+            decoder = json.loads(tokenizer.backend_tokenizer.to_str()).get("decoder")
+        except Exception:
+            # Custom decoders may not support serialization; display fallback is safe.
+            decoder = None
+        is_bl = _is_byte_level_decoder(decoder)
+        _BYTE_LEVEL_VERDICTS[tid] = is_bl
         return is_bl
 
     # Slow path: probe with a known é token.
@@ -85,9 +103,10 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
             # If any char in the piece is NOT in the byte decoder table,
             # this tokenizer does NOT use byte-level encoding.
             if any(ch not in _BYTE_DECODER for ch in piece):
+                _BYTE_LEVEL_VERDICTS[tid] = False
                 return False
         # All sampled tokens are byte-decodable → likely byte-level BPE.
-        _BYTE_LEVEL_TOKENIZERS.add(tid)
+        _BYTE_LEVEL_VERDICTS[tid] = True
         return True
     except Exception:
         return False
