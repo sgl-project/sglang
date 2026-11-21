@@ -1136,6 +1136,9 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
+    # Try AITER's FlyDSL BF16 unified attention (gfx950, Q/K 192, V 128, page 64
+    # or 128) before its Triton unified attention in the AITER backend.
+    SGLANG_USE_AITER_FLYDSL_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
