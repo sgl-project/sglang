@@ -1,4 +1,5 @@
 pub mod cli;
+mod gateway_flags;
 pub mod sampling;
 pub mod types;
 pub use cli::Cli;
