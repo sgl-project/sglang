@@ -46,6 +46,7 @@ from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
+    solve_lplb_prob,
     topk_ids_logical_to_physical,
     topk_ids_logical_to_physical_and_record,
 )
@@ -2604,16 +2605,14 @@ def _post_process_topk_ids(
             expert_location_dispatch_info is not None
             and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
         ):
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                lp_routed_ids = (
-                    topk_ids[:, :-num_shared_topk_slots]
-                    if router_wrote_shared_cols
-                    else topk_ids
-                )
-                log2phy_prob = lplb_solver.solve(lp_routed_ids)
+            lp_routed_ids = (
+                topk_ids[:, :-num_shared_topk_slots]
+                if router_wrote_shared_cols
+                else topk_ids
+            )
+            log2phy_prob = solve_lplb_prob(
+                lp_routed_ids, expert_location_dispatch_info, layer_id
+            )
 
         if log2phy_prob is not None:
             if router_wrote_shared_cols:
@@ -2720,17 +2719,35 @@ def _post_process_topk_ids(
         # second zeroing here would be redundant (zeroing is idempotent).
 
     else:
+        # Non-CUDA/HIP backends (Ascend NPU, CPU, XPU, ...). LP dispatch still
+        # needs the solver run here, and every platform shares the same
+        # logical->physical remap.
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
+        ):
+            lp_routed_ids = (
+                topk_ids[:, :-num_shared_topk_slots]
+                if router_wrote_shared_cols
+                else topk_ids
+            )
+            log2phy_prob = solve_lplb_prob(
+                lp_routed_ids, expert_location_dispatch_info, layer_id
+            )
         if num_shared_topk_slots > 0:
             shared_cols = topk_ids[:, -num_shared_topk_slots:]
             routed_cols = topk_ids_logical_to_physical(
-                topk_ids[:, :-num_shared_topk_slots], expert_location_dispatch_info
+                topk_ids[:, :-num_shared_topk_slots],
+                expert_location_dispatch_info,
+                log2phy_prob,
             )
             _mask_topk_ids_padded_region(routed_cols, num_token_non_padded)
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             recorder_topk_ids = routed_cols
         else:
             topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
+                topk_ids, expert_location_dispatch_info, log2phy_prob
             )
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
