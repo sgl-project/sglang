@@ -422,6 +422,7 @@ impl KvEventIndex {
                 peers: Arc::clone(&peers),
                 snapshot_http: snapshot_http.clone(),
                 bootstrap_tx: bootstrap_tx.clone(),
+                block_size_oracle: Arc::clone(&block_size_oracle),
                 ctrl_tx: ctrl_tx.downgrade(),
             },
             pump_cancel.clone(),
@@ -558,9 +559,10 @@ impl KvEventIndex {
             );
             return;
         }
-        // Establish the bigram flag alongside block_size. EAGLE-family workers
-        // hash KV blocks over token bigrams, so the policy must use the bigram
-        // hasher for its query hashes to match the worker's stored hashes.
+        // Seed the bigram flag alongside block_size from `speculative_algorithm`.
+        // It's only a guess: hybrid-SSM workers stay unigram under EAGLE/MTP,
+        // so the mode observed in the worker's events overrides it
+        // (`observe_hash_mode`).
         self.block_size_oracle.set_bigram(cfg.is_bigram);
         let kv_dp_ranks = if self.maintain_tree {
             subscribable_ranks(cfg.port_base, cfg.dp_size)
@@ -811,6 +813,8 @@ struct PumpDeps {
     /// Obligation queue, so a gap-discarded rank can be handed back for another
     /// sweep instead of staying cold with budget unspent.
     bootstrap_tx: mpsc::Sender<ObligationBatch>,
+    /// Learns each worker's actual block-hash mode from its `BlockStored` events.
+    block_size_oracle: Arc<BlockSizeOracle>,
     /// Loopback into this pump's own control channel, so a probe answer arrives
     /// on the single writer like every other tree mutation.
     ///
@@ -849,6 +853,7 @@ async fn pump_loop(
         peers,
         snapshot_http,
         bootstrap_tx,
+        block_size_oracle,
         ctrl_tx,
     } = deps;
     let pump_state = PumpState {
@@ -1126,6 +1131,9 @@ async fn pump_loop(
                 seq,
                 mut batch,
             } => {
+                // Before any hold-back below, which sheds `token_ids` and may
+                // delay applying the batch.
+                observe_hash_mode(&block_size_oracle, &batch);
                 // A rank still awaiting its snapshot holds its batches: applying
                 // them first would put live deltas *under* the snapshot, where a
                 // stale `BlockStored` from the peer could resurrect a block this
@@ -1291,6 +1299,20 @@ struct PumpState<'a> {
     /// Obligation queue, so the graft path can hand a gapped rank back for
     /// another sweep. See [`resolve_gap`].
     bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
+}
+
+/// Feed the oracle the hash mode of the first `BlockStored` in `batch` that
+/// carries tokens. The engine picks bigram or unigram block keys per cache type,
+/// so the events, not `speculative_algorithm`, are the source of truth for the
+/// query hasher. An event without tokens says nothing about the mode.
+fn observe_hash_mode(oracle: &BlockSizeOracle, batch: &KvEventBatch) {
+    let observed = batch.events.iter().find_map(|event| match event {
+        KvCacheEvent::BlockStored(b) if !b.token_ids.is_empty() => Some(b.is_bigram),
+        _ => None,
+    });
+    if let Some(is_bigram) = observed {
+        oracle.observe_bigram(is_bigram);
+    }
 }
 
 /// Apply one batch, honouring the cursor's out-of-order filter.
