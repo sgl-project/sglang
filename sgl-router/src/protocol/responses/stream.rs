@@ -183,7 +183,7 @@ impl ResponsesStream {
             return;
         }
         if !matches!(self.open, Some(Open::Reasoning { .. })) {
-            self.close_open(Finish::Completed, Some("commentary"), out);
+            self.close_open_with_phase(Finish::Completed, Some("commentary"), out);
             let id = new_id("rs");
             let index = self.next_index();
             let mut item = reasoning_item(&id, "", "in_progress", &self.echo);
@@ -239,7 +239,7 @@ impl ResponsesStream {
             return;
         }
         if !matches!(self.open, Some(Open::Message { .. })) {
-            self.close_open(Finish::Completed, Some("commentary"), out);
+            self.close_open(Finish::Completed, out);
             let id = new_id("msg");
             let index = self.next_index();
             let mut item = message_item(&id, "", "in_progress");
@@ -297,7 +297,7 @@ impl ResponsesStream {
                 // Only a new call follows held text in generation order; a
                 // continuing delta is the engine sending a step's text first.
                 self.last_held = false;
-                self.close_open(Finish::Completed, Some("commentary"), out);
+                self.close_open_with_phase(Finish::Completed, Some("commentary"), out);
                 let call = Call {
                     id: new_id("fc"),
                     index: self.next_index(),
@@ -339,7 +339,12 @@ impl ResponsesStream {
         }
     }
 
-    fn close_open(&mut self, finish: Finish, phase: Option<&str>, out: &mut Vec<u8>) {
+    fn close_open(&mut self, finish: Finish, out: &mut Vec<u8>) {
+        let phase = (finish != Finish::Aborted).then_some("final_answer");
+        self.close_open_with_phase(finish, phase, out);
+    }
+
+    fn close_open_with_phase(&mut self, finish: Finish, phase: Option<&str>, out: &mut Vec<u8>) {
         let Some(open) = self.open.take() else {
             return;
         };
@@ -457,7 +462,7 @@ impl ResponsesStream {
         };
         self.ensure_started(out);
         let finish = Finish::from_chat(Some(&reason));
-        self.close_open(finish, Some("final_answer"), out);
+        self.close_open(finish, out);
         // Only the item generated last can have been cut off.
         let (calls_finish, held_finish) = if self.last_held {
             (Finish::Completed, finish)
@@ -466,7 +471,7 @@ impl ResponsesStream {
         };
         self.close_calls(calls_finish, out);
         self.flush_held(out);
-        self.close_open(held_finish, Some("final_answer"), out);
+        self.close_open(held_finish, out);
         let mut resp = self.response(finish.status());
         finish.annotate(&mut resp);
         self.emit(finish.event(), json!({ "response": resp }), out);
@@ -477,7 +482,7 @@ impl ResponsesStream {
     fn emit_failed(&mut self, message: &str, out: &mut Vec<u8>) {
         self.ensure_started(out);
         self.held.clear();
-        self.close_open(Finish::Aborted, None, out);
+        self.close_open(Finish::Aborted, out);
         self.close_calls(Finish::Aborted, out);
         let mut resp = self.response("failed");
         resp["error"] = failed_error(message);
