@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_flux2_strided_qknorm_rope,
@@ -13,6 +14,9 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm_with_optional_rope,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
+    flashinfer_apply_rope_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits import flux_2
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -47,6 +51,15 @@ def reference(q, k, qn, kn, cache):
     )
 
 
+def _packed_qk_fusion_supported() -> bool:
+    """The dispatch this test covers mounts on NVIDIA SM90 and newer."""
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and current_arch().is_sm_at_least(9, 0)
+    )
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip is None, "NVIDIA CUDA required"
 )
@@ -76,17 +89,32 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                             packed.view(torch.int16), original.view(torch.int16)
                         )
                     )
-                    if can_use_flux2_strided_qknorm_rope(
-                        q, k, qn.weight, kn.weight, cache
-                    ):
+                    if _packed_qk_fusion_supported():
+                        self.assertTrue(
+                            can_use_flux2_strided_qknorm_rope(
+                                q, k, qn.weight, kn.weight, cache
+                            )
+                        )
                         self.assertTrue(gate.verified)
                         self.assertFalse(gate.disabled)
-                        self.assert_bits(
-                            flux2_strided_qknorm_rope(
-                                q, k, qn.weight, kn.weight, cache, qn.variance_epsilon
-                            ),
-                            reference(q, k, qn, kn, cache),
-                        )
+                        if flashinfer_apply_rope_inplace is not None:
+                            # Bit-exactness is contracted against
+                            # FlashInfer's interleaved RoPE, the dispatch
+                            # this kernel replaces. Without FlashInfer the
+                            # reference takes a different rounding path and
+                            # the runtime BitExactFusionGate, not this
+                            # test, decides.
+                            self.assert_bits(
+                                flux2_strided_qknorm_rope(
+                                    q,
+                                    k,
+                                    qn.weight,
+                                    kn.weight,
+                                    cache,
+                                    qn.variance_epsilon,
+                                ),
+                                reference(q, k, qn, kn, cache),
+                            )
                     else:
                         self.assertFalse(gate.verified)
                         self.assertFalse(gate.disabled)
