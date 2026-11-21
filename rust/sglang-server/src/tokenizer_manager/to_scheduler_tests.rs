@@ -1672,6 +1672,7 @@ fn tokenizer_pool_return_leaves_fitted_prompt_ids() {
                 prompt_token_ids: Some(slot.clone()),
                 ..Default::default()
             })),
+            pipeline_guard: None,
         });
         let mut req = tok_rx.try_recv().expect("text goes to the tokenizer pool");
         if aborted {
