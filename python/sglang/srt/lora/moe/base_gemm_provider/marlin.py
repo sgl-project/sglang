@@ -32,6 +32,8 @@ class MarlinRowState(PairRowState, kw_only=True):
 class MarlinPairProvider(PairRowDomainProvider):
     _use_atomic_add = True
     _is_fp8 = False
+    # LoRA blocks can hold shared memory needed by the down GEMM at launch.
+    down_gemm_first = True
     derived_base_weights = "the Marlin-repacked expert weights"
 
     def __init__(self, quant_info: MoeLoraMarlinQuantInfo):
