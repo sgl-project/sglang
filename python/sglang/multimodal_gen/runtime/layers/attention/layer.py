@@ -74,7 +74,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -794,11 +797,14 @@ class LocalAttention(nn.Module):
                 k_ = k_.repeat_interleave(repeat_factor, dim=1)
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
-            sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-                if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                else nullcontext()
-            )
+            if current_platform.masked_sdpa_needs_math(q_.shape[-1]):
+                sdpa_context = sdpa_kernel(SDPBackend.MATH)
+            elif self.allow_cudnn_sdp and q_.device.type == "cuda":
+                sdpa_context = sdpa_kernel(
+                    _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True
+                )
+            else:
+                sdpa_context = nullcontext()
             attn_kwargs = {
                 "attn_mask": mask,
                 "dropout_p": 0.0,

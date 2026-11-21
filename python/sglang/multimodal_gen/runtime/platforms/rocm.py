@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import (
+    get_hip_version,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
@@ -65,6 +66,18 @@ class RocmPlatform(Platform):
     def is_gfx1151(cls) -> bool:
         return torch.cuda.is_available() and cls.get_gcn_arch_name().startswith(
             "gfx1151"
+        )
+
+    # Workaround: torch built for ROCm 7.2 (AOTriton 0.11.2) efficient SDPA
+    # returns wrong masked outputs for head dims 32/48/96; these measured
+    # correct. Drop once fixed upstream.
+    _MASKED_EFFICIENT_SDPA_HEAD_DIMS = (16, 64, 80, 128, 256)
+
+    @classmethod
+    def masked_sdpa_needs_math(cls, head_dim: int) -> bool:
+        return (
+            get_hip_version()[:2] == (7, 2)
+            and head_dim not in cls._MASKED_EFFICIENT_SDPA_HEAD_DIMS
         )
 
     @classmethod
