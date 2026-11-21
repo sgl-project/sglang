@@ -69,6 +69,19 @@ __global__ void merge_attn_states_kernel(
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 
   const float max_lse = fmaxf(p_lse, s_lse);
+
+  // Both sides empty (p_lse = s_lse = -inf, e.g. a chunk with no keys for this token): -inf - (-inf)
+  // below is NaN. Write zeros and keep the LSE at -inf so later merges see an empty state.
+  if (std::isinf(max_lse)) {
+    if (pack_offset < head_size) {
+      reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_offset / pack_size] = make_uint4(0, 0, 0, 0);
+    }
+    if (output_lse != nullptr && pack_idx == 0) {
+      output_lse[token_idx * num_heads + head_idx] = max_lse;
+    }
+    return;
+  }
+
   p_lse = p_lse - max_lse;
   s_lse = s_lse - max_lse;
   const float p_se = expf(p_lse);
