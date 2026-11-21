@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     resolve_sampling_params_cls,
 )
+from sglang.multimodal_gen.runtime.loader import weight_prefetch
 from sglang.multimodal_gen.runtime.managers.worker_bootstrap import (
     SchedulerProcessSpec,
     ServerArgsPayload,
@@ -198,6 +199,45 @@ def _start_scheduler_processes(
     return processes
 
 
+def _log_weight_prefetch_done(bytes_read: int, seconds: float) -> None:
+    logger.info(
+        "[server-load] weight prefetch done: %.1f GB in %.1f s (%.1f GB/s)",
+        bytes_read / 1e9,
+        seconds,
+        bytes_read / 1e9 / max(seconds, 1e-9),
+    )
+
+
+def _start_weight_prefetch(server_args: ServerArgs) -> None:
+    """Warm the page cache with the pipeline's weights while the workers start."""
+    if not server_args.weight_loader_prefetch_checkpoints:
+        return
+    overrides = {**server_args.component_paths, **server_args.component_weights_paths}
+    if server_args.transformer_weights_path is not None:
+        overrides["transformer"] = server_args.transformer_weights_path
+    files = weight_prefetch.pipeline_weight_files(
+        server_args.model_path,
+        revision=server_args.revision,
+        model_subfolder=server_args.model_subfolder,
+        model_variant=server_args.model_variant,
+        component_overrides=overrides,
+    )
+    planned_bytes = weight_prefetch.start_weight_prefetch(
+        files, on_done=_log_weight_prefetch_done
+    )
+    if planned_bytes:
+        logger.info(
+            "[server-load] weight prefetch: %d files, %.1f GB",
+            len(files),
+            planned_bytes / 1e9,
+        )
+    else:
+        logger.info(
+            "[server-load] weight prefetch skipped: no local safetensors weights "
+            "to read, or they exceed the host memory headroom"
+        )
+
+
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     Args:
@@ -221,6 +261,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     local_num_gpus = num_gpus // nnodes
     rank_offset = node_rank * local_num_gpus
     server_args_payload = ServerArgsPayload.capture(server_args)
+    _start_weight_prefetch(server_args)
     processes = _start_scheduler_processes(
         server_args_payload,
         [(i, rank_offset + i) for i in range(local_num_gpus)],
