@@ -1547,11 +1547,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # step slots, gather back after (pad steps are never committed).
                 batch_size = query_start_loc.shape[0] - 1
                 num_dense_tokens = batch_size * draft_token_num
-                dense_token_indices = ragged_verify_dense_scatter_indices(
-                    query_start_loc=query_start_loc,
-                    seq_len=seq_len,
-                    draft_token_num=draft_token_num,
-                )
+                dense_token_indices = forward_metadata.ragged_dense_token_indices
+                if (
+                    dense_token_indices is None
+                    or dense_token_indices.shape[0] != seq_len
+                ):
+                    dense_token_indices = ragged_verify_dense_scatter_indices(
+                        query_start_loc=query_start_loc,
+                        seq_len=seq_len,
+                        draft_token_num=draft_token_num,
+                    )
+                    forward_metadata.ragged_dense_token_indices = dense_token_indices
                 dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
                 dense.index_copy_(0, dense_token_indices, mixed_qkv)
                 mixed_qkv_dense = dense[:num_dense_tokens].view(

@@ -520,9 +520,11 @@ def test_gdn_compact_ragged_verify_replayssm_cuda_graph():
         req_pool_indices=cache_idx,
     )
 
-    # Warmup & capture
+    # Warmup & capture (fresh ForwardMetadata for capture so hoisted scatter
+    # indices are recorded inside the captured graph, matching _capture_metadata).
     _ = backend.forward_extend(layer, fb, mixed_qkv_buf, a_buf, b_buf)
     torch.cuda.synchronize()
+    backend.forward_metadata.ragged_dense_token_indices = None
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         out_buf = backend.forward_extend(layer, fb, mixed_qkv_buf, a_buf, b_buf)
