@@ -130,7 +130,10 @@ class TestBatchStagingReservations(CustomTestCase):
         scheduler = SimpleNamespace(
             disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
         )
-        batch = SimpleNamespace(reqs=[SimpleNamespace(bootstrap_room=7, extend_end=33)])
+        req = SimpleNamespace(
+            bootstrap_room=7, extend_end=33, disagg_decode_prefix_len=0
+        )
+        batch = SimpleNamespace(reqs=[req])
         run = SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
             run(scheduler, batch)
@@ -164,7 +167,10 @@ class TestBatchStagingReservations(CustomTestCase):
         scheduler = SimpleNamespace(
             disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
         )
-        batch = SimpleNamespace(reqs=[SimpleNamespace(bootstrap_room=7, extend_end=16)])
+        req = SimpleNamespace(
+            bootstrap_room=7, extend_end=160, disagg_decode_prefix_len=128
+        )
+        batch = SimpleNamespace(reqs=[req])
         socket = Mock()
         with (
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
@@ -176,9 +182,9 @@ class TestBatchStagingReservations(CustomTestCase):
                 scheduler, batch
             )
             self.assertEqual(socket.send_multipart.call_count, 1)
-            manager.add_transfer_request(7, np.array([0]), slice(0, 1), False)
+            manager.add_transfer_request(7, np.array([0, 1]), slice(0, 2), False)
             self.assertEqual(socket.send_multipart.call_count, 1)
-            batch.reqs[0].extend_end = 33
+            req.extend_end = 161
             SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
                 scheduler, batch
             )

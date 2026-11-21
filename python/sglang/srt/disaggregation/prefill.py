@@ -688,7 +688,8 @@ class SchedulerDisaggregationPrefillMixin:
             room = req.bootstrap_room
             if room is not None and room in kv_mgr.transfer_infos:
                 if lazy and req.extend_end is not None:
-                    prefetch(room, upto_tokens=req.extend_end)
+                    upto_tokens = max(0, req.extend_end - req.disagg_decode_prefix_len)
+                    prefetch(room, upto_tokens=upto_tokens)
                 else:
                     prefetch(room)
 
