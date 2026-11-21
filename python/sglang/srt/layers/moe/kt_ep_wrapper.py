@@ -108,10 +108,10 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
         num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
 
     Returns:
-        A copy of topk_ids with CPU expert IDs masked as -1; topk_ids is unchanged
+        Modified topk_ids tensor with CPU expert IDs masked as -1
     """
-    # Out of place: topk_ids may be a persistent routing buffer (see aiter_topk.py).
-    return topk_ids.masked_fill(topk_ids >= num_gpu_experts, -1)
+    topk_ids[topk_ids >= num_gpu_experts] = -1
+    return topk_ids
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):

@@ -14,7 +14,12 @@ from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
     is_tbo_enabled,
 )
-from sglang.srt.runtime_context import get_context, get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -76,8 +81,8 @@ def _shared_columns(
             device=device,
         )
         cached = config.aiter_shared_columns = (key, weights, ids)
-    # Captured graphs keep writing the first buffer, so a changed layout falls back
-    # instead of replacing it.
+    # Captured graphs keep writing the first buffer,
+    # so a changed layout falls back instead of replacing it.
     if cached[0] != key:
         return None
     return cached[1], cached[2]
@@ -130,6 +135,8 @@ def try_select_experts(
         # The other micro-batch may route through this layer before this one's
         # experts read the layer's single buffer.
         or is_tbo_enabled()
+        # KT masks CPU expert IDs in place, which would overwrite the persistent shared column.
+        or get_exec().moe.kt_weight_path is not None
         or num_token_non_padded is not None
         or expert_location_dispatch_info is not None
         or has_per_rank_fused_shared_slots(n_shared)

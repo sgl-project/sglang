@@ -42,7 +42,7 @@ register_amd_ci(est_time=180, suite="base-b-test-1-gpu-small-amd")
 
 
 def _publish(test):
-    """Publish a default config with fresh resources for the test's lifetime."""
+    # Publish a default config with fresh resources for the test's lifetime.
     reset_context()
     test.addCleanup(reset_context)
     get_context().override_server_args().install()
@@ -204,6 +204,8 @@ class _FakeAiterBiasedGroupedTopk:
                 "weights_shape": tuple(topk_weights.shape),
                 "weights_row_stride": topk_weights.stride(0),
                 "ids_row_stride": topk_ids.stride(0),
+                "gating_dtype": gating_output.dtype,
+                "bias_dtype": correction_bias.dtype,
                 "weights_ptr": topk_weights.data_ptr(),
                 "ids_ptr": topk_ids.data_ptr(),
             }
@@ -307,6 +309,11 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             with get_context().override_server_args(tp_size=2, ep_size=2):
                 self.assertIsNone(fuse(self._config()))
 
+        with self.subTest(case="kt_cpu_experts"):
+            # KT masks CPU expert IDs in place, so it must not see the persistent buffer.
+            with get_context().override_server_args(kt_weight_path="/kt/weights"):
+                self.assertIsNone(fuse(self._config()))
+
         with self.subTest(case="per_rank_shared_slots"):
             with get_flags().moe.override(a2a_backend=MoeA2ABackend.DEEPEP):
                 self.assertIsNone(fuse(self._config()))
@@ -408,6 +415,75 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         self.assertTrue(
             torch.all(second.topk_ids[:, self.TOPK_ROUTED :] == self.NUM_EXPERTS)
         )
+
+    def test_changed_layout_keeps_the_first_buffer_and_falls_back(self):
+        """Captured graphs keep writing the first buffer, so a config whose
+        shared-column layout changed takes the ordinary path and leaves it."""
+        config = self._config()
+        self.assertIsNotNone(self._fuse(config))
+        cached = config.aiter_shared_columns
+        config.fused_shared_experts_scaling_factor = 0.5
+
+        self.assertIsNone(self._fuse(config))
+        self.assertIs(config.aiter_shared_columns, cached)
+        self.assertEqual(len(self.fake_kernel.calls), 1)
+
+    def test_routes_in_the_dtype_the_ordinary_path_uses(self):
+        """An fp32 bias routes in fp32; any other bias is cast to the logits dtype."""
+        for bias_dtype, expected in (
+            (torch.float32, torch.float32),
+            (torch.bfloat16, torch.bfloat16),
+        ):
+            with self.subTest(bias_dtype=bias_dtype):
+                self.fake_kernel.calls.clear()
+                config = self._config(
+                    correction_bias=torch.randn(
+                        (self.NUM_EXPERTS,), dtype=bias_dtype, device=get_device()
+                    )
+                )
+                self.assertIsNotNone(self._fuse(config))
+                (call,) = self.fake_kernel.calls
+                self.assertEqual(call["gating_dtype"], expected)
+                self.assertEqual(call["bias_dtype"], expected)
+
+    def test_per_token_bias_and_router_partials_skip_the_fusion(self):
+        """select_experts does not try the fusion with a per-token expert bias or
+        ROCm router partials, which the ordinary path consumes."""
+
+        class _Ordinary(Exception):
+            pass
+
+        hidden_states, router_logits = self._inputs(37)
+        config = self._config(scoring_func="sigmoid")
+        cases = {
+            "dynamic_expert_bias": (
+                "biased_grouped_topk_impl",
+                dict(dynamic_expert_bias=torch.zeros_like(router_logits)),
+            ),
+            "router_logits_partials": (
+                "biased_grouped_topk",
+                dict(
+                    router_logits_partials=torch.zeros(
+                        (1, 37, self.NUM_EXPERTS),
+                        dtype=torch.float32,
+                        device=get_device(),
+                    )
+                ),
+            ),
+        }
+        for name, (ordinary, kwargs) in cases.items():
+            with (
+                self.subTest(case=name),
+                patch.object(topk_module, "_is_hip", True),
+                patch.object(topk_module, "_use_aiter", True),
+                patch.object(topk_module, ordinary, side_effect=_Ordinary),
+            ):
+                with self.assertRaises(_Ordinary):
+                    topk_module.select_experts(
+                        hidden_states, router_logits, config, **kwargs
+                    )
+        self.assertEqual(self.fake_kernel.calls, [])
+        self.assertIsNone(config.aiter_shared_columns)
 
     def test_buffer_is_released_with_its_config(self):
         """A buffer lives as long as its routing config, so dropping a model
