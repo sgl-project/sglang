@@ -9,27 +9,22 @@ def pack_groups(tokens_per_group: torch.Tensor, num_nodes: int) -> torch.Tensor:
     assert num_groups % num_nodes == 0
     groups_per_rank = num_groups // num_nodes
 
-    indices = tokens_per_group.float().sort(-1, descending=True).indices.cpu()
-    ret = torch.full_like(
-        tokens_per_group, fill_value=-1, dtype=torch.int64, device="cpu"
-    )
+    indices_list = tokens_per_group.float().sort(-1, descending=True).indices.tolist()
+    tokens_per_group_list = tokens_per_group.tolist()
+    ret_list = [[-1] * num_groups for _ in range(num_layers)]
     for layer in range(num_layers):
         node_tokens = [0] * num_nodes
         node_groups = [0] * num_nodes
-        for group in indices[layer]:
-
-            def key_func(rank: int) -> int:
-                if node_groups[rank] >= groups_per_rank:
-                    return 1, 0
-                else:
-                    return 0, node_tokens[rank]
-
-            rank = min(range(num_nodes), key=key_func)
+        for group in indices_list[layer]:
+            rank = min(
+                (r for r in range(num_nodes) if node_groups[r] < groups_per_rank),
+                key=node_tokens.__getitem__,
+            )
             assert node_groups[rank] < groups_per_rank
-            ret[layer, group] = rank * groups_per_rank + node_groups[rank]
-            node_tokens[rank] += tokens_per_group[layer, group]
+            ret_list[layer][group] = rank * groups_per_rank + node_groups[rank]
+            node_tokens[rank] += tokens_per_group_list[layer][group]
             node_groups[rank] += 1
-    return ret
+    return torch.tensor(ret_list, dtype=torch.int64, device="cpu")
 
 
 def make_redundant_experts_chunkwise(
