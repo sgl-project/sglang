@@ -738,8 +738,12 @@ class HiCacheNixl(HiCacheStorage):
             if self._logical_anchor:
                 bounce[:page_num].fill_(1)
             else:
-                for i, page_offset in enumerate(host_indices[::page_size].tolist()):
-                    src = self.mem_pool_host.get_data_page(page_offset, flat=True)
+                host_indices = host_indices[::page_size].tolist()
+                page_size = 1
+                for i in range(page_num):
+                    src = self.mem_pool_host.get_data_page(
+                        host_indices[i * page_size], flat=True
+                    )
                     bounce[i].copy_(src)
 
         host_buffers = self._bounce_slot_buffers(bounce, page_num)
@@ -792,13 +796,15 @@ class HiCacheNixl(HiCacheStorage):
 
         if self._logical_anchor:
             return results
+        host_indices = host_indices[::page_size].tolist()
+        page_size = 1
 
         # non zero copy: copy data from the get-side bounce buffer to mem_pool_host
-        for i, page_offset in enumerate(host_indices[::page_size].tolist()):
+        for i in range(page_num):
             if not results[i]:
                 break
             self.mem_pool_host.set_from_flat_data_page(
-                page_offset, self._bounce_get[i]
+                host_indices[i * page_size], self._bounce_get[i]
             )
         return results
 
