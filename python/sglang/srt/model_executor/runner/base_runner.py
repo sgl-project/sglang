@@ -551,7 +551,16 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # A speculative target prefills with plain EXTEND forwards, so an EXTEND
+        # dummy keeps its mode; its other dummies take the verify shape.
+        _is_target_extend = (
+            forward_mode_override == ForwardMode.EXTEND and not mr.is_draft_worker
+        )
+        if (
+            mr.spec_algorithm.is_speculative()
+            and not _is_pd_prefill_target
+            and not _is_target_extend
+        ):
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
@@ -559,11 +568,8 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
-            assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
-            ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
+            assert capture_forward_mode == ForwardMode.EXTEND, (
+                "extend_num_tokens_per_req requires an EXTEND dummy"
             )
             num_tokens_per_req = extend_num_tokens_per_req
 

@@ -21,7 +21,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    get_global_server_args,
+)
 
 
 class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
@@ -229,7 +232,11 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
 
         # Parallel tiling gives each replicated rank complete tiles, then gathers
         # them before the seeded posterior sample.
-        prepared = minimax_h3_prepared_keyframes(batch, plan)
+        prepared = minimax_h3_prepared_keyframes(
+            batch,
+            plan,
+            keyframe_fit=get_global_server_args().pipeline_config.keyframe_fit,
+        )
         prepared_indices = tuple(prepared.get("semantic_frame_indices") or ())
         if prepared_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES or len(
             prepared.get("images") or ()

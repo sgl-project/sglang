@@ -360,6 +360,9 @@ class TestAllocationIntegration(CustomTestCase):
             cache_request_handle=CacheRequestHandle(rid="retry", attempt_id=0),
             prefill_attempt_count=1,
             output_ids=[42],
+            grammar=None,
+            return_logprob=False,
+            return_sampling_mask=False,
             skip_radix_cache_insert=False,
             kv=SimpleNamespace(cache_protected_len=16),
             full_untruncated_fill_ids=list(range(32)),
@@ -441,6 +444,9 @@ class TestAllocationIntegration(CustomTestCase):
         req.multimodal_inputs = Mock()
         req.prefill_attempt_count = 0
         req.output_ids = [42]
+        req.grammar = None
+        req.return_logprob = False
+        req.return_sampling_mask = False
         req.skip_radix_cache_insert = False
         req.kv = SimpleNamespace(cache_protected_len=16)
         req.full_untruncated_fill_ids = list(range(32))
@@ -652,6 +658,7 @@ class TestAllocationIntegration(CustomTestCase):
             req.pending_bootstrap = True
             req.disagg_kv_sender = self.sender(room=i + 1)
         scheduler = self.inflight_scheduler(reqs)
+        scheduler.prefill_admission_no_token = False
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
         waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)

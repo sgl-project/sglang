@@ -19,9 +19,9 @@ use sglang_processor::openai::{
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
-use super::super::dp_relay::HintRoute;
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
+use super::pd_routing::HintRoute;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
 use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};

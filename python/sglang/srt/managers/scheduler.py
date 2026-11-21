@@ -1417,6 +1417,9 @@ class Scheduler(
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # The last prefill admission pass refused a request with NO_TOKEN; the
+        # PD prefill parked-yield rule reads and clears it.
+        self.prefill_admission_no_token = False
         self.result_queue: deque[
             tuple[ScheduleBatch, GenerationBatchResult | EmbeddingBatchResult]
         ] = deque()
@@ -4588,6 +4591,7 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        self.prefill_admission_no_token = False
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4752,6 +4756,13 @@ class Scheduler(
         chunk_parked = (
             self.chunked_req is not None and self.chunked_req not in adder.can_run_list
         )
+        if (
+            chunk_parked
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.has_bootstrapped_parked_chunk()
+        ):
+            # No KV for the next chunk of a bootstrapped request: refused as well.
+            self.prefill_admission_no_token = True
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
@@ -4877,6 +4888,8 @@ class Scheduler(
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._drop_unadmitted_match(req)
+                    if res == AddReqResult.NO_TOKEN:
+                        self.prefill_admission_no_token = True
                 if res == AddReqResult.UNSCHEDULABLE and not added:
                     # Nothing holding memory will give it back: waiting would
                     # keep the request queued forever.

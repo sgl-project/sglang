@@ -3919,7 +3919,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
-            # Parked hits first (FIFO fairness with retries; buffer only).
+            # Parked hits first, in line order (buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
                 while parked:

@@ -66,6 +66,7 @@ def _build_batch(seq_specs, with_token_ids):
         extend_return_top_logprob=True,
         extend_token_ids_logprob=with_token_ids,
         top_logprobs_nums=[TOPK_CYCLE[i % 3] for i in range(len(seq_specs))],
+        input_candidate_selectors=None,
         extend_logprob_pruned_lens_cpu=pruned_lens,
         extend_input_logprob_token_ids_gpu=torch.zeros(
             len(input_logprob_indices), dtype=torch.int64

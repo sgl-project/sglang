@@ -376,6 +376,10 @@ class ReqState:
     input_top_logprobs_scheduler_flat: Optional[Tuple[np.ndarray, np.ndarray, int]] = (
         None
     )
+    # Weights of an input candidate selector's candidates (float32 [rows, k]),
+    # sent once at prefill completion, and their cached response fields.
+    input_top_logprobs_weights: Optional[np.ndarray] = None
+    input_top_logprobs_weights_fields: Optional[Dict[str, Any]] = None
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -528,6 +532,27 @@ def _add_sampling_mask_to_meta_info(
                 return_b64=state.obj.return_flat_raw_sampling_mask_b64,
             )
         )
+
+
+def _build_top_logprobs_weights_fields(
+    weights: np.ndarray, num_positions: int, flat: bool, return_b64: bool
+) -> Dict[str, Any]:
+    """Build the response fields for the [rows, k] weights of prompt top
+    logprob candidates. Nested: one row per position, null where
+    `input_top_logprobs` is. Flat: the layout of `input_top_logprobs_shape`
+    and `input_top_logprobs_null_prefix`."""
+    if not flat:
+        # The first position alone has no row, as in `input_top_logprobs`.
+        assert num_positions == weights.shape[0] + 1, (num_positions, weights.shape)
+        return {"input_top_logprobs_weights": [None] + weights.tolist()}
+    if return_b64:
+        return {
+            "input_top_logprobs_weights_flat_b64": pybase64.b64encode(
+                weights.tobytes()
+            ).decode("utf-8"),
+            "input_top_logprobs_weights_flat_b64_dtype": "float32",
+        }
+    return {"input_top_logprobs_weights_flat": weights.reshape(-1).tolist()}
 
 
 class InputFormat(Enum):
@@ -3369,6 +3394,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
+            if state.input_top_logprobs_weights is not None:
+                if state.input_top_logprobs_weights_fields is None:
+                    state.input_top_logprobs_weights_fields = (
+                        _build_top_logprobs_weights_fields(
+                            state.input_top_logprobs_weights,
+                            len(state.input_top_logprobs_val),
+                            flat=use_flat,
+                            return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                        )
+                    )
+                meta_info.update(state.input_top_logprobs_weights_fields)
             use_flat_output = state.obj.return_flat_raw_output_top_logprobs
             # Built once on the finished response; streaming is rejected and
             # only that response reaches a non-streaming client.
@@ -3492,6 +3528,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
+            # An entry per request of the batch, None without weights.
+            assert recv_obj.input_top_logprobs_weights is None or len(
+                recv_obj.input_top_logprobs_weights
+            ) == len(recv_obj.rids)
+            if (
+                recv_obj.input_top_logprobs_weights is not None
+                and recv_obj.input_top_logprobs_weights[recv_obj_index] is not None
+            ):
+                state.input_top_logprobs_weights = recv_obj.input_top_logprobs_weights[
+                    recv_obj_index
+                ]
             if recv_obj.output_top_logprobs_val is not None:
                 state.output_top_logprobs_val.extend(
                     recv_obj.output_top_logprobs_val[recv_obj_index]

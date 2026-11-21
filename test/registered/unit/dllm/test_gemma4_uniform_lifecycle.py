@@ -40,6 +40,7 @@ class _Req(FakeReq):
             kv_committed_len=context_len + block_size,
         )
         self.finished_reason = None
+        self.ignored_stop_token_len = None
         self.finish_on_update = False
         self.retracted_stain = False
         self.sampling_params = SimpleNamespace(max_new_tokens=1024)

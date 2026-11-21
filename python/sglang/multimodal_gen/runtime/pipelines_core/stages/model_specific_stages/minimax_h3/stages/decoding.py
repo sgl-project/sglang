@@ -228,6 +228,25 @@ def _canonical_output_audio_waveform(
     return audio_waveform.permute(1, 0, 2).contiguous()
 
 
+def _trim_audio_to_video_duration(
+    audio_waveform: torch.Tensor, batch: Req, sample_rate: int
+) -> torch.Tensor:
+    """Cut ``[1, C, L]`` audio to the video's duration, as the reference does.
+
+    The audio latents cover whole hops, so the decoded waveform runs past the
+    last video frame (e.g. 165600 samples for 124 frames at 24 fps and 32 kHz,
+    whose duration is 165333 samples). Same rule as the Diffusers Pika H3 Flex
+    audio decode step: ``round(num_frames / fps * sample_rate)``. The base
+    MiniMax-H3 reference keeps the full waveform.
+    """
+    if not batch.num_frames or not batch.fps:
+        return audio_waveform
+    num_samples = round(int(batch.num_frames) / float(batch.fps) * int(sample_rate))
+    if 0 < num_samples < int(audio_waveform.shape[-1]):
+        audio_waveform = audio_waveform[..., :num_samples].contiguous()
+    return audio_waveform
+
+
 _MINIMAX_H3_DECODER_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
 _MINIMAX_H3_CANONICAL_REQUEST_EXTRA_KEY = "minimax_h3_canonical_request"
 _MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY = "minimax_h3_resolved_plan"
@@ -502,6 +521,10 @@ class MiniMaxH3DecodingStage(DecodingStage):
         output_audio_waveform = _canonical_output_audio_waveform(
             audio_waveform, batch_size=batch_size
         )
+        if server_args.pipeline_config.trim_audio_to_video:
+            output_audio_waveform = _trim_audio_to_video_duration(
+                output_audio_waveform, batch, audio_sample_rate
+            )
         streamed_output_path = streamed_video_output_path(
             batch, server_args, batch_size
         )

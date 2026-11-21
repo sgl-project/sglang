@@ -995,11 +995,26 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            # A client may stop reading at a request's finishing event; a proxy
+            # that has not read [DONE] by then sees a cancelled stream. So a
+            # single request's last event, and an error event, go out in one
+            # write with [DONE]. A batch (several prompts, or n > 1) still
+            # writes [DONE] on its own. The tokenizer manager sets is_single
+            # when it normalizes obj, before the first output; one that
+            # normalizes a copy leaves it unset, which reads as a batch.
+            done_sent = False
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
+                    event = b"data: " + dumps_json(out) + b"\n\n"
+                    if (
+                        getattr(obj, "is_single", False)
+                        and out["meta_info"]["finish_reason"] is not None
+                    ):
+                        event += b"data: [DONE]\n\n"
+                        done_sent = True
+                    yield event
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -1017,8 +1032,10 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                     }
                 }
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + dumps_json(out) + b"\n\n"
-            yield b"data: [DONE]\n\n"
+                yield b"data: " + dumps_json(out) + b"\n\ndata: [DONE]\n\n"
+                done_sent = True
+            if not done_sent:
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
             stream_results(),

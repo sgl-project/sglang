@@ -118,7 +118,7 @@ class TestRustServerRequestLogAndCrashDump(CustomTestCase):
             finish = re.search(
                 rf"^\[[\d\- :]+\] Finish: obj=GenerateReqInput\(rid='{obj.rid}', .*"
                 rf"out=\{{'meta_info': \{{'id': '{obj.rid}', .*'finish_reason': "
-                r"\{'type': 'length', 'length': 4\}",
+                r"\{'type': 'length', 'length': 4, 'ignored_stop': None\}",
                 log,
                 re.MULTILINE,
             )

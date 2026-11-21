@@ -199,6 +199,22 @@ def get_vmm_feature_consumer_count() -> int:
     return get_mm_feature_consumer_count()
 
 
+@dataclass(frozen=True)
+class CudaVmmPoolRegion:
+    """A whole pool handed to an external publisher (see
+    ``CudaVmmMemoryPool.hand_over``): its device, the address of its first byte
+    in this process, its size, and the chunk layout. Every chunk starts and
+    ends on ``alignment`` and opens with ``control_size`` bytes of
+    acknowledgement words, one 32-bit word per consumer."""
+
+    device_index: int
+    base: int
+    size: int
+    control_size: int
+    alignment: int
+    consumer_count: int
+
+
 class CudaVmmMemoryPool:
     """Bounded CUDA VMM pool shared through FABRIC or a local POSIX FD."""
 
@@ -502,6 +518,99 @@ class CudaVmmMemoryPool:
             raise
         finally:
             self._finish_publish()
+
+    def hand_over(self) -> CudaVmmPoolRegion:
+        """Give the whole unused pool to a publisher outside this object, such
+        as a native frontend's media workers, and stop recycling it. From then
+        on ``wrap_tensor`` and ``wrap_tensors`` find no room. The external
+        publisher lays chunks out as they do, zeroes a chunk's control words
+        before publishing it, frees a chunk only once every consumer
+        acknowledged it, and stops writing before ``shutdown``;
+        ``external_proxies`` builds the proxies of what it published."""
+        with self._publisher_condition:
+            self._raise_if_failed()
+            if self._closing or self._closed:
+                raise RuntimeError("CUDA VMM multimodal pool is closing")
+            unused = [_CudaVmmMemoryChunk(0, self.allocation_size)]
+            if self.occupied_chunks or self.available_chunks != unused:
+                raise RuntimeError("only an unused CUDA VMM pool can be handed over")
+            self.available_chunks = []
+        self._stop_recycler.set()
+        return CudaVmmPoolRegion(
+            device_index=self.device_index,
+            base=self.memory_pool.data_ptr(),
+            size=self.allocation_size,
+            control_size=self.control_size,
+            alignment=_CONTROL_ALIGNMENT,
+            consumer_count=self.consumer_count,
+        )
+
+    def external_proxies(
+        self,
+        control_offset: int,
+        tensors: Sequence[tuple[int, Sequence[int], torch.dtype]],
+    ) -> list[CudaVmmTensorTransportProxy]:
+        """The proxies of the tensors an external publisher copied into the
+        chunk at ``control_offset`` (see ``hand_over``), each given as its
+        ``(offset from the chunk's data, shape, dtype)``. A lone tensor at the
+        start of the data gets the proxy ``wrap_tensor`` builds; several share
+        one owner, as ``wrap_tensors`` packs them, so one copy and one
+        acknowledgement cover the chunk. Raises once the pool or its POSIX FD
+        broker failed, as ``wrap_tensor`` does."""
+        self._raise_if_failed()
+        if not tensors:
+            raise ValueError("a published chunk holds at least one tensor")
+        layouts = []
+        for relative_offset, shape, dtype in tensors:
+            shape = torch.Size(shape)
+            layouts.append(
+                _CudaVmmPackedTensorLayout(
+                    relative_offset=relative_offset,
+                    data_nbytes=shape.numel() * dtype.itemsize,
+                    shape=shape,
+                    dtype=dtype,
+                )
+            )
+        data_offset = control_offset + self.control_size
+        data_nbytes = max(
+            layout.relative_offset + layout.data_nbytes for layout in layouts
+        )
+        if (
+            control_offset % _CONTROL_ALIGNMENT
+            or min(layout.relative_offset for layout in layouts) < 0
+            or data_offset + data_nbytes > self.allocation_size
+        ):
+            raise ValueError(
+                f"a published chunk at {control_offset} with {data_nbytes} data "
+                f"bytes is not a chunk of this {self.allocation_size}-byte pool"
+            )
+        transport = dict(
+            fabric_handle=self.fabric_handle,
+            posix_socket_path=self.posix_socket_path,
+            allocation_size=self.allocation_size,
+            control_offset=control_offset,
+            consumer_count=self.consumer_count,
+        )
+        if len(layouts) == 1:
+            (layout,) = layouts
+            if layout.relative_offset != 0:
+                raise ValueError("a tensor alone in its chunk starts the chunk's data")
+            return [
+                CudaVmmTensorTransportProxy(
+                    data_offset=data_offset,
+                    data_nbytes=layout.data_nbytes,
+                    shape=layout.shape,
+                    dtype=layout.dtype,
+                    **transport,
+                )
+            ]
+        owner = _CudaVmmPackedTransportOwner(
+            data_offset=data_offset, data_nbytes=data_nbytes, **transport
+        )
+        return [
+            CudaVmmPackedTensorTransportProxy(owner=owner, layout=layout)
+            for layout in layouts
+        ]
 
     def _copy_into_chunk(
         self,

@@ -34,7 +34,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.enable_hicache_storage = True
-        s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
+        s.tree_cache = SimpleNamespace(
+            buffer_pipeline=None, check_hicache_events=self.calls.drain
+        )
         s._process_storage_prefetch_retries = self.calls.retry
         s.process_pending_chunked_abort = Mock()
         s.process_prefill_chunk = Mock()

@@ -704,7 +704,9 @@ affects Ref2VA image references, not FL2VA keyframes, video, or audio references
 Changing it changes the conditioning input, so keep it fixed for quality and
 performance comparisons; the server does not infer it from the adapter name.
 FastH3 Omni retains its previous `diffusers` default; this native H3 change does
-not alter that distilled release's preprocessing.
+not alter that distilled release's preprocessing. Pika H3 Flex also defaults to
+`diffusers`, which is how its released pipeline resizes image references from
+the 768 tier upwards.
 
 ```bash Command
 curl -sS -X POST http://127.0.0.1:30010/v1/videos \

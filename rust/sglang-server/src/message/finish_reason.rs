@@ -33,12 +33,22 @@ pub enum FinishKind {
     Length {
         #[serde(default)]
         length: Option<u64>,
+        /// Null when unset, as Python writes it; boxed so every [`ChunkEvent`] stays small.
+        #[serde(default)]
+        ignored_stop: Option<Box<IgnoredStop>>,
     },
     /// `FINISH_ABORT` — a scheduler-side termination. Boxed because it is by far
     /// the widest variant and the rarest: unboxed it would set the size of every
     /// [`ChunkEvent`], including the plain stop/length ones (see
     /// `chunk_event_frame_stays_small`).
     Abort(Box<AbortReason>),
+}
+
+/// A length finish's `ignored_stop`: with `ignore_eos`, the output length at
+/// which the first stop token would have ended the request.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct IgnoredStop {
+    pub position: u64,
 }
 
 /// The `FINISH_ABORT` payload. `status_code`/`err_type` are `None` for a plain
@@ -203,7 +213,8 @@ mod tests {
             serde_json::json!({"type": "stop", "matched": 9}),
             serde_json::json!({"type": "stop", "matched": "</s>"}),
             serde_json::json!({"type": "stop", "matched": [9, 10]}),
-            serde_json::json!({"type": "length", "length": 8}),
+            serde_json::json!({"type": "length", "length": 8, "ignored_stop": null}),
+            serde_json::json!({"type": "length", "length": 8, "ignored_stop": {"position": 2}}),
             serde_json::json!({
                 "type": "abort", "message": "Aborted",
                 "status_code": null, "err_type": null

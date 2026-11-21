@@ -36,10 +36,6 @@ from sglang.srt.configs.hy_v4_flash import (
     HYV4FlashTextConfig,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.engram import EngramHasher
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -82,7 +78,7 @@ _DIRECT_WEIGHT_UPDATE_ERROR = (
 
 
 def _maybe_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    if get_tensor_model_parallel_world_size() > 1:
+    if get_parallel().tp_size > 1:
         return tensor_model_parallel_all_reduce(x)
     return x
 
@@ -634,10 +630,7 @@ class FlashEngramHasher(EngramHasher):
 class FlashEngramEmbedding(nn.Module):
     def __init__(self, sizes, dim: int, fp8: bool):
         super().__init__()
-        tp, rank = (
-            get_tensor_model_parallel_world_size(),
-            get_tensor_model_parallel_rank(),
-        )
+        tp, rank = get_parallel().tp_size, get_parallel().tp_rank
         self.head_start, self.head_end = _engram_head_range(sizes, tp, rank)
         self.vocab_start = sum(sizes[: self.head_start])
         self.vocab_end = sum(sizes[: self.head_end])
@@ -693,7 +686,7 @@ class FlashEngram(nn.Module):
         self.total_width = len(sizes) * self.head_dim
         self.start = self.multi_head_embedding.head_start * self.head_dim
         self.stop = self.multi_head_embedding.head_end * self.head_dim
-        self.rank = get_tensor_model_parallel_rank()
+        self.rank = get_parallel().tp_rank
         self.lookup_gamma = nn.Parameter(
             torch.ones(local, self.head_dim, dtype=torch.bfloat16)
         )

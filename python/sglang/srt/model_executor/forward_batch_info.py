@@ -240,6 +240,18 @@ def _elastic_should_preserve_local_token_counts(
     return uneven_token_count
 
 
+def input_candidate_selectors(batch: ScheduleBatch) -> Optional[List[Optional[Any]]]:
+    """The requests' input candidate selectors, or None when an extend batch
+    has none: only prefill reads them."""
+    if (
+        not batch.return_logprob
+        or not batch.forward_mode.is_extend_without_speculative()
+    ):
+        return None
+    selectors = [req.logprob.input_candidate_selector for req in batch.reqs]
+    return selectors if any(s is not None for s in selectors) else None
+
+
 def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
     features = get_exec().features
     mode = features.return_hidden_states_mode
@@ -541,6 +553,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
+    input_candidate_selectors: Optional[List[Optional[Any]]] = None
     token_ids_logprobs: Optional[List[Optional[Union[List[int], TokenIdRows]]]] = None
 
     # For multimodal
@@ -1076,6 +1089,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
+            input_candidate_selectors=input_candidate_selectors(batch),
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,

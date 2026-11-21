@@ -140,6 +140,14 @@ class TestTboFilterBatchMarker(CustomTestCase):
         child = _filter(parent, lo=0, hi=4)
         self.assertIsNone(child.attention_kv_len_lower_bound)
 
+    def test_filter_batch_drops_input_candidate_selectors(self):
+        """The parent's logits processor reads the selectors, as it reads
+        top_logprobs_nums; a batch with one must still split."""
+        parent = _make_target_verify_batch(8)
+        parent.input_candidate_selectors = [object()] + [None] * 7
+        child = _filter(parent, lo=0, hi=4)
+        self.assertIsNone(child.input_candidate_selectors)
+
     def test_filter_batch_drops_aux_hidden_states_buffer(self):
         """Decode graph capture sets the shared aux output on the parent before
         the TBO split; children must not inherit it."""
