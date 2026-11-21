@@ -112,6 +112,10 @@ class NomasPipelineConfig(PipelineConfig):
     def supports_dynamic_batching(self):
         return False
 
+    def supports_sequential_multi_output_inference(self):
+        # A latent session holds one sample, so n outputs run as n requests.
+        return True
+
     def supports_disaggregation(self):
         return False
 
