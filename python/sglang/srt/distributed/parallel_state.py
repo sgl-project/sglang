@@ -2356,6 +2356,36 @@ def graph_capture(stream=None):
             yield context
 
 
+@contextmanager
+def aiter_copy_in_capture():
+    """Capture aiter collectives through the pre-registered input pool, so the
+    capture registers no graph buffers.
+
+    aiter records a captured buffer only if no earlier capture registered its
+    address. A later capture sharing the graph pool would otherwise register a
+    list that depends on each rank's allocator, and ranks would exchange
+    misaligned IPC handles (hipIpcOpenMemHandle fails, or kernels write to the
+    wrong peer buffers). Fixed in aiter by ROCm/aiter#6819; drop this once the
+    ROCm image ships an aiter with it.
+    """
+    if not is_hip():
+        yield
+        return
+    groups = (_TP, _PP, _DCP, _ATTN_TP, _SHARED_EXPERTS_TP, _MOE_EP, _MOE_TP)
+    comms = [
+        comm
+        for comm in (getattr(group, "ca_comm", None) for group in groups)
+        if getattr(comm, "enable_register_for_capturing", False)
+    ]
+    for comm in comms:
+        comm.enable_register_for_capturing = False
+    try:
+        yield
+    finally:
+        for comm in comms:
+            comm.enable_register_for_capturing = True
+
+
 logger = logging.getLogger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True

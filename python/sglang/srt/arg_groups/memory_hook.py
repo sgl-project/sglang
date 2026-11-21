@@ -46,6 +46,27 @@ def handle_offload_compatibility(server_args: Any) -> None:
         )
 
 
+def apply_inkling_rocm_memory_defaults(server_args: Any):
+    """Inkling2 on ROCm defaults to the validated 8192-token prefill chunks at
+    mem_fraction_static 0.85: the generic reserve left about 11 GB after graph
+    capture, and the first 16k-token prefill chunk ran out of device memory."""
+    cfg = resolving_view(server_args)
+    defaults = {}
+    if cfg.chunked_prefill_size is None:
+        defaults["chunked_prefill_size"] = 8192
+    if cfg.mem_fraction_static is None:
+        defaults["mem_fraction_static"] = 0.85
+    if (
+        defaults
+        and get_platform().is_hip
+        and model_config_of(server_args).hf_config.architectures[0]
+        == "Inkling2ForConditionalGeneration"
+    ):
+        declare_resolution(
+            server_args, "_apply_inkling_rocm_memory_defaults", **defaults
+        )
+
+
 def handle_gpu_memory_settings(server_args: Any):
     """
     Configure GPU memory-dependent settings including

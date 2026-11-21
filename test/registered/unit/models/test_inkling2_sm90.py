@@ -29,7 +29,8 @@ def _fake_model(req_pool_size, hidden):
 
 @pytest.mark.parametrize("valid_mask", [None, "gated"])
 def test_store_verify_commit_routes_invalid_rows_to_sink(valid_mask):
-    if not torch.cuda.is_available():
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        # ROCm fuses the gather this fake asserts (test_inkling2_rocm.py covers it).
         pytest.skip("needs CUDA")
     req_pool_size, hidden, stride, bs, real_bs = 16, 8, 4, 6, 3
     model = _fake_model(req_pool_size, hidden)

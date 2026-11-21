@@ -83,6 +83,7 @@ def _q_ref(t, dq, dkv, tau):
     return out.view(t, dq)
 
 
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA JIT attention prologue")
 @pytest.mark.parametrize("t", [1, 3, 8, 32])
 def test_prologue_decode_tau_fold(t):
     dq, dkv = 2048, 256

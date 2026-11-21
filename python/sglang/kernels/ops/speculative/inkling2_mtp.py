@@ -5,6 +5,29 @@ from triton.language.extra import libdevice
 
 
 @triton.jit
+def _mix_rmsnorm_row(
+    X,
+    ALPHA,
+    WEIGHT,
+    TAP_STRIDE: tl.constexpr,
+    HIDDEN_STRIDE: tl.constexpr,
+    TAPS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    h = tl.arange(0, BLOCK)
+    mixed = tl.full((BLOCK,), 0, tl.float32)
+    for tap in tl.static_range(TAPS):
+        x = tl.load(X + tap * TAP_STRIDE + h * HIDDEN_STRIDE, h < HIDDEN, 0)
+        alpha = tl.load(ALPHA + tap).to(tl.float32)
+        mixed += x.to(tl.float32) * alpha
+    inv_rms = tl.rsqrt(tl.sum(mixed * mixed, 0) / HIDDEN + EPS)
+    weight = tl.load(WEIGHT + h, h < HIDDEN, 0).to(tl.float32)
+    return mixed * inv_rms * weight
+
+
+@triton.jit
 def _mix_rmsnorm(
     X,
     ALPHA,
@@ -20,18 +43,18 @@ def _mix_rmsnorm(
 ):
     row = tl.program_id(0)
     h = tl.arange(0, BLOCK)
-    mixed = tl.full((BLOCK,), 0, tl.float32)
-    for tap in tl.static_range(TAPS):
-        x = tl.load(
-            X + row * ROW_STRIDE + tap * TAP_STRIDE + h * HIDDEN_STRIDE,
-            h < HIDDEN,
-            0,
-        ).to(tl.float32)
-        alpha = tl.load(ALPHA + tap).to(tl.float32)
-        mixed += x * alpha
-    inv_rms = tl.rsqrt(tl.sum(mixed * mixed, 0) / HIDDEN + EPS)
-    weight = tl.load(WEIGHT + h, h < HIDDEN, 0).to(tl.float32)
-    tl.store(OUT + row * HIDDEN + h, mixed * inv_rms * weight, h < HIDDEN)
+    out = _mix_rmsnorm_row(
+        X + row * ROW_STRIDE,
+        ALPHA,
+        WEIGHT,
+        TAP_STRIDE,
+        HIDDEN_STRIDE,
+        TAPS,
+        HIDDEN,
+        EPS,
+        BLOCK,
+    )
+    tl.store(OUT + row * HIDDEN + h, out, h < HIDDEN)
 
 
 def mix_rmsnorm(
