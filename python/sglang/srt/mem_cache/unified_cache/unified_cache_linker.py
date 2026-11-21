@@ -516,13 +516,14 @@ class UnifiedCacheLinkerWrapper:
         return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
-        n = len(successes)
-        assert n <= len(self.pending_offloads)
-        if n == 0:
-            return
-        completed = self.pending_offloads[:n]
-        del self.pending_offloads[:n]
-        for pending, success in zip(completed, successes):
+        completed_iter = None
+        assert len(successes) <= len(self.pending_offloads)
+        for success in successes:
+            if completed_iter is None:
+                n = len(successes)
+                completed_iter = iter(self.pending_offloads[:n])
+                del self.pending_offloads[:n]
+            pending = next(completed_iter)
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
