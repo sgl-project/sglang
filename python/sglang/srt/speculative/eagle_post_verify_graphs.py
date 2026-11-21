@@ -134,8 +134,7 @@ class EaglePostVerifyGraphs:
             or batch.has_grammar
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or info.acc_additive_penalties is not None
-            or info.acc_scaling_penalties is not None
+            or info.step_penalties is not None
             or info.logit_bias is not None
             or info.sampling_seed is not None
             or info.need_min_p_sampling

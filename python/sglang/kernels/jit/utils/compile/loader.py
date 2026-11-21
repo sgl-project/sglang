@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.arch import get_compile_arch, get_default_target_flags
+from sglang.kernels.jit.utils.arch import (
+    CudaArchPolicy,
+    get_default_target_flags,
+    resolve_compile_arch,
+)
 from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import (
@@ -66,6 +70,7 @@ def load_jit(
     extra_dependencies: List[str] | None = None,
     header_only: bool = True,
     cuda_units: List[List[str]] | None = None,
+    cuda_arch_policy: CudaArchPolicy | None = None,
 ) -> Module:
     """Load a JIT module, compiling it if no cached build still applies.
 
@@ -92,6 +97,14 @@ def load_jit(
                        macros, includes `cuda_files` and exports nothing; ninja
                        builds the units in parallel, so a module can split its
                        kernel instantiations across them.
+    :param cuda_arch_policy: The CUDA target: "specific" (the local GPU's
+                             arch-specific one, e.g. sm_103a) or "family" (its
+                             family's, e.g. sm_100f, one build every device of
+                             the family runs). None takes
+                             ``SGLANG_JIT_CUDA_ARCH_POLICY``. A module that needs
+                             the arch-specific target (its instructions, or
+                             more than 48 KB of static shared memory) passes
+                             "specific".
     """
     if cuda_units and not (header_only and cuda_files):
         raise ValueError("cuda_units needs a header-only module with cuda_files.")
@@ -138,6 +151,7 @@ def load_jit(
         extra_cuda_cflags = _filter_hgcc_cuda_flags(extra_cuda_cflags) + sailify_flags
 
     module_args = tuple(str(arg) for arg in args)
+    compile_arch = resolve_compile_arch(cuda_arch_policy, module_args[0])
     spec = BuildSpec(
         module_args=module_args,
         cpp_files=resolve_sources(cpp_files),
@@ -145,14 +159,12 @@ def load_jit(
         cpp_wrappers=tuple(cpp_wrappers or ()),
         cuda_wrappers=tuple(cuda_wrappers or ()),
         cflags=tuple(DEFAULT_CFLAGS + (extra_cflags or [])),
-        cuda_cflags=tuple(
-            get_default_target_flags(get_compile_arch(module_args[0]))
-            + extra_cuda_cflags
-        ),
+        cuda_cflags=tuple(get_default_target_flags(compile_arch) + extra_cuda_cflags),
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
         header_only=header_only,
         cuda_units=tuple(tuple(unit) for unit in cuda_units or ()),
+        compile_arch=compile_arch,
     )
 
     # Generated once and threaded through: the cache key is taken over this
@@ -160,7 +172,9 @@ def load_jit(
     build_file = ninja.generate(spec)
 
     build_key = cache.compute_build_key(spec, build_file=build_file)
-    scope = cache.build_key_dir(module_name=spec.module_name, build_key=build_key)
+    scope = cache.build_key_dir(
+        module_name=spec.module_name, build_key=build_key, arch=spec.compile_arch
+    )
 
     prebuilt = _find_prebuilt(spec=spec, scope=scope)
     if prebuilt is not None:
