@@ -116,6 +116,8 @@ class TensorTransport:
             acknowledged = True
             if self.device.type == "cuda":
                 torch.cuda.set_device(self.device)
+                # Mooncake TCP can acknowledge a pageable host copy before its GPU write completes
+                self.receive_stream.wait_stream(torch.cuda.default_stream(self.device))
             tensors, event = self.manager.load_tensors_async(
                 key, reply["manifest"], self.device, stream=self.receive_stream
             )
