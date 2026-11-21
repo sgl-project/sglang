@@ -28,8 +28,8 @@ use sglang_processor::dynamo_protocols::types::{
 use sglang_processor::openai::ChatModel;
 use sglang_processor::{
     DeepSeekDelta, DeepSeekFinish, DeepSeekOutputOptions, DeepSeekOutputParser, DeepSeekStopMatch,
-    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning, tool_call_id,
-    tool_call_stream,
+    GEMMA4_REASONING_START, ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice,
+    split_reasoning, tool_call_id, tool_call_stream,
 };
 
 use super::super::auth::DeclaredRoute;
@@ -302,9 +302,15 @@ async fn chat_completions(
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
     let prompt_stub_tokens = chat_model.unreported_prompt_tokens() as u32;
-    // As Python, the continued text decides whether generation starts in reasoning.
+    // Gemma 4 tool-reply templates can leave the channel open in the prompt.
+    let gemma4_reasoning_prefilled =
+        matches!(reasoning_parser.as_deref(), Some("gemma4" | "gemma-4"))
+            && rendered.continuation.is_empty()
+            && rendered.prompt.as_str().ends_with(GEMMA4_REASONING_START);
     let reasoning_options = ReasoningOptions {
-        force_reasoning,
+        force_reasoning: gemma4_reasoning_prefilled
+            .then_some(true)
+            .or(force_reasoning),
         previous_content,
         ..Default::default()
     };
@@ -335,7 +341,7 @@ async fn chat_completions(
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             // Python's thinking mode: the grammar starts after the reasoning,
             // which the scheduler also counts.
-            require_reasoning: reasoning_options.force_reasoning == Some(true),
+            require_reasoning: force_reasoning == Some(true),
             mm: (!images.is_empty()).then(|| {
                 Box::new(MmData {
                     image_data: images.clone(),
@@ -1911,6 +1917,70 @@ mod tests {
         assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(frames.len(), 7);
+    }
+
+    /// A Gemma 4 template can open the reasoning channel after a tool reply.
+    /// The generated tokens then start with reasoning, without an opening marker.
+    #[tokio::test]
+    async fn gemma4_stream_separates_reasoning_after_tool_reply() {
+        use super::super::test_utils::checkpoint_formatter;
+
+        let args = Arc::new(ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("gemma4".into()),
+            ..Default::default()
+        });
+        let formatter = checkpoint_formatter(
+            &serde_json::json!({"model_type": "gemma4"}),
+            "{% if messages[-1]['role'] == 'tool' and enable_thinking %}<|channel>thought\n\
+             {% else %}<|turn>model\n{% endif %}",
+        );
+        for (thinking, generated, expected_reasoning) in [
+            (
+                true,
+                "Check the result.<channel|>Done.",
+                "Check the result.",
+            ),
+            (false, "Done.", ""),
+        ] {
+            let state = answering_app_state_with(args.clone(), formatter.clone(), None, generated);
+            let response = post_json(
+                super::routes().with_state(state),
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": "model", "stream": true, "skip_special_tokens": false,
+                    "chat_template_kwargs": {"enable_thinking": thinking},
+                    "messages": [
+                        {"role": "user", "content": "Check my booking."},
+                        {"role": "assistant", "tool_calls": [{
+                            "id": "call_1", "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }]},
+                        {"role": "tool", "tool_call_id": "call_1", "content": "Confirmed."},
+                    ],
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let deltas: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            let field = |name: &str| -> String {
+                deltas
+                    .iter()
+                    .filter_map(|frame| frame["choices"][0]["delta"][name].as_str())
+                    .collect()
+            };
+            assert_eq!(field("reasoning_content"), expected_reasoning);
+            assert_eq!(field("content"), "Done.");
+        }
     }
 
     #[tokio::test]

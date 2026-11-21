@@ -41,8 +41,9 @@ pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
     ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    ReasoningStreamSplitter, ToolConstraint, chat_tool_definitions, dynamo_tool_choice,
-    dynamo_tool_parser_name, parse_tool_calls, split_reasoning, tool_call_stream, tool_constraint,
+    GEMMA4_REASONING_START, ReasoningStreamSplitter, ToolConstraint, chat_tool_definitions,
+    dynamo_tool_choice, dynamo_tool_parser_name, parse_tool_calls, split_reasoning,
+    tool_call_stream, tool_constraint,
 };
 #[cfg(feature = "render")]
 pub use render::{

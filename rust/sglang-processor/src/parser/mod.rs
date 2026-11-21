@@ -25,7 +25,7 @@ use crate::think::ReasoningOptions;
 mod reasoning;
 mod tools;
 
-pub use self::reasoning::{ReasoningStreamSplitter, split_reasoning};
+pub use self::reasoning::{GEMMA4_REASONING_START, ReasoningStreamSplitter, split_reasoning};
 pub use self::tools::{
     ToolConstraint, chat_tool_definitions, dynamo_tool_choice, dynamo_tool_parser_name,
     parse_tool_calls, tool_call_stream, tool_constraint,

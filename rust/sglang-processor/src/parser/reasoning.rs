@@ -8,6 +8,8 @@ use dynamo_parsers::reasoning::{
 
 use crate::think::{ReasoningOptions, ThinkDetector, think_config};
 
+pub const GEMMA4_REASONING_START: &str = "<|channel>thought\n";
+
 /// Build the parser a Python `--reasoning-parser` name selects. Names Dynamo
 /// does not know fall back to its non-forced basic parser.
 fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
@@ -36,8 +38,14 @@ impl Backend {
             return Self::Sglang(ThinkDetector::new(config, options));
         }
         let mut parser = build_reasoning_parser(name);
-        if let Some(force_reasoning) = options.force_reasoning {
-            parser.set_in_reasoning(force_reasoning);
+        match (name, options.force_reasoning) {
+            ("gemma4" | "gemma-4", Some(true)) => {
+                // Dynamo's Gemma 4 parser does not implement set_in_reasoning.
+                // Feed the already-rendered opener to seed its streaming state.
+                parser.parse_reasoning_streaming_incremental(GEMMA4_REASONING_START, &[]);
+            }
+            (_, Some(force_reasoning)) => parser.set_in_reasoning(force_reasoning),
+            _ => {}
         }
         Self::Dynamo(Mutex::new(parser))
     }
