@@ -48,7 +48,10 @@ def _init_component_model(
     component_config: Any,
     model_cls: type[nn.Module] | None = None,
 ) -> nn.Module:
-    config_dict = component_config.to_dict()
+    if isinstance(component_config, dict):
+        config_dict = component_config.copy()
+    else:
+        config_dict = component_config.to_dict()
     config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 
