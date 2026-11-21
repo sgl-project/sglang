@@ -6,7 +6,9 @@ attention layer with ``save_kv_cache=False``, the usual SGLang pattern for produ
 
 * ``qkv_proj_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_FUSED_QKV_CACHE``): up to 32 rows, the QKV + output-gate
   projection's split-K partials feed the QK-norm / RoPE / cache-store epilogue directly.
-* ``qk_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_QK_ROPE_CACHE``): up to 64 rows, from the projected Q/K/V.
+* ``qk_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_QK_ROPE_CACHE``): up to ``SGLANG_ROCM_MUSE_QK_ROPE_CACHE_MAX_ROWS``
+  rows, from the projected Q/K/V; with ``SGLANG_USE_TLX_QK_NORM_ROPE``, any row count on the vendored
+  ``tlx.ops.qk_norm_rope_kv_cache``.
 
 Both write exactly where and what the backend's own store would (FP8 with the layer's per-tensor scales, through
 the full -> SWA slot mapping on sliding layers), so they only engage when the backend reads K/V from the
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 QK_ROPE_CACHE = envs.SGLANG_ROCM_MUSE_QK_ROPE_CACHE.get()
 FUSED_QKV_CACHE = envs.SGLANG_ROCM_MUSE_FUSED_QKV_CACHE.get()
 QK_ROPE_CACHE_MAX_ROWS = envs.SGLANG_ROCM_MUSE_QK_ROPE_CACHE_MAX_ROWS.get()
+_USE_TLX_QK_NORM_ROPE = envs.SGLANG_USE_TLX_QK_NORM_ROPE.get()
 _logged: set = set()
 
 
@@ -176,6 +179,11 @@ def qk_norm_rope_kv_write(
     forward_batch: ForwardBatch,
 ):
     """(q, k) normalized and rotated with K/V already in the cache, or None when the kernel does not apply."""
+    if _USE_TLX_QK_NORM_ROPE:
+        tlx_q = _tlx_qk_norm_rope_kv_write(attention, positions, q, k, v, forward_batch)
+        if tlx_q is not None:
+            # The attention layer reads K/V from the cache (save_kv_cache=False); k is passed through unread.
+            return tlx_q, k
     if not (
         0 < q.shape[0] <= QK_ROPE_CACHE_MAX_ROWS
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
@@ -199,6 +207,53 @@ def qk_norm_rope_kv_write(
         target.swa_mapping,
         attention.norm_eps,
         attention.scale_query_by,
+        target.k_scale,
+        target.v_scale,
+    )
+
+
+def _tlx_qk_norm_rope_kv_write(
+    attention,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor | None:
+    from sglang.kernels.ops.attention.tlx import (
+        qk_norm_rope_kv_cache,
+        qk_norm_rope_kv_cache_supported,
+    )
+
+    if not (q.shape[0] > 0 and _attention_shape_ok(attention, forward_batch)):
+        return None
+    target = _kv_write_target(attention, forward_batch)
+    if target is None or not (
+        target.k_scale.dtype == target.v_scale.dtype == torch.float32
+    ):
+        return None
+    page_size = get_attn_backend().page_size
+    k_cache = target.k_cache.view(
+        -1, page_size, attention.num_kv_heads, attention.head_dim
+    )
+    v_cache = target.v_cache.view(
+        -1, page_size, attention.num_kv_heads, attention.head_dim
+    )
+    if not qk_norm_rope_kv_cache_supported(q, k, v, k_cache):
+        return None
+    _note("QK norm/RoPE/FP8 cache (TLX)", q.shape[0])
+    return qk_norm_rope_kv_cache(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        target.locations,
+        target.swa_mapping,
+        positions if target.cos_sin is not None else None,
+        target.cos_sin,
+        attention.norm_eps,
+        float(attention.scale_query_by),
         target.k_scale,
         target.v_scale,
     )

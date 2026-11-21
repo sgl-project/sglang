@@ -1,11 +1,18 @@
-"""gfx950 residual-stream boundary from fbtriton ``tlx.ops.norm_residual_norm``, vendored in ``sglang.kernels.tlx_ops``.
+"""gfx950 layernorm kernels from fbtriton ``tlx.ops``, vendored in ``sglang.kernels.tlx_ops``.
 
-``norm_residual_norm`` RMS-normalizes a BF16 branch (weight after the norm, or the input-scale form that applies it
-first), rounds it to BF16, updates the FP32 stream as ``alpha * stream + beta * y`` (per-channel or scalar gate) or
-``stream + y``, and RMS-normalizes the new stream, optionally rounded to BF16 first. It returns the BF16 output and
-the FP32 stream. Rejected (see ``norm_residual_norm_supported``): hidden sizes other than 4096, 8192 and 16384, other
-dtypes, non-contiguous or empty inputs. No FP8 or router copy of the output. The caller gates the architecture.
-Runtime requirements are in ``sglang/kernels/jit/utils/tlx_runtime.py``.
+``norm_residual_norm`` (``tlx.ops.norm_residual_norm``) RMS-normalizes a BF16 branch (weight after the norm, or the
+input-scale form that applies it first), rounds it to BF16, updates the FP32 stream as ``alpha * stream + beta * y``
+(per-channel or scalar gate) or ``stream + y``, and RMS-normalizes the new stream, optionally rounded to BF16 first.
+It returns the BF16 output and the FP32 stream. Rejected (see ``norm_residual_norm_supported``): hidden sizes other
+than 4096, 8192 and 16384, other dtypes, non-contiguous or empty inputs. No FP8 or router copy of the output. It uses
+TLX primitives; runtime requirements are in ``sglang/kernels/jit/utils/tlx_runtime.py``.
+
+``rmsnorm_gate`` (``tlx.ops.rmsnorm_gate``) computes what ``FusedRMSNormGate``
+(``srt/rocm_muse_spark/fused_norm_gate.py``) does for a weightless norm and head dim 64, bit for bit: per head,
+``x * rsqrt(mean(x * x) + eps) * sigmoid(gate)`` in FP32, rounded to BF16. It is plain Triton (no TLX primitives), so
+stock ROCm Triton runs it.
+
+The callers gate the architecture.
 """
 
 import torch
@@ -59,3 +66,29 @@ def norm_residual_norm(
         None,
         None,
     )
+
+
+def rmsnorm_gate_supported(x: torch.Tensor, gate: torch.Tensor) -> bool:
+    """Whether ``rmsnorm_gate`` handles these operands; host-only, never reads device data.
+
+    Head dim 64 and a weightless norm are the caller's to check; here: BF16 ``x`` and ``gate`` of one ``(T, H * 64)``
+    shape, ``H`` a multiple of 8, contiguous rows.
+    """
+    return (
+        x.dim() == 2
+        and gate.shape == x.shape
+        and x.shape[0] > 0
+        and x.shape[1] % (8 * 64) == 0
+        and x.dtype == gate.dtype == torch.bfloat16
+        and x.stride(1) == 1
+        and gate.stride(1) == 1
+    )
+
+
+def rmsnorm_gate(x: torch.Tensor, gate: torch.Tensor, eps: float) -> torch.Tensor:
+    """Per 64-element head: ``bf16(x * rsqrt(mean(x * x) + eps) * sigmoid(gate))`` in FP32; contiguous output."""
+    from sglang.kernels.tlx_ops.kernels.fused.rmsnorm_gate.gfx950 import (
+        rmsnorm_gate as _rmsnorm_gate,
+    )
+
+    return _rmsnorm_gate(x, gate, eps, None)

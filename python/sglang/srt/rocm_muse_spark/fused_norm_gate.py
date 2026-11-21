@@ -17,8 +17,14 @@ import triton.language as tl
 from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
     verify_reduce_norm_gate,
 )
+from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark import fused_op_tuning
 from sglang.srt.rocm_muse_spark.base_fused_op import BaseFusedOp, FusedOpBackend
+
+_USE_TLX_RMSNORM_GATE = envs.SGLANG_USE_TLX_RMSNORM_GATE.get()
+# MI350X, 16 heads of 64: the Triton kernel is ~5% faster up to 256 rows, tlx.ops.rmsnorm_gate from 512 rows
+# (1.04x at 512, 1.15x at 2048, 1.26x at 8192). Both are bitwise equal.
+_TLX_RMSNORM_GATE_MIN_ROWS = 512
 
 
 def _as_grouped_gate_view(
@@ -179,6 +185,20 @@ class FusedRMSNormGate(BaseFusedOp):
             )
         )
 
+    def tlx_decode_foldable(self, g) -> bool:
+        """Whether the TLX paged decode can apply this norm-gate in its reduce: weightless norm, flat BF16 gate,
+        head dim 64."""
+        return (
+            self._use_o_norm
+            and self._use_o_gate
+            and self._effective_weight is None
+            and self._head_dim == 64
+            and g is not None
+            and g.ndim == 2
+            and g.dtype == torch.bfloat16
+            and g.stride(1) == 1
+        )
+
     def merges_verify_partials(self) -> bool:
         """Whether ``forward_verify_partials`` serves this op (norm always on, head dim 64)."""
         return self._use_o_norm and self._head_dim == 64
@@ -249,6 +269,24 @@ class FusedRMSNormGate(BaseFusedOp):
         H = x.shape[-1] // D
 
         assert x.is_contiguous(), "x must be contiguous"
+        if (
+            _USE_TLX_RMSNORM_GATE
+            and x.shape[0] >= _TLX_RMSNORM_GATE_MIN_ROWS
+            and self._use_o_norm
+            and self._use_o_gate
+            and self._effective_weight is None
+            and D == 64
+            and g is not None
+            and g.ndim == 2
+        ):
+            from sglang.kernels.ops.layernorm.tlx import (
+                rmsnorm_gate,
+                rmsnorm_gate_supported,
+            )
+
+            x_rows = x.view(x.shape[0], -1)
+            if rmsnorm_gate_supported(x_rows, g):
+                return rmsnorm_gate(x_rows, g, self._eps).view(x.shape)
         x_flat = x.reshape(-1, D)
         N = x_flat.shape[0]
 

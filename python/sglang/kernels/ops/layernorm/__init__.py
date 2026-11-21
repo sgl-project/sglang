@@ -142,6 +142,16 @@ register_kernel(
     )
 )
 
+# Vendored tlx.ops.rmsnorm_gate (gfx950, head dim 64); plain Triton, no TLX runtime needed.
+register_kernel(
+    KernelSpec(
+        op="layernorm.tlx_rmsnorm_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.tlx:rmsnorm_gate",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+
 register_kernel(
     KernelSpec(
         op="layernorm.fused_kda_output_quant",
