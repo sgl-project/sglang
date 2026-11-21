@@ -118,8 +118,8 @@ ENCODER_MAX_BATCH_SIZE_EXPLICIT = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.is_set()
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 
 
-async def await_task_completion_on_cancel(task: asyncio.Task, operation: str):
-    """Keep task-owned resources live until cancellation reaches a safe point."""
+async def await_task_completion_on_cancel(task: asyncio.Future, operation: str):
+    """Keep resources live until the shielded operation reaches a safe point."""
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -137,13 +137,6 @@ async def await_task_completion_on_cancel(task: asyncio.Task, operation: str):
                 exc_info=task.exception(),
             )
         raise
-
-
-async def _await_transfer_completion(awaitable, operation: str):
-    """Do not let cancellation outlive a zero-copy transfer using its buffer."""
-    return await await_task_completion_on_cancel(
-        asyncio.ensure_future(awaitable), operation
-    )
 
 
 class EncoderMetaRegistry:
@@ -2052,8 +2045,10 @@ class MMEncoder:
             # Queue sends in order under the lock, then wait for buffer
             # ownership independently so libzmq can pipeline the connection.
             try:
-                await _await_transfer_completion(
-                    asyncio.to_thread(tracker.wait, self.send_timeout),
+                await await_task_completion_on_cancel(
+                    asyncio.get_running_loop().run_in_executor(
+                        None, tracker.wait, self.send_timeout
+                    ),
                     f"ZMQ transfer for req_id={mm_data.req_id}",
                 )
             except Exception:
@@ -2090,7 +2085,7 @@ class MMEncoder:
             finally:
                 sock.close(linger=5000)
 
-        await _await_transfer_completion(
+        await await_task_completion_on_cancel(
             asyncio.get_running_loop().run_in_executor(self.executor, send_with_socket),
             f"ZMQ transfer for req_id={mm_data.req_id}",
         )
@@ -2111,8 +2106,11 @@ class MMEncoder:
         size: int,
     ) -> int:
         """Keep the send active until its blocking transfer stops using the MR."""
-        return await _await_transfer_completion(
-            asyncio.to_thread(
+        # Event-loop shutdown cancels all Tasks, including shielded Tasks.
+        # Await the executor Future directly to keep the MR live until completion.
+        return await await_task_completion_on_cancel(
+            asyncio.get_running_loop().run_in_executor(
+                None,
                 self.engine.transfer_sync,
                 session_id,
                 source_address,

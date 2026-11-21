@@ -693,6 +693,63 @@ class TestEncoderDPAbandonedRequest(CustomTestCase):
         asyncio.run(run())
 
 
+class TestMooncakeTransferShutdown(CustomTestCase):
+    def test_shutdown_keeps_registration_until_transfer_finishes(self):
+        """Cancelling all event-loop tasks must drain an in-flight RDMA write."""
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            started = asyncio.Event()
+            release_transfer = threading.Event()
+            transfer_finished = threading.Event()
+            deregistration = []
+
+            def transfer_sync(*_args):
+                loop.call_soon_threadsafe(started.set)
+                if not release_transfer.wait(timeout=5):
+                    raise TimeoutError("test did not release the transfer")
+                transfer_finished.set()
+                return 0
+
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder._element_size = 2
+            encoder.engine = SimpleNamespace(
+                register=lambda _address, _nbytes: None,
+                transfer_sync=transfer_sync,
+                deregister=lambda address: deregistration.append(
+                    (address, transfer_finished.is_set())
+                ),
+            )
+            embedding = torch.zeros((1, 2), dtype=torch.bfloat16)
+            data = SimpleNamespace(req_id="req", shape=embedding.shape, _mr_ptr=None)
+            with patch.object(
+                encoder_server,
+                "get_disagg",
+                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+            ):
+                send = asyncio.create_task(
+                    encoder._send(embedding, data, "session", 1234)
+                )
+                try:
+                    await asyncio.wait_for(started.wait(), timeout=5)
+                    tasks = asyncio.all_tasks() - {asyncio.current_task()}
+                    for task in tasks:
+                        task.cancel()
+                    # Let cancelled child tasks settle while the worker is blocked.
+                    await asyncio.gather(*(tasks - {send}), return_exceptions=True)
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    self.assertEqual(deregistration, [])
+                finally:
+                    release_transfer.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await send
+
+            self.assertEqual(deregistration, [(embedding.data_ptr(), True)])
+
+        asyncio.run(run())
+
+
 class TestMooncakeRegistration(CustomTestCase):
     def setUp(self):
         self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
