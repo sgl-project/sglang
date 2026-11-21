@@ -19,6 +19,7 @@ _Ops = tuple[
     Callable[..., torch.Tensor],
     Callable[..., torch.Tensor],
     torch.dtype,
+    torch.dtype,
 ]
 
 
@@ -30,7 +31,13 @@ def _ops() -> _Ops | None:
         from aiter.ops.shuffle import shuffle_weight
     except ImportError:
         return None
-    return get_hip_quant(QuantType.per_1x32), shuffle_weight, gemm_a4w4, dtypes.fp4x2
+    return (
+        get_hip_quant(QuantType.per_1x32),
+        shuffle_weight,
+        gemm_a4w4,
+        dtypes.fp4x2,
+        dtypes.fp8_e8m0,
+    )
 
 
 @functools.cache
@@ -61,19 +68,20 @@ def pack(*, weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         )
     if not available():
         raise RuntimeError("latent MXFP4 GEMM requires AITER on gfx950")
-    quant, shuffle, _, fp4x2 = _ops()
+    quant, shuffle, _, fp4x2, _ = _ops()
     q, scale = quant(weight.contiguous(), quant_dtype=fp4x2, shuffle=True)
     return shuffle(q, layout=_PRESHUFFLE_LAYOUT), scale
 
 
 def run(*, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """x @ weight.T after per-1x32 MXFP4 activation quantization."""
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] == 0:
+    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] == 0 or x.shape[1] == 0:
         raise ValueError("latent MXFP4 GEMM needs nonempty 2D BF16 activations")
     # gemm_a4w4 and the preshuffled scales read whole 256x256 tiles.
     if (
         weight.ndim != 2
         or x.device.type != "cuda"
+        or weight.shape[0] == 0
         or weight.shape[0] % 256 != 0
         or x.shape[1] % 256 != 0
         or x.shape[1] != weight.shape[1] * 2
@@ -88,8 +96,10 @@ def run(*, x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.
         raise ValueError("latent MXFP4 weight and scales must match the activations")
     # pack() already checked available(), so skip it per call.
     ops = _ops()
-    if ops is None or weight.dtype != ops[3]:
-        raise ValueError("latent MXFP4 GEMM needs packed FP4 weights from pack()")
-    quant, _, gemm, fp4x2 = ops
+    if ops is None or weight.dtype != ops[3] or scale.dtype != ops[4]:
+        raise ValueError(
+            "latent MXFP4 GEMM needs packed FP4 weights and E8M0 scales from pack()"
+        )
+    quant, _, gemm, fp4x2, _ = ops
     xq, x_scale = quant(x.contiguous(), quant_dtype=fp4x2, shuffle=True)
     return gemm(xq, weight, x_scale, scale, dtype=x.dtype, bpreshuffle=True)

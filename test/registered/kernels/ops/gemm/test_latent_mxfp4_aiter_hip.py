@@ -119,6 +119,30 @@ class TestKimiK3LatentMXFP4(CustomTestCase):
                         scale=scale[:rows, : k // 32].contiguous(),
                     )
 
+    def test_rejects_scales_that_are_not_e8m0(self):
+        _, packed, scale = self.projections[0]
+        x = torch.ones((1, 7168), dtype=torch.bfloat16, device=self.device)
+        for invalid_scale in (scale.float(), scale.to(torch.bfloat16)):
+            with self.subTest(dtype=invalid_scale.dtype):
+                with self.assertRaisesRegex(ValueError, "E8M0 scales"):
+                    latent_mxfp4_aiter_hip.run(x=x, weight=packed, scale=invalid_scale)
+
+    def test_rejects_empty_dimensions(self):
+        _, packed, scale = self.projections[0]
+        for x, weight in (
+            (
+                torch.ones((1, 0), dtype=torch.bfloat16, device=self.device),
+                packed[:, :0],
+            ),
+            (
+                torch.ones((1, 7168), dtype=torch.bfloat16, device=self.device),
+                packed[:0],
+            ),
+        ):
+            with self.subTest(x=tuple(x.shape), weight=tuple(weight.shape)):
+                with self.assertRaises(ValueError):
+                    latent_mxfp4_aiter_hip.run(x=x, weight=weight, scale=scale)
+
     def test_rejects_missing_or_host_scales(self):
         _, packed, scale = self.projections[0]
         x = torch.ones((1, 7168), dtype=torch.bfloat16, device=self.device)
