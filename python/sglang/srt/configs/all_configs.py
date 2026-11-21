@@ -59,6 +59,7 @@ from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
 from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
+from sglang.srt.configs.minicpm5 import MiniCPM5Config
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 from sglang.srt.configs.minicpmv4_7 import MiniCPMV4_7Config
 from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
@@ -179,6 +180,7 @@ __all__ = [
     "JetNemotronConfig",
     "JetVLMConfig",
     "MiniCPMHybridConfig",
+    "MiniCPM5Config",
     "Step3p5Config",
     "MiniMaxM3VLConfig",
     "Spark2_5Config",
