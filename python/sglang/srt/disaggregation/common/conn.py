@@ -2819,6 +2819,13 @@ class CommonKVReceiver(BaseKVReceiver):
             return self._poll()
 
     def _poll(self) -> KVPoll:
+        if (
+            self.conclude_state == KVPoll.Success
+            and self.kv_mgr.request_status.get(self.bootstrap_room) == KVPoll.Failed
+        ):
+            # Success is cached before the request commits; the manager failed
+            # the room since (a metadata item it dropped).
+            self.conclude_state = KVPoll.Failed
         if self.conclude_state is not None:
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
