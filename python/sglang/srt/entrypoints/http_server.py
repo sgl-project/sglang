@@ -1161,7 +1161,14 @@ async def list_external_corpora():
 # curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 async def clear_hicache_storage_backend():
-    """Clear the hierarchical cache storage backend."""
+    """Clear the hierarchical cache storage backend.
+
+    Only allowed when an admin API key is configured (mirrors the
+    attach/detach endpoints for the same backend).
+    """
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
+
     ret = await _global_state.tokenizer_manager.clear_hicache_storage()
     return Response(
         content="Hierarchical cache storage backend cleared.\n",
