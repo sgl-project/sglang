@@ -156,6 +156,8 @@ class SchedulerInternalStateController:
                 handler = handlers.get(key)
                 if handler is None:
                     raise UpdateRejected(f"Updating {key} is not supported.")
+                if isinstance(value, str) and not handler.accepts_str:
+                    raise UpdateRejected(f"{key} must be a number, got {value!r}.")
                 handler.validate(key, value)
         except UpdateRejected as rejection:
             logger.warning(str(rejection))
@@ -174,6 +176,11 @@ class SchedulerInternalStateController:
         return {
             "pp_max_micro_batch_size": _UpdateHandler(
                 self._validate_pp_micro_batch_size, _override
+            ),
+            "schedule_policy": _UpdateHandler(
+                self._validate_schedule_policy,
+                self._apply_schedule_policy,
+                accepts_str=True,
             ),
             "speculative_accept_threshold_single": _UpdateHandler(
                 self._validate_accept_threshold, self._apply_accept_threshold
@@ -196,6 +203,31 @@ class SchedulerInternalStateController:
                 f"Updating {key} to {value} is rejected because it is out of "
                 f"the valid range [1, {upper}]."
             )
+
+    def _validate_schedule_policy(self, key: str, value: Any) -> None:
+        if not isinstance(value, str):
+            raise UpdateRejected(f"{key} must be a string, got {value!r}.")
+        if self.scheduler.enable_priority_scheduling and value not in ("fcfs", "lof"):
+            raise UpdateRejected(
+                f"{key} must be 'fcfs' or 'lof' with priority scheduling, "
+                f"got {value!r}."
+            )
+        # A dry build runs every startup check, so apply cannot fail.
+        try:
+            self.scheduler.create_schedule_policy(value)
+        except ValueError as error:
+            raise UpdateRejected(f"Updating {key} to {value!r}: {error}") from error
+
+    def _apply_schedule_policy(self, key: str, value: Any) -> Dict[str, Any]:
+        # Runs between steps; the next step ranks the waiting queue anew.
+        scheduler = self.scheduler
+        if value != scheduler.schedule_policy:
+            # The old policy may hold the waiting queue's on-leave callback.
+            scheduler.waiting_queue.set_on_leave(None)
+            scheduler.policy = scheduler.create_schedule_policy(value)
+            scheduler.schedule_policy = value
+            logger.info(f"{key}={value!r}, effective {scheduler.policy.policy.value!r}")
+        return {key: value}
 
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the
@@ -279,9 +311,11 @@ class _UpdateHandler:
         self,
         validate: Callable[[str, Any], None],
         apply: Callable[[str, Any], Optional[Dict[str, Any]]],
+        accepts_str: bool = False,
     ) -> None:
         self.validate = validate
         self.apply = apply
+        self.accepts_str = accepts_str
 
 
 def _override(key: str, value: Any) -> Dict[str, Any]:

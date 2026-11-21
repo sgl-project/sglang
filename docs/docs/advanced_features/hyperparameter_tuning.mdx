@@ -81,6 +81,18 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 - Try other parallelism strategies (e.g. [expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/)) or DP attention for deepseek models (with `--attn-dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
 
+### Change `--schedule-policy` without a restart
+
+You can change `schedule_policy` on a running server. The endpoint requires `--admin-api-key`:
+
+```bash
+curl -s -X POST http://localhost:30000/set_internal_state \
+  -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
+  -d '{"server_args": {"schedule_policy": "lpm"}}'
+```
+
+The server runs the same checks as at startup and rejects a value that startup would reject. For example, `shortest-prefill-first` needs prefix caching, and priority scheduling allows only `fcfs` and `lof`. As at startup, `lpm`, `dfs-weight` and `hrrn` fall back to `fcfs` when prefix caching is off. The new policy orders the waiting queue from the next step. `/server_info` reports the requested value under `internal_states`.
+
 
 ### LPM under long waiting queues
 

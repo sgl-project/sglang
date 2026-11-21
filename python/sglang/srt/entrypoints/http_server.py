@@ -940,6 +940,7 @@ async def server_info(request: Request):
 
 # example usage:
 # curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"server_args": {"pp_max_micro_batch_size": 8}}'
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"server_args": {"schedule_policy": "lpm"}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(
     obj: Annotated[SetInternalStateReq, Body()], request: Request
