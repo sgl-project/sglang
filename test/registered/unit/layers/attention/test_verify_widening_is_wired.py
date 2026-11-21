@@ -18,7 +18,7 @@ pool, so under the unified pool the translated page table a verify kernel
 reads has to cover `seq_lens + num_draft_tokens` columns per row; a table
 filled only to `seq_lens` silently leaves the draft tail stale.
 
-These tests drive fa3's eager and captured verify builds from a verify plan
+These tests drive fa3's eager and out-of-graph replay verify builds from a verify plan
 over a non-identity virtual->physical page map, and check the page table the
 kernel reads: every row translated, and filled through the draft tail.
 
@@ -161,7 +161,7 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
             )
 
     def test_captured_verify_build(self):
-        """The captured build a cuda-graph replay runs."""
+        """Out-of-graph replay build; unified fixed-width verify gathers in graph."""
         for page_size in (1, 4):
             req_to_token, live = _batch(page_size, self.N_PAGES)
             runner_ids = _runner_ids(req_to_token, page_size, self.N_PAGES)
