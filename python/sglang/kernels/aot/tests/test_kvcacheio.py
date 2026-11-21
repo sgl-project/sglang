@@ -8,6 +8,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_all_layer_lf_ph,
     transfer_kv_all_layer_mla,
+    transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
@@ -769,6 +770,50 @@ def test_transfer_kv_page_head(
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("block_quota", [None, 1, 2, 16])
+def test_transfer_kv_all_layer_mla_lf_pf_block_quota(block_quota):
+    """
+    The all-layer MLA LF->PF copy writes exactly the target host rows for any
+    block quota, including the default one.
+    """
+    device = "cuda"
+    torch.cuda.manual_seed(42)
+    num_layers, item_bytes, total_items, num_items = 4, 576, 4096, 512
+
+    src_layers = [
+        torch.randint(
+            0, 256, (total_items, item_bytes), dtype=torch.uint8, device=device
+        )
+        for _ in range(num_layers)
+    ]
+    src_layers_device = torch.tensor(
+        [layer.data_ptr() for layer in src_layers], dtype=torch.uint64, device=device
+    )
+    dst_layout_dim = num_layers * item_bytes
+    dst = torch.zeros(total_items, dst_layout_dim, dtype=torch.uint8).pin_memory()
+    src_indices = torch.randperm(total_items, device=device)[:num_items]
+    dst_indices = torch.randperm(total_items, device=device)[:num_items]
+
+    kwargs = {} if block_quota is None else {"block_quota": block_quota}
+    transfer_kv_all_layer_mla_lf_pf(
+        src_layers_device,
+        dst,
+        src_indices,
+        dst_indices,
+        item_size=item_bytes,
+        dst_layout_dim=dst_layout_dim,
+        num_layers=num_layers,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.cat([layer[src_indices] for layer in src_layers], dim=1).cpu()
+    torch.testing.assert_close(dst[dst_indices.cpu()], expected)
+    untouched = torch.ones(total_items, dtype=torch.bool)
+    untouched[dst_indices.cpu()] = False
+    assert not dst[untouched].any()
 
 
 if __name__ == "__main__":
