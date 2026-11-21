@@ -130,9 +130,8 @@ class TestAiterMlaFp8PrefillPs(CustomTestCase):
         """Heads without an mla_reduce_v1 instance pad up to one;
         padding must not perturb the real heads' output or LSE, nor reach a missing instance."""
         q_lens, kv_lens = [300, 77], [517, 1200]
-        # Which 12/48/96-head (Kimi-K3 at TP8/TP2/TP1) path runs on the extended paths
-        # depends on the installed AITER, so also force the padded one. Without the
-        # extension the table alone decides and repeat-padding fills (other models).
+        # Native 12/48/96-head paths depend on the installed AITER, so also force the padded one;
+        # without the extension, the static table and repeat-padding apply.
         for num_heads, pad, extended in (
             (KIMI_K3_TP8_HEADS, False, True),
             (KIMI_K3_TP8_HEADS, True, True),

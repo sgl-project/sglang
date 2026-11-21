@@ -879,9 +879,8 @@ class AiterAttnBackend(AttentionBackend):
             and get_exec().kernel.mla_fp8_prefill_extended
             and not model_runner.is_draft_worker
         )
-        # mla_reduce_v1 has instances only for _MLA_REDUCE_V1_HEADS (plus what
-        # AITER reports on the extended paths);
-        # other head counts pad up to one, or fall back to flash_attn_varlen_func.
+        # mla_reduce_v1 covers _MLA_REDUCE_V1_HEADS (plus AITER-reported shapes on the extended paths);
+        # other head counts pad up, or fall back to flash_attn_varlen_func.
         self.fp8_prefill_num_head = (
             self.check_fp8_prefill_num_head(
                 num_head=self.num_head,
@@ -898,13 +897,14 @@ class AiterAttnBackend(AttentionBackend):
         self.fp8_prefill_num_kv_head = self.num_kv_head + (
             (self.fp8_prefill_num_head or self.num_head) - self.num_head
         )
-        # forward_mha reads the prefix latent in bf16 when the backend packs prefix K/V;
-        # do so only where every prefix chunk runs the asm fp8 prefill on a bf16 model.
-        self.supports_prefix_chunk_kv_pack = (
+        # forward_mha discovers pack_prefix_chunk_kv dynamically; hide it unless every
+        # prefix chunk runs the asm fp8 prefill on a bf16 model.
+        if not (
             self.mla_fp8_prefill_extended
             and self.use_fp8_prefill_attn
             and self.input_dtype == torch.bfloat16
-        )
+        ):
+            self.pack_prefix_chunk_kv = None
         if self.use_fp8_prefill_attn and self.fp8_prefill_num_head != self.num_head:
             logger.info(
                 f"aiter asm fp8 MLA prefill pads {self.num_head} query heads to "
@@ -1324,10 +1324,7 @@ class AiterAttnBackend(AttentionBackend):
     def check_fp8_prefill_num_head(
         self, *, num_head: int, num_kv_head: int, v_head_dim: int, ask_aiter: bool
     ) -> Optional[int]:
-        """Check _MLA_REDUCE_V1_HEADS (and, with ask_aiter, the compiled AITER)
-        to get head count to run the asm fp8 mla prefill, return None if it is
-        invalid so we will fall it back to aiter fa implementation.
-        """
+        # None means no asm fp8 prefill head count fits: fall back to aiter fa.
         supported = _MLA_REDUCE_V1_HEADS.get(v_head_dim, frozenset())
         if num_head in supported or (
             ask_aiter
