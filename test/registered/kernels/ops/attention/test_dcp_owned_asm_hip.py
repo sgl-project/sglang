@@ -1,0 +1,212 @@
+"""Owned DSA DCP route on ROCm: the fused query and KV write, and the decode
+indexer row split.
+
+Covers:
+1. ``build_dcp_csr`` packs exactly the owned slots of the localized page table.
+2. The AITER fused RoPE + fp8 query row + KV write at this rank's owned locs
+   writes what the pool's DCP-widened write does.
+3. A row slice of the packed top-k with ``row_to_batch`` gives the same rows as
+   the whole batch, which is what the per-rank decode indexer split relies on.
+
+``asm_sparse_mla_dcp`` needs gfx950; its test is in test_dcp_owned_asm_gfx95.py.
+"""
+
+import pytest
+import torch
+
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=30, stage="base-a-jit-kernel-unit", runner_config="amd")
+
+if not torch.cuda.is_available():
+    pytest.skip("GPU required", allow_module_level=True)
+
+# aiter's e4m3 alias is float8_e4m3fn on gfx950 and float8_e4m3fnuz on gfx942,
+# and its fused KV-cache kernels assert on whichever one the device does not use.
+try:
+    from aiter.ops.triton.utils.types import e4m3_dtype as FP8
+except ImportError:
+    FP8 = torch.float8_e4m3fn
+
+H, KV_LORA_RANK, ROPE_DIM, TOPK, DCP = 64, 512, 64, 2048, 4
+# The RoPE rounds its own way before the fp8 cast: one e4m3 step (3 mantissa
+# bits), absolute at e4m3fn's smallest normal (fnuz's is a binade lower).
+FP8_RTOL, FP8_ATOL = 2**-3, 2**-6
+
+
+def _owned_table(rows: int, ctx: int, rank: int):
+    from sglang.kernels.ops.attention.dsa.transform_index import (
+        transform_index_page_table_dcp,
+    )
+
+    table = torch.stack(
+        [torch.randperm(ctx, device="cuda")[:TOPK] for _ in range(rows)]
+    ).int()
+    # Row 0 owns nothing on rank 0; row 1 has a short top-k.
+    table[0, :] = -1
+    table[0, 0] = 1
+    table[1, 100:] = -1
+    return transform_index_page_table_dcp(table, DCP, rank)
+
+
+def test_build_dcp_csr_packs_owned_slots():
+    from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import build_dcp_csr
+
+    torch.manual_seed(0)
+    local, counts = _owned_table(rows=37, ctx=40000, rank=0)
+    indptr, indices = build_dcp_csr(local, counts)
+
+    assert indptr[0].item() == 0
+    torch.testing.assert_close(indptr[1:] - indptr[:-1], counts.int())
+    for r in range(local.shape[0]):
+        n = counts[r].item()
+        got = indices[indptr[r] : indptr[r] + n]
+        torch.testing.assert_close(got, local[r, :n].int())
+
+
+def _rope_interleaved(x, cos, sin):
+    x0, x1 = x[..., 0::2].float(), x[..., 1::2].float()
+    c, s = cos[:, None].float(), sin[:, None].float()
+    return torch.stack([x0 * c - x1 * s, x1 * c + x0 * s], -1).flatten(-2)
+
+
+@pytest.mark.parametrize("T,rank", [(24, 0), (144, 1), (2304, 3)])
+def test_fused_rope_cat_and_cache_matches_dcp_write(T, rank, monkeypatch):
+    from types import SimpleNamespace
+
+    from aiter.ops.triton.fusions.fused_kv_cache import (
+        fused_qk_rope_cat_and_cache_mla,
+    )
+
+    from sglang.kernels.ops.kvcache.mla_buffer import (
+        set_mla_kv_buffer_triton_fp8_quant,
+    )
+    from sglang.srt.mem_cache import memory_pool
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+    from sglang.srt.models.deepseek_common.attention_forward_methods import (
+        forward_mla_rocm,
+    )
+
+    torch.manual_seed(4)
+    rows, max_pos = 4096, 65536
+    parallel = SimpleNamespace(attn_dcp_size=DCP, attn_dcp_rank=rank)
+    monkeypatch.setattr(forward_mla_rocm, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(memory_pool, "get_parallel", lambda: parallel)
+    # The owned-row mapping is the pool's; borrow it without a forward context.
+    pool = SimpleNamespace(_write_loc_dcp_span=DCP)
+    pool.owned_write_rows = lambda loc: MLATokenToKVPool.owned_write_rows(pool, loc)
+    monkeypatch.setattr(forward_mla_rocm, "get_token_to_kv_pool", lambda: pool)
+    # Distinct widened slots, slot 0 (the reserved padding slot) among them.
+    loc = torch.randperm(rows * DCP, device="cuda")[:T]
+    loc[T // 2] = 0
+    batch = SimpleNamespace(out_cache_loc=loc)
+    owned_loc = forward_mla_rocm._dcp_owned_cache_loc(batch)
+    assert forward_mla_rocm._dcp_owned_cache_loc(batch) is owned_loc
+
+    positions = torch.randint(0, max_pos, (T,), device="cuda")
+    freqs = torch.rand(max_pos, ROPE_DIM // 2, device="cuda") * 6.3
+    cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
+    q_nope = torch.randn(T, H, KV_LORA_RANK, device="cuda").bfloat16()
+    q_pe = torch.randn(T, H, ROPE_DIM, device="cuda").bfloat16()
+    k_nope = torch.randn(T, 1, KV_LORA_RANK, device="cuda").bfloat16()
+    k_pe = torch.randn(T, 1, ROPE_DIM, device="cuda").bfloat16()
+
+    kv = torch.zeros(rows, 1, KV_LORA_RANK + ROPE_DIM, device="cuda", dtype=FP8)
+    q8, *_ = fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv,
+        owned_loc,
+        positions,
+        cos,
+        sin,
+        None,
+        False,
+        apply_scale=False,
+        q_out_dtype=FP8,
+    )
+
+    c, s = cos[positions], sin[positions]
+    ref_q = torch.cat([q_nope.float(), _rope_interleaved(q_pe, c, s)], -1)
+    torch.testing.assert_close(
+        q8.float(), ref_q.to(FP8).float(), rtol=FP8_RTOL, atol=FP8_ATOL
+    )
+    ref_kv = torch.zeros_like(kv)
+    set_mla_kv_buffer_triton_fp8_quant(
+        ref_kv,
+        loc,
+        k_nope,
+        _rope_interleaved(k_pe, c, s).bfloat16(),
+        FP8,
+        dcp_world_size=DCP,
+        dcp_rank=rank,
+    )
+    torch.testing.assert_close(
+        kv[..., :KV_LORA_RANK].float(),
+        ref_kv[..., :KV_LORA_RANK].float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(kv.float(), ref_kv.float(), rtol=FP8_RTOL, atol=FP8_ATOL)
+
+
+@pytest.mark.parametrize("rows", [24, 144])
+def test_packed_topk_row_slice_matches_whole_batch(rows):
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_packed_v2
+
+    torch.manual_seed(2)
+    page_size, max_len = 64, 16384
+    lengths = torch.randint(
+        TOPK // 2, max_len, (rows,), device="cuda", dtype=torch.int32
+    )
+    pages = max_len // page_size
+    page_table = torch.stack(
+        [torch.randperm(4 * pages, device="cuda")[:pages] for _ in range(rows)]
+    ).int()
+    scores = torch.randn(rows, max_len, device="cuda")
+
+    whole = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+    all_rows = torch.arange(rows, dtype=torch.int32, device="cuda")
+    topk_transform_packed_v2(
+        scores.clone(),
+        lengths,
+        page_table,
+        whole,
+        page_size,
+        row_starts=torch.zeros_like(all_rows),
+        row_to_batch=all_rows,
+    )
+
+    per = -(-rows // DCP)
+    split = torch.empty(per * DCP, TOPK, dtype=torch.int32, device="cuda")
+    for rank in range(DCP):
+        lo, hi = min(rank * per, rows), min(rank * per + per, rows)
+        if hi == lo:
+            continue
+        row_ids = torch.arange(lo, hi, dtype=torch.int32, device="cuda")
+        topk_transform_packed_v2(
+            scores[lo:hi].clone(),
+            lengths[lo:hi],
+            page_table,
+            split[rank * per : rank * per + hi - lo],
+            page_size,
+            row_starts=torch.zeros_like(row_ids),
+            row_to_batch=row_ids,
+        )
+
+    # The top-k order within a row is unspecified; the selected set is not.
+    torch.testing.assert_close(
+        split[:rows].sort(-1).values, whole.sort(-1).values, rtol=0, atol=0
+    )
+    # Each selected slot is the page-table translation of one of the row's top-k.
+    for r in (0, rows - 1):
+        n = lengths[r].item()
+        pos = torch.topk(scores[r, :n], TOPK).indices
+        expect = page_table[r, pos // page_size] * page_size + pos % page_size
+        assert set(whole[r].tolist()) == set(expect.int().tolist())
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

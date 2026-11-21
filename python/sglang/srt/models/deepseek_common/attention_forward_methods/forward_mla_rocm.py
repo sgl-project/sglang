@@ -84,6 +84,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# One per owned attention kernel (asm or Triton), whose costs differ.
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -507,6 +508,59 @@ def _fused_rope_cat_and_cache(
     )
 
 
+def _dcp_fused_kv_write_matches_pool() -> bool:
+    """Whether the fused kernel's KV write is the pool's own: fp8 DSA rows."""
+    pool = get_token_to_kv_pool()
+    return (
+        pool.supports_external_mla_kv_write and pool.use_dsa and pool.dtype == fp8_dtype
+    )
+
+
+def _dcp_owned_cache_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+    """``out_cache_loc`` as this rank's KV rows, by the pool's own mapping.
+
+    Computed once per batch. A memo from a warmup run is not reused under graph
+    capture, where it would be a constant in the graph.
+    """
+    loc = forward_batch.out_cache_loc
+    capturing = torch.cuda.is_current_stream_capturing()
+    memo = getattr(forward_batch, "_dcp_owned_cache_loc", None)
+    if memo is None or memo[0] is not loc or memo[1] != capturing:
+        memo = (loc, capturing, get_token_to_kv_pool().owned_write_rows(loc))
+        forward_batch._dcp_owned_cache_loc = memo
+    return memo[2]
+
+
+def _dcp_fused_rope_cat_and_cache(
+    attn: DeepseekV2AttentionMLA,
+    q_nope_out: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> torch.Tensor:
+    """RoPE, the fp8 ``[q_nope | q_pe]`` row the asm attention reads, and this
+    rank's share of the KV write, in one AITER kernel."""
+    q8, _, _, _ = fused_qk_rope_cat_and_cache_mla(
+        q_nope_out,
+        q_pe,
+        k_nope,
+        k_pe,
+        get_token_to_kv_pool().get_key_buffer(attn.attn_mqa.layer_id),
+        _dcp_owned_cache_loc(forward_batch),
+        positions,
+        attn.rotary_emb.cos_cache,
+        attn.rotary_emb.sin_cache,
+        attn.attn_mqa.k_scale,
+        attn.rotary_emb.is_neox_style,
+        # set_mla_kv_buffer casts the fp8 DSA rows without a scale.
+        apply_scale=False,
+        q_out_dtype=fp8_dtype,
+    )
+    return q8
+
+
 def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
 
@@ -584,6 +638,34 @@ class DeepseekMLARocmForwardMixin:
     mixin's forward methods to support MLA_ROCM. ROCm dense MHA preparation
     does dispatch ``run_mla_indexer``.
     """
+
+    def _dcp_asm_mla_eligible(self: DeepseekV2AttentionMLA, q_nope) -> bool:
+        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
+            ASM_KV_LORA_RANK,
+            ASM_MAX_ROWS,
+            ASM_NUM_HEADS,
+            ASM_ROPE_DIM,
+            asm_sparse_mla_dcp_available,
+        )
+
+        if q_nope.shape[0] > ASM_MAX_ROWS:
+            return False
+        eligible = getattr(self, "_dcp_asm_mla_ok", None)
+        if eligible is None:
+            eligible = (
+                _use_aiter_gfx95
+                and self.dcp_size > 1
+                and self.rotary_emb is not None
+                and _dcp_fused_kv_write_matches_pool()
+                and self._dcp_q_gather_dtype() == torch.float8_e4m3fn
+                and self.num_local_heads * self.dcp_size == ASM_NUM_HEADS
+                and self.kv_lora_rank == ASM_KV_LORA_RANK
+                and self.qk_rope_head_dim == ASM_ROPE_DIM
+                and self.w_kc_qrep is not None
+                and asm_sparse_mla_dcp_available()
+            )
+            self._dcp_asm_mla_ok = eligible
+        return eligible
 
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
@@ -794,6 +876,11 @@ class DeepseekMLARocmForwardMixin:
             and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 
+        pack_q8_for_asm = (
+            q_replicate_active
+            and not is_in_tc_piecewise_cuda_graph()
+            and self._dcp_asm_mla_eligible(q_nope)
+        )
         if pre_qn is not None:
             # the plugin's q_nope @ w_kc, already token-major
             q_nope_out = pre_qn
@@ -865,7 +952,16 @@ class DeepseekMLARocmForwardMixin:
                 elif is_kv_b_lora_active(self):
                     q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
-        if self._applies_rope_in_prepare(forward_batch):
+        if pack_q8_for_asm:
+            # The fp8 asm attention reads one [T, H, kv_lora_rank + rope] row;
+            # the KV write is done here, so core skips it.
+            q8 = _dcp_fused_rope_cat_and_cache(
+                self, q_nope_out, q_pe, k_nope, k_pe, positions, forward_batch
+            )
+            q_nope_out, q_pe = q8.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+        elif self._applies_rope_in_prepare(forward_batch):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
@@ -913,6 +1009,7 @@ class DeepseekMLARocmForwardMixin:
             topk_indices,
             llama_4_scaling,
             q_nope if fuse_bmm_rope_cache else None,
+            pack_q8_for_asm,
         )
 
     def _applies_rope_in_prepare(
@@ -962,6 +1059,7 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
         q_nope_unabsorbed=None,
+        asm_q8: bool = False,
     ):
         save_kv_cache = True
 
@@ -1055,6 +1153,9 @@ class DeepseekMLARocmForwardMixin:
                         forward_batch,
                         q_rope=q_pe,
                         k_rope=k_pe,
+                        # Prepare wrote the KV with the asm query.
+                        save_kv_cache=not asm_q8,
+                        asm_q8=asm_q8,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)
@@ -1156,9 +1257,7 @@ class DeepseekMLARocmForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
-                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
-                    self.current_attention_backend
-                )
+                is_lse_base_on_e = self._dcp_lse_base_on_e(asm_q8)
                 if self._dcp_project_before_merge():
                     # Project-before-merge: the LSE merge is linear in the
                     # partial output, so V-project every group head first and
@@ -1292,6 +1391,10 @@ class DeepseekMLARocmForwardMixin:
             attn_output.transpose(0, 1), self.w_vc_qrep, out=projected.transpose(0, 1)
         )
         return projected
+
+    def _dcp_lse_base_on_e(self: DeepseekV2AttentionMLA, asm_q8: bool) -> bool:
+        # The asm owned attention returns a natural-log LSE.
+        return is_mla_dcp_lse_base_on_e(self.current_attention_backend) or asm_q8
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """
