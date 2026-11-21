@@ -238,7 +238,8 @@ if HAS_TILELANG:
         for key ``Starts[r] + j`` lands in ``Logits[r, j]``, so the workspace is
         [rows, longest request] instead of [rows, all keys of the batch]. A
         second grid dimension splits each row block's key range, which keeps the
-        grid full when few rows are scored."""
+        grid full when few rows are scored. Scores are stored times ``InvScale``,
+        which saves a separate pass over the logits."""
         rows = T.dynamic("rows")
         keys = T.dynamic("keys")
         width = T.dynamic("width")
@@ -250,6 +251,7 @@ if HAS_TILELANG:
             Logits: T.Tensor([rows, width], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
+            InvScale: T.float32,
         ):
             with T.Kernel(T.ceildiv(rows, block_q), key_splits, threads=threads) as (
                 bx,
@@ -294,7 +296,9 @@ if HAS_TILELANG:
                         # its own window.
                         if column >= 0:
                             if column < width:
-                                Logits[row_base + qi, column] = reduced[n, qi]
+                                Logits[row_base + qi, column] = (
+                                    reduced[n, qi] * InvScale
+                                )
 
         return kernel
 
@@ -556,10 +560,11 @@ def tilelang_qsa_mqa_prefill_relative(
         logits,
         starts,
         ends,
+        # Multiplying by 1.0 / scale gives the same fp32 scores as the absolute
+        # path's div_ by scale (test_relative_prefill_scores_equal_absolute).
+        1.0 / (score_scale or math.sqrt(head_dim)),
     )
-    logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
-    return logits
+    return logits[:rows]
 
 
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
