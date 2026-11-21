@@ -388,12 +388,28 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         pen1.merge(pen2)
         self.assertEqual(pen1.min_new_tokens.shape[0], 2)
 
+    def test_stop_token_ids_follow_filter_and_merge(self):
+        """The stop ids (padded with -1) are sliced by filter and padded to a
+        common width by merge."""
+        _, pen = self._setup([(3, {5, 10}, 2), (5, None, 2)])
+        self.assertEqual(
+            [sorted(r) for r in pen.stop_token_ids.tolist()], [[2, 5, 10], [-1, -1, 2]]
+        )
+        _, other = self._setup([(1, {7, 8, 9, 11}, 2)])
+        pen.merge(other)
+        self.assertEqual(pen.stop_token_ids.shape, (3, 5))
+        self.assertEqual(sorted(pen.stop_token_ids[2].tolist()), [2, 7, 8, 9, 11])
+        self.assertEqual(sorted(pen.stop_token_ids[0].tolist()), [-1, -1, 2, 5, 10])
+        pen.filter(torch.tensor([2]))
+        self.assertEqual(sorted(pen.stop_token_ids[0].tolist()), [2, 7, 8, 9, 11])
+
     def test_teardown_cleans_attributes(self):
         """Test that teardown removes min_new_tokens, stop_token_penalties, and len_output_tokens."""
         _, pen = self._setup([(3, None, 2)])
         pen.teardown()
         self.assertFalse(hasattr(pen, "min_new_tokens"))
         self.assertFalse(hasattr(pen, "stop_token_penalties"))
+        self.assertFalse(hasattr(pen, "stop_token_ids"))
         self.assertFalse(hasattr(pen, "len_output_tokens"))
 
 

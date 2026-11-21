@@ -24,9 +24,10 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.sampling.sampling_batch_info import apply_acc_penalties
+from sglang.srt.speculative.spec_info import per_row_penalties_supported
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils.log_utils import print_warning_once
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -226,11 +227,15 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    draft_tokens: Optional[torch.Tensor] = None,
+    num_drafts: Optional[torch.Tensor] = None,
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    Per-request penalties are broadcast over the verify block instead of
-    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    Row ``j`` of a request's ``draft_token_num`` verify rows follows the drafts
+    ``draft_tokens[b, :j]`` (``[bs, draft_token_num - 1]``), of which only the
+    first ``num_drafts[b]`` are real when given. Penalties count them, as
+    ordinary decoding would.
     """
     if sampling_info is None:
         return
@@ -248,40 +253,45 @@ def apply_dflash_verify_logits_adjustments(
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
 
-    if sampling_info.has_custom_logit_processor:
-        apply_custom_logit_processor(
-            next_token_logits,
-            sampling_info,
-            num_tokens_in_batch=draft_token_num,
+    if not per_row_penalties_supported():
+        _apply_block_start_logits_adjustments(
+            next_token_logits, sampling_info, draft_token_num
         )
+        return
 
-    grammar_mask = getattr(sampling_info, "grammar_mask", None)
-    logit_bias = getattr(sampling_info, "logit_bias", None)
+    penalties = sampling_info.speculative_penalties
+    logit_bias = sampling_info.logit_bias
+    if penalties is not None:
+        if draft_tokens is None or draft_tokens.shape != (bs, draft_token_num - 1):
+            raise ValueError(
+                "DFlash verify penalties need [bs, draft_token_num - 1] draft tokens."
+            )
+        # The kernel adds the fp32 bias to the penalized logits and rounds once,
+        # as decoding one token at a time does; the grammar mask below then adds
+        # only 0 or -inf.
+        penalties.apply_(
+            next_token_logits,
+            penalties.overrides(draft_tokens, num_drafts),
+            logit_bias,
+        )
+        logit_bias = None
+    else:
+        # Forward copies carry per-row penalties whenever a penalty is active.
+        assert sampling_info.acc_additive_penalties is None
 
-    logits_3d: Optional[torch.Tensor] = None
-
-    def get_logits_3d() -> torch.Tensor:
-        nonlocal logits_3d
-        if logits_3d is None:
-            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
-        return logits_3d
-
-    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
-    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
-    apply_acc_penalties(next_token_logits, sampling_info, draft_token_num)
-
+    grammar_mask = sampling_info.grammar_mask
+    logits_3d = next_token_logits.view(bs, draft_token_num, -1)
     if grammar_mask is not None:
-        vocab_mask_bias = torch.zeros(
+        mask_bias = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        grammar_mask.apply(vocab_mask_bias)
-        get_logits_3d().add_(
-            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
-        )
-
-    if logit_bias is not None:
+        grammar_mask.apply(mask_bias)
+        if logit_bias is not None:
+            mask_bias.add_(logit_bias)
+        logits_3d.add_(mask_bias[:, None, :].to(dtype=next_token_logits.dtype))
+    elif logit_bias is not None:
         if (
             logit_bias.device != next_token_logits.device
             or logit_bias.dtype != next_token_logits.dtype
@@ -290,7 +300,55 @@ def apply_dflash_verify_logits_adjustments(
                 device=next_token_logits.device,
                 dtype=next_token_logits.dtype,
             )
-        get_logits_3d().add_(logit_bias[:, None, :])
+        logits_3d.add_(logit_bias[:, None, :])
+
+    # Last, as the sampler applies it after ModelRunner._preprocess_logits.
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+
+
+def _apply_block_start_logits_adjustments(
+    next_token_logits: torch.Tensor, sampling_info: Any, draft_token_num: int
+) -> None:
+    """Verify logit adjustments where the per-row penalty kernels do not run.
+
+    The custom logit processor runs first. With a grammar mask or an active
+    penalizer orchestrator, every row then gets
+    ``SamplingBatchInfo.apply_logits_bias`` of the block start: its penalties,
+    the mask and the logit bias. Otherwise rows get only the logit bias. The
+    scheduler's forward copies carry no orchestrator, so their penalties apply
+    only with a grammar mask. Penalties count no tokens of these steps (see
+    ``SpeculativeAlgorithm.tracks_speculative_penalty_history``).
+    """
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+    bs = len(sampling_info)
+    logits_3d = next_token_logits.view(bs, draft_token_num, -1)
+    penalizer = sampling_info.penalizer_orchestrator
+    if (
+        penalizer is not None and penalizer.is_required
+    ) or sampling_info.grammar_mask is not None:
+        block_start = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=torch.float32,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_logits_bias(block_start)
+        logits_3d.add_(block_start[:, None, :].to(dtype=next_token_logits.dtype))
+    elif sampling_info.logit_bias is not None:
+        logits_3d.add_(
+            sampling_info.logit_bias[:, None, :].to(
+                device=next_token_logits.device, dtype=next_token_logits.dtype
+            )
+        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -1305,5 +1363,18 @@ def build_speculative_verify_target_probs(
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    params = req.sampling_params
+    if not per_row_penalties_supported() and (
+        params.frequency_penalty != 0.0
+        or params.presence_penalty != 0.0
+        or params.repetition_penalty != 1.0
+        or params.min_new_tokens > 0
+    ):
+        print_warning_once(
+            "DFLASH speculative decoding applies sampling penalties and "
+            "min_new_tokens exactly only on CUDA and ROCm; on this device they "
+            "count no tokens of speculative steps."
+        )
 
     return None
