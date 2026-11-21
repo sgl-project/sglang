@@ -493,6 +493,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # (e.g. a residual-stream merge) writes a wider tensor than
         # `config.hidden_size`, so let it declare that width.
         input_embeds_hidden_size = self._input_embeds_hidden_size()
+        input_embeds_dtype = self._input_embeds_dtype()
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -515,6 +516,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            input_embeds_dtype=input_embeds_dtype,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -526,7 +528,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             cache_loc_dtype=self._cache_loc_dtype(),
             is_multimodal=self.is_multimodal,
             hidden_size=input_embeds_hidden_size,
-            embed_dtype=self.model_runner.dtype,
+            embed_dtype=input_embeds_dtype,
             enable_mamba_track=self.mamba_track_enabled,
             # FullCG always pads to a capture bucket. Models that mask padded
             # hidden rows need the live boundary even without expert parallelism.
@@ -808,6 +810,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.model,
             "input_embeds_hidden_size",
             self.model_runner.model_config.hidden_size,
+        )
+
+    def _input_embeds_dtype(self) -> torch.dtype:
+        """Use the model's declared embedding dtype, defaulting to its weight dtype."""
+        return getattr(
+            self.model_runner.model, "input_embeds_dtype", self.model_runner.dtype
         )
 
     def _next_token_logits_buffer(self, rows: int) -> Optional[torch.Tensor]:
@@ -2186,6 +2194,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             top_logprobs_nums=forward_batch.top_logprobs_nums,
+            input_candidate_selectors=forward_batch.input_candidate_selectors,
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
@@ -2505,6 +2514,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_token_logprobs=output.input_token_logprobs,
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,
+            input_top_logprobs_weights=output.input_top_logprobs_weights,
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
             input_logprobs_copy_done=output.input_logprobs_copy_done,
