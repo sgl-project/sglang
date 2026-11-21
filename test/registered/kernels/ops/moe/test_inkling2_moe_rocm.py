@@ -50,14 +50,16 @@ def _sum_splits(partials, dtype):
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tokens", [1, 5, 8, 13, 300])
-def test_expert_gemm(fmt, tokens):
+# (512, 1024) generic; Inkling-2-Mini's w13 (2304, 2304) and w2 (2304, 1152)
+@pytest.mark.parametrize("n,k", [(512, 1024), (2304, 2304), (2304, 1152)])
+def test_expert_gemm(fmt, tokens, n, k):
     """NVFP4: products of e2m1, e4m3 scales and NVFP4-fake-quantized activations are
     exact in FP16, so the FP32 accumulator equals float64 up to summation order."""
     from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
     from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     torch.manual_seed(tokens)
-    nexp, n, k, top_k, start = 16, 512, 1024, 8, 8
+    nexp, top_k, start = 16, 8, 8
     if fmt == "nvfp4":
         w = torch.randint(0, 256, (nexp, n, k // 2), device="cuda", dtype=torch.uint8)
         s = (torch.rand(nexp, n, k // 16, device="cuda") * 2 + 0.25).to(
@@ -164,7 +166,9 @@ def test_expert_gemm_software_nvfp4_tile(monkeypatch, warps, gather):
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tokens", [1, 4, 40, 128])
-def test_consumers_sum_split_k_partials(fmt, tokens):
+# (w13 width, hidden): generic, and Inkling-2-Mini (1152-wide experts, hidden 2304)
+@pytest.mark.parametrize("n2,k", [(512, 1024), (2304, 2304)])
+def test_consumers_sum_split_k_partials(fmt, tokens, n2, k):
     """The SwiGLU and combine kernels sum expert_gemm's split-K partials in split order:
     bitwise equal to summing them first, with several splits and with one."""
     from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
@@ -172,7 +176,7 @@ def test_consumers_sum_split_k_partials(fmt, tokens):
     from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 
     torch.manual_seed(tokens)
-    nexp, n2, k, top_k, start, caps = 16, 512, 1024, 8, 8, (7.0, 7.0)
+    nexp, top_k, start, caps = 16, 8, 8, (7.0, 7.0)
     if fmt == "nvfp4":
         w13 = torch.randint(
             0, 256, (nexp, n2, k // 2), device="cuda", dtype=torch.uint8

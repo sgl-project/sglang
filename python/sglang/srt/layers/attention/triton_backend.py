@@ -2025,9 +2025,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
-            if return_lse:
-                raise NotImplementedError("Deterministic Triton extend has no LSE")
-            return self._forward_extend_unified(
+            self._forward_extend_unified(
                 q,
                 o,
                 layer,
@@ -2037,7 +2035,9 @@ class TritonAttnBackend(AttentionBackend):
                 sinks,
                 score_mod=score_mod,
                 aux_tensors=aux_tensors,
+                lse=lse,
             )
+            return (o, lse) if return_lse else o
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -2451,10 +2451,12 @@ class TritonAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor],
         score_mod=None,
         aux_tensors=None,
+        lse=None,
     ):
         """
         Unified 1-stage extend attention for deterministic inference.
-        Both prefix and extend KV are accessed through unified kv_indices.
+        Both prefix and extend KV are accessed through unified kv_indices;
+        lse, when given, receives each query row's log-sum-exp.
         """
         bs = forward_batch.batch_size
 
@@ -2498,6 +2500,11 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indptr = self.forward_metadata.kv_indptr
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
+        if _is_hip and layer.window_anchor_at_start:
+            prefix_kv_indptr, prefix_kv_indices = _hip.anchored_window_kv(
+                self, layer, forward_batch
+            )
+            sliding_window_size, window_start_pos = -1, None
 
         extend_kv_indices = forward_batch.out_cache_loc
         window_locs = self._window_write_locs() or {}
@@ -2560,6 +2567,9 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        if _is_hip:
+            aux_tensors = _hip.unified_window_aux(aux_tensors, sliding_window_size)
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2585,6 +2595,7 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            lse=lse,
         )
 
         return o
@@ -2674,6 +2685,22 @@ class TritonAttnBackend(AttentionBackend):
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+
+        if _is_hip and self.enable_deterministic and rel_bias is not None:
+            return _hip.forward_decode_unified(
+                self,
+                q,
+                o,
+                layer,
+                forward_batch,
+                kv_indptr,
+                kv_indices,
+                logits_soft_cap,
+                sinks,
+                score_mod,
+                aux_tensors,
+                return_lse,
+            )
 
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float

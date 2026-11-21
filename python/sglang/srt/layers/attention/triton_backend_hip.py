@@ -90,6 +90,21 @@ def init_inkling2_state(backend, model_runner, max_bs) -> None:
     backend.is_hip_dspark_draft = (
         model_runner.is_draft_worker and model_runner.spec_algorithm.is_dspark()
     )
+    # Inkling2's local layers attend the current token and the sliding_window_size - 1
+    # before it (FA4's window_size=(w - 1, 0)), but the window sub-pool, and so each
+    # rail, is w - 1 long: a decode rail ending at the current token would drop the
+    # oldest key. The sub-pool keeps it (it retains w - 1 keys behind the new token),
+    # so read rails of the full window; extend masks the extra prefix key by position.
+    hf_config = model_runner.model_config.hf_config
+    window = getattr(
+        getattr(hf_config, "text_config", None), "sliding_window_size", None
+    )
+    if window and any(
+        arch.startswith("Inkling2") for arch in hf_config.architectures or ()
+    ):
+        backend.window_lengths = {
+            name: max(length, window) for name, length in backend.window_lengths.items()
+        }
 
 
 def _window_rail(backend):
@@ -574,3 +589,82 @@ def forward_draft_block(backend, q, k, v, o, lse, layer, kv_indptr, kv_indices, 
         -1,
         causal,
     )
+
+
+def unified_window_aux(aux_tensors, sliding_window_size):
+    """The unified kernel faults reading a half-precision score_mod aux tensor on a
+    sliding-window layer (gfx950), so window layers pass it in fp32; the kernel
+    adds it to fp32 logits either way."""
+    if (
+        sliding_window_size > 0
+        and aux_tensors
+        and aux_tensors[0].dtype in (torch.bfloat16, torch.float16)
+    ):
+        return [aux_tensors[0].float()]
+    return aux_tensors
+
+
+def forward_decode_unified(
+    backend,
+    q,
+    o,
+    layer,
+    forward_batch,
+    kv_indptr,
+    kv_indices,
+    logits_soft_cap,
+    sinks,
+    score_mod,
+    aux_tensors,
+    return_lse,
+):
+    """Deterministic decode as a one-token extend on the unified kernel: a window
+    rail is padded to absolute tiles, so the decoded token sums its keys in the
+    same tiles and order as a prefill over the same tokens, bit for bit."""
+    bs = forward_batch.batch_size
+    seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
+    sliding_window_size, window_start_pos = -1, None
+    if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        sliding_window_size = layer.sliding_window_size
+        window_lens = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+        kv_indptr, kv_indices = backend.align_window_kv_to_tiles(
+            kv_indptr, kv_indices, seq_lens - window_lens, bs
+        )
+        window_start_pos = seq_lens - (kv_indptr[1 : bs + 1] - kv_indptr[:bs])
+    kv_lens = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+    lse = (
+        q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
+        if return_lse
+        else None
+    )
+    if layer.k_scale is not None and layer.v_scale is not None:
+        k_descale, v_descale = layer.k_scale_float, layer.v_scale_float
+    else:
+        k_descale = v_descale = 1.0
+    kv = backend.kv_layers.read(layer.layer_id)
+    aux_tensors = unified_window_aux(aux_tensors, sliding_window_size)
+    backend.extend_attention_fwd_unified(
+        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+        kv.key(),
+        kv.value(),
+        k_descale,
+        v_descale,
+        torch.arange(bs + 1, dtype=torch.int32, device=q.device),
+        kv_indptr,
+        kv_indices,
+        (kv_lens - 1).to(torch.int32),
+        1,
+        sm_scale=layer.scaling,
+        logit_cap=logits_soft_cap,
+        is_causal=True,
+        sliding_window_size=sliding_window_size,
+        sinks=sinks,
+        window_start_pos=window_start_pos,
+        xai_temperature_len=layer.xai_temperature_len,
+        page_size=backend.page_size,
+        score_mod=score_mod,
+        aux_tensors=aux_tensors,
+        lse=lse,
+    )
+    return (o, lse) if return_lse else o

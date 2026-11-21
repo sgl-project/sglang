@@ -584,5 +584,7 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_skip_first_ngram_calls",
     "cuda_graph_persistence",
     "cuda_graph_persistence_config",
+    "inkling2_loop_num_passes",
+    "inkling2_loop_share_cache",
 )
 # fmt: on

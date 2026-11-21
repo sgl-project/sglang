@@ -429,6 +429,11 @@ def attn_res(
             )
         )
         assert normed.shape == (n_queries, tokens, hidden) and normed.is_contiguous()
+    if split:
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        # the split kernel sums a row's dot products in another order
+        split = not is_batch_invariant_mode_enabled()
     if split and not split_chunk:
         split_chunk = _split_chunk(tokens, n, n_queries)
     if split and split_chunk and 0 < tokens <= ATTN_RES_SPLIT_MAX_TOKENS:
@@ -471,7 +476,9 @@ def attn_res(
         return tuple((normed if norms is not None else scratch).unbind(0))
     # Swept on MI350X (idle, hidden 4608): small batches with few sources take the
     # whole hidden row in one 8192-wide chunk; otherwise 1024-wide chunks.
-    if tokens <= 64 and (n <= 5 or (n <= 9 and n_queries == 1)):
+    if not split:
+        block, num_warps = 1024, 4  # batch invariant: one chunking for every batch
+    elif tokens <= 64 and (n <= 5 or (n <= 9 and n_queries == 1)):
         block, num_warps = 8192, 16
     else:
         block, num_warps = 1024, 4

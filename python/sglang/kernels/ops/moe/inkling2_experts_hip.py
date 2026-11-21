@@ -351,6 +351,12 @@ def default_config(rows, num_experts, nvfp4=False, mfma_order=False):
     MFMA-order weights run experts_gluon, whose width is fixed. mfma_order: weights in
     experts_gluon's MFMA order, which take other prefill tiles with the same K split
     (bitwise)."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if is_batch_invariant_mode_enabled():
+        # One tile and K order for every batch, so a row's sums do not depend on
+        # what it is batched with (deterministic inference)
+        return GemmConfig(16, 64, 256, 1, 4, 1)
     # MTP verify at c1 is 64 rows (8 draft tokens x top-8); above 64 rows the
     # consumers' reads of the FP32 partials cost more than splitting K saves
     if rows <= 64:
@@ -445,6 +451,10 @@ def expert_gemm(
     if not rows:
         return out.unsqueeze(0)
     cfg = config or default_config(rows, num_experts, nvfp4, mfma_order)
+    if config is None:
+        # Inkling-2-Mini's w2 is 1152 wide (9 x 128): halve BK until it divides K
+        while width % cfg.bk and cfg.bk > 64:
+            cfg = cfg._replace(bk=cfg.bk // 2)
     assert width % cfg.bk == 0 and out_size % cfg.bn == 0
     # The largest split of at most cfg.split_k that divides the K tiles evenly.
     tiles = width // cfg.bk

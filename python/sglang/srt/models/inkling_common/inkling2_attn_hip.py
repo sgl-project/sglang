@@ -1,6 +1,7 @@
 """ROCm forward of Inkling2Attention: the Triton backend's relative-bias attention."""
 
 from sglang.kernels.ops.attention.inkling2_attn import gate_sink
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.quantization.unquant import _prefer_triton_a16w16
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -14,7 +15,9 @@ if is_gfx95_supported():
         pass
 
 
-def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batch):
+def forward(
+    attention, attn, q, k, v, r, gate, sinks, sources, positions, forward_batch
+):
     """ROCm: the Triton backend's relative-bias attention on a compact rel bias.
     Decode and MTP verify take the fused prologue (verify saves the conv windows),
     which also stores K and V into the KV cache when the backend names the target,
@@ -22,8 +25,14 @@ def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batc
     tokens = q.shape[0]
     mode = forward_batch.forward_mode
     verify = mode.is_target_verify()
-    if attention.fused_decode_prologue and (mode.is_decode() or verify):
-        kv_pool = fused_kv_write_buffers(attention.attn, forward_batch, k.dtype)
+    # Deterministic inference takes the extend route for every mode, so a decoded
+    # token's logprob matches the one a prefill over the same tokens computes.
+    if (
+        attention.fused_decode_prologue
+        and (mode.is_decode() or verify)
+        and not is_batch_invariant_mode_enabled()
+    ):
+        kv_pool = fused_kv_write_buffers(attn, forward_batch, k.dtype)
         q, k, v, rel_bias = attention._decode_prologue(
             q,
             k,
@@ -39,7 +48,7 @@ def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batc
         verify_kwargs = (
             dict(rel_bias_scale_after_add=True, pack_gqa=False) if verify else {}
         )
-        output = attention.attn(
+        output = attn(
             q,
             k,
             v,
@@ -51,7 +60,7 @@ def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batc
         )
     else:
         q, k, v, r = attention._prologue(q, k, v, r, sources, positions, forward_batch)
-        output, lse = attention.attn(
+        output, lse = attn(
             q,
             k,
             v,
@@ -65,7 +74,9 @@ def forward(attention, q, k, v, r, gate, sinks, sources, positions, forward_batc
             output.reshape(tokens, -1), gate, lse, sinks, output_dtype=q.dtype
         )
     output = apply_wo_ud(attention.wo_ud, output)
-    return get_parallel().attn_tp_group.all_reduce(output)
+    from sglang.srt.models.inkling2_hip import all_reduce
+
+    return all_reduce(get_parallel().attn_tp_group, output)
 
 
 def apply_wo_ud(layer, x):
@@ -74,6 +85,7 @@ def apply_wo_ud(layer, x):
     equal up to 64 rows."""
     if (
         _aiter_a16w16 is not None
+        and not is_batch_invariant_mode_enabled()
         and layer.bias is None
         and _prefer_triton_a16w16(x, layer.weight)
     ):

@@ -5,10 +5,7 @@ import torch
 
 from sglang.kernels.ops.communication.inkling2_comm import all_reduce
 from sglang.kernels.ops.gemm import inkling2_marlin_sm90 as marlin_sm90
-from sglang.kernels.ops.gemm.inkling2_linear import (
-    linear_k_group_partials,
-    uses_k_groups,
-)
+from sglang.kernels.ops.gemm.inkling2_linear import linear_k_group_partials
 from sglang.kernels.ops.moe import inkling2_experts_hip as experts_hip
 from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 from sglang.kernels.ops.moe.inkling2_route_hip import (
@@ -17,11 +14,18 @@ from sglang.kernels.ops.moe.inkling2_route_hip import (
     route_metadata_quantize,
     route_topk_metadata,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.models.inkling_common.inkling2_moe import (
     BF16_COMBINE_MIN_TOKENS,
     RoutedOutput,
 )
 from sglang.srt.runtime_context import get_parallel
+
+
+def _deterministic_all_reduce(group, x):
+    from sglang.srt.models.inkling2_hip import all_reduce as hip_all_reduce
+
+    return hip_all_reduce(group, x)
 
 
 def mfma_reorders(shape):
@@ -50,7 +54,10 @@ def moe_forward(moe, x, combine):
         return forward_experts(moe.experts, x, weights, ids, False, route, quantized)
     out = forward_experts(moe.experts, x, weights, ids, True, route, quantized)
     if get_parallel().moe_tp_size > 1:
-        out = all_reduce(out, get_parallel().moe_tp_group)
+        if is_batch_invariant_mode_enabled():
+            out = _deterministic_all_reduce(get_parallel().moe_tp_group, out)
+        else:
+            out = all_reduce(out, get_parallel().moe_tp_group)
     return out
 
 
@@ -148,12 +155,23 @@ def forward_experts(experts, x, weights, ids, combine, route=None, quantized=Non
     if experts.ep_size > 1:
         # Like Hopper: BF16 partial sums above BF16_COMBINE_MIN_TOKENS halve the
         # prefill traffic; the reduction itself accumulates in FP32.
-        if tokens > BF16_COMBINE_MIN_TOKENS:
+        if tokens > BF16_COMBINE_MIN_TOKENS and not is_batch_invariant_mode_enabled():
             sums = sums.to(torch.bfloat16)
-        sums = get_parallel().moe_ep_group.all_reduce(sums)
+        sums = _deterministic_all_reduce(get_parallel().moe_ep_group, sums)
     if not combine:
         return RoutedOutput(sums, experts._identity[:tokens], 1)
     return sums.to(x.dtype)
+
+
+def _route_partials(x, weight):
+    """Whether the gate's k-group partials (route_topk_metadata's input) apply:
+    uses_k_groups without its K >= 2560 floor, a dense-path speed choice; the
+    partials kernel masks a ragged last 1024-wide group (Inkling-2-Mini's 2304)."""
+    return (
+        x.dtype == weight.dtype == torch.bfloat16
+        and x.stride(-1) == weight.stride(-1) == 1
+        and x.shape[-1] == weight.shape[1]
+    )
 
 
 def gate_and_route(gate, experts, x):
@@ -161,10 +179,10 @@ def gate_and_route(gate, experts, x):
     ROUTE_FUSED_MAX_TOKENS tokens, the experts' route and fake-quantized x from the
     same launch (route_topk_metadata, bitwise the separate kernels); otherwise
     (weights, ids, None, None)."""
-    if not (
+    if is_batch_invariant_mode_enabled() or not (
         1 <= x.shape[0] <= ROUTE_FUSED_MAX_TOKENS
         and gate.topk == 8
-        and uses_k_groups(x, gate.weight)
+        and _route_partials(x, gate.weight)
     ):
         return *gate(x), None, None
     num_local = experts.w13_weight.shape[0]

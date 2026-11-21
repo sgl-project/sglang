@@ -44,7 +44,8 @@ def _attn_res_reference(sources, addend, queries, normalize):
 @pytest.mark.parametrize("split", [False, 512, 1024])
 @pytest.mark.parametrize("tokens", [1, 9, 64, 300])
 @pytest.mark.parametrize("n,nq", [(1, 1), (2, 3), (5, 1), (9, 1), (12, 3)])
-def test_block_attention_residual(tokens, n, nq, split):
+@pytest.mark.parametrize("hidden", [4608, 2304])  # Inkling-2-Small, Inkling-2-Mini
+def test_block_attention_residual(tokens, n, nq, split, hidden):
     """One-CTA kernel and the split kernel at both chunk widths (300 rows take the
     one-CTA kernel either way)."""
     from functools import partial
@@ -55,23 +56,23 @@ def test_block_attention_residual(tokens, n, nq, split):
 
     torch.manual_seed(n * 7 + nq)
     srcs = [
-        torch.randn(tokens, 4608, device="cuda", dtype=torch.bfloat16) * (i + 1)
+        torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * (i + 1)
         for i in range(n)
     ]
     addend = (
-        torch.randn(tokens, 4608, device="cuda", dtype=torch.bfloat16)
+        torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
         if n % 2
         else None
     )
-    q = torch.randn(nq, 4608, device="cuda") * 4608**-0.5 * 3
+    q = torch.randn(nq, hidden, device="cuda") * hidden**-0.5 * 3
     ref = _attn_res_reference(srcs, addend, q, True)
     first = [y.clone() for y in attn_res(srcs, addend, q, normalize_values=True)]
     for y, r in zip(first, ref):
         assert y.dtype == torch.float32 and _rel(y, r) < 1e-5
     norms = [
         (
-            torch.randn(4608, device="cuda", dtype=torch.bfloat16),
-            torch.rand(4608, device="cuda", dtype=torch.bfloat16) + 0.5,
+            torch.randn(hidden, device="cuda", dtype=torch.bfloat16),
+            torch.rand(hidden, device="cuda", dtype=torch.bfloat16) + 0.5,
             1e-6,
             torch.bfloat16,
         )
