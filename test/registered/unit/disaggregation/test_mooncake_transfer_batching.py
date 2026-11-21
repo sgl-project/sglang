@@ -3,7 +3,7 @@ import ctypes
 import unittest
 from collections import defaultdict
 from queue import SimpleQueue
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -601,6 +601,40 @@ class TestDcpPackLifetime(CustomTestCase):
         self.assertEqual(observed, [11])
 
 
+class _NeverDoneEvent:
+    """A device event whose work does not finish until the test sets `done`."""
+
+    def __init__(self):
+        self.polled = Event()
+        self.done = Event()
+
+    def query(self) -> bool:
+        self.polled.set()
+        return self.done.is_set()
+
+    def synchronize(self) -> None:
+        self.done.wait()
+
+
+class _ClearedOnRead(dict):
+    """request_status whose `room` is cleared just as the worker reads it."""
+
+    def __init__(self, statuses, room):
+        super().__init__(statuses)
+        self.room = room
+
+    def __contains__(self, room):
+        found = super().__contains__(room)
+        if room == self.room:
+            self.pop(room, None)
+        return found
+
+    def get(self, room, default=None):
+        if room == self.room:
+            self.pop(room, None)
+        return super().get(room, default)
+
+
 class TestMooncakeEarlySend(CustomTestCase):
     def test_sender_queues_event_once_without_waiting_on_scheduler(self):
         for last in (False, True):
@@ -690,6 +724,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             enable_trace=False,
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
+            transfer_timeout=0,
             _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},
             transfer_infos={1: {"peer": peer}},
@@ -793,6 +828,52 @@ class TestMooncakeEarlySend(CustomTestCase):
                 manager, queue, MagicMock(), staging_buffer=object()
             )
         self.assertEqual(order, ["wait", "gather"])
+
+    def _run_worker_on_a_stuck_room(self):
+        """Room 1 waits on a device event that never completes; room 2 is queued
+        behind it on the same worker. The transfer timeout is on."""
+        stuck = _NeverDoneEvent()
+        self.addCleanup(stuck.done.set)
+        manager, queue = self._worker(stuck)
+        manager.transfer_timeout = 600
+        manager.request_status[2] = KVPoll.WaitingForInput
+        manager.transfer_infos[2] = manager.transfer_infos[1]
+        stuck_chunk = queue.get_nowait()
+        queue.get_nowait()  # Queue room 2 behind room 1, ahead of the stop sentinel.
+        for chunk in (
+            stuck_chunk,
+            TransferKVChunk(2, [0], slice(0, 1), False, None, None),
+            None,
+        ):
+            queue.put(chunk)
+        worker = Thread(
+            target=MooncakeKVManager.transfer_worker,
+            args=(manager, queue, MagicMock()),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(stuck.polled.wait(5))
+        return manager, worker
+
+    def test_failed_room_stops_blocking_the_rooms_behind_it(self):
+        # The sender's transfer timeout or an abort fails the room during the wait.
+        manager, worker = self._run_worker_on_a_stuck_room()
+        manager.request_status[1] = KVPoll.Failed
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        # Only room 2 was read and sent; room 1's chunk was dropped and acked.
+        manager.send_kvcache.assert_called_once()
+        manager._maybe_ack_drained_abort.assert_any_call(1)
+        self.assertNotIn(1, manager._staging_outstanding)
+
+    def test_room_cleared_during_the_wait_does_not_kill_the_worker(self):
+        """The scheduler thread may clear the room between two status reads; a
+        membership test followed by an index then raises and kills the worker."""
+        manager, worker = self._run_worker_on_a_stuck_room()
+        manager.request_status = _ClearedOnRead(manager.request_status, room=1)
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        manager.send_kvcache.assert_called_once()
 
 
 class TestMooncakeStagingDeviceType(unittest.TestCase):

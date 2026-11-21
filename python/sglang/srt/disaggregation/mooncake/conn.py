@@ -116,6 +116,24 @@ class FailedSessionProbe:
     interval: float
 
 
+def _wait_chunk_event(*, kv_mgr: MooncakeKVManager, event, room: int) -> None:
+    """Wait for a chunk's device event. With SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT
+    set, poll it so a room that fails meanwhile (that timeout, an abort or a decode
+    failure) stops blocking the rooms queued behind it on this worker."""
+    if kv_mgr.transfer_timeout <= 0:
+        event.synchronize()
+        return
+    # 50 us doubling to 200 us: in a CPU microbench a 1 ms cap cost the scheduler
+    # thread as much GIL time and added ~0.8 ms to a healthy wait.
+    interval = 5e-5
+    while not event.query():
+        # One read: the scheduler thread may clear the room at any moment.
+        if kv_mgr.request_status.get(room, KVPoll.Failed) == KVPoll.Failed:
+            return
+        time.sleep(interval)
+        interval = min(interval * 2, 2e-4)
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -2896,10 +2914,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.room in self.request_status
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
-                        kv_chunk.wait_event.synchronize()
+                        _wait_chunk_event(
+                            kv_mgr=self, event=kv_chunk.wait_event, room=kv_chunk.room
+                        )
                     kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
-                    kv_chunk.indices_event.synchronize()
+                    _wait_chunk_event(
+                        kv_mgr=self, event=kv_chunk.indices_event, room=kv_chunk.room
+                    )
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
                     kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()

@@ -339,6 +339,11 @@ The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom me
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`300`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT`**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for a request's KV transfer to finish after its last chunk is queued; each PP stage times its own transfer. Past it the request fails, decode is notified, and its prefill KV is freed. The clock includes the time the request waits in the transfer worker's queue, so set it above the worst-case queue wait plus transfer time. Applies to the Mooncake, Ascend, NIXL and Mori backends. With Mooncake and Ascend, a transfer worker waiting on a failed request's device event also stops waiting, so requests queued later proceed; requests already queued behind it within the timeout window can time out with it, because their clock includes that wait. A worker stuck inside a transfer engine call is not released, and decode frees its pages after `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0` (disabled)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><code>SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL</code></strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between cleanups of bootstrap entries</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>120</code></td>
