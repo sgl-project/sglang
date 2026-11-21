@@ -16,6 +16,7 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
+import functools
 from typing import Optional
 
 import torch
@@ -64,6 +65,35 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
+
+
+@functools.cache
+def smallm_max_t() -> int:
+    """Token-count ceiling for the small-M ROCm HIP kernel (0 when disabled)."""
+    return 128 if is_hip() else 0
+
+
+@functools.cache
+def fused_max_t() -> int:
+    """Token ceiling of the fused all-reduce + aggregation (0 when disabled)."""
+    return 64 if is_hip() else 0
+
+
+def use_hip_smallm(
+    num_tokens: int, hidden_size: int, nvb: int, dtype: torch.dtype
+) -> bool:
+    """Whether an aggregation point of this shape and dtype takes
+    attn_res_smallm_hip."""
+    if not (
+        dtype == torch.bfloat16
+        and 0 < num_tokens <= smallm_max_t()
+        and nvb >= 1
+        and _use_hip_fused(hidden_size, nvb)
+    ):
+        return False
+    from sglang.kernels.ops.attention.attn_res_smallm_hip import supported
+
+    return supported(hidden_size, nvb)
 
 
 def get_cw(
@@ -303,13 +333,21 @@ def _aggregate_hip(
     """Single ROCm Triton kernel: the bank stays in registers so scoring and
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
-    pre-norm mixture instead. Returns (result, prefix)."""
+    pre-norm mixture instead. Returns (result, prefix). Small token counts take
+    the single HIP kernel instead (attn_res_smallm_hip)."""
     from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)
     out = torch.empty_like(prefix_sum)
-    attn_res_hip(
+    kernel = attn_res_hip
+    if use_hip_smallm(prefix_sum.shape[0], prefix_sum.shape[1], nvb, prefix_sum.dtype):
+        from sglang.kernels.ops.attention.attn_res_smallm_hip import (
+            attn_res_smallm_hip,
+        )
+
+        kernel = attn_res_smallm_hip
+    kernel(
         prefix_sum,
         bank,
         cw,
@@ -494,6 +532,43 @@ class AttnResidual:
     def _count_write(self, rows: Optional[slice]) -> None:
         self.num_valid_blocks += 1
         self.written_on_slice |= rows is not None
+
+    def forward_ar_fused(
+        self,
+        ca,
+        partial: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        score_norm: RMSNorm,
+        out_norm: RMSNorm,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """All-reduce the TP-partial `partial` (o_proj output) and aggregate in
+        one kernel. Same result as forward(all_reduce(partial), prefix_sum, ...)
+        (no bank write). None when the fused kernel does not apply; the caller
+        then reduces."""
+        from sglang.kernels.ops.communication import k3_ar_agg_hip
+
+        nvb = self.num_valid_blocks
+        T, H = partial.shape
+        if T > fused_max_t() or not k3_ar_agg_hip.usable(ca, T, H, nvb):
+            return None
+        if prefix_sum is not None and prefix_sum.shape != partial.shape:
+            return None
+        out, prefix = torch.empty_like(partial), torch.empty_like(partial)
+        k3_ar_agg_hip.ar_agg(
+            ca,
+            partial.contiguous(),
+            prefix_sum,
+            self.block_residual,
+            get_cw(score_proj, score_norm),
+            out_norm.weight,
+            nvb,
+            score_norm.variance_epsilon,
+            out_norm.variance_epsilon,
+            out=out,
+            prefix_out=prefix,
+        )
+        return out, prefix
 
     def forward(
         self,
