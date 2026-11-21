@@ -2,8 +2,10 @@ import unittest
 from contextlib import ExitStack
 
 import openai
+import requests
 
 from sglang.srt.environ import envs
+from sglang.srt.speculative.dflash_utils import is_dflash_sampling_verify_available
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -106,6 +108,10 @@ class TestDFlashServerBase(
             print(f"early_stop: max_tokens={max_tokens}, text={text!r}")
         assert self.process.poll() is None
 
+    @unittest.skipUnless(
+        is_dflash_sampling_verify_available(),
+        "no DFLASH sampling-verify kernel, so the server rejects temperature > 0",
+    )
     def test_eos_handling(self):
         client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
         response = client.chat.completions.create(
@@ -134,6 +140,31 @@ class TestDFlashServerBase(
             outputs.append(response.choices[0].text)
         print(f"determinism: {outputs=}")
         self.assertEqual(outputs[0], outputs[1])
+        assert self.process.poll() is None
+
+    @unittest.skipUnless(
+        is_dflash_sampling_verify_available(),
+        "no DFLASH sampling-verify kernel, so the server rejects temperature > 0",
+    )
+    def test_logprob_match(self):
+        super().test_logprob_match()
+
+    # The default draft has no selector or LiLiCorr head, so without the kernel
+    # DFLASH can only verify greedily.
+    @unittest.skipIf(
+        is_dflash_sampling_verify_available(),
+        "the DFLASH sampling-verify kernel lets the server admit temperature > 0",
+    )
+    def test_non_greedy_request_returns_bad_request(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0.7, "max_new_tokens": 8},
+            },
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("(temperature=0 or top_k=1)", response.text)
         assert self.process.poll() is None
 
 
