@@ -1726,46 +1726,6 @@ class TestHicacheMambaSize(CustomTestCase):
         self.assertAlmostEqual(kv_sizes["swa_host_size"], 122 / 3)
         self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
 
-    def test_mamba_stack_gives_the_pin_to_mamba_and_the_rest_to_kv(self):
-        """The non-SWA hybrid builder splits through the same pin as the SWA one."""
-        kv_pool = self._pool(8 << 30)
-        params = SimpleNamespace(
-            page_size=1, mtp_draft_device_pools=(), mtp_draft_mamba_pools=()
-        )
-        with (
-            self._hicache_args(mamba_size=70),
-            patch.object(hybrid_pool_assembler, "_mamba_info"),
-            patch.object(
-                hybrid_pool_assembler, "_mamba_layer_mapping", return_value={2: 0}
-            ),
-            patch.object(
-                hybrid_pool_assembler,
-                "prepare_host_pool_config",
-                return_value=SimpleNamespace(
-                    root=kv_pool, packed_draft_device_pools=()
-                ),
-            ),
-            patch.object(
-                hybrid_pool_assembler, "_kv_budget_index_bytes", return_value=0
-            ),
-            patch.object(hybrid_pool_assembler, "build_kv_host_pool") as kv_host,
-            patch.object(hybrid_pool_assembler, "_build_pool_entries", return_value=[]),
-            patch.object(hybrid_pool_assembler, "HostPoolGroup"),
-            patch.object(hybrid_pool_assembler, "_mamba_entry") as mamba_entry,
-            patch.object(hybrid_pool_assembler, "_build_cache_controller"),
-        ):
-            hybrid_pool_assembler.build_hybrid_mamba_stack(
-                params=params,
-                kv_pool=kv_pool,
-                mamba_pool=self._pool(6 << 30),
-                full_layer_mapping={0: 0},
-                start_layer=0,
-                load_cache_event=None,
-                storage_backend=None,
-            )
-        self.assertEqual(kv_host.call_args.kwargs["host_size"], 122)
-        self.assertEqual(mamba_entry.call_args.kwargs["host_size"], 70)
-
     def test_both_stacks_build_the_pinned_mamba_host_pool_at_its_pin(self):
         """Both builders hand the pin to a real Mamba host pool, which holds floor(pin / slot bytes) + 1 slots,
         and give the KV host pool the rest of --hicache-size."""
@@ -1773,7 +1733,7 @@ class TestHicacheMambaSize(CustomTestCase):
             size=4,
             spec_state_size=4,
             cache_params=InklingConvCacheParams(
-                shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                shape=InklingConvStateShape(conv=[(2, 2)], temporal=(128, 128, 8)),
                 layers=[0, 1],
                 dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
             ),
@@ -1868,38 +1828,29 @@ class TestHicacheMambaSize(CustomTestCase):
     def test_pin_below_one_mamba_slot_is_rejected(self):
         """Host sizing pads by one slot,
         so a pin smaller than one state slot would silently build a one-slot pool."""
-        params = SimpleNamespace(
-            mtp_draft_mamba_pools=(),
-            token_to_kv_pool_allocator=SimpleNamespace(state_slots=MagicMock()),
+        # Six layers of 256 MiB temporal state per slot: about 1.6 GB, so a 1 GB pin holds none.
+        buffer_info = MambaStateBufferInfo(
+            temporal=torch.empty((6, 2, 512, 512, 256), device="meta"),
+            conv=(torch.empty((6, 2, 2, 2), device="meta"),),
         )
-        for pin_gb, rejected in ((1, True), (2, False)):
-            with (
-                self.subTest(pin_gb=pin_gb),
-                self._hicache_args(mamba_size=pin_gb),
-                patch.object(
-                    hybrid_pool_assembler,
-                    "build_mamba_host_pool",
-                    return_value=SimpleNamespace(size_per_token=int(2e9)),
-                ),
-                patch.object(hybrid_pool_assembler, "_state_host_layout"),
-                patch.object(hybrid_pool_assembler, "build_pool_entry"),
-            ):
-                build = partial(
-                    hybrid_pool_assembler._mamba_entry,
-                    params=params,
-                    mamba_pool=None,
-                    info=SimpleNamespace(layer_ids=(0,)),
-                    layer_mapping={0: 0},
-                    transfer_layer_id_max=1,
-                    host_size=pin_gb,
-                    host_evict_fn=None,
-                    device_evict_fn=None,
-                )
-                if rejected:
-                    with self.assertRaisesRegex(ValueError, "one Mamba state slot"):
-                        build()
-                else:
-                    build()
+
+        def meta_alloc(dims, *, dtype, **_):
+            return torch.empty(dims, dtype=dtype, device="meta")
+
+        with (
+            self._hicache_args(mamba_size=1),
+            host_memory_budget_scope(1 << 40),
+            patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": meta_alloc}),
+            self.assertRaisesRegex(ValueError, "one Mamba state slot"),
+        ):
+            MambaPoolHost(
+                buffer_info=buffer_info,
+                host_to_device_ratio=2,
+                host_size=1,
+                device_capacity=2,
+                pin_memory=False,
+                layout="page_first",
+            )
 
     def test_pin_holds_the_packed_mtp_draft_layers(self):
         """Each pinned host slot also carries every packed MTP draft Mamba layer,

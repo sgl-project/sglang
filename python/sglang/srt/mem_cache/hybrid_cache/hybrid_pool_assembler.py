@@ -256,20 +256,6 @@ def _split_hicache_size_with_mamba(
     return (*kv_sizes, mamba_size)
 
 
-def _require_pinned_mamba_slot(*, host_pool: MambaPoolHost, host_size: float) -> None:
-    # Ratio sizing (host_size 0) never carries a pin;
-    # sizing pads each host pool by one slot, so a sub-slot pin builds a 1-slot pool.
-    if host_size <= 0 or get_memory().hicache_mamba_size == 0:
-        return
-    if host_size * 1e9 >= host_pool.size_per_token:
-        return
-    raise ValueError(
-        f"--hicache-mamba-size {host_size:g} cannot hold one Mamba state slot, "
-        f"which takes {host_pool.size_per_token / 1e9:.3f} GB across the target "
-        "and MTP draft Mamba layers."
-    )
-
-
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1200,7 +1186,6 @@ def _mamba_entry(
         layout=_state_host_layout(),
         mtp_draft_device_pools=drafts,
     )
-    _require_pinned_mamba_slot(host_pool=host_pool, host_size=host_size)
     return build_pool_entry(
         name=PoolName.MAMBA,
         host_pool=host_pool,
