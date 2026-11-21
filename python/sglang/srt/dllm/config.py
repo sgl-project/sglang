@@ -64,6 +64,13 @@ class DllmConfig:
         if not architectures:
             raise RuntimeError("The model config does not declare an architecture")
         arch = architectures[0]
+        # Other models may not define these diffusion config fields.
+        if arch == "NemotronLabsDiffusionModel":
+            DLLM_PARAMS[arch] = {
+                "block_size": model_config.hf_config.block_size,
+                "mask_id": model_config.hf_config.mask_token_id,
+                "algorithm": "NemotronFastDiffuser",
+            }
         if arch in DLLM_PARAMS:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]

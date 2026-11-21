@@ -18,7 +18,7 @@ python3 -m sglang.launch_server \
 
 ## First-Done-First-Out (FDFO) Scheduling
 
-FDFO scheduling is **enabled by default**: each request leaves the batch as soon as its block is resolved, instead of advancing in lockstep where fast-converging requests must wait for slow long-tail requests before leaving the batch (head-of-line blocking). This improves throughput and is orthogonal to `--dllm-algorithm`, so it works with any dLLM algorithm. Pass `--no-dllm-fdfo` to fall back to synchronous lockstep scheduling:
+FDFO scheduling is **enabled by default**: each request leaves the batch as soon as its block is resolved, instead of advancing in lockstep where fast-converging requests must wait for slow long-tail requests before leaving the batch (head-of-line blocking). This improves throughput and is orthogonal to `--dllm-algorithm`, so it works with any dLLM algorithm. For algorithms that support synchronous scheduling, pass `--no-dllm-fdfo` to use lockstep scheduling:
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -28,6 +28,42 @@ python3 -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000
 ```
+
+## Nemotron Labs Diffusion
+
+You can serve [nvidia/Nemotron-Labs-Diffusion-8B](https://huggingface.co/nvidia/Nemotron-Labs-Diffusion-8B) on NVIDIA CUDA GPUs in autoregressive or block-diffusion mode.
+
+For autoregressive generation, launch the model without a dLLM algorithm:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path nvidia/Nemotron-Labs-Diffusion-8B
+```
+
+For block diffusion, select `NemotronFastDiffuser`:
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path nvidia/Nemotron-Labs-Diffusion-8B \
+  --dllm-algorithm NemotronFastDiffuser
+```
+
+Block diffusion uses FA4 on SM100 GPUs and FlashInfer on other CUDA GPUs, with BF16 weights and the default FDFO scheduler. Use `--attention-backend flashinfer` to select FlashInfer on SM100. Both modes preserve the configured CUDA graph settings. Causal context encoding can use prefill graphs, while denoising uses decode graphs. It encodes committed context causally and fills each new block bidirectionally, starting with a causal next-token prediction. Block size and mask ID come from the checkpoint. The confidence threshold defaults to `0.9`; you can set `threshold` in a YAML file passed with `--dllm-algorithm-config`.
+
+Use greedy sampling for block diffusion:
+
+```bash
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "nvidia/Nemotron-Labs-Diffusion-8B",
+    "messages": [{"role": "user", "content": "What is 15% of 240?"}],
+    "temperature": 0,
+    "max_tokens": 256
+  }'
+```
+
+The block-diffusion implementation requires FDFO and disables prefix caching and chunked prefill. It does not support quantized loading, LoRA, pipeline/context parallelism, attention data parallelism, penalties, constrained decoding or logprob requests. LinearSpec is not implemented.
 
 ## Example Configuration File
 
@@ -146,6 +182,11 @@ Below the supported models are summarized in a table.
       <td><strong>DiffusionGemma</strong></td>
       <td><code>google/diffusiongemma-26B-A4B-it</code></td>
       <td>Uniform-state (renoising) block-diffusion multimodal (text + image) MoE, 25.2B total / 3.8B active, served with the <code>Gemma4Renoise</code> sampler.</td>
+    </tr>
+    <tr>
+      <td><strong>Nemotron Labs Diffusion</strong></td>
+      <td><code>nvidia/Nemotron-Labs-Diffusion-8B</code></td>
+      <td>Autoregressive generation or block diffusion with <code>NemotronFastDiffuser</code>.</td>
     </tr>
   </tbody>
 </table>
