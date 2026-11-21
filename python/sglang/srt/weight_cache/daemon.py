@@ -46,7 +46,7 @@ import os
 import signal
 import socket
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -93,6 +93,40 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+
+def destroy_nccl_communicators() -> List[str]:
+    """Destroy the NCCL communicators (PyNccl) of this process's groups.
+
+    A group of more than one rank creates one when it is built and connects it
+    with a warm-up all-reduce, for the collectives of a forward pass, which a
+    daemon never runs. Loading registers no NCCL window on it (symmetric memory
+    is for forward passes). PyNccl has no teardown of its own: dropping it, as
+    GroupCoordinator.destroy() does, keeps the communicator and its buffers
+    until the process exits.
+
+    ncclCommDestroy can wait for the communicator's other ranks, so every rank
+    must call this at the same point. The groups go in registration order,
+    which model-parallel initialization makes the same on every rank. The
+    groups keep everything else. Returns the names of the groups whose
+    communicator was destroyed.
+    """
+    from sglang.srt.distributed import parallel_state
+
+    destroyed = []
+    for ref in list(parallel_state._groups.values()):
+        group = ref()
+        comm = group.get_available_pynccl_comm() if group is not None else None
+        if comm is None:
+            continue
+        # From here on the group has no PyNccl, and a stale reference can
+        # neither be enabled again nor reach the destroyed communicator.
+        group.pynccl_comm = None
+        handle, comm.comm = comm.comm, None
+        comm.available, comm.disabled = False, True
+        comm.nccl.ncclCommDestroy(handle)
+        destroyed.append(group.unique_name)
+    return destroyed
 
 
 @dataclasses.dataclass
@@ -548,6 +582,18 @@ class WeightCacheDaemon:
             )
         )
 
+    def release_nccl_communicators(self) -> None:
+        """Destroy the NCCL communicators that only loading used
+        (destroy_nccl_communicators); the exported weights stay as they are."""
+        tic = time.perf_counter()
+        destroyed = destroy_nccl_communicators()
+        if destroyed:
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+                f"Destroyed the NCCL communicators of {destroyed}, which only "
+                f"loading used, in {time.perf_counter() - tic:.2f}s"
+            )
+
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
         # Do NOT unlink an existing socket here: stale-file cleanup is the launch
@@ -717,9 +763,13 @@ def run_weight_cache_daemon(
     )
 
     daemon.load()
-    _await_cluster_ready_to_serve(
-        timeout=resolving_view(server_args).weight_cache_timeout
-    )
+    timeout = resolving_view(server_args).weight_cache_timeout
+    _await_cluster_ready_to_serve(timeout=timeout)
+    if dist.get_world_size() > 1:
+        # Every rank is past loading: free what only loading used, before an
+        # engine on this GPU sizes its KV cache, and publish once all have.
+        daemon.release_nccl_communicators()
+        _await_cluster_ready_to_serve(timeout=timeout)
     daemon.serve()
 
 
