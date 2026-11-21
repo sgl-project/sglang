@@ -125,7 +125,7 @@ def _chunked_lora_expand_kernel(
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
     s_offset_physical = tl.load(
         permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
-    )
+    ).to(tl.int64)
 
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
     # The pointers will be advanced as we move in the K direction

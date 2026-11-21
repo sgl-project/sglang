@@ -388,5 +388,67 @@ def test_split_k_compact_replay_uses_current_metadata():
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
+# (rows - 1) * width = 2,147,516,416 > 2^31: the last physical row's offset wraps
+# in int32 arithmetic. fp16 input or output of this shape is about 4.3 GB.
+LARGE_ROWS, LARGE_WIDTH, LARGE_RANK = 65538, 32768, 16
+
+
+def _large_single_token_batch_info():
+    """One segment whose only logical token maps to the last physical row."""
+    permutation = torch.zeros(LARGE_ROWS, dtype=torch.int32, device="cuda")
+    permutation[0] = LARGE_ROWS - 1
+    return LoRABatchInfo(
+        use_cuda_graph=False,
+        bs=1,
+        num_segments=1,
+        max_len=16,
+        seg_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        seg_lens=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        permutation=permutation,
+        weight_indices=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        lora_ranks=torch.tensor([LARGE_RANK], dtype=torch.int32, device="cuda"),
+        scalings=torch.ones(1, dtype=torch.float, device="cuda"),
+    )
+
+
+def _skip_without_free_gpu_memory():
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < 10 * 2**30:
+        pytest.skip("needs about 10 GB of free GPU memory")
+
+
+@pytest.mark.parametrize("split_k", [None, 2])
+def test_shrink_row_offset_past_int32(split_k):
+    """The shrink kernels (plain and split-K) index x with the int32 permutation;
+    a row past 2^31 elements must still be read at its real offset."""
+    _skip_without_free_gpu_memory()
+    x = torch.zeros(LARGE_ROWS, LARGE_WIDTH, dtype=torch.float16, device="cuda")
+    x[-1] = 1
+    weights = torch.full(
+        (1, LARGE_RANK, LARGE_WIDTH), 1 / 1024, dtype=torch.float16, device="cuda"
+    )
+    out = chunked_sgmv_lora_shrink_forward(
+        x, weights, _large_single_token_batch_info(), 1, split_k=split_k
+    )
+    torch.cuda.synchronize()
+    assert (out[-1] == 32).all()
+
+
+def test_expand_row_offset_past_int32():
+    """The expand kernel writes into a base output past 2^31 elements."""
+    _skip_without_free_gpu_memory()
+    x = torch.zeros(LARGE_ROWS, LARGE_RANK, dtype=torch.float16, device="cuda")
+    x[-1] = 1
+    weights = torch.full(
+        (1, LARGE_WIDTH, LARGE_RANK), 1 / LARGE_RANK, dtype=torch.float16, device="cuda"
+    )
+    slice_offsets = torch.tensor([0, LARGE_WIDTH], dtype=torch.int32, device="cuda")
+    out = chunked_sgmv_lora_expand_forward(
+        x, weights, _large_single_token_batch_info(), slice_offsets, LARGE_WIDTH, None
+    )
+    torch.cuda.synchronize()
+    assert (out[-1] == 1).all()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
