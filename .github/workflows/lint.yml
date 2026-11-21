@@ -79,8 +79,14 @@ jobs:
       - name: Test PR title check
         run: node --test .github/scripts/pr-title.test.cjs
 
+      - name: Test AMD nightly summary
+        run: node --test .github/scripts/amd-nightly-summary.test.cjs
+
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
+
+      - name: Test AMD performance outcome reporting
+        run: node --test .github/actions/report-amd-perf-outcome/action.test.cjs
 
       # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
       # are NOT required to install `mint` for local pre-commit. External links
