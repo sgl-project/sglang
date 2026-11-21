@@ -56,6 +56,7 @@ class AnthropicUsage(BaseModel):
 class TextBlock(BaseModel):
     type: Literal["text"] = "text"
     text: str
+    cache_control: Optional[dict[str, Any]] = None
 
 
 class ImageBlock(BaseModel):
@@ -91,6 +92,50 @@ class ToolReferenceBlock(BaseModel):
     id: Optional[str] = None
 
 
+class McpToolReference(BaseModel):
+    type: Literal["mcp_tool_reference"]
+    server_name: str
+    name: str
+
+
+class McpToolsetReference(BaseModel):
+    type: Literal["mcp_toolset_reference"]
+    server_name: str
+
+
+class ToolDefinition(BaseModel):
+    """A tool given by value: `definition` is a `tools` entry."""
+
+    type: Literal["tool_definition"]
+    definition: dict[str, Any]
+
+
+class ToolAdditionBlock(BaseModel):
+    """Anthropic beta block: a ``system`` message offers a tool from its position
+    on. Rendered through deepseek-recipe, which reads only a ``tool_reference``
+    target."""
+
+    type: Literal["tool_addition"] = "tool_addition"
+    tool: Annotated[
+        Union[
+            ToolReferenceBlock, McpToolReference, McpToolsetReference, ToolDefinition
+        ],
+        Field(discriminator="type"),
+    ]
+    cache_control: Optional[dict[str, Any]] = None
+
+
+class ToolRemovalBlock(BaseModel):
+    """Anthropic beta block: a ``system`` message withdraws a tool."""
+
+    type: Literal["tool_removal"] = "tool_removal"
+    tool: Annotated[
+        Union[ToolReferenceBlock, McpToolReference, McpToolsetReference],
+        Field(discriminator="type"),
+    ]
+    cache_control: Optional[dict[str, Any]] = None
+
+
 class SearchResultBlock(BaseModel):
     type: Literal["search_result"] = "search_result"
     # ``source`` here is a URL/identifier string (unlike ImageBlock.source).
@@ -117,6 +162,8 @@ AnthropicContentBlock = Annotated[
         ToolUseBlock,
         ToolResultBlock,
         ToolReferenceBlock,
+        ToolAdditionBlock,
+        ToolRemovalBlock,
         SearchResultBlock,
         ThinkingBlock,
         RedactedThinkingBlock,
@@ -128,6 +175,8 @@ AnthropicContentBlock = Annotated[
 class AnthropicMessage(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: Union[str, list[AnthropicContentBlock]]
+    clear_at: Optional[Literal["next_user_message", "never"]] = None
+    output_config: Optional[dict[str, Any]] = None
 
 
 # ---------- Tools (discriminated by ``type`` family) ----------
