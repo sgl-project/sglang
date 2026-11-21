@@ -87,6 +87,10 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         self.num_bits = weight_quant.num_bits
         self.packed_factor = 32 // self.num_bits
         self.group_size = weight_quant.group_size
+        if self.group_size != 128:
+            raise ValueError(
+                f"CUTLASS W4AFP8 MoE requires group_size=128, got {self.group_size}"
+            )
         self.weight_quant = weight_quant
         self.input_quant = input_quant
 

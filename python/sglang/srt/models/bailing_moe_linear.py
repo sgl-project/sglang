@@ -958,7 +958,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                 else ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    params_dtype=torch.float32,
+                    params_dtype=None if config.tie_word_embeddings else torch.float32,
                     quant_config=None if config.tie_word_embeddings else quant_config,
                     use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )

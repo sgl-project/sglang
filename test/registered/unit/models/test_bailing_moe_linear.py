@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models import bailing_moe_linear
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -59,9 +60,14 @@ class TestBailingMoELinearTiedLMHead(CustomTestCase):
         self.assertIs(embed, head)
 
     def test_last_pipeline_stage_loads_tied_head_from_embedding(self):
-        weight = torch.randn(self.config.vocab_size, self.config.hidden_size)
-        with get_parallel().override(
-            pp_group=SimpleNamespace(is_first_rank=False, is_last_rank=True)
+        weight = torch.randn(
+            self.config.vocab_size, self.config.hidden_size, dtype=torch.float32
+        )
+        with (
+            set_default_torch_dtype(torch.bfloat16),
+            get_parallel().override(
+                pp_group=SimpleNamespace(is_first_rank=False, is_last_rank=True)
+            ),
         ):
             model = bailing_moe_linear.BailingMoeV2_5ForCausalLM(config=self.config)
             loaded = model.load_weights([("model.word_embeddings.weight", weight)])
@@ -69,7 +75,7 @@ class TestBailingMoELinearTiedLMHead(CustomTestCase):
         self.assertIsInstance(model.lm_head, bailing_moe_linear.ParallelLMHead)
         self.assertIn("lm_head.weight", loaded)
         torch.testing.assert_close(
-            model.lm_head.weight[: self.config.vocab_size], weight
+            model.lm_head.weight[: self.config.vocab_size], weight.bfloat16()
         )
 
 

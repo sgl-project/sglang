@@ -100,6 +100,23 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                 self.assertEqual(layer.w13_weight_scale.shape[-1], 32)
                 self.assertEqual(layer.w2_weight_scale.shape[-1], 2)
 
+    def test_w4afp8_rejects_group64_expert_override(self):
+        config = _make_wna16_moe_config(["Linear"], num_bits=4)
+        expert_group = _make_wna16_moe_config(
+            PER_LAYER_EXPERT_TARGETS, num_bits=4, group_size=64
+        )["config_groups"]["group_0"]
+        expert_group["input_activations"] = {
+            "num_bits": 8,
+            "type": "float",
+            "symmetric": True,
+            "strategy": "token",
+            "dynamic": True,
+        }
+        config["config_groups"]["experts"] = expert_group
+        quant_config = CompressedTensorsConfig.from_config(config)
+        with self.assertRaisesRegex(ValueError, "requires group_size=128, got 64"):
+            quant_config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+
     def test_unsupported_bits_error_is_one_message(self):
         """The unsupported-bits error reads as a sentence, not a tuple repr."""
         quant_config = CompressedTensorsConfig.from_config(
