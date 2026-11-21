@@ -46,6 +46,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # The shared chunk kernel writes the fp32 track snapshot; without it, prefix-cache
+    # checkpoints fall back to the per-chunk states, rounded to the activation dtype.
+    supports_track_state_snapshot: bool = not is_cpu() and not is_npu() and not is_xpu()
     # The chunk kernel steps slots by the pool's stride(0) in int64.
     extend_honors_slot_pitch: bool = True
 
@@ -201,6 +204,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
                     "mapped GDN MIS output requires the Triton chunk kernel"
                 )
             output_args = {"out": out, "output_indices": output_indices}
+        track_args = {}
+        if self.supports_track_state_snapshot:
+            track_args = {
+                "track_state": kwargs.get("track_state"),
+                "track_chunk_idx": kwargs.get("track_chunk_idx"),
+            }
         # Static tables of a CUDA-graph captured prefill (gdn_prefill_graph.py).
         graph_table_args = {}
         if kwargs.get("chunk_indices") is not None:
@@ -237,6 +246,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **track_args,
             **graph_table_args,
             **output_args,
         )
