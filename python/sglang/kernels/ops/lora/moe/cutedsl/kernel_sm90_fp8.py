@@ -41,7 +41,6 @@ from sglang.kernels.ops.lora.moe.cutedsl.kernel_sm90_bf16 import (
 from sglang.kernels.ops.lora.moe.cutedsl.scheduler import (
     MoESchedulerParams,
     create_moe_tile_scheduler,
-    resolve_scheduler_params_and_grid,
 )
 
 
@@ -98,95 +97,22 @@ class GroupedGemmKernelSm90Fp8(GroupedGemmKernelSm90Bf16):
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
-        self.a_dtype = a.element_type
-        self.b_dtype = b.element_type
-        self.c_dtype = c.element_type
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
-        self.b_layout = utils.LayoutEnum.from_tensor(b)
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        if cutlass.const_expr(self.a_dtype != self.b_dtype):
-            raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-
-        self._setup_attributes()
-
-        tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
+        # api.py passes the scales after B, as for SM100; the BF16 host code
+        # takes them last and hands them to this class's kernel.
+        GroupedGemmKernelSm90Bf16.__call__(
+            self,
             a,
-            self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
-            self.cluster_shape_mn[1],
-        )
-        tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             b,
-            self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-            self.cluster_shape_mn[0],
-        )
-        tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
-            c, self.epi_smem_layout_staged, self.epi_tile
-        )
-
-        self.tile_sched_params, grid = resolve_scheduler_params_and_grid(
-            a=a,
-            cta_tile_k=self.tile_shape_mnk[2],
-            cluster_shape_mn=self.cluster_shape_mn,
-            swap_ab=self.swap_ab,
-            persistent_clusters=self.persistent_clusters,
-            max_active_clusters=max_active_clusters,
-        )
-
-        @cute.struct
-        class SharedStorage:
-            mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.ab_stage * 2
-            ]
-            sA: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-            sB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-            sC: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.c_dtype, cute.cosize(self.epi_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-
-        self.shared_storage = SharedStorage
-
-        self.kernel(
-            tma_atom_a,
-            tma_tensor_a,
-            tma_atom_b,
-            tma_tensor_b,
-            tma_atom_c,
-            tma_tensor_c,
-            sfa,
-            sfb,
+            c,
             group_m,
             direct_schedule,
             schedule_tiles,
-            self.tiled_mma,
-            self.cta_layout_mnk,
-            self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.epi_smem_layout_staged,
-            self.tile_sched_params,
+            max_active_clusters,
+            stream,
             epilogue_op,
-        ).launch(
-            grid=grid,
-            block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 1),
-            min_blocks_per_mp=1,
-            stream=stream,
+            sfa,
+            sfb,
         )
-        return
 
     @cute.kernel
     def kernel(
@@ -809,3 +735,18 @@ class GroupedGemmKernelSm90Fp8(GroupedGemmKernelSm90Bf16):
             raise TypeError(f"the FP8 grouped GEMM takes e4m3 A/B; got {a_dtype}")
         if c_dtype is not cutlass.BFloat16:
             raise TypeError(f"C must be BF16; got {c_dtype}")
+
+
+class GroupedGemmKernelSm90Fp8Rowwise(GroupedGemmKernelSm90Fp8):
+    """Per-weight-row and per-token scales: the BF16 mainloop, with the
+    K-invariant scales applied in the epilogue."""
+
+    ROW_SCALED = True
+    # One accumulator set: no partial-tile pipeline to select.
+    SUPPORTS_SINGLE_K_PIPELINE = False
+    kernel = GroupedGemmKernelSm90Bf16.kernel
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.single_k_pipeline:
+            raise ValueError("the row-scaled FP8 kernel has no single-K pipeline")

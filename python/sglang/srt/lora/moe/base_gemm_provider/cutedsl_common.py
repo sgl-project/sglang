@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
 import torch
 
 from sglang.srt.lora.moe.base_gemm_provider.base import prepare_buffer
+from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import masked_m_max
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.lora.moe.cutedsl.api import GroupedGemmConfig
+    from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
+    from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
+        GemmConfigTable,
+    )
     from sglang.srt.lora.moe.quant_info import StandardLayoutQuantInfo
     from sglang.srt.lora.workspace import LoraWorkspace
 
@@ -20,30 +27,52 @@ logger = logging.getLogger(__name__)
 _COMPILE_CACHE: dict[tuple, object] = {}
 
 
-class CuteDslStageCall(msgspec.Struct, frozen=True):
+class _CuteDslStageCall(msgspec.Struct, frozen=True):
     compiled_fn: object
     b_arg: object
     sf_weights: torch.Tensor | None = None
 
 
+class _GemmScheduleFields(TypedDict):
+    """Row-state fields of _schedules(); every CuTeDSL row state declares them."""
+
+    token_width: int  # the tile width the rows were planned and scheduled for
+    gemm1_schedule: torch.Tensor  # int64 packed tile entries of gate/up
+    gemm1_tiles: torch.Tensor  # int32 [1], the entries in use
+    gemm2_schedule: torch.Tensor  # the same for down
+    gemm2_tiles: torch.Tensor
+
+
 class CuteDslTileMixin:
+    """Shared CuTeDSL tile logic. The format subclass supplies _prepare_dummy."""
+
     NARROW_TOKEN_WIDTH = 8
-    NARROW_PERSISTENT_CLUSTERS = 128
     WIDE_TOKEN_WIDTH = 64
-    WIDE_PERSISTENT_CLUSTERS = 128
     XWIDE_TOKEN_WIDTH = 128
-    XWIDE_PERSISTENT_CLUSTERS = 128
-    # The packed schedule supports only 1x1 clusters and 1-CTA MMA.
-    CLUSTER_SHAPE_MN = (1, 1)
-    USE_2CTA_INSTRS = False
-    OCCUPANCY = 1
-    MMA_INST_TILE_K = 4
+    PERSISTENT_CLUSTERS = 128
     WIDE_EXPECTED_M_THRESHOLD: int
     XWIDE_EXPECTED_M_THRESHOLD = 96
     OUTPUT_WIDTH = 128
 
-    _ROW_MODE: str
-    _DTYPE_TAG: str
+    # Supplied by the concrete provider: class attributes ...
+    _ROW_MODE: str  # "masked" or "contiguous"; part of the compile key
+    _DTYPE_TAG: str  # the weight encoding; part of the compile key
+    contract: MoeBaseProviderContract  # its key names the tuned config table
+    # ... and bound in its __init__ before _init_tiles().
+    quant_info: StandardLayoutQuantInfo
+    _gate_up_slices: int
+    _prepare_gemm: Callable[..., Any]  # cutedsl.api.prepare_<rows>_<encoding>
+
+    # Bound by _init_tiles(); scaled encodings bind the weight scales.
+    _sf_w13: torch.Tensor | None = None
+    _sf_w2: torch.Tensor | None = None
+    _build_schedules: Callable[
+        ..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]
+    _schedule_capacities: Callable[..., tuple[int, int]]
+    _compiled: dict[int, dict[str, _CuteDslStageCall]]  # token width -> stage
+    _tile_configs: dict[int, GroupedGemmConfig]
+    _config_table: GemmConfigTable | None
 
     def _init_tiles(
         self, quant_info: StandardLayoutQuantInfo, *, drop_narrow_tile: bool = False
@@ -57,6 +86,11 @@ class CuteDslTileMixin:
         from sglang.kernels.ops.lora.moe.cutedsl.schedule_builder import (
             MAX_EXPERTS,
             MAX_TOKEN_CLUSTERS,
+            build_dual_stage_schedules_contiguous,
+            build_dual_stage_schedules_masked,
+            dual_stage_schedule_capacities_contiguous,
+            dual_stage_schedule_capacities_masked,
+            validate_tile_geometry_contiguous,
         )
         from sglang.srt.lora.moe.base_gemm_provider.gemm_config_store import (
             cutedsl_version,
@@ -71,6 +105,13 @@ class CuteDslTileMixin:
                 f"direct schedule's {MAX_EXPERTS}-expert packing"
             )
         self._max_token_clusters = MAX_TOKEN_CLUSTERS
+        if self._ROW_MODE == "masked":
+            self._build_schedules = build_dual_stage_schedules_masked
+            self._schedule_capacities = dual_stage_schedule_capacities_masked
+        else:
+            self._build_schedules = build_dual_stage_schedules_contiguous
+            self._schedule_capacities = dual_stage_schedule_capacities_contiguous
+        self._w13, self._w2 = quant_info.w13_weight, quant_info.w2_weight
         self._bind_weights(quant_info)
 
         device = quant_info.w13_weight.device
@@ -80,15 +121,15 @@ class CuteDslTileMixin:
             and torch.cuda.get_device_capability(device) < (10, 0)
         )
         # Use one persistent cluster per SM on 152-SM Blackwell devices.
-        xwide_clusters = self.XWIDE_PERSISTENT_CLUSTERS
+        xwide_clusters = self.PERSISTENT_CLUSTERS
         if (
             torch.cuda.get_device_capability(device) >= (10, 0)
             and torch.cuda.get_device_properties(device).multi_processor_count == 152
         ):
             xwide_clusters = 152
         tile_set = (
-            (self.NARROW_TOKEN_WIDTH, self.NARROW_PERSISTENT_CLUSTERS),
-            (self.WIDE_TOKEN_WIDTH, self.WIDE_PERSISTENT_CLUSTERS),
+            (self.NARROW_TOKEN_WIDTH, self.PERSISTENT_CLUSTERS),
+            (self.WIDE_TOKEN_WIDTH, self.PERSISTENT_CLUSTERS),
             (self.XWIDE_TOKEN_WIDTH, xwide_clusters),
         )
         if drop_narrow_tile:
@@ -105,17 +146,17 @@ class CuteDslTileMixin:
         )
         tile_set = self._merge_table_tiles(tile_set)
 
-        self._compiled: dict[int, dict[str, CuteDslStageCall]] = {}
+        self._compiled: dict[int, dict[str, _CuteDslStageCall]] = {}
+        self._tile_configs: dict[int, GroupedGemmConfig] = {}
         for token_width, persistent_clusters in tile_set:
-            self._admit_tile_width(token_width)
+            if self._ROW_MODE == "contiguous":
+                validate_tile_geometry_contiguous(token_width, self.M_ALIGNMENT)
+            # The packed schedule takes the default 1x1 clusters and 1-CTA MMA.
             config = GroupedGemmConfig(
                 mma_tiler_mn=(self.OUTPUT_WIDTH, token_width),
-                cluster_shape_mn=self.CLUSTER_SHAPE_MN,
-                use_2cta_instrs=self.USE_2CTA_INSTRS,
-                occupancy=self.OCCUPANCY,
-                mma_inst_tile_k=self.MMA_INST_TILE_K,
                 persistent_clusters=persistent_clusters,
             )
+            self._tile_configs[token_width] = config
             self._compiled[token_width] = {}
             self._compile_stage(token_width, "gemm1", config)
             self._compile_stage(token_width, "gemm2", config)
@@ -149,20 +190,19 @@ class CuteDslTileMixin:
     def _bind_weights(self, quant_info: StandardLayoutQuantInfo) -> None:
         """Optional hook for dtype-specific weight preparation."""
 
-    def _admit_tile_width(self, token_width: int) -> None:
-        """Optional hook for row-layout constraints."""
-
     def _stage_weight(self, stage: str) -> torch.Tensor:
-        if stage == "gemm1":
-            return self.quant_info.w13_weight
-        if stage == "gemm2":
-            return self.quant_info.w2_weight
-        raise ValueError(f"unknown CuTeDSL base stage {stage!r}")
+        return self._w13 if stage == "gemm1" else self._w2
 
     def _stage_scale(self, stage: str) -> torch.Tensor | None:
-        return None
+        return self._sf_w13 if stage == "gemm1" else self._sf_w2
 
-    def _compile_stage(self, token_width: int, stage: str, config) -> None:
+    def _stage_constexprs(self, stage: str) -> tuple:
+        return ()
+
+    def _compile_stage(
+        self, token_width: int, stage: str, config, *, lora_k: int = 0
+    ) -> None:
+        """``lora_k`` > 0 compiles the epilogue-LoRA build (block-scaled only)."""
         weight = self._stage_weight(stage)
         device = weight.device
         key = (
@@ -174,15 +214,20 @@ class CuteDslTileMixin:
             self.quant_info.num_local_experts,
             weight.shape[1],
             weight.shape[2],
+            *self._stage_constexprs(stage),
+            lora_k,
         )
         compiled_fn = _COMPILE_CACHE.get(key)
         if compiled_fn is None:
-            prepared = self._prepare_dummy(stage, config)
+            prepared = self._prepare_dummy(
+                stage, config, **({"lora_k": lora_k} if lora_k else {})
+            )
             # Load the module before graph capture with a zero-tile launch.
             prepared.launch()
             compiled_fn = prepared.compiled_fn
             _COMPILE_CACHE[key] = compiled_fn
-        self._compiled[token_width][stage] = CuteDslStageCall(
+        call_key = f"{stage}:lora" if lora_k else stage
+        self._compiled[token_width][call_key] = _CuteDslStageCall(
             compiled_fn=compiled_fn,
             b_arg=self._as_dynamic_cute_tensor(weight, leading_dim=2),
             sf_weights=self._stage_scale(stage),
@@ -213,34 +258,53 @@ class CuteDslTileMixin:
             f"tile's schedule packing ({widest * self._max_token_clusters})"
         )
 
+    def _stage_geometry(self, token_width: int, **rows) -> dict:
+        return dict(
+            token_width=token_width,
+            n_gemm1=self.gate_up_slices * self.quant_info.intermediate_size,
+            n_gemm2=self.quant_info.hidden_size,
+            output_width=self.OUTPUT_WIDTH,
+            **rows,
+        )
+
+    def _plan_rows(self, num_tokens: int, expected_m: int) -> tuple[int, int]:
+        """Return tile width and tile-aligned m_max for unpredicated scale loads."""
+        token_width = self._token_width_for(num_tokens, expected_m)
+        return token_width, masked_m_max(num_tokens, token_width)
+
+    def _schedules(
+        self,
+        counts: torch.Tensor,
+        token_width: int,
+        prefix: str,
+        workspace: LoraWorkspace | None,
+        **rows: int,
+    ) -> _GemmScheduleFields:
+        """Build both stages' packed schedules on-device from ``counts``."""
+        geometry = self._stage_geometry(token_width, **rows)
+        outputs = {}
+        if workspace is not None:
+            outputs = self._schedule_buffers(
+                workspace,
+                f"{prefix}:tw{token_width}",
+                self._schedule_capacities(
+                    num_experts=self.quant_info.num_local_experts, **geometry
+                ),
+                counts.device,
+            )
+        schedule1, tiles1, schedule2, tiles2 = self._build_schedules(
+            counts, **geometry, **outputs
+        )
+        return dict(
+            token_width=token_width,
+            gemm1_schedule=schedule1,
+            gemm1_tiles=tiles1,
+            gemm2_schedule=schedule2,
+            gemm2_tiles=tiles2,
+        )
+
     def _stream(self, device: torch.device):
         return self._cu_stream(torch.cuda.current_stream(device).cuda_stream)
-
-    @staticmethod
-    def _output_clusters(n: int) -> int:
-        return (n + CuteDslTileMixin.OUTPUT_WIDTH - 1) // CuteDslTileMixin.OUTPUT_WIDTH
-
-    def _small_prepare_outputs(
-        self,
-        workspace: LoraWorkspace | None,
-        prefix: str,
-        capacities: tuple[int, int],
-        num_experts: int,
-        device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        """Schedule buffers plus the small prepare's stage-begin scratch."""
-        import triton
-
-        scratch_len = 2 * max(16, triton.next_power_of_2(num_experts))
-        outputs = self._schedule_buffers(workspace, prefix, capacities, device)
-        outputs["scratch"] = prepare_buffer(
-            workspace,
-            f"{prefix}:small_scratch",
-            (scratch_len,),
-            dtype=torch.int32,
-            device=device,
-        )
-        return outputs
 
     @staticmethod
     def _schedule_buffers(

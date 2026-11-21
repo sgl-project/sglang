@@ -216,6 +216,44 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                             up_alpha, torch.tensor([0.5 * (reload + 1)])
                         )
 
+    def test_lora_loaders_keep_checkpoint_scales_without_swizzled_copies(self):
+        for backend in (
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_MARLIN,
+        ):
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(
+                    runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                ),
+                mock.patch.object(
+                    modelopt_quant,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_blackwell=True),
+                ),
+                mock.patch.object(modelopt_quant, "is_cuda", return_value=False),
+            ):
+                layer = torch.nn.Module()
+                layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
+                layer.num_experts = layer.num_local_experts = 2
+                method = ModelOptNvFp4FusedMoEMethod(
+                    modelopt_quant.ModelOptFp4Config(
+                        is_checkpoint_nvfp4_serialized=True,
+                        group_size=16,
+                        use_per_token_activation=False,
+                    )
+                )
+                method.create_weights(layer, 2, 128, 128, torch.bfloat16)
+                for stage in ("w13", "w2"):
+                    scale = getattr(layer, f"{stage}_weight_scale")
+                    swizzled = getattr(layer, f"{stage}_blockscale_swizzled")
+                    self.assertEqual(scale.dtype, torch.float8_e4m3fn)
+                    if backend is MoeRunnerBackend.FLASHINFER_CUTLASS:
+                        self.assertEqual(swizzled.shape, scale.shape)
+                    else:
+                        self.assertIsNone(swizzled)
+
     def test_non_gated_trtllm_loads_one_projection(self):
         with get_flags().moe.override(
             runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,

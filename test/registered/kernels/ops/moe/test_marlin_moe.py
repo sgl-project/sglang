@@ -158,6 +158,59 @@ class TestFusedMarlinMoe(CustomTestCase):
             raise unittest.SkipTest("This test requires a CUDA device.")
         torch.set_default_device("cuda")
 
+    def test_fp8_w8a16_moe(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            prepare_moe_fp8_layer_for_marlin,
+        )
+        from sglang.srt.lora.moe.base_gemm_provider.marlin import (
+            MarlinFp8PairProvider,
+        )
+        from sglang.srt.lora.moe.quant_info import MoeLoraFp8MarlinQuantInfo
+
+        if torch.cuda.get_device_capability()[0] < 9:
+            self.skipTest("FP8 Marlin MoE requires SM90 or newer")
+
+        dim, experts = 128, 2
+        rng = torch.Generator(device="cuda").manual_seed(3)
+        w13 = torch.randn(experts, 2 * dim, dim, generator=rng).to(torch.float8_e4m3fn)
+        w2 = torch.randn(experts, dim, dim, generator=rng).to(torch.float8_e4m3fn)
+        layer = SimpleNamespace(
+            w13_weight=w13,
+            w2_weight=w2,
+            hidden_size=dim,
+            intermediate_size_per_partition=dim,
+            num_local_experts=experts,
+            moe_runner_config=SimpleNamespace(
+                is_gated=True, activation="silu", apply_router_weight_on_input=False
+            ),
+        )
+        prepare_moe_fp8_layer_for_marlin(
+            layer,
+            w13_scales=torch.full((experts, 1, 2 * dim), 0.125, dtype=torch.float32),
+            w2_scales=torch.full((experts, 1, dim), 0.0625, dtype=torch.float32),
+        )
+        provider = MarlinFp8PairProvider(MoeLoraFp8MarlinQuantInfo.from_layer(layer))
+        x = torch.randn(3, dim, generator=rng, dtype=torch.bfloat16)
+        ids = torch.tensor([[0], [1], [1]], dtype=torch.int32)
+        state = provider.prepare(x, ids, 1)
+        gateup = x.new_zeros(provider.gateup_out_shape(state))
+        provider.gateup(state, gateup)
+        out = x.new_zeros(provider.down_out_shape(state))
+        provider.down(state, SiluAndMul()(gateup), out)
+
+        ref = torch_experts(
+            x,
+            w13.bfloat16() * 0.125,
+            w2.bfloat16() * 0.0625,
+            x.new_ones(ids.shape),
+            ids,
+        )
+        self.assertLess(
+            float((out.float() - ref.float()).norm() / ref.float().norm()), 0.02
+        )
+
     def test_fused_marlin_moe(self):
         test_cases = marlin_moe_generate_valid_test_cases()
 

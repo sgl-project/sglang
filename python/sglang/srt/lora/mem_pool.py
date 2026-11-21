@@ -24,7 +24,7 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
-from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.lora_config import LoRAConfig, get_normalized_target_modules
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     ATTN_TP_LORA_MODULE_NAMES,
@@ -35,7 +35,6 @@ from sglang.srt.lora.utils import (
     copy_weight_into_buffer,
     get_hidden_dim,
     get_lm_head_lora_b_shard_size,
-    get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
 )
@@ -1004,6 +1003,8 @@ class LoRAMemoryPool:
             }
 
             for name, weights in layer_weights.items():
+                if name in skipped_weight_names:
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
 
                 # Check if this is an MoE weight (has expert index in name)
@@ -1446,6 +1447,8 @@ class LoRAMemoryPool:
 
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
+                if name in skipped_weight_names:
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
                 if (
                     target_module == "embed_tokens"

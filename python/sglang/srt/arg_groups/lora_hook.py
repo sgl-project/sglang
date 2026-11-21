@@ -6,10 +6,19 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, register_post_process
 from sglang.srt.environ import envs
+from sglang.srt.lora.lora_config import (
+    get_normalized_target_modules,
+    load_adapter_config,
+)
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.moe.families import (
+    CONFIG_QUANTIZATIONS,
+    default_vendor,
+    family_of_config,
+)
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -177,6 +186,84 @@ def check_lora_server_args(server_args: Any):
     check_lora_moe_runner_args(server_args)
 
 
+def _adapter_paths(lora_paths: Any) -> list[str]:
+    if isinstance(lora_paths, dict):
+        return list(lora_paths.values())
+    paths = []
+    for entry in lora_paths or ():
+        if isinstance(entry, str):
+            paths.append(entry.split("=", 1)[-1])
+        elif isinstance(entry, dict):
+            paths.append(entry.get("lora_path"))
+        elif isinstance(entry, LoRARef):
+            # Python callers (bench_one_batch resolves without check_server_args).
+            paths.append(entry.lora_path)
+    return [path for path in paths if path]
+
+
+def _targets_routed_experts(cfg: Any) -> bool:
+    if cfg.lora_target_modules:
+        names = get_normalized_target_modules(cfg.lora_target_modules)
+    else:
+        names = set()
+        for path in _adapter_paths(cfg.lora_paths):
+            names |= get_normalized_target_modules(
+                load_adapter_config(path)["target_modules"]
+            )
+    return "all" in names or {"gate_up_proj", "down_proj"} <= names
+
+
+# Text model types treated as dense regardless of expert-count fields.
+_DENSE_TEXT_MODEL_TYPES = frozenset({"qwen3_5_text"})
+
+
+def _has_routed_experts(model_config: Any) -> bool:
+    text_model_type = getattr(model_config.hf_text_config, "model_type", None)
+    if text_model_type in _DENSE_TEXT_MODEL_TYPES:
+        return False
+    for config in (model_config.hf_text_config, model_config.hf_config):
+        for field in (
+            "num_experts",
+            "num_local_experts",
+            "n_routed_experts",
+            "moe_num_experts",
+        ):
+            value = getattr(config, field, None)
+            if isinstance(value, int) and value > 0:
+                return True
+    return False
+
+
+@register_post_process
+def resolve_lora_moe_runner_backend(view: Any) -> dict:
+    """Pick the family's default lora_* runner for expert-targeted v2 LoRA."""
+    if (
+        view.moe_runner_backend != "auto"
+        or view.lora_backend != "triton_v2"
+        or not (view.enable_lora or (view.enable_lora is None and view.lora_paths))
+    ):
+        return {}
+    model_config = model_config_of(view)
+    if not _has_routed_experts(model_config) or not _targets_routed_experts(view):
+        return {}
+    family = family_of_config(model_config)
+    if family is None:
+        logger.info(
+            "--moe-runner-backend stays auto: MoE LoRA has no base-GEMM provider "
+            "for quantization %r",
+            model_config.quantization,
+        )
+        return {}
+    backend = f"lora_{default_vendor(family)}"
+    logger.info(
+        "--moe-runner-backend auto -> %s: --lora-backend triton_v2 serves the %s "
+        "MoE experts through the LoRA runner",
+        backend,
+        family,
+    )
+    return {"moe_runner_backend": backend}
+
+
 def check_lora_moe_runner_args(server_args: Any):
     """Reject unsupported LoRA MoE configurations before layer attachment."""
     cfg = resolving_view(server_args)
@@ -203,16 +290,14 @@ def check_lora_moe_runner_args(server_args: Any):
             f"--moe-runner-backend {backend} requires --lora-backend triton_v2"
         )
     _check_v2_lora_modes(cfg, f"--moe-runner-backend {backend}")
-    # Layer attachment checks the specific weight layout within each scheme.
-    if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
+    # The checkpoint's resolved method, not the flag (often unset or an alias).
+    model_config = model_config_of(cfg)
+    quantization = model_config.quantization
+    if quantization not in CONFIG_QUANTIZATIONS:
+        supported = ", ".join(q or "unquantized" for q in CONFIG_QUANTIZATIONS)
         raise ValueError(
-            f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
-            f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
-        )
-    if cfg.quantization == "modelopt_fp4" and backend != "lora_marlin":
-        raise ValueError(
-            f"--moe-runner-backend {backend} cannot run ModelOpt NVFP4 MoE; "
-            "use --moe-runner-backend lora_marlin"
+            f"--moe-runner-backend {backend} cannot serve {quantization} MoE "
+            f"weights. Supported MoE quantizations are {supported}."
         )
     if cfg.moe_a2a_backend != "none":
         raise ValueError(
