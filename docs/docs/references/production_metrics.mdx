@@ -7,6 +7,18 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## Detokenizer router processing time
+
+With `--detokenizer-worker-num > 1` and `--enable-metrics`, `sglang:detokenizer_router_processing_seconds` measures the wall-clock time spent routing each received scheduler message. It includes batch splitting, serialization, and sends to detokenizer workers, including blocking sends. It excludes waiting for and deserializing the incoming message, and does not measure inter-process queue latency or detokenizer worker processing time.
+
+Each message produces one observation, including control broadcasts, empty batches, and messages whose handling raises an exception. A batch sent to multiple workers still produces one observation. This is a per-message histogram, not a per-request latency metric. When metrics are disabled, the router creates no histogram and does not read the clock.
+
+For example, you can inspect the p99 router processing time in seconds:
+
+```promql
+histogram_quantile(0.99, sum by (le) (rate(sglang:detokenizer_router_processing_seconds_bucket[5m])))
+```
+
 ## Language model metrics
 
 `sglang:time_to_first_token_seconds` measures the time from request creation in the API server to the first token. For streaming requests it ends when the first output arrives after detokenization, which may contain no printable text. Non-streaming clients only see the final response, so for them it ends when the scheduler produced the first token.
