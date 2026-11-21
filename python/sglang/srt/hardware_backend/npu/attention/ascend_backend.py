@@ -2006,6 +2006,31 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
+        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
+            )
+
+            # RoPE0 uses Q512 and packed KV528. The operator fills the
+            # missing RoPE lanes without widening the physical KV cache.
+            # DSA supplies indices that already encode causal visibility.
+            output, _, _ = kv_quant_sparse_flash_attention(
+                query=q_nope,
+                query_rope=q_nope[..., :0],
+                packed_kv=packed_kv.view(torch.uint8),
+                sparse_indices=topk_indices,
+                block_table=self.forward_metadata.block_tables,
+                actual_seq_lengths_query=actual_seq_qlen.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                    device=q_nope.device, dtype=torch.int32
+                ),
+                scale_value=layer.scaling,
+                return_softmax_lse=False,
+            )
+            return output
+
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
         packed = packed_kv.view(torch.float8_e4m3fn)
         return torch_npu.npu_kv_quant_sparse_flash_attention(
@@ -2145,9 +2170,15 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # SFA's MLA interface requires a fixed 64-dimensional query_rope even
-        # for models without RoPE.
-        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+        # The BF16 MLA interface needs an explicit zero RoPE tensor.
+        packed_rope0 = (
+            self.qk_rope_head_dim == 0
+            and is_npu_arch35()
+            and self.token_to_kv_pool.dsa_kv_cache_store_fp8
+        )
+        if packed_rope0:
+            q_pe = q_nope[..., :0]
+        elif self.qk_rope_head_dim == 0 and is_npu_arch35():
             k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
             q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
         elif self.qk_rope_head_dim == 0:

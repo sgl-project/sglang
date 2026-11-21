@@ -841,6 +841,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
+        elif self.dsa_kv_cache_store_fp8 and self.kpool_use_compress:
+            # The pooled-key writer and scorer still use BF16.
+            self.index_k_store_dtype = torch.bfloat16
+            self.index_k_scale_dtype = None
         else:
             self.index_k_store_dtype = self.store_dtype
             self.index_k_scale_dtype = (
@@ -976,9 +980,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if (
-                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
-                ) and self.num_indexer_layers > 0:
+                if self.index_k_scale_dtype is not None and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
