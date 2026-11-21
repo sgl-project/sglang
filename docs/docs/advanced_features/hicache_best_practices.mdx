@@ -8,7 +8,7 @@ metatags:
 SGLang HiCache extends the traditional RadixAttention with a three-tier hierarchical KV caching system that dramatically improves performance for long-context and multi-turn conversation scenarios. By intelligently managing KV caches across GPU memory, host memory, and external storage backends, HiCache addresses the fundamental capacity bottleneck that limits cache hit rates in conventional systems.
 
 <Note>
-L1 and L2 are private to a single inference instance; only L3 can be shared. Host memory cannot be pooled across instances or across hosts, not even for two instances on the same node. Raising `--hicache-ratio` or `--hicache-size` only enlarges the instance's own private L2. Cross-instance reuse is the job of L3, which needs `--hicache-storage-backend` and a backend configured for the scope you want: the `file` backend defaults to the node-local `/tmp/hicache`, whereas `mooncake`, `hf3fs`, `nixl` and `aibrix` reach cluster scope when every instance shares the same namespace. See [Tier Sharing Scope](/docs/advanced_features/hicache_design#tier-sharing-scope).
+L1 and L2 are private to a single inference instance; only L3 can be shared. Host memory cannot be pooled across instances or across hosts, not even for two instances on the same node. Raising `--hicache-ratio` or `--hicache-size` only enlarges the instance's own private L2. Cross-instance reuse is the job of L3, which needs `--hicache-storage-backend` and a backend configured for the scope you want: the `file` backend defaults to the node-local `/tmp/hicache`, whereas `gcs`, `mooncake`, `hf3fs`, `nixl` and `aibrix` reach cluster scope when every instance shares the same namespace and, for `gcs`, the same bucket prefix. See [Tier Sharing Scope](/docs/advanced_features/hicache_design#tier-sharing-scope).
 </Note>
 
 ## Configuration Guidelines
@@ -176,6 +176,64 @@ filesystem. Both are optional. Eviction state and the optional
 plus rename rather than `fsync`. The module docstring of
 `sglang/srt/mem_cache/storage/fast_file/fast_file_store.py` lists every
 extra-config key.
+
+### Deployment with Google Cloud Storage
+
+The `gcs` backend stores one object per KV page in a Google Cloud Storage
+bucket. It speaks the native GCS API (no S3 gateway), so it works with GCS,
+Hierarchical Namespace buckets and GCS-compatible emulators. Install the SDK
+where the server runs (the backend is registered without it, and attaching the
+backend without it fails with an install hint):
+
+```bash Command
+pip install google-cloud-storage
+```
+
+The bucket must already exist, and the identity running SGLang needs
+`storage.objects.get`, `storage.objects.create`, `storage.objects.delete` and
+`storage.objects.list` on it (for example `roles/storage.objectAdmin`).
+Credentials come from Application Default Credentials by default, or from a
+service-account key path in the `credentials` extra-config key:
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-mem-layout page_first \
+  --hicache-io-backend kernel \
+  --hicache-write-policy write_through \
+  --hicache-storage-backend gcs \
+  --hicache-storage-backend-extra-config \
+  '{"bucket":"my-kv-bucket","prefix":"cluster-a/qwen3","project":"my-project","credentials":"/etc/gcp/kv-sa.json","max_workers":32}'
+```
+
+Extra-config keys:
+
+- `bucket` (required): bucket name. The backend never creates or configures
+  the bucket, so bucket location, storage class and lifecycle rules stay under
+  infrastructure control.
+- `prefix`: object-name prefix shared by one deployment, e.g.
+  `cluster-a/qwen3`. `clear()` only deletes objects under this prefix, so
+  several deployments can share a bucket.
+- `project`: project used for billing and quota. Defaults to the credential's
+  project.
+- `credentials`: path to a service-account JSON key. Defaults to Application
+  Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, workload identity, ...).
+- `max_workers`: parallel upload/download threads (default 16).
+
+Object names combine the prefix with the key suffix resolved by the storage
+config, never with a backend-local rank number. With
+`--hicache-storage-key-scheme unified` each layer/head chunk is a separate
+object named by its topology-free coordinate, so deployments with different
+TP/PP/CP splits share objects and hybrid side pools are not supported (the
+controller already restricts unified keys to a single KV pool). With the
+default rank-suffix scheme, MLA ranks share page objects while MHA and CP
+ranks get distinct ones.
+
+Every read validates the downloaded object length against the target page and
+treats a mismatch as a miss, so a truncated or foreign object is never copied
+into the host pool.
 
 ### Deployment with HF3FS
 
