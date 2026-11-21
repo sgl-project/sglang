@@ -69,13 +69,9 @@ def mla_gluon_dcp_unsupported_reason(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> str | None:
-    """Why aiter's Gluon MLA cannot run a DCP decode or verify here, or None if it can.
-
-    Mirrors mla_gluon's asserts for its bh16 regimes as of ROCm/aiter@285579b62
-    (aiter/ops/triton/gluon/mla_gluon.py); update it when aiter relaxes them. Its
-    bh64 regime (64 or 128 heads) also needs batch % 64 and a long min_kv_seq_len,
-    which DCP cannot promise.
-    """
+    # Why aiter's Gluon MLA cannot run a DCP decode or verify here, or None if it can.
+    # Mirrors mla_gluon's bh16 asserts as of ROCm/aiter@285579b62 (aiter/ops/triton/gluon/mla_gluon.py);
+    # update it when aiter relaxes them.
     mla_gluon = _gluon_fn()
     if mla_gluon is None:
         return "Gluon MLA is unavailable (see the 'aiter mla gluon' log)"
@@ -89,6 +85,7 @@ def mla_gluon_dcp_unsupported_reason(
             "mla_gluon needs kv_lora_rank 512 and qk_rope_head_dim 64, "
             f"got {kv_lora_rank} and {qk_rope_head_dim}"
         )
+    # The bh64 regime (64 or 128 heads) also needs batch % 64 and a long min_kv_seq_len, which DCP cannot promise.
     if not 1 <= gathered_num_head <= 96 or gathered_num_head == 64:
         return (
             "mla_gluon runs at most 96 gathered heads other than 64, "

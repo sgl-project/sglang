@@ -596,8 +596,8 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
     fp8-cache routes to Gluon (e.g. a Gluon verify) must still start."""
 
     def _build(self, *, kv_cache_dtype, verify_backend="asm", dcp_size=8):
-        # Kimi K3 at TP8 DCP8 (96 gathered heads, 4 draft tokens), on a Gluon that
-        # cannot run it, so any route that reaches Gluon must raise.
+        # Kimi K3 at TP8 DCP8 (96 gathered heads, 4 draft tokens),
+        # on a Gluon that cannot run it, so any route that reaches Gluon must raise.
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 

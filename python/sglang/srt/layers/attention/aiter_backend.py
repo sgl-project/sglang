@@ -1271,8 +1271,8 @@ class AiterAttnBackend(AttentionBackend):
                 and self.mla_decode_backend == "asm"
                 and not self.use_mla_dcp_asm
             ):
-                self._log_mla_dcp_decode_on_gluon()
                 if may_run_mla_decode:
+                    self._log_mla_dcp_decode_on_gluon()
                     self._check_mla_dcp_gluon(
                         gathered_num_head=_gathered_num_head,
                         kv_lora_rank=model_runner.model_config.kv_lora_rank,
@@ -2785,6 +2785,10 @@ class AiterAttnBackend(AttentionBackend):
             use_2d_view=True,
         )
         lse_a = lse_a.view(n_rows, num_heads)
+        # Gluon writes nothing for a row with no KV on this rank (as in the decode mask).
+        empty = seqused_k == 0
+        out_a.masked_fill_(empty[:, None, None], 0.0)
+        lse_a.masked_fill_(empty[:, None], -1e30)
 
         # The verify window arrives as `k_window`, computed this forward and
         # identical on every rank, so only one rank attends it; the others

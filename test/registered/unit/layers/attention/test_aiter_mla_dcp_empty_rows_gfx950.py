@@ -1,8 +1,9 @@
-"""DCP decode on gfx950: rows with no KV on this rank (real asm and Gluon kernels)."""
+"""DCP decode and verify on gfx950: rows with no KV on this rank (real asm and Gluon kernels)."""
 
 import itertools
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -19,6 +20,8 @@ HEAD_DIM = KV_LORA + ROPE
 SCALING = HEAD_DIM**-0.5
 
 
+# The tolerances below are loose sanity bounds, not measured error: the empty-row assertions are exact, and
+# these only catch NaN, stale or zeroed values in the other rows (bf16 and a8w8 fp8 rounding is the floor).
 def _reference(q, kv, kv_lens, offsets):
     # fp32 attention over each row's local KV -> (out, natural-log lse).
     out = torch.zeros(len(kv_lens), NUM_HEADS, KV_LORA, device=q.device)
@@ -108,6 +111,49 @@ class TestMlaDcpDecodeEmptyRowsGfx950(CustomTestCase):
 
         _poison_cached_blocks(bs, device)
         out, lse = be._forward_decode_dcp(q, kv, _layer(), k_descale=1.0)
+        self._check(out, lse, q, kv, kv_lens, atol=2e-2)
+
+    @unittest.skipUnless(_gluon_fn() is not None, "needs Triton with Gluon cga_layout")
+    def test_gluon_verify_rows_without_local_kv_return_a_zero_partial_with_no_weight(
+        self,
+    ):
+        """The Gluon DCP target verify hands its prefix partial to the merge, so empty rows must be neutral."""
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        device = get_device()
+        torch.manual_seed(0)
+        q_len, bs = 4, 16  # 64 rows: one KV split, as in the decode test
+        n_rows = bs * q_len
+        kv_lens = _kv_lens(n_rows)
+        max_len = max(kv_lens)
+        kv = torch.randn(sum(kv_lens), HEAD_DIM, dtype=torch.bfloat16, device=device)
+        q = torch.randn(
+            n_rows, NUM_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        offsets = [0] + list(itertools.accumulate(kv_lens))
+        table = torch.zeros(n_rows, max_len, dtype=torch.int32, device=device)
+        for i, n in enumerate(kv_lens):
+            table[i, :n] = torch.arange(offsets[i], offsets[i] + n, device=device)
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(read=lambda _: SimpleNamespace(key=lambda: kv))
+        )
+        be.forward_metadata = SimpleNamespace(
+            use_asm_cprr_verify=False,
+            max_q_len=q_len,
+            local_kv_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+            verify_token_table=table,
+        )
+        layer = _layer()
+        layer.layer_id = 0
+
+        _poison_cached_blocks(n_rows, device)
+        # Rank 1 returns its prefix partial without attending the verify window.
+        with mock.patch(
+            "sglang.srt.layers.attention.aiter_backend.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_rank=1),
+        ):
+            out, lse = be._forward_verify_dcp(q, None, layer, k_descale=1.0)
         self._check(out, lse, q, kv, kv_lens, atol=2e-2)
 
     def test_asm_rows_without_local_kv_return_a_zero_partial_with_no_weight(self):
