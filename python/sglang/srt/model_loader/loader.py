@@ -9,6 +9,7 @@ import collections
 import concurrent.futures
 import dataclasses
 import fnmatch
+import functools
 import gc
 import glob
 import hashlib
@@ -112,9 +113,11 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.layers.utils.common import get_layer_id, set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    CheckpointTensorReaders,
+    _node_local_peers,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -420,6 +423,74 @@ def _validate_default_loader_extra_config(
         )
 
 
+_EXPERT_ID_RE = re.compile(r"\bexperts\.(\d+)\.")
+
+
+def _checkpoint_tensor_readers(
+    model: Optional[nn.Module],
+) -> Optional[CheckpointTensorReaders]:
+    """Map checkpoint tensors to the node's ranks that read them: under EP a
+    rank reads only its own experts. Ranks skip the tensors they do not read."""
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    if model is None or not torch.distributed.is_initialized():
+        return None
+    moe_layers = collections.defaultdict(list)
+    for name, module in model.named_modules():
+        # Only where checkpoint layer ids match the module's.
+        if (
+            isinstance(module, FusedMoE)
+            and module.moe_ep_size > 1
+            and get_layer_id(name + ".") == module.layer_id
+        ):
+            moe_layers[module.layer_id].append(module)
+    # Several MoE modules in a layer may renumber the checkpoint's experts.
+    moe_layers = {i: m[0] for i, m in moe_layers.items() if len(m) == 1}
+    if not moe_layers:
+        return None
+
+    node_peers = _node_local_peers(get_parallel().world_group.ranks)
+    expert_peers = _node_local_peers(get_parallel().moe_tp_group.ranks)
+
+    @functools.lru_cache(maxsize=None)
+    def is_local_expert(layer_id: int, expert_id: int) -> bool:
+        moe = moe_layers[layer_id]
+        if expert_id >= moe._num_global_routed:  # Not one of its routed experts.
+            return True
+        return next(moe._weight_loader_expert_ids(None, expert_id), None) is not None
+
+    def readers(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
+        match = _EXPERT_ID_RE.search(name)
+        layer_id = get_layer_id(name)
+        # Some backends read per-expert scalars, e.g. input scales, on every rank.
+        if match is None or layer_id not in moe_layers or nbytes <= 8:
+            return node_peers
+        if is_local_expert(layer_id, int(match.group(1))):
+            return expert_peers
+        return None
+
+    # With experts placed in order, the node's EP ranks hold one block of them.
+    index, count = _node_local_peers(get_parallel().moe_ep_group.ranks)
+    location = get_global_expert_location_metadata()
+    m = None if location is None else location.physical_to_logical_map_cpu
+    if (m is None or torch.equal(m, torch.arange(m.shape[-1]).expand_as(m))) and all(
+        moe._expert_storage_rank == moe.moe_ep_rank for moe in moe_layers.values()
+    ):
+
+        def node_reads(name: str, nbytes: int) -> bool:
+            match = _EXPERT_ID_RE.search(name)
+            layer_id = get_layer_id(name)
+            if match is None or layer_id not in moe_layers or nbytes <= 8:
+                return True
+            moe, expert_id = moe_layers[layer_id], int(match.group(1))
+            block = expert_id // moe._num_local_routed - moe.moe_ep_rank + index
+            return expert_id >= moe._num_global_routed or 0 <= block < count
+
+        readers.node_reads = node_reads
+    return readers
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -648,6 +719,7 @@ class DefaultModelLoader(BaseModelLoader):
         resolved_source: Optional[ResolvedSource] = None,
         startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
+        model: Optional[nn.Module] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -702,6 +774,7 @@ class DefaultModelLoader(BaseModelLoader):
                 startup_prefetch_active or start_iterator_prefetch
             )
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
+            readers = _checkpoint_tensor_readers(model)
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
@@ -751,6 +824,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    readers=readers,
                     max_inflight_bytes=extra_config.get("max_inflight_bytes"),
                 )
             else:
@@ -765,6 +839,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    readers=readers,
                 )
 
         else:
@@ -820,7 +895,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, model=model)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
