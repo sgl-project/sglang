@@ -59,6 +59,13 @@ until every rank stops writing, then discard them without publishing. Pending
 slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
 The deprecated HiCache extra config is used only when linker JSON is omitted.
 
+### Direct linker offload in PD disaggregation
+
+With the linker and `--disaggregation-decode-enable-radix-cache` on both roles,
+the prefill writes the prompt and the decode writes only the tokens after it.
+Set `"offload": false` in the prefill's linker JSON to keep prefill lookup and
+loading but move all writes to the decode, which then writes the full sequence.
+
 ### Decode context parallelism (DCP)
 
 Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
