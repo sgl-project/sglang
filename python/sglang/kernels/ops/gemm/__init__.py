@@ -626,6 +626,15 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+# Quark W4A4 MXFP4 dense GEMM on gfx950: aiter's gemm_afp4wfp4 with a K-tail-safe tiling (triton#11256).
+register_kernel(
+    KernelSpec(
+        op="gemm.gemm_afp4wfp4_k_tail_safe",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.gemm.afp4wfp4_k_tail_gfx950:gemm_afp4wfp4_k_tail_safe",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 # Vendored tlx.ops.mm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
 register_kernel(
     KernelSpec(
