@@ -71,7 +71,9 @@ runtime_base = [
   "transformers==5.19.0",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xxhash",
+  "zstandard",
 ]
 
 # runtime_common: backward-compatible — same install result as before the split.
