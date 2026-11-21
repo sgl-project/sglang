@@ -28,6 +28,7 @@ use sglang_processor::dynamo_protocols::types::CreateChatCompletionResponse;
 use tower::ServiceExt;
 
 use super::app::AppState;
+use super::openai::chat::SamplingDefaults;
 use crate::api_server::http::auth::DeclaredRoute;
 use crate::api_server::responses::{Responses, ResponsesFailure};
 
@@ -110,10 +111,16 @@ async fn create(inner: Router, state: Arc<AppState>, request: Request) -> Respon
         chat_formatter: state.chat_formatter.as_ref(),
         server_args: &state.server_args,
     };
-    let plan = match adapter.plan(&request, stream) {
+    let mut plan = match adapter.plan(&request, stream) {
         Ok(plan) => plan,
         Err(error) => return failure(&error),
     };
+    // Chat falls back to 1.0. Leave explicit and model temperatures to its
+    // normal resolution, but supply the Responses fallback when both are absent.
+    let model_defaults = &state.server_args.model_config.default_sampling_params;
+    if request.temperature.or(model_defaults.temperature).is_none() {
+        plan.chat_body["temperature"] = SamplingDefaults::RESPONSES.fallback_temperature.into();
+    }
     parts.uri = "/v1/chat/completions".parse::<Uri>().expect("static path");
     parts.headers.remove(header::CONTENT_LENGTH);
     parts.headers.remove(header::CONTENT_ENCODING);
