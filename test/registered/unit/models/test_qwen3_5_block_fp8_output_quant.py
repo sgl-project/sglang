@@ -91,6 +91,7 @@ class TestBlockFp8TupleInputLayout(CustomTestCase):
         det=False,
         rl_target=None,
         lora=False,
+        forced_backend=None,
     ):
         exec_ctx = SimpleNamespace(
             deterministic=SimpleNamespace(
@@ -100,6 +101,10 @@ class TestBlockFp8TupleInputLayout(CustomTestCase):
         )
         lora_ctx = SimpleNamespace(enable_lora=lora)
         with (
+            patch(
+                "sglang.kernels.fused_op.get_fused_op_backend",
+                return_value=forced_backend,
+            ),
             patch(
                 "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
                 return_value=bi,
@@ -143,9 +148,23 @@ class TestBlockFp8TupleInputLayout(CustomTestCase):
             (False, False),
         )
         # SM100 UE8M0 -> col-major TMA packed int32 UE8M0 when (k // 128) % 4 == 0
+        # for small decode (m <= 16) and large decode/prefill (m > 48).
         self.assertEqual(
-            self._eval(linear, dg_ue8m0=True, dg_supported=True, gemv=False),
+            self._eval(linear, m=8, dg_ue8m0=True, dg_supported=True, gemv=False),
             (True, True),
+        )
+        self.assertEqual(
+            self._eval(linear, m=64, dg_ue8m0=True, dg_supported=True, gemv=False),
+            (True, True),
+        )
+        # SM100 UE8M0 mid-batch decode bucket (16 < m <= 48) stays on unfused path,
+        # while SM90 keeps m=32 enabled.
+        self.assertIsNone(
+            self._eval(linear, m=32, dg_ue8m0=True, dg_supported=True, gemv=False)
+        )
+        self.assertEqual(
+            self._eval(linear, m=32, dg_ue8m0=False, dg_supported=True, gemv=False),
+            (False, True),
         )
         # SM100 UE8M0 with non-4-group-aligned K (e.g. 768 = 6 groups) -> None
         linear_768 = _make_linear(n=2048, k=768)
@@ -154,10 +173,17 @@ class TestBlockFp8TupleInputLayout(CustomTestCase):
         )
 
     def test_rejection_gates(self):
+        from sglang.kernels.spec import KernelBackend
+
         cases = [
             ("m_zero", _make_linear(), {"m": 0}),
             ("k_unaligned", _make_linear(k=200), {"k": 200}),
             ("fp16", _make_linear(), {"dtype": torch.float16}),
+            (
+                "forced_backend_torch",
+                _make_linear(),
+                {"forced_backend": KernelBackend.TORCH},
+            ),
             ("batch_invariant", _make_linear(), {"bi": True}),
             ("deterministic", _make_linear(), {"det": True}),
             ("rl_on_policy", _make_linear(), {"rl_target": "ref"}),

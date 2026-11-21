@@ -1650,6 +1650,7 @@ def get_block_fp8_tuple_input_layout(
     """Return ``(scale_ue8m0, scale_transposed)`` if ``linear`` can directly
     consume a pre-quantized group-128 block-FP8 ``(q, scale)`` tuple, else None.
     """
+    from sglang.kernels.fused_op import get_fused_op_backend
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
     from sglang.srt.runtime_context import get_exec, get_lora
 
@@ -1659,6 +1660,7 @@ def get_block_fp8_tuple_input_layout(
         or k % 128 != 0
         or input_dtype != torch.bfloat16
         or _is_musa
+        or get_fused_op_backend() is not None
         or is_batch_invariant_mode_enabled()
         or torch.compiler.is_compiling()
         or not getattr(linear, "input_is_parallel", True)
@@ -1721,7 +1723,10 @@ def get_block_fp8_tuple_input_layout(
     )
 
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        if deepgemm_supported and (k // 128) % 4 == 0:
+        # B200 UE8M0 decode showed a ~2.4% median dip around bs=32 while
+        # small decode (m <= 16), large decode (m >= 64), and prefill all gain
+        # +1.8% to +3.6%; keep the mid-batch bucket on the unfused path.
+        if deepgemm_supported and (k // 128) % 4 == 0 and not (16 < m <= 48):
             return (True, True)
         return None
 

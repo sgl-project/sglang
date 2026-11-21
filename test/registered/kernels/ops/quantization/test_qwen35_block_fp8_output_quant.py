@@ -1,5 +1,7 @@
 """CUDA correctness and CUDA Graph tests for fused Qwen3.5 blockwise FP8 output quantization."""
 
+import sys
+
 import pytest
 import torch
 
@@ -228,3 +230,7 @@ def test_qwen35_block_fp8_output_quant_cuda_graph():
     assert torch.equal(gdn_s, exp_gdn_s)
     assert torch.equal(attn_q.view(torch.uint8), exp_attn_q.view(torch.uint8))
     assert torch.equal(attn_s, exp_attn_s)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
