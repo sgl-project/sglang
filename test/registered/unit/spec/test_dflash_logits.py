@@ -270,6 +270,8 @@ def test_fused_candidates_need_a_power_of_two_head_split(monkeypatch, head_tp_si
     )
     DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
     assert calls == [{}]
+
+
 def test_candidate_topk_on_a_tied_embedding_head_under_tp(monkeypatch):
     """Gemma-4 ties lm_head to embed_tokens, a plain nn.Embedding that holds the
     whole vocabulary on every TP rank. Treating it as a vocab shard crashed the
