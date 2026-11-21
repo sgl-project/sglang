@@ -227,6 +227,8 @@ class SchedulerBatchResultProcessor:
         if capturer is None or not capturer.has_host_cache:
             return
         start_len = req.routed_experts_start_len
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            start_len = max(start_len, len(req.origin_input_ids))
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,

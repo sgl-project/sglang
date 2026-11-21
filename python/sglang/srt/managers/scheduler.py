@@ -3779,6 +3779,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # Prefill owns prompt-side routing [start_len, prompt_len);
+                # decode never runs prompt tokens through MoE layers, so only
+                # collect decode-generated rows [prompt_len, seqlen - 1).
+                req.routed_experts_start_len = len(req.origin_input_ids)
+
         self._bind_pp_arrival_prefetch(req, recv_req)
 
         # Expected here too: the grammar queue holds it before it is queued.
