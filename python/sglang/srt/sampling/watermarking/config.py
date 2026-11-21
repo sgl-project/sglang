@@ -125,6 +125,12 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
         raise WatermarkConfigError(
             "watermark config max_probability must be a number greater than 0 and at most 1"
         )
+    for name in ("mixing_probability", "max_probability"):
+        value = raw.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+        ):
+            raise WatermarkConfigError(f"watermark config {name} must be a number")
     for name in ("default_enabled", "enforce_all"):
         if raw.get(name) is not None and not isinstance(raw[name], bool):
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")
