@@ -840,23 +840,66 @@ def test_head128_mean_square_exact(batch, seq, heads, packed, amplitude):
 
 
 @pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
-def test_head128_mean_square_capture_replay_and_compile():
-    from sglang.kernels.ops.diffusion.norm.rmsnorm_cast_before_weight_bitexact import (
-        rmsnorm_mean_square_bitexact,
-    )
+@pytest.mark.parametrize("width", [64, 128, 4096])
+def test_mean_square_capture_replay_and_compile(width):
+    from sglang.kernels.ops.diffusion import rmsnorm_mean_square_bitexact
 
     x = torch.randn(1, 31, 4, 128, device="cuda", dtype=torch.bfloat16)
+    if width == 64:
+        x = x[..., 64:]
+    elif width == 4096:
+        x = torch.randn(17, width, device=DEVICE, dtype=torch.bfloat16)
     rmsnorm_mean_square_bitexact(x)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = rmsnorm_mean_square_bitexact(x)
     compiled = torch.compile(rmsnorm_mean_square_bitexact, fullgraph=True)
-    for _ in range(2):
-        x.normal_()
+    for amplitude in (1.0, 1000.0):
+        x.normal_().mul_(amplitude)
         graph.replay()
         expected = x.float().square().mean(-1, keepdim=True)
         assert torch.equal(captured, expected)
         assert torch.equal(compiled(x), expected)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+@pytest.mark.parametrize("layout", ["head64", "first_half", "second_half", "width4096"])
+@pytest.mark.parametrize("amplitude", [1.0, 1e-38, 1e19])
+def test_vae_mean_square_reduction_and_offsets(layout, amplitude):
+    from sglang.kernels.ops.diffusion import rmsnorm_mean_square_bitexact
+
+    if layout == "width4096":
+        x = torch.randn(17 * 4096 + 1, device=DEVICE, dtype=torch.bfloat16)[1:].view(
+            17, 4096
+        )
+    else:
+        width = 64 if layout == "head64" else 128
+        shape = (1, 2, 8, width) if layout == "first_half" else (2, 17, 8, width)
+        x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+        if layout != "head64":
+            x = x[..., :64] if layout == "first_half" else x[..., 64:]
+    x.mul_(amplitude)
+    expected = x.float().square().mean(-1, keepdim=True)
+    assert torch.equal(rmsnorm_mean_square_bitexact(x), expected)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="Requires CUDA PTX")
+def test_vae_mean_square_rejects_other_reduction_layouts():
+    from sglang.kernels.ops.diffusion import (
+        can_use_rmsnorm_mean_square,
+        rmsnorm_mean_square_bitexact,
+    )
+
+    for x in (
+        torch.empty(15, 4096, device=DEVICE, dtype=torch.bfloat16),
+        torch.empty(17, 8192, device=DEVICE, dtype=torch.bfloat16)[:, ::2],
+        torch.empty(2, 19, 8, 128, device=DEVICE, dtype=torch.bfloat16)[
+            :, 1:-1, :, 64:
+        ],
+    ):
+        assert not can_use_rmsnorm_mean_square(x)
+        with pytest.raises(ValueError, match="Unsupported ordered mean-square"):
+            rmsnorm_mean_square_bitexact(x)
 
 
 def _moss_image_norm_eager(x, weight):
