@@ -1566,6 +1566,9 @@ def reserve_trtllm_mxfp4_moe_workspace(
     from flashinfer.fused_moe import trtllm_fused_moe_workspace_size
     from flashinfer.tllm_enums import ActivationType
 
+    # Kernel tests load weights without a published server config.
+    if not get_context().is_config_namespace_published("disagg"):
+        return
     if get_disagg().disaggregation_mode == "decode":
         return
     prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
