@@ -68,6 +68,32 @@ class TestIsBlockScaleFp8(unittest.TestCase):
         proj = _make_proj(torch.float8_e4m3fn, weight_scale_shape=(64,))
         self.assertFalse(self.fn(proj))
 
+    def test_block_scale_inv_fp8_returns_true(self):
+        """Fp8LinearMethod block quant: fp32 weight_scale_inv [N/128, K/128]."""
+        proj = _make_proj(torch.float8_e4m3fn)
+        proj.weight_scale_inv = torch.empty(1, 4, dtype=torch.float32)
+        proj.quant_method = SimpleNamespace(weight_block_size=[128, 128])
+        self.assertTrue(self.fn(proj))
+
+    def test_block_32_scale_inv_fp8_returns_false(self):
+        """[32, 32] blocks need K/32 activation scales; the fused kernels emit K/128."""
+        proj = _make_proj(torch.float8_e4m3fn)
+        proj.weight_scale_inv = torch.empty(2, 16, dtype=torch.float32)
+        proj.quant_method = SimpleNamespace(weight_block_size=[32, 32])
+        self.assertFalse(self.fn(proj))
+
+    def test_scale_inv_without_block_size_returns_false(self):
+        """weight_scale_inv with no known block size stays on the unfused path."""
+        proj = _make_proj(torch.float8_e4m3fn)
+        proj.weight_scale_inv = torch.empty(1, 4, dtype=torch.float32)
+        self.assertFalse(self.fn(proj))
+
+    def test_mxfp8_scale_inv_returns_false(self):
+        """MXFP8 keeps uint8 e8m0 scales in weight_scale_inv [N, K/32]."""
+        proj = _make_proj(torch.float8_e4m3fn)
+        proj.weight_scale_inv = torch.empty(64, 16, dtype=torch.uint8)
+        self.assertFalse(self.fn(proj))
+
     def test_no_weight_attribute_returns_false(self):
         """No weight attribute — should return False gracefully."""
         proj = SimpleNamespace()

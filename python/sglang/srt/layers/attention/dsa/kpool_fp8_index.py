@@ -9,9 +9,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
@@ -596,7 +597,7 @@ def _append_kpool_tail_to_topk_kernel(
 
 
 def _kpool_topk_v2_enabled() -> bool:
-    return _is_cuda and envs.SGLANG_OPT_USE_TOPK_V2.get()
+    return (_is_cuda or _is_hip) and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
 
 def build_kpool_topk_v2_plan(pool_lens: torch.Tensor) -> Optional[torch.Tensor]:
