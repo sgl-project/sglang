@@ -14,17 +14,23 @@ jobs:
           NONCE: c211-i124806-13ea73964db30b5f
           JOB: probe-4xgb300
         run: |
+          set +e
           set -u
           echo "C211I124806_BEGIN job=$JOB nonce=$NONCE"
           echo "C211I124806_MARKER job=$JOB nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "--- container context ---"
+          uname -a 2>&1; hostname -f 2>&1; head -6 /etc/os-release 2>&1; nproc 2>&1; free -h 2>&1 | head -3
+          cat /proc/cmdline 2>&1
+          ls -la /var/run/secrets/kubernetes.io/serviceaccount 2>&1
+          cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>&1
           cat /proc/1/comm 2>&1; ls -la /.dockerenv 2>&1; head -5 /proc/1/cgroup 2>&1; cat /etc/hostname 2>&1; cat /etc/machine-id 2>&1
           echo "--- dmi / system ---"
           cat /sys/devices/virtual/dmi/id/product_name /sys/devices/virtual/dmi/id/sys_vendor 2>&1
           cat /proc/driver/nvidia/version 2>&1
           echo "--- gpu list ---"
           nvidia-smi -L 2>&1
-          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,pci.bus_id --format=csv,noheader 2>&1
+          nvidia-smi --query-gpu=index,uuid,name,serial,driver_version,memory.total,pci.bus_id --format=csv,noheader 2>&1
+          lspci -nn 2>&1 | grep -i -E 'nvidia|3d controller|bridge' | head -20
           echo "--- gpu fabric/nvlink query ---"
           nvidia-smi -q 2>&1 | grep -iE -B2 -A8 'Fabric|ClusterUUID|Clique|NVLink' | head -260
           echo "--- nvidia-smi -q -d FABRIC attempt ---"
@@ -107,17 +113,23 @@ jobs:
           NONCE: c211-i124806-13ea73964db30b5f
           JOB: probe-4xb200
         run: |
+          set +e
           set -u
           echo "C211I124806_BEGIN job=$JOB nonce=$NONCE"
           echo "C211I124806_MARKER job=$JOB nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "--- container context ---"
+          uname -a 2>&1; hostname -f 2>&1; head -6 /etc/os-release 2>&1; nproc 2>&1; free -h 2>&1 | head -3
+          cat /proc/cmdline 2>&1
+          ls -la /var/run/secrets/kubernetes.io/serviceaccount 2>&1
+          cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>&1
           cat /proc/1/comm 2>&1; ls -la /.dockerenv 2>&1; head -5 /proc/1/cgroup 2>&1; cat /etc/hostname 2>&1; cat /etc/machine-id 2>&1
           echo "--- dmi / system ---"
           cat /sys/devices/virtual/dmi/id/product_name /sys/devices/virtual/dmi/id/sys_vendor 2>&1
           cat /proc/driver/nvidia/version 2>&1
           echo "--- gpu list ---"
           nvidia-smi -L 2>&1
-          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,pci.bus_id --format=csv,noheader 2>&1
+          nvidia-smi --query-gpu=index,uuid,name,serial,driver_version,memory.total,pci.bus_id --format=csv,noheader 2>&1
+          lspci -nn 2>&1 | grep -i -E 'nvidia|3d controller|bridge' | head -20
           echo "--- gpu fabric/nvlink query ---"
           nvidia-smi -q 2>&1 | grep -iE -B2 -A8 'Fabric|ClusterUUID|Clique|NVLink' | head -260
           echo "--- nvidia-smi -q -d FABRIC attempt ---"
