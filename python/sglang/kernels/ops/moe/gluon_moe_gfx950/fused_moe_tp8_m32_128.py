@@ -9,7 +9,7 @@ from triton.experimental.gluon import language as gl
 
 from .common import _encode_groups, _quantize_input, _unpack_words, _weight_offset
 
-_artifact_next_power_of_2 = triton.constexpr_function(triton.next_power_of_2)
+_artifact_next_power_of_2 = triton.next_power_of_2
 
 @gluon.jit
 def _router_linear(X, W, L, M: gl.constexpr, H: gl.constexpr, SX: gl.constexpr, BM: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, Counts, Sorted, Jobs, ROUTED_CAPACITY: gl.constexpr, pid_m, pid_n, SPLITS: gl.constexpr, split):
