@@ -35,7 +35,7 @@ docker pull lmsysorg/sglang:latest
 The examples use `latest`. To use another image, replace the tag in the pull and run commands:
 
 - Nightly: Built daily from the latest `main`, including changes not yet in a stable release. Choose a tag from the [nightly image list](https://hub.docker.com/r/lmsysorg/sglang/tags?name=nightly).
-- AWS EFA: Any of the images above plus the AWS EFA userspace stack, for EFA-enabled EC2 instances. Add `-efa` to the tag: `latest-efa` or the dated `nightly-dev-efa-<date>-<sha>` (moving tag `dev-efa`). See [AWS EFA](/docs/advanced_features/pd_disaggregation#aws-efa) for what the images include and how to run them.
+- AWS EFA: The CUDA 13 images above include the AWS EFA userspace for EFA-enabled EC2 instances. See [AWS EFA](/docs/advanced_features/pd_disaggregation#aws-efa) for the settings that enable it.
 
 For reproducible deployments, use a specific release or dated nightly tag from [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang/tags).
 

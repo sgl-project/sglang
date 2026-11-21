@@ -534,7 +534,7 @@ If the original data is still needed, back it up before running `analyse()`.
   lead to lengthy profiling data parsing times. Reduce these values
   appropriately when you only need a quick overview.
 - **CUDA Graph impact**: To see the full Python call stack → operator mapping in
-  traces, add `--disable-cuda-graph` when starting the server. Note that this
+  traces, add `--disable-decode-cuda-graph --disable-prefill-cuda-graph` when starting the server. Note that this
   reduces decode performance — only use during profiling. To analyze CUDA Graph
   capture specifically, use `--enable-profile-cuda-graph` — traces are saved to
   `SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/`.

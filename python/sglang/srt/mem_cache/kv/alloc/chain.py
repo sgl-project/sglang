@@ -91,6 +91,9 @@ _NETWORK_ROWS = "network-rows"
 # units of 1/_GROWTH_SCALE page.
 _GROWTH_DECAY = 16
 _GROWTH_SCALE = 64
+# Distinct (prompt, decode) questions `max_new_tokens_for_memory` keeps
+# answers for; past it the answers are dropped and asked afresh.
+_MAX_NEW_TOKENS_MEMO_SIZE = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -231,12 +234,20 @@ def take_new_pages(
             if owner.place_pages(new_virtual_pages, num_new_pages, consumer) is None:
                 return None
         else:
-            owner.ids.bind(new_virtual_pages, physical_pages)
-            owner._maybe_zero_pages(physical_pages)
+            owner._bind_pages(new_virtual_pages, physical_pages)
     # A rebind moves the capacity epoch; a step within its pages takes none.
     if num_new_pages > 0:
         owner.free_virtual_ids = owner.free_virtual_ids[num_new_pages:]
     return out_indices
+
+
+def _shared_copy(ids, bands: int):
+    """Ids that ``bands`` ledgers record, as ``(ids, copy)`` for each band's
+    `Band.set_inflight_forward`: one copy they share when several record a
+    tensor (a ledger never writes its ids), else the ids for a band to copy."""
+    if bands > 1 and isinstance(ids, torch.Tensor) and ids.numel() > 0:
+        return ids.clone(), False
+    return ids, True
 
 
 class ChainAllocator(BaseTokenToKVPoolAllocator):
@@ -258,6 +269,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     stage_capacity: Optional[StageCapacity] = None
     # Every stage's simulated snapshot, kept until the capacity epoch moves.
     _stage_memo: Tuple[Optional[int], Tuple[ChainSnapshot, ...]] = (None, ())
+    # The state sub-pool's band; None without recurrent state.
+    mamba_allocator: Optional[Band] = None
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -395,6 +408,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._growth: Dict[str, int] = {b.sub_pool_name: 0 for b in self.bands}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
+        # `max_new_tokens_for_memory`'s answers by question: an empty pool's,
+        # so they change only with the pool's geometry (`_reset_geometry_memo`).
+        self._max_new_tokens_memo: Dict[tuple, Optional[int]] = {}
         self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._set_token_shares(full_max_total_num_tokens, swa_max_total_num_tokens)
 
@@ -484,12 +500,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def _snapshot_key_now(self) -> int:
         """The chain's capacity epoch and, per band, its compaction mode, which
-        is not a capacity field."""
+        is not a capacity field. Every capacity read goes through here, so the
+        state slots an open free group holds back are freed first: the bands
+        share the arena, and a free outside a group would have given them back."""
+        self._settle_state_free_group()
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
             bits = (bits << 1) | bool(band.lazy_compaction)
         return (epoch << len(self.bands)) | bits
+
+    def pricing_key(self) -> int:
+        """What every capacity answer depends on besides its question: the key
+        `pricing_snapshot` (and each stage's snapshot) is kept under."""
+        return self._snapshot_key_now()
 
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
@@ -611,6 +635,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self._size_swa = min(geometry.window_tokens for geometry in geometries)
         self.stage_capacity = StageCapacity(stage, geometries, checks=checks)
         self._stage_memo = (None, ())
+        self._reset_geometry_memo()
 
     def _logical_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
         """Live pages per band, and virtual pages in use per id owner: what
@@ -697,6 +722,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def units_fit(self, demands: Dict[str, int]) -> bool:
         """Whether a take of these units (pages of a token sub-pool, slots of the
         state sub-pool) succeeds now by the take's own checks, on every PP stage."""
+        state = self.mamba_allocator
+        if state is not None and state.sub_pool_name in demands:
+            self._settle_state_free_group()
         return self._ask(
             "units_fit",
             lambda: _units_key(demands),
@@ -779,6 +807,26 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def state_slots_fit(self, count: int) -> bool:
         """Whether ``count`` state slots can be taken now."""
         return count <= 0 or self.units_fit({self.mamba_allocator.sub_pool_name: count})
+
+    def state_slots_fit_in_place(self, count: int) -> bool:
+        """Whether ``count`` state slots can be taken now without moving a page:
+        where the bands stand, around send-held bytes, so the take needs no
+        relief (compaction or relayout) and waits for no send. Under pipeline
+        stages, on every stage's snapshot, so all of them answer alike."""
+        if count <= 0:
+            return True
+        name = self.mamba_allocator.sub_pool_name
+        demands = {name: count}
+
+        def in_place(snapshot: ChainSnapshot) -> bool:
+            return (
+                count <= snapshot.band(name).free_virtual_pages
+                and plan_layout(snapshot, demands, NO_MOVE) is not None
+            )
+
+        if self.stage_capacity is None:
+            return in_place(self.held_snapshot())
+        return self._ask("state_in_place", lambda: _units_key(demands), in_place)
 
     def estimated_state_slots_available(self) -> int:
         """`estimated_units_available` of the state sub-pool: observers only."""
@@ -1136,14 +1184,35 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         slots and request row, window retirement (`demand.window_retirement`),
         and the smallest chunk admission may cut its prompt to
         (`smallest_admissible_chunk`)."""
+        windows = self._ceiling_windows(sliding_window_size)
+        state_slots = (
+            0 if self.mamba_allocator is None else self.fresh_request_state_slots
+        )
+        # Every request of one prompt and decode length asks the same question
+        # of the same empty pool: answer it once.
+        key = (
+            input_tokens,
+            max_new_tokens,
+            token_capacity,
+            tuple(windows.items()),
+            state_slots,
+            bool(self.request_allocators),
+            chunk_size,
+            chunk_align,
+            prefill_retire_lag,
+            eviction_interval,
+            checkpoint_interval,
+            decode_retire_lag,
+        )
+        memo = self._max_new_tokens_memo
+        if key in memo:
+            return memo[key]
+        if len(memo) >= _MAX_NEW_TOKENS_MEMO_SIZE:
+            memo.clear()
         page = self.page_size
         paged_input = -(-input_tokens // page) * page
         max_new_tokens = min(
             max_new_tokens, max(0, token_capacity - paged_input - page - 1)
-        )
-        windows = self._ceiling_windows(sliding_window_size)
-        state_slots = (
-            0 if self.mamba_allocator is None else self.fresh_request_state_slots
         )
         # Below the grid no shorter chunk is admissible: admission runs the
         # request at the configured chunk or not at all.
@@ -1168,18 +1237,27 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 empty_pool=True,
             )
 
-        if not fits(0):
-            return None
+        # A request that fits with all of its decode fits with less of it.
         if fits(max_new_tokens):
-            return max_new_tokens
-        low, high = 0, max_new_tokens
-        while low < high:
-            mid = (low + high + 1) // 2
-            if fits(mid):
-                low = mid
-            else:
-                high = mid - 1
-        return low
+            answer = max_new_tokens
+        elif max_new_tokens == 0 or not fits(0):
+            answer = None
+        else:
+            low, high = 0, max_new_tokens
+            while low < high:
+                mid = (low + high + 1) // 2
+                if fits(mid):
+                    low = mid
+                else:
+                    high = mid - 1
+            answer = low
+        memo[key] = answer
+        return answer
+
+    def _reset_geometry_memo(self) -> None:
+        """Forget the answers that depend on the pool's geometry: its size,
+        the FULL cap, and the pipeline stages every question is asked of."""
+        self._max_new_tokens_memo.clear()
 
     def get_extend_allocation_demand(
         self,
@@ -1215,6 +1293,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     reclaim_for_load_back = _asks_the_cache
 
     def resize(self, config) -> None:
+        self._reset_geometry_memo()
         if (
             not self.arena.backed_after_capture
             or config.unified_memory_pool_bytes != self.arena.total_bytes
@@ -1460,9 +1539,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             member.end_load_reservation()
 
     def prewarm_compaction(self) -> None:
-        """Prewarm the page-move path of every member that compacts."""
+        """Prewarm the page-move path of every member that compacts, and the
+        state copy-on-write that runs the same kernel."""
         for member in self.members:
             member.prewarm_compaction()
+        if self.state is not None:
+            self.state.pool.prewarm_copy()
 
     def compaction_can_run(self) -> bool:
         """Whether bytes freed on either side can serve the other side's next
@@ -1497,6 +1579,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         request_rows: Optional[torch.Tensor] = None,
         token_writes_unknown: bool = False,
         state_writes_unknown: bool = False,
+        state_slots_owned: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
         write set through their own v2p. The state band, written in place by
@@ -1504,22 +1587,38 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state slots the forward writes; a request band takes the batch's request
         rows, its virtual ids. ``token_writes_unknown`` /
         ``state_writes_unknown``: the token / state bands cannot read this
-        forward's write ids before it ends."""
+        forward's write ids before it ends. ``state_slots_owned``: the caller
+        hands ``state_slots_virtual`` over, so the state band keeps it as its
+        ledger's copy. Bands that record the same ids share one copy."""
         with record_function("ChainAllocator.set_inflight_forward"):
             requests = set(self.request_allocators.values())
+            token_bands = sum(
+                member is not self.mamba_allocator and member not in requests
+                for member in self.members
+            )
+            tokens, copy_tokens = _shared_copy(
+                None if token_writes_unknown else out_cache_loc_virtual, token_bands
+            )
+            rows, copy_rows = _shared_copy(request_rows, len(requests))
             for member in self.members:
                 if member in requests:
                     member.set_inflight_forward(
-                        forward_done, request_rows, writes_unknown=False
+                        forward_done, rows, writes_unknown=False, copy=copy_rows
                     )
                     continue
-                is_state = member is self.mamba_allocator
+                if member is self.mamba_allocator:
+                    member.set_inflight_forward(
+                        forward_done,
+                        state_slots_virtual,
+                        writes_unknown=state_writes_unknown,
+                        copy=not state_slots_owned,
+                    )
+                    continue
                 member.set_inflight_forward(
                     forward_done,
-                    state_slots_virtual if is_state else out_cache_loc_virtual,
-                    writes_unknown=(
-                        state_writes_unknown if is_state else token_writes_unknown
-                    ),
+                    tokens,
+                    writes_unknown=token_writes_unknown,
+                    copy=copy_tokens,
                 )
 
     def settle_pending_for_recovery(self, bands=None):
@@ -1614,11 +1713,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     )
                 continue
             assert bind.numel() == pages.numel()
-            window.ids.bind(bind, pages)
-            window._maybe_zero_pages(pages)
+            window._bind_pages(bind, pages)
         return out
 
-    @_one_operation
     def _plan_and_take(
         self,
         demands: Dict[str, int],
@@ -1626,18 +1723,24 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         bind_at_frontier: bool = False,
         consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[Dict[str, Optional[torch.Tensor]]]:
-        """Physical pages for ``demands`` (pages per band) in a planned layout;
-        None exactly when `feasible` says no, and a plan that does not realize
-        raises. With ``bind_at_frontier``, see `realize`."""
+        """Physical pages for ``demands`` (pages per band) in a planned layout,
+        as one allocator operation (`_one_operation`) that takes from the
+        demanded bands only; None exactly when `feasible` says no, and a plan
+        that does not realize raises. With ``bind_at_frontier``, see `realize`."""
         demands = {name: n for name, n in demands.items() if n > 0}
         if not demands:
             return {}
-        with self._relief(demands) as plan:
-            if plan is None:
-                return None
-            return self.realize(
-                plan, bind_at_frontier=bind_at_frontier, consumer=consumer
-            )
+        # Before the operation: a take of any band sees the state slots an
+        # open free group holds back as free, as an immediate free would.
+        self._settle_state_free_group()
+        with allocator_operation(self.members) as op:
+            op.declare_takes(demands)
+            with self._relief(demands) as plan:
+                if plan is None:
+                    return None
+                return self.realize(
+                    plan, bind_at_frontier=bind_at_frontier, consumer=consumer
+                )
 
     @_one_operation
     def realize(
@@ -1715,10 +1818,48 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             # No layout serves it: refused before any pending page settles.
             yield None
             return
+        packed = self._pack_ends_on_device(demands)
+        if packed is not None:
+            yield packed
+            return
         # Settle pending pages first, so the plan and its realization see holes
         # and live pages only (a float left with no live page parks).
         with self.settle_pending_for_recovery(self.bands):
             yield from self._relief_plan(demands)
+
+    def _pack_ends_on_device(self, demands: Dict[str, int]) -> Optional[TakePlan]:
+        """Lay the chain out for ``demands`` with no host read, when its least
+        rearrangement only packs ends that can pack on the device
+        (`Band.pack_on_device`): pack them, and return the plan's takes left
+        to realize. None, with nothing changed, otherwise.
+
+        Without a recorded transfer, a fixed page, or a float holding pending
+        pages, the plan and the layout are the ones a host relief makes after
+        settling. The choice reads counts and logical state alone, alike on
+        every rank."""
+        if self.full_attn_allocator.network_waiter is not None or any(
+            band.records_transfers
+            or band.usage.fixed
+            or (band.grow_direction == "float" and band._pending_until_retire)
+            for band in self.bands
+        ):
+            return None
+        plan = first_plan(self.pricing_snapshot(), demands, growth=self._growth)
+        bands = {band.sub_pool_name: band for band in self.bands}
+        if (
+            plan is None
+            or plan.targets
+            or not plan.flush
+            or not all(bands[name].can_pack_on_device() for name in plan.flush)
+        ):
+            return None
+        for name in plan.flush:
+            bands[name].pack_on_device()
+        # The other ends settle too, as at a host relief's entry, so their
+        # takes choose among the same holes.
+        for band in self.bands:
+            band.settle_pending()
+        return msgspec.structs.replace(plan, flush=())
 
     def _relief_plan(self, demands: Dict[str, int]):
         held = False
@@ -2037,6 +2178,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if need_size <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        self._settle_state_free_group()
         demands = {state.sub_pool_name: need_size}
         decided = self._decided_take(demands)
         if decided is False:
@@ -2059,8 +2201,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     f"{need_size} slots was refused"
                 )
         else:
-            state.ids.bind(slots, pages)
-            state._maybe_zero_pages(pages)
+            state._bind_pages(slots, pages)
         state.free_virtual_ids = state.free_virtual_ids[need_size:]
         return state._expand_pages_to_tokens(slots)
 
@@ -2089,8 +2230,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         "refused"
                     )
             else:
-                band.ids.bind(rows, pages)
-                band._maybe_zero_pages(pages)
+                band._bind_pages(rows, pages)
         return True
 
     def free_request_rows(self, rows: torch.Tensor) -> None:
@@ -2236,6 +2376,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps_group = []
         self.full_page_reps_group = []
         self.full_free_group = []
+        # A retire batch's state slots go back in one free of the state band.
+        if self.mamba_allocator is not None:
+            self.mamba_allocator.free_group_begin()
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
@@ -2246,6 +2389,18 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.free_full(torch.cat(full_free_group))
         if pending or full_pending:
             self._release_page_reps(pending, full_pending)
+        if self.mamba_allocator is not None:
+            self.mamba_allocator.free_group_end()
+
+    def _settle_state_free_group(self) -> None:
+        """Free the state slots an open free group holds back, so a take or a
+        capacity read of any band inside the group sees them as a free outside
+        it would. A retire batch's frees with no take or read between them
+        still reach the state band as one free."""
+        state = self.mamba_allocator
+        if state is not None and state.free_group:
+            state.free_group_end()
+            state.free_group_begin()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()` for a segment whose window pages

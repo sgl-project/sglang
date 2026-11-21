@@ -113,15 +113,12 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.transformer = transformer
         self.scheduler = scheduler
 
-        self.vae_scale_factor = (
-            2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
-        )
+        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample)
         self.image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor * 2
         )
         self.vl_processor = processor
-        self.tokenizer_max_length = 1024
-        self.latent_channels = self.vae.z_dim if getattr(self, "vae", None) else 16
+        self.latent_channels = self.vae.z_dim
         # (dtype, device) -> latent mean/std, uploaded once
         self.latent_stats = {}
 
@@ -429,8 +426,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         generator = batch.generator
 
         assert batch.image_path is not None
-        image = load_image(_resolve_layered_image_path(batch.image_path))
-        image = image.convert("RGBA")
+        # the layered VAE encodes RGBA, so the input's alpha must survive loading
+        image = load_image(
+            _resolve_layered_image_path(batch.image_path),
+            convert_method=lambda image: image.convert("RGBA"),
+        )
         image_size = image.size
         resolution = server_args.pipeline_config.resolution
         calculated_width, calculated_height = calculate_dimensions(
@@ -446,7 +446,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch.width = width
         batch.height = height
 
-        # if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
         image = self.image_processor.resize(image, calculated_height, calculated_width)
         prompt_image = image
         image = self.image_processor.preprocess(

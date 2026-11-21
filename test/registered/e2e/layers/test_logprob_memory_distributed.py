@@ -43,6 +43,7 @@ def _run_rank(rank, rendezvous):
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
             top_logprobs_nums=None,
+            input_candidate_selectors=None,
             extend_logprob_pruned_lens_cpu=[rows // 2, rows // 2],
             extend_input_logprob_token_ids_gpu=token_ids,
             token_ids_logprobs=None,

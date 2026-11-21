@@ -547,7 +547,6 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
                 f"Expected {multiview_layout.num_views} rig view IDs, got {rig_view_ids.numel()}."
             )
 
-        self._ensure_cache_dicts()
         if (
             cache_key not in self.cached_kv
             or cache_key not in self.cached_gen_rope_inputs

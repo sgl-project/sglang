@@ -28,6 +28,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -42,7 +43,7 @@ mp.set_start_method("spawn", force=True)
 
 register_npu_ci(
     est_time=400,
-    suite="nightly-1-npu-a3",
+    suite="nightly-test-1-npu-a3",
     nightly=True,
     disabled="run failed",
 )
@@ -138,8 +139,7 @@ def init_process_seed(
             str(rank),
             "--tp-size",
             str(tp_size),
-            "--admin-api-key",
-            ADMIN_API_KEY_FOR_TEST,
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ),
     )
     torch.npu.synchronize()
@@ -242,8 +242,7 @@ def init_process_dst(
                 "remote_instance",
                 "--remote-instance-weight-loader-backend",
                 remote_instance_loader_backend,
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
     torch.npu.synchronize()
