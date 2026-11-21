@@ -39,6 +39,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
@@ -339,20 +344,13 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             )
             attention_hidden_states = attention_hidden_states * self.attn_out_multiplier
 
-            attn_backend = get_attn_backend()
-            assert isinstance(attn_backend, HybridLinearAttnBackend)
-            assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
             # Mamba block
+            mamba_input = hidden_states * self.ssm_in_multiplier
             mamba_hidden_states = torch.empty_like(hidden_states)
-            attn_backend.linear_attn_backend.forward(
-                self.mamba,
-                hidden_states * self.ssm_in_multiplier,
-                mamba_hidden_states,
-                layer_id=self.layer_id,
-                forward_batch=forward_batch,
-                mup_vector=self.mup_vector,
-                use_triton_causal_conv=forward_batch.forward_mode.is_target_verify(),
-            )
+            if is_in_breakable_cuda_graph():
+                self._eager_mamba(mamba_input, mamba_hidden_states)
+            else:
+                self._forward_mamba(mamba_input, mamba_hidden_states, forward_batch)
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 
             hidden_states = attention_hidden_states + mamba_hidden_states
@@ -362,6 +360,31 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.feed_forward(hidden_states, forward_batch)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
+
+    def _forward_mamba(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        attn_backend = get_attn_backend()
+        assert isinstance(attn_backend, HybridLinearAttnBackend)
+        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        attn_backend.linear_attn_backend.forward(
+            self.mamba,
+            hidden_states,
+            output,
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            mup_vector=self.mup_vector,
+            use_triton_causal_conv=forward_batch.forward_mode.is_target_verify(),
+        )
+
+    # A graph break: the Mamba2 extend reads each request's state slot and chunk
+    # metadata, which a captured segment would replay from capture time.
+    @eager_on_graph
+    def _eager_mamba(self, hidden_states: torch.Tensor, output: torch.Tensor) -> None:
+        self._forward_mamba(hidden_states, output, get_forward_batch())
 
 
 ALL_DECODER_LAYER_TYPES = {
