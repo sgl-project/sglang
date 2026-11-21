@@ -270,8 +270,8 @@ class TestAiterSharedColumnsContract(CustomTestCase):
         )
 
     def test_ineligible_configs_fall_back_without_touching_aiter(self):
-        """Every guard in the eligibility predicate returns None, allocates no
-        buffer, and never reaches the kernel."""
+        """Every eligibility guard returns None, allocates no buffer,
+        and never reaches the kernel."""
         configs = []
 
         def fuse(config, **kwargs):
@@ -628,8 +628,7 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             self.assertEqual(len(self.fake_kernel.calls), 1)
             self.assertEqual(tuple(fused.topk_ids.shape), (37, total))
 
-            # Fall-through: the ordinary routing gate is stubbed, since the real one needs
-            # aiter symbols a non-ROCm build never imported; the append after it is backend-neutral.
+            # Stub the ROCm-only routing gate; the append after it is backend-neutral.
             routed = (
                 torch.rand((37, self.TOPK_ROUTED), device=router_logits.device),
                 torch.randint(
