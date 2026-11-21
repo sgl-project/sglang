@@ -83,6 +83,14 @@ class SystemOneServing(OpenAIServingDecisions):
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
         if self.joint_head_config is not None or self.pointer_head is not None:
             return self._validate_joint_schema_request(request)
+        if self.question_encoder is not None:
+            error = self.question_encoder.validate_request(request)
+            if error is not None:
+                return error
+            if request.packing not in (None, False, "none", "shared"):
+                return "Nemotron Decision packing must be 'none' or 'shared'."
+            if request.long_mode not in (None, "full"):
+                return "Nemotron Decision reads the full prompt; compaction is not supported."
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
@@ -319,6 +327,15 @@ class SystemOneServing(OpenAIServingDecisions):
         pair_labels = None
         for question_id, view in zip(request.questions, views):
             try:
+                if self.question_encoder is not None:
+                    if view.kind == "score":
+                        _check_legend(question_id, view)
+                    yield self.question_encoder.encode(
+                        request.state,
+                        request.questions[question_id],
+                        chat_template_kwargs,
+                    )
+                    continue
                 labels = default_labels(view)
                 if view.kind == "choice" and len(view.names) > len(labels):
                     if pair_labels is None:
@@ -420,20 +437,39 @@ class SystemOneServing(OpenAIServingDecisions):
             return await self._answer_pointer(
                 adapted_request, request, views, raw_request
             )
+        adapter = (
+            self._resolve_lora_path(request.model, None)
+            if self.question_encoder is not None
+            else None
+        )
+        shared_prefix = (
+            await asyncio.to_thread(self.question_encoder.packing_prefix, request.state)
+            if self.question_encoder is not None and request.packing == "shared"
+            else None
+        )
         _, _, result = await self._score(
             adapted_request=adapted_request,
             raw_request=raw_request,
+            shared_prefix=shared_prefix,
             temperature=(
                 1.0
                 if self.decision_config is None
                 else self.decision_config["temperature"]
             ),
+            **({"lora_path": adapter} if adapter is not None else {}),
         )
         answers = {}
         for i, question_id in enumerate(request.questions):
+            probabilities = result.scores[i]
+            if self.question_encoder is not None:
+                probabilities = self.question_encoder.calibrate(
+                    request.questions[question_id].type,
+                    probabilities,
+                    result.token_logprobs[i],
+                )
             answers[question_id] = _answer(
                 view=views[i],
-                probabilities=result.scores[i],
+                probabilities=probabilities,
                 mass=label_mass(result.token_logprobs[i]),
                 question_id=question_id,
             )

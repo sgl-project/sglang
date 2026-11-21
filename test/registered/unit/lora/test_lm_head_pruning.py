@@ -16,6 +16,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -34,15 +35,24 @@ class TestLMHeadPruning(CustomTestCase):
         cases = (
             {
                 "name": "without_logprobs",
+                "is_prefill_only": False,
                 "extend_seq_lens": [4, 5, 6],
                 "return_logprob": False,
                 "logprob_start_lens": None,
             },
             {
                 "name": "with_logprobs",
+                "is_prefill_only": False,
                 "extend_seq_lens": [4, 5, 6],
                 "return_logprob": True,
                 "logprob_start_lens": [0, 5, 3],
+            },
+            {
+                "name": "prefill_only_without_selected_positions",
+                "is_prefill_only": True,
+                "extend_seq_lens": [4, 5, 6],
+                "return_logprob": True,
+                "logprob_start_lens": [3, 4, 5],
             },
         )
 
@@ -71,6 +81,8 @@ class TestLMHeadPruning(CustomTestCase):
                 forward_batch = SimpleNamespace(
                     forward_mode=ForwardMode.EXTEND,
                     batch_size=len(extend_seq_lens),
+                    is_prefill_only=case["is_prefill_only"],
+                    token_indices_to_pool=None,
                     return_logprob=case["return_logprob"],
                     extend_seq_lens_cpu=extend_seq_lens,
                     extend_logprob_start_lens_cpu=case["logprob_start_lens"],
@@ -81,6 +93,39 @@ class TestLMHeadPruning(CustomTestCase):
                     "LoRA lm_head segment lengths must match the exact per-request "
                     "rows forwarded by logits pruning",
                 )
+
+    def test_setwise_lora_routes_match_the_rows_gathered_for_the_head(self):
+        lengths = [5, 7, 4]
+        indices = [torch.tensor([1, 4]), torch.tensor([6]), torch.tensor([0, 2, 3])]
+        owners = torch.repeat_interleave(torch.arange(3), torch.tensor(lengths))
+        hidden = owners[:, None].float()
+        metadata = LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=lengths,
+        )
+        with patch.object(
+            LogitsProcessor, "_get_logits", return_value=torch.zeros(6, 8)
+        ) as project:
+            LogitsProcessor.compute_logprobs_at_positions(
+                LogitsProcessor.__new__(LogitsProcessor),
+                torch.arange(sum(lengths)),
+                hidden,
+                None,
+                metadata,
+                indices,
+            )
+        gathered = project.call_args.args[0]
+        actual = torch.bincount(gathered[:, 0].long(), minlength=3).tolist()
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=3,
+            return_logprob=True,
+            is_prefill_only=True,
+            token_indices_to_pool=indices,
+            extend_seq_lens_cpu=lengths,
+            extend_logprob_start_lens_cpu=[0, 0, 0],
+        )
+        self.assertEqual(get_lm_head_pruned_lens(batch), actual)
 
 
 if __name__ == "__main__":

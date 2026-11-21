@@ -595,6 +595,7 @@ def get_lm_head_pruned_lens(
     or None if lm_head pruning is not applicable for this batch.
 
     Pruning rules:
+    - Prefill-only position readouts: one row per selected position
     - Extend without logprobs: 1 token per sequence
     - Extend with logprobs: max(extend_len - logprob_start_len, 1) per sequence
     - Decode / target_verify / draft_extend_v2: no pruning
@@ -613,6 +614,13 @@ def get_lm_head_pruned_lens(
 
     if not lm_head_pruning:
         return None
+
+    if (
+        forward_batch.is_prefill_only
+        and forward_batch.token_indices_to_pool is not None
+    ):
+        # Setwise readouts gather these rows before calling the LM head.
+        return [len(indices) for indices in forward_batch.token_indices_to_pool]
 
     if forward_batch.return_logprob:
         pruned_lens = []

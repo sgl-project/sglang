@@ -75,7 +75,7 @@ class Schedule(msgspec.Struct):
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
     ] = False
     max_prefill_tokens: A[
-        int,
+        Optional[int],
         Arg(
             help=(
                 "The maximum number of tokens in a prefill batch. The real bound "
@@ -83,8 +83,9 @@ class Schedule(msgspec.Struct):
                 "context length." + f"\n\n{human_readable_int.__doc__}"
             ),
             type_parser=human_readable_int,
+            fallback=16384,
         ),
-    ] = 16384
+    ] = None
     prefill_max_requests: A[
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
