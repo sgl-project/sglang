@@ -305,7 +305,7 @@ def commit_block_accept_tokens_to_penalties(
     if sampling_info.step_penalties is not None:
         # Guarded here: building the mask launches device work.
         positions = torch.arange(out_tokens.shape[1], device=out_tokens.device)
-        sampling_info.commit_sampled_tokens(
+        sampling_info.step_penalties.commit(
             out_tokens, accept_mask=positions < commit_lens[:, None]
         )
 

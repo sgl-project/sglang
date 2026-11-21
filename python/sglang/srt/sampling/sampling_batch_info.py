@@ -5,7 +5,7 @@ import logging
 import operator
 import random
 from functools import cache
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
@@ -153,12 +153,8 @@ class SamplingBatchInfo:
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
     grammar_mask: Optional[GrammarMask] = None
 
-    # Set by the scheduler at each launch; the acc_* fields cache the
-    # [bs, vocab] logit penalties built for acc_penalties_step.
+    # Set by the scheduler at each launch.
     step_penalties: Optional[StepPenalties] = None
-    acc_additive_penalties: Optional[torch.Tensor] = None
-    acc_scaling_penalties: Optional[torch.Tensor] = None
-    acc_penalties_step: Optional[StepPenalties] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -439,28 +435,21 @@ class SamplingBatchInfo:
         vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
         self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
-    def set_step_penalties(self, step_penalties: Optional[StepPenalties]) -> None:
-        self.step_penalties = step_penalties
+    # The step's [bs, vocab] penalty tables, under the names the verify paths
+    # and provider views read.
+    @property
+    def acc_additive_penalties(self) -> Optional[torch.Tensor]:
+        if self.step_penalties is None:
+            return None
+        return self.step_penalties.logit_penalties()[0]
 
-    def acc_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Built on the step's first call, which must run on the sampling stream."""
-        if self.acc_penalties_step is not self.step_penalties:
-            self.acc_additive_penalties, self.acc_scaling_penalties = (
-                (None, None)
-                if self.step_penalties is None
-                else self.step_penalties.logit_penalties()
-            )
-            self.acc_penalties_step = self.step_penalties
-        return self.acc_additive_penalties, self.acc_scaling_penalties
-
-    def commit_sampled_tokens(
-        self, token_ids: torch.Tensor, accept_mask: Optional[torch.Tensor] = None
-    ) -> None:
-        if self.step_penalties is not None:
-            self.step_penalties.commit(token_ids, accept_mask)
+    @property
+    def acc_scaling_penalties(self) -> Optional[torch.Tensor]:
+        if self.step_penalties is None:
+            return None
+        return self.step_penalties.logit_penalties()[1]
 
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        self.acc_penalties()
         apply_acc_penalties(logits, self)
 
     def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
@@ -721,9 +710,9 @@ class SamplingBatchInfo:
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
         else:
             new = dataclasses.replace(self)
-        # Built at launch, while the step's rows are live; spec readers and
-        # provider views read the acc_* fields directly.
-        new.acc_penalties()
+        if new.step_penalties is not None:
+            # Built at launch, on the forward stream, while the step's rows are live.
+            new.step_penalties.logit_penalties()
         return new
 
 

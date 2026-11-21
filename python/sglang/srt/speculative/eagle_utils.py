@@ -1199,7 +1199,7 @@ def commit_accept_tokens_to_penalties(
 ) -> None:
     if sampling_info.step_penalties is not None:
         # Guarded here: building the arguments launches device work.
-        sampling_info.commit_sampled_tokens(
+        sampling_info.step_penalties.commit(
             predict[accept_index.clamp(min=0)], accept_mask=accept_index >= 0
         )
 

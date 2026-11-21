@@ -54,12 +54,15 @@ class _H2DCopies(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def _step_penalties(reqs, device):
+def _admitted_pool(reqs, device):
     pool = PenaltyStatusPool(VOCAB_SIZE, device)
-    for req in reqs:
-        pool.alloc([req])
-        pool.reset_history([req])
-    return StepPenalties.build(reqs, pool)
+    pool.alloc(reqs)
+    pool.reset_history(reqs)
+    return pool
+
+
+def _step_penalties(reqs, device):
+    return StepPenalties.build(reqs, _admitted_pool(reqs, device))
 
 
 class _SamplingMetadataTestBase(CustomTestCase):
@@ -97,13 +100,14 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].eos_token_ids = {2}
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
-        penalties = _step_penalties(reqs, self.device)
+        pool = _admitted_pool(reqs, self.device)
         self.assert_device_tensor(
-            penalties.min_new_tokens,
+            StepPenalties.build(reqs, pool).min_new_tokens,
             torch.tensor([[2], [1]], dtype=torch.int32),
             torch.int32,
         )
         for step in range(3):
+            penalties = StepPenalties.build(reqs, pool)
             additive, scaling = penalties.logit_penalties()
             self.assertIsNone(scaling)
             expected = torch.zeros(3, VOCAB_SIZE)

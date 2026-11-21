@@ -40,7 +40,7 @@ def _info(reqs, pool):
         vocab_size=VOCAB_SIZE,
         device="cpu",
     )
-    info.set_step_penalties(StepPenalties.build(reqs, pool))
+    info.step_penalties = StepPenalties.build(reqs, pool)
     return info
 
 

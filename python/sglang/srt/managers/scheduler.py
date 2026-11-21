@@ -5437,8 +5437,8 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            batch.sampling_info.set_step_penalties(
-                StepPenalties.build(batch.reqs, self.penalty_status_pool)
+            batch.sampling_info.step_penalties = StepPenalties.build(
+                batch.reqs, self.penalty_status_pool
             )
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2

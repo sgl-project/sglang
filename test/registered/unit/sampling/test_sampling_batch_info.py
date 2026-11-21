@@ -30,6 +30,11 @@ DEVICE = "cpu"
 
 
 # Helper: construct a minimal SamplingBatchInfo
+def _tables_step(additive, scaling=None):
+    """A step whose penalty tables are given."""
+    return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+
+
 def _make_info(batch_size=2, **overrides):
     """Create a SamplingBatchInfo with sane defaults for testing."""
     defaults = dict(
@@ -232,7 +237,7 @@ class TestApplyLogitsBias(CustomTestCase):
     def test_applies_additive_penalties(self):
         """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
+        info.step_penalties = _tables_step(torch.tensor([[-1.0] * VOCAB_SIZE]))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
         self.assertAlmostEqual(logits[0, 0].item(), -1.0, places=5)
@@ -260,18 +265,14 @@ class TestApplyLogitsBias(CustomTestCase):
     def test_builds_step_penalties_without_forward_copy(self):
         """Some non-overlap paths sample on the scheduler's own info, not a copy."""
         info = _make_info(batch_size=1)
-        step = MagicMock()
-        step.logit_penalties.return_value = (torch.full((1, VOCAB_SIZE), -1.0), None)
-        info.set_step_penalties(step)
+        info.step_penalties = _tables_step(torch.full((1, VOCAB_SIZE), -1.0))
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
-        step.logit_penalties.assert_called_once_with()
         self.assertTrue(torch.equal(logits, torch.full_like(logits, -1.0)))
 
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = None
         info.logit_bias = None
         info.grammar_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -292,7 +293,7 @@ class TestApplyLogitsBias(CustomTestCase):
             -4.0
         )
         info = _make_info(batch_size=1)
-        info.acc_additive_penalties = torch.ones(1, VOCAB_SIZE)
+        info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
         info.grammar_mask = GrammarMask(grammar, torch.ones(1, VOCAB_SIZE))
         info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -316,11 +317,9 @@ class TestApplyLogitsBias(CustomTestCase):
                 logits.add_(vocab_mask)
             )
             info = _make_info(batch_size=1)
-            info.acc_additive_penalties = torch.linspace(
-                -0.5, 0.5, VOCAB_SIZE
-            ).unsqueeze(0)
-            info.acc_scaling_penalties = torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(
-                0
+            info.step_penalties = _tables_step(
+                torch.linspace(-0.5, 0.5, VOCAB_SIZE).unsqueeze(0),
+                torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
             )
             info.grammar_mask = GrammarMask(
                 grammar,
@@ -341,30 +340,6 @@ class TestApplyLogitsBias(CustomTestCase):
         )
 
         self.assertTrue(torch.equal(observed_logits, ordinary_logits))
-
-
-# acc_penalties
-class TestAccPenalties(CustomTestCase):
-    def test_builds_tables_once_per_step(self):
-        info = _make_info(batch_size=2)
-        step = MagicMock()
-        step.logit_penalties.return_value = (
-            torch.zeros(2, VOCAB_SIZE),
-            torch.ones(2, VOCAB_SIZE),
-        )
-        info.set_step_penalties(step)
-        additive, scaling = info.acc_penalties()
-        self.assertEqual(info.acc_penalties(), (additive, scaling))
-        step.logit_penalties.assert_called_once_with()
-        self.assertIs(info.acc_additive_penalties, additive)
-        self.assertIs(info.acc_scaling_penalties, scaling)
-
-        next_step = MagicMock()
-        next_step.logit_penalties.return_value = (None, torch.ones(2, VOCAB_SIZE))
-        info.set_step_penalties(next_step)
-        self.assertEqual(info.acc_penalties(), next_step.logit_penalties.return_value)
-        info.set_step_penalties(None)
-        self.assertEqual(info.acc_penalties(), (None, None))
 
 
 # update_regex_vocab_mask
@@ -721,14 +696,12 @@ class TestMergeBatch(CustomTestCase):
 class TestCopyForForward(CustomTestCase):
     def test_returns_copy_with_step_tables(self):
         """Both copy implementations preserve every field, including fields
-        declared with init=False; only the copy carries the step's tables."""
-        tables = ("acc_additive_penalties", "acc_penalties_step")
+        declared with init=False, and build the step's tables at the copy."""
         for fast_path in (False, True):
-            additive = torch.zeros(1, VOCAB_SIZE)
             info = _make_info(batch_size=1)
             step = MagicMock()
-            step.logit_penalties.return_value = (additive, None)
-            info.set_step_penalties(step)
+            step.logit_penalties.return_value = (torch.zeros(1, VOCAB_SIZE), None)
+            info.step_penalties = step
             with (
                 self.subTest(fast_path=fast_path),
                 patch(
@@ -737,13 +710,9 @@ class TestCopyForForward(CustomTestCase):
                 ),
             ):
                 copied = info.copy_for_forward()
-            self.assertIs(copied.acc_additive_penalties, additive)
-            self.assertIs(copied.acc_penalties_step, step)
-            self.assertIsNone(info.acc_additive_penalties)
-            self.assertIsNone(info.acc_penalties_step)
+            step.logit_penalties.assert_called_once_with()
             for name, value in info.__dict__.items():
-                if name not in tables:
-                    self.assertIs(copied.__dict__[name], value, name)
+                self.assertIs(copied.__dict__[name], value, name)
 
 
 # from_schedule_batch

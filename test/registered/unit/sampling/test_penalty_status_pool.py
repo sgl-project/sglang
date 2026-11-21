@@ -194,12 +194,15 @@ class TestHistory(CustomTestCase):
         b = _req(2, output_ids=[5], presence_penalty=1.0)
         _admit(pool, a)
         _admit(pool, b)
+        read_at_launch = StepPenalties.build([a, b], pool)
+        tables = read_at_launch.logit_penalties()
         step = StepPenalties.build([a, b], pool)
-        step.logit_penalties()
 
         pool.free(a)
         pool.free(b)
         self.assertEqual(pool.counts.shape[0], 0)
+        # Tables built at launch stay; a first read after the drop sees no history.
+        self.assertIs(read_at_launch.logit_penalties(), tables)
         additive, scaling = step.logit_penalties()
         expected = _expected_penalties([a, b], [[], []])
         torch.testing.assert_close(

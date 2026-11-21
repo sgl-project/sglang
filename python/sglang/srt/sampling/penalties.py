@@ -180,7 +180,7 @@ class PenaltyStatusPool:
         self.lens.index_add_(0, indices, weights.sum(dim=1, dtype=torch.int32))
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class StepPenalties:
     pool: PenaltyStatusPool
     batch_size: int
@@ -194,6 +194,9 @@ class StepPenalties:
     min_new_tokens: Optional[torch.Tensor]
     # [n, k] stop token ids, padded with vocab_size; set with min_new_tokens.
     stop_token_ids: Optional[torch.Tensor]
+    _tables: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = (
+        dataclasses.field(default=None, init=False, repr=False, compare=False)
+    )
 
     @classmethod
     def build(cls, reqs: Sequence, pool: PenaltyStatusPool) -> Optional[StepPenalties]:
@@ -245,7 +248,13 @@ class StepPenalties:
         )
 
     def logit_penalties(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """(additive, scaling) [batch_size, vocab] penalties, each None if unused."""
+        """(additive, scaling) [batch_size, vocab] penalties, each None if unused;
+        built on the first call, which must run on the sampling stream."""
+        if self._tables is None:
+            self._tables = self._build_tables()
+        return self._tables
+
+    def _build_tables(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         counts = self.pool.gather_counts(self.penalty_indices)
         vocab_size = self.pool.vocab_size
         device = counts.device

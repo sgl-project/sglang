@@ -270,7 +270,7 @@ def test_append_auxiliary_output_ignores_absent_outputs():
     assert append_auxiliary_output(output, None) is output
 
 
-_SAMPLING_INFO = SimpleNamespace(commit_sampled_tokens=lambda token_ids: None)
+_SAMPLING_INFO = SimpleNamespace(step_penalties=None)
 
 
 def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
