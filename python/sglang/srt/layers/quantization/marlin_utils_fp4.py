@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Callable, Optional
 
 import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
+    GPTQ_MARLIN_TILE,
     USE_FP32_REDUCE_DEFAULT,
+    get_scale_perms,
     marlin_make_workspace,
     marlin_permute_bias,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
+from sglang.srt.layers.utils import copy_into_param_storage
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -44,16 +48,20 @@ def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     return marlin_scales[:, 1::2].contiguous()
 
 
-def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
-    assert global_scale.dtype in [torch.half, torch.bfloat16]
-    global_scale_shape = global_scale.shape
+def _nvfp4_marlin_global_scale_factor(dtype: torch.dtype) -> float:
+    assert dtype in [torch.half, torch.bfloat16]
     fp4_exponent = 2
-    if global_scale.dtype == torch.half:
+    if dtype == torch.half:
         target_exponent = 5
-    elif global_scale.dtype == torch.bfloat16:
+    elif dtype == torch.bfloat16:
         target_exponent = 8
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
-    global_scale = global_scale * (2.0 ** (exponent_bias - 7))
+    return 2.0 ** (exponent_bias - 7)
+
+
+def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tensor:
+    global_scale_shape = global_scale.shape
+    global_scale = global_scale * _nvfp4_marlin_global_scale_factor(global_scale.dtype)
     if global_scale_shape == torch.Size([]):
         global_scale = global_scale.reshape(1)
     return global_scale
@@ -139,6 +147,18 @@ def apply_fp4_marlin_linear(
     return output.reshape(out_shape)
 
 
+def _marlin_padded_nk(size_n: int, size_k: int) -> tuple[int, int]:
+    # Marlin accepts either N%64/K%128 or N%128/K%64. Select the smaller
+    # padded shape, matching vLLM's marlin_padded_nk helper.
+    return min(
+        (
+            ((size_n + 63) // 64 * 64, (size_k + 127) // 128 * 128),
+            ((size_n + 127) // 128 * 128, (size_k + 63) // 64 * 64),
+        ),
+        key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]),
+    )
+
+
 def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     if getattr(layer, "quant_config", None) is not None:
         group_size = layer.quant_config.group_size
@@ -153,36 +173,25 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     assert layer.weight.shape == (part_size_n, part_size_k // 2)
 
-    # Marlin accepts either N%64/K%128 or N%128/K%64. Select the smaller
-    # padded shape, matching vLLM's marlin_padded_nk helper.
-    padded_size_n, padded_size_k = min(
-        (
-            ((part_size_n + 63) // 64 * 64, (part_size_k + 127) // 128 * 128),
-            ((part_size_n + 127) // 128 * 128, (part_size_k + 63) // 64 * 64),
-        ),
-        key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]),
-    )
-
+    padded_size_n, padded_size_k = _marlin_padded_nk(part_size_n, part_size_k)
+    weight = layer.weight.data
+    weight_scale = layer.weight_scale.data
     if (padded_size_n, padded_size_k) != (part_size_n, part_size_k):
         pad_rows = padded_size_n - part_size_n
         pad_cols = (padded_size_k - part_size_k) // 2
         scale_pad_cols = (padded_size_k - part_size_k) // 16
-        layer.weight = torch.nn.Parameter(
-            torch.nn.functional.pad(layer.weight, (0, pad_cols, 0, pad_rows)),
-            requires_grad=False,
-        )
-        layer.weight_scale = torch.nn.Parameter(
-            torch.nn.functional.pad(
-                layer.weight_scale, (0, scale_pad_cols, 0, pad_rows)
-            ),
-            requires_grad=False,
+        weight = torch.nn.functional.pad(weight, (0, pad_cols, 0, pad_rows))
+        weight_scale = torch.nn.functional.pad(
+            weight_scale, (0, scale_pad_cols, 0, pad_rows)
         )
 
-    device = layer.weight.device
-    layer.workspace = marlin_make_workspace(device)
+    device = weight.device
+    # A weight update repacks again; captured CUDA graphs keep this workspace.
+    if not hasattr(layer, "workspace"):
+        layer.workspace = marlin_make_workspace(device)
 
     perm = torch.empty(0, dtype=torch.int, device=device)
-    qweight = layer.weight.view(torch.int32).T.contiguous()
+    qweight = weight.view(torch.int32).T.contiguous()
     marlin_qweight = gptq_marlin_repack(
         b_q_weight=qweight,
         perm=perm,
@@ -190,9 +199,11 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         size_n=padded_size_n,
         num_bits=4,
     )
-    layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
+    # Repacking into the checkpoint parameters' storage keeps their
+    # weight_loader, so the layer can load new weights after a restore.
+    copy_into_param_storage(layer.weight, marlin_qweight)
 
-    weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
+    weight_scale = weight_scale.T.contiguous().to(param_dtype)
     weight_scale = marlin_permute_scales(
         s=weight_scale,
         size_k=padded_size_k,
@@ -200,17 +211,114 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         group_size=16,
     )
     weight_scale = nvfp4_marlin_process_scales(weight_scale)
-    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+    copy_into_param_storage(layer.weight_scale, weight_scale)
 
     weight_global_scale = layer.weight_global_scale.to(param_dtype)
     weight_global_scale = nvfp4_marlin_process_global_scale(weight_global_scale)
-    layer.weight_global_scale = torch.nn.Parameter(
-        weight_global_scale, requires_grad=False
-    )
+    copy_into_param_storage(layer.weight_global_scale, weight_global_scale)
     # layer.bias is left in logical order and length: apply_fp4_marlin_linear
     # adds it after the GEMM, and with skip_bias_add the linear layer returns it
     # to its caller. Only the MoE kernel, which applies bias in-kernel, needs it
     # permuted.
+
+
+@functools.cache
+def _marlin_4bit_inverse_weight_perm(device: torch.device) -> torch.Tensor:
+    # The permutation gptq_marlin_repack applies within each 16x64 tile of
+    # 4-bit values (vLLM's marlin_utils_test.get_weight_perm), inverted.
+    perm = []
+    for i in range(32):
+        col = i // 4
+        tile = [
+            16 * row + col + 8 * block
+            for block in (0, 1)
+            for row in (
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            )
+        ]
+        for j in range(4):
+            perm.extend(p + 256 * j for p in tile)
+    perm = torch.tensor(perm).view(-1, 8)[:, [0, 2, 4, 6, 1, 3, 5, 7]].flatten()
+    return torch.argsort(perm).to(device)
+
+
+def unpack_fp4_weight_from_marlin(
+    marlin_qweight: torch.Tensor, size_n: int, size_k: int
+) -> torch.Tensor:
+    """Invert gptq_marlin_repack for a 4-bit weight with no act order.
+
+    Returns the [size_n, size_k // 2] uint8 layout NVFP4 checkpoints store,
+    two values per byte with the lower K index in the low nibble. Each row of
+    the Marlin layout holds one 16-row tile of K, so we unpack a block of rows
+    at a time and keep the temporaries at a fraction of the weight.
+    """
+    tile = GPTQ_MARLIN_TILE
+    inverse_perm = _marlin_4bit_inverse_weight_perm(marlin_qweight.device)
+    weight = torch.empty(
+        (size_n, size_k // 2), dtype=torch.uint8, device=marlin_qweight.device
+    )
+    rows_per_block = 64
+    for row in range(0, size_k // tile, rows_per_block):
+        block = marlin_qweight[row : row + rows_per_block]
+        values = torch.stack(
+            [((block >> (4 * i)) & 0xF).to(torch.uint8) for i in range(8)], dim=-1
+        ).view(-1, 1024)[:, inverse_perm]
+        values = (
+            values.view(block.shape[0], size_n // tile, tile, tile)
+            .permute(1, 3, 0, 2)
+            .reshape(size_n, block.shape[0] * tile // 2, 2)
+        )
+        weight[:, row * tile // 2 : (row + block.shape[0]) * tile // 2] = values[
+            ..., 0
+        ] | (values[..., 1] << 4)
+    return weight
+
+
+def unpack_nvfp4_scales_from_marlin(
+    marlin_scales: torch.Tensor, size_n: int, size_k: int
+) -> torch.Tensor:
+    """Invert marlin_permute_scales and nvfp4_marlin_process_scales.
+
+    Returns the [size_n, size_k // 16] FP8 block scales of the checkpoint.
+    The processed byte is bits 14..7 of the FP16 value 128 * scale, and those
+    bits hold every bit of a non-negative E4M3 scale, so the inverse is exact.
+    """
+    scales = (marlin_scales.view(torch.uint8).to(torch.int16) << 7).view(torch.half)
+    scales = (scales / 2**7).view(-1, 4)[:, [0, 2, 1, 3]]
+    scale_perm, _ = get_scale_perms()
+    inverse_perm = torch.argsort(torch.tensor(scale_perm)).to(scales.device)
+    scales = scales.reshape(-1, len(scale_perm))[:, inverse_perm]
+    return scales.view(size_k // 16, size_n).T.to(torch.float8_e4m3fn)
+
+
+def restore_nvfp4_layer_from_marlin(layer: torch.nn.Module) -> None:
+    """Undo prepare_nvfp4_layer_for_marlin in place.
+
+    The weight and block scales go back to the checkpoint layout in their own
+    storage, so a weight update can load into them and repack again, and a
+    tensor the update does not rewrite repacks to the same bytes.
+    """
+    part_size_n = layer.output_size_per_partition
+    part_size_k = layer.input_size_per_partition
+    padded_size_n, padded_size_k = _marlin_padded_nk(part_size_n, part_size_k)
+    # Unpack everything before writing, so a failure leaves the layer repacked.
+    weight = unpack_fp4_weight_from_marlin(
+        layer.weight.data, padded_size_n, padded_size_k
+    )[:part_size_n, : part_size_k // 2].contiguous()
+    weight_scale = unpack_nvfp4_scales_from_marlin(
+        layer.weight_scale.data, padded_size_n, padded_size_k
+    )[:part_size_n, : part_size_k // 16].contiguous()
+    # The FP32 scalar the caller binds before repacking, so rebinding it
+    # copies into this storage instead of replacing it.
+    weight_global_scale = layer.weight_global_scale
+    factor = _nvfp4_marlin_global_scale_factor(weight_global_scale.dtype)
+    global_scale = (weight_global_scale.data.float() / factor).reshape(())
+    copy_into_param_storage(layer.weight, weight)
+    copy_into_param_storage(layer.weight_scale, weight_scale)
+    copy_into_param_storage(weight_global_scale, global_scale)
 
 
 def prepare_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
@@ -574,7 +682,9 @@ def prepare_moe_nvfp4_layer_for_marlin(
         raise RuntimeError("NVFP4 Marlin MoE requires FP16 or BF16 activations.")
 
     device = w13.device
-    layer.workspace = marlin_make_workspace(device, 4)
+    # A weight update repacks again; captured CUDA graphs keep this workspace.
+    if not hasattr(layer, "workspace"):
+        layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     if not layer.moe_runner_config.is_gated:
@@ -607,7 +717,10 @@ def prepare_moe_nvfp4_layer_for_marlin(
             tensor_list.append(marlin_permute_bias(bias[i].to(param_dtype)))
         return torch.stack(tensor_list)
 
-    layer.w13_weight = torch.nn.Parameter(
+    # Repacking into the checkpoint parameters' storage keeps their
+    # weight_loader, so the layer can load new weights after a restore.
+    copy_into_param_storage(
+        layer.w13_weight,
         _repack_moe_fp4_weight_for_marlin(
             w13,
             num_experts=num_experts,
@@ -615,15 +728,15 @@ def prepare_moe_nvfp4_layer_for_marlin(
             size_k=w13_size_k,
             perm=perm,
         ),
-        requires_grad=False,
     )
-    layer.w2_weight = torch.nn.Parameter(
+    copy_into_param_storage(
+        layer.w2_weight,
         _repack_moe_fp4_weight_for_marlin(
             w2, num_experts=num_experts, size_n=w2_size_n, size_k=w2_size_k, perm=perm
         ),
-        requires_grad=False,
     )
-    layer.w13_weight_scale = torch.nn.Parameter(
+    copy_into_param_storage(
+        layer.w13_weight_scale,
         _permute_moe_fp4_scales_for_marlin(
             w13_scale.to(param_dtype),
             num_experts=num_experts,
@@ -632,9 +745,9 @@ def prepare_moe_nvfp4_layer_for_marlin(
             group_size=16,
             process_scales=nvfp4_marlin_process_scales,
         ),
-        requires_grad=False,
     )
-    layer.w2_weight_scale = torch.nn.Parameter(
+    copy_into_param_storage(
+        layer.w2_weight_scale,
         _permute_moe_fp4_scales_for_marlin(
             w2_scale.to(param_dtype),
             num_experts=num_experts,
@@ -643,18 +756,88 @@ def prepare_moe_nvfp4_layer_for_marlin(
             group_size=16,
             process_scales=nvfp4_marlin_process_scales,
         ),
-        requires_grad=False,
     )
-    layer.w13_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w13_global_scale), requires_grad=False
+    copy_into_param_storage(
+        layer.w13_weight_scale_2, _process_global_scale(w13_global_scale)
     )
-    layer.w2_weight_scale_2 = torch.nn.Parameter(
-        _process_global_scale(w2_global_scale), requires_grad=False
+    copy_into_param_storage(
+        layer.w2_weight_scale_2, _process_global_scale(w2_global_scale)
     )
 
     if w13_bias is not None:
-        layer.w13_bias = torch.nn.Parameter(
-            _permute_bias(w13_bias), requires_grad=False
-        )
+        copy_into_param_storage(layer.w13_bias, _permute_bias(w13_bias))
     if w2_bias is not None:
-        layer.w2_bias = torch.nn.Parameter(_permute_bias(w2_bias), requires_grad=False)
+        copy_into_param_storage(layer.w2_bias, _permute_bias(w2_bias))
+
+
+def restore_moe_nvfp4_layer_from_marlin(layer: torch.nn.Module) -> None:
+    """Undo prepare_moe_nvfp4_layer_for_marlin in place.
+
+    Weights and block scales go back to the checkpoint layout in their own
+    storage, through temporaries of one layer's size like the repack's. The
+    global scales go back to FP32 values of shape [num_experts] that process
+    to the same bytes, and the caller puts back any w13 columns the repack
+    dropped. Biases are not restored, since no caller of this function creates
+    them.
+    """
+    num_experts = layer.w13_weight.shape[0]
+    hidden_size = layer.hidden_size
+    intermediate_size = layer.intermediate_size_per_partition
+    num_shards = 2 if layer.moe_runner_config.is_gated else 1
+    padded_intermediate_size = intermediate_size
+    if not layer.moe_runner_config.is_gated:
+        padded_intermediate_size = (intermediate_size + 127) // 128 * 128
+    w13_size_n = padded_intermediate_size * num_shards
+    w13_rows = intermediate_size * num_shards
+
+    def _unpack_experts(name, size_n, size_k, unpack, rows, cols):
+        param = getattr(layer, name)
+        return torch.stack(
+            [
+                unpack(param.data[i], size_n, size_k)[:rows, :cols]
+                for i in range(num_experts)
+            ]
+        )
+
+    # Unpack everything before writing, so a failure leaves the layer repacked.
+    restored = {}
+    restored["w13_weight"] = _unpack_experts(
+        "w13_weight",
+        w13_size_n,
+        hidden_size,
+        unpack_fp4_weight_from_marlin,
+        w13_rows,
+        hidden_size // 2,
+    )
+    restored["w2_weight"] = _unpack_experts(
+        "w2_weight",
+        hidden_size,
+        padded_intermediate_size,
+        unpack_fp4_weight_from_marlin,
+        hidden_size,
+        intermediate_size // 2,
+    )
+    restored["w13_weight_scale"] = _unpack_experts(
+        "w13_weight_scale",
+        w13_size_n,
+        hidden_size,
+        unpack_nvfp4_scales_from_marlin,
+        w13_rows,
+        hidden_size // 16,
+    )
+    restored["w2_weight_scale"] = _unpack_experts(
+        "w2_weight_scale",
+        hidden_size,
+        padded_intermediate_size,
+        unpack_nvfp4_scales_from_marlin,
+        hidden_size,
+        intermediate_size // 16,
+    )
+
+    for name in ("w13_weight_scale_2", "w2_weight_scale_2"):
+        param = getattr(layer, name)
+        factor = _nvfp4_marlin_global_scale_factor(param.dtype)
+        restored[name] = param.data.float() / factor
+
+    for name, value in restored.items():
+        copy_into_param_storage(getattr(layer, name), value)

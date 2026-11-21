@@ -212,9 +212,8 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         )
         prepare_moe_nvfp4_layer_for_marlin(layer)
 
-        # The helper allocates repacked weights and rebinds w13_weight/w2_weight
-        # to them; the packed parameters still own the original storage, which
-        # would otherwise stay resident for every layer.
+        # w13_weight/w2_weight are the packed parameters, repacked in their own
+        # storage; drop the packed names so each tensor is registered once.
         layer.register_parameter("w13_weight_packed", None)
         layer.register_parameter("w2_weight_packed", None)
 
