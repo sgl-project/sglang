@@ -155,6 +155,23 @@ def test_route_radix4_ties(renormalize):
         _assert_matches_oracle(scores, bias, renormalize)
 
 
+def test_route_radix4_one_outlier_in_every_lane():
+    """The search starts from the bits where a row's keys disagree, reduced over
+    every lane of every wave. Each row here has one expert above an otherwise
+    flat field, one row per expert, so a reduction that misses any lane sees no
+    disagreement there and ranks the outlier by tie order instead of first."""
+    scores = torch.full(
+        (NUM_EXPERTS, NUM_EXPERTS), 0.25, dtype=torch.bfloat16, device="cuda"
+    )
+    scores.fill_diagonal_(2.0)
+    bias = torch.zeros(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
+    ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, 2.5)[1]
+    assert torch.equal(
+        ids[:, 0], torch.arange(NUM_EXPERTS, dtype=ids.dtype, device="cuda")
+    )
+    _assert_matches_oracle(scores, bias)
+
+
 def test_route_radix4_nan_never_wins():
     bias = torch.zeros(NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
     scores = torch.randn(4, NUM_EXPERTS, dtype=torch.bfloat16, device="cuda")
