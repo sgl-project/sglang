@@ -1292,7 +1292,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and key_raw.ndim == 2
             and key_raw.shape[-1] == 128
             and key_raw.stride(-1) == 1
-            and key_raw.stride(0) % 4 == 0
+            and (key_raw.shape[0] <= 1 or key_raw.stride(0) % 4 == 0)
             and key_raw.storage_offset() % 4 == 0
             and out_cache_loc is not None
             and out_cache_loc.dtype == torch.int64

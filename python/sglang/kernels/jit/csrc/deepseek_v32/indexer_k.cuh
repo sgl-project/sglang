@@ -491,7 +491,8 @@ struct FusedKIndexerNormRopeStoreKernel {
           ", ",
           dcp_rank);
       RuntimeCheck(
-          k_input.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(k_input.data_ptr()) % (4 * sizeof(DType)) == 0,
+          (B.unwrap() <= 1 || k_input.stride(0) % 4 == 0) &&
+              reinterpret_cast<uintptr_t>(k_input.data_ptr()) % (4 * sizeof(DType)) == 0,
           "unaligned index-K input");
     }
 

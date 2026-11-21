@@ -146,7 +146,9 @@ def test_k_store_matches_unfused(strided):
     assert torch.equal(buf_ref, buf_fused)
 
 
-@pytest.mark.parametrize("rows,dcp_size,dcp_rank", [(32768, 1, 0), (1024, 4, 3)])
+@pytest.mark.parametrize(
+    "rows,dcp_size,dcp_rank", [(1, 1, 0), (32768, 1, 0), (1024, 4, 3)]
+)
 def test_k_no_rope_norm_store_matches_unfused(rows, dcp_size, dcp_rank):
     _skip_if_unavailable()
     if torch.cuda.get_device_capability() != (12, 0):
@@ -164,6 +166,12 @@ def test_k_no_rope_norm_store_matches_unfused(rows, dcp_size, dcp_rank):
     key = torch.randn(rows, HEAD_DIM + 32, dtype=torch.bfloat16, device=device)[
         :, :HEAD_DIM
     ]
+    # A singleton row's stride may be normalized to one by DLPack. It
+    # is never used to reach a second row; the data pointer stays aligned.
+    ref_key = key
+    if rows == 1:
+        key = key.as_strided((1, HEAD_DIM), (1, 1))
+        assert key.stride(0) == 1
     weight = 1 + 0.15 * torch.randn(HEAD_DIM, device=device)
     bias = 0.05 * torch.randn(HEAD_DIM, device=device)
     loc = torch.arange(rows, dtype=torch.int64, device=device)
@@ -175,7 +183,7 @@ def test_k_no_rope_norm_store_matches_unfused(rows, dcp_size, dcp_rank):
     pages = (rows + PAGE_SIZE * dcp_size - 1) // (PAGE_SIZE * dcp_size) + 1
     ref = torch.full((pages, page_bytes + 32), 165, dtype=torch.uint8, device=device)
     fused = ref.clone()
-    normed = norm.layernorm(key, weight, bias, 1e-5)
+    normed = norm.layernorm(ref_key, weight, bias, 1e-5)
     fused_store_index_k_cache(
         normed, ref[:, :page_bytes], loc, PAGE_SIZE, dcp_size, dcp_rank
     )
