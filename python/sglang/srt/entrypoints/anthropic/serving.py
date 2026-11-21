@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.request_headers import apply_session_id_header
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -200,6 +201,10 @@ class AnthropicServing:
         """Main entry point for /v1/messages endpoint."""
         try:
             chat_request = self._convert_to_chat_completion_request(request)
+            # `/v1/messages` builds its chat request here and calls the serving layer
+            # directly, so the header fallback the HTTP routes apply never runs on
+            # this path; applying it here keeps the header honoured for both APIs.
+            apply_session_id_header(chat_request, getattr(raw_request, "headers", {}))
         except asyncio.CancelledError:
             raise
         except Exception as e:
