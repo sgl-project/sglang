@@ -3054,9 +3054,19 @@ def _should_use_sm120_torch_fp8_linear(
     if max_n <= 0:
         return False
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.runtime_context import get_exec
 
     if is_batch_invariant_mode_enabled():
         return False
+    try:
+        deterministic = get_exec().deterministic
+        if (
+            deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+        ):
+            return False
+    except ValueError:
+        pass
     return (
         bias is None
         and output_dtype in (torch.bfloat16, torch.float16)

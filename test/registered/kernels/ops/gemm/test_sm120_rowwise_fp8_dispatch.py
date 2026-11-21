@@ -186,8 +186,18 @@ def test_apply_fp8_linear_sm120_dispatch_and_fallbacks(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_batch_invariant_mode_falls_back_to_cutlass():
-    from sglang.srt import batch_invariant_ops
+@pytest.mark.parametrize(
+    "bi,det,rl_target",
+    [
+        (True, False, None),
+        (False, True, None),
+        (False, False, "ref"),
+    ],
+)
+def test_deterministic_and_batch_invariant_modes_fall_back_to_cutlass(
+    bi: bool, det: bool, rl_target: str | None
+):
+    from sglang.srt import batch_invariant_ops, runtime_context
 
     m, k, n = 16, 4096, 4096
     x, weight, weight_scale, _ = _make_rowwise_inputs(m, k, n, dtype=torch.bfloat16)
@@ -203,6 +213,12 @@ def test_batch_invariant_mode_falls_back_to_cutlass():
         called.append("cutlass")
         return torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
+    fake_exec = SimpleNamespace(
+        deterministic=SimpleNamespace(
+            enable_deterministic_inference=det,
+            rl_on_policy_target=rl_target,
+        )
+    )
     with (
         mock.patch.object(fp8_utils, "_is_cuda", True),
         mock.patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", False),
@@ -214,8 +230,9 @@ def test_batch_invariant_mode_falls_back_to_cutlass():
             fp8_utils, "sglang_per_token_quant_fp8", return_value=(qx, x_scale)
         ),
         mock.patch.object(
-            batch_invariant_ops, "is_batch_invariant_mode_enabled", return_value=True
+            batch_invariant_ops, "is_batch_invariant_mode_enabled", return_value=bi
         ),
+        mock.patch.object(runtime_context, "get_exec", return_value=fake_exec),
         mock.patch.object(torch, "_scaled_mm", side_effect=fake_torch_scaled_mm),
         mock.patch.object(
             fp8_utils, "fp8_scaled_mm", side_effect=fake_cutlass, create=True
