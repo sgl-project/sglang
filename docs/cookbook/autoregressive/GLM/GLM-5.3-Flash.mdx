@@ -424,6 +424,8 @@ To disable thinking for a request, pass `chat_template_kwargs: {"thinking": fals
 
 Generated commands enable `--tool-call-parser auto` (which resolves to `glm47` for GLM-5.3-Flash) by default, so structured calls are returned in `message.tool_calls`. You can disable **Tool Call Parser** in the Playground when tool calling is not needed. On follow-up turns, read both `reasoning_content` and `content` because a thinking model can use either field around tool execution.
 
+**Control-token spellings in caller text (text-only).** For text-only chat requests rendered by the built-in Python chat template (the default unless overridden with `--chat-template`), caller-supplied text in messages, reasoning, tool schemas, tool arguments, and tool results is encoded with the base vocabulary so literal control-token spellings (such as `</think>` or `<tool_call>`) do not turn into control token IDs. Multimodal requests (which use the Hugging Face processor), `--chat-template` overrides, and pre-tokenized `input_ids` requests are outside this scope. Set `SGLANG_ENABLE_ORDINARY_TEXT_CONTENT=false` to opt out and encode caller text like template text. On the first qualifying text chat request per tokenizer worker, building and caching the `added_tokens`-stripped encoder copy takes ~1.3 s (measured ~1.1–1.6 s on GLM-5.3-Flash's ~154K vocabulary; subsequent requests add < 1 ms), so include a text chat request when prewarming workers.
+
 ### 3.3 Multimodal serving
 
 The base recipes accept image and video content through the OpenAI-compatible chat API. Keep the processor defaults unless you have measured a different sampling or resize policy. Inputs above the video token budget are clamped to the processor's limit rather than rejected.

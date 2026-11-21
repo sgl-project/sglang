@@ -355,6 +355,8 @@ Here is how you can calculate it:
 
 Generated commands enable `--tool-call-parser auto` by default, so structured calls are returned in `message.tool_calls` with `finish_reason: "tool_calls"`. `auto` resolves to **`glm47`** for GLM-5.3: the model emits the newer `<tool_call>…<arg_key>…<arg_value>…` format, which the older `glm` parser does not parse (the call would be left as raw text in `content`). Running with no tool-call parser fails the same way, and `finish_reason` stays `"stop"`, so an agent loop never sees the call. You can disable **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground) when tool calling is not needed. On thinking mode the turn also fills `reasoning_content`, so print both fields.
 
+**Control-token spellings in caller text (text-only).** On the text-only chat path with the built-in Python chat template (the default unless overridden with `--chat-template`), caller-supplied text in messages, reasoning, tool schemas, tool arguments, and tool results is encoded with the base vocabulary so literal control-token spellings (such as `</think>` or `<tool_call>`) do not turn into control token IDs. Multimodal requests, `--chat-template` overrides, and pre-tokenized `input_ids` requests are outside this scope. Set `SGLANG_ENABLE_ORDINARY_TEXT_CONTENT=false` to opt out and encode caller text like template text. On the first qualifying text chat request per tokenizer worker, building and caching the `added_tokens`-stripped encoder copy takes ~1.3 s (measured ~1.1–1.6 s on GLM-5.3's ~154K vocabulary; subsequent requests add < 1 ms), so include a text chat request when prewarming workers.
+
 <Accordion title="Tool Calling Example (Python)">
 
 ```python Example

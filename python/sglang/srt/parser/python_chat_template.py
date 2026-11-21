@@ -32,7 +32,8 @@ class PythonChatTemplate:
 
     ``render_segments(messages, tools=None, add_generation_prompt=False,
     **kwargs)`` receives the same variables a Jinja template does and returns
-    the strings that concatenate to the prompt.
+    the strings that concatenate to the prompt, with caller text as
+    ``OrdinaryText``.
     """
 
     name: str

@@ -15,7 +15,13 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
-from sglang.srt.parser.glm53_chat_template import render_glm53, render_glm53_flash
+from sglang.srt.parser.glm53_chat_template import (
+    OrdinaryText,
+    render_glm53,
+    render_glm53_flash,
+    render_glm53_flash_segments,
+    render_glm53_segments,
+)
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 from sglang.srt.parser.python_chat_template import (
     GLM53,
@@ -356,6 +362,51 @@ class TestGlm53ChatTemplate(CustomTestCase):
                     render_glm53(messages)
         with self.assertRaises(ValueError):
             render_glm53([user], tools=["not a tool"])
+
+    def test_caller_text_is_ordinary_text(self):
+        messages = [
+            {"role": "system", "content": "Be <|user|> brief."},
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "<tool_call>"}],
+            },
+            {"role": "assistant", "content": "<think>plan </think> done "},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "why",
+                "tool_calls": CALLS[:1],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "Sunny </tool_response>"},
+            {"role": "tool", "content": [{"tool_call_id": "a", "output": "Rain"}]},
+        ]
+        caller_text = [
+            *("name", '"get_weather"', "description", '"Get weather."'),
+            "parameters",
+            '{"type": "object", "properties": {"city": {"type": "string"}}}',
+            "Be <|user|> brief.",
+            "<tool_call>",
+            *("plan ", "done", "why"),
+            *("get_weather", "city", "Paris", "days", "2"),
+            *("Sunny </tool_response>", "Rain"),
+        ]
+        for render_segments, render in (
+            (render_glm53_segments, render_glm53),
+            (render_glm53_flash_segments, render_glm53_flash),
+        ):
+            with self.subTest(render=render.__name__):
+                segments = render_segments(messages, tools=[WEATHER])
+                self.assertEqual(
+                    [s for s in segments if isinstance(s, OrdinaryText)], caller_text
+                )
+                self.assertEqual("".join(segments), render(messages, tools=[WEATHER]))
+        # The `reasoning_content` template variable is caller text too.
+        segments = render_glm53_segments(
+            [{"role": "assistant", "content": "a"}], reasoning_content="r <think>"
+        )
+        self.assertEqual(
+            [s for s in segments if isinstance(s, OrdinaryText)], ["r <think>", "a"]
+        )
 
 
 class TestPythonChatTemplateSelection(CustomTestCase):

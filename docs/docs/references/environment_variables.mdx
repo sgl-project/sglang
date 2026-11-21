@@ -422,6 +422,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_ORDINARY_TEXT_CONTENT</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On the text-only chat path of built-in Python chat templates (GLM-5.3 and GLM-5.3-Flash when not overridden by <code>--chat-template</code>), encode caller-supplied text (messages, reasoning, tool schemas, arguments, and tool results) with the base vocabulary so control-token spellings do not become control IDs. Multimodal requests (handled by the HF processor) and <code>--chat-template</code> overrides are unaffected. Set to <code>false</code> to encode caller text like template text. First use per tokenizer worker copies the tokenizer without <code>added_tokens</code> and caches it (~1.3 s once on GLM-5.3's ~154K-token vocabulary).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_LOGPROB_CHUNK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Process logits in chunks to reduce peak memory.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
