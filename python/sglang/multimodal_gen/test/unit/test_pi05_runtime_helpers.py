@@ -321,11 +321,18 @@ def test_pi05_graph_config_validation():
             Pi05PipelineConfig(**overrides)
 
 
-def test_pi05_core_precision_follows_policy_dtype(tmp_path, monkeypatch):
-    monkeypatch.setattr(Pi05PolicyModel, "__init__", lambda self, *a, **k: None)
+def test_pi05_core_precision_follows_policy_dtype(monkeypatch):
+    def fail_download(*_args, **_kwargs):
+        raise AssertionError("maybe_download_model ran before dtype validation")
+
+    monkeypatch.setattr(pi05_policy_module, "maybe_download_model", fail_download)
     with pytest.raises(ValueError, match="bf16 or fp32"):
         Pi05PolicyModel.from_pretrained(
-            str(tmp_path), Pi05PipelineConfig(materialize_dtype="fp16")
+            "unused/model", Pi05PipelineConfig(materialize_dtype="fp16")
+        )
+    with pytest.raises(ValueError, match="bf16 or fp32"):
+        Pi05PolicyModel.from_pretrained(
+            "unused/model", Pi05PipelineConfig(), dtype=torch.float16
         )
 
     precisions = []
@@ -338,7 +345,11 @@ def test_pi05_core_precision_follows_policy_dtype(tmp_path, monkeypatch):
         Pi05CoreModel(
             Pi05PipelineConfig(materialize_dtype="BF16"), runtime_role="prefix"
         )
-    assert precisions == ["bfloat16"]
+    with set_default_torch_dtype(torch.float32):
+        Pi05CoreModel(
+            Pi05PipelineConfig(materialize_dtype="bf16"), runtime_role="prefix"
+        )
+    assert precisions == ["bfloat16", "float32"]
 
 
 def test_prefix_cache_key_distinguishes_bucket_layouts_and_mask_holes():
