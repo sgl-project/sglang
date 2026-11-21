@@ -381,15 +381,11 @@ class TestNormalizeRopeScalingCompat(CustomTestCase):
         self.assertEqual(llm_cfg.rope_scaling["type"], "dynamic")
 
     def test_no_crash_on_non_dict_rope_scaling(self):
-        # Not a `PretrainedConfig`: its `rope_scaling` setter standardizes the value,
-        # and raises on a non-dict (huggingface/transformers#49515).
         cfg = SimpleNamespace(rope_scaling="not_a_dict")
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling, "not_a_dict")
 
     def test_no_crash_on_dict_without_rope_type(self):
-        # Not a `PretrainedConfig`: its `rope_scaling` setter standardizes the value,
-        # which adds `rope_type` (huggingface/transformers#49515).
         cfg = SimpleNamespace(rope_scaling={"factor": 4.0})
         normalize_rope_scaling_compat(cfg)
         self.assertNotIn("type", cfg.rope_scaling)
@@ -1070,8 +1066,6 @@ class TestNormalizeTpStyle(CustomTestCase):
             num_attention_heads=2,
             num_key_value_heads=2,
         )
-        # Read the plan off the model, as the backend does: the config's plan stops
-        # carrying the embedding entry with huggingface/transformers#49570.
         plan = AutoModel.from_config(config).tp_plan
         self.assertIn("embedding_rowwise", plan.values())
         for pattern, style in plan.items():
