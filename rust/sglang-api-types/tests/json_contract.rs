@@ -6,6 +6,22 @@
 
 use sglang_api_types::api::v1::*;
 
+#[test]
+fn skip_detokenize_survives_json_and_protobuf_roundtrips() {
+    use prost::Message;
+
+    for value in [None, Some(false), Some(true)] {
+        let request = GenerateRequest {
+            skip_detokenize: value,
+            ..Default::default()
+        };
+        let binary = GenerateRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        let json = serde_json::to_value(&binary).unwrap();
+        let decoded: GenerateRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.skip_detokenize, value);
+    }
+}
+
 fn sp(json: &str) -> Result<SamplingParams, serde_json::Error> {
     serde_json::from_str(json)
 }
