@@ -401,10 +401,12 @@ def _qwen4_verify_conv_prepare_kernel(
     valid_ptr,
     conv_ptr,
     intermediate_ptr,
+    intermediate_rows_ptr,
     state_stride0,
     state_stride1,
     state_stride2,
     index_stride,
+    intermediate_row_stride,
     cache_stride0,
     cache_stride1,
     cache_stride2,
@@ -413,6 +415,8 @@ def _qwen4_verify_conv_prepare_kernel(
     WIDTH: tl.constexpr,
     STATE_LEN: tl.constexpr,
     HAS_INTERMEDIATE: tl.constexpr,
+    HAS_INTERMEDIATE_ROWS: tl.constexpr,
+    CACHE_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -440,6 +444,11 @@ def _qwen4_verify_conv_prepare_kernel(
         mask,
     )
     if HAS_INTERMEDIATE and STATE_LEN > 0:
+        intermediate_row = req
+        if HAS_INTERMEDIATE_ROWS:
+            intermediate_row = tl.load(
+                intermediate_rows_ptr + req * intermediate_row_stride
+            ).to(tl.int64)
         step = offsets // (CHANNELS * STATE_LEN)
         channel = (offsets // STATE_LEN) % CHANNELS
         state_col = offsets % STATE_LEN
@@ -460,14 +469,18 @@ def _qwen4_verify_conv_prepare_kernel(
             other=0,
         )
         value = tl.where(valid, tl.where(col < STATE_LEN, state, x), 0)
+        if HAS_INTERMEDIATE_ROWS:
+            # Padding can map to the last live request row. It must not erase
+            # that request's snapshots; invalid token windows are never committed.
+            mask = mask & valid
         tl.store(
             intermediate_ptr
-            + req * cache_stride0
+            + intermediate_row * cache_stride0
             + step * cache_stride1
             + channel * cache_stride2
             + state_col * cache_stride3,
             value,
-            mask,
+            mask & (intermediate_row >= 0) & (intermediate_row < CACHE_ROWS),
         )
 
 
@@ -498,7 +511,16 @@ def _qwen4_verify_conv_finish_kernel(
 
 
 def can_fuse_qwen4_verify_conv(
-    x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+    x,
+    residual,
+    weight,
+    state,
+    state_indices,
+    valid,
+    width,
+    dilation,
+    intermediate,
+    intermediate_state_indices=None,
 ):
     return (
         x.is_cuda
@@ -533,21 +555,57 @@ def can_fuse_qwen4_verify_conv(
             intermediate is None
             or (
                 intermediate.ndim == 4
-                and intermediate.shape[0] >= state_indices.numel()
+                and (
+                    intermediate_state_indices is not None
+                    or intermediate.shape[0] >= state_indices.numel()
+                )
                 and intermediate.shape[1] >= width
                 and intermediate.shape[2:] == state.shape[1:]
                 and intermediate.device == x.device
                 and intermediate.dtype in (torch.bfloat16, torch.float32)
             )
         )
+        and (
+            intermediate_state_indices is None
+            or (
+                intermediate_state_indices.shape == state_indices.shape
+                and intermediate_state_indices.dtype in (torch.int32, torch.int64)
+                and intermediate_state_indices.device == x.device
+            )
+        )
     )
 
 
 def fused_qwen4_verify_conv(
-    x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+    x,
+    residual,
+    weight,
+    state,
+    state_indices,
+    valid,
+    width,
+    dilation,
+    intermediate,
+    intermediate_state_indices=None,
 ):
+    """Write verify windows to batch rows or explicit speculative scratch rows.
+
+    Scratch rows are independent of persistent ``state_indices``. Live requests
+    must have distinct in-bounds rows. Padding may map to a row occupied by a
+    live request, so invalid writes are masked when explicit rows are supplied.
+    Out-of-bounds scratch rows are also masked without host synchronization.
+    """
     if not can_fuse_qwen4_verify_conv(
-        x, residual, weight, state, state_indices, valid, width, dilation, intermediate
+        x,
+        residual,
+        weight,
+        state,
+        state_indices,
+        valid,
+        width,
+        dilation,
+        intermediate,
+        intermediate_state_indices,
     ):
         raise ValueError("unsupported input for Qwen4 PLE verify convolution")
     output = torch.empty_like(x)
@@ -568,13 +626,19 @@ def fused_qwen4_verify_conv(
         valid,
         conv_input,
         intermediate if intermediate is not None else x,
+        intermediate_state_indices if intermediate_state_indices is not None else x,
         *state.stride(),
         state_indices.stride(0),
+        intermediate_state_indices.stride(0)
+        if intermediate_state_indices is not None
+        else 0,
         *(intermediate.stride() if intermediate is not None else (0, 0, 0, 0)),
         CHANNELS=channels,
         WIDTH=width,
         STATE_LEN=state_len,
         HAS_INTERMEDIATE=intermediate is not None,
+        HAS_INTERMEDIATE_ROWS=intermediate_state_indices is not None,
+        CACHE_ROWS=intermediate.shape[0] if intermediate is not None else 0,
         BLOCK=256,
     )
     conv = torch.nn.functional.conv1d(

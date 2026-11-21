@@ -114,6 +114,8 @@ class Mamba2Metadata(ForwardMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
+    # Request-pool rows, independent of persistent mamba_cache_indices.
+    req_pool_indices: Optional[torch.Tensor] = None
 
     @dataclass(kw_only=True, frozen=True)
     class MixedMetadata:
@@ -220,9 +222,11 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
+        req_pool_indices: Optional[torch.Tensor] = None,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
+            req_pool_indices=req_pool_indices,
             query_start_loc=forward_metadata.query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
             mamba_track_indices=forward_metadata.mamba_track_indices,
@@ -267,6 +271,7 @@ class Mamba2Metadata(ForwardMetadata):
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
+                req_pool_indices=forward_batch.req_pool_indices,
             )
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         if extend_seq_lens_cpu is None:
@@ -323,6 +328,7 @@ class Mamba2Metadata(ForwardMetadata):
                 mamba_track_mask_indices
             ]
         return Mamba2Metadata(
+            req_pool_indices=forward_batch.req_pool_indices,
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
             mamba_track_indices=forward_metadata.mamba_track_indices,
