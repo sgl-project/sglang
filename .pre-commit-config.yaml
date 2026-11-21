@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/kernels/jit/csrc/diffusion/vsa_block_sparse_sm100)
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/kernels/jit/csrc/diffusion/vsa_block_sparse_sm100|python/sglang/kernels/tlx_ops/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -108,7 +108,7 @@ repos:
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
       - id: check-opt-in-ci-tiers
-        name: check opt-in CI tiers match the workflows that gate on them
+        name: check opt-in CI tiers match their workflows and pr-gate callers skip on opted-in
         entry: python3 scripts/lint/check_opt_in_ci_tiers.py
         language: system
         files: ^(\.github/workflows/.*\.yml|scripts/ci/opt_in_ci_tiers\.json|scripts/lint/check_opt_in_ci_tiers\.py)$
@@ -140,7 +140,7 @@ repos:
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py
         language: system
-        files: ^(test/registered/.*\.py|scripts/ci/runner_configs\.yml)$
+        files: ^(test/registered/.*\.py|scripts/ci/.*|\.github/(workflows|actions)/.*)$
         pass_filenames: false
       - id: check-no-registered-tests-in-package
         name: reject CI-registered tests inside the sglang package

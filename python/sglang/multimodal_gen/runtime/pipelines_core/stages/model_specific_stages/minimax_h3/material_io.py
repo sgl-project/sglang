@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -37,6 +38,9 @@ _BASE64_ALPHABET = frozenset(
 # The alphabet, then at most two padding characters. Payloads with percent escapes
 # or whitespace, which material URIs may also carry, take the per-character path.
 _PLAIN_BASE64_PAYLOAD = re.compile(r"[A-Za-z0-9+/_-]*={0,2}")
+# pre-queue probes localize one request's materials on threads; they must
+# create and share a single material workdir
+_MATERIAL_WORKDIR_LOCK = threading.Lock()
 
 _DEFAULT_SUFFIX_BY_TYPE = {
     "image": ".png",
@@ -572,15 +576,16 @@ def _material_output_paths(
 
 
 def _material_workdir(batch: Any) -> str:
-    registry = batch.extra.setdefault(MINIMAX_H3_TEMP_DIRS_EXTRA_KEY, {})
-    material_dirs = registry.get("material")
-    if isinstance(material_dirs, list) and material_dirs:
-        return str(material_dirs[0])
-    return minimax_h3_register_temp_dir(
-        batch,
-        tempfile.mkdtemp(prefix="minimax_h3_material_"),
-        owner="material",
-    )
+    with _MATERIAL_WORKDIR_LOCK:
+        registry = batch.extra.setdefault(MINIMAX_H3_TEMP_DIRS_EXTRA_KEY, {})
+        material_dirs = registry.get("material")
+        if isinstance(material_dirs, list) and material_dirs:
+            return str(material_dirs[0])
+        return minimax_h3_register_temp_dir(
+            batch,
+            tempfile.mkdtemp(prefix="minimax_h3_material_"),
+            owner="material",
+        )
 
 
 def _decode_base64_chunk(encoded: bytes | bytearray) -> bytes:

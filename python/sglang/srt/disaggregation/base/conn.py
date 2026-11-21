@@ -121,6 +121,7 @@ class KVArgs:
     draft_window_pages: int = 0
     page_size: int
     draft_rows_dcp_collapsed: bool = False
+    draft_kv_ring_paged: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.

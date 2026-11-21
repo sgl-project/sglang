@@ -7,7 +7,7 @@ test/registered/unit/memory/test_ptr_table.py.
 
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 import unittest
 
