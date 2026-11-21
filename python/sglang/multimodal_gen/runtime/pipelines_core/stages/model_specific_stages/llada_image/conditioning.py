@@ -21,9 +21,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 
-# srt group globals the diffusion runtime mirrors from its own TP group. srt's
-# initialize_model_parallel refuses to run while any of them is set.
-_MIRRORED_SRT_GROUPS = ("_TP", "_ATTN_TP", "_MOE_TP", "_MOE_EP")
+# srt group globals the diffusion runtime mirrors from its own TP/PP groups.
+# srt's initialize_model_parallel refuses to run while any of them is set.
+_MIRRORED_SRT_GROUPS = ("_TP", "_ATTN_TP", "_MOE_TP", "_MOE_EP", "_PP")
 
 
 def _resolve_llada_image_component_path(

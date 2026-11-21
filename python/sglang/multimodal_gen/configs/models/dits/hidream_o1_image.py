@@ -32,10 +32,23 @@ class HiDreamO1ImageArchConfig(DiTArchConfig):
     in_channels: int = HIDREAM_O1_IN_CHANNELS
     tms_token_id: int = HIDREAM_O1_TMS_TOKEN_ID
 
+    # Special token ids the Dev variant's TI2I conditioning reads from the
+    # checkpoint's stock Qwen3-VL config.
+    image_token_id: int = 151655
+    video_token_id: int = 151656
+    vision_start_token_id: int = 151652
+    # Qwen3-VL vision tower spatial merge factor; used to downscale the raw
+    # ``image_grid_thw`` into the LLM-visible grid.
+    vision_spatial_merge_size: int = 2
+
     # Fused checkpoint layout: q/k/v -> qkv_proj and gate/up -> gate_up_proj.
-    # The tuple is (replacement, merge_index, total_merged_params).
+    # The tuple is (replacement, merge_index, total_merged_params); a plain
+    # string replacement is a pure rename (no fusion).
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # The vision tower reuses SRT VisionAttention naming for its fused
+            # qkv, so the model.visual.* keys need a rename, not a merge.
+            r"(.*)\.attn\.qkv\.(weight|bias)$": r"\1.attn.qkv_proj.\2",
             r"(.*)\.self_attn\.q_proj\.(weight|bias)$": (
                 r"\1.self_attn.qkv_proj.\2",
                 0,

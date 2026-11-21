@@ -1237,6 +1237,13 @@ class Scheduler(
         output_path_items = self._count_first_dim(output_batch.output_file_paths)
 
         if output_items is None and output_path_items is None:
+            if not self.worker.is_output_rank:
+                # Only the output rank materializes client-visible payloads for
+                # file-path/raw-frame transports (`output` is cleared on every
+                # rank and only the output rank fills the transport fields).
+                # Non-output ranks deliver nothing per request; that is a valid
+                # split and must not fall into the error path below.
+                return [OutputBatch() for _ in reqs]
             logger.warning(
                 "Batched output has neither tensor outputs nor output_file_paths; cannot split safely."
             )
