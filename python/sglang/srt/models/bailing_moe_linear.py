@@ -1256,8 +1256,16 @@ class BailingMoELinearForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
+            logits_input_dtype = (
+                self.lm_head.weight.dtype
+                if self.config.tie_word_embeddings
+                else torch.float32
+            )
             return self.logits_processor(
-                input_ids, hidden_states.float(), self.lm_head, forward_batch
+                input_ids,
+                hidden_states.to(logits_input_dtype),
+                self.lm_head,
+                forward_batch,
             )
         else:
             return hidden_states
