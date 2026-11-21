@@ -168,7 +168,9 @@ class ComponentResidencyManager:
     def host_pin_budget(self) -> HostPinBudget:
         # measure headroom after loading, when the first offload path needs it
         if self._host_pin_budget is None:
-            self._host_pin_budget = HostPinBudget()
+            self._host_pin_budget = HostPinBudget.for_local_worker(
+                self.server_args.num_gpus // self.server_args.nnodes
+            )
         return self._host_pin_budget
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:

@@ -45,7 +45,10 @@ def test_manager_pins_once_across_requests_and_strategy_rebuilds(tmp_path, pin, 
         component_residency_strategies={},
     )
     args = SimpleNamespace(
-        residency_mode=lambda _: "snapshot-offload", pin_cpu_memory=pin
+        num_gpus=1,
+        nnodes=1,
+        residency_mode=lambda _: "snapshot-offload",
+        pin_cpu_memory=pin,
     )
     manager = ComponentResidencyManager(pipeline, args)
     budget = manager.host_pin_budget

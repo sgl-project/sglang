@@ -294,16 +294,57 @@ class HostPinBudget:
         # next joint solve must still see the original node capacity.
         self.planning_capacity_bytes = max(0, self.available_bytes - self.reserve_bytes)
         self.committed_bytes = 0
+        self.local_worker_count = 1
+        self._allocator_share_bytes = self.reserve_bytes
+        self.mmap_share_bytes = 0
 
     @classmethod
     def for_local_worker(cls, local_worker_count: int) -> "HostPinBudget":
         """Give one worker a non-overlapping share of the node allowance."""
         worker_count = max(1, local_worker_count)
-        node_available = host_memory_available_bytes()
-        node_spendable = max(0, node_available - host_pin_reserve_bytes(node_available))
-        return cls(
-            available_bytes=node_spendable // worker_count,
-            reserve_bytes=0,
+        node_available = (
+            0 if host_copies_are_redundant() else host_memory_available_bytes()
+        )
+        node_reserve = host_pin_reserve_bytes(node_available)
+        budget = cls(
+            available_bytes=node_available // worker_count,
+            reserve_bytes=(node_reserve + worker_count - 1) // worker_count,
+        )
+        budget.local_worker_count = worker_count
+        return budget
+
+    def reserve_streaming_memory(
+        self, *, weight_bytes: int, staging_bytes: int, mmap_window_bytes: int
+    ) -> None:
+        """Protect the streaming working set before booking any layer stores."""
+        if not mmap_window_bytes:
+            return
+        ranks = self.local_worker_count
+        # The copy reserve covers allocator growth and runtime allocations.
+        # File pages in the active window can be shared by local workers.
+        runtime_share = (HOST_COPY_RESERVE_BYTES + ranks - 1) // ranks
+        allocator_growth = max(0, runtime_share - self._allocator_share_bytes)
+        if weight_bytes <= self.spendable_bytes - allocator_growth:
+            return
+        mmap_share = (mmap_window_bytes + ranks - 1) // ranks
+        # Couriers retain private buffers across stages. Sequential components
+        # reuse the page cache, so only the largest shared window is needed.
+        extra = (
+            staging_bytes
+            + allocator_growth
+            + max(0, mmap_share - self.mmap_share_bytes)
+        )
+        self._allocator_share_bytes += allocator_growth
+        self.mmap_share_bytes = max(self.mmap_share_bytes, mmap_share)
+        self.reserve_bytes += extra
+        self.planning_capacity_bytes = max(0, self.planning_capacity_bytes - extra)
+        logger.info(
+            "Layerwise host budget: %.2f GiB private staging, %.2f GiB shared "
+            "mmap window across %d local worker(s); %.2f GiB left for pins on this worker.",
+            staging_bytes / GIB_BYTES,
+            mmap_window_bytes / GIB_BYTES,
+            ranks,
+            self.spendable_bytes / GIB_BYTES,
         )
 
     @property
