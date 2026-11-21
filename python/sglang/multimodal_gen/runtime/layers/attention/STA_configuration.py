@@ -3,8 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 import os
+import tempfile
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 
@@ -265,7 +268,7 @@ def read_specific_json_files(folder_path: str) -> list[dict[str, Any]]:
     files = os.listdir(folder_path)
     # Filter files
     matching_files = [f for f in files if "mask" in f and f.endswith(".json")]
-    print(f"Found {len(matching_files)} matching files: {matching_files}")
+    print(f"Found {len(matching_files)} matching mask files")
 
     for file_name in matching_files:
         file_path = os.path.join(folder_path, file_name)
@@ -363,7 +366,7 @@ def select_best_mask_strategy(
 
 def save_mask_search_results(
     mask_search_final_result: list[dict[str, list[float]]],
-    prompt: str,
+    artifact_id: str,
     mask_strategies: list[str],
     output_dir: str = "output/mask_search_result/",
 ) -> str | None:
@@ -402,16 +405,16 @@ def save_mask_search_results(
                 step_results.append(layer_losses)
         mask_search_dict["L1_loss"][mask_strategy_str] = step_results
 
-    # Create the output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Create a filename based on the first 20 characters of the prompt
-    filename = prompt[:50].replace(" ", "_")
-    filepath = os.path.join(output_dir, f"mask_search_{filename}.json")
-
-    # Save the results to a JSON file
-    with open(filepath, "w") as f:
-        json.dump(mask_search_dict, f, indent=4)
+    filepath = os.path.join(output_dir, f"mask_search_{UUID(artifact_id).hex}.json")
+    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+    # Keep partially written files out of the tuning reader, including across ranks.
+    f = tempfile.NamedTemporaryFile(mode="w", dir=output_dir, delete=False)
+    try:
+        with f:
+            json.dump(mask_search_dict, f, indent=4)
+        os.replace(f.name, filepath)
+    finally:
+        Path(f.name).unlink(missing_ok=True)
 
     print(f"Successfully saved mask research results to {filepath}")
 

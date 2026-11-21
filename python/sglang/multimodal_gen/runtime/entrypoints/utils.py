@@ -13,6 +13,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -1009,6 +1010,9 @@ def prepare_request(
         VSA_sparsity=vsa_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    if attention_backend_config.get("STA_mode") == "STA_SEARCHING":
+        # Assign before dispatch so all workers name the same calibration sample.
+        req.extra["sta_search_artifact_id"] = uuid.uuid4().hex
     if getattr(sampling_params, "max_sequence_length", None) is not None:
         req.max_sequence_length = sampling_params.max_sequence_length
 
