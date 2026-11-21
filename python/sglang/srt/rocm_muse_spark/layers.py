@@ -181,7 +181,10 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         prefix: str = "",
         parallel_group: LinearParallelGroup = "attn_tp",
+        quant_config=None,
     ):
+        """``quant_config`` (Quark PTPC-FP8 only) registers an FP8 weight and a per-row scale; both shard along
+        the output rows, so ``weight_loader`` places them like the BF16 weight."""
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
         self.tp_rank = tp_rank
@@ -206,7 +209,7 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
             output_size=local * tp_size,
             bias=bias,
             gather_output=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=prefix,
             parallel_group=parallel_group,
         )
@@ -236,6 +239,26 @@ class QKVOGateParallelLinear(ColumnParallelLinear):
         param_data = param.data.narrow(output_dim, offsets[loaded_shard_id], shard_size)
         if loaded_shard_id in ("q", "g"):
             start = self.tp_rank * shard_size
+            total = shard_size * self.tp_size
         else:
             start = (self.tp_rank // self.num_kv_head_replicas) * shard_size
-        param_data.copy_(loaded_weight.narrow(output_dim, start, shard_size))
+            total = shard_size * self.tp_size // self.num_kv_head_replicas
+        if (
+            loaded_weight.dim() <= output_dim
+            or loaded_weight.shape[output_dim] != total
+        ):
+            raise ValueError(
+                f"QKV gate shard {loaded_shard_id}: expected {total} rows, got "
+                f"{tuple(loaded_weight.shape)}"
+            )
+        shard = loaded_weight.narrow(output_dim, start, shard_size)
+        if shard.shape != param_data.shape:
+            raise ValueError(
+                f"QKV gate shard {loaded_shard_id}: {tuple(shard.shape)} does not fit "
+                f"{tuple(param_data.shape)}"
+            )
+        param_data.copy_(shard)
+
+    # Quark linear methods register their parameters with ``weight_loader_v2``; the FP8 weight and its per-row
+    # scale shard along the output rows exactly like the BF16 weight, so the q/k/v/g-aware loader serves both.
+    weight_loader_v2 = weight_loader
