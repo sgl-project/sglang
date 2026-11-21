@@ -227,3 +227,37 @@ def invoke_down_b_into_base(
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
     )
+
+
+@triton.jit
+def _used_slot_list_kernel(
+    mapping_ptr,  # [num_tokens] adapter slot per token, -1 = base
+    num_tokens,
+    out_ptr,  # int32 [1 + SLOTS]
+    SLOTS: tl.constexpr,
+    SLOTS_P2: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    slots = tl.arange(0, SLOTS_P2)
+    used = tl.zeros((SLOTS_P2,), tl.int32)
+    for start in range(0, num_tokens, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        token_slot = tl.load(mapping_ptr + offs, mask=offs < num_tokens, other=-1)
+        hit = (token_slot.to(tl.int32)[:, None] == slots[None, :]).to(tl.int32)
+        used = tl.maximum(used, tl.max(hit, axis=0))
+    used = tl.where(slots < SLOTS, used, 0)
+    tl.store(out_ptr + 1 + tl.cumsum(used, axis=0) - used, slots, mask=used > 0)
+    tl.store(out_ptr + tl.arange(0, 1), tl.zeros((1,), tl.int32) + tl.sum(used))
+
+
+def used_slot_list(mapping: torch.Tensor, max_loras: int, out: torch.Tensor) -> None:
+    """Write [count, sorted slot IDs] on device so graph replay follows the mapping."""
+    assert out.dtype == torch.int32 and out.numel() >= 1 + max_loras
+    _used_slot_list_kernel[(1,)](
+        mapping,
+        mapping.numel(),
+        out,
+        SLOTS=max_loras,
+        SLOTS_P2=max(2, triton.next_power_of_2(max_loras)),
+        BLOCK=1024,
+    )
