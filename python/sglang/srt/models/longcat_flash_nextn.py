@@ -534,7 +534,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        cached_a_proj = self._get_pending_a_proj() if fuse_qkv_a_proj else None
 
         nextn_layer_prefix = "model.layers.0"
         nextn_spec_weight_names = [
@@ -653,7 +653,8 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        # Own the storage while waiting for another update bucket.
+                        cached_a_proj[name] = loaded_weight.clone()
                         q_a_proj_name = (
                             name
                             if "q_a_proj" in name

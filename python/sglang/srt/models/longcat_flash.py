@@ -947,6 +947,18 @@ class LongcatFlashForCausalLM(nn.Module):
                 ]:
                     requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
+    def _get_pending_a_proj(self) -> dict[str, torch.Tensor]:
+        if not hasattr(self, "_pending_a_proj"):
+            self._pending_a_proj = {}
+        return self._pending_a_proj
+
+    def discard_pending_weight_halves(self) -> List[str]:
+        """Clear unmatched projections at weight-update session boundaries."""
+        pending = self._get_pending_a_proj()
+        names = sorted(pending)
+        pending.clear()
+        return names
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -967,7 +979,7 @@ class LongcatFlashForCausalLM(nn.Module):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        cached_a_proj = self._get_pending_a_proj() if fuse_qkv_a_proj else None
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
@@ -1049,7 +1061,9 @@ class LongcatFlashForCausalLM(nn.Module):
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = loaded_weight
+                            # Update buckets may reuse their storage before the
+                            # matching projection arrives in another load call.
+                            cached_a_proj[name] = loaded_weight.clone()
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
