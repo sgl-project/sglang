@@ -408,6 +408,46 @@ def test_dual_variant_needs_one_sampling_contract(tmp_path):
             pipeline._load_config()
 
 
+@pytest.mark.parametrize("dual", [False, True])
+def test_dual_variant_releases_the_idle_dit_before_placing_the_other(dual):
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.transformer = torch.nn.Linear(1, 1)
+    stage.transformer_2 = torch.nn.Linear(1, 1) if dual else None
+    calls = []
+    stage.finish_unused_declared_component = lambda *, component_name, module: (
+        calls.append(("release", component_name, module))
+    )
+    stage._manage_dit_use_site = lambda module, name, batch: calls.append(
+        ("use", name, module)
+    )
+
+    stage._component_residency_manager = None
+    assert stage._begin_dit_use(True, None) is (
+        stage.transformer_2 or stage.transformer
+    )
+    assert calls == []
+
+    stage._component_residency_manager = object()
+    ref2va = stage._begin_dit_use(True, None)
+    t2va = stage._begin_dit_use(False, None)
+    assert t2va is stage.transformer
+    if not dual:
+        assert ref2va is stage.transformer
+        assert calls == [
+            ("use", "transformer", stage.transformer),
+            ("use", "transformer", stage.transformer),
+        ]
+        return
+    # the DiT kept ready after the previous request leaves before the other is placed
+    assert ref2va is stage.transformer_2
+    assert calls == [
+        ("release", "transformer", stage.transformer),
+        ("use", "transformer_2", stage.transformer_2),
+        ("release", "transformer_2", stage.transformer_2),
+        ("use", "transformer", stage.transformer),
+    ]
+
+
 def test_synthetic_warmup_target_honors_warmup_flags():
     def target(num_frames=None, resolution=None):
         width, height = map(int, (resolution or "896x512").split("x"))

@@ -321,10 +321,14 @@ on the FL2VA one. Both partitions must declare the same sampling contract in
 sglang serve --model-path Pika-Labs/Pika-H3-Flex --model-variant fl2va+ref2va --port 30010
 ```
 
-- **Memory.** Each GPU that holds the DiT holds both transformers (61.7 GiB on
-  disk each) beside one text encoder and one pair of VAEs. The variant was
-  developed on 8× B300; GPUs that cannot keep both transformers resident are
-  **Unverified**.
+- **Memory.** Each GPU that holds the DiT holds both transformers (61.7 GiB of
+  weights each) beside one text encoder and one pair of VAEs. They do not fit
+  together on an H200, where the default placement fails at load with CUDA
+  out of memory. Validated on 2× H200 (Ulysses 2) with
+  `--dit-cpu-offload true`, which keeps both on the host and moves the one a
+  request needs onto the GPU, so a request for the other partition's tasks
+  first waits for that move. Keeping both resident, on GPUs with room for
+  them, is **Unverified**.
 - **Adapters.** [Pika H3 Flex](#pika-h3-flex-six-step-adapters) applies each
   partition's bundled adapter to its own transformer. `--lora-path` applies an
   adapter to both; the [LoRA API](/docs/sglang-diffusion/api/openai_api#lora-management)
