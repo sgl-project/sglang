@@ -2469,6 +2469,7 @@ INLINE_SYSTEM_TEMPLATE = (
     "encoding_spec, chat_template_name, jinja_template, preserve",
     [
         ("kimi_k3", None, None, True),
+        ("dsv41", None, None, True),
         ("dsv32", None, INLINE_SYSTEM_TEMPLATE, False),
         (None, None, INLINE_SYSTEM_TEMPLATE, True),
         (None, "llama-3", INLINE_SYSTEM_TEMPLATE, False),
@@ -2485,10 +2486,21 @@ def test_inline_instruction_keeps_history_prefix(
     tokenizer_manager.tokenizer.chat_template = jinja_template
     template_manager = MockTemplateManager()
     template_manager.chat_template_name = chat_template_name
-    with patch.object(
-        OpenAIServingResponses,
-        "_resolve_chat_encoding_spec",
-        return_value=encoding_spec,
+    # `__init__` also builds the encoder adapter eagerly, and the dsv41 one
+    # parses the checkpoint tokenizer, which the Mock here cannot satisfy. Where
+    # an inline system turn lands is decided by `supports_inline_system` before
+    # that build, so stub it.
+    with (
+        patch.object(
+            OpenAIServingResponses,
+            "_resolve_chat_encoding_spec",
+            return_value=encoding_spec,
+        ),
+        patch.object(
+            OpenAIServingResponses,
+            "_build_chat_encoding_adapter",
+            return_value=None,
+        ),
     ):
         serving = OpenAIServingResponses(tokenizer_manager, template_manager)
     history = [
