@@ -23,6 +23,9 @@ def _get_loop_num(hf_config: Any) -> int:
 
 
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+    """``layer_model`` (the module owning ``layers``) may define
+    ``get_attention_layers()``, returning one attention module (or None) per
+    layer, in place of the attribute-path lookup of attention modules."""
     attention_layers: list[Any] = []
     moe_layers: list[Any] = []
     moe_fusions: list[Any] = []
@@ -37,10 +40,20 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
         layers = layers.values()
-    for layer in layers:
+    model_attention_layers = None
+    if hasattr(layer_model, "get_attention_layers"):
+        model_attention_layers = list(layer_model.get_attention_layers())
+        if len(model_attention_layers) != len(layers):
+            raise ValueError(
+                f"get_attention_layers() returned {len(model_attention_layers)} "
+                f"entries for {len(layers)} layers"
+            )
+    for i, layer in enumerate(layers):
         attn_layer = None
         mha_companion_layer = None
-        if hasattr(layer, "self_attn"):
+        if model_attention_layers is not None:
+            attn_layer = model_attention_layers[i]
+        elif hasattr(layer, "self_attn"):
             if hasattr(layer.self_attn, "attn"):
                 attn_layer = layer.self_attn.attn
             elif hasattr(layer.self_attn, "attn_mqa"):
