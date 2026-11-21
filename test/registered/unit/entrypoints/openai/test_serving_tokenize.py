@@ -92,6 +92,20 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         )
         return OpenAIServingTokenize(tm, templates)
 
+    def test_tokenizer_is_required(self):
+        serving = self._serving()
+        serving.tokenizer_manager.tokenizer = None
+        for body in (
+            {"prompt": "hi"},
+            {"prompt": ["hi", "hello"]},
+            {"prompt": []},
+            {"messages": HISTORY},
+        ):
+            with self.subTest(body=body):
+                status, message = _tokenize(serving, **body)
+                self.assertEqual(status, 400)
+                self.assertIn("--skip-tokenizer-init", message)
+
     def test_formatting_options(self):
         turn = "<user> hi </s> <assistant> call lookup Paris hello </s>"
         expected = {
