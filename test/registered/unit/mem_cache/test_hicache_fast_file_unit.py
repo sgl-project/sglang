@@ -1012,6 +1012,117 @@ class TestMinFreeSpace(FastFileTestBase):
         self.assertFalse(b.exists("victim"))
         self.assertTrue(b.exists("newk"))
 
+    def test_concurrent_write_cannot_reuse_space_reserved_by_pending_write(self):
+        b = self.make_backend(min_free="100")
+        free = [150]
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_writev = b._writev_exact
+        outcomes = {}
+
+        def blocked_write(fd, buffers):
+            if not write_started.is_set():
+                write_started.set()
+                self.assertTrue(release_write.wait(timeout=5))
+            written = original_writev(fd, buffers)
+            free[0] -= written
+            return written
+
+        with (
+            mock.patch.object(
+                b._evictor, "_fs_stats", side_effect=lambda: (1024, free[0])
+            ),
+            mock.patch.object(b, "_writev_exact", side_effect=blocked_write),
+        ):
+            first = threading.Thread(
+                target=lambda: outcomes.setdefault("first", b.set("a", _t(40)))
+            )
+            first.start()
+            self.assertTrue(write_started.wait(timeout=5))
+            try:
+                # "a" has reserved 40 B of the 50 B headroom; a concurrent 40 B
+                # write must not double-spend that headroom before "a" commits,
+                # while a 10 B write still fits in the remaining headroom.
+                self.assertFalse(b.set("b", _t(40)))
+                self.assertFalse(b.exists("b"))
+                self.assertTrue(b.set("small", _t(10)))
+                self.assertTrue(b.exists("small"))
+            finally:
+                release_write.set()
+            first.join(timeout=5)
+
+        self.assertTrue(outcomes["first"])
+        self.assertTrue(b.exists("a"))
+        self.assertEqual(free[0], 100)
+        self.assertEqual(b._evictor.snapshot()["pending_writes"], 0)
+
+    def test_evicts_to_cover_pending_writes_and_new_write(self):
+        b = self.make_backend(min_free="100")
+        suffixed = b._get_suffixed_key("victim")
+        path = b._page_path(suffixed)
+        with open(path, "wb") as f:
+            f.write(b"v" * 40)
+        b._evictor._lru[suffixed] = 40
+        b._evictor._total_bytes = 40
+
+        free = [150]
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_writev = b._writev_exact
+        original_remove = os.remove
+        outcomes = {}
+
+        def tracked_remove(p):
+            if os.path.exists(p):
+                free[0] += os.path.getsize(p)
+            return original_remove(p)
+
+        def blocked_write(fd, buffers):
+            if not write_started.is_set():
+                write_started.set()
+                self.assertTrue(release_write.wait(timeout=5))
+            written = original_writev(fd, buffers)
+            free[0] -= written
+            return written
+
+        with (
+            mock.patch.object(
+                b._evictor, "_fs_stats", side_effect=lambda: (1024, free[0])
+            ),
+            mock.patch("os.remove", side_effect=tracked_remove),
+            mock.patch.object(b, "_writev_exact", side_effect=blocked_write),
+        ):
+            first = threading.Thread(
+                target=lambda: outcomes.setdefault("first", b.set("a", _t(40)))
+            )
+            first.start()
+            self.assertTrue(write_started.wait(timeout=5))
+            try:
+                # 150 - (40 pending + 40 new) = 70 < 100, so "b" must evict the
+                # 40 B victim (free -> 190, 190 - 80 = 110 >= 100) before write.
+                self.assertTrue(b.set("b", _t(40)))
+                self.assertFalse(b.exists("victim"))
+            finally:
+                release_write.set()
+            first.join(timeout=5)
+
+        self.assertTrue(outcomes["first"])
+        self.assertTrue(b.exists("a"))
+        self.assertTrue(b.exists("b"))
+
+    def test_aborted_pending_write_releases_free_space_reservation(self):
+        b = self.make_backend(min_free="100")
+        b._evictor._fs_stats = lambda: (1024, 150)
+        suffixed_a = b._get_suffixed_key("a")
+        suffixed_b = b._get_suffixed_key("b")
+
+        self.assertTrue(b._evictor.reserve(suffixed_a, 40, key="a"))
+        self.assertFalse(b._evictor.reserve(suffixed_b, 40, key="b"))
+
+        b._evictor.abort(suffixed_a)
+        self.assertTrue(b._evictor.reserve(suffixed_b, 40, key="b"))
+        b._evictor.commit(suffixed_b)
+
 
 class TestMLAOwnerGating(FastFileTestBase):
     def test_only_rank_zero_evicts_and_creates_files_for_replicated_kv(self):
