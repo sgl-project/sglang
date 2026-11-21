@@ -1949,8 +1949,10 @@ async def openai_v1_classify(request: ClassifyRequest, raw_request: Request):
 )
 async def openai_v1_tokenize(request: TokenizeRequest, raw_request: Request):
     """OpenAI-compatible tokenization endpoint."""
-    return await raw_request.app.state.openai_serving_tokenize.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_tokenize.handle_request(
+            request, raw_request
+        )
     )
 
 
