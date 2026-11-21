@@ -484,6 +484,168 @@ class _K3TowerStub:
         )
 
 
+@pytest.mark.parametrize("rank", [1, 0])
+def test_kimi_k3_encoder_cache_keeps_preprocessed_dp_ownership(rank):
+    """Partial cache hits must not rebalance already materialized CPU images.
+
+    The tower and collective use deterministic CPU features; item ownership,
+    cache lookup, the K3 loader, and DP reconstruction use their real consumers.
+    """
+    import asyncio
+    from unittest.mock import Mock
+    from unittest.mock import patch as mock_patch
+
+    import sglang.srt.disaggregation.encoder.server as encoder_server
+    from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessResult
+    from sglang.srt.disaggregation.encoder.server import EncodeContext, MMEncoder
+    from sglang.srt.managers.req_types import MultimodalDataItem
+    from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+    from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.encoder_preprocessing import (
+        EncoderPreprocessOutput,
+        hash_raw_encoder_item,
+    )
+    from sglang.srt.multimodal.modality import Modality
+
+    patch_counts = [400, 360, 320, 280]
+    token_counts = [count // 4 for count in patch_counts]
+    full_owners = ([0, 3], [1, 2])
+    grids = torch.tensor([[1, 20, count // 20] for count in patch_counts])
+    features = [
+        torch.full((count, 2), float(index + 1))
+        for index, count in enumerate(patch_counts)
+    ]
+
+    class RecordingTower(_K3TowerStub):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def __call__(self, pixel_values, *, grid_hw, max_seqlen, grid_thw_list):
+            self.calls.append((pixel_values.clone(), grid_thw_list))
+            assert grid_hw.tolist() == grid_thw_list
+            assert max_seqlen == max(t * h * w for t, h, w in grid_thw_list)
+            return pixel_values.reshape(-1, 4, 2)
+
+    class RecordingGather:
+        def __init__(self):
+            self.calls = 0
+
+        def all_gather(self, local_embeddings, dim):
+            self.calls += 1
+            # The original batch has equally loaded ranks. A cache miss subset
+            # would change both its shape and its owner-local feature contents.
+            expected_shards = [
+                torch.cat([features[index] for index in owners]).reshape(-1, 4, 2)
+                for owners in full_owners
+            ]
+            torch.testing.assert_close(local_embeddings, expected_shards[rank])
+            return torch.cat(expected_shards, dim=dim)
+
+    tower, gather = RecordingTower(), RecordingGather()
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.use_data_parallel = True
+    model.vision_tower = tower
+    model.mm_projector = lambda embeddings: embeddings.mean(dim=1)
+
+    encoder = MMEncoder.__new__(MMEncoder)
+    encoder.model_type = "kimi_k3"
+    encoder.cache_namespace = "sha256:" + "12" * 32
+    encoder.mm_cache = encoder_server.MultiModalStaticCache(1 << 20)
+    encoder.mm_cache_lock = asyncio.Lock()
+
+    def make_context():
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=feature.clone(),
+                model_specific_data={"grid_thws": grids[index : index + 1]},
+            )
+            for index, feature in enumerate(features)
+        ]
+        # The CPU K3 producer establishes identity before owner materialization.
+        for item in items:
+            item.set_hash(hash_raw_encoder_item(item.feature))
+        output = EncoderPreprocessOutput(
+            {"pixel_values": [item.feature for item in items], "grid_thws": grids},
+            mm_items=items,
+            item_sizes=patch_counts,
+            materialize_local_items=lambda local_items: [
+                item.feature for item in local_items
+            ],
+        )
+        output.materialize_for_rank(rank, 2)
+        return EncodeContext(
+            req_id="kimi-k3-owner-cache",
+            modality=Modality.IMAGE,
+            preprocess_result=EncoderPreprocessResult(
+                mm_inputs=output, grid_thw=grids, token_counts=token_counts
+            ),
+            get_feature_fn=model.get_image_feature,
+            mm_feature=output["pixel_values"],
+            num_items=4,
+            items_per_req=[2, 2],
+            aux_data={},
+            str_mm_hashes=None,
+            use_global_cache=False,
+            is_health_check=False,
+        )
+
+    metrics = Mock()
+    with (
+        mock_patch.object(encoder_server, "encoder_metrics_collector", metrics),
+        get_context().override_server_args(tp_size=2, enable_prefix_mm_cache=True),
+        get_parallel().override(
+            tp_size=2,
+            tp_rank=rank,
+            attn_tp_size=2,
+            attn_tp_rank=rank,
+            attn_tp_group=gather,
+        ),
+    ):
+        partial = make_context()
+        item_zero_key = encoder._calculate_hashes_from_features(
+            partial.mm_feature, partial.preprocess_result, Modality.IMAGE
+        )[0]
+        encoder.mm_cache.set(
+            item_zero_key,
+            EmbeddingResult(embedding=torch.ones(token_counts[0], 2)),
+        )
+        result = asyncio.run(
+            encoder._compute_direct_embedding(partial, keep_on_gpu=False)
+        )
+        expected = torch.cat(
+            [
+                torch.full((count, 2), float(index + 1))
+                for index, count in enumerate(token_counts)
+            ]
+        )
+        torch.testing.assert_close(result, expected)
+        assert len(tower.calls) == gather.calls == 1
+        local_features, local_grids = tower.calls[0]
+        torch.testing.assert_close(
+            local_features, torch.cat([features[index] for index in full_owners[rank]])
+        )
+        assert local_grids == grids[list(full_owners[rank])].tolist()
+        metrics.record_cache_tokens.assert_called_with(
+            0, sum(token_counts), modality="image"
+        )
+        metrics.record_cache_files.assert_called_with(0, 4, modality="image")
+
+        # A genuine full cache hit remains usable without a second forward.
+        hot = make_context()
+        hot_result = asyncio.run(
+            encoder._compute_direct_embedding(hot, keep_on_gpu=False)
+        )
+        assert len(tower.calls) == gather.calls == 1
+        metrics.record_cache_tokens.assert_called_with(
+            sum(token_counts), sum(token_counts), modality="image"
+        )
+        metrics.record_cache_files.assert_called_with(4, 4, modality="image")
+        torch.testing.assert_close(hot_result, expected)
+
+
 def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     """K3 vision is image-wise DP: the DP runner must receive lazy features
     (pixel_values=None + a loader), and the loader must materialize exactly
