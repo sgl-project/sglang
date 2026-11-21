@@ -59,7 +59,10 @@ class SGLDiffusionProfiler:
     Supports both full profiling and scheduled profiling.
 
     1. if profile_all_stages is on: profile all stages, including all denoising steps
-    2. otherwise, if num_profiled_timesteps is specified: profile {num_profiled_timesteps} denoising steps. profile all steps if num_profiled_timesteps==-1
+    2. otherwise, profile up to num_profiled_timesteps denoising steps after
+       one warmup step. Omit warmup when recording every available step;
+       num_profiled_timesteps=-1 records all steps, including the first one.
+       Collection starts at the denoising stage and ends when it exits.
     """
 
     _instance = None
@@ -76,11 +79,13 @@ class SGLDiffusionProfiler:
         with_stack: bool | None = None,
         record_shapes: bool | None = None,
         is_host: bool = False,
+        sampled_dump_rank: int | None = 0,
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
         self.full_profile = full_profile
         self.is_host = is_host
+        self.sampled_dump_rank = sampled_dump_rank
 
         self.log_dir = _resolve_profiler_log_dir(log_dir)
 
@@ -131,8 +136,25 @@ class SGLDiffusionProfiler:
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
-            warmup = 0 if num_steps == -1 else 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
+            if (
+                num_actual_steps is None
+                or num_actual_steps <= 0
+                or (num_inference_steps is not None and num_inference_steps <= 0)
+            ):
+                raise ValueError(
+                    "The number of profiled denoising steps must be positive"
+                )
+            if num_inference_steps is not None:
+                num_actual_steps = min(num_actual_steps, num_inference_steps)
+            warmup = int(
+                num_steps != -1
+                and (
+                    num_inference_steps is None
+                    or num_actual_steps < num_inference_steps
+                )
+            )
+            # Count warmup for early stopping, but not as an active trace step.
             self.num_active_steps = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
                 **common_torch_profiler_args,
@@ -148,10 +170,12 @@ class SGLDiffusionProfiler:
 
         logger.info(f"Profiling request: {request_id} for {self.profile_mode_id}...")
 
+        self.has_started = False
         self.has_stopped = False
 
         SGLDiffusionProfiler._instance = self
-        self.start()
+        if self.full_profile:
+            self.start()
 
     @staticmethod
     def _resolve_activities(
@@ -197,24 +221,38 @@ class SGLDiffusionProfiler:
         return ret or _default()
 
     def start(self):
+        if self.has_started or self.has_stopped:
+            return
         logger.info("Starting Profiler...")
         self.profiler.start()
+        self.has_started = True
+
+    @contextlib.contextmanager
+    def profile_denoising_stage(self):
+        """Bound sampled profiling to the stage, including an early stage exit."""
+        if self.full_profile:
+            yield
+            return
+        self.start()
+        try:
+            yield
+        finally:
+            self.stop(dump_rank=self.sampled_dump_rank)
 
     def _step(self):
         self.profiler.step()
 
     def step_stage(self):
-        if self.full_profile:
+        if self.full_profile and not self.has_stopped:
             self._step()
 
     def step_denoising_step(self):
-        if not self.full_profile:
-            if self.num_active_steps >= 0:
-                self._step()
-                self.num_active_steps -= 1
-            else:
-                # early exit when enough steps are captured, to reduce the trace file size
-                self.stop(dump_rank=0)
+        if not self.full_profile and self.has_started and not self.has_stopped:
+            self._step()
+            self.num_active_steps -= 1
+            if self.num_active_steps == 0:
+                # Stop at the end of the requested window, before later steps.
+                self.stop(dump_rank=self.sampled_dump_rank)
 
     @classmethod
     def get_instance(cls) -> "SGLDiffusionProfiler":
@@ -224,6 +262,10 @@ class SGLDiffusionProfiler:
         if self.has_stopped:
             return
         self.has_stopped = True
+        if not self.has_started:
+            # A request may fail or be cancelled before reaching its denoiser.
+            SGLDiffusionProfiler._instance = None
+            return
         logger.info("Stopping Profiler...")
         if current_platform.is_cuda_alike():
             torch.cuda.synchronize()
