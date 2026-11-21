@@ -152,6 +152,23 @@ _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 _KDA_FUSED_DECODE_MAX_BLOCKS_SM90 = 2048
 
 
+def _prepack_mhc_fn(model: nn.Module) -> None:
+    # Also reached through the NextN draft model, which is not a subclass.
+    from sglang.kernels.ops.layernorm.mhc import prepack_aiter_mhc_fn
+
+    packed = sum(
+        prepack_aiter_mhc_fn(fn)
+        for module in model.modules()
+        for fn in (
+            getattr(module, "hc_attn_fn", None),
+            getattr(module, "hc_ffn_fn", None),
+        )
+        if isinstance(fn, torch.Tensor)
+    )
+    if packed:
+        logger.info("Packed %d mHC pre weights for AITER BF16 GEMM", packed)
+
+
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -2032,6 +2049,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+        _prepack_mhc_fn(self)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
@@ -2043,6 +2061,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # call only this.
         if not is_nextn:
             self._prepare_fused_decode_layers()
+        _prepack_mhc_fn(self)
 
     def _prepare_fused_decode_layers(self) -> None:
         if self.model is None:

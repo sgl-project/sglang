@@ -209,6 +209,73 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
                             post_out_actual, post_ref_out, atol=2e-2, rtol=2e-2
                         )
 
+    def _aiter_pre(self, residual, fn, scale, base, norm_weight):
+        return mhc._try_aiter_mhc_pre(
+            residual,
+            fn,
+            scale,
+            base,
+            self.rms_eps,
+            self.hc_eps,
+            self.hc_eps,
+            2.0,
+            20,
+            norm_weight,
+            self.rms_eps,
+        )
+
+    def test_packed_hc_fn_matches_fp32_gemm(self):
+        """The BF16 hi/lo pre GEMM must reproduce the FP32 GEMM's mixes and layer input."""
+        norm_weight = torch.linspace(
+            0.75, 1.25, self.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        with envs.SGLANG_USE_AITER.override(True):
+            for tokens in (1, 64, 4096):
+                with self.subTest(tokens=tokens):
+                    residual, fn, scale, base = self._inputs(tokens)
+                    reference = self._aiter_pre(residual, fn, scale, base, norm_weight)
+                    mhc.prepack_aiter_mhc_fn(fn)
+                    self.assertIsNotNone(mhc._aiter_packed_hc_fn(fn))
+                    actual = self._aiter_pre(residual, fn, scale, base, norm_weight)
+                    torch.cuda.synchronize()
+                    post, comb, layer_input = actual
+                    torch.testing.assert_close(post, reference[0], atol=1e-5, rtol=1e-4)
+                    torch.testing.assert_close(comb, reference[1], atol=1e-5, rtol=1e-4)
+                    # ~1e-6 mix differences flip at most one BF16 rounding step.
+                    torch.testing.assert_close(
+                        layer_input, reference[2], atol=1e-2, rtol=1.6e-2
+                    )
+
+    def test_packed_hc_fn_dispatch_and_invalidation(self):
+        """A packed weight is used until the parameter is written, then FP32 resumes."""
+        residual, fn, scale, base = self._inputs(64)
+        fn = torch.nn.Parameter(fn)
+        seen = []
+        real_pre = sys.modules["aiter.ops.mhc"].mhc_pre
+
+        def recording_pre(residual, gemm_fn, *args, **kwargs):
+            seen.append((gemm_fn.dtype, kwargs.get("w_preshuffle_bf16", 0)))
+            return real_pre(residual, gemm_fn, *args, **kwargs)
+
+        with (
+            envs.SGLANG_USE_AITER.override(True),
+            patch("aiter.ops.mhc.mhc_pre", recording_pre),
+        ):
+            mhc.prepack_aiter_mhc_fn(fn)
+            self.assertIsNotNone(self._aiter_pre(residual, fn, scale, base, None))
+            with torch.no_grad():
+                fn.mul_(1.0)
+            self.assertIsNotNone(self._aiter_pre(residual, fn, scale, base, None))
+        self.assertEqual(seen[0][1], 1)
+        self.assertNotEqual(seen[0][0], torch.float32)
+        self.assertEqual(seen[1], (torch.float32, 0))
+
+    def test_unmeasured_hc_fn_geometry_is_not_packed(self):
+        fn = torch.randn(24, 4 * 7168, device="cuda", dtype=torch.float32)
+        with envs.SGLANG_USE_AITER.override(True):
+            mhc.prepack_aiter_mhc_fn(fn)
+        self.assertIsNone(mhc._aiter_packed_hc_fn(fn))
+
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
 class TestMhcPostSplitH(CustomTestCase):
