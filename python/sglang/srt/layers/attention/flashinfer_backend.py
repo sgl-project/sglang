@@ -5,6 +5,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
 )
 
 """
@@ -39,6 +40,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
+    is_cp_enabled,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
@@ -58,6 +60,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -387,6 +390,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+
+        self.allow_bidirectional_attention_in_extend = (
+            self._bidirectional_extend_allowed()
+        )
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
@@ -1516,6 +1523,66 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    @staticmethod
+    def _bidirectional_extend_allowed() -> bool:
+        # Bidirectional extend attention needs the whole prompt in one forward.
+        # Chunked prefill and the CUDA graph modes that split or pad a prefill
+        # break that, as in the Triton backend's gate. So does prefill context
+        # parallelism: a shard reads keys only up to its own end.
+        return (
+            (
+                cuda_graph_fully_disabled()
+                or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            )
+            and get_schedule().chunked_prefill_size == -1
+            and not is_cp_enabled()
+        )
+
+    def _extend_is_causal(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        window_planned: bool = False,
+    ) -> bool:
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            return False
+        if layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL:
+            if window_planned:
+                # A window plan reads only the keys of each query's causal
+                # window, so the layer stays causal on it.
+                return True
+            # A DLLM extend is one complete, fixed-width canvas, so it stays
+            # bidirectional even when the generic gate is off.
+            return not (
+                self.allow_bidirectional_attention_in_extend
+                or forward_batch.forward_mode.is_dllm_extend()
+            )
+        return True
+
+    def _extend_window_left(self, layer: RadixAttention, causal: bool) -> int:
+        multi_item_params = self.forward_metadata.multi_item_params
+        if multi_item_params and multi_item_params.is_enabled():
+            # Multi-item scoring masks per item; a sliding window could cut
+            # across item boundaries.
+            return -1
+        if not causal and layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL:
+            # FlashInfer has no right window, so a bidirectional sliding-window
+            # layer attends every token of this forward, as in the Triton
+            # backend. A cached prefix keeps its planned window mask.
+            return -1
+        return layer.sliding_window_size
+
+    def _extend_window_planned(self, wrapper_idx: int) -> bool:
+        # Under sliding-window dispatch the window layers' ragged wrapper is
+        # planned with the window as well, so check every wrapper this extend
+        # runs.
+        if self.dispatch_reason != WrapperDispatch.SLIDING_WINDOW:
+            return False
+        wrappers = [self.forward_metadata.prefill_wrappers[wrapper_idx]]
+        if self.forward_metadata.use_ragged:
+            wrappers.append(self.prefill_wrappers_ragged[wrapper_idx])
+        return any(wrapper._window_left >= 0 for wrapper in wrappers)
+
     @debug_kernel_api
     def forward_extend(
         self,
@@ -1559,16 +1626,17 @@ class FlashInferAttnBackend(AttentionBackend):
 
         wrapper_idx = self._get_wrapper_idx(layer)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
+        window_dispatch = self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+        causal = self._extend_is_causal(
+            layer,
+            forward_batch,
+            window_planned=self._extend_window_planned(wrapper_idx),
+        )
+        window_left = self._extend_window_left(layer, causal)
         # Window-read planning may put the window in a custom mask. Other
         # wrappers leave per-layer windows to forward, even when planned with -1.
-        paged_window_left = layer.sliding_window_size
-        if (
-            self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
-            and prefill_wrapper_paged._window_left < 0
-        ) or (
-            self.forward_metadata.multi_item_params
-            and self.forward_metadata.multi_item_params.is_enabled()
-        ):
+        paged_window_left = window_left
+        if window_dispatch and prefill_wrapper_paged._window_left < 0:
             paged_window_left = -1
 
         logits_soft_cap = layer.logit_cap
@@ -1615,10 +1683,6 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
-            causal = (
-                not layer.is_cross_attention
-                and layer.attn_type != AttentionType.ENCODER_ONLY
-            )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
@@ -1641,12 +1705,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 k = self.kv_layers.read(layer.layer_id).kv()[0]
                 v = self.kv_layers.read(layer.layer_id).kv()[1]
-            causal = True
-            if (
-                layer.is_cross_attention
-                or layer.attn_type == AttentionType.ENCODER_ONLY
-            ):
-                causal = False
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
@@ -1661,26 +1719,18 @@ class FlashInferAttnBackend(AttentionBackend):
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
-                    window_left=layer.sliding_window_size,
+                    window_left=window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
 
             else:
-                swa_window_left = (
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                )
                 o1, s1 = prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
