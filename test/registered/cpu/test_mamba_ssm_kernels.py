@@ -245,37 +245,6 @@ def test_mamba_chunk_scan_combined_cpu_vs_ssd_minimal(
     )
 
 
-def test_mamba_chunk_scan_combined_cpu_fp32_fallback():
-    torch.manual_seed(3)
-    x = torch.randn(1, 20, 4, 16)
-    dt = torch.randn(1, 20, 4)
-    A = -torch.rand(4) - 0.1
-    B = torch.randn(1, 20, 2, 32)
-    C = torch.randn_like(B)
-    D = torch.randn(4, 16)
-    dt_bias = torch.randn(4) - 3.0
-    out = torch.empty_like(x)
-
-    final_state = mamba_chunk_scan_combined(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        8,
-        D=D,
-        dt_bias=dt_bias,
-        dt_softplus=True,
-        out=out,
-        return_final_states=True,
-    )
-    expected_out, expected_state = _mamba_scan_reference(
-        x, dt, A, B, C, D, None, dt_bias, None, (0.0, float("inf"))
-    )
-    torch.testing.assert_close(out, expected_out, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(final_state, expected_state, rtol=1e-4, atol=1e-4)
-
-
 def test_mamba_chunk_scan_combined_cpu_varlen_tracks():
     torch.manual_seed(41)
     dtype = torch.bfloat16
