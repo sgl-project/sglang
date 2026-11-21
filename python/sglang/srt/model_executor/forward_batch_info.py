@@ -155,9 +155,8 @@ _HOST_INTS_PER_LAUNCH = 256
 
 
 def _host_ints_to_device(values: List[int], dtype: torch.dtype, device) -> torch.Tensor:
-    """A 1-D ``dtype`` CUDA tensor holding ``values``, written by kernels that take
-    the values as arguments. Unlike a pinned host-to-device copy, the write never
-    queues on a copy engine behind bulk host-to-device transfers.
+    """A 1-D ``dtype`` CUDA tensor holding ``values``,
+    written by kernels that take the values as arguments instead of a pinned copy.
 
     The kernel writes a buffer padded to a power of two (or to whole launches past
     one launch), so a varying length compiles a bounded set of kernels; the
@@ -907,9 +906,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_cpu = global_num_tokens
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         if _kernel_writes_metadata(device):
-            # One kernel writes both: a pinned host-to-device copy would queue on
-            # the copy engine behind bulk transfers (such as host KV restores)
-            # and hold up this forward.
+            # One kernel writes both, instead of two pinned host-to-device copies.
             self.global_num_tokens_gpu = torch.empty(
                 len(global_num_tokens), dtype=torch.int64, device=device
             )
@@ -1222,9 +1219,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 if _kernel_writes_metadata(device):
-                    # Written by kernels: a pinned host-to-device copy would queue
-                    # on the copy engine behind bulk transfers (such as host KV
-                    # load-backs) and hold up this forward.
                     ret.extend_seq_lens = _host_ints_to_device(
                         extend_seq_lens, torch.int32, device
                     )
@@ -1982,9 +1976,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
         if _kernel_writes_metadata(self.global_num_tokens_gpu.device):
-            # One kernel writes the padded counts in place: a pinned host-to-device
-            # copy would queue on the copy engine behind bulk transfers and hold up
-            # this forward.
+            # One kernel writes the padded counts in place, instead of a pinned copy.
             write_host_ints((self.global_num_tokens_gpu,), (global_num_tokens,))
         else:
             global_num_tokens_pinned = torch.tensor(
