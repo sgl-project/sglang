@@ -758,33 +758,24 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"]
     w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"]
 
-    w13_shuffled_u8 = torch.empty_like(w13_weight_u8)
-    w2_shuffled_u8 = torch.empty_like(w2_weight_u8)
-    w13_scale_shuffled = torch.empty_like(w13_scale)
-    w2_scale_shuffled = torch.empty_like(w2_scale)
-
-    for i in range(num_experts):
-        w13_interleaved_u8 = w13_weight_u8[i].index_select(0, reorder_row_indices)
-        w13_scale_interleaved = w13_scale[i].index_select(0, reorder_row_indices)
-
-        w13_shuffled_u8[i].copy_(
-            w13_interleaved_u8.index_select(0, w13_shuffle_row_indices)
-        )
-        w2_shuffled_u8[i].copy_(w2_weight_u8[i].index_select(0, w2_shuffle_row_indices))
-
-        w13_scale_linear = w13_scale_interleaved.reshape(gate_up_dim, -1)
-        w13_scale_shuffled[i].copy_(
-            block_scale_interleave(
-                w13_scale_linear.index_select(0, w13_scale_shuffle_row_indices)
-            ).reshape_as(w13_scale_shuffled[i])
-        )
-
-        w2_scale_linear = w2_scale[i].reshape(hidden_size, -1)
-        w2_scale_shuffled[i].copy_(
-            block_scale_interleave(
-                w2_scale_linear.index_select(0, w2_scale_shuffle_row_indices)
-            ).reshape_as(w2_scale_shuffled[i])
-        )
+    # Every expert takes the same row permutation, so permute the whole stack;
+    # block_scale_interleave swizzles a 3D input expert by expert.
+    w13_row_indices = reorder_row_indices.index_select(0, w13_shuffle_row_indices)
+    w13_scale_row_indices = reorder_row_indices.index_select(
+        0, w13_scale_shuffle_row_indices
+    )
+    w13_shuffled_u8 = w13_weight_u8.index_select(1, w13_row_indices)
+    w2_shuffled_u8 = w2_weight_u8.index_select(1, w2_shuffle_row_indices)
+    w13_scale_shuffled = block_scale_interleave(
+        w13_scale.reshape(num_experts, gate_up_dim, -1)
+        .index_select(1, w13_scale_row_indices)
+        .contiguous()
+    ).reshape_as(w13_scale)
+    w2_scale_shuffled = block_scale_interleave(
+        w2_scale.reshape(num_experts, hidden_size, -1)
+        .index_select(1, w2_scale_shuffle_row_indices)
+        .contiguous()
+    ).reshape_as(w2_scale)
 
     # Keep parameter identities stable for CUDA graph capture reuse.
     copy_or_rebind_param(layer, "w13_weight", w13_shuffled_u8.view(torch.float8_e4m3fn))
