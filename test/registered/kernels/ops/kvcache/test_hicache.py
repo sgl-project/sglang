@@ -15,7 +15,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKVPoolHost,
+    write_back_staging_page_chunk,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.runtime_context import publish, reset_context
@@ -43,6 +46,19 @@ MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
 LAYOUTS = ["layer_first", "page_first"]
 STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
+# MHA stages write_back_staging_page_chunk(PAGE_SIZE) pages per round
+_MHA_CHUNK = write_back_staging_page_chunk(PAGE_SIZE)
+MHA_STAGED_WRITE_BACK_PAGE_COUNTS = sorted(
+    {
+        1,
+        _MHA_CHUNK - 1,
+        _MHA_CHUNK,
+        _MHA_CHUNK + 1,
+        _MHA_CHUNK + 3,
+        2 * _MHA_CHUNK,
+        2 * _MHA_CHUNK + 1,
+    }
+)
 
 
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
@@ -363,7 +379,7 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
 
 
 def _run_page_first_staged_write_back_mha(
-    layout: str, element_dim: int, page_count: int
+    layout: str, element_dim: int, page_count: int, host_order: str = "descending"
 ) -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
     head_num = (
@@ -399,7 +415,7 @@ def _run_page_first_staged_write_back_mha(
     if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
-    if page_count > 64:
+    if page_count > _MHA_CHUNK:
         assert host_pool.staging_page_capacity < page_count
 
     for layer_id in range(NUM_LAYERS):
@@ -414,12 +430,13 @@ def _run_page_first_staged_write_back_mha(
         device=DEVICE,
         dtype=torch.int64,
     )
-    host_pages = torch.arange(
-        page_count,
-        0,
-        -1,
-        dtype=torch.int64,
-    )
+    if host_order == "descending":  # every page its own run
+        host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    elif host_order == "ascending":  # one contiguous run per staging round
+        host_pages = torch.arange(1, 1 + page_count, dtype=torch.int64)
+    else:  # "gapped": two runs, split in the middle
+        host_pages = torch.arange(1, 1 + page_count, dtype=torch.int64)
+        host_pages[page_count // 2 :] += 1
     src_index_dtype = torch.int32 if page_count == 64 else torch.int64
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
     host_indices = _token_indices_for_pages(host_pages, device="cpu")
@@ -459,8 +476,12 @@ def _run_page_first_staged_write_back_mha(
                 ].cpu(),
             )
 
+    # Every host page up to one past the last written page that is not a target,
+    # including the gap between runs, must keep its fill value.
+    written = set(host_pages.tolist())
+    untouched_pages = [p for p in range(max(written) + 2) if p not in written]
     for layer_id in range(NUM_LAYERS):
-        for untouched_page in [0, page_count + 1]:
+        for untouched_page in untouched_pages:
             _assert_page_filled(host_pool.k_data_refs[layer_id], untouched_page, -7)
             _assert_page_filled(host_pool.v_data_refs[layer_id], untouched_page, -11)
 
@@ -591,11 +612,22 @@ def test_hicache_transfer_mla(layout: str, element_dim: int) -> None:
 
 @pytest.mark.parametrize("layout", ["page_first"])
 @pytest.mark.parametrize("element_dim", MHA_ELEMENT_DIMS)
-@pytest.mark.parametrize("page_count", STAGED_WRITE_BACK_PAGE_COUNTS)
+@pytest.mark.parametrize("page_count", MHA_STAGED_WRITE_BACK_PAGE_COUNTS)
 def test_hicache_page_first_staged_write_back_mha(
     layout: str, element_dim: int, page_count: int
 ) -> None:
     _run_page_first_staged_write_back_mha(layout, element_dim, page_count)
+
+
+@pytest.mark.parametrize("host_order", ["ascending", "gapped"])
+@pytest.mark.parametrize("page_count", [3, _MHA_CHUNK + 3])
+def test_hicache_page_first_staged_write_back_mha_coalesced_runs(
+    host_order: str, page_count: int
+) -> None:
+    """Contiguous host pages are merged into one copy per run; same bytes as per page."""
+    _run_page_first_staged_write_back_mha(
+        "page_first", MHA_ELEMENT_DIMS[0], page_count, host_order
+    )
 
 
 @pytest.mark.parametrize("layout", ["page_first"])

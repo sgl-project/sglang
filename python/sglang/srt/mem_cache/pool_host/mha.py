@@ -101,6 +101,12 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def write_back_staging_page_chunk(page_size: int) -> int:
+    """Pages per write-back staging round: at least 4096 tokens, so small pages
+    do not stage 64 tokens per round."""
+    return max(_WRITE_BACK_STAGING_PAGE_CHUNK, 4096 // page_size)
+
+
 def prepare_mha_write_back_staging(
     buffer_info: MHABufferInfo,
     *,
@@ -119,7 +125,8 @@ def prepare_mha_write_back_staging(
         for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
     ):
         return None
-    token_capacity = min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK) * page_size
+    page_chunk = write_back_staging_page_chunk(page_size)
+    token_capacity = min(page_capacity or page_chunk, page_chunk) * page_size
     shapes = tuple(
         (token_capacity, layer_num, head_num, dim)
         for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
@@ -389,7 +396,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         # The staged kernel reads whole device pages, so it needs packed rows.
         if self.layout != "page_first" or not self.device_rows_packed:
             return
-        page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
+        page_capacity = min(
+            self.page_num, write_back_staging_page_chunk(self.page_size)
+        )
         staging = prepare_mha_write_back_staging(
             buffer_info,
             layer_num=self.layer_num,

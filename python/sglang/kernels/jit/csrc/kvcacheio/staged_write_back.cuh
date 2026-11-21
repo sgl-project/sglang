@@ -73,6 +73,15 @@ inline auto get_hip_memcpy_batch_async() -> HipMemcpyBatchAsyncFn {
 }
 #endif
 
+// Calls f(first_page, num_pages) once per run of pages whose destination slots are
+// contiguous, so each run is one copy instead of one copy per page.
+template <typename F>
+inline void for_each_contiguous_page_run(const int64_t* dst, int64_t num_pages, int64_t page_size, F&& f) {
+  for (int64_t begin = 0, page = 1; page <= num_pages; ++page)
+    if (page == num_pages || dst[page * page_size] != dst[(page - 1) * page_size] + page_size)
+      f(begin, page - begin), begin = page;
+}
+
 inline void copy_page_first_pages_fallback(
     const std::vector<tvm::ffi::TensorView>& src_ptrs,
     std::vector<tvm::ffi::TensorView> dst_ptrs,
@@ -93,13 +102,14 @@ inline void copy_page_first_pages_fallback(
     const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
     const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
     RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
-    for (const auto page_offset : irange(num_pages)) {
+    for_each_contiguous_page_run(dst_indices_ptr, num_pages, page_size, [&](int64_t page_offset, int64_t run_pages) {
       const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
                             static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
       char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
-    }
+      RuntimeDeviceCheck(cudaMemcpyAsync(
+          dst_ptr, src_ptr, src_page_bytes * static_cast<size_t>(run_pages), cudaMemcpyDeviceToHost, stream));
+    });
   }
 }
 
@@ -139,15 +149,15 @@ inline bool try_copy_page_first_pages_batch(
     const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
     const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
     host::RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
-    for (const auto page_offset : host::irange(num_pages)) {
+    for_each_contiguous_page_run(dst_indices_ptr, num_pages, page_size, [&](int64_t page_offset, int64_t run_pages) {
       char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
       char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
       batch_srcs.push_back(src_ptr);
       batch_dsts.push_back(dst_ptr);
-      batch_sizes.push_back(src_page_bytes);
-    }
+      batch_sizes.push_back(src_page_bytes * static_cast<size_t>(run_pages));
+    });
   }
 
   hipMemcpyAttributes attrs{};
@@ -155,7 +165,15 @@ inline bool try_copy_page_first_pages_batch(
   size_t attrs_idx = 0;
   size_t fail_idx = std::numeric_limits<size_t>::max();
   const hipError_t err = copy_fn(
-      batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, &attrs_idx, 1, &fail_idx, stream);
+      batch_dsts.data(),
+      batch_srcs.data(),
+      batch_sizes.data(),
+      batch_sizes.size(),
+      &attrs,
+      &attrs_idx,
+      1,
+      &fail_idx,
+      stream);
   if (err == hipErrorNotSupported && fail_idx == std::numeric_limits<size_t>::max()) {
     (void)hipGetLastError();
     return false;
@@ -205,15 +223,15 @@ inline bool try_copy_page_first_pages_batch(
     if (tensor_id == 0) {
       first_page_bytes = src_page_bytes;
     }
-    for (const auto page_offset : host::irange(num_pages)) {
+    for_each_contiguous_page_run(dst_indices_ptr, num_pages, page_size, [&](int64_t page_offset, int64_t run_pages) {
       char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
       char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
       batch_srcs.push_back(src_ptr);
       batch_dsts.push_back(dst_ptr);
-      batch_sizes.push_back(src_page_bytes);
-    }
+      batch_sizes.push_back(src_page_bytes * static_cast<size_t>(run_pages));
+    });
   }
   if (first_page_bytes < kLargeCopyThresholdBytes) {
     return false;
@@ -233,7 +251,7 @@ inline bool try_copy_page_first_pages_batch(
       batch_dsts.data(),
       batch_srcs.data(),
       batch_sizes.data(),
-      num_copies,
+      batch_sizes.size(),
       &attrs,
       attrs_idxs.data(),
       1,
