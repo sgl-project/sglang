@@ -21,6 +21,7 @@ image patch rows. This processor removes them after the parent processing
 to produce a single contiguous range of image tokens per image.
 """
 
+from bisect import bisect_left, bisect_right
 from typing import List, Union
 
 from sglang.srt.models.lightonocr import LightOnOCRForConditionalGeneration
@@ -83,11 +84,12 @@ class LightOnOCRProcessor(PixtralProcessor):
         input_ids = result.input_ids or []
         mm_items = result.mm_items or []
 
+        break_token_ids = self._break_token_ids
         new_input_ids = []
-        old_to_new = {}
+        surviving_old_indices = []
         for old_idx, token_id in enumerate(input_ids):
-            if token_id not in self._break_token_ids:
-                old_to_new[old_idx] = len(new_input_ids)
+            if token_id not in break_token_ids:
+                surviving_old_indices.append(old_idx)
                 new_input_ids.append(token_id)
 
         if len(new_input_ids) == len(input_ids):
@@ -97,14 +99,20 @@ class LightOnOCRProcessor(PixtralProcessor):
         for mm_item in mm_items:
             if not mm_item.offsets:
                 continue
-            new_indices = sorted(
-                old_to_new[idx]
-                for start, end in mm_item.offsets
-                for idx in range(start, end + 1)
-                if idx in old_to_new
-            )
-            if new_indices:
-                mm_item.offsets = [(new_indices[0], new_indices[-1])]
+            min_new_idx = None
+            max_new_idx = None
+            for start, end in mm_item.offsets:
+                lo = bisect_left(surviving_old_indices, start)
+                hi = bisect_right(surviving_old_indices, end) - 1
+                if lo <= hi:
+                    if min_new_idx is None or lo < min_new_idx:
+                        min_new_idx = lo
+                    if max_new_idx is None or hi > max_new_idx:
+                        max_new_idx = hi
+            if min_new_idx is not None and max_new_idx is not None:
+                mm_item.offsets = [(min_new_idx, max_new_idx)]
+            else:
+                mm_item.offsets = []
 
         result.input_ids = new_input_ids
         return result
