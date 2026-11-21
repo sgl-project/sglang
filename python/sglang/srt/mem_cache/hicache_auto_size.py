@@ -119,12 +119,18 @@ def _host_allocator_and_device(params: CacheInitParams):
 
 @contextmanager
 def _explicit_size_budget(params: CacheInitParams):
-    # One snapshot per rank: sampling per pool charges a late rank for its peers' pools.
-    # On gfx950 the snapshot is clamped to the rank's TTM pinnable share.
+    # Sampling per pool charges a late rank for its peers' pools, so ranks sharing a host take one
+    # snapshot each; on gfx950 it is clamped to the rank's TTM pinnable share.
     from sglang.srt.mem_cache.pool_host.rocm_budget import rocm_pinnable_share_bytes
 
+    gfx950_ttm = rocm_pinnable_share_bytes() is not None
+    if ranks_per_host() == 1 and not gfx950_ttm:
+        # A lone rank has no peer to race; sampling per pool still sees the pools of other engines
+        # on this host, which a snapshot would not.
+        yield
+        return
     allocator, kvcache_device = _host_allocator_and_device(params)
-    if rocm_pinnable_share_bytes() is not None:
+    if gfx950_ttm:
         # gfx950 pins every host pool out of its TTM share: no hugetlb credit
         allocator = kvcache_device = None
     plain, hugetlb = host_memory_budget_plain_hugetlb(
@@ -146,7 +152,7 @@ def auto_size_hicache(
     """Reduce the default HiCache ratio until this machine's host pools fit.
 
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size;
-    those pools keep their size but still book one host memory snapshot.
+    those pools keep their size; ranks sharing a host (or gfx950) book one host memory snapshot.
     """
     if not enabled:
         yield

@@ -344,7 +344,8 @@ def host_memory_preflight(
     )
     total = plain_part + pool_part
     if mode == HUGEPAGE_MODE_PREFER:
-        if plain_part > plain or pool_part > pool:
+        # A reserve above free RAM must not reject mappings that charge only the hugetlb pool.
+        if (plain_part > 0 and plain_part > plain) or pool_part > pool:
             return HostMemoryPreflight(total, min(plain + pool_part, plain_part + pool))
         if pool_part == 0 and plain_part > 0:
             return HostMemoryPreflight(total, max(plain, pool) if pool > 0 else plain)
