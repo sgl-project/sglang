@@ -6,9 +6,14 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.moe.topk as topk_module
+from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    prebuild_dispatchers,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -25,33 +30,105 @@ from sglang.srt.runtime_context import get_context, get_flags, get_model, get_pa
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def test_dispatch_preserves_negative_routing_sentinel():
+def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0):
     dispatcher = object.__new__(StandardDispatcher)
     dispatcher.moe_ep_size = 2
+    dispatcher.moe_ep_rank = moe_ep_rank
+    dispatcher.num_experts = 8 + num_shared
+    dispatcher.num_local_shared_experts = num_shared
+    dispatcher.num_local_routed_experts = 4
+    dispatcher.num_local_experts = 4 + num_shared
     dispatcher.skip_local_expert_mapping = False
-    dispatcher.local_expert_mapping = torch.tensor([-1, -1, 0, 1], dtype=torch.int32)
     dispatcher.use_aiter_moe_runner = False
+    dispatcher.local_expert_mapping = None
     dispatcher.expert_mask_gpu = None
+    return dispatcher
 
-    topk_ids = torch.tensor([[-1, 3], [2, 0]], dtype=torch.int32)
-    topk_output = StandardTopKOutput(
-        topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
-        topk_ids=topk_ids,
-        router_logits=None,
-    )
 
-    with patch(
-        "sglang.srt.layers.moe.token_dispatcher.standard."
-        "should_use_flashinfer_cutlass_moe_fp4_allgather",
-        return_value=False,
-    ):
-        output = dispatcher.dispatch(torch.ones((2, 4)), topk_output)
+class _LazyDispatcher(BaseDispatcher):
+    # No ``prebuild`` override: builds its state at the first dispatch.
 
-    expected = torch.tensor([[-1, 1], [0, -1]], dtype=torch.int32)
-    assert torch.equal(output.topk_output.topk_ids, expected)
+    prebuild_pending = True
+
+    def dispatch(self, hidden_states, topk_output):
+        raise NotImplementedError
+
+    def combine(self, combine_input):
+        raise NotImplementedError
+
+
+class TestStandardDispatcherPrebuild(CustomTestCase):
+    def setUp(self):
+        standard = "sglang.srt.layers.moe.token_dispatcher.standard."
+        self.enterContext(patch(standard + "get_device", return_value="cpu"))
+        self.enterContext(
+            patch(
+                standard + "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=False,
+            )
+        )
+
+    def test_prebuilt_mapping_matches_the_first_dispatch(self):
+        """EP2 output was garbage when a capture recorded the expert-mapping fill;
+        the prebuilt mapping must equal the lazy one, or stay unbuilt like it."""
+        topk_ids = torch.tensor([[0, 5], [8, 3]], dtype=torch.int32)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
+            topk_ids=topk_ids,
+            router_logits=None,
+        )
+        for rank in (0, 1):
+            with self.subTest(moe_ep_rank=rank):
+                lazy = _ep_dispatcher(moe_ep_rank=rank, num_shared=1)
+                lazy.dispatch(torch.ones((2, 4)), topk_output)
+                eager = _ep_dispatcher(moe_ep_rank=rank, num_shared=1)
+                self.assertTrue(eager.prebuild_pending)
+                eager.prebuild()
+                self.assertFalse(eager.prebuild_pending)
+                mapping = eager.local_expert_mapping
+                self.assertTrue(torch.equal(mapping, lazy.local_expert_mapping))
+                out = eager.dispatch(torch.ones((2, 4)), topk_output)
+                self.assertIs(eager.local_expert_mapping, mapping)
+                self.assertTrue(
+                    torch.equal(out.topk_output.topk_ids, mapping[topk_ids.long()])
+                )
+        for field, value in (
+            ("moe_ep_size", 1),
+            ("skip_local_expert_mapping", True),
+            ("use_aiter_moe_runner", True),
+        ):
+            with self.subTest(unbuilt_layout=field):
+                dispatcher = _ep_dispatcher(moe_ep_rank=0)
+                setattr(dispatcher, field, value)
+                self.assertFalse(dispatcher.prebuild_pending)
+                dispatcher.prebuild()
+                self.assertIsNone(dispatcher.local_expert_mapping)
+
+    def test_model_walk_prebuilds_every_dispatcher(self):
+        """Each dispatcher a module holds is prebuilt once, whatever its attribute name,
+        two-batch-overlap inners included; one without ``prebuild`` stays lazy."""
+        plain = _ep_dispatcher(moe_ep_rank=0)
+        inners = [_ep_dispatcher(moe_ep_rank=1), _ep_dispatcher(moe_ep_rank=1)]
+        wrapper = object.__new__(MaybeTboDeepEPDispatcher)
+        wrapper._inners = inners
+        model = torch.nn.Module()
+        for name, dispatcher in (
+            ("moe", plain),
+            ("custom", wrapper),
+            ("lora", plain),  # a LoRA wrapper shares its base layer's dispatcher
+            ("lazy", _LazyDispatcher()),
+        ):
+            setattr(model, name, torch.nn.Module())
+            setattr(getattr(model, name), f"{name}_dispatcher", dispatcher)
+
+        self.assertFalse(model.lazy.lazy_dispatcher.implements_prebuild)
+        self.assertEqual(prebuild_dispatchers(model), 2)
+        for dispatcher in [plain, *inners]:
+            self.assertIsNotNone(dispatcher.local_expert_mapping)
+        self.assertEqual(prebuild_dispatchers(model), 0)
 
 
 class TestLayerRunnerDispatch(CustomTestCase):
@@ -100,8 +177,12 @@ class TestLayerRunnerDispatch(CustomTestCase):
             top_k=2,
         )
 
-    def _build_layer(self, method, *, routing_method_type=None):
-        with patch.object(method, "create_weights"):
+    def _build_layer(self, method, *, scheme=None, routing_method_type=None):
+        def create_weights(*, layer, **kwargs):
+            if scheme is not None:
+                layer.scheme = scheme
+
+        with patch.object(method, "create_weights", side_effect=create_weights):
             return FusedMoE(
                 num_experts=4,
                 top_k=2,
@@ -371,6 +452,9 @@ class TestLayerRunnerDispatch(CustomTestCase):
 
     def test_direct_kernels_declare_their_execution_contract(self):
         """A missing or dormant runner must not change a direct kernel's ID ABI."""
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
         from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxint4_moe import (
             CompressedTensorsMxInt4MoE,
         )
@@ -380,18 +464,30 @@ class TestLayerRunnerDispatch(CustomTestCase):
         )
 
         cases = [
-            (CompressedTensorsMxInt4MoE, MoeRunnerBackend.FLASHINFER_TRTLLM, False),
-            (Mxfp4FlashinferTrtllmMoEMethod, MoeRunnerBackend.FLASHINFER_MXFP4, True),
-            (ModelOptFp8MoEMethod, MoeRunnerBackend.FLASHINFER_TRTLLM, False),
+            (
+                CompressedTensorsFusedMoEMethod,
+                CompressedTensorsMxInt4MoE,
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+                False,
+            ),
+            (
+                Mxfp4FlashinferTrtllmMoEMethod,
+                None,
+                MoeRunnerBackend.FLASHINFER_MXFP4,
+                True,
+            ),
+            (ModelOptFp8MoEMethod, None, MoeRunnerBackend.FLASHINFER_TRTLLM, False),
         ]
-        for method_type, backend, fp4 in cases:
+        for method_type, scheme_type, backend, fp4 in cases:
             with (
                 self.subTest(method=method_type.__name__),
                 get_flags().moe.override(runner_backend=backend),
             ):
                 method = object.__new__(method_type)
                 layer = self._build_layer(
-                    method, routing_method_type=RoutingMethodType.DeepSeekV3
+                    method,
+                    scheme=object.__new__(scheme_type) if scheme_type else None,
+                    routing_method_type=RoutingMethodType.DeepSeekV3,
                 )
                 self.assertEqual(layer.runner_backend, backend)
                 self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
@@ -427,21 +523,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
             CompressedTensorsMxInt4MoE,
         )
 
-        scheme = object.__new__(CompressedTensorsMxInt4MoE)
-        method = object.__new__(CompressedTensorsFusedMoEMethod)
-
-        def create_weights(*, layer, **kwargs):
-            layer.scheme = scheme
-
-        with patch.object(method, "create_weights", side_effect=create_weights):
-            layer = FusedMoE(
-                num_experts=4,
-                top_k=2,
-                hidden_size=4,
-                intermediate_size=96,
-                layer_id=0,
-                quant_method=method,
-            )
+        layer = self._build_layer(
+            object.__new__(CompressedTensorsFusedMoEMethod),
+            scheme=object.__new__(CompressedTensorsMxInt4MoE),
+        )
         self.assertEqual(layer.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM)
         self.assertTrue(layer.use_flashinfer_trtllm_moe)
         self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
@@ -453,6 +538,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
         from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
             build_ep_expert_map,
         )
+        from sglang.srt.layers.quantization.quark.quark import QuarkFusedMoEMethod
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a8_mxfp4_moe import (
             QuarkW4A8MXFp4MoE,
         )
@@ -462,7 +548,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
             "_use_gfx1250_w4a8",
             True,
         ):
-            expert_parallel = self._build_layer(object.__new__(QuarkW4A8MXFp4MoE))
+            expert_parallel = self._build_layer(
+                object.__new__(QuarkFusedMoEMethod),
+                scheme=object.__new__(QuarkW4A8MXFp4MoE),
+            )
             with get_parallel().override(
                 tp_size=1,
                 tp_rank=0,
@@ -471,7 +560,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 moe_ep_size=1,
                 moe_ep_rank=0,
             ):
-                single_rank = self._build_layer(object.__new__(QuarkW4A8MXFp4MoE))
+                single_rank = self._build_layer(
+                    object.__new__(QuarkFusedMoEMethod),
+                    scheme=object.__new__(QuarkW4A8MXFp4MoE),
+                )
         for layer in (expert_parallel, single_rank):
             self.assertIsNone(layer.runner_backend)
             self.assertFalse(layer.dispatcher.skip_local_expert_mapping)

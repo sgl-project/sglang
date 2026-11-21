@@ -73,6 +73,7 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
     return SimpleNamespace(
         tp_rank=0,
         tp_size=1,
+        dcp_size=1,
         pp_rank=0,
         pp_size=1,
         attn_cp_rank=0,
@@ -84,6 +85,8 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
         tp_lcm_size=None,
         should_split_heads=False,
         extra_config=extra_config,
+        unified_suffixes=None,
+        unified_chunk_spans=None,
     )
 
 

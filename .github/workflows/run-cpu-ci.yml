@@ -6,6 +6,8 @@
 # workflow it calls are trusted; only the code under test comes from the PR.
 # That code runs on hosted runners with a read-only token and no secrets
 # (nothing here inherits them), the same exposure as `/rerun-test` cpu mode.
+# The pass/fail result is written back to the handler's reply comment by a
+# separate job that checks out main, as rerun-test.yml does.
 name: Run CPU CI
 run-name: "[run-cpu-ci] ${{ inputs.git_ref }}"
 
@@ -35,6 +37,18 @@ on:
         required: false
         type: boolean
         default: true
+      # Set by the slash-command handler: the reply comment write-back-result
+      # updates with ✅/❌, and the marker locating its line.
+      reply_comment_id:
+        description: "Reply comment ID to write back result to"
+        required: false
+        type: string
+        default: ""
+      reply_marker:
+        description: "Marker for locating the line in the reply comment"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: run-cpu-ci-${{ inputs.git_ref }}
@@ -67,3 +81,36 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '15'
+
+  # Its own job, so the stage keeps the read-only token: only this job, which
+  # runs main's code and no PR code, can write to the PR's comments.
+  write-back-result:
+    needs: base-a-test-cpu
+    if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Write back result to reply comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ needs.base-a-test-cpu.result }}" == "success" ]]; then
+            STATUS=success
+          else
+            STATUS=failure
+          fi
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status "$STATUS" \
+            --repo "${{ github.repository }}"

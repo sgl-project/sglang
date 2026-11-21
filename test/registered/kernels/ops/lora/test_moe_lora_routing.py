@@ -11,7 +11,7 @@ from sglang.srt.lora.workspace import LoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _tensors(route):
@@ -251,6 +251,68 @@ class TestMoeLoraRouting(CustomTestCase):
                 self._assert_layout(result, expected, block_size, sentinel_last=True)
             for count in counts:
                 self.assertEqual(torch.count_nonzero(count).item(), 0)
+
+    def test_full_width_route_domains_across_builders_and_graph_replay(self):
+        """Wide signed IDs retain their validity through every aligned route builder."""
+        wide = 2**40
+        base_slots = torch.tensor([0, -wide, wide, 1, 0, 0, 1], dtype=torch.int64)
+        base_groups = torch.tensor(
+            [
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [-wide, wide],
+                [2**31, -1],
+                [torch.iinfo(torch.int64).min, torch.iinfo(torch.int64).max],
+                [2, 3],
+            ],
+            dtype=torch.int64,
+        )
+        for groups_per_slot in (1, 4):
+            for builder, repeats in (("small", 1), ("jit", 64), ("large", 1)):
+                with self.subTest(groups_per_slot=groups_per_slot, builder=builder):
+                    host_slots = base_slots.repeat(repeats)
+                    host_groups = base_groups.repeat(repeats, 1)
+                    slots = host_slots.to(self.device)
+                    groups = host_groups.to(self.device)
+                    workspace = LoraWorkspace()
+                    workspace.begin_forward(graph_mode=True)
+                    capacity = 256 if builder == "large" else None
+
+                    def build():
+                        return _tensors(
+                            build_route(
+                                slots,
+                                group_ids=groups,
+                                groups_per_slot=groups_per_slot,
+                                max_loras=2,
+                                block_size=16,
+                                workspace=workspace,
+                                tensor_prefix=f"fullwidth:{builder}",
+                                capacity=capacity,
+                            )
+                        )
+
+                    graph, result = self._capture(build)
+                    for state in ("initial", "inactive", "recovery"):
+                        next_slots = host_slots.clone()
+                        next_groups = host_groups.clone()
+                        if state == "inactive":
+                            next_slots.fill_(-wide)
+                            next_groups.fill_(-wide)
+                        slots.copy_(next_slots)
+                        groups.copy_(next_groups)
+                        for tensor in result:
+                            tensor.fill_(-7)
+                        graph.replay()
+                        expected = self._expected(
+                            next_slots, next_groups, groups_per_slot, 2
+                        )
+                        self._assert_layout(
+                            result, expected, 16, sentinel_last=builder == "large"
+                        )
+                        self.assertEqual(slots.cpu().tolist(), next_slots.tolist())
+                        self.assertEqual(groups.cpu().tolist(), next_groups.tolist())
 
     def test_parallel_workspace_joins_reused_graph_regions(self):
         workspace = LoraWorkspace()

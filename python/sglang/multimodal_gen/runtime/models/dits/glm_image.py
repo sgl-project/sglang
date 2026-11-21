@@ -487,9 +487,6 @@ class GlmImageAttention(torch.nn.Module):
     ):
         super().__init__()
 
-        self.k_cache = None
-        self.v_cache = None
-
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.dim_head = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
@@ -570,6 +567,7 @@ class GlmImageAttention(torch.nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def forward(
@@ -973,8 +971,6 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             bias=True,
         )
 
-        self.gradient_checkpointing = False
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1064,7 +1060,10 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 prior_token_drop.unsqueeze(-1), 0
             )
         else:
-            prior_embedding[prior_token_drop] *= 0.0
+            # select, not a boolean-mask write: its nonzero syncs the host
+            prior_embedding = torch.where(
+                prior_token_drop.unsqueeze(-1), prior_embedding * 0.0, prior_embedding
+            )
 
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.

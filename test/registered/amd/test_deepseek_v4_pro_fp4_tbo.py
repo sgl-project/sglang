@@ -17,7 +17,7 @@ needs the real 8-GPU model (a dummy model path would not exercise TBO). Uses the
 Pro model (fp4 routed experts); do NOT force SGLANG_DSV4_FP4_EXPERTS=false here or
 the expert weights are read at the wrong (fp8) shape.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro suite
 """
 
 import os
@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=14400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=14400, suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro", nightly=True
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(

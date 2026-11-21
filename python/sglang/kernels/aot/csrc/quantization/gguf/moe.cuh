@@ -114,18 +114,21 @@ static __device__ __forceinline__ void moe_q(
 
       if (threadIdx.x < n_per_r / QK8_1) {
         const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-        const int col_y_eff = token_offs[threadIdx.y] / top_k;
         const int block_x = ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
 
-        if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
-          const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
-          half2* dsi_dst = &tile_y_ds[threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
+#pragma unroll
+        for (int i = 0; i < mmq_x; i += nwarps) {
+          const int col_y_eff = token_offs[i / nwarps] / top_k;
+          if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+            const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
+            half2* dsi_dst = &tile_y_ds[(threadIdx.y + i) * (WARP_SIZE_GGUF / QI8_1) + kby];
 
-          if (need_sum) {
-            *dsi_dst = *dsi_src;
-          } else {
-            float* dfi_dst = (float*)dsi_dst;
-            *dfi_dst = __low2float(*dsi_src);
+            if (need_sum) {
+              *dsi_dst = *dsi_src;
+            } else {
+              float* dfi_dst = (float*)dsi_dst;
+              *dfi_dst = __low2float(*dsi_src);
+            }
           }
         }
       }

@@ -227,14 +227,6 @@ def is_async_tracing_available() -> bool:
     )
 
 
-def maybe_start_trace_exporter(
-    otlp_endpoint: str, server_name: str, trace_modules: Optional[str] = None
-):
-    """Conditionally start the async exporter based on SGLANG_TRACE_ASYNC env var."""
-    if envs.SGLANG_TRACE_ASYNC.get():
-        start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
-
-
 # ---------------------------------------------------------------------------
 # Exporter process
 # ---------------------------------------------------------------------------
@@ -883,7 +875,7 @@ class TraceReqContextAsync:
         serializable_info = None
         if abort_info is not None:
             try:
-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+                from sglang.srt.managers.req_types import BaseFinishReason
 
                 if isinstance(abort_info, BaseFinishReason):
                     serializable_info = abort_info.to_json()

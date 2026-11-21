@@ -6,8 +6,11 @@ use std::collections::HashMap;
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
-use super::deepseek_v4::{engine_message, normalize_tools, pydantic_bool, split_continuation};
 use super::glm53::valid_documents;
+use super::pydantic_dump::{
+    continues_final_message, engine_message, normalize_tools, pydantic_bool, split_continuation,
+};
+use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 /// `apply_chat_template` arguments SGLang passes itself: as kwargs they fail the
@@ -25,6 +28,10 @@ const RESERVED_KWARGS: &[&str] = &[
 ];
 
 const MEDIA_PARTS: &[&str] = &["image_url", "video_url", "audio_url", "input_audio"];
+
+/// What the template raises on a developer turn, which Dynamo would fold into
+/// the system turn.
+pub(crate) const DEVELOPER_ERROR: &str = "Unexpected message role.";
 
 /// Qwen3.8's templates (Max, 27B, Flash-Next): Qwen3-Coder's tool-call format,
 /// with a `reasoning_effort` instruction and `preserve_thinking`.
@@ -55,7 +62,7 @@ pub(crate) fn render(
     content_parts: bool,
     mut request: Value,
     defaults: &HashMap<String, Value>,
-) -> Result<(String, String), String> {
+) -> Result<(String, String), RenderError> {
     let args = template_args(&request, defaults)?;
     let tools = template_tools(&request)?;
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
@@ -65,21 +72,28 @@ pub(crate) fn render(
         .into_iter()
         .map(|message| template_message(message, content_parts))
         .collect::<Result<Vec<_>, _>>()?;
-    let prefix = split_continuation(&mut messages, &request)?;
+    let prefix = split_continuation(&mut messages, continues_final_message(&request)?);
     // The template raises on a later system turn, which Dynamo would demote to a user turn.
     if messages.iter().skip(1).any(|m| m["role"] == "system") {
         return Err("System message must be at the beginning.".into());
     }
+    if messages.iter().any(|m| m["role"] == "developer") {
+        return Err(DEVELOPER_ERROR.into());
+    }
     messages.iter_mut().for_each(join_text_parts);
     if messages.iter().any(trims_unlike_python) {
-        return Err("text Python's trim strips unlike minijinja's renders on the engine".into());
+        return Err(RenderError::Declined(
+            "text Python's trim strips unlike minijinja's".into(),
+        ));
     }
     if messages
         .iter()
         .chain(tools.iter().flatten())
         .any(prints_unlike_python)
     {
-        return Err("numbers serde_json prints unlike Python render on the engine".into());
+        return Err(RenderError::Declined(
+            "numbers serde_json prints unlike Python".into(),
+        ));
     }
     let PromptFormatter::OAI(formatter) = formatter;
     let prompt = formatter
@@ -94,10 +108,10 @@ pub(crate) fn render(
 
 /// The kwargs SGLang renders with: the request's, over its effort, filled in by
 /// the server's defaults.
-fn template_args(
+pub(super) fn template_args(
     request: &Value,
     defaults: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, String> {
+) -> Result<HashMap<String, Value>, RenderError> {
     let mut kwargs: HashMap<String, Value> = match &request["chat_template_kwargs"] {
         Value::Null => HashMap::new(),
         Value::Object(kwargs) => kwargs.clone().into_iter().collect(),
@@ -124,7 +138,7 @@ fn template_args(
         .iter()
         .find(|key| kwargs.contains_key(**key))
     {
-        return Err(format!("chat_template_kwargs.{key} renders on the engine"));
+        return Err(RenderError::Declined(format!("chat_template_kwargs.{key}")));
     }
     // `render_jinja_template` raises unless `documents` iterates as dicts.
     if !valid_documents(kwargs.get("documents").unwrap_or(&Value::Null)) {
@@ -147,7 +161,7 @@ fn template_args(
 
 /// `_process_messages`: the request tools as `Tool.model_dump()` gives them; only
 /// the named tool for a named `tool_choice`, and none for `"none"`.
-fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
+pub(super) fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
     let choice = &request["tool_choice"];
     let Some(tools) = request["tools"]
         .as_array()
@@ -162,8 +176,10 @@ fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
         .into_iter()
         .zip(tools)
         .map(|(mut dump, tool)| {
-            let defer = tool.get("defer_loading").filter(|v| !v.is_null());
-            dump["defer_loading"] = defer.map(pydantic_bool).transpose()?.into();
+            // `Tool._serialize` drops an unset `defer_loading`, null included.
+            if let Some(defer) = tool.get("defer_loading").filter(|v| !v.is_null()) {
+                dump["defer_loading"] = pydantic_bool(defer)?.into();
+            }
             // `Tool.type` is any string, dumped as sent.
             if let Some(kind) = tool.get("type").filter(|kind| kind.is_string()) {
                 dump["type"] = kind.clone();
@@ -180,7 +196,7 @@ fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
 /// The message SGLang's Jinja path hands the template: the pydantic dump without
 /// null fields, tool calls dumped, and content as
 /// `process_content_for_template_format` and `normalize_tool_content` leave it.
-fn template_message(message: Value, content_parts: bool) -> Result<Value, String> {
+fn template_message(message: Value, content_parts: bool) -> Result<Value, RenderError> {
     let mut message = engine_message(message);
     if let Some(fields) = message.as_object_mut() {
         // Only request tools reach the template; Dynamo rejects message-level ones.
@@ -196,7 +212,7 @@ fn template_message(message: Value, content_parts: bool) -> Result<Value, String
         .iter()
         .any(|part| MEDIA_PARTS.contains(&part["type"].as_str().unwrap_or_default()))
     {
-        return Err("Qwen3.8 media renders on the engine".into());
+        return Err(RenderError::Declined("Qwen3.8 media".into()));
     }
     // Strings keep only text parts, parts lists also tool references; strings and a
     // tool result's text parts join with spaces.
@@ -273,7 +289,7 @@ fn trims_unlike_python(message: &Value) -> bool {
 /// Whether `value` holds a number Dynamo's serde_json prints unlike Python's
 /// `json.dumps`: floats in exponent notation (`1e-06`, `1e+16`), integers
 /// beyond 64 bits, and negative zero, which serde_json also reads from `-0`.
-fn prints_unlike_python(value: &Value) -> bool {
+pub(super) fn prints_unlike_python(value: &Value) -> bool {
     match value {
         Value::Number(number) => number.as_f64().is_some_and(|f| {
             let positive_zero = f == 0.0 && f.is_sign_positive();
@@ -316,9 +332,11 @@ impl OAIChatLikeRequest for TemplateRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::json;
 
-    use crate::render::ChatFormatter;
+    use crate::render::{ChatFormatter, TemplateArgs, TemplateError};
 
     /// Qwen3.8 is known by its template, which takes content parts lists only when it
     /// renders media; Qwen3's template is not Qwen3.8.
@@ -347,5 +365,42 @@ mod tests {
             formatter(template.replace("preserve_thinking", "")),
             ChatFormatter::HuggingFace { .. }
         ));
+    }
+
+    /// A developer turn fails as in Python on the fallback path too, which media
+    /// requests take, rather than rendering as the system turn Dynamo folds it into.
+    #[test]
+    fn developer_turn_fails_on_the_fallback_path() {
+        let formatter = ChatFormatter::from_tokenizer_config(&json!({"chat_template": concat!(
+            "{#- <function= <parameter= preserve_thinking Reasoning effort is set to -#}",
+            "{%- for m in messages -%}<|im_start|>{{ m.role }}\n",
+            "{%- if m.content is string %}{{ m.content }}{% else %}",
+            "{%- for part in m.content %}{% if part.type == 'image_url' %}",
+            "<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ part.text }}{% endif %}",
+            "{%- endfor %}{% endif %}<|im_end|>\n{% endfor -%}"
+        )}))
+        .unwrap();
+        let body = json!({
+            "model": "test",
+            "messages": [
+                {"role": "developer", "content": "Be brief."},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "text", "text": "What is this?"}
+                ]}
+            ]
+        });
+        assert!(matches!(
+            formatter.render_request(body.clone(), &HashMap::new()),
+            Err(TemplateError::NeedsRenderFallback { .. })
+        ));
+        let request = serde_json::from_value(body.clone()).unwrap();
+        let args = TemplateArgs::new(&body, &HashMap::new());
+        match formatter.render_template(&request, &args) {
+            Err(TemplateError::Renderer { message }) => {
+                assert_eq!(message, super::DEVELOPER_ERROR)
+            }
+            other => panic!("{:?}", other.map(|(prompt, _)| prompt.into_text())),
+        }
     }
 }

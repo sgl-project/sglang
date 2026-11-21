@@ -7,6 +7,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Iterator,
     Optional,
     OrderedDict,
     Protocol,
@@ -21,8 +22,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
+        AscendOpsCombineInput,
+        AscendOpsDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
@@ -125,16 +126,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_triton_kernels(
+    def format_is_ascend_ops(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[StandardDispatchOutput]:
-        return dispatch_output.format.is_standard()
-
-    @staticmethod
-    def format_is_ascend_tp(
-        dispatch_output: DispatchOutput,
-    ) -> TypeGuard[AscendTPDispatchOutput]:
-        return dispatch_output.format.is_ascend_tp()
+    ) -> TypeGuard[AscendOpsDispatchOutput]:
+        return dispatch_output.format.is_ascend_ops()
 
     @staticmethod
     def format_is_deepep_normal(
@@ -173,13 +168,13 @@ class DispatchOutputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
-    ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
-    def is_ascend_tp(self) -> bool:
-        return self == DispatchOutputFormat.ASCEND_TP
+    def is_ascend_ops(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_OPS
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -231,10 +226,10 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
-    def format_is_ascend_tp(
+    def format_is_ascend_ops(
         combine_input: CombineInput,
-    ) -> TypeGuard[AscendTPCombineInput]:
-        return combine_input.format == CombineInputFormat.ASCEND_TP
+    ) -> TypeGuard[AscendOpsCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_OPS
 
     @staticmethod
     def format_is_deepep_normal(
@@ -276,7 +271,7 @@ class CombineInputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
-    ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
 
 
 class RoutewiseLayout(Enum):
@@ -437,3 +432,64 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    @property
+    def prebuild_pending(self) -> bool:
+        """True while ``prebuild()`` would still create state;
+        the first dispatch otherwise creates it lazily."""
+        return False
+
+    def prebuild(self) -> None:
+        """Create the lazy dispatch state (comm buffers, expert maps) outside capture;
+        idempotent, a no-op by default."""
+
+    @property
+    def implements_prebuild(self) -> bool:
+        """Without a ``prebuild`` override,
+        CUDA graph persistence falls back to native capture."""
+        return type(self).prebuild is not BaseDispatcher.prebuild
+
+
+def iter_dispatchers(model: torch.nn.Module) -> Iterator[BaseDispatcher]:
+    """Each distinct dispatcher that a module of ``model`` holds as an attribute;
+    models name the attribute differently and LoRA wrappers share their base's."""
+    seen = set()
+    for module in model.modules():
+        for value in vars(module).values():
+            if isinstance(value, BaseDispatcher) and id(value) not in seen:
+                seen.add(id(value))
+                yield value
+
+
+def prebuild_dispatchers(model: torch.nn.Module) -> int:
+    """Prebuild every dispatcher of ``model``; returns how many had state pending."""
+    num_prebuilt = 0
+    for dispatcher in iter_dispatchers(model):
+        if dispatcher.implements_prebuild and dispatcher.prebuild_pending:
+            dispatcher.prebuild()
+            num_prebuilt += 1
+    return num_prebuilt
+
+
+def build_dispatcher_quant_config(
+    layer: torch.nn.Module,
+    weight_dtype: Optional[torch.dtype],
+    quant_type: Optional[Any] = None,
+    gate_up_interleaved: Optional[bool] = None,
+) -> dict:
+    """Describe a MoE layer's numerics to its dispatcher.
+
+    ``quant_type`` is the ``AiterQuantType`` the layer will hand AITER; it is
+    what separates the two fp8 activation formats. ``weight_dtype`` is semantic,
+    not storage: MXFP4 is stored as uint8 but reported as float4_e2m1fn_x2.
+    Consumers must tolerate every key but ``weight_dtype`` being absent.
+    """
+    runner_config = getattr(layer, "moe_runner_config", None)
+    return {
+        "weight_dtype": weight_dtype,
+        "quant_type": quant_type,
+        "runner_config": runner_config,
+        "gate_up_interleaved": gate_up_interleaved,
+        "swiglu_limit": getattr(runner_config, "swiglu_limit", None)
+        or getattr(runner_config, "gemm1_clamp_limit", None),
+    }

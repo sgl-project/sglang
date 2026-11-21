@@ -27,6 +27,7 @@ class EncoderArchConfig(ArchConfig):
             AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.SAGE_ATTN_3,
+            AttentionBackendEnum.AMX_ATTN,
         }
     )
     output_hidden_states: bool = False
@@ -51,7 +52,6 @@ class TextEncoderArchConfig(EncoderArchConfig):
         default_factory=list
     )  # mapping from huggingface weight names to custom names
     tokenizer_kwargs: dict[str, Any] = field(default_factory=dict)
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [])
 
     def __post_init__(self) -> None:
         self.tokenizer_kwargs = {
@@ -64,6 +64,13 @@ class TextEncoderArchConfig(EncoderArchConfig):
 @dataclass
 class ImageEncoderArchConfig(EncoderArchConfig):
     pass
+
+
+@dataclass
+class AudioEncoderArchConfig(EncoderArchConfig):
+    model_id: str = ""
+    sample_rate: int = 16000
+    video_rate: int = 30
 
 
 @dataclass
@@ -99,3 +106,8 @@ class TextEncoderConfig(EncoderConfig):
 @dataclass
 class ImageEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=ImageEncoderArchConfig)
+
+
+@dataclass
+class AudioEncoderConfig(EncoderConfig):
+    arch_config: ArchConfig = field(default_factory=AudioEncoderArchConfig)

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
@@ -135,18 +136,6 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
-def swiglu_gpt_oss_sigmoid_alpha_contiguous(
-    output: torch.Tensor,
-    input: torch.Tensor,  # first half is gate, second half is up
-    gemm1_alpha: float,
-    gemm1_limit: float,
-) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d].clamp(max=gemm1_limit)
-    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
-    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
-
-
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -275,11 +264,14 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
+            topk_ids, block_size_m, return_inactive_prefix_count=True
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            return_inactive_prefix_count=expert_map is None,
         )
 
     if workspace is None:
@@ -339,6 +331,8 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -352,11 +346,12 @@ def fused_marlin_moe(
     if activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:
             raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
+        swiglu_oai_split(
             intermediate_cache1.view(-1, gemm1_n),
             gemm1_alpha,
+            1.0,
             clamp_limit,
+            out=intermediate_cache2,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
@@ -380,9 +375,7 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    # Gate-up is dead after activation, so its storage can hold the down output.
-    # Skipped down routes must start at zero before the top-k reduction.
-    intermediate_cache3.zero_()
+    # Gate-up is dead; the down GEMM defines inactive rows in the shared output.
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
@@ -401,7 +394,10 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
+        zero_inactive_output=True,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
