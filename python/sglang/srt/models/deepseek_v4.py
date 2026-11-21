@@ -428,7 +428,9 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
-def _wo_a_aiter_gemm_eligible(use_aiter: bool, is_hip: bool, is_gfx95: bool) -> bool:
+def _wo_a_aiter_gemm_eligible(
+    use_aiter: bool, is_hip: bool, is_gfx95: bool, is_gfx1250: bool = False
+) -> bool:
     """Static eligibility for the aiter ``wo_a`` reroute.
 
     Folds the global ``SGLANG_USE_AITER`` switch and the HIP/gfx95 platform
@@ -436,7 +438,7 @@ def _wo_a_aiter_gemm_eligible(use_aiter: bool, is_hip: bool, is_gfx95: bool) -> 
     ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
-    return bool(use_aiter and is_hip and is_gfx95)
+    return bool(use_aiter and is_hip and (is_gfx95 or is_gfx1250))
 
 
 # Resolve eligibility and import the aiter kernel ONCE at module import: the
@@ -448,6 +450,7 @@ _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
     _use_aiter,
     _is_hip,
     _is_gfx95_supported,
+    _is_gfx1250_supported,
 )
 _wo_a_batched_gemm_bf16 = None
 if _wo_a_aiter_batched_gemm_enabled:
@@ -2201,12 +2204,10 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            q_lora_e8m0 = (
-                _is_gfx95_supported or _is_gfx1250_supported
-            ) and self._q_lora_quant_e8m0(with_indexer=False)
-            if (_is_gfx95_supported or _is_gfx1250_supported) and (
-                _use_aiter or q_lora_e8m0
-            ):
+            q_lora_e8m0 = _is_gfx95_supported and self._q_lora_quant_e8m0(
+                with_indexer=False
+            )
+            if _is_gfx95_supported and (_use_aiter or q_lora_e8m0):
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -2348,12 +2349,10 @@ class MQALayer(MqaAttentionBase):
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
         if do_fused_qk_norm_rope:
-            q_lora_e8m0 = (
-                _is_gfx95_supported or _is_gfx1250_supported
-            ) and self._q_lora_quant_e8m0(with_indexer=True)
-            if (_is_gfx95_supported or _is_gfx1250_supported) and (
-                _use_aiter or q_lora_e8m0
-            ):
+            q_lora_e8m0 = _is_gfx95_supported and self._q_lora_quant_e8m0(
+                with_indexer=True
+            )
+            if _is_gfx95_supported and (_use_aiter or q_lora_e8m0):
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
