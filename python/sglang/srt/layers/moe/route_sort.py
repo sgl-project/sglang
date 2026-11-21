@@ -183,6 +183,9 @@ def try_route_sort_fused(
     block_m = None if consumer is None else consumer.sort_block_m(scores.shape[0])
     if block_m not in moe_route_radix4.SORT_BLOCK_MS:
         return None
+    # Past SORT_MAX_TOKENS AITER's own sort is the faster pipeline.
+    if scores.shape[0] > moe_route_radix4.SORT_MAX_TOKENS:
+        return None
     # The tail sort's helper CTAs wait on each other, so a partition too small to hold them
     # together keeps the unfused router.
     if not moe_route_radix4.sort_tail_fits(scores.shape[0], scores.device):

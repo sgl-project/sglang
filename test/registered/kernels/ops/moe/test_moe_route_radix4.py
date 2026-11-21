@@ -989,7 +989,8 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     sizes = [1, 16, 64, 65, 128, 256, 512]
     expected = {}
     for m in sizes:
-        expected[m] = aiter_block_m(get_2stage_cfgs(**consumer.cfg_args(m)))
+        block_m = aiter_block_m(get_2stage_cfgs(**consumer.cfg_args(m)))
+        expected[m] = block_m if m <= moe_route_radix4.SORT_MAX_TOKENS else None
     registered = {}
     for m in sizes:
         registrations = []
