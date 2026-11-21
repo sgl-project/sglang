@@ -130,13 +130,19 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             set_weight_attrs(offset_second, extra_weight_attrs)
 
         # ---- bias for scale (activation clip path) ----
-        # This parameter is always created; the kernel uses it only when activation_use_clip is True.
+        # FuseEP consumes checkpoint compensation before ordinary scale processing.
         scale_bias = torch.nn.Parameter(
             torch.empty(
                 num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32
             ),
             requires_grad=False,
         )
+        from sglang.srt.layers.moe import get_moe_a2a_backend
+        from sglang.srt.runtime_context import get_exec
+
+        if get_moe_a2a_backend().is_ascend_fuseep() and get_exec().moe.fuseep_mode == 3:
+            # Detect missing checkpoint compensation instead of consuming empty storage.
+            scale_bias.data.fill_(float("nan"))
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
         set_weight_attrs(scale_bias, extra_weight_attrs)
 

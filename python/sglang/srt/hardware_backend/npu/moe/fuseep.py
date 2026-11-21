@@ -8,6 +8,12 @@ weight-postprocess helper that NPU quant_methods call from their
 
 from __future__ import annotations
 
+import importlib.metadata
+import inspect
+import json
+import logging
+import math
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,6 +49,44 @@ def forward_fuseep(
     hidden_states: torch.Tensor,
     topk_output: TopKOutput,
 ) -> torch.Tensor:
+    mode = get_exec().moe.fuseep_mode
+    if mode == 3:
+        capacity = _mega_moe_capacity()
+        _log_mega_moe_geometry(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            capacity,
+            layer.moe_ep_size,
+            layer.moe_tp_size,
+        )
+        if hidden_states.dtype != torch.bfloat16:
+            raise ValueError("FuseEP mode 3 requires BF16 hidden states")
+        if hidden_states.shape[0] > capacity:
+            raise ValueError(
+                f"FuseEP mode 3 input has {hidden_states.shape[0]} tokens, exceeding "
+                f"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={capacity}"
+            )
+        if not getattr(layer, "_mega_moe_weights_processed", False):
+            raise RuntimeError("FuseEP mode 3 expert weights have not been prepared")
+        buffer = _get_fuseep_buffer(layer)
+        hidden_states, _ = buffer.fused_deep_moe(
+            x=hidden_states,
+            topk_idx=topk_output.topk_ids.to(torch.int32),
+            topk_weights=topk_output.topk_weights.to(torch.float32),
+            gmm1_permuted_weight=layer.w13_weight,
+            gmm1_permuted_weight_scale=getattr(layer, "w13_weight_scale", None),
+            gmm2_weight=layer.w2_weight,
+            gmm2_weight_scale=getattr(layer, "w2_weight_scale", None),
+            num_max_dispatch_tokens_per_rank=capacity,
+            num_experts=layer.num_experts,
+            fuse_mode=3,
+            quant_mode=layer._mega_moe_quant_mode,
+            **layer._mega_moe_activation_params,
+            l1_bias=getattr(layer, "w13_scale_bias", None),
+            l2_bias=getattr(layer, "w2_scale_bias", None),
+        )
+        return hidden_states
+
     buf = _get_fuseep_buffer(layer)
     hidden_states, _ = buf.fused_deep_moe(
         hidden_states,
@@ -56,9 +100,331 @@ def forward_fuseep(
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         ),
         num_experts=layer.num_experts,
-        fuse_mode=get_exec().moe.fuseep_mode,
+        fuse_mode=mode,
     )
     return hidden_states
+
+
+@lru_cache(maxsize=128)
+def _log_mega_moe_geometry(rows: int, hidden: int, capacity: int, ep: int, tp: int):
+    logging.getLogger(__name__).info(
+        "A3 MegaMoE input_shape=(%d, %d) dispatch_capacity=%d ep_size=%d moe_tp_size=%d",
+        rows,
+        hidden,
+        capacity,
+        ep,
+        tp,
+    )
+
+
+def _mega_moe_capacity() -> int:
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if not 1 <= capacity <= 4096:
+        raise ValueError(
+            "A3 FuseEP mode 3 requires "
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK in [1, 4096]"
+        )
+    return capacity
+
+
+def _mega_moe_activation(config):
+    activation = config.activation
+    if not getattr(config, "is_gated", True):
+        raise ValueError("MegaMoE requires a gated activation")
+    if getattr(config, "swiglu_limit", None) not in (None, 0):
+        raise ValueError("MegaMoE does not expose clipped SwiGLU through DeepEP")
+    if getattr(config, "gemm1_beta", None) is not None:
+        raise ValueError("MegaMoE does not expose gemm1_beta through DeepEP")
+    if getattr(config, "apply_router_weight_on_input", False) or getattr(
+        config, "no_combine", False
+    ):
+        raise ValueError(
+            "MegaMoE requires routing weights on the combined expert output"
+        )
+    alpha = getattr(config, "gemm1_alpha", None)
+    clamp = getattr(config, "gemm1_clamp_limit", None)
+    if activation in ("silu", "swiglu"):
+        if alpha not in (None, 1.0) or clamp is not None:
+            raise ValueError(
+                "Ordinary SwiGLU cannot use SiTU/OAI activation parameters"
+            )
+        return dict(activation="swiglu")
+    if activation in ("situ", "situglu"):
+        beta = 4.0 if alpha is None else float(alpha)
+        linear_beta = None if clamp is None else float(clamp)
+        if (
+            not math.isfinite(beta)
+            or beta <= 0
+            or (
+                linear_beta is not None
+                and (not math.isfinite(linear_beta) or linear_beta < 0)
+            )
+        ):
+            raise ValueError(
+                "SiTU requires finite positive beta and nonnegative linear_beta"
+            )
+        # None explicitly preserves the model's unclamped SiTU variant.
+        return dict(activation="situ", beta=beta, linear_beta=linear_beta)
+    raise ValueError(
+        f"MegaMoE does not support activation {activation!r}; use SwiGLU or SiTU"
+    )
+
+
+def _check_mega_moe_operator(operator):
+    # Validate the A3 invocation, independent of DeepEP's optional MXFP kwargs.
+    arguments = dict.fromkeys(
+        (
+            "x",
+            "topk_ids",
+            "topk_weights",
+            "l1_weights",
+            "l2_weights",
+            "sym_buffer",
+            "l1_weights_sf",
+            "l2_weights_sf",
+            "l1_bias",
+            "l2_bias",
+            "x_active_mask",
+        )
+    )
+    arguments.update(activation="swiglu", activation_params=None)
+    try:
+        inspect.signature(operator).bind(**arguments)
+    except TypeError as exc:
+        raise RuntimeError(
+            "DeepEP's MegaMoE loader returned an incompatible A3 operator; "
+            "upgrade to matching CANN toolkit/operator packages exposing "
+            f"activation_params and use a compatible DeepEP build: {exc}"
+        ) from exc
+    return sorted(arguments)
+
+
+@lru_cache(maxsize=1)
+def _check_mega_moe_support():
+    try:
+        import cann_ops_transformer
+        import deep_ep
+        from cann_ops_transformer.ops import get_symm_buffer_for_mega_moe, mega_moe
+        from deep_ep import Buffer
+        from deep_ep.buffer import FuseMode
+        from deep_ep.strategies import fused_strategy
+
+        arguments = inspect.signature(Buffer.fused_deep_moe).parameters
+        for name, module, package in (
+            ("deep_ep", deep_ep, "deep-ep"),
+            ("cann_ops_transformer", cann_ops_transformer, "cann-ops-transformer"),
+        ):
+            try:
+                version = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                version = getattr(module, "__version__", None)
+            logging.getLogger(__name__).warning(
+                "MegaMoE package %s: path=%s version=%s", name, module.__file__, version
+            )
+        logging.getLogger(__name__).warning(
+            "MegaMoE signatures: fused_deep_moe%s mega_moe%s",
+            inspect.signature(Buffer.fused_deep_moe),
+            inspect.signature(mega_moe),
+        )
+        required = {
+            "fuse_mode",
+            "quant_mode",
+            "activation",
+            "beta",
+            "linear_beta",
+            "l1_bias",
+            "l2_bias",
+        }
+        if int(FuseMode.MEGA_MOE) != 3 or not required.issubset(arguments):
+            raise RuntimeError("DeepEP does not expose the current MegaMoE API")
+        if not callable(mega_moe) or not callable(get_symm_buffer_for_mega_moe):
+            raise RuntimeError("ops-transformer does not expose MegaMoE")
+        operator_signature = inspect.signature(mega_moe)
+        # DeepEP owns native-operator compatibility; do not patch its strategies here.
+        get_symm_buffer_for_mega_moe, compatible_operator = (
+            fused_strategy.MegaMoeStrategy._load_mega_moe_ops()
+        )
+        keywords = _check_mega_moe_operator(compatible_operator)
+        diagnostic = {
+            "deep_ep": {
+                "path": deep_ep.__file__,
+                "version": getattr(deep_ep, "__version__", None),
+            },
+            "cann_ops_transformer": {
+                "path": cann_ops_transformer.__file__,
+                "version": getattr(cann_ops_transformer, "__version__", None),
+            },
+            "fused_deep_moe_signature": str(inspect.signature(Buffer.fused_deep_moe)),
+            "mega_moe_signature": str(operator_signature),
+            "strategy_path": fused_strategy.__file__,
+            "operator_keywords": sorted(keywords),
+            "legacy_swiglu_adapter": compatible_operator is not mega_moe,
+        }
+        logging.getLogger(__name__).warning(
+            "MegaMoE dependencies: %s", json.dumps(diagnostic)
+        )
+    except (
+        ImportError,
+        AttributeError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        OSError,
+        SyntaxError,
+    ) as exc:
+        raise RuntimeError(
+            "FuseEP mode 3 requires matching CANN, ops-transformer and "
+            "DeepEP packages exposing FuseMode.MEGA_MOE, activation and bias "
+            f"arguments; dependency check failed: {exc}"
+        ) from exc
+    soc = torch.npu.get_device_name()
+    if not soc.startswith("Ascend910_93"):
+        raise ValueError(f"FuseEP mode 3 currently supports Ascend A3, got {soc}")
+    return get_symm_buffer_for_mega_moe, compatible_operator
+
+
+def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+        NPUUnquantMoEMethod,
+        NPUW4A8Int8MoEMethod,
+        NPUW8A8Int8MoEMethod,
+    )
+
+    if getattr(layer, "_mega_moe_weights_processed", False):
+        return
+    kernels = (layer.w13_kernel, layer.w2_kernel)
+    if type(kernels[0]) is not type(kernels[1]) or type(kernels[0]) not in (
+        NPUW4A8Int8MoEMethod,
+        NPUW8A8Int8MoEMethod,
+        NPUUnquantMoEMethod,
+    ):
+        raise ValueError(
+            "A3 MegaMoE requires homogeneous BF16, W4A8 INT, or W8A8 INT experts; FP8/MXFP/FP4 layouts need a separate platform adapter"
+        )
+    unquantized = type(kernels[0]) is NPUUnquantMoEMethod
+    w4a8 = isinstance(kernels[0], NPUW4A8Int8MoEMethod)
+    if w4a8 and any(
+        not kernel.is_per_channel_weight or kernel.activation_use_clip
+        for kernel in kernels
+    ):
+        raise ValueError(
+            "FuseEP mode 3 requires per-channel scales without activation clipping"
+        )
+    config = layer.moe_runner_config
+    activation_params = _mega_moe_activation(config)
+    if layer.num_fused_shared_experts:
+        raise ValueError("FuseEP mode 3 requires separate shared experts")
+    ep = layer.moe_ep_size
+    if layer.moe_tp_size != 1 or ep not in (2, 4, 8, 16, 32, 64):
+        raise ValueError("A3 FuseEP mode 3 requires MoE TP=1 and EP=2/4/8/16/32/64")
+    experts = layer.num_local_experts
+    hidden = layer.hidden_size
+    intermediate = layer.intermediate_size_per_partition
+    if (
+        not ep <= layer.num_experts <= 1024
+        or layer.num_experts != experts * ep
+        or experts > 128
+        or not 1024 <= hidden <= 8192
+        or hidden % 512
+        or not 1024 <= intermediate <= 3584
+        or intermediate % 512
+        or not 1 <= config.top_k <= 16
+    ):
+        raise ValueError("Expert geometry is outside A3 MegaMoE limits")
+
+    # Validate both projections before replacing registered parameters with lists.
+    source = {}
+    for prefix, channels, inputs in (
+        ("w13", 2 * intermediate, hidden),
+        ("w2", hidden, intermediate),
+    ):
+        weight = getattr(layer, f"{prefix}_weight")
+        scale = getattr(layer, f"{prefix}_weight_scale", None)
+        shape = (experts, channels // (2 if w4a8 else 1), inputs)
+        dtype = torch.bfloat16 if unquantized else torch.int8
+        if weight.dtype != dtype or tuple(weight.shape) != shape:
+            raise ValueError(
+                f"Invalid {prefix} checkpoint weight; expected {dtype} storage {shape}"
+            )
+        if unquantized:
+            if scale is not None or any(
+                getattr(layer, f"{prefix}_{suffix}", None) is not None
+                for suffix in ("bias", "weight_bias", "scale_bias")
+            ):
+                raise ValueError(
+                    "BF16 MegaMoE requires weights without quantization scales or expert bias"
+                )
+            source[prefix] = weight.data, None, None
+            continue
+        if (
+            scale.dtype != torch.float32
+            or tuple(scale.shape) != (experts, channels, 1)
+            or scale.device != weight.device
+            or not torch.isfinite(scale).all().item()
+            or (scale < 0).any().item()
+            or hasattr(layer, f"{prefix}_weight_scale_second")
+        ):
+            raise ValueError(
+                f"FuseEP mode 3 requires finite per-channel {prefix} scales"
+            )
+        offset = getattr(layer, f"{prefix}_weight_offset", None)
+        if offset is not None and torch.count_nonzero(offset).item():
+            raise ValueError(
+                f"FuseEP mode 3 does not support nonzero {prefix} weight offsets"
+            )
+        bias = getattr(layer, f"{prefix}_scale_bias", None)
+        if w4a8:
+            if (
+                bias is None
+                or bias.ndim != 3
+                or tuple(bias.shape[:2]) != (experts, channels)
+                or bias.shape[2] < 1
+                or bias.dtype != torch.float32
+                or bias.device != weight.device
+                or not torch.isfinite(bias).all().item()
+            ):
+                raise ValueError(
+                    f"FuseEP mode 3 requires loaded {prefix}_scale_bias compensation"
+                )
+        elif any(
+            getattr(layer, f"{prefix}_{suffix}", None) is not None
+            for suffix in ("bias", "weight_bias", "scale_bias")
+        ):
+            raise ValueError("FuseEP mode 3 W8A8 does not support expert bias")
+        source[prefix] = weight.data, scale.data, bias
+
+    _mega_moe_capacity()
+    _check_mega_moe_support()
+    converted = {}
+    for prefix, (weight, scale, bias) in source.items():
+        weights = [
+            npu_format_cast(expert.transpose(-2, -1).contiguous())
+            for expert in weight.unbind(0)
+        ]
+        converted[f"{prefix}_weight"] = (
+            [expert.view(torch.int32) for expert in weights] if w4a8 else weights
+        )
+        if not unquantized:
+            converted[f"{prefix}_weight_scale"] = [
+                expert.reshape(-1)
+                .contiguous()
+                .view(torch.int32)
+                .to(torch.int64)
+                .bitwise_and(0xFFFFFFFF)
+                .view(torch.uint64)
+                for expert in scale.unbind(0)
+            ]
+        if w4a8:
+            # MoE TP=1 owns all loaded W2 compensation segments.
+            converted[f"{prefix}_scale_bias"] = [
+                expert.sum(dim=-1) for expert in bias.data.unbind(0)
+            ]
+    for name, value in converted.items():
+        delattr(layer, name)
+        setattr(layer, name, value)
+    layer._mega_moe_activation_params = activation_params
+    layer._mega_moe_quant_mode = 0 if unquantized else 1
+    layer._mega_moe_weights_processed = True
 
 
 def _permute_w13_weight_scale(w: torch.Tensor, tile_n: int) -> torch.Tensor:
@@ -121,10 +487,10 @@ def _scale_from_float_to_int64(scale: torch.Tensor) -> torch.nn.Parameter:
 
 
 def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
-    """Apply the Ascend FuseEP-specific weight layout for a single weight group.
-
-    Invoked by ``maybe_apply_fuseep_weights`` for both ``"w13"`` and ``"w2"``.
-    """
+    """Prepare a FuseEP projection; mode 3 converts both projections together."""
+    if get_exec().moe.fuseep_mode == 3:
+        _process_mega_moe_weights(layer)
+        return
     if get_exec().moe.fuseep_mode == 1:
         # -- The fused MoE optimization mode "1": dispatch_gmm_combine_decode --
         if weight_prefix == "w13":
