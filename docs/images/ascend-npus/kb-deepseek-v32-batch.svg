@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="Decode cost versus batch size at 128k context (DeepSeek-V3.2)">
+<rect x="0" y="0" width="760" height="320" rx="12" fill="#f7f8fa"/>
+<text x="24" y="40" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#1c2330">Decode cost versus batch size at 128k context (DeepSeek-V3.2)</text>
+<text x="24" y="62" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#6b7280">A3 Series, W8A8 INT8, 32 cards, 128k input + 1k output.</text>
+<line x1="300" y1="86" x2="300" y2="250" stroke="#dfe3e9" stroke-width="1"/>
+<text x="286" y="113.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">Batch 8 · low latency</text>
+<rect x="300" y="96.0" width="82.3" height="26" rx="4" fill="#2f6feb"/>
+<text x="392.3" y="113.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">26 ms</text>
+<text x="286" y="188.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">Batch 16 · high throughput</text>
+<rect x="300" y="171.0" width="338.8" height="26" rx="4" fill="#f08a24"/>
+<text x="648.8" y="188.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">107 ms</text>
+<text x="24" y="302" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#8a919e">Source: DeepSeek-V3.2 best practice, low-latency and high-throughput configurations.</text>
+</svg>

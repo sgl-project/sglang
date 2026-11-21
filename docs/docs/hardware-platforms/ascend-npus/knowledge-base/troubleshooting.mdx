@@ -1,0 +1,72 @@
+---
+title: "Troubleshooting index"
+description: "Map an Ascend NPU symptom or log signature to its FAQ section, and run the health checks that resolve the most common deployment failures."
+keywords:
+  - troubleshooting
+  - 故障排查
+  - 报错
+  - error
+  - FAQ
+  - OOM
+  - out of memory
+  - 显存不足
+  - 507035
+  - 507000
+  - aclnnInplaceFillScalar
+  - alloc_extend_kernel
+  - op.preamble.length
+  - HCCL
+  - Errno 101
+  - fp8
+---
+
+The [FAQ](/docs/hardware-platforms/ascend-npus/faq) holds the full log excerpts and fixes. This page is the index: find the signature you see, confirm which section applies, then follow the link. Reference the section number when you file an issue; the table follows the current FAQ numbering.
+
+## Match a signature
+
+| What you see | Likely area | First action | FAQ section |
+| --- | --- | --- | --- |
+| `Context corruption detected`, `op.preamble.length <= op.nbytes`, then `Fatal Python error: Aborted` | PD disaggregation, long sequences | Disable overlap scheduling on the prefill node with `--disable-overlap-schedule` | [§1](/docs/hardware-platforms/ascend-npus/faq) |
+| `aclnnInplaceFillScalar failed, error code is 507000` in graph mode | Too many captured NPU graphs | Upgrade to CANN 8.5 with torch_npu 2.8, or cap captured graphs at 10 or fewer | [§2](/docs/hardware-platforms/ascend-npus/faq) |
+| `alloc_extend_kernel` fault, `ACL stream synchronize failed, error code:507035` | Kernel path in the NPU allocator | Apply the allocator branch workaround in FAQ §3 | [§3](/docs/hardware-platforms/ascend-npus/faq) |
+| `Not enough memory. Please try to increase --mem-fraction-static` | KV cache does not fit | Check `npu-smi info`, then spread with `--tp` or adjust `--mem-fraction-static` | [§4](/docs/hardware-platforms/ascend-npus/faq) |
+| You need to rebuild or update `sgl_kernel_npu` | Kernel package version | Rebuild and reinstall the wheel from source | [§5](/docs/hardware-platforms/ascend-npus/faq) |
+| `[Errno 101] Network is unreachable` while fetching ShareGPT | No direct Hugging Face access | Set `HF_ENDPOINT` to a mirror, or pre-download the dataset | [§6](/docs/hardware-platforms/ascend-npus/faq) |
+| `Unexpected type fp8` at load time | FP8 checkpoint on Ascend | Replace the weights with an INT8 checkpoint | [§7](/docs/hardware-platforms/ascend-npus/faq) |
+| Unsure whether to use a stable tag or a daily build | Image selection | Use the validated tag for production; try a daily build only to test a fix | [§8](/docs/hardware-platforms/ascend-npus/faq) |
+
+## Run the health checks first
+
+Most startup failures are settled by these four checks before any log reading:
+
+```shell Command
+npu-smi info
+npu-smi info -l
+docker images | grep -i sglang
+env | grep -E "HCCL_SOCKET_IFNAME|GLOO_SOCKET_IFNAME|PYTORCH_NPU_ALLOC_CONF"
+```
+
+| Check | Expected | If it fails |
+| --- | --- | --- |
+| `npu-smi info` | Lists devices with health and memory | Command missing means no driver; install the NPU HDK |
+| `npu-smi info -l` | `Chip Count: 2` per NPU on A3, `1` on 950PR/DT | A mismatch means you sized `--tp-size` from the wrong card count |
+| Image tag | Matches the configuration you copied | Re-pull the exact tag; flags drift between tags |
+| `HCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` | Point at the inter-node interface | Multi-node jobs fail at startup with an unreachable peer |
+
+## Narrow it down
+
+- Startup fails before the server reports ready: check the image tag, `--tp-size`, and memory first.
+- Requests fail after a period of healthy traffic: correlate with sequence length and concurrency. The PD disaggregation and graph-mode entries above both appear only under load.
+- Accuracy looks wrong rather than slow: check the checkpoint format before the deployment flags. Loading a quantized router gate as BF16 is one known cause in MXFP8 MoE checkpoints; see [Quantization selection](/docs/hardware-platforms/ascend-npus/knowledge-base/quantization-selection).
+- Performance is lower than a published baseline: confirm the image tag and the benchmark settings, then profile with [Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling) before changing parameters.
+
+## Add a new entry
+
+When you solve a problem that is not listed here, add it to the FAQ with the error signature, the cause, and the fix. Then add one row to the table above, keeping the FAQ section number and the link. Error signatures should be copied from the log verbatim, including error codes, so that a search for the code finds the entry.
+
+## See also
+
+- [Troubleshooting and FAQ](/docs/hardware-platforms/ascend-npus/faq): full log excerpts
+- [Installation](/docs/hardware-platforms/ascend-npus/getting-started/installation): driver, CANN, and image setup
+- [Parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning): memory, graph capture, and scheduling flags
+- [Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling): when the problem is performance rather than failure
