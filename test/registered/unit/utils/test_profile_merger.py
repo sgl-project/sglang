@@ -320,6 +320,39 @@ class TestProfileMergerEdgeCases(CustomTestCase):
         self.assertIn("[TP01-DP00] 84", pids)
         self.assertIn("[TP00-DP01-PP00] 85", pids)
 
+    def test_events_missing_pid_or_args_and_tp_dirname(self):
+        tp_dir = os.path.join(self.temp_dir, "TP-subdir")
+        os.makedirs(tp_dir, exist_ok=True)
+        merger = ProfileMerger(tp_dir, self.profile_id)
+
+        # Non-TP file inside a directory whose name contains "TP-" should be ignored
+        non_tp_path = os.path.join(tp_dir, f"{self.profile_id}-other.trace.json.gz")
+        with gzip.open(non_tp_path, "wt") as f:
+            json.dump({"traceEvents": [{"ph": "X", "name": "ignored", "pid": 1}]}, f)
+
+        tp_path = os.path.join(tp_dir, f"{self.profile_id}-TP-0.trace.json.gz")
+        trace_data = {
+            "schemaVersion": 1,
+            "traceEvents": [
+                {"ph": "M", "name": "global_clock_sync"},
+                {"ph": "M", "name": "process_sort_index", "pid": 83},
+                {"ph": "X", "name": "kernel", "pid": 83, "ts": 10.0, "dur": 5.0},
+            ],
+        }
+        with gzip.open(tp_path, "wt") as f:
+            json.dump(trace_data, f)
+
+        merged_path = merger.merge_chrome_traces()
+        with gzip.open(merged_path, "rt") as f:
+            merged_data = json.load(f)
+
+        events = merged_data["traceEvents"]
+        self.assertEqual(len(events), 3)
+        self.assertNotIn("pid", events[0])
+        self.assertEqual(events[1]["pid"], "[TP00] 83")
+        self.assertIn("sort_index", events[1]["args"])
+        self.assertEqual(events[2]["pid"], "[TP00] 83")
+
 
 if __name__ == "__main__":
     unittest.main()

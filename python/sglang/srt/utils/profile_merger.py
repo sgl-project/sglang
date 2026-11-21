@@ -95,7 +95,7 @@ class ProfileMerger:
             for f in trace_files
             if not f.endswith(f"merged-{self.profile_id}.trace.json.gz")
             and not f.endswith("-memory.pickle")
-            and "TP-" in f
+            and "TP-" in os.path.basename(f)
         ]
         trace_files = list(set(trace_files))
         return trace_files
@@ -150,11 +150,14 @@ class ProfileMerger:
             if event.get("name") == "process_sort_index":
                 pid = self._maybe_cast_int(event.get("pid"))
                 if pid is not None and pid < self.pid_sort_index_threshold:
+                    if not isinstance(event.get("args"), dict):
+                        event["args"] = {}
                     event["args"]["sort_index"] = self._calculate_sort_index(
                         rank_info, pid
                     )
 
-            event["pid"] = f"{rank_label} {event['pid']}"
+            if event.get("pid") is not None:
+                event["pid"] = f"{rank_label} {event['pid']}"
 
         return events
 
