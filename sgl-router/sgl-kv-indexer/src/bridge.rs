@@ -47,6 +47,8 @@ pub struct BridgeConfig {
     /// The worker's component cache spec, forwarded on every apply batch. `None`
     /// for a legacy / full-only worker that reports no component metadata.
     pub cache_spec: Option<WorkerCacheSpec>,
+    /// Shared DRAM pool the worker reads; empty if unset.
+    pub dram_pool_id: String,
 }
 
 impl BridgeConfig {
@@ -65,6 +67,12 @@ impl BridgeConfig {
             &std::env::var("KV_INDEXER_CLEAR_TIERS").unwrap_or_else(|_| "HBM,DRAM,SSD".to_string()),
         )?;
         let cache_spec = cache_spec_from_env()?;
+        let dram_pool_id = env_nonempty("KV_INDEXER_DRAM_POOL_ID").unwrap_or_default();
+        if !dram_pool_id.is_empty() && cache_spec.is_none() {
+            return Err(BridgeError::Config(
+                "a DRAM pool requires KV_INDEXER_CACHE_COMPONENTS".into(),
+            ));
+        }
 
         Ok(Self {
             worker_id,
@@ -74,6 +82,7 @@ impl BridgeConfig {
             indexer_endpoint,
             clear_tiers,
             cache_spec,
+            dram_pool_id,
         })
     }
 }
@@ -323,9 +332,17 @@ async fn run_session(
 ) -> Result<(), BridgeError> {
     // Tracked only to log a discontinuity. Nothing acts on it.
     let mut last_seq: Option<u64> = None;
+    // The first tick joins immediately; later ticks repair idle bindings after restart.
+    let mut binding_refresh = tokio::time::interval(Duration::from_secs(30));
+    binding_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let message = tokio::select! {
+            _ = binding_refresh.tick(), if !config.dram_pool_id.is_empty() => {
+                client.apply_external_kv_batch(build_apply_request(config, 0, EventActions::default()))
+                    .await.map_err(classify_rpc)?;
+                continue;
+            }
             result = tokio::task::unconstrained(subscriber.recv()) => result?,
             _ = tokio::signal::ctrl_c() => {
                 info!("received ctrl-c; shutting down bridge");
@@ -459,6 +476,7 @@ fn build_apply_request(
         actions,
         worker_address: config.worker_address.clone(),
         cache_spec: config.cache_spec,
+        dram_pool_id: config.dram_pool_id.clone(),
     }
 }
 
@@ -1194,6 +1212,7 @@ mod tests {
             indexer_endpoint: "http://[::1]:50051".to_string(),
             clear_tiers,
             cache_spec: None,
+            dram_pool_id: String::new(),
         }
     }
 
@@ -1283,6 +1302,7 @@ mod tests {
             }],
             worker_address: "http://worker-1".into(),
             cache_spec: None,
+            ..Default::default()
         };
 
         let batches = split_apply_request(request);
@@ -1319,6 +1339,7 @@ mod tests {
                 .collect(),
             worker_address: "http://worker-1".into(),
             cache_spec: None,
+            ..Default::default()
         };
 
         let batches = split_apply_request(request);
@@ -1695,8 +1716,10 @@ mod tests {
             swa_tier_mask: 0,
             mamba_tier_mask: 0,
         });
+        config.dram_pool_id = "node-0".into();
         let request = request_of(&config, 0, vec![stored(&[1], "GPU")]);
         assert_eq!(request.cache_spec, config.cache_spec);
+        assert_eq!(request.dram_pool_id, "node-0");
     }
 
     // --- cache spec config helpers ---

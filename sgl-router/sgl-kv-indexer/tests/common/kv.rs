@@ -75,5 +75,6 @@ pub fn apply_request(
         actions,
         worker_address: address.to_string(),
         cache_spec: None,
+        ..Default::default()
     }
 }

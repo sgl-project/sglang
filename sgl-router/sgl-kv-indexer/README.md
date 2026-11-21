@@ -57,12 +57,19 @@ The server stores:
 
 - block hash → token count and `(worker, tier) → component mask`
 - worker → router-facing address, `WorkerCacheSpec`, and reverse holdings by tier
+- block hash → `dram_pool_id → component mask`, stored once per shared pool
+- DRAM pool → reverse holdings and member worker ids
 - block hash → cumulative hit count
 
 Component masks are `FULL=1`, `SWA=2`, `MAMBA=4`, and `0` for legacy
 whole-block events. `REPORT` replaces the component snapshot for one
 `(worker, tier, block)` placement. `REVOKE` removes that placement, and
 `CLEAR_ALL_AT_TIER` removes every placement for the worker at that tier.
+
+For shared DRAM, members set `KV_INDEXER_DRAM_POOL_ID` and a cache spec; the
+owner reports DRAM once with that pool id and no worker identity. A member's
+prefix combines its HBM with the pool's DRAM under its own spec.
+Members refresh bindings every 30s; the owner must replay residency after restart.
 
 ## Build
 
@@ -243,6 +250,7 @@ Required or commonly used bridge variables:
 - `SGLANG_KV_EVENT_ENDPOINT`: worker PUB endpoint
 - `SGLANG_KV_EVENT_TOPIC`: ZMQ subscription topic
 - `KV_INDEXER_CLEAR_TIERS`: tiers affected by clear, default `HBM,DRAM,SSD`
+- `KV_INDEXER_DRAM_POOL_ID`: optional shared DRAM pool; requires a component spec
 - `KV_INDEXER_CACHE_COMPONENTS`: optional `full,swa` or `full,mamba`
 - `KV_INDEXER_SWA_WINDOW_TOKENS`: required when SWA is configured
 - `KV_INDEXER_FULL_TIERS`, `KV_INDEXER_SWA_TIERS`,
