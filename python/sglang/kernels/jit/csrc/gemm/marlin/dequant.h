@@ -474,14 +474,15 @@ __device__ inline void dequant_fp8_scales<half2, host::kFE4M3fn.id()>(int q, hal
 
 template <>
 __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE4M3fn.id()>(int q, nv_bfloat162* frag_b) {
-  constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
-  constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
-  constexpr int MASK = 0x7F007F00;
-
-  // Extract and shift FP8 values to BF16 format
-  int Out1 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
-  q <<= 8;
-  int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
+  // The top byte of each 16-bit lane is an S0E5M3 scale (scale * 2^7, 5-bit
+  // exponent with bias 15, 3-bit mantissa). Move it into the bf16 exponent and
+  // mantissa fields and add 127 - 15 = 112 to the exponent, so that scales
+  // below 2^-6 (E4M3 subnormals) are exact too. A zero byte becomes 2^-15; its
+  // product with an FP4 value (at most 6 * 2^-126 here) underflows to 0, so a
+  // zero scale still gives zero weights.
+  constexpr uint32_t BIAS = (112u << 7) * 0x00010001u;
+  const uint32_t Out1 = ((static_cast<uint32_t>(q) & 0xFF00FF00u) >> 4) + BIAS;
+  const uint32_t Out2 = (((static_cast<uint32_t>(q) << 8) & 0xFF00FF00u) >> 4) + BIAS;
 
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
