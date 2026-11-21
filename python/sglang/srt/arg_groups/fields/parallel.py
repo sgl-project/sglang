@@ -265,8 +265,8 @@ class Parallel(msgspec.Struct):
         "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
         "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
         "sequence-sharded activations with no extra communication volume. "
-        "Prefill only; supports Qwen3 dense, Kimi-K3 without attention DP or CP, "
-        "and Muse Spark ModelOpt NVFP4 with "
+        "Prefill only; supports Qwen3 dense, Qwen4Exp, Kimi-K3 without attention "
+        "DP or CP, GLM-5.3-Flash without MoE A2A, and Muse Spark ModelOpt NVFP4 with "
         "TP4/EP4 or TP8/EP8 with FlashInfer A2A or MegaMoE. "
         "Muse Spark requires the FlashInfer TRT-LLM MoE runner and "
         "NVLink/NVSwitch.",

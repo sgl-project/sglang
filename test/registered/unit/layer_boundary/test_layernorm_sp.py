@@ -245,6 +245,17 @@ class TestLayerNormSPValidation(CustomTestCase):
                 }
             )
 
+    def test_glm5_next_rejects_modes_that_move_its_token_rows(self):
+        glm = {**self.VALID, "architecture": "Glm5NextForConditionalGeneration"}
+        validate_layernorm_sp(**{**glm, "tp_size": 8, "ep_size": 8})
+        for override, message in (
+            ({"attn_cp_size": 2}, "attn_cp_size == 1"),
+            ({"moe_a2a_backend": "deepep"}, "moe-a2a-backend none"),
+            ({"enable_attn_tp_input_scattered": True}, "input-scattered"),
+        ):
+            with self.subTest(**override), self.assertRaisesRegex(ValueError, message):
+                validate_layernorm_sp(**{**glm, **override})
+
     def test_rejects_pipeline_parallelism(self):
         with self.assertRaisesRegex(ValueError, "pipeline"):
             validate_layernorm_sp(**{**self.VALID, "pp_size": 2})

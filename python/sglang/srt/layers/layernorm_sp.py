@@ -58,6 +58,7 @@ SP_SUPPORTED_ARCHITECTURES = (
     | KIMI_K3_SP_ARCHITECTURES
     | frozenset(
         {
+            "Glm5NextForConditionalGeneration",
             "Qwen3ForCausalLM",
             "Qwen4ExpForCausalLM",
             "Qwen4ExpForConditionalGeneration",
