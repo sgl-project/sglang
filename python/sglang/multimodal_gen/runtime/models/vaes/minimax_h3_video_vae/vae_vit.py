@@ -32,9 +32,7 @@ def _cuda_autocast_disabled(tensor: torch.Tensor):
 
 
 def _fused_blocks_available(blocks, hidden_states) -> bool:
-    # The fused Triton norms decode to all-NaN on ROCm (MI300), where
-    # tensor.is_cuda is also true; keep ROCm on the unfused fp32-norm path.
-    if not current_platform.is_cuda():
+    if not (current_platform.is_cuda() or current_platform.is_rocm()):
         return False
     if (
         not hidden_states.is_cuda
@@ -75,6 +73,18 @@ def _run_fused_transformer_blocks(blocks, hidden_states, rotary_pos_emb):
         logger.info(
             "MiniMax H3 video VAE decoder fuses each scaled residual add into the next RMSNorm"
         )
+    # attn.to_qkv and ff.w1 take the normed rows straight into an autocast
+    # linear; storing them in its dtype skips a cast kernel (same rounding).
+    # Measured on ROCm only.
+    linear_dtype = None
+    if (
+        current_platform.is_rocm()
+        and hidden_states.is_cuda
+        and torch.is_autocast_enabled("cuda")
+    ):
+        linear_dtype = torch.get_autocast_dtype("cuda")
+        if linear_dtype not in (torch.float16, torch.bfloat16):
+            linear_dtype = None
     pending = None
     pending_scale = None
     for block in blocks:
@@ -84,6 +94,7 @@ def _run_fused_transformer_blocks(blocks, hidden_states, rotary_pos_emb):
             fused_norm=True,
             pending=pending,
             pending_scale=pending_scale,
+            out_dtype=linear_dtype,
         )
     return _scaled_residual_add(hidden_states, pending, pending_scale)
 
