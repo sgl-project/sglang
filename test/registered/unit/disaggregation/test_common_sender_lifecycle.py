@@ -188,6 +188,7 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         manager.send_kv_status_message.assert_not_called()
 
     def test_room_stuck_on_one_pp_stage_is_released_as_failed_on_every_stage(self):
+        # TODO(YAMY1234): with #47618 PP0 decides the release; rework for that path.
         stages = [self._stuck_sender(KVPoll.Transferring)[0] for _ in range(2)]
         stages[0].kv_mgr.request_status[42] = KVPoll.Success
         stages[1]._last_chunk_time -= 61
@@ -206,6 +207,18 @@ class TestCommonSenderLifecycle(unittest.TestCase):
             )
             consensus = SchedulerPPMixin._pp_pd_get_prefill_transferred_ids(stage)
         self.assertEqual(consensus, {"r": True})
+
+    def test_pp_consensus_poll_does_not_time_out_a_later_stage(self):
+        # PP0's last chunk is long queued, but stage 1 has not finished its
+        # forward: the consensus poll must not count that against the timeout.
+        sender, manager = self._stuck_sender(KVPoll.Success)
+        manager.request_status = FakePPStatus(
+            manager.request_status, {42: KVPoll.WaitingForInput}
+        )
+        sender._last_chunk_time -= 61
+        self.assertEqual(sender.poll_pp_consensus(), KVPoll.WaitingForInput)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        manager.send_kv_status_message.assert_not_called()
 
     def test_mooncake_trace_context_reaches_worker_and_finishes(self):
         trace = Mock(tracing_enable=True)

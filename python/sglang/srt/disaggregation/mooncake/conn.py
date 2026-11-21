@@ -116,32 +116,22 @@ class FailedSessionProbe:
     interval: float
 
 
-def _wait_chunk_event(
-    *, kv_mgr: MooncakeKVManager, event, room: int, label: str
-) -> None:
+def _wait_chunk_event(*, kv_mgr: MooncakeKVManager, event, room: int) -> None:
     """Wait for a chunk's device event. With SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT
-    set, poll it so a failed or timed-out room stops blocking the rooms queued behind
-    it; the status check after the wait then drops the chunk."""
-    timeout = kv_mgr.transfer_timeout
-    if timeout <= 0:
+    set, poll it so a room that fails meanwhile (that timeout, an abort or a decode
+    failure) stops blocking the rooms queued behind it on this worker."""
+    if kv_mgr.transfer_timeout <= 0:
         event.synchronize()
         return
-    start = time.perf_counter()
+    # 50 us doubling to 200 us: in a CPU microbench a 1 ms cap cost the scheduler
+    # thread as much GIL time and added ~0.8 ms to a healthy wait.
+    interval = 5e-5
     while not event.query():
-        if (
-            room not in kv_mgr.request_status
-            or kv_mgr.check_status(room) == KVPoll.Failed
-        ):
+        # One read: the scheduler thread may clear the room at any moment.
+        if kv_mgr.request_status.get(room, KVPoll.Failed) == KVPoll.Failed:
             return
-        waited = time.perf_counter() - start
-        if waited >= timeout:
-            kv_mgr.fail_transfer_on_timeout(
-                bootstrap_room=room,
-                stuck_in=f"the transfer worker's wait on {label}",
-                elapsed=waited,
-            )
-            return
-        time.sleep(1e-4)
+        time.sleep(interval)
+        interval = min(interval * 2, 2e-4)
 
 
 # decode
@@ -2925,18 +2915,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(kv_chunk.room) != KVPoll.Failed
                     ):
                         _wait_chunk_event(
-                            kv_mgr=self,
-                            event=kv_chunk.wait_event,
-                            room=kv_chunk.room,
-                            label="wait_event",
+                            kv_mgr=self, event=kv_chunk.wait_event, room=kv_chunk.room
                         )
                     kv_chunk.wait_event = None
                 if kv_chunk.indices_event is not None:
                     _wait_chunk_event(
-                        kv_mgr=self,
-                        event=kv_chunk.indices_event,
-                        room=kv_chunk.room,
-                        label="indices_event",
+                        kv_mgr=self, event=kv_chunk.indices_event, room=kv_chunk.room
                     )
                     kv_chunk.indices_event = None
                 if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):

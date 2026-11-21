@@ -2343,7 +2343,7 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
-    # perf_counter() when the last chunk was queued; the transfer timeout counts from it.
+    # Monotonic time the last chunk was queued; the transfer timeout counts from it.
     _last_chunk_time: Optional[float] = None
 
     def __init__(
@@ -2582,12 +2582,17 @@ class CommonKVSender(BaseKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
-        return self._poll_with_status(self.kv_mgr.check_status)
+        return self._poll_with_status(
+            self.kv_mgr.check_status, check_transfer_timeout=True
+        )
 
     def poll_pp_consensus(self) -> KVPoll:
+        # Only propagates: each PP stage times out its own transfer in poll().
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
-    def _poll_with_status(self, check_status) -> KVPoll:
+    def _poll_with_status(
+        self, check_status, check_transfer_timeout: bool = False
+    ) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
 
@@ -2610,7 +2615,10 @@ class CommonKVSender(BaseKVSender):
             timeout_status = self._check_bootstrap_timeout()
             if timeout_status is not None:
                 status = timeout_status
-        elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+        elif check_transfer_timeout and status in (
+            KVPoll.WaitingForInput,
+            KVPoll.Transferring,
+        ):
             timeout_status = self._check_transfer_timeout(status)
             if timeout_status is not None:
                 status = timeout_status

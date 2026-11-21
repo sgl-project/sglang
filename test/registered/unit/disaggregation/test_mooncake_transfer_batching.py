@@ -2,7 +2,6 @@ import concurrent.futures
 import ctypes
 import unittest
 from collections import defaultdict
-from functools import partial
 from queue import SimpleQueue
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
@@ -12,7 +11,6 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
@@ -618,6 +616,25 @@ class _NeverDoneEvent:
         self.done.wait()
 
 
+class _ClearedOnRead(dict):
+    """request_status whose `room` is cleared just as the worker reads it."""
+
+    def __init__(self, statuses, room):
+        super().__init__(statuses)
+        self.room = room
+
+    def __contains__(self, room):
+        found = super().__contains__(room)
+        if room == self.room:
+            self.pop(room, None)
+        return found
+
+    def get(self, room, default=None):
+        if room == self.room:
+            self.pop(room, None)
+        return super().get(room, default)
+
+
 class TestMooncakeEarlySend(CustomTestCase):
     def test_sender_queues_event_once_without_waiting_on_scheduler(self):
         for last in (False, True):
@@ -812,22 +829,13 @@ class TestMooncakeEarlySend(CustomTestCase):
             )
         self.assertEqual(order, ["wait", "gather"])
 
-    def _run_worker_on_a_stuck_room(self, timeout):
+    def _run_worker_on_a_stuck_room(self):
         """Room 1 waits on a device event that never completes; room 2 is queued
-        behind it on the same worker."""
+        behind it on the same worker. The transfer timeout is on."""
         stuck = _NeverDoneEvent()
         self.addCleanup(stuck.done.set)
         manager, queue = self._worker(stuck)
-        manager.transfer_timeout = timeout
-        manager.pp_rank = 0
-        manager.fail_transfer_on_timeout = partial(
-            CommonKVManager.fail_transfer_on_timeout, manager
-        )
-        manager.conclude_failure = MagicMock(
-            side_effect=lambda bootstrap_room, failure_reason: (
-                manager.request_status.update({bootstrap_room: KVPoll.Failed})
-            )
-        )
+        manager.transfer_timeout = 600
         manager.request_status[2] = KVPoll.WaitingForInput
         manager.transfer_infos[2] = manager.transfer_infos[1]
         stuck_chunk = queue.get_nowait()
@@ -844,27 +852,27 @@ class TestMooncakeEarlySend(CustomTestCase):
             daemon=True,
         )
         worker.start()
-        return manager, worker, stuck
-
-    def test_transfer_timeout_fails_a_stuck_room_and_serves_the_rooms_behind(self):
-        manager, worker, _ = self._run_worker_on_a_stuck_room(timeout=0.2)
-        worker.join(5)
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(manager.request_status[1], KVPoll.Failed)
-        reason = manager.conclude_failure.call_args.kwargs["failure_reason"]
-        self.assertIn("transfer worker's wait on wait_event", reason)
-        # Only room 2 was read and sent; room 1's chunk was dropped.
-        manager.send_kvcache.assert_called_once()
-        manager._maybe_ack_drained_abort.assert_any_call(1)
-
-    def test_transfer_timeout_stops_the_wait_once_the_room_failed(self):
-        # An abort during the wait frees the worker long before the timeout.
-        manager, worker, stuck = self._run_worker_on_a_stuck_room(timeout=600)
         self.assertTrue(stuck.polled.wait(5))
+        return manager, worker
+
+    def test_failed_room_stops_blocking_the_rooms_behind_it(self):
+        # The sender's transfer timeout or an abort fails the room during the wait.
+        manager, worker = self._run_worker_on_a_stuck_room()
         manager.request_status[1] = KVPoll.Failed
         worker.join(5)
         self.assertFalse(worker.is_alive())
-        manager.conclude_failure.assert_not_called()
+        # Only room 2 was read and sent; room 1's chunk was dropped and acked.
+        manager.send_kvcache.assert_called_once()
+        manager._maybe_ack_drained_abort.assert_any_call(1)
+        self.assertNotIn(1, manager._staging_outstanding)
+
+    def test_room_cleared_during_the_wait_does_not_kill_the_worker(self):
+        """The scheduler thread may clear the room between two status reads; a
+        membership test followed by an index then raises and kills the worker."""
+        manager, worker = self._run_worker_on_a_stuck_room()
+        manager.request_status = _ClearedOnRead(manager.request_status, room=1)
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
         manager.send_kvcache.assert_called_once()
 
 
