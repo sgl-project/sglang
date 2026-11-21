@@ -24,7 +24,10 @@ class AWQIntelAMXLinearKernel:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _amx_process_weight_after_loading(
-            layer, ["qweight", "qzeros", "scales"], None, "awq"
+            layer,
+            ["qweight", "qzeros", "scales"],
+            None,
+            "awq",
         )
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
@@ -52,10 +55,16 @@ class AWQIntelAMXMoEKernel:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _amx_process_weight_after_loading(
-            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "awq"
+            layer,
+            ["w13_qweight", "w13_qzeros", "w13_scales"],
+            None,
+            "awq",
         )
         _amx_process_weight_after_loading(
-            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "awq"
+            layer,
+            ["w2_qweight", "w2_qzeros", "w2_scales"],
+            None,
+            "awq",
         )
 
     def create_moe_runner(

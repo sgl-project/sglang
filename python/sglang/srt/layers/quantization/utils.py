@@ -259,11 +259,12 @@ def override_config(config: QuantizationConfig, prefix: str):
         if config.get_name() == "gptq"
         else 32 // config.weight_bits
     )  # packed into int32
-    if config.get_name() == "gptq_marlin":
+    if config.get_name() in ("gptq", "gptq_marlin"):
         is_sym = get_dynamic_override(config, prefix, "sym", config.is_sym)
         if isinstance(is_sym, bool):
             config.is_sym = is_sym
 
+    if config.get_name() == "gptq_marlin":
         if (config.weight_bits, config.is_sym) not in config.TYPE_MAP:
             raise ValueError(
                 "Unsupported quantization config: "
