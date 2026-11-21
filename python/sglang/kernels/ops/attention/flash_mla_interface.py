@@ -10,6 +10,7 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 ``use_legacy=False``. CUDA only: HIP and XPU keep their own sgl-kernel ops.
 """
 
+import inspect
 from typing import Optional, Tuple, Union
 
 import flash_mla
@@ -20,6 +21,11 @@ from flash_mla.flash_mla_interface import FlashMLASchedMeta
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
 # why the tensor-metadata API (it predates V4.1) reads such a cache as V3.2.
 _V32_NO_ROPE_BYTES_PER_TOKEN = 528
+
+# FlashMLA builds whose prefill can write out_sf in the 128x4-swizzled scale layout.
+MEGA_PREFILL_SWIZZLED_SF = (
+    "out_sf_swizzled_128x4" in inspect.signature(_mega.prefill).parameters
+)
 
 # The only RoPE / output-cast configuration MegaAttention accepts:
 # both kernel sets assert every one of these values.
@@ -197,8 +203,13 @@ def flash_mla_mega_prefill(
     enable_q_norm: bool = False,
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
+    out_sf_swizzled_128x4: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
-    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse).
+
+    ``out_sf_swizzled_128x4`` writes out_sf in the 128x4-swizzled scale layout (needs
+    MEGA_PREFILL_SWIZZLED_SF); its view then has stride(0) != 1."""
+    extra = {"out_sf_swizzled_128x4": True} if out_sf_swizzled_128x4 else {}
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -212,6 +223,7 @@ def flash_mla_mega_prefill(
         enable_q_norm=enable_q_norm,
         rms_norm_eps=rms_norm_eps,
         use_legacy=use_legacy,
+        **extra,
         **_MEGA_FIXED_PARAMS,
     )
 
