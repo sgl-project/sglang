@@ -29,6 +29,10 @@ from ..common.out_quant_gfx950 import store_fp8_out
 from ..common.utils import robust_allocator, sparse_out_dtype
 from .topk_sparse import _merge_topk_attn_out_kernel
 
+# Triton before 3.9 only has the private _reinterpret.
+if not hasattr(gl.shared_memory_descriptor, "reinterpret"):
+    gl.shared_memory_descriptor.reinterpret = gl.shared_memory_descriptor._reinterpret
+
 _LOG2E = 1.4426950408889634
 _LN2 = gl.constexpr(0.6931471805599453)
 _WARPS = 4
@@ -179,7 +183,7 @@ def _block_table(
         gl.int32, [TOPK_P, 4], gl.SwizzledSharedLayout(1, 1, 1, [1, 0]), rec
     )
     # Rank-1 layout so .index(i) picks entry i.
-    tab = tab._reinterpret(gl.int32, [TOPK_P, 4], gl.SwizzledSharedLayout(1, 1, 1, [0]))
+    tab = tab.reinterpret(gl.int32, [TOPK_P, 4], gl.SwizzledSharedLayout(1, 1, 1, [0]))
     return tab, c_end
 
 
