@@ -34,9 +34,11 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.managers.incremental_detokenize import LimitedCapacityDict
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -90,6 +92,7 @@ def _make_controller(
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
+    ctl.routing_key_to_rank = LimitedCapacityDict(capacity=1 << 16)
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
     return ctl
 
@@ -101,6 +104,7 @@ def _req(
     rid="USER",
     time_stats=None,
     input_embeds=None,
+    routing_key=None,
 ):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.
 
@@ -113,6 +117,7 @@ def _req(
         bootstrap_room=bootstrap_room,
         input_ids=None if input_embeds is not None else (input_ids or []),
         input_embeds=input_embeds,
+        routing_key=routing_key,
     )
 
 
@@ -401,6 +406,61 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestFollowRoutingKeyScheduler(CustomTestCase):
+    def test_a_new_key_goes_to_the_least_loaded_rank_and_stays_there(self):
+        ctl = _make_controller(num_dp_ranks=3)
+        ctl.dp_budget.total_requests = [5, 0, 1]
+        ctl.follow_routing_key_scheduler(_req(routing_key="a"))
+        ctl.follow_routing_key_scheduler(_req(routing_key="b"))
+        # "a" lifts rank 1 to 1 request; the tie with rank 2 goes to the lower rank
+        self.assertEqual(ctl.routing_key_to_rank[hash("a")], 1)
+        self.assertEqual(ctl.routing_key_to_rank[hash("b")], 1)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 2, 1])
+        ctl.dp_budget.total_requests[1] = 100
+        ctl.follow_routing_key_scheduler(_req(routing_key="a"))
+        ctl.follow_routing_key_scheduler(
+            TokenizedEmbeddingReqInput(
+                input_text="",
+                input_ids=[1],
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=SamplingParams(),
+                routing_key="a",
+            )
+        )
+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 4)
+
+    def test_a_key_whose_rank_went_inactive_is_placed_again(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        first = ctl.routing_key_to_rank[hash("session")]
+        ctl._active_workers = [rank for rank in range(4) if rank != first]
+        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        second = ctl.routing_key_to_rank[hash("session")]
+        self.assertNotEqual(second, first)
+        ctl.workers[second].send_pyobj.assert_called_once()
+
+    def test_a_request_not_routed_by_its_key_is_not_remembered(self):
+        for case, req, rank in (
+            ("routed_dp_rank wins", _req(routing_key="session", routed_dp_rank=0), 0),
+            ("no key is balanced", _req(), 1),
+            ("an empty key is no key", _req(routing_key=""), 1),
+        ):
+            with self.subTest(case):
+                ctl = _make_controller(num_dp_ranks=2)
+                ctl.dp_budget.total_requests = [3, 0]
+                ctl.follow_routing_key_scheduler(req)
+                ctl.workers[rank].send_pyobj.assert_called_once()
+                self.assertEqual(len(ctl.routing_key_to_rank), 0)
+
+    def test_the_least_recently_used_key_is_forgotten_first(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.routing_key_to_rank = LimitedCapacityDict(capacity=2)
+        for key in ("a", "b", "a", "c"):
+            ctl.follow_routing_key_scheduler(_req(routing_key=key))
+        self.assertEqual(list(ctl.routing_key_to_rank), [hash("a"), hash("c")])
 
 
 class TestDispatchingWithTrace(CustomTestCase):

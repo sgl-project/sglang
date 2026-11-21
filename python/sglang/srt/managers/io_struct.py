@@ -1177,6 +1177,7 @@ class GenerateReqInput:
             require_reasoning=self.require_reasoning,
             max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
+            routing_key=self.routing_key,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
@@ -1621,6 +1622,7 @@ class EmbeddingReqInput:
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
+                routing_key=self.routing_key,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 encoding_format=self.encoding_format,
@@ -1655,6 +1657,7 @@ class EmbeddingReqInput:
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
+                routing_key=self.routing_key,
                 dimensions=self.dimensions,
                 encoding_format=self.encoding_format,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
@@ -1716,6 +1719,8 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     time_stats: Optional[PickleWrapper] = None
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
