@@ -4264,10 +4264,7 @@ class SchedulerDisaggregationDecodeMixin:
         )
         # DSpark's seed writes the bonus tokens and seq lens into the FutureMap
         # and reads nothing back; it takes no hidden states or DSA top-k indices.
-        dspark = (
-            envs.SGLANG_OPT_DSPARK_NONBLOCKING_PD_ADMIT.get()
-            and self.spec_algorithm.is_dspark()
-        )
+        dspark = self.spec_algorithm.is_dspark()
         return (
             (eagle or dspark)
             and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()

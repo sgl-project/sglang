@@ -944,41 +944,33 @@ class TestAdmissionOverlap(CustomTestCase):
         )
         dspark = _admit_scheduler("dspark")
         with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
-            for enabled in (False, True):
-                with envs.SGLANG_OPT_DSPARK_NONBLOCKING_PD_ADMIT.override(enabled):
-                    self.assertEqual(scope(dspark, batch), enabled)
-                    # The DSpark switch leaves EAGLE alone.
-                    self.assertFalse(scope(_admit_scheduler("eagle"), batch))
-            # It follows the megakernel runtime switch unless set; the PD decode
-            # switch turns it off.
-            with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
-                self.assertTrue(scope(dspark, batch))
-                with envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.override(
-                    False
+            # On by default for DSpark; EAGLE still needs the megakernel runtime
+            # switch, and the PD decode switch turns both off.
+            self.assertTrue(scope(dspark, batch))
+            self.assertFalse(scope(_admit_scheduler("eagle"), batch))
+            with envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.override(False):
+                self.assertFalse(scope(dspark, batch))
+            # Paths that may read device results back stay blocking.
+            for req in (
+                _admit_req(grammar=object()),
+                _admit_req(kv=SimpleNamespace(retraction_backup=object())),
+            ):
+                self.assertFalse(scope(dspark, SimpleNamespace(reqs=[req])))
+            for scheduler in (
+                _admit_scheduler("dspark", enable_overlap=False),
+                _admit_scheduler("dspark", enable_hisparse=True),
+            ):
+                self.assertFalse(scope(scheduler, batch))
+            for field, value in (
+                ("disaggregation_decode_enable_radix_cache", True),
+                ("disaggregation_decode_host_receive_threshold", 0.5),
+            ):
+                other = SimpleNamespace(**{**vars(disagg), field: value})
+                with patch(
+                    "sglang.srt.disaggregation.decode.get_disagg",
+                    return_value=other,
                 ):
                     self.assertFalse(scope(dspark, batch))
-            with envs.SGLANG_OPT_DSPARK_NONBLOCKING_PD_ADMIT.override(True):
-                # Paths that may read device results back stay blocking.
-                for req in (
-                    _admit_req(grammar=object()),
-                    _admit_req(kv=SimpleNamespace(retraction_backup=object())),
-                ):
-                    self.assertFalse(scope(dspark, SimpleNamespace(reqs=[req])))
-                for scheduler in (
-                    _admit_scheduler("dspark", enable_overlap=False),
-                    _admit_scheduler("dspark", enable_hisparse=True),
-                ):
-                    self.assertFalse(scope(scheduler, batch))
-                for field, value in (
-                    ("disaggregation_decode_enable_radix_cache", True),
-                    ("disaggregation_decode_host_receive_threshold", 0.5),
-                ):
-                    other = SimpleNamespace(**{**vars(disagg), field: value})
-                    with patch(
-                        "sglang.srt.disaggregation.decode.get_disagg",
-                        return_value=other,
-                    ):
-                        self.assertFalse(scope(dspark, batch))
 
     def test_seed_is_ordered_on_forward_stream_without_schedule_wait(self):
         for nonblocking in (False, True):
