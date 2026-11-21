@@ -25,7 +25,7 @@ from sglang.srt.runtime_context import (
     process_model_config,
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
-from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,14 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
             get_parallel().attn_cp_rank
         ]
 
-    global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
+    # Align to attention TP as prepare_mlp_sync_batch does. A no-op once it has
+    # run; needed when metadata is planned before it, as the eager multi-step
+    # draft decode does (planned once, padded again on every step).
+    attn_tp_size = get_parallel().attn_tp_size
+    global_num_tokens = [
+        ceil_align(num_tokens, attn_tp_size)
+        for num_tokens in forward_batch.global_num_tokens_cpu
+    ]
     attn_cp_size = get_parallel().attn_cp_size
     # Non-CP forwards (including speculative forwards) use attention-TP padding
     # only, matching ForwardBatch.prepare_mlp_sync_batch.

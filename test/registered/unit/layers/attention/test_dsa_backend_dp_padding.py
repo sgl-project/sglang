@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention import graph_utils
 from sglang.srt.layers.attention.dsa.dsa_dcp import DcpPageTableCache
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.utils import cal_padded_tokens
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _apply_q_row_plan,
@@ -97,6 +98,32 @@ class TestDSABackendDPPadding(CustomTestCase):
                 global_num_tokens=[8, 7, 6, 0],
             )
         self.assertEqual(mode, DpPaddingMode.MAX_LEN)
+
+    def test_padded_tokens_align_to_attn_tp_before_mlp_sync(self):
+        """The eager multi-step draft decode plans its metadata before
+        prepare_mlp_sync_batch, so cal_padded_tokens sees the raw per-rank
+        counts and must apply the same attention-TP alignment itself."""
+        cases = (
+            # (raw per-rank counts, rows after prepare_mlp_sync_batch)
+            ([5, 4], 8),  # was 5: metadata planned for 5 rows, q has 8
+            ([1, 1], 4),  # bs 1 warmup draft decode
+            ([8, 4], 8),  # already aligned: unchanged
+        )
+        for raw, expected in cases:
+            forward_batch = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                global_num_tokens_cpu=raw,
+                dp_padding_mode=DpPaddingMode.MAX_LEN,
+                is_extend_in_batch=False,
+            )
+            with (
+                self.subTest(raw=raw),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.get_parallel",
+                    return_value=SimpleNamespace(attn_tp_size=4, attn_cp_size=1),
+                ),
+            ):
+                self.assertEqual(cal_padded_tokens(forward_batch), expected)
 
     def test_plan_live_rows(self):
         cases = (
