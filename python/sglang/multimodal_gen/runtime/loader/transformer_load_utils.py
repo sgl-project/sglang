@@ -566,11 +566,13 @@ def _validate_gguf_runtime_support(
             "so FSDP does not manage it."
         )
     if server_args.lora_path is not None:
-        raise ValueError(
-            "LoRA is not supported on a GGUF transformer: an adapter cannot be "
-            "merged into packed GGML blocks. Use the unquantized checkpoint to "
-            "serve LoRA."
-        )
+        if server_args.lora_merge_mode == "merge":
+            raise ValueError(
+                "GGUF LoRA requires --lora-merge-mode dynamic (or auto); "
+                "packed GGML weights cannot be merged."
+            )
+        if server_args.tp_size != 1:
+            raise ValueError("GGUF LoRA currently requires TP=1.")
     # H3's AdaLN paths read the transformer's safetensors directly -- the cache
     # builder needs unquantized weights, and the online rebuild is handed the
     # safetensors file list, which is empty for a GGUF load.
