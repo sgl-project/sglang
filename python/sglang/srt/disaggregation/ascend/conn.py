@@ -309,7 +309,9 @@ class AscendKVManager(MooncakeKVManager):
         # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
         # decode peer registers all model layers. Pair only this layout by
         # global layer id; every other Ascend layout keeps the legacy path.
-        if self.is_hybrid_mla_backend and self.pp_size > 1:
+        if self.is_hybrid_mla_backend and (
+            self.pp_size > 1 or get_parallel().enable_dsa_cache_layer_split
+        ):
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 src_data_ptrs=self.kv_args.kv_data_ptrs,

@@ -4481,8 +4481,9 @@ class HybridLinearKVPool(KVCache):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
         if self.use_mla and _is_npu and layer_ids:
-            data_ptrs, _, _ = self.get_contiguous_buf_infos()
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
+            # The child numbers compact full-attention layers; transfer peers
+            # pair entries by model layer, including owned-only CP shards.
+            return [layer_ids[i] for i in self.full_kv_pool.get_kv_layer_ids()]
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):

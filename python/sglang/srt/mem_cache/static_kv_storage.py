@@ -1084,7 +1084,12 @@ def _static_state_entries(
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.
-            if getattr(token_to_kv_pool, "use_dsa", False):
+            # Ascend registers index-K alongside K/V in its KV entry groups.
+            # Registering it again as DSA state gives split ranks a different
+            # state schema from decode (including ranks owning no layers).
+            if getattr(token_to_kv_pool, "use_dsa", False) and not isinstance(
+                token_to_kv_pool.full_kv_pool, NPUMLATokenToKVPool
+            ):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
                 tail_ptrs, tail_lens, tail_item_lens = (
