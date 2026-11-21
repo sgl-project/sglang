@@ -36,8 +36,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-# backend-specific: only ROCm runs the real AITER kernel through the strided
-# shared-column buffer, including CUDA-graph replay.
+# Backend-specific: only ROCm runs the real AITER kernel through the strided shared-column buffer,
+# including CUDA-graph replay.
 register_amd_ci(est_time=180, suite="base-b-test-1-gpu-small-amd")
 
 
@@ -49,8 +49,8 @@ def _publish(test):
 
 
 def _full_batch(num_tokens, device):
-    # A non-padded count keeps select_experts on the ordinary routing + append
-    # path while masking no row, which makes it the reference for the fusion.
+    # A non-padded count keeps select_experts on the ordinary routing + append path
+    # while masking no row, which makes it the reference for the fusion.
     return torch.tensor([num_tokens], dtype=torch.int32, device=device)
 
 
@@ -108,8 +108,8 @@ class TestAiterSharedColumnsKernel(CustomTestCase):
         )
 
     def test_fused_output_matches_routing_then_append(self):
-        # None and 1 are the two spellings models use for an unscaled shared
-        # expert; both must land on the same weight.
+        # None and 1 are the two spellings models use for an unscaled shared expert;
+        # both must land on the same weight.
         for factor in (None, 1, 0.25):
             for case in self.CASES:
                 num_tokens, num_experts, groups, topk_group = case[:4]
@@ -177,13 +177,9 @@ class TestAiterSharedColumnsKernel(CustomTestCase):
 
 
 class _FakeAiterBiasedGroupedTopk:
-    """Stand-in for ``aiter.biased_grouped_topk`` with the same call contract.
-
-    The fusion needs only in-place writes that honor the row stride of the
-    views it is handed; ``copy_`` keeps that, so a caller that passed
-    contiguous scratch instead of a view into the buffer would lose its
-    shared columns.
-    """
+    # Stand-in for aiter.biased_grouped_topk with the same call contract.
+    # The copy_ calls below honor the row stride of the views they are handed,
+    # so a caller that passed contiguous scratch instead of a view would lose its shared columns.
 
     def __init__(self):
         self.calls = []
@@ -409,8 +405,8 @@ class TestAiterSharedColumnsContract(CustomTestCase):
             first.topk_weights.data_ptr(), third.topk_weights.data_ptr()
         )
 
-        # The larger batch reuses the same buffer, so the shared columns of the
-        # rows it newly exposes must still hold the prefilled values.
+        # The larger batch reuses the same buffer,
+        # so the shared columns of the rows it newly exposes must still hold the prefilled values.
         self.assertTrue(torch.all(second.topk_weights[:, self.TOPK_ROUTED :] == 1.0))
         self.assertTrue(
             torch.all(second.topk_ids[:, self.TOPK_ROUTED :] == self.NUM_EXPERTS)

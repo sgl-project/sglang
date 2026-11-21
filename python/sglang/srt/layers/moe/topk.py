@@ -1974,8 +1974,8 @@ def _biased_grouped_topk_postprocess(
 def aiter_grouped_topk_route_inputs(
     gating_output: torch.Tensor, correction_bias: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Logits and bias for AITER biased_grouped_topk and radix4: an fp32 bias
-    routes in fp32, any other bias in the logits dtype."""
+    # For AITER biased_grouped_topk and radix4: an fp32 bias routes in fp32,
+    # any other bias in the logits dtype.
     if correction_bias.dtype == torch.float32:
         return gating_output.to(torch.float32), correction_bias
     return gating_output, correction_bias.to(dtype=gating_output.dtype)

@@ -105,8 +105,8 @@ def _radix4_routes(
         return False
     scores = router_logits
     if scores.dtype != route_bias.dtype:
-        # The router casts the logits to the bias dtype; a meta tensor with the
-        # cast's layout decides coverage without paying for the cast.
+        # The router casts the logits to the bias dtype;
+        # a meta tensor decides coverage without paying for the cast.
         scores = torch.empty_like(scores, dtype=route_bias.dtype, device="meta")
     return moe_route_radix4.covered(
         scores, route_bias, routed_k, num_expert_group, topk_group
@@ -132,8 +132,7 @@ def try_select_experts(
         # Standalone callers that never published config keep the ordinary path.
         or not get_context().is_config_namespace_published("parallel")
         or get_parallel().moe_ep_size != 1
-        # The other micro-batch may route through this layer before this one's
-        # experts read the layer's single buffer.
+        # Under TBO, the other micro-batch may route through this layer's buffer first.
         or is_tbo_enabled()
         # KT masks CPU expert IDs in place, which would overwrite the persistent shared column.
         or get_exec().moe.kt_weight_path is not None
