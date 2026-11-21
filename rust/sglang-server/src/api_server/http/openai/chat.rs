@@ -203,11 +203,14 @@ async fn chat_completions(
 
     // Python's chat-layer facts for the served template, and whether the
     // reply starts in reasoning, as Python decides it from the request.
-    let chat_model = state
-        .chat_formatter
-        .as_ref()
-        .map(ChatModel::for_formatter)
-        .unwrap_or_default();
+    let chat_model = ChatModel {
+        model_type: state.server_args.model_config.model_type.clone(),
+        ..state
+            .chat_formatter
+            .as_ref()
+            .map(ChatModel::for_formatter)
+            .unwrap_or_default()
+    };
     let force_reasoning = chat_model.request_thinking(
         reasoning_parser.as_deref(),
         &raw,
@@ -1245,8 +1248,8 @@ mod tests {
 
     use super::super::ChatFormatter;
     use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted, chunk,
-        post_json, with_cached_tokens,
+        answering_app_state_with, answering_app_state_with_item, answering_app_state_with_request,
+        body_json, chat_submitted, chatml_formatter, chunk, post_json, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1516,6 +1519,93 @@ mod tests {
         let app = super::routes().with_state(state);
         let response = post_json(app, "/v1/chat/completions", body).await;
         body_json(response).await["choices"][0]["message"].clone()
+    }
+
+    /// Dropping Gemma 4's channel markers makes reasoning indistinguishable from content.
+    #[tokio::test]
+    async fn gemma4_chat_keeps_reasoning_markers() {
+        use crate::message::config::ModelConfig;
+        use crate::message::request::RequestKind;
+
+        const MARKED: &str = "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
+        const STRIPPED: &str = "thought\nCheck the calculation.The answer is 4.";
+        let tokenizer = Tokenizer::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        ))
+        .unwrap();
+
+        for (model_type, parser, stream, expected_content) in [
+            ("gemma4", Some("gemma4"), false, "The answer is 4."),
+            ("gemma4", Some("gemma4"), true, "The answer is 4."),
+            ("gemma4_unified", None, false, MARKED),
+            ("llama", None, false, STRIPPED),
+        ] {
+            let args = Arc::new(ServerArgs {
+                served_model_name: "model".into(),
+                reasoning_parser: parser.map(str::to_owned),
+                model_config: ModelConfig {
+                    model_type: Some(model_type.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let state = answering_app_state_with_request(
+                args,
+                chatml_formatter(),
+                Some(tokenizer.clone()),
+                move |request| {
+                    let RequestKind::Generate(generate) = &request.kind else {
+                        panic!("expected generation");
+                    };
+                    assert_eq!(generate.chat_prompt.is_some(), parser.is_some());
+                    // Replay the same output at the decoder boundary with the submitted flag.
+                    let text = if generate.sampling_params.skip_special_tokens {
+                        STRIPPED
+                    } else {
+                        MARKED
+                    };
+                    chunk(request.rid.as_str(), text, true)
+                },
+            );
+            let response = post_json(
+                super::routes().with_state(state),
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": "model", "stream": stream, "skip_special_tokens": true,
+                    "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let frames: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                let field = |name: &str| -> String {
+                    frames
+                        .iter()
+                        .filter_map(|frame| frame["choices"][0]["delta"][name].as_str())
+                        .collect()
+                };
+                assert_eq!(field("reasoning_content"), "Check the calculation.");
+                assert_eq!(field("content"), expected_content);
+            } else {
+                let body = body_json(response).await;
+                let message = &body["choices"][0]["message"];
+                assert_eq!(message["content"], expected_content, "{model_type}: {body}");
+                if parser.is_some() {
+                    assert_eq!(message["reasoning_content"], "Check the calculation.");
+                }
+            }
+        }
     }
 
     /// The DeepSeek-V4.1 checkpoint the processor's `openai_parity` fixture

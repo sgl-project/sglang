@@ -76,6 +76,8 @@ mod deepseek {
 /// Facts about the served model that Python's chat layer reads.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ChatModel {
+    /// The checkpoint's HF `model_type`, independent of the chosen template.
+    pub model_type: Option<String>,
     /// `get_model().context_length`.
     pub context_length: Option<u64>,
     /// `model_config.get_default_sampling_params()` under `--sampling-defaults model`.
@@ -195,10 +197,13 @@ impl ChatModel {
         self.chat_encoding_spec.as_deref() == Some("kimi_k3")
     }
 
-    /// `_patch_reasoning_skip_special_tokens`: K3's markers are special
-    /// tokens, so its output keeps them.
+    /// Match Python chat's detokenization for models whose parsers need special tokens.
     pub fn keeps_special_tokens(&self, reasoning_parser: Option<&str>) -> bool {
-        self.is_kimi_k3() || reasoning_parser == Some("kimi_k3")
+        matches!(
+            self.model_type.as_deref(),
+            Some("gemma4" | "gemma4_unified")
+        ) || self.is_kimi_k3()
+            || reasoning_parser == Some("kimi_k3")
     }
 
     /// `_reported_prompt_tokens`: the prompt tokens left out of `usage`.

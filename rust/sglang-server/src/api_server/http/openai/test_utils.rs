@@ -23,6 +23,7 @@ use super::{indexed_decode_stream, model_error, openai_error, routes};
 use crate::api_server::core::CoreEvent;
 use crate::api_server::handlers::{CoreCall, CoreHandle};
 use crate::message::config::ServerArgs;
+use crate::message::request::Request as IntakeRequest;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -197,7 +198,7 @@ fn answering_app_state_logged(
         server_args(),
         formatter.unwrap(),
         None,
-        |rid| chunk(rid, "ok", true),
+        |request| chunk(request.rid.as_str(), "ok", true),
         Some(request_log),
     )
 }
@@ -221,6 +222,18 @@ pub(super) fn answering_app_state_with_item(
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     answer: impl Fn(&str) -> ResponseItem + Send + 'static,
 ) -> Arc<super::AppState> {
+    answering_app_state_with_request(server_args, formatter, tokenizer, move |request| {
+        answer(request.rid.as_str())
+    })
+}
+
+/// Answer a generation based on the request submitted to the core.
+pub(super) fn answering_app_state_with_request(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    answer: impl Fn(&IntakeRequest) -> ResponseItem + Send + 'static,
+) -> Arc<super::AppState> {
     answering_app_state_built(server_args, formatter, tokenizer, answer, None)
 }
 
@@ -228,7 +241,7 @@ fn answering_app_state_built(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
-    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+    answer: impl Fn(&IntakeRequest) -> ResponseItem + Send + 'static,
     request_log: Option<Arc<crate::api_server::core::RequestLog>>,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
@@ -237,7 +250,7 @@ fn answering_app_state_built(
         let mut open = Vec::new();
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            request.sink.try_send(answer(request.rid.as_str())).unwrap();
+            request.sink.try_send(answer(&request)).unwrap();
             open.push(request);
         }
     });

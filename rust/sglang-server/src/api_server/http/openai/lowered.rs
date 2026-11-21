@@ -113,6 +113,7 @@ impl OpenAiChat {
                 ..Default::default()
             },
             model: ChatModel {
+                model_type: server_args.model_config.model_type.clone(),
                 context_length: Some(server_args.model_config.context_len),
                 generation_config,
                 ..ChatModel::for_formatter(formatter)
