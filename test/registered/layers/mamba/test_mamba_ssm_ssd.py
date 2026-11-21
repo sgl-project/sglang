@@ -883,6 +883,73 @@ def test_mamba_chunk_scan_lone_request_nonfinite_input_stays_nonfinite(target):
     )
 
 
+@pytest.mark.parametrize("target", ["x", "B"])
+@pytest.mark.parametrize(
+    "chunk_size,lens",
+    [(16, [40, 30]), (16, [16, 20, 20]), (128, [200, 100, 60])],
+    ids=["two_seqs_carry", "three_seqs_chain", "chunk128_three_seqs"],
+)
+def test_mamba_chunk_scan_nonfinite_stays_with_its_request_across_chunks(
+    chunk_size, lens, target
+):
+    """The first request carries a non-finite x or B at token 2 and spans several
+    chunks. Every later request in the packed prefill must stay exact (output and
+    final state), through chunk boundaries and through a chain of three requests.
+    The offender's own last token must stay non-finite: its carried state must not
+    be zeroed in later chunks, only kept out of the other requests' rows.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state = 2, 16, 16
+    seqlen = sum(lens)
+
+    x = torch.ones(1, seqlen, n_heads, d_head, device=device)
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    if target == "x":
+        x[0, 2, 0, 1] = torch.inf
+    else:
+        B[0, 2, 0, 1] = torch.inf
+    dt = torch.ones(1, seqlen, n_heads, device=device)
+    A = torch.zeros(n_heads, device=device)
+    C = torch.ones(1, seqlen, 1, d_state, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+
+    out = torch.empty_like(x)
+    states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=out,
+        return_varlen_states=True,
+    )
+
+    assert not out[:, lens[0] - 1].isfinite().all(), (
+        "the offending request's own carried state must stay visible in its last "
+        "token, not be zeroed"
+    )
+    start = lens[0]
+    for i, n in enumerate(lens[1:], start=1):
+        expected = (
+            d_state * torch.arange(1, n + 1, device=device, dtype=torch.float32)
+        )[None, :, None, None].expand(1, n, n_heads, d_head)
+        torch.testing.assert_close(out[:, start : start + n], expected)
+        torch.testing.assert_close(states[i], torch.full_like(states[i], float(n)))
+        start += n
+
+
 if __name__ == "__main__":
     import sys
 

@@ -426,16 +426,16 @@ def _chunk_scan_fwd_kernel(
                 mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
                 other=0.0,
             )
-            if HAS_SEQ_IDX:
-                # prev_states can carry another sequence's non-finite state across
-                # a chunk boundary (its own chunk legitimately went non-finite);
-                # scale_m is 0 for those rows, but 0 * nan is still nan, and that
-                # would leak through tl.dot into acc below regardless of scale_m.
-                prev_states = tl.where(
-                    (prev_states - prev_states) == 0.0, prev_states, 0.0
-                )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
+            if HAS_SEQ_IDX:
+                if not HAS_INITSTATES:
+                    # prev_states belongs to seq_idx_prev. scale_m is 0 for the rows
+                    # of any other sequence, but 0 * nan is nan, so a non-finite
+                    # carried state would reach those rows through tl.dot. Select the
+                    # rows that own it instead: their own nan stays visible, and
+                    # other sequences' rows get an exact 0.
+                    acc = tl.where((seq_idx_m == seq_idx_prev)[:, None], acc, 0.0)
         else:
             for k in range(0, dstate, BLOCK_SIZE_K):
                 C = tl.load(
@@ -451,16 +451,15 @@ def _chunk_scan_fwd_kernel(
                     & (offs_n[None, :] < hdim),
                     other=0.0,
                 )
-                if HAS_SEQ_IDX:
-                    # See the comment on the other `prev_states` sanitize above.
-                    prev_states = tl.where(
-                        (prev_states - prev_states) == 0.0, prev_states, 0.0
-                    )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
                 acc += tl.dot(C, prev_states)
                 C_ptrs += BLOCK_SIZE_K
                 prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
+            if HAS_SEQ_IDX:
+                if not HAS_INITSTATES:
+                    # See the comment on the other `prev_states` select above.
+                    acc = tl.where((seq_idx_m == seq_idx_prev)[:, None], acc, 0.0)
 
     if HAS_SEQ_IDX:
         # seq_idx is non-decreasing within [c_off, chunk_size_limit) (this pseudo-
