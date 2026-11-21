@@ -396,6 +396,12 @@ class TestAdmissionMatchedPrefixTokens(CustomTestCase):
 class TestShortestPrefillLoadScaling(CustomTestCase):
     make_req = TestShortestPrefillFirst.make_req
 
+    def setUp(self):
+        # The chunk reservation reads the encoder replay flag.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     def make_policy(self, **scaling):
         return SchedulePolicy(
             policy="shortest-prefill-first",
