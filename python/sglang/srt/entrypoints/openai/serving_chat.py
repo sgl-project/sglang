@@ -3456,10 +3456,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder or template takes history as ``reasoning_content``
         rather than via :meth:`wrap_reasoning_history`; see
-        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+        :func:`chat_encoding.spec_owns_reasoning_history` for why. Rewrapping
+        can change whitespace at the end marker and break prefix-cache reuse.
         """
         return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (
-            isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+            self._reasoning_detector is not None
             and self.template_manager.chat_template_name is None
             and self._template_reads_reasoning_content
         )

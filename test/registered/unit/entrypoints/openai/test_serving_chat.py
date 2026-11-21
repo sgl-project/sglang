@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import asyncio
 import copy
 import gc
+import itertools
 import json
 import unittest
 import uuid
@@ -4157,10 +4158,11 @@ class ServingChatTestCase(CustomTestCase):
         _use_chat_encoding(self.chat, None)
         self.assertFalse(self.chat.supports_native_reasoning_history())
 
-    def test_response_template_messages_thinking_replay(self):
+    def test_template_messages_thinking_replay(self):
         from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
         from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
         from sglang.srt.parser.beam import BeamReasoningDetector
+        from sglang.srt.parser.reasoning_parser import Glm45Detector
 
         request = AnthropicMessagesRequest(
             model="x",
@@ -4191,9 +4193,14 @@ class ServingChatTestCase(CustomTestCase):
             (reads, content_only, None, False),
             (reads, None, "chatml", False),
         ]
-        for template, default, conversation, native in cases:
+        for (template, default, conversation, native), detector in itertools.product(
+            cases, (BeamReasoningDetector, Glm45Detector)
+        ):
             with self.subTest(
-                template=template, default=default, conversation=conversation
+                template=template,
+                default=default,
+                conversation=conversation,
+                detector=detector.__name__,
             ):
                 self.tm.tokenizer.chat_template = template
                 self.template_manager.chat_template_name = conversation
@@ -4203,7 +4210,7 @@ class ServingChatTestCase(CustomTestCase):
                 ):
                     chat = OpenAIServingChat(self.tm, self.template_manager)
                 chat.chat_encoding_spec = None
-                chat._reasoning_detector = BeamReasoningDetector()
+                chat._reasoning_detector = detector()
                 converted = AnthropicServing(chat)._convert_to_chat_completion_request(
                     request
                 )
