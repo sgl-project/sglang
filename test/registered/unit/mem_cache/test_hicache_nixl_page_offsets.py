@@ -3,7 +3,6 @@
 import sys
 import types
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -26,6 +25,9 @@ from sglang.srt.mem_cache.storage.nixl.hicache_nixl import (
     HiCacheNixl,
     _HybridPoolContext,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _DummyHostPool:
@@ -55,28 +57,28 @@ class _DummyHostPool:
 
 
 class TestHiCacheNixlPageOffsets(unittest.TestCase):
-    def _make_stub_nixl(self, host_pool: _DummyHostPool, is_zero_copy: bool) -> HiCacheNixl:
+    def _make_stub_nixl(
+        self, host_pool: _DummyHostPool, is_zero_copy: bool
+    ) -> HiCacheNixl:
         nixl = HiCacheNixl.__new__(HiCacheNixl)
         nixl.mem_pool_host = host_pool
         nixl.is_zero_copy = is_zero_copy
         nixl.is_mla_model = False
         nixl._logical_anchor = False
+        nixl.needs_page_alignment = False
         nixl._bounce_page_bytes = host_pool.page_numel * 4
-        nixl._bounce_set = torch.zeros(
-            (16, host_pool.page_numel), dtype=torch.float32
+        nixl._bounce_page_numel = host_pool.page_numel
+        nixl._bounce_set = torch.zeros((16, host_pool.page_numel), dtype=torch.float32)
+        nixl._bounce_get = torch.zeros((16, host_pool.page_numel), dtype=torch.float32)
+        ctx = _HybridPoolContext(
+            host_pool=host_pool,
+            is_zero_copy=is_zero_copy,
+            bounce_set=nixl._bounce_set,
+            bounce_get=nixl._bounce_get,
+            bounce_page_bytes=nixl._bounce_page_bytes,
         )
-        nixl._bounce_get = torch.zeros(
-            (16, host_pool.page_numel), dtype=torch.float32
-        )
-        nixl._hybrid_pool_ctx = {
-            PoolName.MAMBA: _HybridPoolContext(
-                host_pool=host_pool,
-                is_zero_copy=is_zero_copy,
-                bounce_set=nixl._bounce_set,
-                bounce_get=nixl._bounce_get,
-                bounce_page_bytes=nixl._bounce_page_bytes,
-            )
-        }
+        ctx.bounce_page_numel = host_pool.page_numel
+        nixl._hybrid_pool_ctx = {PoolName.MAMBA: ctx}
         nixl._get_suffixed_key = lambda key, pool_name=None: (
             f"{key}_{pool_name}" if pool_name else f"{key}_v1"
         )
@@ -114,9 +116,7 @@ class TestHiCacheNixlPageOffsets(unittest.TestCase):
         self.assertEqual(page_offsets_b, [0, 12, 20])
         self.assertTrue(all(type(off) is int for off in page_offsets_b))
         self.assertEqual(host_pool.received_get_offsets, [0, 12, 20])
-        self.assertTrue(
-            all(type(off) is int for off in host_pool.received_get_offsets)
-        )
+        self.assertTrue(all(type(off) is int for off in host_pool.received_get_offsets))
         self.assertEqual(len(key_strs_b), 3)
         self.assertEqual(len(host_buffers_b), 3)
         self.assertEqual(mult_b, 1)
@@ -126,26 +126,20 @@ class TestHiCacheNixlPageOffsets(unittest.TestCase):
         host_pool = _DummyHostPool(page_size=page_size, num_pages=8)
         nixl = self._make_stub_nixl(host_pool, is_zero_copy=False)
 
-        host_indices = torch.tensor(
-            [4, 5, 6, 7, 16, 17, 18, 19], dtype=torch.int64
-        )
+        host_indices = torch.tensor([4, 5, 6, 7, 16, 17, 18, 19], dtype=torch.int64)
         keys = ["p1", "p4"]
         key_list, host_buffers = nixl._batch_preprocess(keys, host_indices, op="set")
         self.assertEqual(key_list, ["p1_v1", "p4_v1"])
         self.assertEqual(len(host_buffers), 2)
         self.assertEqual(host_pool.received_get_offsets, [4, 16])
-        self.assertTrue(
-            all(type(off) is int for off in host_pool.received_get_offsets)
-        )
+        self.assertTrue(all(type(off) is int for off in host_pool.received_get_offsets))
 
         nixl._bounce_get[0].fill_(42.0)
         nixl._bounce_get[1].fill_(99.0)
         results = nixl._batch_get_postprocess(host_indices, [True, True])
         self.assertEqual(results, [True, True])
         self.assertEqual(host_pool.received_set_offsets, [4, 16])
-        self.assertTrue(
-            all(type(off) is int for off in host_pool.received_set_offsets)
-        )
+        self.assertTrue(all(type(off) is int for off in host_pool.received_set_offsets))
         self.assertTrue(torch.all(host_pool.storage[4] == 42.0))
         self.assertTrue(torch.all(host_pool.storage[16] == 99.0))
 
