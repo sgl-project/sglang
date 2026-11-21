@@ -18,7 +18,10 @@ from safetensors import safe_open
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    ONLINE_QUANTIZATION_METHODS,
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
@@ -31,6 +34,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.mixed_precision import (
+    MixedPrecisionConfig,
+    parse_precision_rules,
+    quant_sub_configs,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
@@ -177,7 +185,10 @@ class TransformerQuantLoadSpec:
 
     @property
     def is_convrot_int8(self) -> bool:
-        return isinstance(self.quant_config, ConvRotInt8Config)
+        configs = quant_sub_configs(self.quant_config)
+        return bool(configs) and all(
+            isinstance(config, ConvRotInt8Config) for config in configs
+        )
 
     @property
     def is_serialized_convrot_int8(self) -> bool:
@@ -819,6 +830,13 @@ def _needs_device_weight_postprocess(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    return any(
+        _config_needs_device_weight_postprocess(config)
+        for config in quant_sub_configs(quant_config)
+    )
+
+
+def _config_needs_device_weight_postprocess(quant_config: QuantizationConfig) -> bool:
     quant_name = _get_quant_config_name(quant_config)
     if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
@@ -991,6 +1009,19 @@ def _resolve_quant_config_from_transformer_override(
     )
 
 
+def _build_mixed_precision_config(*, server_args: ServerArgs) -> QuantizationConfig:
+    """Build the per-layer routing config from --quantization-overrides."""
+    rules = parse_precision_rules(
+        server_args.quantization_overrides,
+        supported_formats=ONLINE_QUANTIZATION_METHODS,
+    )
+    return MixedPrecisionConfig(
+        base_format=server_args.quantization,
+        rules=rules,
+        ignored_layers=server_args.quantization_ignored_layers,
+    )
+
+
 def _resolve_quant_config(
     *,
     hf_config: dict,
@@ -1051,18 +1082,17 @@ def _resolve_quant_config(
                 "such as owner/repo:Q4_K_M)."
             )
 
-        # Online-quant convention: for `fp8`, `mxfp4` and `convrot_int8`, a
+        # Online-quant convention: for an ONLINE_QUANTIZATION_METHODS entry, a
         # no-arg QuantizationConfig() selects the post-load path -- weights
         # load in source dtype and are quantized in
-        # process_weights_after_loading. Only those three configs take
-        # --quantization-ignored-layers.
+        # process_weights_after_loading. Only those configs take
+        # --quantization-ignored-layers and --quantization-overrides.
         quant_cls = get_quantization_config(server_args.quantization)
-        quant_kwargs = {}
-        if server_args.quantization in {"fp8", "mxfp4", "convrot_int8"}:
-            quant_kwargs["ignored_layers"] = getattr(
-                server_args, "quantization_ignored_layers", None
-            )
-        return quant_cls(**quant_kwargs)
+        if server_args.quantization not in ONLINE_QUANTIZATION_METHODS:
+            return quant_cls()
+        if not server_args.quantization_overrides:
+            return quant_cls(ignored_layers=server_args.quantization_ignored_layers)
+        return _build_mixed_precision_config(server_args=server_args)
 
     quant_config = (
         override_quant_config
