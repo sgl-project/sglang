@@ -705,7 +705,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
 
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
-        """FIA views and packed drafts must restore without querying their owners."""
+        """FIA views and packed drafts restore through their current backing."""
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         with mock.patch.dict("os.environ", {"ASCEND_USE_FIA": "True"}):
@@ -724,10 +724,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 for layers in (2, 1)
             )
         infos = tuple(pool.get_device_pool_infos()[0].buffer_info for pool in pools)
-        for pool in pools:
-            pool.get_hicache_transfer_buffers = mock.Mock(
-                side_effect=AssertionError("runtime owner query")
-            )
+        npu_patch = mock.patch(f"{MHA_POOL_HOST_MODULE}._is_npu", True)
+        npu_patch.start()
+        self.addCleanup(npu_patch.stop)
         host = MHATokenToKVPoolHost(
             infos[0],
             2,
@@ -741,6 +740,16 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             draft_buffer_infos=infos[1:],
         )
         self.addCleanup(host.destroy)
+        self.assertEqual(
+            host.k_buffer.shape,
+            (
+                host.page_num,
+                host.layer_num,
+                host.page_size,
+                host.head_num,
+                host.head_dim,
+            ),
+        )
         expected = []
         for i, info in enumerate(infos):
             for tensor in info.transfer_buffers():
@@ -754,19 +763,20 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 if direction == "D2H":
                     host_buffer[0].copy_(device_buffer[:, 1])
                 else:
-                    device_buffer[:, 1].copy_(host_buffer[0])
+                    layer = kwargs["device_layer_id"]
+                    device_buffer[layer, 1].copy_(
+                        host_buffer[0, kwargs["host_layer_id"]]
+                    )
 
         with (
             mock.patch(
-                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
-                SimpleNamespace(H2D="H2D", D2H="D2H"),
-                create=True,
-            ),
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_all_layer_kv_split_lf_pf",
+                side_effect=lambda **kw: transfer(direction="D2H", **kw),
+            ) as backup,
             mock.patch(
-                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
-                side_effect=transfer,
-                create=True,
-            ),
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_per_layer_kv_split_pf_lf",
+                side_effect=lambda **kw: transfer(direction="H2D", **kw),
+            ) as load,
         ):
             host.backup_from_device_all_layer(
                 object(), _indices(0, 16), _indices(16, 32), "kernel_ascend"
@@ -774,12 +784,27 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             for info in infos:
                 for buffer in info.transfer_buffers():
                     buffer.zero_()
-            host.load_to_device_per_layer(
-                object(), _indices(0, 16), _indices(16, 32), 0, "kernel_ascend"
-            )
+            for layer_id in range(3):
+                host.load_to_device_per_layer(
+                    object(),
+                    _indices(0, 16),
+                    _indices(16, 32),
+                    layer_id,
+                    "kernel_ascend",
+                    is_draft=layer_id >= host.target_layer_num,
+                )
+        self.assertEqual(backup.call_count, 2)
+        self.assertEqual(load.call_count, 3)
         actual = [tensor[:, 1] for info in infos for tensor in info.transfer_buffers()]
         for before, after in zip(expected, actual, strict=True):
             self.assertTrue(torch.equal(before, after))
+
+    def test_npu_mha_rejects_layer_first(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host._transfer_device = SimpleNamespace(type="npu")
+        host.layout = "layer_first"
+        with self.assertRaisesRegex(ValueError, "does not support layer_first"):
+            host.init_kv_buffer()
 
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
