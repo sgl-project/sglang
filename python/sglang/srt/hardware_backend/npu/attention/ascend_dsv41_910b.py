@@ -104,6 +104,44 @@ def index_topk(
     indexer = layer.indexer
     kwargs = indexer_args(backend, forward_batch, layer.compress_ratio)
     topk = backend._dsv4_index_topk
+    if keys.dtype == torch.int8:
+        from sglang.srt.hardware_backend.npu.dsv4 import dsv41_int8_indexer
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        supported = (indexer.candidate_topk_blocks, indexer.candidate_block_size) == (
+            2048,
+            8,
+        ) and query.shape[-2] in (32, 64)
+        query, keys, weights, qs, ks = dsv41_int8_indexer.prepare_indexer_operands(
+            query,
+            keys,
+            weights,
+            backend.token_to_kv_pool.get_index_scale(layer.layer_id),
+            backend._dsv41_qli_kv_lens(forward_batch),
+            None
+            if forward_batch.forward_mode.is_target_verify()
+            else getattr(forward_batch, "seq_lens_cpu", None),
+            kwargs,
+            capture=get_is_capture_mode(),
+            capacity=16384 if supported else None,
+            filtered=candidates is not None,
+        )
+        if keys.dtype == torch.int8:
+            indices, blocks = dsv41_int8_indexer.index_topk(
+                query,
+                keys,
+                weights,
+                qs,
+                ks,
+                topk,
+                candidate_topk_index=candidates,
+                candidate_topk_blocks=indexer.candidate_topk_blocks if publish else 0,
+                candidate_block_size=indexer.candidate_block_size,
+                **kwargs,
+            )
+            return indices, (blocks, indices.new_empty(0)) if publish else None
     if candidates is not None:
         indices, _ = sparse_lightning_indexer(
             query,

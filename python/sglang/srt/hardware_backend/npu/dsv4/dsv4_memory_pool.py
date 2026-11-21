@@ -24,6 +24,7 @@ import torch_npu
 from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog, kv_compress_epilog_v2
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.utils import is_ascend_910b, is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
@@ -392,12 +393,31 @@ class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
 
     def _npu_index_row_dims(self) -> Tuple[int, int, torch.dtype, torch.dtype]:
         assert self.index_head_dim > 0, self.index_head_dim
+        if is_ascend_910b() and envs.SGLANG_DSV41_NPU_INT8_INDEX_CACHE.get():
+            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_indexer import (
+                INDEX_HEAD_DIM,
+                INDEX_METADATA_BYTES,
+            )
+
+            if self.index_head_dim != INDEX_HEAD_DIM:
+                raise ValueError("DeepSeek-V4.1 INT8 index keys require 128 components")
+            return INDEX_HEAD_DIM, INDEX_METADATA_BYTES, torch.int8, torch.uint8
         if is_ascend_910b():
             return NPUDSV4KVLayout.V41_BF16.indexer_kv_info(self.index_head_dim)
         return NPUDSV4KVLayout.V41_CMP_FP4.indexer_kv_info(self.index_head_dim)
 
-    def store_bf16(self, layer_id, locations, keys):
-        _store_dsv41_rows(self.index_k_buffer[layer_id], locations, keys)
+    def store_index_rows(self, layer_id, locations, keys):
+        key_buffer = self.index_k_buffer[layer_id]
+        if key_buffer.dtype == torch.int8:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv41_int8_indexer import (
+                write_index_rows,
+            )
+
+            write_index_rows(
+                key_buffer, self.index_scale_buffer[layer_id], locations, keys
+            )
+        else:
+            _store_dsv41_rows(key_buffer, locations, keys)
 
 
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
@@ -451,6 +471,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 return NPUDSV4KVLayout.V41_BF16
             return NPUDSV4KVLayout.V41_CMP_FP4
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
+
+    def pd_kv_layout(self):
+        layout = super().pd_kv_layout()
+        if (
+            self._is_v41_model()
+            and is_ascend_910b()
+            and envs.SGLANG_DSV41_NPU_INT8_INDEX_CACHE.get()
+        ):
+            return layout + ",indexer:int8_g128_s16_v2"
+        return layout
 
     def _window_kv_layout(self):
         """Row format of the non-compressed (full/swa/window) pools.
@@ -1009,7 +1039,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         if from_indexer:
             indexer_pool = self._indexer_pool(ratio)
             if isinstance(indexer_pool, DSV41NPUIndexerPool) and is_ascend_910b():
-                indexer_pool.store_bf16(compress_layer_id, loc, kv)
+                indexer_pool.store_index_rows(compress_layer_id, loc, kv)
                 return
             if device_type == "npu":
                 assert indexer_pool.has_npu_storage, (
