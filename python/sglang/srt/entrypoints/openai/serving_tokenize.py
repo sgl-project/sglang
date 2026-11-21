@@ -105,7 +105,13 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 raise ValueError(
                     "add_generation_prompt is supported only with a Jinja chat template."
                 )
-            if (
+            if isinstance(chat_request.continue_final_message, str):
+                if chat_request._format_add_generation_prompt:
+                    raise ValueError(
+                        "add_generation_prompt conflicts with field-specific "
+                        "continue_final_message."
+                    )
+            elif (
                 chat_request.continue_final_message
                 and not chat_request._format_add_generation_prompt
             ):
