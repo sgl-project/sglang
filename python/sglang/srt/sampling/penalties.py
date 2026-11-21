@@ -66,8 +66,7 @@ class PenaltyStatusPool:
 
     def alloc(self, reqs: Sequence) -> None:
         for req in reqs:
-            req.uses_penalty = uses_penalty(req.sampling_params)
-            if not req.uses_penalty or req.penalty_index is not None:
+            if req.penalty_index is not None or not uses_penalty(req.sampling_params):
                 continue
             if self.free_indices:
                 req.penalty_index = self.free_indices.pop()
@@ -198,16 +197,10 @@ class StepPenalties:
 
     @classmethod
     def build(cls, reqs: Sequence, pool: PenaltyStatusPool) -> Optional[StepPenalties]:
-        batch_indices = [i for i, r in enumerate(reqs) if r.uses_penalty]
+        batch_indices = [i for i, r in enumerate(reqs) if r.penalty_index is not None]
         if not batch_indices:
             return None
         penalty_indices = [reqs[i].penalty_index for i in batch_indices]
-        for i, index in zip(batch_indices, penalty_indices):
-            if index is None:
-                raise RuntimeError(
-                    f"request {reqs[i].rid} uses sampling penalties but its penalty "
-                    "index was freed while it is still in a batch"
-                )
 
         device = pool.device
         params = [reqs[i].sampling_params for i in batch_indices]

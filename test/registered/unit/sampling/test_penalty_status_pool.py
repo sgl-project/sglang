@@ -22,7 +22,6 @@ def _req(num, output_ids=(), **sampling_params):
         penalty_index=None,
         output_ids=list(output_ids),
         sampling_params=SamplingParams(**sampling_params),
-        uses_penalty=False,
         eos_token_ids=None,
         tokenizer=SimpleNamespace(eos_token_id=None, additional_stop_token_ids=None),
     )
