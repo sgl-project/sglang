@@ -298,11 +298,28 @@ class BlockStored(KVCacheEvent):
     # label] runs of multimodal tokens whose item carried a caller routing
     # label. Labels are routing metadata only and never affect hashes or reuse.
     mm_routing_spans: Optional[list[list[tuple[int, int, str]]]] = None
+    # Recurrent-state checkpoint events only (``publish_recurrent_checkpoints``).
+    # Attention events leave both unset. The values mirror vLLM's
+    # self-describing KV events: ``group_idx`` is the KV cache group and
+    # ``kv_cache_spec_kind`` names its kind, so a consumer parses both engines
+    # with one code path. A checkpoint event carries exactly one hash, the
+    # hash of the page the recurrent state is valid at, and no token ids.
+    group_idx: Optional[int] = None
+    kv_cache_spec_kind: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    # See BlockStored: set only on recurrent-state checkpoint events.
+    group_idx: Optional[int] = None
+    kv_cache_spec_kind: Optional[str] = None
+
+
+# The KV cache group and kind published for recurrent-state checkpoints. The
+# attention group is implicit (no ``group_idx``), so the recurrent group is 1.
+RECURRENT_CHECKPOINT_GROUP_IDX = 1
+RECURRENT_CHECKPOINT_SPEC_KIND = "mamba"
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -735,6 +752,18 @@ class KVEventsConfig(BaseModel):
     and, for requests with mm_routing_labels, mm_routing_spans.
     """
 
+    publish_recurrent_checkpoints: bool = False
+    """Hybrid models (attention + Mamba / GDN / linear-attention layers) can
+    resume a cached prefix only where a recurrent state was kept. When true,
+    the radix cache also publishes those states: a ``BlockStored`` with
+    ``kv_cache_spec_kind="mamba"``, ``group_idx=1`` and one block hash, the
+    hash of the page the state is valid at (the same hash the attention
+    ``BlockStored`` for that page carries), when a state is cached on device,
+    and a matching ``BlockRemoved`` when it is evicted while the attention KV
+    stays. Off by default: consumers that do not read ``kv_cache_spec_kind``
+    would take these for attention blocks. Dense models publish nothing extra.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -745,6 +774,12 @@ def uses_dynamo_format(kv_events_config: Optional[str]) -> bool:
     if not kv_events_config:
         return False
     return KVEventsConfig.from_cli(kv_events_config).format == "dynamo"
+
+
+def publishes_recurrent_checkpoints(kv_events_config: Optional[str]) -> bool:
+    if not kv_events_config:
+        return False
+    return KVEventsConfig.from_cli(kv_events_config).publish_recurrent_checkpoints
 
 
 class EventPublisherFactory:

@@ -411,12 +411,14 @@ class MambaComponent(TreeComponent):
                 self.reclaimable_value_len(node)
             )
             self._cost_mark_used(node)
+            self._record_state_store(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
             self.tree_core.set_component_device_value(
                 node.id, self.component_type, params.mamba_value
             )
+            self._record_state_store(node)
             node.last_access_time = get_and_increase_time_counter()
             self._cost_mark_used(node)
             self._cost_forget_gains(node)
@@ -426,6 +428,17 @@ class MambaComponent(TreeComponent):
         node.last_access_time = get_and_increase_time_counter()
         self._cost_mark_used(node)
         result.mamba_exist = True
+
+    def _record_state_store(self, node: UnifiedTreeNode) -> None:
+        """Publish the state cached on ``node`` (KV events, when enabled)."""
+        kv_events = getattr(self.tree_core, "kv_events", None)
+        if kv_events is not None:
+            kv_events.record_state_store(node)
+
+    def _record_state_remove(self, node: UnifiedTreeNode) -> None:
+        kv_events = getattr(self.tree_core, "kv_events", None)
+        if kv_events is not None:
+            kv_events.record_state_remove(node)
 
     def _emit_excess_path_states_eviction(
         self,
@@ -534,6 +547,9 @@ class MambaComponent(TreeComponent):
             freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             cd.value = None
+            # The attention pages may stay (a tombstone), so the checkpoint
+            # needs its own removal.
+            self._record_state_remove(node)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[self.component_type]
@@ -1377,6 +1393,7 @@ class MambaComponent(TreeComponent):
                 self.tree_core.set_component_device_value(
                     node.id, ct, transfer.device_indices.clone()
                 )
+                self._record_state_store(node)
                 self._cost_mark_used(node)
                 self._cost_forget_gains(node)
 

@@ -379,6 +379,7 @@ def build_kv_cache(
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     dynamo_kv_event_format: bool = False,
+    publish_recurrent_checkpoints: bool = False,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
     draft_window_reaches: Optional[dict[str, int]] = None,
 ) -> KVCacheBuildResult:
@@ -472,6 +473,7 @@ def build_kv_cache(
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,
+        publish_recurrent_checkpoints=publish_recurrent_checkpoints,
         kv_event_lora_names=kv_event_lora_names,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
