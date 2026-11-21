@@ -96,6 +96,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
+from sglang.srt.layers.dcp.prefill_route import init_dcp_prefill_crossover
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
@@ -1184,6 +1185,13 @@ class ModelRunner:
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
+        if get_parallel().dcp_enabled:
+            # The owned route reads the replicated buffers prepared above.
+            init_dcp_prefill_crossover(
+                model=self.model,
+                attn_backend=self.attn_backend,
+                partial_dtype=self.dtype,
+            )
 
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of

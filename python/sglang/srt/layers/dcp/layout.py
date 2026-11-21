@@ -43,6 +43,19 @@ def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
+def dcp_projects_before_merge(
+    *, w_vc_replicated: bool, o_proj_unquantized: bool, kv_b_lora_active: bool
+) -> bool:
+    """Whether the owned MLA DCP route V-projects every group head before its
+    a2a, so the wire carries v_head_dim per head instead of kv_lora_rank."""
+    return (
+        get_parallel().dcp_comm_backend == "a2a"
+        and w_vc_replicated
+        and o_proj_unquantized
+        and not kv_b_lora_active
+    )
+
+
 def dsa_index_k_page_tokens(page_size: int) -> int:
     if dsa_shards_index_k():
         return page_size * get_parallel().attn_dcp_size
