@@ -61,7 +61,7 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
 
     def test_writer_matches_split_chain_bytes(self):
         """K3's KV scale is 1, so the fused write must store the split chain's bytes,
-        also for -0.0, inf and NaN lanes. A slot < 0 token skips only its cache write;
+        also for -0.0, inf and NaN lanes (inf and NaN in k: BF16 cache only). A slot < 0 token skips only its cache write;
         its Q row is still written."""
         for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for tokens in (1, 33, 256):
@@ -71,14 +71,20 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
     def _check_split_chain_bytes(self, cache_dtype, tokens):
         values = _inputs(tokens, cache_dtype=cache_dtype, cache_rows=tokens + 8)
         if tokens >= 4:
-            # The PE halves are copied, not rotated: an inf lane must not turn its
-            # partner into NaN, and a -0.0 lane must keep its sign.
+            # The PE halves are copied, not rotated (the NeoX partner of lane i is lane
+            # i + 32): an inf lane must not turn its partner into NaN, and a -0.0 lane
+            # must keep its sign whatever its partner's.
             values["q_pe"][0, 0, 0] = float("inf")
-            values["q_pe"][1, 0, 0] = -0.0
-            values["q_pe"][1, 0, 1] = -3.0
-            values["k_pe"][2, 0, 0] = -0.0
-            values["k_pe"][2, 0, 1] = -3.0
+            values["q_pe"][1, 0, (0, 33)] = -0.0
+            values["q_pe"][1, 0, (1, 32)] = -3.0
+            values["k_pe"][2, 0, (0, 33)] = -0.0
+            values["k_pe"][2, 0, (1, 32)] = -3.0
             values["q_nope"][3, 0, 0] = float("nan")
+            if cache_dtype == torch.bfloat16:
+                # An FP8 cache saturates inf and maps NaN differently from the split
+                # chain's torch cast; that is not the launch's doing.
+                values["k_pe"][0, 0, 0] = float("inf")
+                values["k_nope"][3, 0, 0] = float("nan")
         slots = torch.randperm(tokens + 8, device="cuda")[:tokens]
         slots[-1] = -1
         values["slot_mapping"] = slots

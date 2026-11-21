@@ -14,10 +14,12 @@
 """Kimi-K3 ROCm MLA decode: write the query and the latent KV cache in one launch.
 
 K3 MLA applies no RoPE. The writer runs AITER's NoPE fused concat/cache kernel
-(fused_qk_cat_and_cache_mla): it copies the PE halves through unrotated, so Q and the
-cache values equal the split concat/cache chain's, bit for bit including -0.0, inf and
-NaN lanes. Where the attention backend reads an FP8 query padded to its kernel head
-count (mla_fp8_q_out), the same launch casts Q into that buffer.
+(fused_qk_cat_and_cache_mla): it copies the PE halves through unrotated, so Q and a
+BF16 cache equal the split concat/cache chain's bit for bit, including -0.0, inf and
+NaN lanes. An FP8 cache matches for -0.0 and in-range values; the kernel's cast
+saturates inf, which torch's does not. Where the attention backend reads an FP8 query
+padded to its kernel head count (mla_fp8_q_out), the same launch casts Q into that
+buffer.
 
 kimi_k3 calls create_q_cache_writer on every platform; this module alone decides
 where the fused write runs (fused_q_cache_available) and returns None elsewhere.

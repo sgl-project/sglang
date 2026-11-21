@@ -317,6 +317,9 @@ class TestKimiK3MlaQCacheWriterGate(CustomTestCase):
         self.assertIs(fused[0], self.fused_q)
         self.assertIsNone(kernel.call_args.kwargs["q_out"])
         self.assertEqual(kernel.call_args.kwargs["q_out_dtype"], torch.bfloat16)
+        # K3's KV scale is 1: the NoPE launch must skip the scale, not load one.
+        self.assertIsNone(kernel.call_args.kwargs["k_scale"])
+        self.assertIs(kernel.call_args.kwargs["apply_scale"], False)
 
     def test_malformed_fp8_query_buffer_raises(self):
         """A buffer the launch cannot fill as the asm verify reads it is a backend
