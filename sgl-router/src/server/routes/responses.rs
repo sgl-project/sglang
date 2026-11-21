@@ -70,9 +70,21 @@ async fn adapt(resp: Response<Body>, echo: EchoContext, streaming: bool) -> Resp
     // A non-streaming reply can be as large as a request body.
     off_worker::run_for_body(bytes.len(), || {
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(chat) => {
+            Ok(chat)
+                if chat["choices"]
+                    .get(0)
+                    .is_some_and(|choice| choice["message"].is_object()) =>
+            {
                 let body = serde_json::to_vec(&chat_to_response(&chat, &echo)).expect("serialize");
                 rebuild(parts, body)
+            }
+            Ok(_) => {
+                tracing::warn!("responses: upstream reply has no chat choice");
+                parts.status = StatusCode::BAD_GATEWAY;
+                rebuild(
+                    parts,
+                    responses::error_body(502, "upstream reply contains no completion"),
+                )
             }
             Err(e) => {
                 tracing::warn!(error = %e, "responses: upstream reply is not JSON");
