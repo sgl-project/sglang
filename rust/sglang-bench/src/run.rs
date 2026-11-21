@@ -750,9 +750,7 @@ mod tests {
     fn default_gaps_keep_the_mean_rate() {
         let mut rng = StdRng::seed_from_u64(11);
         let n = 200_000;
-        let total: f64 = (0..n)
-            .map(|_| arrival_interval(&mut rng, 1.0, false))
-            .sum();
+        let total: f64 = (0..n).map(|_| arrival_interval(&mut rng, 1.0, false)).sum();
         let mean = total / n as f64;
         // Exponential gaps with mean 1/rate, i.e. mean 1 at rate 1.
         assert!((mean - 1.0).abs() < 0.02, "mean {mean}");
