@@ -50,6 +50,7 @@ import numpy as np
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.memory.page_pack import pack_pairs, remap_packed_pages
 from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
     free_unbind_inplace,
@@ -219,10 +220,11 @@ class _CapacityField(Generic[_T]):
 class _AllocatorOperation:
     """One allocator operation over some bands (`allocator_operation`): which
     bands read ahead on the host, everything (``read``) or their free and
-    pending pages only (``geometry``), whether it moves pages, and whether a
-    stream wait was queued."""
+    pending pages only (``geometry``), whether it moves pages, whether a
+    stream wait was queued, and which bands it takes pages from (``takes``,
+    by name; None when any may)."""
 
-    __slots__ = ("bands", "read", "geometry", "moves", "waited")
+    __slots__ = ("bands", "read", "geometry", "moves", "waited", "takes")
 
     def __init__(self, bands, moves: bool) -> None:
         self.bands = list(bands)
@@ -230,6 +232,20 @@ class _AllocatorOperation:
         self.geometry: Set[int] = set()
         self.moves = moves
         self.waited = False
+        self.takes: Optional[Set[str]] = None
+
+    def declare_takes(self, names) -> None:
+        """Only the bands ``names`` take pages in the rest of this operation,
+        so only they read their geometry ahead of a wait (`Band._before_wait`).
+        Declarations accumulate. An operation that already waited or read with
+        every band open stays open, and so does one whose declaration adds a
+        band after a wait."""
+        names = set(names)
+        if self.takes is None:
+            if not self.waited and not self.geometry:
+                self.takes = names
+        elif not names <= self.takes:
+            self.takes = None if self.waited else self.takes | names
 
 
 @contextlib.contextmanager
@@ -413,7 +429,7 @@ class Band:
         self.entry_bytes = band.entry_bytes
         self.min_slot_index = arena.first_entry(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Zero page envelopes on hand-out -- see _maybe_zero_pages.
+        # Zero page envelopes on hand-out -- see _bind_pages.
         self._zero_pages_on_alloc = band.zero_on_handout
         self.forward_stream = forward_stream
 
@@ -505,6 +521,10 @@ class Band:
         self._stats_n_flush_did_work: int = 0
         self._stats_n_flush_moves: int = 0
         self._stats_n_pages_absorbed: int = 0
+        # Device packs (`pack_on_device`): they absorb pages into
+        # `_stats_n_pages_absorbed`, but their move count is never read on the host,
+        # so flush work and moves count host flushes only.
+        self._stats_n_device_packs: int = 0
         self._stats_peak_free_list_len: int = 0
         self._stats_peak_pending_pages: int = 0
         self._stats_n_emits: int = 0
@@ -686,11 +706,12 @@ class Band:
         """Whether the free list's host copy matches it."""
         return self._host_free is not None
 
-    def _assert_ready_for_geometry(self, where: str) -> None:
+    def _assert_ready_for_geometry(self, where: str, *, on_host: bool = True) -> None:
         """Layout-changing geometry decides on holes and live pages only: the
-        band holds no pending page and, inside an urgent recovery, its free
-        list's host copy matches it (the recovery's entry made both true).
-        Signalled at invariant level WARN (logged) and STRICT (raises)."""
+        band holds no pending page and, inside an urgent recovery that decides
+        ``on_host``, its free list's host copy matches it (the recovery's entry
+        made both true; a device pack reads no copy). Signalled at invariant
+        level WARN (logged) and STRICT (raises)."""
         level = resolve_level()
         if level < InvariantCheckLevel.WARN:
             return
@@ -704,7 +725,9 @@ class Band:
         )
         expect_host(
             GEOMETRY_READY,
-            not (self._recovery_depth and not self._free_pages_host_known()),
+            not (
+                on_host and self._recovery_depth and not self._free_pages_host_known()
+            ),
             msg=f"{self.sub_pool_name}: {where} with no host copy of its free list",
             level=level,
         )
@@ -744,9 +767,11 @@ class Band:
     def _before_wait(self) -> None:
         """Before a stream wait: every band of the current allocator operation
         that has not yet read ahead does (`_read_ahead`), once per operation,
-        and the operation counts as waited; without an operation, every chain
-        band reads ahead. Called whether or not the wait is then needed, so
-        every rank reads at the same points."""
+        and the operation counts as waited; an operation that moves nothing
+        reads only the geometry of the bands it takes from that a fence may
+        order. Without an operation, every chain band reads ahead. Called
+        whether or not the wait is then needed, so every rank reads at the
+        same points."""
         op = self._operation
         if op is None:
             for band in self._chain_bands():
@@ -758,7 +783,11 @@ class Band:
             if op.moves:
                 band._read_ahead()
                 op.read.add(id(band))
-            elif id(band) not in op.geometry and band._fence_may_order_takes():
+            elif (
+                id(band) not in op.geometry
+                and (op.takes is None or band.sub_pool_name in op.takes)
+                and band._fence_may_order_takes()
+            ):
                 band._read_ahead_geometry()
                 op.geometry.add(id(band))
         op.waited = True
@@ -793,28 +822,23 @@ class Band:
             or self._fence_may_order_takes()
         )
 
-    def _reach_bytes(self) -> Tuple[int, int]:
-        """The bytes ``[lo, hi)`` this band's span may cover before a move:
-        its span, and the gap up to the nearest opaque frontier it grows
-        into (both gaps for a float)."""
+    def _span_bytes(self, span: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+        """The bytes ``[lo, hi)`` of the pages ``span`` (this band's span by
+        default)."""
+        first, end = self._span_range() if span is None else span
         epp = self.entry_bytes_per_page
-        first, end = self._span_range()
-        lo, hi = first * epp, end * epp
-        if self.grow_direction != "down":
-            hi = max(hi, self._chain_low_frontier_above_bytes())
-        if self.grow_direction != "up":
-            lo = min(lo, self._chain_high_frontier_below_bytes())
-        return lo, hi
+        return first * epp, end * epp
 
     def _fence_may_order_takes(self) -> bool:
-        """Whether an outstanding fence of any chain band's ledger meets the
-        bytes this band may span before a move, so that a take here chooses its
-        holes on the host. A fence only ever becomes done, so a band this skips
+        """Whether an outstanding fence of any chain band's ledger meets this
+        band's span, so that a take here chooses its holes on the host. Holes
+        lie in the span a take finds, never in the extension it adds
+        (`_acquire`), and a fence only ever becomes done, so a band this skips
         before a wait needs no host read after it."""
         chain = self._chain_bands()
         if not any(band.usage.has_fences() for band in chain):
             return False
-        lo, hi = self._reach_bytes()
+        lo, hi = self._span_bytes()
         return any(band.usage.fence_outstanding(lo, hi) for band in chain)
 
     def _read_ahead_geometry(self) -> None:
@@ -889,6 +913,10 @@ class Band:
     # Waits on the host for network transfers a move cannot avoid; shared by
     # every band of a chain (`ChainAllocator.set_network_waiter`).
     network_waiter: Optional[NetworkWaiter] = None
+
+    # Whether a transfer was ever recorded on this band (`record_transfer`): a
+    # host copy or a network engine, whose pages only a host read names.
+    records_transfers: bool = False
 
     def cap_available(self, tokens: int) -> int:
         if self.max_live_tokens is None:
@@ -1104,7 +1132,7 @@ class Band:
 
     def _consumers(self, consumer: Consumer) -> Tuple[Consumer, ...]:
         """Who writes a page handed out to ``consumer``: every hand-out but a
-        host load's is zeroed first on a band that zeroes (`_maybe_zero_pages`)."""
+        host load's is zeroed first on a band that zeroes (`_bind_pages`)."""
         if self._zero_pages_on_alloc and consumer is not Consumer.HOST_LOAD:
             return (consumer, Consumer.ZERO)
         return (consumer,)
@@ -1142,9 +1170,11 @@ class Band:
         (`page_usage.CLEARANCE`). Counts decide every check, never whether an
         event fired.
 
-        With ``bind`` (virtual pages) and no hole to take, the frontier pages
-        are taken and bound in one kernel. ``placement``: a float's planned
-        extension block; a ``planned`` take extends only into it."""
+        With ``bind`` (virtual pages) the pages are bound to them, and zeroed
+        on a band that zeroes (`_bind_pages`); with no hole to take, the
+        frontier pages are taken, bound and zeroed in one kernel.
+        ``placement``: a float's planned extension block; a ``planned`` take
+        extends only into it."""
         with record_function("Band.acquire"):
             if num_pages <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
@@ -1167,6 +1197,9 @@ class Band:
                 # settle's wait, `settle_pending`); a float keeps its span (no park).
                 self.settle_pending(through=pending.batches_for(short))
             n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
+            # The holes lie in the span before the extension: a fence only on
+            # the extended pages orders none of them.
+            hole_span = self._span_range()
             # Extend, then take holes; every host read before the first wait.
             extension = None
             if need_more > 0:
@@ -1188,7 +1221,9 @@ class Band:
             )
             if n_drain > 0:
                 self._taken_holes_host = None
-                holes, hole_clearance = self._take_holes(n_drain, consumers)
+                holes, hole_clearance = self._take_holes(
+                    n_drain, consumers, span=hole_span
+                )
                 clearance.merge(hole_clearance)
                 if self._taken_holes_host is None:
                     acquired = None
@@ -1199,6 +1234,14 @@ class Band:
             self._wait_clearance(clearance)
             if holes is None and bind is not None:
                 first, _ = extension
+                if self._zero_pages_on_alloc:
+                    return self.arena.bind_zero_units(
+                        self.sub_pool_name,
+                        bind,
+                        self.ids.virtual_to_physical,
+                        self.ids.physical_to_virtual,
+                        start=first,
+                    )
                 return alloc_bind_inplace(
                     bind,
                     self.ids.virtual_to_physical,
@@ -1212,7 +1255,7 @@ class Band:
             if holes is not None and fresh is not None:
                 pages = torch.cat([holes, fresh])
             if bind is not None:
-                self.ids.bind(bind, pages)
+                self._bind_pages(bind, pages)
             return pages
 
     def _count_taken(self, num_pages: int) -> None:
@@ -1283,10 +1326,15 @@ class Band:
         return "low" if self.grow_direction == "up" else "high"
 
     def _take_holes(
-        self, n: int, consumers: Tuple[Consumer, ...]
+        self,
+        n: int,
+        consumers: Tuple[Consumer, ...],
+        *,
+        span: Tuple[int, int],
     ) -> Tuple[torch.Tensor, Clearance]:
         """Remove ``n`` holes from the free list for ``consumers`` and return
-        them, in the order they bind, with what they must clear.
+        them, in the order they bind, with what they must clear. ``span``: the
+        pages ``[first, end)`` that hold every hole.
 
         The choice depends on retirement and releases only, never on a fired
         event, so every rank takes the same pages: holes no unretired fence
@@ -1295,8 +1343,7 @@ class Band:
         free list only after its forward was processed or waited. A fixed page
         on the free list holds nothing to keep, so it is a hole like any."""
         end = self._hole_end()
-        epp = self.entry_bytes_per_page
-        lo, hi = (page * epp for page in self._span_range())
+        lo, hi = self._span_bytes(span)
         chain = self._chain_bands()
         # Byte ranges an unretired forward (or an unreleased transfer) makes
         # ``consumers`` wait to write: the only fences that order the choice.
@@ -1527,36 +1574,40 @@ class Band:
         self, v_pages: torch.Tensor, N: int, consumer: Consumer = Consumer.FORWARD
     ) -> Optional[torch.Tensor]:
         """Acquire ``N`` pages for ``consumer`` and bind them to virtual pages
-        ``v_pages``; with no hole to take, one Triton kernel does both. Returns
-        physical page ids [N], or None on shortfall."""
+        ``v_pages`` (`_bind_pages`); with no hole to take, one Triton kernel
+        takes, binds and zeroes them. Returns physical page ids [N], or None on
+        shortfall."""
         with record_function("Band.place_pages"):
             if self._physical_take_scope is not None:
                 physical = self.take_physical_pages(N, consumer)
                 if physical is not None:
-                    self.ids.bind(v_pages, physical)
-                    self._maybe_zero_pages(physical)
+                    self._bind_pages(v_pages, physical)
                 return physical
             if N * self.page_size > self.cap_available(N * self.page_size):
                 return None
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
-            phys_pages = self.acquire(N, consumer, bind=v_pages)
-            if phys_pages is None:
-                return None
-            self._maybe_zero_pages(phys_pages)
-            return phys_pages
+            return self.acquire(N, consumer, bind=v_pages)
 
-    def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
-        """Zero the page ENVELOPES on hand-out (MHA and MLA pools): the MLA
-        kernels and trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole
-        pages and give the rows past seq_len a zero weight, so a NaN there still
-        reaches the output. Never-written bytes must read as finite values; a
-        mamba neighbour's fp32 state, read as bf16, may not.
+    def _bind_pages(self, v_pages: torch.Tensor, phys_pages: torch.Tensor) -> None:
+        """Bind ``v_pages`` to ``phys_pages``, zeroing the page ENVELOPES in the
+        same launch on hand-out (MHA and MLA pools): the MLA kernels and
+        trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole pages and
+        give the rows past seq_len a zero weight, so a NaN there still reaches
+        the output. Never-written bytes must read as finite values; a mamba
+        neighbour's fp32 state, read as bf16, may not.
         """
-        if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
+        if not self._zero_pages_on_alloc:
+            self.ids.bind(v_pages, phys_pages)
             return
-        with record_function("Band._maybe_zero_pages"):
-            self.arena.zero_units(self.sub_pool_name, phys_pages)
+        with record_function("Band._bind_pages"):
+            self.arena.bind_zero_units(
+                self.sub_pool_name,
+                v_pages,
+                self.ids.virtual_to_physical,
+                self.ids.physical_to_virtual,
+                units=phys_pages,
+            )
 
     # -- alloc --
 
@@ -1623,7 +1674,11 @@ class Band:
     # -- free --
 
     def free(
-        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+        self,
+        free_index: torch.Tensor,
+        *,
+        _pages: Optional[torch.Tensor] = None,
+        owned: bool = False,
     ) -> None:
         """Free virtual TOKEN ids: recover virtual PAGE ids, un-map v2p/p2v,
         (if id-owner) recycle the page ids, and return the physical pages to the
@@ -1633,12 +1688,16 @@ class Band:
         the data-dependent dedup is skipped. `free_index` is token-granular and
         need not be page-aligned. While a forward is in flight the physical
         pages are pending until its step is processed (`_pend_until_retire`).
+        ``owned``: the caller hands ``free_index`` over and never writes it
+        again, so an open free group holds it without a copy.
         """
         with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if self.free_group is not None:
-                self.free_group.append(self._copy_for_free_group(free_index))
+                self.free_group.append(
+                    free_index if owned else self._copy_for_free_group(free_index)
+                )
                 return
             self._free_lazy(free_index, pages=_pages)
 
@@ -1938,12 +1997,21 @@ class Band:
             f"Band({self.sub_pool_name!r}).prewarm_compaction needs "
             "the reserved sink page 0"
         )
-        # The sink page copied onto itself, listed twice: every byte written is
-        # the byte read, so the coinciding src/dst are harmless, and two entries
-        # make `.all()` launch the reduction kernel a real commit uses (it skips
-        # the kernel for one element).
+        # The sink page as both ends of two pairs, which copy nothing, and two
+        # entries make `.all()` launch the reduction kernel a real commit uses
+        # (it skips the kernel for one element).
         sink = torch.zeros(2, dtype=torch.int64, device=self.device)
         self._move_pages(sink, sink)
+        # A device pack's pair selection and remap (`pack_on_device`) over a
+        # span already packed: every pair is padded, and no entry changes.
+        grow_up = self.grow_direction == "up"
+        packed = torch.tensor(
+            [0, 0, -1, -1] if grow_up else [-1, -1, 0, 0], device=self.device
+        )
+        src, dst = pack_pairs(packed, first=0, end=4, packed_end=2, grow_up=grow_up)
+        remap_packed_pages(
+            src, dst, self.ids.virtual_to_physical, self.ids.physical_to_virtual
+        )
         # The commit's p2v check; its page-table gather and writes are the ones
         # alloc and free run, so they are warm before any compaction can exist.
         torch._assert_async((sink >= 0).all(), "prewarm_compaction")
@@ -1968,6 +2036,7 @@ class Band:
         written_virtual: Optional[torch.Tensor],
         *,
         writes_unknown: bool = False,
+        copy: bool = True,
     ) -> None:
         """Record a just-launched forward's `forward_done` event and the virtual
         ids it writes in this band, for `_flush`'s write-race check. The ledger
@@ -1977,11 +2046,15 @@ class Band:
         launches the next microbatch before the previous one ends. Pass
         `written_virtual=None` when the forward writes nothing here, and
         ``writes_unknown`` when its write ids cannot be read before it ends:
-        nothing then moves until it retires.
+        nothing then moves until it retires. Without ``copy`` the caller hands
+        ``written_virtual`` over as the ledger's copy, and never writes it again.
         """
         with record_function("Band.set_inflight_forward"):
             self.usage.record_forward(
-                forward_done, written_virtual, writes_unknown=writes_unknown
+                forward_done,
+                written_virtual,
+                writes_unknown=writes_unknown,
+                copy=copy,
             )
 
     def _physical_pages_of(self, ids: torch.Tensor, *, widened: bool) -> Set[int]:
@@ -2055,6 +2128,7 @@ class Band:
         not ``copy``."""
         if ids is None or len(ids) == 0:
             return
+        self.records_transfers = True
         self.usage.record_transfer(
             signal,
             ids,
@@ -2268,7 +2342,8 @@ class Band:
             f"flush={self._stats_n_flush_calls} "
             f"(work={self._stats_n_flush_did_work} "
             f"moves={self._stats_n_flush_moves} "
-            f"abs={self._stats_n_pages_absorbed}) "
+            f"abs={self._stats_n_pages_absorbed} "
+            f"device_packs={self._stats_n_device_packs}) "
             f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
             f"peak_holes={self._stats_peak_free_list_len} "
             f"peak_pending={self._stats_peak_pending_pages} "
@@ -2300,7 +2375,8 @@ class Band:
                 f"flush={self._stats_n_flush_calls} "
                 f"(work={self._stats_n_flush_did_work} "
                 f"moves={self._stats_n_flush_moves} "
-                f"abs={self._stats_n_pages_absorbed}) "
+                f"abs={self._stats_n_pages_absorbed} "
+                f"device_packs={self._stats_n_device_packs}) "
                 f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
                 f"peak_holes={self._stats_peak_free_list_len} "
                 f"peak_pending={self._stats_peak_pending_pages} "
@@ -2820,6 +2896,79 @@ class Band:
             with settle_pending_for_recovery((self,)):
                 return self._flush(urgent=True)
 
+    def can_pack_on_device(self) -> bool:
+        """Whether `pack_on_device` may pack this band, decided from logical
+        state alone: an end that compacts lazily, with no fixed page, no
+        transfer ever recorded, and every unfinished forward ended by the
+        latest one."""
+        return (
+            self.grow_direction != "float"
+            and self.lazy_compaction
+            and self.min_page_index >= 1
+            and not self.usage.fixed
+            and not self.records_transfers
+            and (self.usage.latest_forward is not None or not self.usage.forwards())
+        )
+
+    def pack_on_device(self) -> None:
+        """Pack the live pages against the band's base, as an urgent flush
+        does, but with no page id read on the host: the pairs and the remap
+        are fixed-shape device work sized from the live count, and the
+        frontier moves to the packed end that count gives. The stream first
+        waits the latest forward, so no copy races a forward and no vacated
+        page needs a fence; it then settles the pending pages. The pairs are
+        the ones a host flush makes, so every rank lays the band out alike.
+        Only for a band that `can_pack_on_device`."""
+        with record_function("Band.pack_on_device"):
+            assert self.can_pack_on_device(), (
+                f"{self.sub_pool_name}: a device pack needs a lazy end with no "
+                "fixed page and no recorded transfer"
+            )
+            self._settle_inflight_forward()
+            self.settle_pending()
+            self._assert_ready_for_geometry("a device pack", on_host=False)
+            # Pages vacated under a forward that has now ended: free like any
+            # page the physical-to-virtual table leaves unbound.
+            self.usage.take_ready_vacated(urgent=True)
+            first, end = self._span_range()
+            live = self.live_page_count
+            grow_up = self.grow_direction == "up"
+            packed_end = first + live if grow_up else end - live
+            if live and end - first > live:
+                self._move_packed_pages(first, end, packed_end, grow_up)
+            # A host copy of the pages a use names was taken before the move.
+            for use in self.usage.uses:
+                if use.unit_tokens is None:
+                    use.host_pages = None
+            self.watermark_physical = packed_end if grow_up else packed_end - 1
+            self._set_free_pages(
+                torch.empty(0, dtype=torch.int64, device=self.device), host=[]
+            )
+            self._pending_host = []
+            self._stats_n_flush_calls += 1
+            self._stats_n_device_packs += 1
+            # The frontier moves from ``end - first`` pages to the live count.
+            self._stats_n_pages_absorbed += end - first - live
+            self._maybe_emit_stats()
+
+    def _move_packed_pages(
+        self, first: int, end: int, packed_end: int, grow_up: bool
+    ) -> None:
+        """Copy the live pages of span ``[first, end)`` past ``packed_end``
+        into its free pages before it (`pack_pairs`), and rebind them."""
+        p2v = self.ids.physical_to_virtual
+        src, dst = pack_pairs(
+            p2v, first=first, end=end, packed_end=packed_end, grow_up=grow_up
+        )
+        # The free pages may still meet fences of earlier moves.
+        self._wait_clearance(
+            self._range_clearance(first, end, (Consumer.SCHEDULE_COPY,))
+        )
+        self._count_move_batch()
+        self._move_pages(src, dst)
+        moved = remap_packed_pages(src, dst, self.ids.virtual_to_physical, p2v)
+        self._inverse_history.append((src, dst, moved))
+
     def flush_opportunistic(self) -> int:
         """Public, non-urgent flush at quiescent points; never blocks
         `schedule_stream`. Fast-path the empty state: the scheduler triggers this
@@ -3266,27 +3415,32 @@ class FloatBand(Band):
         phys_pages = self.take_physical_pages(N, consumer)
         if phys_pages is None:
             return None
-        self.ids.bind(v_pages, phys_pages)
-        self._maybe_zero_pages(phys_pages)
+        self._bind_pages(v_pages, phys_pages)
         return phys_pages
 
     # -- free: hole-marking, boundary absorption, park-on-empty --
 
     def free(
-        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+        self,
+        free_index: torch.Tensor,
+        *,
+        _pages: Optional[torch.Tensor] = None,
+        owned: bool = False,
     ) -> None:
         """Mark the freed pages as interior HOLES / absorb boundary ones.
 
         `_pages` carries virtual PAGE ids the caller already derived -- same
         contract as the base allocator, and honoured for the same reason: deriving
         them again via `torch.unique` is a data-dependent-shape op, i.e. a HOST
-        SYNC on the per-step free path.
+        SYNC on the per-step free path. ``owned``: as `Band.free`.
         """
         with record_function("FloatBand.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if self.free_group is not None:
-                self.free_group.append(self._copy_for_free_group(free_index))
+                self.free_group.append(
+                    free_index if owned else self._copy_for_free_group(free_index)
+                )
                 return
             # Page-derivation ladder, as `_free_lazy`: caller ids, the ps==1
             # identity, then dedup.

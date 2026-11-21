@@ -80,7 +80,7 @@ class TestMLUCIReport(unittest.TestCase):
                 "jobs": [
                     {
                         "id": 101,
-                        "name": "MLU / pr-test-1-mlu",
+                        "name": "MLU / extra-test-1-mlu",
                         "runner_group_name": "mlu-ci",
                         "runner_name": "mlu-runner-1",
                         "status": "completed",
@@ -95,7 +95,7 @@ class TestMLUCIReport(unittest.TestCase):
                 "artifacts": [
                     {
                         "id": 201,
-                        "name": "mlu-ci-result-pr-42-1-pr-test-1-mlu",
+                        "name": "mlu-ci-result-pr-42-1-extra-test-1-mlu",
                         "expired": False,
                     }
                 ]

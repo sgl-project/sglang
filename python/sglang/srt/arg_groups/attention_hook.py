@@ -84,11 +84,7 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
             "--dcp-size."
         )
 
-    attn_tp_size = (
-        tp_size
-        // (view.dp_size if view.enable_dp_attention else 1)
-        // view.attn_cp_size
-    )
+    attn_tp_size = tp_size // view.attn_cp_size
     q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
     kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp_size))
     q_group = q_heads * dcp_size // kv_heads
@@ -470,6 +466,12 @@ def handle_linear_attn_backend(server_args: Any):
                 "kernel uses a strictly-lower causal mask and is invalid for "
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+            )
+        if verify == "aiter":
+            raise ValueError(
+                "--enable-linear-replayssm-spec verifies through its own "
+                "ReplaySSM kernels and cannot use "
+                "--linear-attn-verify-backend aiter."
             )
         if decode not in ("triton", "flashinfer"):
             raise ValueError(

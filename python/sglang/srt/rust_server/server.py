@@ -16,6 +16,7 @@ import json
 import logging
 import operator
 import os
+import secrets
 import signal
 import threading
 import time
@@ -47,6 +48,7 @@ from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_mm,
     get_observability,
@@ -65,6 +67,11 @@ from sglang.srt.rust_server.multimodal import (
     RustMmProcessor,
     RustMmSpec,
     settle_shm_buffers,
+)
+from sglang.srt.rust_server.warmups import (
+    check_rust_server_warmups,
+    rust_server_warmup_names,
+    start_rust_server_warmups,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.flatten import (
@@ -235,6 +242,14 @@ class RustServer:
         # Batches whose customized_info could not be sent (see
         # `_customized_info_json`).
         self._dropped_customized_info = 0
+        # The `--warmups` thread, if any (see `rust_server.warmups`).
+        self.warmup_thread: Optional[threading.Thread] = None
+        # Set on the scheduler loop's first `drain`, from when the listener's
+        # requests are served; the warmups wait for it.
+        self._scheduler_loop_started = threading.Event()
+        # The launching process, which `_fail_startup` signals; looked up now,
+        # so a failure after it died cannot signal whoever adopted this one.
+        self._launcher = psutil.Process().parent()
 
     @classmethod
     def _request_input_class(cls) -> type:
@@ -295,7 +310,8 @@ class RustServer:
                 "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
                 f"model_type={scheduler.model_config.hf_config.model_type!r} "
                 f"(supported: {', '.join(supported)}; "
-                "images only). Unset SGLANG_RUST_SERVER to serve this model."
+                "images only). Pass --disable-multimodal to serve it text-only, "
+                "or unset SGLANG_RUST_SERVER."
             )
         return mm_spec
 
@@ -367,7 +383,11 @@ class RustServer:
 
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
-        """Collective: every rank calls once; returns listener endpoints by DP rank."""
+        """Collective: every rank calls once; returns listener endpoints by DP rank.
+
+        Each listener's entry carries a ``peer_token`` its rank draws here: the
+        listener serves relayed control requests only with it, and only the
+        ranks of this launch learn it, through this gather."""
         if get_exec().moe.is_ep_joiner:
             # An elastic-EP joiner stays out: the serving ranks gathered at
             # their own startup and never enter this collective again, so a
@@ -402,6 +422,7 @@ class RustServer:
                     get_parallel().dp_rank,
                 ),
                 "endpoint": address.to_url(),
+                "peer_token": secrets.token_urlsafe(32),
             }
             if bind_host == "0.0.0.0" and address.is_ipv6:
                 config["address_error"] = (
@@ -449,6 +470,8 @@ class RustServer:
 
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        warmup_names = rust_server_warmup_names(get_serving().warmups)
+        check_rust_server_warmups(warmup_names)
 
         # Preserve the DP startup log; ports use node-local offsets.
         dp_rank = (
@@ -550,15 +573,41 @@ class RustServer:
         )
 
         instance._watch_startup_failure()
+        # The base server handle: a package's extension handle may wrap it, and
+        # only the base server owns the custom-warmup readiness gate.
+        instance.warmup_thread = start_rust_server_warmups(
+            instance.server,
+            base_url=cls._local_url(listen_port),
+            disaggregation_mode=get_disagg().disaggregation_mode,
+            warmup_names=warmup_names,
+            api_key=get_serving().api_key,
+            scheduler_loop_started=instance._scheduler_loop_started,
+            # A listener another rank's shutdown closed has not begun draining.
+            is_draining=lambda: bool(
+                instance.drain_state() & (DRAIN_DRAINING | DRAIN_CLOSED)
+            ),
+            on_failure=instance._fail_startup,
+        )
+
         return instance
 
+    def _fail_startup(self, error: str) -> None:
+        """Take the server down after a failed startup warmup, as Python's
+        HTTP server does (``_execute_server_warmup``, or a failed lifespan for
+        ``--warmups``): signal the parent process the way a crashed scheduler
+        does (``run_scheduler_process``), and the parent kills the process
+        tree."""
+        logger.error("Rust server startup failed: %s", error)
+        try:
+            self._launcher.send_signal(signal.SIGQUIT)
+        except psutil.NoSuchProcess:
+            # The process tree is already going down.
+            logger.error("Rust server startup failed after the launcher exited")
+
     def _watch_startup_failure(self) -> threading.Thread:
-        """Take the server down when its startup warmup fails, as Python's
-        HTTP server does (``_execute_server_warmup``): signal the parent
-        process the way a crashed scheduler does (``run_scheduler_process``),
-        and the parent kills the process tree. A watcher thread, so a hung
-        scheduler loop cannot hold the server up."""
-        parent = psutil.Process().parent()
+        """Take the server down when its startup warmup fails
+        (``_fail_startup``). A watcher thread, so a hung scheduler loop cannot
+        hold the server up."""
 
         def watch() -> None:
             error = self.server.wait_startup_failure()
@@ -566,14 +615,23 @@ class RustServer:
                 # Shut down, after a warmup that succeeded, was skipped, or
                 # never finished.
                 return
-            logger.error("Rust server startup warmup failed: %s", error)
-            parent.send_signal(signal.SIGQUIT)
+            self._fail_startup(f"startup warmup failed: {error}")
 
         thread = threading.Thread(
             target=watch, name="rust-server-startup-watch", daemon=True
         )
         thread.start()
         return thread
+
+    @staticmethod
+    def _local_url(port: int) -> str:
+        """This process's own listener, reached over loopback for a wildcard bind."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0"):
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        return NetworkAddress(host, port).to_url()
 
     def install_sigterm_drain(
         self, notify: Optional[str] = None, hold_drain_end: bool = False
@@ -803,6 +861,8 @@ class RustServer:
         `zmq.NOBLOCK`. Parking for work is :meth:`wait_request`, which does
         release the GIL.
         """
+        if not self._scheduler_loop_started.is_set():
+            self._scheduler_loop_started.set()
         limit = max_recv if max_recv > 0 else self._max_per_poll
         out = []
         for req in self.server.recv_requests(limit):
