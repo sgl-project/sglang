@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.model_executor import model_runner as model_runner_module
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -31,6 +32,8 @@ def _resolve(
     is_draft_worker=False,
     algorithm="EAGLE",
     draft_backend="fa3",
+    head_dim=None,
+    attention_arch=None,
 ):
     """The (label, dtype) a runner stamps from the given flags."""
     runner = ModelRunner.__new__(ModelRunner)
@@ -39,6 +42,10 @@ def _resolve(
     runner.is_draft_worker = is_draft_worker
     runner.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
     runner.draft_attention_backend = draft_backend
+    if head_dim is not None:
+        runner.model_config = SimpleNamespace(
+            head_dim=head_dim, attention_arch=attention_arch or AttentionArch.MHA
+        )
     with (
         patch.object(
             model_runner_module,
@@ -104,6 +111,71 @@ class TestRunnerKvCacheDtypeLabel(CustomTestCase):
             ),
             ("auto", torch.bfloat16),
         )
+
+    def test_a_dflash_fa4_draft_keeps_fp8_where_fa4_casts_it_in_kernel(self):
+        from sglang.srt.mem_cache import kv_cache_dtype as kv_cache_dtype_module
+
+        fp8, bf16 = ("fp8_e4m3", torch.float8_e4m3fn), ("auto", torch.bfloat16)
+        mha, mla = AttentionArch.MHA, AttentionArch.MLA
+        for capability, head_dim, arch, expected in (
+            # SM90 FA4 casts an fp8 e4m3 cache in-kernel at head_dim 256 and 512.
+            ((9, 0), 256, mha, fp8),
+            ((9, 0), 512, mha, fp8),
+            # Other head dims and other archs still need a compute-dtype cache.
+            ((9, 0), 128, mha, bf16),
+            ((10, 0), 256, mha, bf16),
+            # Absorbed MLA (an MLA DFLASH draft's head_dim is 256) passes qv,
+            # which the cast-in-kernel path does not take.
+            ((9, 0), 256, mla, bf16),
+        ):
+            with (
+                self.subTest(capability=capability, head_dim=head_dim, arch=arch),
+                patch.object(kv_cache_dtype_module, "_is_hip", False),
+                patch.object(torch.cuda, "is_available", return_value=True),
+                patch.object(
+                    torch.cuda, "get_device_capability", return_value=capability
+                ),
+            ):
+                self.assertEqual(
+                    _resolve(
+                        flag="fp8_e4m3",
+                        is_draft_worker=True,
+                        algorithm="DFLASH",
+                        draft_backend="fa4",
+                        head_dim=head_dim,
+                        attention_arch=arch,
+                    ),
+                    expected,
+                )
+
+    def test_fa4_casts_only_a_plain_fp8_e4m3_mha_cache_on_sm90(self):
+        from sglang.srt.mem_cache.kv_cache_dtype import fa4_casts_fp8_kv
+
+        e4m3 = torch.float8_e4m3fn
+        for kwargs, expected in (
+            (dict(kv_cache_dtype=e4m3, kv_cache_dtype_str="fp8_e4m3"), True),
+            # MXFP8 also stores e4m3, but runs FA4's block-scaled path.
+            (dict(kv_cache_dtype=e4m3, kv_cache_dtype_str="mxfp8"), False),
+            (
+                dict(kv_cache_dtype=torch.float8_e5m2, kv_cache_dtype_str="fp8_e5m2"),
+                False,
+            ),
+            (
+                dict(kv_cache_dtype=e4m3, kv_cache_dtype_str="fp8_e4m3", use_mla=True),
+                False,
+            ),
+            (
+                dict(
+                    kv_cache_dtype=e4m3,
+                    kv_cache_dtype_str="fp8_e4m3",
+                    device_capability=(10, 0),
+                ),
+                False,
+            ),
+        ):
+            args = dict(use_mla=False, device_capability=(9, 0)) | kwargs
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                self.assertEqual(fa4_casts_fp8_kv(**args), expected)
 
 
 if __name__ == "__main__":
