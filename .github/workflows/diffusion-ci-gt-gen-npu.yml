@@ -111,6 +111,11 @@ jobs:
         run: |
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
 
+      - name: Prefetch image-edit inputs
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
+
       - name: Generate outputs
         env:
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1npu }}
@@ -172,6 +177,11 @@ jobs:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
+
+      - name: Prefetch image-edit inputs
+        env:
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+        run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
 
       - name: Generate outputs
         env:
