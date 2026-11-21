@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.deep_select import (
     is_deep_select_supported,
     topk_page_transform,
@@ -60,8 +61,12 @@ class FullTopKIndexer:
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_prefill_lite_topk = use_prefill_lite_topk
         self.use_deep_gemm_decode = use_deep_gemm_decode
+        # Hopper keeps the top-k v2 select_decode path: DeepSelect decode there
+        # lowers draft acceptance (https://github.com/sgl-project/sglang/issues/49336).
         self.use_deep_select_decode = (
-            not use_deep_gemm_decode and is_deep_select_supported()
+            not use_deep_gemm_decode
+            and is_deep_select_supported()
+            and not current_arch().is_sm(9)
         )
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
