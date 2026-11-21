@@ -624,7 +624,7 @@ client (Codex) can replay reasoning across turns through either the router or
 the engine. Replayed items are read as `summary`, then `content`, then the
 blob.
 
-The router is stateless: `previous_response_id`, `conversation`, `background`,
+The router is stateless: `store: true`, `previous_response_id`, `conversation`, `background`,
 stored `prompt` templates and `item_reference` items are rejected with 400, as
 are `top_logprobs` and `include: ["message.output_text.logprobs"]`. The
 stored-response routes under `/v1/responses/` answer 501. Every error uses the
