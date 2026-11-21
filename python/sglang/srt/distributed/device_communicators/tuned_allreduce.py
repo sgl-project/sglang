@@ -17,6 +17,7 @@ import logging
 import os
 import re
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Dict,
     List,
@@ -35,9 +36,6 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators.allreduce_tune_table import (
     AllreduceTuneTable,
 )
-from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-    CustomAllreduce,
-)
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.torch_symm_mem import (
     TorchSymmMemCommunicator,
@@ -46,6 +44,13 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+
+if TYPE_CHECKING:
+    # Not imported at run time: custom_all_reduce -> custom_all_reduce_utils
+    # imports parallel_state, which imports this module.
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +150,7 @@ class _SglangCustomImpl(Protocol):
 Comm = Union[
     PyNcclCommunicator,
     TorchSymmMemCommunicator,
-    CustomAllreduce,
+    "CustomAllreduce",
     _FlyComm,
     _QuickComm,
     _CustomComm,
@@ -566,6 +571,11 @@ def _construct_comm(
 # different classes, so the class selects the call. The row's method only
 # says which collective was timed.
 def _bound_call(cls: type, class_name: str, captures: bool) -> Optional[_BoundCall]:
+    # Imported here, after parallel_state has finished loading (see TYPE_CHECKING above).
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
     if ".flydsl." in class_name or _QUANT_CLASS.search(cls.__name__):
         return _BoundCall(
             cast(FitsFn, _flydsl_quick_allreduce_fits),
