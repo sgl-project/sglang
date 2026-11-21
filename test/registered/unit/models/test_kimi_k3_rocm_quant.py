@@ -288,10 +288,11 @@ class TestMergeKdaInprojFp8(CustomTestCase):
     row-cat of FP8 payloads would silently drop them."""
 
     def setUp(self):
-        # The merge runs on ROCm only; that gate lives in kimi_k3_rocm_quant.
-        patcher = mock.patch.object(kimi_k3_rocm_quant, "_is_hip", True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # The merge and its forward path run on ROCm only.
+        for module in (kimi_k3_rocm_quant, kimi_k3):
+            patcher = mock.patch.object(module, "_is_hip", True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_no_tail_off_rocm(self):
         """kimi_k3 asks for the tail on every platform, so a non-HIP build must

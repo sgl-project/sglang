@@ -99,8 +99,8 @@ def k3_kv_b_for_absorb(
     )
 
     weight = _k3_channel_fp8_checkpoint_weight(module)
-    # Where the absorb would dequantize an FP8 w_kc/w_vc back to BF16, the lossy
-    # requant would buy nothing.
+    # Where the absorb would dequantize an FP8 w_kc/w_vc back to BF16,
+    # the lossy requant would buy nothing.
     if not (
         envs.SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8.get()
         and rocm_absorb_bmm_runs_fp8(weight.dtype)
@@ -121,12 +121,8 @@ def k3_kv_b_for_absorb(
 
 
 def _k3_channel_fp8_checkpoint_weight(module: nn.Module) -> torch.Tensor:
-    """module.weight as [out, in], undoing QuarkW8A8Fp8's post-processing if it ran.
-
-    Loaders that restore an already-processed state (ShardedStateLoader,
-    RemoteModelLoader) run post_load_weights on its transposed, maybe
-    AITER-preshuffled, [in, out] view.
-    """
+    # module.weight as [out, in], undoing QuarkW8A8Fp8's post-processing if it ran;
+    # loaders that restore a processed state hand post_load_weights its [in, out] view.
     weight = module.weight.data
     if not _is_processed_quark_channel_fp8(module):
         return weight
@@ -143,7 +139,7 @@ def _k3_channel_fp8_checkpoint_weight(module: nn.Module) -> torch.Tensor:
 
 
 def _is_quark_channel_fp8_scheme(module: nn.Module) -> bool:
-    """Quark per-channel FP8 with dynamic activations, in any weight layout."""
+    # Quark per-channel FP8 with dynamic activations, in any weight layout.
     from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
     from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 
@@ -156,7 +152,7 @@ def _is_quark_channel_fp8_scheme(module: nn.Module) -> bool:
 
 
 def _is_quark_channel_fp8(module: nn.Module) -> bool:
-    """Quark per-channel FP8 with dynamic activations, before post-processing."""
+    # Quark per-channel FP8 with dynamic activations, before post-processing.
     if not _is_quark_channel_fp8_scheme(module):
         return False
     weight, scale = module.weight, module.weight_scale
@@ -188,10 +184,8 @@ def k3_kda_inproj_fp8_tail_rows(
         return 0
     if not all(_is_quark_channel_fp8(m) for m in (f_a_proj, b_proj, f_b_proj)):
         return 0
-    # fused_qkvg_proj does not exist yet (its size is this answer), so resolve
-    # its quant method on a weightless probe; [q,k,v,g] may be excluded alone.
-    # The probe keeps fused_qkvg_proj's class, which Quark's
-    # layer_type_quant_config matches by name; only LinearBase.__init__ runs.
+    # fused_qkvg_proj does not exist yet, so resolve its quant method on a weightless probe;
+    # the probe keeps its class, which Quark's layer_type_quant_config matches by name.
     qkvg_probe = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
     LinearBase.__init__(
         qkvg_probe,
@@ -278,7 +272,7 @@ def k3_merge_kda_inproj_fp8(
 
 
 def _is_processed_quark_channel_fp8(module: nn.Module) -> bool:
-    """QuarkW8A8Fp8.process_weights_after_loading leaves a transposed [in, out] view."""
+    # QuarkW8A8Fp8.process_weights_after_loading leaves a transposed [in, out] view.
     weight = module.weight
     return (
         _is_quark_channel_fp8_scheme(module)
@@ -296,7 +290,7 @@ def _kda_inproj_fp8_processed_sizes(
     b_proj: nn.Module,
     f_b_proj: nn.Module,
 ) -> Optional[tuple[list[int], None]]:
-    """Split sizes of a qkvg_proj whose merged tail was restored already processed."""
+    # Split sizes of a qkvg_proj whose merged tail was restored already processed.
     in_dim, rows = qkvg_proj.weight.shape
     wide = sum(qkvg_sizes)
     tail = rows - wide
@@ -312,11 +306,11 @@ def _kda_inproj_fp8_processed_sizes(
             "fused_qkvg_proj has a processed [f_a | b] tail but the KDA in-proj "
             "weights are not the processed Quark per-channel FP8 layout it holds."
         )
-    # A state saved without the tail loads into a narrowed view and leaves the
-    # tail uninitialized. The weight may be preshuffled; the scales never are.
+    # A state saved without the tail loads into a narrowed view and leaves the tail
+    # uninitialized; the weight may be preshuffled, the scales never are.
     scale = qkvg_proj.weight_scale.reshape(-1)
-    # The merge writes pad scales of 1.0, which processing may rescale like every
-    # channel (2x for e4m3fnuz), so ask only for one positive value.
+    # The merge writes pad scales of 1.0, which processing may rescale like every channel
+    # (2x for e4m3fnuz); ask only for one positive value.
     pad_scale = scale[wide + n_fa + n_b :]
     if not (
         torch.equal(scale[wide : wide + n_fa], f_a_proj.weight_scale.reshape(-1))

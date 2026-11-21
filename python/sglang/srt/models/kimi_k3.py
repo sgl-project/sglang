@@ -2026,8 +2026,8 @@ class KimiK3DeltaAttention(nn.Module):
             self._qkvg_gate_float_shard = _qkvg_gate_shard_is_float(
                 quant_config, prefix
             )
-            # Built before fused_qkvg_proj, which on ROCm may reserve room for
-            # their rows; registered after it to keep the module order.
+            # Built before fused_qkvg_proj, which on ROCm may reserve room for their rows;
+            # registered after it to keep the module order.
             b_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads,
@@ -2114,7 +2114,7 @@ class KimiK3DeltaAttention(nn.Module):
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
             self._bfa_f_b_w: Optional[torch.Tensor] = None
-            # Quark FP8: fused_qkvg_proj's own weight holds the merged rows, so
+            # Quark FP8: fused_qkvg_proj's own weight holds the merged rows;
             # every batch size runs the merged GEMM (_merge_kda_inproj_fp8).
             self._qkvgbfa_in_qkvg_proj = False
             self._derived_weight_cache_error: Optional[str] = None
@@ -2348,7 +2348,7 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
-        if self._merge_kda_inproj_fp8():
+        if _is_hip and self._merge_kda_inproj_fp8():
             return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
@@ -2394,11 +2394,9 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_side_tgv_m_ranges = m_ranges
 
     def _merge_kda_inproj_fp8(self) -> bool:
-        """Copy the Quark FP8 [f_a | b] rows into fused_qkvg_proj's reserved tail;
-        False where no tail was reserved.
-
-        Leaves _bfa_w None. A re-run after weight processing keeps the merge,
-        since the weights no longer have the checkpoint layout it reads."""
+        # Copy the Quark FP8 [f_a | b] rows into fused_qkvg_proj's reserved tail;
+        # False where no tail was reserved. Leaves _bfa_w None. A re-run after weight
+        # processing keeps the merge, since the weights no longer have the checkpoint layout.
         if self._qkvgbfa_in_qkvg_proj:
             return True
         if not self._kda_inproj_tail_rows:
@@ -2412,8 +2410,8 @@ class KimiK3DeltaAttention(nn.Module):
         )
         if merged is None:
             return False
-        # Rows were written in place, so the loader's process_weights_after_loading
-        # prepares the projection's only copy; f_a_proj/b_proj keep small unused ones.
+        # Rows were written in place, so process_weights_after_loading prepares the only copy;
+        # f_a_proj/b_proj keep small unused ones.
         self._qkvgbfa_sizes, self._bfa_f_b_w = merged
         # The cached f_b is BF16; other activation dtypes (--dtype float16) run f_b_proj.
         if self.o_norm.weight.dtype != torch.bfloat16:
@@ -2653,7 +2651,7 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
-            if self._qkvgbfa_in_qkvg_proj:
+            if _is_hip and self._qkvgbfa_in_qkvg_proj:
                 # Quark FP8: one GEMM through fused_qkvg_proj's own weight, which
                 # holds the [f_a | b] tail (_merge_kda_inproj_fp8), at every batch.
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
@@ -2664,7 +2662,7 @@ class KimiK3DeltaAttention(nn.Module):
                 if defer_f_b:
                     forget_gate = f_a
                 elif self._bfa_f_b_w is None:
-                    # Restored from an already-processed state: no BF16 f_b cache.
+                    # No BF16 f_b cache (restored processed state or non-BF16 activations).
                     forget_gate = self.f_b_proj(f_a.contiguous())[0]
                 else:
                     forget_gate = k3_kda_inproj_fp8_f_b(
