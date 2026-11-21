@@ -978,6 +978,7 @@ class ExecMoe(msgspec.Struct):
             "ascend_ops",
             "pplx",
             "flashinfer_megamoe",
+            "flashinfer_rdma",
         ],
         Arg(
             help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
@@ -996,10 +997,17 @@ class ExecMoe(msgspec.Struct):
                 "pplx",
                 "ascend_ops",
                 "flashinfer_megamoe",
+                "flashinfer_rdma",
             ],
             resolvable=True,
         ),
     ] = "none"
+    flashinfer_rdma_max_tokens_per_rank: A[
+        int,
+        "Physical decode/verify token capacity per rank for flashinfer_rdma. "
+        "Includes speculative draft tokens per request; prefill uses a separate "
+        "collective path. Increase this value for larger decode batches.",
+    ] = 256
     enable_w4a4_mxfp4_megamoe: A[
         bool,
         "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "

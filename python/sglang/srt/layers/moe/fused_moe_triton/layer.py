@@ -271,6 +271,40 @@ def create_moe_dispatcher(
         )
     elif a2a_backend.is_ascend_ops():
         return AscendOpsDispatcher(moe_runner_config, get_moe_ascend_ops_config())
+    elif a2a_backend.is_flashinfer_rdma():
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+            Mxfp4FlashinferCutlassMoEMethod,
+        )
+
+        native_mxfp4 = (
+            isinstance(quant_method, Mxfp4FlashinferCutlassMoEMethod)
+            and quant_method._use_mxfp8_act_scaling
+            and moe_runner_config.runner_backend.is_flashinfer_mxfp4()
+        )
+        modelopt_nvfp4 = (
+            isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
+            and not quant_method.quant_config.use_per_token_activation
+            and moe_runner_config.runner_backend.is_flashinfer_cutlass()
+        )
+        if not moe_runner_config.is_gated or not (native_mxfp4 or modelopt_nvfp4):
+            raise ValueError(
+                "flashinfer_rdma requires gated ModelOpt NVFP4/flashinfer_cutlass "
+                "or native SM120 MXFP4/flashinfer_mxfp4 experts."
+            )
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer_rdma import (
+            FlashinferRdmaDispatcher,
+        )
+
+        return FlashinferRdmaDispatcher(
+            group=get_parallel().tp_group.device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            moe_runner_config=moe_runner_config,
+            max_tokens_per_rank=get_exec().moe.flashinfer_rdma_max_tokens_per_rank,
+        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_parallel().tp_group.device_group,

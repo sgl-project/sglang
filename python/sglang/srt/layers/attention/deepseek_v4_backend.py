@@ -3078,7 +3078,6 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
-
         cp_active = is_cp_active(forward_batch)
         cp_sparse_prefill = (
             cp_active

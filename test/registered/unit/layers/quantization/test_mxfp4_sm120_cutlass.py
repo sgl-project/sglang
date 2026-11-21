@@ -91,7 +91,8 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
             sys.modules[module_name] = cached_module
 
 
-def test_dsv4_sm120_load_contract(monkeypatch, request):
+@pytest.mark.parametrize("intermediate", [256, 288, 576])
+def test_dsv4_sm120_load_contract(monkeypatch, request, intermediate):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
     from sglang.srt.runtime_context import get_context
 
@@ -99,11 +100,13 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
     platform.install()
     request.addfinalizer(platform.restore)
 
+    monkeypatch.setattr(adapter_module, "is_flashinfer_available", lambda: True)
     captured = {}
 
     class _Fp8Method:
         def create_weights(self, *args, **kwargs):
             captured.update(kwargs)
+            captured["intermediate_size_per_partition"] = args[3]
 
     with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
         method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(_Fp8Method(), "test")
@@ -111,12 +114,65 @@ def test_dsv4_sm120_load_contract(monkeypatch, request):
         SimpleNamespace(),
         num_experts=4,
         hidden_size=256,
-        intermediate_size_per_partition=256,
+        intermediate_size_per_partition=intermediate,
         params_dtype=torch.bfloat16,
     )
 
     assert method.load_up_proj_weight_first
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
+    assert captured["intermediate_size_per_partition"] == intermediate
+
+
+@pytest.mark.parametrize("intermediate,padded", [(288, 384), (576, 640)])
+def test_sm120_padding_preserves_gate_up_and_down_shards(
+    monkeypatch, intermediate, padded
+):
+    import flashinfer
+
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+
+    # Only scale-layout permutation is mocked; exercise the real post-load
+    # padding and ensure the original TP shard remains byte-for-byte intact.
+    monkeypatch.setattr(flashinfer, "block_scale_interleave", lambda value: value)
+    layer = torch.nn.Module()
+    layer.intermediate_size_per_partition = intermediate
+    shapes = {
+        "w13_weight": (2, 2 * intermediate, 64),
+        "w2_weight": (2, 128, intermediate // 2),
+        "w13_weight_scale_inv": (2, 2 * intermediate, 4),
+        "w2_weight_scale_inv": (2, 128, intermediate // 32),
+    }
+    originals = {}
+    for name, shape in shapes.items():
+        value = torch.randint(1, 127, shape, dtype=torch.uint8)
+        originals[name] = value.clone()
+        if "scale" in name:
+            value = value.view(torch.float8_e8m0fnu)
+        layer.register_parameter(name, torch.nn.Parameter(value, requires_grad=False))
+    method = object.__new__(Mxfp4FlashinferCutlassMoEMethod)
+    method._fp8 = SimpleNamespace(process_weights_after_loading=lambda layer: None)
+    method._use_mxfp8_act_scaling, method._use_sm90_humming = True, False
+    method.prefix = "test.experts"
+    method.moe_runner_config = SimpleNamespace(
+        intermediate_size_per_partition=intermediate
+    )
+    method.process_weights_after_loading(layer)
+    assert layer.intermediate_size_per_partition == padded
+    assert method.moe_runner_config.intermediate_size_per_partition == padded
+    for name in ("w13_weight", "w13_weight_scale_inv"):
+        actual = getattr(layer, name).view(torch.uint8)
+        assert torch.equal(actual[:, :intermediate], originals[name][:, :intermediate])
+        assert torch.equal(
+            actual[:, padded : padded + intermediate], originals[name][:, intermediate:]
+        )
+    for name in ("w2_weight", "w2_weight_scale_inv"):
+        actual = getattr(layer, name).view(torch.uint8)
+        assert torch.equal(actual[..., : originals[name].shape[-1]], originals[name])
+    assert torch.count_nonzero(layer.w13_weight[:, intermediate:padded]) == 0
+    assert torch.count_nonzero(layer.w13_weight[:, padded + intermediate :]) == 0
+    assert torch.count_nonzero(layer.w2_weight[..., intermediate // 2 :]) == 0
 
 
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch, stated_tp_group):
@@ -160,6 +216,7 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch, stated_tp_group):
         w13_weight_scale_inv=torch.nn.Parameter(w31_scale.clone(), requires_grad=False),
         w2_weight_scale_inv=torch.nn.Parameter(w2_scale.clone(), requires_grad=False),
         num_local_experts=num_experts,
+        intermediate_size_per_partition=intermediate,
         moe_tp_size=1,
         moe_tp_rank=0,
         moe_ep_size=1,
