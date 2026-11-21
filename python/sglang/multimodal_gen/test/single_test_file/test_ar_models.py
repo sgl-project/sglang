@@ -6,7 +6,7 @@ that a non-empty output comes back.
 
 Run directly:
 
-    pytest -v python/sglang/multimodal_gen/test/server/test_ar_models.py
+    pytest -v python/sglang/multimodal_gen/test/single_test_file/test_ar_models.py
     pytest -v ... -k GLMImage              # one class
 """
 
