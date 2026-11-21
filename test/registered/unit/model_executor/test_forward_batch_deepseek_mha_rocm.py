@@ -157,7 +157,7 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         self.assertFalse(any(fb.prefix_chunk_has_zero_kv))
 
     def test_capacity_below_batch_size_packs_on_hip_and_raises_elsewhere(self):
-        """A chunk capacity below the batch size packs on HIP and raises a clear error elsewhere."""
+        """Capacity <= 0 raises everywhere; 0 < capacity < batch size packs on HIP, raises elsewhere."""
         prefix_lens, capacity = [5, 1, 1], 2
         for is_hip, bad_capacity in itertools.product((False, True), (0, -2)):
             with (
