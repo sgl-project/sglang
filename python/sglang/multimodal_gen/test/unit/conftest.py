@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -70,6 +71,18 @@ def _make_unit_server_args():
         model_paths={},
         pipeline_config=pipeline_config,
     )
+
+
+@pytest.fixture(autouse=True)
+def restore_root_logger():
+    # ServerArgs() runs configure_logger, which resets the root level and handlers.
+    root = logging.getLogger()
+    level, handlers = root.level, root.handlers[:]
+    try:
+        yield
+    finally:
+        root.setLevel(level)
+        root.handlers[:] = handlers
 
 
 @pytest.fixture(autouse=True)
