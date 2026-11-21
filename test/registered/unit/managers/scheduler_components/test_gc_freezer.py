@@ -136,15 +136,41 @@ class TestGCFreezer(CustomTestCase):
         )
         self.assertEqual(self._gc_calls(), young + young + full + young + full + young)
 
-    def test_cache_reset_unfreezes_and_collects_fully_at_once(self):
-        # Unfrozen objects land in the oldest generation, which collect(1) misses;
-        # a flush runs with empty queues, so the full collection costs no batch.
-        freezer = self._freezer(freeze_after_batches=5)
-        self._frozen_at(freezer, range(1, 8))
+    def test_young_freeze_and_full_pass_on_the_same_batch(self):
+        # N=4, M=2: both are due at 8 and 12; the full pass covers the batch.
+        freezer = self._freezer(freeze_after_batches=4, freeze_every_batches=2)
+        self.assertEqual(self._frozen_at(freezer, range(1, 13)), [4, 6, 8, 10, 12])
+        young, full = (
+            [call.collect(1), call.freeze()],
+            [
+                call.unfreeze(),
+                call.collect(),
+                call.freeze(),
+            ],
+        )
+        self.assertEqual(self._gc_calls(), young * 2 + full + young + full)
+
+    def test_cache_reset_collects_and_freezes_again_at_once(self):
+        """The heap must not stay unfrozen until the next scheduled freeze, which
+        with --gc-freeze-every-batches 0 is up to N batches away."""
+        freezer = self._freezer(freeze_after_batches=3)
+        self.assertEqual(self._frozen_at(freezer, range(1, 5)), [3])
         self.gc_ops.reset_mock()
         freezer.on_cache_reset()
-        self.assertEqual(self._gc_calls(), [call.unfreeze(), call.collect()])
-        self.assertEqual(self._frozen_at(freezer, range(8, 11)), [10])
+        self.assertEqual(
+            self._gc_calls(), [call.unfreeze(), call.collect(), call.freeze()]
+        )
+        self.assertEqual(self._frozen_at(freezer, range(5, 8)), [6])
+
+    def test_cache_reset_after_a_batch_freeze_skips_the_idle_refreeze(self):
+        # The reset already refroze the heap; an idle freeze would collect again.
+        freezer = self._freezer(freeze_on_idle_secs=5.0, freeze_after_batches=3)
+        self._frozen_at(freezer, range(1, 4))
+        freezer.on_idle(self.forward_ct[0])
+        freezer.on_cache_reset()
+        self.gc_ops.reset_mock()
+        freezer.on_idle(self.forward_ct[0])
+        self.assertEqual(self._gc_calls(), [])
 
     def test_cache_reset_keeps_the_batch_schedule(self):
         freezer = self._freezer(freeze_after_batches=10, freeze_every_batches=4)
@@ -181,12 +207,15 @@ class TestBatchFreezeAfterCacheReset(CustomTestCase):
         for _ in range(10):
             _Node(root)
         alive = weakref.ref(root)
+        live = _Node()
         gc.disable()  # Only the freezer's own collections may run.
         try:
             freezer.on_batch(1)
             del root
             freezer.on_cache_reset()
             self.assertIsNone(alive())
+            # The reset froze the heap again: frozen objects are not listed.
+            self.assertFalse(any(obj is live for obj in gc.get_objects()))
         finally:
             gc.unfreeze()
             gc.enable()

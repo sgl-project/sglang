@@ -38,11 +38,12 @@ class GCFreezer:
     def on_cache_reset(self) -> None:
         if self._freeze_on_idle_secs > 0 or self._freeze_after_batches > 0:
             gc.unfreeze()
-        if self._freeze_after_batches > 0:
-            # The unfrozen heap lands in the oldest generation, which the batch
-            # freeze's collect(1) never reaches; a flush runs with empty queues.
+        if self._batch_froze:
+            # The unfrozen heap lands in the oldest generation, which collect(1)
+            # never reaches; a flush runs with empty queues, so collect and refreeze.
             gc.collect()
-        if self._freeze_on_idle_secs > 0:
+            gc.freeze()
+        elif self._freeze_on_idle_secs > 0:
             self._next_freeze = time.monotonic()
 
     def on_batch(self, forward_ct: int) -> None:
