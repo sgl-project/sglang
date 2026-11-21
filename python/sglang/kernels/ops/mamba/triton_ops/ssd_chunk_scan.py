@@ -13,6 +13,8 @@ import triton
 import triton.language as tl
 from packaging import version
 
+from sglang.srt.kernel_plugins.flashinfer_packages import kernel_site
+
 from .autotune import autotune_cache_kwargs, prune_oversized_tiles
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -557,6 +559,7 @@ def _chunk_scan_fwd_kernel(
     )
 
 
+@kernel_site
 def _chunk_scan_fwd(
     cb,
     x,

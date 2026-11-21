@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.kernel_plugins import flashinfer_packages
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -45,9 +46,10 @@ def _unsupported_derived_weight_cache_error(
 ) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
-    Compensated mHC projections and HPC-Ops bf16xfp32 GEMM retain derived
-    weight splits that in-place loader writes do not refresh. Model-owned
-    caches can also declare this constraint via ``_derived_weight_cache_error``.
+    Compensated mHC projections, HPC-Ops bf16xfp32 GEMM and FlashInfer kernel
+    packages with a setup step retain derived weights that in-place loader
+    writes do not refresh. Model-owned caches can also declare this constraint
+    via ``_derived_weight_cache_error``.
     Reject before writing weights to avoid serving stale cached values,
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
@@ -73,6 +75,8 @@ def _unsupported_derived_weight_cache_error(
             reason = getattr(module, "_derived_weight_cache_error", None)
             if reason is not None:
                 return reason
+    if error := flashinfer_packages.weight_rewrite_error("online weight updates"):
+        return error
     from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
