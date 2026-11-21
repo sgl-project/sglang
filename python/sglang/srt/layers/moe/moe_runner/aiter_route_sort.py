@@ -208,6 +208,11 @@ def _cfg_args(lookup: dict, m: int) -> dict:
     return dict(token=api.get_padded_M(m), q_dtype_a=quant_dtype_a, **args)
 
 
+# The largest batch the fused sort beats AITER's standard (non-aux) sort at: bench_moe_route_radix4_sort.py
+# has it ahead through 256 tokens and level to behind from 512; the aux sort loses to it at every size.
+_STANDARD_SORT_MAX_TOKENS = 256
+
+
 class AiterRouteSortConsumer:
     """Which block_m a layer's fused_moe takes the router's sort at, per batch
     size (route_sort.RouteSortConsumer).
@@ -272,14 +277,23 @@ class AiterRouteSortConsumer:
             self._decline(f"get_2stage_cfgs rejects M={m}: {e}")
             return None
         if api.presorted_moe_block_m is not None:
-            return api.presorted_moe_block_m(metadata)
-        if (
+            block_m = api.presorted_moe_block_m(metadata)
+        elif (
             metadata.full_impl is None
             and bool(metadata.output_aux)
             and int(metadata.block_m) == api.presort_block_m
         ):
-            return api.presort_block_m
-        return None
+            block_m = api.presort_block_m
+        else:
+            block_m = None
+        # AITER's standard sort is cheaper than its aux sort, so past this size it beats the fused one.
+        if (
+            block_m is not None
+            and not metadata.output_aux
+            and m > _STANDARD_SORT_MAX_TOKENS
+        ):
+            return None
+        return block_m
 
     def _decline(self, reason: str) -> None:
         self._lookup = None

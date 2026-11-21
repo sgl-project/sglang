@@ -992,7 +992,12 @@ def test_select_experts_sorts_only_where_aiter_takes_it(mode, monkeypatch):
     sizes = [1, 16, 64, 65, 128, 256, 512]
     expected = {}
     for m in sizes:
-        expected[m] = aiter_block_m(get_2stage_cfgs(**consumer.cfg_args(m)))
+        metadata = get_2stage_cfgs(**consumer.cfg_args(m))
+        block_m = aiter_block_m(metadata)
+        # AITER's standard sort beats the fused one past the consumer's size limit.
+        if not metadata.output_aux and m > aiter_route_sort._STANDARD_SORT_MAX_TOKENS:
+            block_m = None
+        expected[m] = block_m
     registered = {}
     for m in sizes:
         registrations = []

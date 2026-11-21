@@ -277,6 +277,24 @@ class TestAiterRouteSortConsumerAiterAnswers(CustomTestCase):
             [r and r["M"] for r in registrations], [16, None, 128, None, None, None]
         )
 
+    def test_standard_sorts_are_fused_only_up_to_the_measured_size(self):
+        """AITER's non-aux sort beats the fused one past 256 tokens; the aux sort never does."""
+        limit = aiter_route_sort._STANDARD_SORT_MAX_TOKENS
+        for aux, expected in ((False, [limit]), (True, [limit, limit + 1])):
+            with self.subTest(aux=aux):
+                lookup = MagicMock(
+                    side_effect=lambda **kw: _metadata(32, output_aux=aux)
+                )
+                with _patch_cfg_api(lookup, lambda metadata: metadata.block_m):
+                    consumer = aiter_route_sort.AiterRouteSortConsumer()
+                    consumer.observe(_fused_moe_call(1))
+                    sorted_at = [
+                        m
+                        for m in (limit, limit + 1)
+                        if consumer.sort_block_m(m) is not None
+                    ]
+                self.assertEqual(sorted_at, expected)
+
     def test_bm16_config_without_the_aux_sort_pipeline_declines(self):
         """An AITER without presorted_moe_block_m reads a presort only on the
         aux-sort pipeline at BM=16: its A16W4 SiTUv2 rows are BM=16 without it,

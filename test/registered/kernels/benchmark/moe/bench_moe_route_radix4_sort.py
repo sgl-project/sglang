@@ -24,9 +24,13 @@ from aiter.fused_moe import moe_sorting  # noqa: E402
 SORT_WS = moe_route_radix4.new_sort_workspace(torch.device("cuda"))
 
 
-def _aiter_sort(ids, weights, moe_buf, block_m):
-    # The consuming call: the BM=16 pipeline is the aux sort, which also writes the aux tensors
-    # (AITER has no aux sort at BM=32); both zero moe_buf.
+# The sorts AITER's fused_moe consumes: block_m and whether it is the aux sort (which also
+# writes the aux tensors); every one zeroes moe_buf.
+SORTS = {"bm16_aux": (16, True), "bm16": (16, False), "bm32": (32, False)}
+
+
+def _aiter_sort(ids, weights, moe_buf, sort):
+    block_m, aux = SORTS[sort]
     return moe_sorting(
         ids,
         weights,
@@ -34,24 +38,24 @@ def _aiter_sort(ids, weights, moe_buf, block_m):
         MODEL_DIM,
         torch.bfloat16,
         block_size=block_m,
-        output_aux=block_m == 16,
+        output_aux=aux,
         output=moe_buf,
     )
 
 
-def _aiter_route_then_sort(scores, bias, moe_buf, block_m):
+def _aiter_route_then_sort(scores, bias, moe_buf, sort):
     weights = torch.empty((scores.shape[0], TOPK), dtype=torch.float32, device="cuda")
     ids = torch.empty((scores.shape[0], TOPK), dtype=torch.int32, device="cuda")
     aiter_biased_grouped_topk(scores, bias, weights, ids, 1, 1, True, SCALING)
-    return _aiter_sort(ids, weights, moe_buf, block_m)
+    return _aiter_sort(ids, weights, moe_buf, sort)
 
 
-def _radix4_then_aiter_sort(scores, bias, moe_buf, block_m):
+def _radix4_then_aiter_sort(scores, bias, moe_buf, sort):
     weights, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, True, SCALING)
-    return _aiter_sort(ids, weights, moe_buf, block_m)
+    return _aiter_sort(ids, weights, moe_buf, sort)
 
 
-def _radix4_fused_sort(scores, bias, moe_buf, block_m):
+def _radix4_fused_sort(scores, bias, moe_buf, sort):
     return moe_route_radix4.route_radix4_with_sort(
         scores,
         bias,
@@ -59,7 +63,7 @@ def _radix4_fused_sort(scores, bias, moe_buf, block_m):
         True,
         SCALING,
         sort_ws=SORT_WS,
-        block_m=block_m,
+        block_m=SORTS[sort][0],
         moe_buf=moe_buf,
     )
 
@@ -73,10 +77,10 @@ PROVIDERS = {
 
 # fp32 scores and bias are what Kimi-K3's router dispatches. marker.do_bench clones
 # the inputs per replay, so every launch reads cold L2.
-@marker.parametrize("block_m", list(moe_route_radix4.SORT_BLOCK_MS))
+@marker.parametrize("sort", list(SORTS))
 @marker.parametrize("num_tokens", [1, 16, 64, 128, 256, 512, 1024], [16, 256])
 @marker.benchmark("provider", list(PROVIDERS))
-def benchmark(num_tokens: int, block_m: int, provider: str):
+def benchmark(num_tokens: int, sort: str, provider: str):
     torch.manual_seed(0)
     scores = torch.randn(num_tokens, NUM_EXPERTS, device="cuda")
     bias = torch.randn(NUM_EXPERTS, device="cuda") * 0.1
@@ -84,7 +88,7 @@ def benchmark(num_tokens: int, block_m: int, provider: str):
     return marker.do_bench(
         PROVIDERS[provider],
         input_args=(scores, bias, moe_buf),
-        input_kwargs={"block_m": block_m},
+        input_kwargs={"sort": sort},
     )
 
 
