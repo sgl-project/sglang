@@ -68,6 +68,7 @@ def pp_sync_polls(
     pp_rank: int,
     pp_size: int,
     send_window: PPSyncSendWindow,
+    p2p_tag: P2PTag,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
@@ -85,7 +86,7 @@ def pp_sync_polls(
     if pp_rank > 0:
         data = pp_group.recv_object(
             src=pp_rank - 1,
-            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            tag=p2p_tag,
         )
     if pp_rank + 1 < pp_size:
         send_window.add(
@@ -93,7 +94,7 @@ def pp_sync_polls(
                 data,
                 dst=pp_rank + 1,
                 async_send=True,
-                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+                tag=p2p_tag,
             )
         )
     return data
@@ -125,14 +126,20 @@ def poll_and_all_reduce_prefill_pp(
     pp_rank: int,
     pp_size: int,
     pp_poll_send_window: PPSyncSendWindow,
+    p2p_tag: P2PTag,
+    release: bool = False,
 ) -> List[int]:
+    """PP0 polls every stage's status and forwards its polls to the other
+    stages. With release, a transfer concludes only once every stage has."""
     polls: List[int] = []
     if pp_rank == 0:
-        polls = _poll_with_failure_injection_pp(pollers)
+        polls = _poll_with_failure_injection_pp(pollers, release=release)
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_send_window)
+    polls = pp_sync_polls(
+        polls, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
+    )
     return polls
 
 
@@ -305,15 +312,16 @@ def _poll_with_failure_injection(pollers) -> List[int]:
     return [int(poller.poll()) for poller in pollers]
 
 
-def _poll_with_failure_injection_pp(pollers) -> List[int]:
+def _poll_with_failure_injection_pp(pollers, release: bool = False) -> List[int]:
+    def poll(poller):
+        return poller.poll_pp_release() if release else poller.poll_pp_consensus()
+
     if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
-            int(KVPoll.Failed)
-            if random.random() < failure_prob
-            else int(poller.poll_pp_consensus())
+            int(KVPoll.Failed) if random.random() < failure_prob else int(poll(poller))
             for poller in pollers
         ]
-    return [int(poller.poll_pp_consensus()) for poller in pollers]
+    return [int(poll(poller)) for poller in pollers]
 
 
 def decode_offloads_kvcache() -> bool:
