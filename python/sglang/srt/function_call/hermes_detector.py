@@ -105,7 +105,9 @@ class HermesDetector(BaseFormatDetector):
         if bot_pos > 0:
             normal_text = current_text[:bot_pos]
             self._buffer = current_text[bot_pos:]
-            return StreamingParseResult(normal_text=normal_text)
+            return StreamingParseResult(
+                normal_text=self._clean_normal_text(normal_text)
+            )
 
         result = super().parse_streaming_increment(new_text="", tools=tools)
         if result.normal_text:
