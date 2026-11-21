@@ -40,7 +40,10 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ENVS = {
     "TASK_QUEUE_ENABLE": "2",
     "ENABLE_PROFILING": "0",
     # "DEEPEP_HCCL_BUFFSIZE": "2500",
-    "SGLANG_PP_LAYER_PARTITION": "18,20,24,16",
+    # PP is intentionally disabled on prefill: the Mooncake PD transfer backend
+    # validates the prefill/decode KV entry layout positionally (decode pp=1, so
+    # prefill pp must be 1), and a PP-sliced prefill kv_item_lens list no longer
+    # lines up with decode's uniform one (KVTransferError: DCP geometry differs).
     # "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     # "SGLANG_ENABLE_SPEC_V2": "1",
     # "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
@@ -88,10 +91,13 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "prefill",
     "--nnodes",
     2,
+    # TP 32 without PP: keeps the 32-rank prefill world (2 pods x 16 NPUs)
+    # identical to the decode side, and mirrors the only other NPU mooncake-PD
+    # case (DSV4), which drops prefill PP for the same KV-layout reason.
     "--tp-size",
-    8,
+    32,
     "--ep-size",
-    8,
+    32,
     "--attn-dp-size",
     8,
     "--mem-fraction-static",
@@ -136,8 +142,6 @@ GLM_5_3_DCP_PD_SEP_PREFILL_ARGS = [
     "--enable-dp-lm-head",
     "--moe-dense-tp",
     1,
-    "--pp-size",
-    4,
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
@@ -230,7 +234,7 @@ GLM_5_3_DCP_PD_SEP_DECODE_ARGS = [
 
 
 # DCP variant with L3 Mooncake store
-# 4-node PD separation, prefill dp8 + pp4, decode tp32/dp8/dcp4
+# 4-node PD separation, prefill tp32 (pp disabled), decode tp32/dp8/dcp4
 # MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_1P1D_DCP_HICACHE_HIT_RATE(
     TestNpuAccuracyMultiNodePdSepTestCaseBase
