@@ -14,6 +14,7 @@
 # ==============================================================================
 import json
 import re
+import sys
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -220,6 +221,110 @@ class TestErnie5_5ToolCallStreaming(CustomTestCase):
                     normal += result.normal_text
                     args += "".join(c.parameters for c in result.calls)
                 self.assertEqual((normal, json.loads(args)), ("hi ", {"n": 5}))
+
+    def test_buffered_values_preserve_split_terminators_and_history(self):
+        """Buffered typed values must not leak into cutoff history, lose a
+        split terminator, or carry buffered text into the next parameter.
+        """
+        for kind, value in (
+            ("object", {"text": "雪<not-a-tag>" * 512, "nested": [1, None, True]}),
+            ("array", list(range(1200))),
+            (["integer", "string"], "not-a-number" * 512),
+        ):
+            tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name="f",
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "payload": {"type": kind},
+                                "path": {"type": "string"},
+                            },
+                        },
+                    ),
+                )
+            ]
+            raw = (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False)
+            )
+            for tag in ("</parameter>", "</invoke>", _E):
+                for cut in range(1, len(tag)):
+                    with self.subTest(kind=kind, tag=tag, cut=cut):
+                        detector = Ernie5_5Detector()
+                        emitted = []
+
+                        def feed(chunk):
+                            result = detector.parse_streaming_increment(chunk, tools)
+                            emitted.extend(c.parameters for c in result.calls)
+
+                        feed(f'{_S}<invoke name="f"><parameter name="payload">')
+                        # Leading/trailing newlines span several input chunks.
+                        text = "\n" * 24 + raw + "\n" * 24
+                        for pos in range(0, len(text), 7):
+                            feed(text[pos : pos + 7])
+                        feed(tag[:cut])
+                        self.assertEqual(
+                            detector.prev_tool_call_arr,
+                            [{"name": "f", "arguments": {}}],
+                        )
+                        self.assertEqual(detector.streamed_args_for_tool, [""])
+                        feed(tag[cut:])
+                        expected = {"payload": value}
+                        if tag == "</parameter>":
+                            # A second buffered parameter and a streamed string
+                            # exercise reset on both paths within the same call.
+                            feed('<parameter name="payload">' + raw)
+                            feed("</parameter>")
+                            feed(_param("path", "after") + "</invoke>" + _E)
+                            expected["path"] = "after"
+                        elif tag == "</invoke>":
+                            feed(_E)
+                        args = "".join(emitted)
+                        self.assertEqual(json.loads(args), expected)
+                        self.assertEqual(detector.streamed_args_for_tool, [args])
+                        self.assertEqual(
+                            detector.prev_tool_call_arr,
+                            [{"name": "f", "arguments": expected}],
+                        )
+
+    def test_buffered_conversion_error_preserves_pending_value(self):
+        """A conversion error must not discard the buffered prefix and turn
+        its leftover closing brackets into a new value on the next increment.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {"payload": {"type": "object"}},
+                    },
+                ),
+            )
+        ]
+        self.addCleanup(sys.set_int_max_str_digits, sys.get_int_max_str_digits())
+        sys.set_int_max_str_digits(4300)
+        raw = '{"n":' + "9" * 5000 + "}"
+        detector = Ernie5_5Detector()
+        detector.parse_streaming_increment(
+            f'{_S}<invoke name="f"><parameter name="payload">' + raw, tools
+        )
+        with self.assertLogs(
+            "sglang.srt.function_call.ernie55_detector", level="ERROR"
+        ):
+            for chunk in ("</parameter>", "</invoke>", _E):
+                self.assertEqual(
+                    detector.parse_streaming_increment(chunk, tools).calls, []
+                )
+                self.assertEqual(detector.streamed_args_for_tool, [""])
+                self.assertEqual(
+                    detector.prev_tool_call_arr, [{"name": "f", "arguments": {}}]
+                )
 
 
 if __name__ == "__main__":
