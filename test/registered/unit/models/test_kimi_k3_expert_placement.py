@@ -14,6 +14,7 @@ from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import route_quant_handoff, route_sort
 from sglang.srt.layers.moe.moe_runner import aiter_route_sort
+from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
 from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK3LinearForCausalLM,
@@ -98,6 +99,16 @@ def _radix4_on_rocm():
         yield
 
 
+def _aiter_runner() -> MagicMock:
+    # A MoeRunner whose core is AITER's, with that core's consumer reachable as
+    # runner.route_sort_consumer.
+    runner = MagicMock()
+    runner.fused_func = None
+    runner.runner_core = MagicMock(spec=AiterRunnerCore)
+    runner.route_sort_consumer = runner.runner_core.route_sort_consumer
+    return runner
+
+
 class _MoeOnRunner(kimi_k3_amd_moe.KimiK3MoEHipMixin):
     """A MoE layer whose route-sort consumer comes from the mixin's own lookup."""
 
@@ -156,7 +167,7 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
     def test_layer_off_rocm_neither_reads_the_switch_nor_asks_its_runner(self):
         """Off ROCm the radix-4 router writes no MoE sort: the layer's scope is a
         no-op and never reads SGLANG_K3_RADIX4_TOPK or asks its runner."""
-        runner = MagicMock()
+        runner = _aiter_runner()
         moe = _MoeOnRunner(runner)
         with (
             patch.object(kimi_k3_amd_moe, "_is_hip", False),
@@ -170,7 +181,7 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
     def test_layer_on_rocm_stages_its_runners_consumer_around_the_forward(self):
         """On ROCm with SGLANG_K3_RADIX4_TOPK the layer asks its runner once and
         stages that consumer only while the scope is open."""
-        runner = MagicMock()
+        runner = _aiter_runner()
         moe = _MoeOnRunner(runner)
         consumer = runner.route_sort_consumer.return_value
         with (
@@ -181,9 +192,14 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
                 with moe._route_sort_scope():
                     self.assertIs(route_sort.staged(), consumer)
                 self.assertIsNone(route_sort.staged())
-            # A layer without a runner has no consumer to stage.
-            with _MoeOnRunner(None)._route_sort_scope():
-                self.assertIsNone(route_sort.staged())
+            # A layer without a runner has no consumer to stage, nor has one whose
+            # core is not AITER's or whose experts run as a fused function.
+            other_core, fused = _aiter_runner(), _aiter_runner()
+            other_core.runner_core = MagicMock()
+            fused.fused_func = object()
+            for no_consumer in (None, other_core, fused):
+                with _MoeOnRunner(no_consumer)._route_sort_scope():
+                    self.assertIsNone(route_sort.staged())
         runner.route_sort_consumer.assert_called_once_with()
         self.assertEqual(consumer.drop.call_count, 2)
 
@@ -191,7 +207,7 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
         """The SP pass re-enters the layer's forward inside its own scope: the
         inner scope's routing consumes only its own request, and its exit hands
         the outer scope its request back, still unconsumed."""
-        runner = MagicMock()
+        runner = _aiter_runner()
         consumer = runner.route_sort_consumer.return_value
         moe = _MoeOnRunner(runner)
         with _radix4_on_rocm(), moe._route_sort_scope():
@@ -207,7 +223,7 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
     def test_scope_clears_and_restores_the_request_on_an_exception(self):
         """A layer that raises leaves no request behind, still drops the sort no
         experts call consumed, and a nested raise restores the outer request."""
-        runner = MagicMock()
+        runner = _aiter_runner()
         consumer = runner.route_sort_consumer.return_value
         moe = _MoeOnRunner(runner)
         with _radix4_on_rocm():

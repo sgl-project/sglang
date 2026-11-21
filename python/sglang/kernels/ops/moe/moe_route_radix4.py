@@ -6,8 +6,8 @@ back to aiter. Kernel notes live in jit/csrc/moe/route_radix4_hip.cuh.
 
 route_radix4_with_sort also writes AITER's BM=16 MoE sort from the same launch,
 for a caller that hands it to AITER's fused_moe in place of moe_sorting. Up to 64
-tokens the last CTA to finish routing sorts; past that the last ceil(M / 16)
-CTAs share the sort, one 16-token chunk each.
+tokens the last CTA to finish routing sorts; past that the last min(ceil(M / 16), 32)
+CTAs share the sort, one chunk each, up to 32 tokens at M = 1024.
 """
 
 from __future__ import annotations
@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 _NUM_EXPERTS = 896
 _TOPK = 16
 _SORT_BLOCK_M = 16
+# Mirrors kRadix4LeaderSortMaxTokens, kRadix4TailChunk and kRadix4MaxTailCtas in route_radix4_hip.cuh.
+_LEADER_SORT_MAX_TOKENS = 64
+_TAIL_CHUNK = 16
+_MAX_TAIL_CTAS = 32
 # One block per token, so the grid outgrows the machine somewhere past a
 # thousand tokens and the kernel turns throughput-bound, where spreading a token
 # over four waves is a cost rather than a win. Measured break-even is ~1.5k
@@ -146,6 +150,19 @@ def route_radix4(
     return out_w, out_i
 
 
+def sort_tail_fits(num_tokens: int, device: torch.device) -> bool:
+    """Whether the sort tail of an M-token launch can never hang on this device.
+
+    The last tail CTAs to arrive spin until every CTA has arrived, so all of them
+    must be resident together; one CTA per CU is the least the kernel guarantees.
+    A stream restricted to fewer CUs (a CU mask) is not visible here.
+    """
+    if num_tokens <= _LEADER_SORT_MAX_TOKENS:
+        return True
+    tail_ctas = min(-(-num_tokens // _TAIL_CHUNK), _MAX_TAIL_CTAS)
+    return torch.cuda.get_device_properties(device).multi_processor_count >= tail_ctas
+
+
 def new_sort_workspace(device: torch.device) -> torch.Tensor:
     """Arrival counters for route_radix4_with_sort (see RouteRadix4Params::sort_ws).
 
@@ -156,8 +173,8 @@ def new_sort_workspace(device: torch.device) -> torch.Tensor:
 
 
 def _sorted_capacity(n_tokens: int) -> int:
-    """AITER's moe_sorting capacity: every route, plus up to BM - 1 padding
-    rows for each expert that can be active."""
+    # AITER's moe_sorting capacity: every route, plus up to BM - 1 padding rows for each
+    # expert that can be active.
     routes = n_tokens * _TOPK
     active = min(_NUM_EXPERTS, routes)
     blocks = (routes + active * (_SORT_BLOCK_M - 1) + _SORT_BLOCK_M - 1) // (

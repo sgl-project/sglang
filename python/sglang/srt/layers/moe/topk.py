@@ -2994,9 +2994,11 @@ def select_experts(
             route_quant_handoff.bind_select_experts(
                 num_token_non_padded, fused_routing_ok=fused_routing_ok
             )
-            route_sort.bind_select_experts(
-                num_token_non_padded, fused_routing_ok=fused_routing_ok
-            )
+            if _use_aiter:
+                # The ROCm radix-4 router is the only reader of this handoff.
+                route_sort.bind_select_experts(
+                    num_token_non_padded, fused_routing_ok=fused_routing_ok
+                )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,

@@ -82,9 +82,12 @@ def test_gguf_vector_registry_is_cuda_local_jit():
 def test_radix4_router_refuses_to_build_off_its_target_devices():
     from sglang.kernels.ops.moe import moe_route_radix4
 
-    with patch.object(moe_route_radix4, "load_jit") as load_jit:
+    with (
+        patch.object(moe_route_radix4, "supported_hardware", return_value=False),
+        patch.object(moe_route_radix4, "load_jit") as load_jit,
+    ):
         with pytest.raises(RuntimeError):
-            moe_route_radix4.build()
+            moe_route_radix4.build.__wrapped__()
     load_jit.assert_not_called()
 
 

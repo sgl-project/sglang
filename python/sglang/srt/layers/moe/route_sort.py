@@ -77,6 +77,8 @@ def scope(consumer: RouteSortConsumer) -> Iterator[None]:
 def staged() -> Optional[RouteSortConsumer]:
     """The staged consumer, until its scope exits, for the MoE runner that
     consumes the sort to show it the layer's experts call."""
+    if torch.compiler.is_compiling():
+        return None
     handoff = get_forward().route_sort_handoff
     return None if handoff is None else handoff.consumer
 
@@ -86,6 +88,9 @@ def bind_select_experts(
 ) -> None:
     """Record the padding row count and whether select_experts leaves the
     router's ids and weights as they are, which a sort of them needs."""
+    # A ContextVar read cannot be traced; a compiled forward keeps the unfused router.
+    if torch.compiler.is_compiling():
+        return
     handoff = get_forward().route_sort_handoff
     if handoff is None:
         return
@@ -94,8 +99,10 @@ def bind_select_experts(
 
 
 def _take() -> Tuple[Optional[RouteSortConsumer], Optional[torch.Tensor]]:
-    """Consume the staged request: its consumer if the routing may be sorted
-    (else None), and the padding row count bound for it."""
+    # Consume the staged request: its consumer if the routing may be sorted (else None),
+    # and the padding row count bound for it.
+    if torch.compiler.is_compiling():
+        return None, None
     handoff = get_forward().route_sort_handoff
     if handoff is None:
         return None, None
@@ -107,17 +114,16 @@ def _take() -> Tuple[Optional[RouteSortConsumer], Optional[torch.Tensor]]:
 
 
 class _SortWorkspaces:
-    """The sort's arrival counters per (device, stream): launches in flight on
-    two streams must not share them. A captured graph keeps its capture stream's
-    counters, so it must not replay alongside eager launches on that stream."""
+    # The sort's arrival counters per (device, stream): launches in flight on two streams
+    # must not share them. A captured graph keeps its capture stream's counters,
+    # so it must not replay alongside eager launches on that stream.
 
     def __init__(self) -> None:
         self.by_stream: dict[tuple[torch.device, int], torch.Tensor] = {}
 
     def get(self, device: torch.device) -> Optional[torch.Tensor]:
-        """The current stream's counters, or None when they would first be
-        allocated inside a graph capture, where they are only zeroed when that
-        one graph replays."""
+        # The current stream's counters, or None when they would first be allocated inside
+        # a graph capture, where they are only zeroed when that one graph replays.
         key = (device, torch.cuda.current_stream(device).cuda_stream)
         ws = self.by_stream.get(key)
         if ws is None:
@@ -140,11 +146,8 @@ def _warn_captured_without_workspace() -> None:
 
 
 def _published_moe_output(n_tokens: int) -> Optional[torch.Tensor]:
-    """The MoE output buffer the model published, when the kernel can zero it.
-
-    The runner only trusts the zeroing when this is also the output its experts
-    call writes.
-    """
+    # The MoE output buffer the model published, when the kernel can zero it. The runner
+    # only trusts the zeroing when this is also the output its experts call writes.
     out = zero_copy_context.ctx.moe_output
     if (
         out is not None
@@ -175,6 +178,10 @@ def try_route_sort_fused(
     """
     consumer, num_token_non_padded = _take()
     if consumer is None or not consumer.takes_sort(scores.shape[0]):
+        return None
+    # The tail sort's helper CTAs wait on each other, so a partition too small to hold them
+    # together keeps the unfused router.
+    if not moe_route_radix4.sort_tail_fits(scores.shape[0], scores.device):
         return None
     sort_ws = get_buffer("route_sort_ws", _SortWorkspaces).get(scores.device)
     if sort_ws is None:
