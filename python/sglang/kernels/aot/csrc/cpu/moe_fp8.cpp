@@ -40,11 +40,16 @@ void fused_experts_fp_kernel_impl(
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
   const int64_t NB = div_up(2 * N, BLOCK_N);
+  // block_size_N == 1 selects the per-channel scale layout: one scale value
+  // per output row, constant across all of K (w1s/w2s have a trailing dim of 1).
+  const bool per_channel = !is_mxfp4 && (block_size_N == 1);
   int64_t scale_size_N = div_up(2 * N, block_size_N);
-  int64_t scale_size_K = div_up(K, block_size_K);
-  int64_t blocks_n_per_group = block_size_N / BLOCK_N;
+  int64_t scale_size_K = per_channel ? 1 : div_up(K, block_size_K);
+  int64_t blocks_n_per_group = per_channel ? 1 : block_size_N / BLOCK_N;
   std::function<int64_t(int64_t)> scale_offset_per_block;
   if constexpr (is_mxfp4) {
+    scale_offset_per_block = [&](int64_t a) { return a * BLOCK_N; };
+  } else if (per_channel) {
     scale_offset_per_block = [&](int64_t a) { return a * BLOCK_N; };
   } else {
     scale_offset_per_block = [&](int64_t a) { return a / blocks_n_per_group; };
@@ -108,6 +113,7 @@ void fused_experts_fp_kernel_impl(
           /*   ldc          */ 2 * N,
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
+          /*   per_channel  */ per_channel,
           /*   do_unpack    */ do_unpack);
     });
 
@@ -144,7 +150,7 @@ void fused_experts_fp_kernel_impl(
   const int64_t MB2 = MB;
   const int64_t NB2 = div_up(OC, BLOCK_N);
   scale_size_N = div_up(K, block_size_N);
-  scale_size_K = div_up(N, block_size_K);
+  scale_size_K = per_channel ? 1 : div_up(N, block_size_K);
   const int64_t packed_IC = get_row_size<packed_t>(IC);
   const int64_t stride_e2 = OC * packed_IC;
   const int64_t stride_oc = packed_IC;
@@ -190,6 +196,7 @@ void fused_experts_fp_kernel_impl(
           /*   ldc          */ BLOCK_N,
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
+          /*   per_channel  */ per_channel,
           /*   do_unpack    */ do_unpack);
 
       // 2.b copy from C to ic2 in original order
@@ -312,6 +319,7 @@ void shared_expert_fp8_kernel_impl(
           /*   ldc          */ 2 * N,
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
+          /*   per_channel  */ false,
           /*   do_unpack    */ do_unpack);
     });
 
@@ -364,6 +372,7 @@ void shared_expert_fp8_kernel_impl(
           /*   ldc          */ BLOCK_N,
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
+          /*   per_channel  */ false,
           /*   do_unpack    */ do_unpack);
 
       // 2.b copy from C to output and add fused_experts_out

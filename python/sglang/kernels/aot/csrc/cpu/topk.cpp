@@ -386,7 +386,7 @@ apply_bias(float* __restrict__ scores2, const float* __restrict__ scores, const 
   }
 }
 
-template <typename scalar_t, typename param_t, int NUM_EXPERTS, int TOPK>
+template <typename scalar_t, typename param_t, int NUM_EXPERTS>
 void biased_grouped_topk_kernel_impl(
     float* __restrict__ topk_weights,
     int32_t* __restrict__ topk_ids,
@@ -396,11 +396,17 @@ void biased_grouped_topk_kernel_impl(
     int64_t num_tokens,
     int64_t num_groups,
     int64_t topk_group,
+    int64_t topk,
+    int64_t num_fused_shared_experts,
+    float shared_expert_weight,
     bool renormalize) {
   using Vec = at::vec::Vectorized<float>;
 
   bool apply_scaling_factor = scaling_factor_value != 1.0f;
   const int64_t num_experts_per_group = NUM_EXPERTS / num_groups;
+  // The fused shared expert (id == NUM_EXPERTS) is appended as the last slot below
+  // and excluded from the routed-weight sum that renormalize/scaling reduce over.
+  const int64_t routed_count = topk - num_fused_shared_experts;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     // scores: sigmoid
     alignas(64) float scores[NUM_EXPERTS];
@@ -459,51 +465,36 @@ void biased_grouped_topk_kernel_impl(
         }
       }
 
-      // find global topk
       std::partial_sort(
-          queue2.begin(), queue2.begin() + TOPK, queue2.end(), [](const elem_t& x, const elem_t& y) -> bool {
+          queue2.begin(), queue2.begin() + routed_count, queue2.end(), [](const elem_t& x, const elem_t& y) -> bool {
             return x.first > y.first;
           });
 
-      for (int j = 0; j < TOPK; ++j) {
+      for (int64_t j = 0; j < routed_count; ++j) {
         int32_t index = queue2[j].second;
-        topk_ids[i * TOPK + j] = index;
-        topk_weights[i * TOPK + j] = scores[index];
+        topk_ids[i * topk + j] = index;
+        topk_weights[i * topk + j] = scores[index];
       }
 
-#if defined(CPU_CAPABILITY_AVX512)
       if (renormalize || apply_scaling_factor) {
-        __mmask16 mask = (1ULL << TOPK) - 1;
-        __m512 x = _mm512_maskz_loadu_ps(mask, topk_weights + i * TOPK);
+        float scale = scaling_factor_value;
         if (renormalize) {
-          float sum = _mm512_reduce_add_ps(x);
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value / sum);
-          __m512 y = _mm512_mul_ps(x, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
-        } else {
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value);
-          __m512 y = _mm512_mul_ps(x, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          float sum = at::vec::reduce_all<float>(
+              [](const Vec& lhs, const Vec& rhs) { return lhs + rhs; }, topk_weights + i * topk, routed_count);
+          scale /= sum;
         }
+        const Vec scale_vec(scale);
+        at::vec::map<float>(
+            [scale_vec](Vec weights) { return weights * scale_vec; },
+            topk_weights + i * topk,
+            topk_weights + i * topk,
+            routed_count);
       }
-#else
-      if (renormalize || apply_scaling_factor){
-        if (renormalize) {
-          float sum = 0.f;
-          for (int64_t j = 0; j < TOPK; ++j) {
-            sum += topk_weights[i * TOPK + j];
-          }
-          float scale = scaling_factor_value / sum;
-          for (int64_t j = 0; j < TOPK; ++j) {
-            topk_weights[i * TOPK + j] *= scale;
-          }
-        }else{
-          for (int64_t j = 0; j < TOPK; ++j) {
-            topk_weights[i * TOPK + j] *= scaling_factor_value;
-          }
-        }
+      if (num_fused_shared_experts > 0) {
+        const int64_t shared_pos = i * topk + topk - 1;
+        topk_ids[shared_pos] = static_cast<int32_t>(NUM_EXPERTS);
+        topk_weights[shared_pos] = shared_expert_weight;
       }
-#endif
     }
   });
 }
@@ -552,16 +543,19 @@ void biased_grouped_topk_kernel_impl(
       topk,                               \
       moe_softcapping);
 
-#define LAUNCH_BIASED_GROUPED_TOPK_KERNEL(NE, NTOPK)             \
-  biased_grouped_topk_kernel_impl<scalar_t, param_t, NE, NTOPK>( \
-      topk_weights.data_ptr<float>(),                            \
-      topk_ids.data_ptr<int32_t>(),                              \
-      gating_output.data_ptr<scalar_t>(),                        \
-      correction_bias.data_ptr<param_t>(),                       \
-      scaling_factor_value,                                      \
-      num_tokens,                                                \
-      num_expert_group,                                          \
-      topk_group,                                                \
+#define LAUNCH_BIASED_GROUPED_TOPK_KERNEL(NE)             \
+  biased_grouped_topk_kernel_impl<scalar_t, param_t, NE>( \
+      topk_weights.data_ptr<float>(),                     \
+      topk_ids.data_ptr<int32_t>(),                       \
+      gating_output.data_ptr<scalar_t>(),                 \
+      correction_bias.data_ptr<param_t>(),                \
+      scaling_factor_value,                               \
+      num_tokens,                                         \
+      num_expert_group,                                   \
+      topk_group,                                         \
+      topk,                                               \
+      num_fused_shared_experts,                           \
+      shared_expert_weight,                               \
       renormalize);
 
 }  // anonymous namespace
@@ -818,7 +812,7 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
   return std::make_tuple(topk_weights, topk_ids);
 }
 
-// biased grouped topk DeepSeek V3/R1
+// biased grouped topk DeepSeek V3/R1, GLM-4.5
 std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     at::Tensor& hidden_states,
     at::Tensor& gating_output,
@@ -829,12 +823,12 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t topk_group,
     int64_t num_fused_shared_experts,
     std::optional<double> routed_scaling_factor,
-    std::optional<at::Tensor> num_token_non_padded) {
-  // TODO: Will support num_fused_shared_experts and num_token_non_padded.
-  // For now, we just check them as default value.
+    std::optional<at::Tensor> num_token_non_padded,
+    double shared_expert_weight) {
+  // TODO: Will support num_token_non_padded.
   TORCH_CHECK(
-      num_fused_shared_experts == 0,
-      "num_fused_shared_experts must be 0 default value, got: ",
+      num_fused_shared_experts == 0 || num_fused_shared_experts == 1,
+      "num_fused_shared_experts must be 0 or 1, got: ",
       num_fused_shared_experts);
   TORCH_CHECK(
       !num_token_non_padded.has_value(),
@@ -849,24 +843,35 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   int64_t num_experts = gating_output.size(1);
   TORCH_CHECK(gating_output.size(0) == num_tokens, "Number of tokens mismatch");
   TORCH_CHECK(correction_bias.numel() == num_experts, "Bias shape mismatch");
+  TORCH_CHECK(
+      num_expert_group > 0 && num_experts % num_expert_group == 0 && num_experts / num_expert_group >= 2,
+      "num_expert_group must divide num_experts with at least two experts per group");
+  TORCH_CHECK(
+      topk_group > 0 && topk_group <= num_expert_group, "topk_group must satisfy 0 < topk_group <= num_expert_group");
+  TORCH_CHECK(topk > num_fused_shared_experts, "topk must be greater than num_fused_shared_experts");
+  TORCH_CHECK(
+      topk - num_fused_shared_experts <= topk_group * (num_experts / num_expert_group),
+      "routed topk exceeds the number of experts in the selected groups");
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
   float scaling_factor_value = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0f;
 
   CPU_DISPATCH_FLOATING_TYPES_EXT(st, correction_bias.scalar_type(), "biased_grouped_topk_kernel", [&] {
-    TORCH_CHECK(topk == 8, "Unexpected topk: ", topk);
     switch (num_experts) {
       case 128:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128, 8);
+        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128);
+        break;
+      case 160:
+        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(160);
         break;
       case 192:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192, 8);
+        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192);
         break;
       case 256:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
+        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256);
         break;
       case 384:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
+        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384);
         break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
