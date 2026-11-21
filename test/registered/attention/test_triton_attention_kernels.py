@@ -1487,32 +1487,44 @@ class TestTritonAttention(CustomTestCase):
 
     def test_unified_sliding_window_tree_mask_batched_and_aligned(self):
         """Batches of requests with different prefix lengths, with the window rail
-        either exact or padded to the tile boundary the way the backend does for
-        deterministic inference, and with more draft nodes than one query block."""
+        either exact or padded to the tile boundary by align_window_kv_to_tiles,
+        with more draft nodes than one query block, and with grouped-query heads
+        in fp16 as well as the default multi-head bf16."""
         device = get_device()
-        window, heads, head_dim, tile = 64, 8, 64, 128
+        window, head_dim, tile = 64, 64, 128
         i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
         arange = lambda lo, hi: torch.arange(lo, hi, device=device)
+        mha = (8, 8, torch.bfloat16)  # query heads, kv heads, dtype
+        gqa = (16, 4, torch.float16)
         cases = [
-            ([56, 65, 199], 4, False),
-            ([56, 65, 199], 4, True),
-            ([300, 135, 64], 4, True),
-            ([199, 300], 80, False),
-            ([199, 300], 80, True),
+            ([56, 65, 199], 4, False, mha),
+            ([56, 65, 199], 4, True, mha),
+            ([300, 135, 64], 4, True, mha),
+            ([199, 300], 80, False, mha),
+            ([199, 300], 80, True, mha),
+            ([56, 65, 199], 4, False, gqa),
+            ([199, 300], 80, True, gqa),
         ]
-        for prefixes, num_draft, aligned in cases:
-            with self.subTest(prefixes=prefixes, num_draft=num_draft, aligned=aligned):
+        for prefixes, num_draft, aligned, (heads, kv_heads, dtype) in cases:
+            with self.subTest(
+                prefixes=prefixes,
+                num_draft=num_draft,
+                aligned=aligned,
+                heads=heads,
+                kv_heads=kv_heads,
+                dtype=dtype,
+            ):
                 torch.manual_seed(1)
                 rng = random.Random(1)
                 bs = len(prefixes)
                 totals = [p + num_draft for p in prefixes]
                 bases = [sum(totals[:i]) for i in range(bs)]
                 k = torch.randn(
-                    sum(totals), heads, head_dim, dtype=torch.bfloat16, device=device
+                    sum(totals), kv_heads, head_dim, dtype=dtype, device=device
                 )
                 v = torch.randn_like(k)
                 q = torch.randn(
-                    bs * num_draft, heads, head_dim, dtype=torch.bfloat16, device=device
+                    bs * num_draft, heads, head_dim, dtype=dtype, device=device
                 )
                 sm_scale = head_dim**-0.5
 
@@ -1528,8 +1540,13 @@ class TestTritonAttention(CustomTestCase):
                             node = parents[node]
                     masks.append(mask)
                     qi = q[i * num_draft : (i + 1) * num_draft]
-                    ki = k[bases[i] : bases[i] + totals[i]]
-                    vi = v[bases[i] : bases[i] + totals[i]]
+                    group = heads // kv_heads
+                    ki = k[bases[i] : bases[i] + totals[i]].repeat_interleave(
+                        group, dim=1
+                    )
+                    vi = v[bases[i] : bases[i] + totals[i]].repeat_interleave(
+                        group, dim=1
+                    )
                     scores = (
                         torch.einsum("qhd,khd->qhk", qi.float(), ki.float()) * sm_scale
                     )
@@ -1603,7 +1620,8 @@ class TestTritonAttention(CustomTestCase):
                     sliding_window_size=window,
                     window_start_pos=window_start,
                 )
-                torch.testing.assert_close(o.float(), expected, atol=3e-2, rtol=3e-2)
+                tol = 3e-2 if dtype == torch.bfloat16 else 4e-3
+                torch.testing.assert_close(o.float(), expected, atol=tol, rtol=tol)
 
 
 if __name__ == "__main__":
