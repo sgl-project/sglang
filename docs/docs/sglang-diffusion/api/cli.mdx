@@ -149,6 +149,8 @@ still use the existing image APIs; encoding is not exposed as a standalone API.
 - `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
+  The default image/video filename is independent of the prompt and input media name.
+  Set `--output-file-name` when a downstream tool needs a predictable filename.
 
 For frame interpolation and upscaling, see [Post-Processing](/docs/sglang-diffusion/api/post_processing).
 
@@ -509,15 +511,22 @@ keep it at `503` for several minutes.
 
 SGLang Diffusion can upload generated images and videos to S3-compatible object storage after generation.
 
+On AWS, assign the serving workload an IAM role scoped to its output bucket.
+Leave both SGLang credential variables unset so [Boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html)
+can obtain and refresh the role's temporary credentials.
+
 ```bash Command
 export SGLANG_CLOUD_STORAGE_TYPE=s3
 export SGLANG_S3_BUCKET_NAME=my-bucket
-export SGLANG_S3_ACCESS_KEY_ID=your-access-key
-export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
-export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables](/docs/sglang-diffusion/environment_variables) for the full set of storage options.
+For an S3-compatible service such as MinIO, set `SGLANG_S3_ENDPOINT_URL`.
+If the service requires an explicit key pair, supply `SGLANG_S3_ACCESS_KEY_ID`
+and `SGLANG_S3_SECRET_ACCESS_KEY` through your deployment's secret manager.
+See [Environment Variables](/docs/sglang-diffusion/environment_variables) for all options.
+
+The returned object URL is not presigned. For private outputs, keep the bucket
+private and authorize downloads separately from the uploader.
 
 Cancellation waits for active uploads to finish before request cleanup can remove
 their source files. Allow for the storage SDK's timeouts and retries in your
