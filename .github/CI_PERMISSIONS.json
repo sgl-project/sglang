@@ -665,6 +665,12 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "gausah01": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
+    },
     "gilfordting": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1031,6 +1037,12 @@
         "can_rerun_failed_ci": true,
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
+    },
+    "micyan01": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "cooldown_interval_minutes": 30,
+        "reason": "custom override"
     },
     "milo-modal": {
         "can_tag_run_ci_label": true,
