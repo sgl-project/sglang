@@ -142,6 +142,44 @@ python -m sglang.benchmark.serving \
     --seed 1
 ```
 
+#### Multi-turn serving latency
+
+On a single A3 card (TP2), a long prefill from the next chat turn can interrupt a request that is already streaming. To bound the time spent on each prefill and give active decodes time to advance, replace `--chunked-prefill-size -1` in the launch command above with these two arguments.
+
+```bash
+--chunked-prefill-size 1024 \
+--prefill-decode-interval 2
+```
+
+To compare the two configurations, run the benchmark below once against each server on port 6688. Keep concurrency at two and vary the number of three-turn conversations. The generated shared-prefix dataset uses the group count and prompts per group to size the workload. Two and eight conversations produce six and 24 completed requests, respectively.
+
+```bash
+results=$(mktemp -d)
+for conversations in 2 8 8 2 2 8; do
+    python -m sglang.benchmark.serving \
+        --backend sglang-oai-chat --base-url http://127.0.0.1:6688 \
+        --tokenizer "$MODEL_PATH" --dataset-name generated-shared-prefix \
+        --max-concurrency 2 --num-prompts "$conversations" \
+        --gsp-num-groups 1 --gsp-prompts-per-group "$conversations" \
+        --gsp-num-turns 3 --gsp-system-prompt-len 2048 --gsp-question-len 128 \
+        --gsp-output-len 64 --gsp-range-ratio 1 --seed 42 \
+        --warmup-requests 1 --flush-cache --output-details \
+        --extra-request-body '{"stream_options":{"include_usage":true}}' \
+        --output-file "$results/$conversations.jsonl" || break
+done
+```
+
+Each JSONL file should contain three records. Pair them in file order, check `completed` for both workloads, and subtract the two-conversation `mean_tpot_ms` from the eight-conversation value. For device traces, run each workload separately with `--profile --profile-activities CPU GPU --profile-steps 32` and a distinct `--profile-output-dir` on the server.
+
+On A3 with Qwen3-Next W8A8 and BF16 NEXTN weights, the following differences were measured on SGLang `0.5.21+npu` (commit `545ed1c6`). The bounded configuration included the [prefill interval fix](https://github.com/sgl-project/sglang/pull/46654).
+
+| Server configuration | Pair 1 (ms) | Pair 2 (ms) | Pair 3 (ms) |
+| --- | ---: | ---: | ---: |
+| Chunking disabled, interval 0 | -61.713 | +2.013 | +2.079 |
+| Chunk size 1024, interval 2 | +0.273 | +0.755 | +0.568 |
+
+The first baseline pair included a 6.52-second inter-chunk gap in the two-conversation run. In the third eight-conversation run, bounded scheduling reduced mean TPOT from 19.15 to 17.94 ms, increased mean time to first token from 401 to 705 ms, and reduced output throughput from 79.19 to 69.53 tokens/s.
+
 ### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN3K5 OUT1K5 50ms
 
 **Model**: Qwen3-Next-80B-A3B-Instruct
