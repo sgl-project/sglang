@@ -56,7 +56,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def _batch(real):
@@ -1070,6 +1070,54 @@ class TestTopKRoutingInputs(CustomTestCase):
             self.assertEqual(compiled(torch.ones(4)).tolist(), [1.0, 1.0, 1.0, 0.0])
             batch.num_token_non_padded.fill_(1)
             self.assertEqual(compiled(torch.ones(4)).tolist(), [1.0, 0.0, 0.0, 0.0])
+
+
+class TestTopKSymbolicShapes(CustomTestCase):
+    def test_static_bias_with_unbacked_routing_shape(self):
+        """A static expert bias must not infer a symbolic token dimension."""
+        torch.manual_seed(0)
+        self.addCleanup(torch.compiler.reset)
+
+        for name, decorated, extra_kwargs in (
+            ("biased_topk_impl", topk_module.biased_topk_impl, {}),
+            (
+                "biased_grouped_topk_impl",
+                topk_module.biased_grouped_topk_impl,
+                {"num_expert_group": 1, "topk_group": 1},
+            ),
+        ):
+            with self.subTest(router=name):
+                torch.compiler.reset()
+                router = decorated.__wrapped__
+                hidden_states = torch.randn(95, 4)
+                gating_output = torch.randn(95, 8)
+                correction_bias = torch.randn(8)
+                kwargs = {
+                    "topk": 2,
+                    "renormalize": True,
+                    **extra_kwargs,
+                }
+
+                expected_weights, expected_ids = router(
+                    hidden_states, gating_output, correction_bias, **kwargs
+                )
+
+                torch._dynamo.decorators.mark_unbacked(
+                    gating_output, (0, 1), strict=True
+                )
+                torch._dynamo.mark_static(correction_bias, 0)
+                compiled_router = torch.compile(
+                    router, backend="eager", dynamic=True, fullgraph=True
+                )
+                actual_weights, actual_ids = compiled_router(
+                    hidden_states, gating_output, correction_bias, **kwargs
+                )
+
+                torch.testing.assert_close(actual_weights, expected_weights)
+                torch.testing.assert_close(actual_ids, expected_ids)
+                self.assertEqual(actual_weights.dtype, torch.float32)
+                self.assertEqual(actual_ids.dtype, torch.int32)
+                torch.testing.assert_close(actual_weights.sum(dim=-1), torch.ones(95))
 
 
 if __name__ == "__main__":

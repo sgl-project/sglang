@@ -1572,6 +1572,16 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
+def _add_correction_bias(
+    scores: torch.Tensor, correction_bias: torch.Tensor
+) -> torch.Tensor:
+    """Add a shared [E] or per-token [T, E] bias to routing scores."""
+    bias = (
+        correction_bias.unsqueeze(0) if correction_bias.ndim == 1 else correction_bias
+    )
+    return scores + bias
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
@@ -1593,12 +1603,9 @@ def biased_topk_impl(
     elif scoring_func == "sqrtsoftplus":
         scores = torch.nn.functional.softplus(gating_output).sqrt()
 
-    num_token = scores.shape[0]
     num_experts = scores.shape[1]
 
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.view(
-        -1, num_experts
-    )
+    scores_for_choice = _add_correction_bias(scores, correction_bias)
     _, topk_ids = torch.topk(
         scores_for_choice,
         k=topk,
@@ -1787,9 +1794,7 @@ def biased_grouped_topk_impl(
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.view(
-        -1, num_experts
-    )
+    scores_for_choice = _add_correction_bias(scores, correction_bias)
     group_scores = (
         scores_for_choice.view(num_token, num_expert_group, -1)
         .topk(2, dim=-1)[0]
