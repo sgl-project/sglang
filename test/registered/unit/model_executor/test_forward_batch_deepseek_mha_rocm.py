@@ -1,7 +1,6 @@
 """ROCm packed prefix-chunk layout: no chunk exceeds SGLANG_MAX_KV_CHUNK_CAPACITY keys,
 each prefix token is covered once and in order, and only HIP takes this layout."""
 
-import itertools
 import unittest
 from types import SimpleNamespace
 from unittest import mock
