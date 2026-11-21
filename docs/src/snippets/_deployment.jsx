@@ -97,7 +97,8 @@
 //   dockerMounts       optional — additional `-v` mount specs, as an array or
 //                      `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
-//                      generated server flags; string or `(selection) => string`
+//                      generated server flags; string or
+//                      `(selection, env) => string`
 //   pythonCommand      optional — command used in Python mode; string or
 //                      `(selection) => string`; defaults to `sglang serve`
 //   runModes           optional — command output tabs to show (`python` and/or

@@ -75,7 +75,6 @@ export const config = {
     mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111",
     // First nightly with #45261, which SM120 needs to start this model.
     rtxpro6000: "lmsysorg/sglang:nightly-dev-20261119-6b374a55",
-    a5: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41",
   },
 
   // Initialize the Ascend environment before launching on A5.
@@ -88,16 +87,6 @@ if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then source /usr/local/memfa
     ? "python3 -m sglang.launch_server"
     : "sglang serve",
   runModes: (sel) => sel.hw === "a3" || sel.hw === "a5" ? ["python"] : ["python", "docker"],
-  dockerRunCommand: (sel, env = []) => sel.hw === "a5"
-    ? `bash -lc 'source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash &&
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash &&
-source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh &&
-source /usr/local/Ascend/nnal/atb/set_env.sh &&
-if [[ -f /usr/local/memfabric_hybrid/set_env.sh ]]; then source /usr/local/memfabric_hybrid/set_env.sh; fi &&
-${env.map((entry) => `export ${entry}`).join(" &&\n")} &&
-exec python3 -m sglang.launch_server "$@"' --`
-    : "sglang serve",
-  dockerMounts: (sel) => sel.hw === "a5" ? ["{{MODEL_PATH}}:{{MODEL_PATH}}"] : [],
 
   github: {
     cookbookModel: "deepseek-ai/deepseek-v4.1",
@@ -799,8 +788,7 @@ exec python3 -m sglang.launch_server "$@"' --`
         "--trust-remote-code",
         "--attention-backend dsv4",
         "--device npu",
-        "--enable-dp-attention",
-        "--dp-size 8",
+        "--attn-dp-size 8",
         "--enable-dp-lm-head",
         "--watchdog-timeout 9000",
         "--max-running-requests 200",

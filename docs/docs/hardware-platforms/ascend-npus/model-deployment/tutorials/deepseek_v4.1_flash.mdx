@@ -25,8 +25,8 @@ The following table summarizes the settings configured by the script. For parame
 |------|------------------------------|
 | Hardware | Huawei Ascend 950PR/DT Series (A5), 8 NPUs per node |
 | Attention | `--attention-backend dsv4` |
-| Tensor parallelism | `--tp-size 8` |
-| Attention data parallelism | `--attn-dp-size 8` |
+| Tensor parallelism | `--tp-size "$TP_SIZE"` (`TP_SIZE` is set from the total NPU count) |
+| Attention data parallelism | `--attn-dp-size "$DP_SIZE"` (`DP_SIZE` is set from the total NPU count) |
 | MoE communication | `--moe-a2a-backend deepep` and `--deepep-mode auto` |
 | DP language-model head | `--enable-dp-lm-head` |
 | NPU graph decode batch sizes | `--cuda-graph-bs-decode 1 2 4 8 16 25` |
@@ -51,29 +51,214 @@ checkpoint accessible at the same path on every node.
 
 ## Installation
 
-For host setup and container creation, follow the
-[SGLang Installation with NPU Support](</docs/hardware-platforms/ascend-npus/getting-started/installation#create-docker-container>) guide. Under **Create Docker Container**, select the **950PR/DT Series** instructions and use the image below wherever the guide asks for an image name. Run the deployment script in the created container.
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30GB** of free space.
+</Warning>
 
-Pull the SGLang image for Huawei Ascend 950PR/DT Series (A5):
+The dependencies required for the NPU runtime environment are integrated into platform-specific Docker images. Pull the image for your hardware and create a container using the corresponding command below. For host setup and further container options, see the [SGLang Installation with NPU Support](</docs/hardware-platforms/ascend-npus/getting-started/installation#create-docker-container>) guide.
+
+<Tabs>
+  <Tab title="A3 Series">
 
 ```bash
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41-1
+A3_IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-dsv41-1"
+docker pull "$A3_IMAGE"
+
+docker run -itd --shm-size=16g --name ${NAME} \
+  --privileged=true --net=host \
+  -v /var/queue_schedule:/var/queue_schedule \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /usr/local/sbin:/usr/local/sbin \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+  --device=/dev/davinci0:/dev/davinci0 \
+  --device=/dev/davinci1:/dev/davinci1 \
+  --device=/dev/davinci2:/dev/davinci2 \
+  --device=/dev/davinci3:/dev/davinci3 \
+  --device=/dev/davinci4:/dev/davinci4 \
+  --device=/dev/davinci5:/dev/davinci5 \
+  --device=/dev/davinci6:/dev/davinci6 \
+  --device=/dev/davinci7:/dev/davinci7 \
+  --device=/dev/davinci8:/dev/davinci8 \
+  --device=/dev/davinci9:/dev/davinci9 \
+  --device=/dev/davinci10:/dev/davinci10 \
+  --device=/dev/davinci11:/dev/davinci11 \
+  --device=/dev/davinci12:/dev/davinci12 \
+  --device=/dev/davinci13:/dev/davinci13 \
+  --device=/dev/davinci14:/dev/davinci14 \
+  --device=/dev/davinci15:/dev/davinci15 \
+  --device=/dev/davinci_manager:/dev/davinci_manager \
+  --device=/dev/hisi_hdc:/dev/hisi_hdc \
+  --entrypoint=bash \
+  "$A3_IMAGE"
 ```
+
+  </Tab>
+  <Tab title="950PR/DT Series">
+
+```bash
+A5_IMAGE="swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-dsv41-1"
+docker pull "$A5_IMAGE"
+
+docker run -itd --shm-size=16g --name ${NAME} \
+  --privileged=true --net=host \
+  -v /var/queue_schedule:/var/queue_schedule \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /usr/local/sbin:/usr/local/sbin \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+  --device=/dev/davinci0:/dev/davinci0 \
+  --device=/dev/davinci1:/dev/davinci1 \
+  --device=/dev/davinci2:/dev/davinci2 \
+  --device=/dev/davinci3:/dev/davinci3 \
+  --device=/dev/davinci4:/dev/davinci4 \
+  --device=/dev/davinci5:/dev/davinci5 \
+  --device=/dev/davinci6:/dev/davinci6 \
+  --device=/dev/davinci7:/dev/davinci7 \
+  --device=/dev/davinci_manager:/dev/davinci_manager \
+  --device=/dev/hisi_hdc:/dev/hisi_hdc \
+  --entrypoint=bash \
+  "$A5_IMAGE"
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+- If the model weights are stored on the host, mount their directory into the container, for example: `-v /path/to/models:/models`.
+- Replace `${NAME}` with your container name, or remove `--name ${NAME}` to use Docker's default name.
+- Replace `<A3-compatible-SGLang-image>` with the tested A3 image URI before running the A3 commands.
+</Tip>
 
 ## Online service deployment
 
-The following script configures the host, initializes the Ascend environment, sets runtime variables, and launches
-SGLang. DSPARK is disabled by default; enable it only when compatible A5 custom operators are available and DSPARK has
-been validated in your environment.
+Select the tab for your hardware and use its corresponding DeepSeek-V4.1-Flash launch script. The A3 script is a
+single-node configuration. In the A5 script, DSPARK is disabled by default; enable it only when compatible A5 custom
+operators are available and DSPARK has been validated in your environment.
 
-Before running the script, replace `/path/to/sglang` and `/path/to/dsv4.1-1017` with paths available on every node. Set
-`NODE_IPS` to the same ordered list of node IP addresses on every node. This example has one node, with `NODE_RANK=0`
-and `HCCL_IF="lo"`. For a multi-node deployment, set each node's `NODE_RANK` to its zero-based position in `NODE_IPS`
-and set `HCCL_IF` to that node's reachable HCCL interface. Run the script on every node in the prepared 950PR/DT Series
-(A5) environment, with sufficient privileges to apply the host settings.
+Configure the following parameters according to your deployment mode: single-node or multi-node.
 
-The supplied deployment script sets `TP_SIZE=8` and `DP_SIZE=8`, while its topology note specifies `DP_SIZE=NNODES`.
-Confirm the intended DP size and cross-node DeepEP support for your SGLang revision before using a multi-node deployment.
+<table>
+  <thead>
+    <tr>
+      <th style={{ whiteSpace: "nowrap" }}>Parameter</th>
+      <th>Single-node deployment</th>
+      <th>Multi-node deployment</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{ whiteSpace: "nowrap" }}><code>MODEL_PATH</code></td>
+      <td>Download the checkpoint for your hardware from <a href="#model-weights">Model weights</a>, then set <code>MODEL_PATH</code> to its directory as accessible from inside the container. For multi-node deployments, make this path accessible inside every node's container.</td>
+      <td>Same as the single-node deployment.</td>
+    </tr>
+    <tr>
+      <td style={{ whiteSpace: "nowrap" }}><code>NODE_IPS</code></td>
+      <td>List the node's communication IP, for example <code>NODE_IPS=("192.168.25.209")</code>.</td>
+      <td>List all node communication IPs in the same order on every node, for example <code>NODE_IPS=("192.168.25.209" "192.168.25.212")</code>. Do not include port numbers.</td>
+    </tr>
+    <tr>
+      <td style={{ whiteSpace: "nowrap" }}><code>NODE_RANK</code></td>
+      <td>Set <code>NODE_RANK=0</code>.</td>
+      <td>Set the rank separately on each node according to its position in <code>NODE_IPS</code>. For the example above, use <code>NODE_RANK=0</code> on <code>192.168.25.209</code> and <code>NODE_RANK=1</code> on <code>192.168.25.212</code>.</td>
+    </tr>
+    <tr>
+      <td style={{ whiteSpace: "nowrap" }}><code>HCCL_IF</code></td>
+      <td>The single-node example uses <code>HCCL_IF="lo"</code>. To inspect available interfaces, run <code>ip -br addr</code>. To check the route to a peer, run <code>ip route get &lt;peer-node-ip&gt;</code>; use the interface shown after <code>dev</code> as <code>HCCL_IF</code>.</td>
+      <td>Set <code>HCCL_IF</code> separately on each node to its local interface for HCCL communication. For example, configure the interface on <code>192.168.25.209</code> on that node, and the interface on <code>192.168.25.212</code> on the other node. Interface names may be the same or different, depending on the cluster configuration.</td>
+    </tr>
+  </tbody>
+</table>
+
+<Tabs>
+  <Tab title="A3 Series">
+
+This is the A3 single-node command. Replace the SGLang source and model checkpoint paths with paths available in your environment.
+
+```bash Command
+unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY
+
+# Use the modified SGLang code
+export TORCH_EXTENSIONS_DIR="$(mktemp -d /tmp/dsv41-jit.XXXXXX)"
+export CANN_OP_BUILDER_NO_FPRINT_CACHE=1
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export STREAMS_PER_DEVICE=32
+export SGLANG_SET_CPU_AFFINITY=1
+
+# Test settings
+export TASK_QUEUE_ENABLE=1
+export INF_NAN_MODE_FORCE_DISABLE=1
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=max
+
+# export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export HCCL_BUFFSIZE=128 # 1024
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+
+# Skip the GPU branch
+export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+export SGLANG_DSV4_FP4_EXPERTS=True
+export SGLANG_OPT_FUSE_WQA_WKV=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_USE_TILELANG_MHC_POST=False
+export SGLANG_OPT_FP8_WO_A_GEMM=False
+
+export MODEL_PATH=/path/to/DeepSeek-V4.1-Flash-1017-w8a8
+
+# Performance settings
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=max
+export SGLANG_RAGGED_VERIFY_MODE=static
+
+python3 -m sglang.launch_server --model-path "$MODEL_PATH" \
+  --page-size 128 \
+  --tp-size 16 \
+  --trust-remote-code \
+  --attention-backend dsv4 \
+  --device npu \
+  --watchdog-timeout 9000 \
+  --host 0.0.0.0 --port 8001 \
+  --mem-fraction-static 0.96 \
+  --max-running-requests 16 \
+  --chunked-prefill-size 4096 \
+  --max-prefill-tokens 131072 \
+  --kv-cache-dtype auto \
+  --enable-dp-lm-head \
+  --cuda-graph-bs-decode 1 2 \
+  --disable-radix-cache \
+  --attn-dp-size 8 \
+  --reasoning-parser deepseek-v4 \
+  --language-model-only \
+  --json-model-override-args '{"architectures": ["DeepseekV4ForCausalLM"], "quantization_config": null}' \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$MODEL_PATH" \
+  --speculative-draft-model-quantization modelslim \
+  --speculative-draft-kv-cache-dtype bf16 \
+  --speculative-dspark-block-size 5
+```
+
+  </Tab>
+  <Tab title="950PR/DT Series">
+
+The A5 configuration below uses a unified non-PD service. Its node and interface settings are configured in the script.
 
 ```bash
 
@@ -121,7 +306,8 @@ SERVED_MODEL_NAME="dsv41"
 NUM_NPUS_PER_NODE=8
 PORT=30000
 DIST_PORT=5567
-NODE_IPS=("<node-0-ip>")
+# Single node
+NODE_IPS=("192.168.25.209")
 NODE_RANK=0
 HCCL_IF="lo"
 NNODES="${#NODE_IPS[@]}"
@@ -130,8 +316,8 @@ if (( NNODES < 1 )); then
   exit 1
 fi
 TOTAL_NPUS=$((NNODES * NUM_NPUS_PER_NODE))
-DP_SIZE=8
-TP_SIZE=8
+TP_SIZE="$TOTAL_NPUS"
+DP_SIZE="$TOTAL_NPUS"
 MASTER_ADDR="${NODE_IPS[0]}"
 DIST_INIT_ADDR="${MASTER_ADDR}:${DIST_PORT}"
 export HCCL_SOCKET_IFNAME="$HCCL_IF"
@@ -165,8 +351,7 @@ python3 -m sglang.launch_server \
   --trust-remote-code \
   --attention-backend dsv4 \
   --device npu \
-  --enable-dp-attention \
-  --dp-size "$DP_SIZE" \
+  --attn-dp-size "$DP_SIZE" \
   --enable-dp-lm-head \
   --watchdog-timeout 9000 \
   --max-running-requests 200 \
@@ -184,6 +369,9 @@ python3 -m sglang.launch_server \
   "${DSPARK_ARGS[@]}"
 ```
 
+  </Tab>
+</Tabs>
+
 ## Functional verification
 
 Once the server prints `The server is fired up and ready to roll!` in the terminal, it is ready to accept requests. For
@@ -195,7 +383,7 @@ Send a chat completion request to the service endpoint on port `30000`:
 ```shell
 curl -i http://127.0.0.1:30000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"dsv4","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"dsv41","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 Expected result: an HTTP 200 response containing a generated answer.
@@ -223,3 +411,4 @@ for supported feature combinations.
 ## FAQ
 
 For common Ascend environment, installation, and runtime issues, see the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
+
