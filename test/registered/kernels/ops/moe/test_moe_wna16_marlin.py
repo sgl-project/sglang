@@ -1233,8 +1233,9 @@ def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
 @pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
 @pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+@pytest.mark.parametrize("rows", [4, 16])
 def test_muse_marlin_inactive_routes(
-    fused_norm, hidden, intermediate, weight_first, use_expert_map
+    fused_norm, hidden, intermediate, weight_first, use_expert_map, rows
 ):
     """Muse finalization excludes undefined inactive projection rows and weights."""
     from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
@@ -1244,7 +1245,7 @@ def test_muse_marlin_inactive_routes(
     )
 
     torch.manual_seed(67)
-    rows, local_experts, topk = 4, 2, 2
+    local_experts, topk = 2, 2
     dtype = torch.bfloat16
     layer = MuseSpark1xFp4Experts.__new__(MuseSpark1xFp4Experts)
     torch.nn.Module.__init__(layer)
@@ -1286,11 +1287,14 @@ def test_muse_marlin_inactive_routes(
     local_ids = torch.tensor(
         [[0, 1], [1, -1], [-1, 0], [-1, -1]], device="cuda", dtype=torch.int32
     )
+    ids = ids.repeat(rows // 4, 1)
+    local_ids = local_ids.repeat(rows // 4, 1)
     if not use_expert_map:
         ids = local_ids.clone()
     weights = torch.tensor(
         [[0.25, 0.75], [0.5, 0.5], [0.25, 0.75], [0.5, 0.5]], device="cuda"
     )
+    weights = weights.repeat(rows // 4, 1)
     weights[local_ids < 0] = float("nan")
     weights[-1, 0] = float("inf")
     input_weights = weights.clone()
@@ -1307,6 +1311,9 @@ def test_muse_marlin_inactive_routes(
     projection_buffers = []
 
     def record_projection_buffer(a, c, *args, **kwargs):
+        # At M=16, global fan-out selects 16 rows under EP, versus 32 at EP1.
+        expected_block_m = 8 if rows == 4 else (16 if use_expert_map else 32)
+        assert kwargs["moe_block_size"] == expected_block_m
         assert kwargs["is_ep"] is use_expert_map
         assert kwargs["has_inactive_prefix_count"] is (not use_expert_map)
         count = args[10]
@@ -1333,6 +1340,24 @@ def test_muse_marlin_inactive_routes(
             rows * topk * max(2 * intermediate, hidden) * x.element_size()
         )
     torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
+    if rows == 16 and use_expert_map:
+        # Compare the old local-density tile (32) with the new tile (16) on
+        # identical inputs, before comparing either path with a dense reference.
+        with patch(
+            "sglang.srt.layers.muse_spark.muse_spark_fp4_moe."
+            "_MARLIN_BLOCK_SIZE_M_CANDIDATES",
+            [32],
+        ):
+            previous_tile_output, _ = layer._marlin_expert_outputs(x, weights, ids)
+        torch.testing.assert_close(
+            expert_output[local_ids >= 0],
+            previous_tile_output[local_ids >= 0],
+            rtol=0.05,
+            atol=0.25,
+            msg=lambda msg: (
+                f"The global- and local-density tile outputs differ:\n{msg}"
+            ),
+        )
     expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)
     w13_ref, w2_ref = references
     for row in range(rows):
@@ -1342,7 +1367,8 @@ def test_muse_marlin_inactive_routes(
                 continue
             gate_up = x[row] @ w13_ref[expert].T
             gate, up = gate_up.chunk(2)
-            activated = torch.nn.functional.silu(gate) * up
+            # The filtered CUDA activation multiplies in FP32, then rounds once.
+            activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(dtype)
             expected_experts[row, route] = activated @ w2_ref[expert].T
     torch.testing.assert_close(
         expert_output[local_ids >= 0],
