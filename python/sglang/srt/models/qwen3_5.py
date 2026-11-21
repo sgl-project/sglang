@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_load
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
+    AuxHiddenStatePacker,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -1902,6 +1903,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def get_prefill_aux_hidden_states_width(self) -> int:
+        # A subclass with its own forward still collects a list.
+        if type(self).forward is not Qwen3_5ForCausalLM.forward:
+            return 0
+        return len(self.layers_to_capture) * self.hidden_size
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1943,7 +1950,11 @@ class Qwen3_5ForCausalLM(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
-        aux_hidden_states = AuxHiddenStateList()
+        aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker.for_batch(forward_batch, len(self.layers_to_capture))
+            if forward_batch.aux_hidden_states_buffer is not None
+            else AuxHiddenStateList()
+        )
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1986,6 +1997,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         if len(aux_hidden_states) == 0:
             return hidden_states
 
+        if isinstance(aux_hidden_states, AuxHiddenStatePacker):
+            return hidden_states, aux_hidden_states.finalize()
         return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -2444,6 +2457,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
+    def get_prefill_aux_hidden_states_width(self) -> int:
+        return self.model.get_prefill_aux_hidden_states_width()
+
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
@@ -2660,6 +2676,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if hasattr(mlp, "num_fused_shared_experts"):
                 return mlp.num_fused_shared_experts
         return 0
+
+    def get_prefill_aux_hidden_states_width(self) -> int:
+        return self.model.get_prefill_aux_hidden_states_width()
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
