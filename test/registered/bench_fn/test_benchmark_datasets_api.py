@@ -114,10 +114,10 @@ class _DummyTokenTensor:
         return self.value
 
 
-def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
+def create_lightweight_tokenizer(num_tokens=2048) -> PreTrainedTokenizerFast:
     """Create a local lightweight tokenizer for CPU-only dataset tests."""
     vocab = {"[UNK]": 0, "[PAD]": 1, "[BOS]": 2, "[EOS]": 3}
-    vocab.update({f"tok_{i}": i + 4 for i in range(2048)})
+    vocab.update({f"tok_{i}": i + 4 for i in range(num_tokens)})
 
     tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = Whitespace()
@@ -1139,6 +1139,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         output_len=2,
         fast_prepare=True,
         global_seed=None,
+        tokenizer=None,
+        input_ids=False,
     ):
         # GSP's own `seed` kwarg only feeds the cache filename; reproducibility
         # of compute_random_lens / gen_prompt comes from seeding the module
@@ -1153,7 +1155,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             question_len=question_len,
             output_len=output_len,
             range_ratio=range_ratio,
-            tokenizer=self.tokenizer,
+            tokenizer=self.tokenizer if tokenizer is None else tokenizer,
             seed=seed,
             send_routing_key=send_routing_key,
             num_turns=num_turns,
@@ -1161,11 +1163,31 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             ordered=ordered,
             group_distribution=mode,
             zipf_alpha=alpha,
+            input_ids=input_ids,
         )
 
     @staticmethod
     def _row_fields(rows):
         return [(r.prompt, r.prompt_len, r.output_len, r.routing_key) for r in rows]
+
+    def test_gsp_cache_isolated_by_tokenizer(self):
+        """Switching tokenizers must return prompts from the new vocabulary."""
+        tokenizer = create_lightweight_tokenizer(num_tokens=8)
+        vocab = tokenizer.get_vocab()
+        for input_ids in (False, True):
+            with self.subTest(input_ids=input_ids):
+                self._run_gsp(input_ids=input_ids)
+                rows = self._run_gsp(tokenizer=tokenizer, input_ids=input_ids)
+                allowed = set(vocab.values()) if input_ids else set(vocab)
+                for row in rows:
+                    tokens = row.prompt if input_ids else row.prompt.split()
+                    self.assertLessEqual(set(tokens), allowed)
+
+    def test_gsp_cache_reused_by_equivalent_tokenizer(self):
+        """Recreating a tokenizer must reuse its cached dataset across RNG seeds."""
+        expected = self._run_gsp()
+        actual = self._run_gsp(tokenizer=create_lightweight_tokenizer(), global_seed=43)
+        self.assertEqual(actual, expected)
 
     def test_gsp_uniform_default_unchanged(self):
         # Uniform mode returns the documented number of rows and is
@@ -1179,12 +1201,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
-    def test_gsp_uniform_cache_path_format_unchanged(self):
-        # The uniform-mode cache filename keeps its existing
-        # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
-        # shape. The trailing class name is a transformers/tokenizers internal
-        # detail (TokenizersBackend / PreTrainedTokenizerFast depending on
-        # version), so we only pin the deterministic numeric portion.
+    def test_gsp_uniform_cache_path(self):
         path = get_gen_prefix_cache_path(
             seed=7,
             num_groups=3,
