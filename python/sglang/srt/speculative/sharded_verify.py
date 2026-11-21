@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,7 @@ def sampling_allows_vocab_shards(
         # invoking any optional local-key policy.
         not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
         and not return_logprob
-        and info.acc_additive_penalties is None
-        and info.acc_scaling_penalties is None
+        and not has_acc_penalties(info)
         and info.logit_bias is None
         and (
             info.is_all_greedy

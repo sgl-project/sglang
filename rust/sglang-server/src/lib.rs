@@ -31,6 +31,7 @@ pub mod test_support {
     pub use crate::api_server::http::pre_generate::test_support::*;
     pub use crate::utils::runtime::test_support::*;
 }
+pub use message::buffers::ExternalBuffer;
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, Http2Config, MetricsConfig, MmFamily, MmResample,
     MmSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
@@ -66,13 +67,14 @@ use crate::utils::{logging, runtime, shm::ShmSegment};
 /// msgpack sidecar) that `RustMmProcessor.wrap_encoded` or an external
 /// package's wrapper consumes. An inline buffer is a numpy array, shaped, that
 /// **owns** the Rust vector (no copy); a shm buffer is a [`ShmBuffer`] naming
-/// the segment to map. `frozen`: immutable snapshot, so field access never
-/// contends on a borrow.
+/// the segment to map; an external buffer is the object its processor's
+/// [`ExternalBuffer`] built. `frozen`: immutable snapshot, so field access
+/// never contends on a borrow.
 #[pyclass(frozen, get_all)]
 pub struct IngressRequest {
     header: Py<PyBytes>,
-    /// `(name, numpy array | ShmBuffer)` in producer order; empty for control
-    /// requests.
+    /// `(name, numpy array | ShmBuffer | external buffer)` in producer order;
+    /// empty for control requests.
     buffers: Vec<(String, Py<PyAny>)>,
 }
 
@@ -133,7 +135,8 @@ impl ShmBuffer {
 }
 
 /// Hand one buffer across: the inline vector becomes a numpy array owning it,
-/// viewed with the buffer's shape; the shm segment becomes its name.
+/// viewed with the buffer's shape; the shm segment becomes its name; an
+/// external buffer becomes the object its processor builds.
 fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(String, Py<PyAny>)> {
     use message::buffers::{BufferData, BufferStore};
     use numpy::{IntoPyArray, PyArrayMethods};
@@ -164,6 +167,7 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
         BufferStore::Shm { segment, dtype } => {
             Py::new(py, ShmBuffer::new(segment, dtype.numpy(), shape))?.into_any()
         }
+        BufferStore::External(external) => external.into_py(py)?,
     };
     Ok((buffer.name, value))
 }
