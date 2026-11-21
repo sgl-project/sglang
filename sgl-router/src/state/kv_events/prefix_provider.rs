@@ -42,6 +42,8 @@ pub struct RankDepths {
     /// deepest depth, so every replica prefers the same one. A tie-break only:
     /// rank load decides first (see `select_dp_rank`).
     pub preferred: Option<u32>,
+    /// Reuse the chain from this lookup when recording the selected rank.
+    pub(crate) media_chain: Option<Vec<i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,7 +224,8 @@ impl RadixTreePrefixProvider {
             .map(|(worker, depth)| (worker.dp_rank, depth))
             .collect();
         let mut preferred = None;
-        if let Some(media) = self.media_chain(tokens, namespace, &hashes) {
+        let media = self.media_chain(tokens, namespace, &hashes);
+        if let Some(media) = &media {
             let before = depths.iter().map(|&(_, d)| d).max();
             let owner_prefix = format!("{worker_url}#");
             let mut remembered = false;
@@ -264,7 +267,11 @@ impl RadixTreePrefixProvider {
                 }
             }
         }
-        RankDepths { depths, preferred }
+        RankDepths {
+            depths,
+            preferred,
+            media_chain: media.map(|m| m.chain),
+        }
     }
 
     /// A media chat's routing chain; `None` for a text prompt or with media
@@ -322,10 +329,14 @@ impl RadixTreePrefixProvider {
             return;
         };
         if let Some(media) = self.media_chain(tokens, namespace, &hashes) {
-            self.tree
-                .media_ranks()
-                .record(&format!("{worker_url}#{rank}"), &media.chain);
+            self.record_rank_chain(&media.chain, worker_url, rank);
         }
+    }
+
+    pub(crate) fn record_rank_chain(&self, chain: &[i64], worker_url: &str, rank: u32) {
+        self.tree
+            .media_ranks()
+            .record(&format!("{worker_url}#{rank}"), chain);
     }
 
     fn block_hashes(&self, tokens: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
@@ -654,7 +665,8 @@ mod tests {
                 .store_event(&KvWorkerId::new("http://a".to_owned(), rank), &event);
         }
         let ns = CacheNamespace::default();
-        provider.record_rank(&prompt[..(4 + 2) * BLOCK as usize], &ns, "http://a", 1);
+        let first = provider.rank_depths(&prompt[..(4 + 2) * BLOCK as usize], &ns, "http://a");
+        provider.record_rank_chain(first.media_chain.as_deref().unwrap(), "http://a", 1);
         let mut by_rank = provider.rank_depths(&prompt, &ns, "http://a").depths;
         by_rank.sort();
         assert_eq!(by_rank, [(0, 4), (1, 6)]);
