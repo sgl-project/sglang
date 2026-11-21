@@ -48,7 +48,10 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_indexed_scale_shift,
     tensors_equal,
 )
-from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.layernorm.norm import (
+    can_use_fused_inplace_qknorm,
+    fused_inplace_qknorm,
+)
 from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     can_use_mxfp8_swizzled,
 )
@@ -561,7 +564,7 @@ def _apply_qk_norm(
         and q.stride(-2) == k.stride(-2) == head_dim
         and q_norm.eps == k_norm.eps
         and not torch.compiler.is_compiling()
-        and current_platform.is_cuda()
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
             q,
@@ -1319,15 +1322,14 @@ class MiniMaxH3Attention(nn.Module):
         # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
         # are torch nn.RMSNorm, so the fused kernel is called directly.
         self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
-                arch.attention_head_dim,
-                rope_dim,
-                True,
-                _BF16_DTYPE,
-                cache_dtype=_BF16_DTYPE,
-                round_norm_before_rope=True,
-            )
+            current_platform.is_cuda() or current_platform.is_rocm()
+        ) and can_use_fused_inplace_qknorm_rope(
+            arch.attention_head_dim,
+            rope_dim,
+            True,
+            _BF16_DTYPE,
+            cache_dtype=_BF16_DTYPE,
+            round_norm_before_rope=True,
         )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
