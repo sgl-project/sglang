@@ -36,6 +36,7 @@ import torch
 
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     _build_dsa_token_shard_plan,
+    build_dsa_pcp_query_shard,
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
     dsa_token_shard_redistribute_heads,
@@ -81,6 +82,34 @@ def _brute(extend_seq_lens, seq_lens, tp_size, tp_rank):
 
 
 class TestDsaTokenShardPlan(CustomTestCase):
+    def test_pcp_shard_preserves_per_query_causal_metadata(self):
+        query_ends = torch.arange(1, 13, dtype=torch.int32)
+        key_lens = torch.tensor([51, 53, 55, 4, 6, 8, 10, 61, 63, 65, 67, 69])
+        table = torch.arange(24, dtype=torch.int32).reshape(12, 2)
+        for rank in range(4):
+            shard = build_dsa_pcp_query_shard(12, query_ends, key_lens, table, 4, rank)
+            self.assertIsNotNone(shard)
+            self.assertEqual(shard.plan.local_start, 3 * rank)
+            self.assertEqual(shard.plan.local_end, 3 * (rank + 1))
+            self.assertEqual(shard.query_ends.tolist(), [1, 2, 3])
+            rows = slice(3 * rank, 3 * (rank + 1))
+            torch.testing.assert_close(shard.key_lens, key_lens[rows])
+            torch.testing.assert_close(shard.block_table, table[rows])
+
+    def test_pcp_shard_falls_back_for_ragged_or_mismatched_rows(self):
+        lengths = torch.arange(1, 13, dtype=torch.int32)
+        table = torch.zeros((12, 2), dtype=torch.int32)
+        for rank in range(4):
+            self.assertIsNone(
+                build_dsa_pcp_query_shard(
+                    11, lengths[:11], lengths[:11], table[:11], 4, rank
+                )
+            )
+            self.assertIsNone(
+                build_dsa_pcp_query_shard(12, lengths, lengths, table[:11], 4, rank)
+            )
+        self.assertIsNone(build_dsa_pcp_query_shard(12, lengths, lengths, table, 1, 0))
+
     def _check(self, extend_seq_lens, seq_lens, tp_size, label=""):
         num_tokens = sum(extend_seq_lens)
         rows = -(-num_tokens // tp_size)

@@ -23,7 +23,7 @@ Composes with the indexer's query sharding: the indexer derives its rows
 from this plan, so both pick the same rows.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -53,6 +53,40 @@ def dsa_token_shard_enabled() -> bool:
 
 # Distinguishes "no plan cached yet" from "cached, and it is None".
 _MISSING = object()
+
+
+class DsaPcpQueryShard(NamedTuple):
+    plan: DsaTokenShardPlan
+    query_ends: torch.Tensor
+    key_lens: torch.Tensor
+    block_table: torch.Tensor
+
+
+def build_dsa_pcp_query_shard(
+    num_rows: int,
+    query_ends: torch.Tensor,
+    key_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+) -> Optional[DsaPcpQueryShard]:
+    """Share one PCP-local row slice between the indexer and SFA."""
+    if (
+        tp_size <= 1
+        or num_rows < tp_size
+        or num_rows % tp_size != 0
+        or query_ends.numel() != num_rows
+        or key_lens.numel() != num_rows
+        or block_table.shape[0] != num_rows
+    ):
+        return None
+
+    # Only the layout of this plan is used. PCP supplies causal lengths per row.
+    plan = plan_dsa_token_shard((num_rows,), (num_rows,), tp_size, tp_rank)
+    rows = slice(plan.local_start, plan.local_end)
+    return DsaPcpQueryShard(
+        plan, query_ends[rows] - plan.local_start, key_lens[rows], block_table[rows]
+    )
 
 
 def get_dsa_token_shard_plan(

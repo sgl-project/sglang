@@ -36,6 +36,8 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
+    dsa_token_shard_redistribute_heads,
+    dsa_token_shard_restore_tokens,
     get_dsa_token_shard_plan,
 )
 from sglang.srt.layers.attention.dsa.utils import (
@@ -50,6 +52,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
@@ -59,6 +62,7 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
     next_power_of_2,
+    print_info_once,
 )
 
 if TYPE_CHECKING:
@@ -1874,6 +1878,23 @@ class AscendAttnBackend(AttentionBackend):
         forward_batch.positions = local_positions
         forward_batch.dsa_cp_metadata_prepared = True
 
+    def can_shard_pcp_dsa_queries(self, forward_batch: ForwardBatch) -> bool:
+        parallel = get_parallel()
+        return (
+            self.use_dsa
+            and self.kv_cache_dtype == torch.bfloat16
+            and self.qk_rope_head_dim > 0
+            and not self.token_to_kv_pool.dsa_kv_cache_store_fp8
+            and not self.enable_sparsity_driven_kv_offload
+            and not self.graph_mode
+            and not get_is_capture_mode()
+            and parallel.pp_size == 1
+            and parallel.attn_tp_size > 1
+            and not parallel.dcp_enabled
+            and dsa_use_prefill_cp(forward_batch)
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+        )
+
     def do_cp_balance_attn(
         self,
         q_nope,
@@ -1884,6 +1905,8 @@ class AscendAttnBackend(AttentionBackend):
         layer,
         actual_seq_qlen,
         actual_seq_lengths_kv,
+        *,
+        block_table: Optional[torch.Tensor] = None,
     ):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
@@ -1912,7 +1935,11 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=actual_seq_lengths_kv.to(
                 device=q_nope.device, dtype=torch.int32
             ),
-            block_table=self.forward_metadata.block_tables,
+            block_table=(
+                self.forward_metadata.block_tables
+                if block_table is None
+                else block_table
+            ),
             sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
@@ -2142,6 +2169,35 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
+            shard = getattr(forward_batch, "npu_dsa_pcp_query_shard", None)
+            if shard is not None:
+                plan = shard.plan
+                if (
+                    q_nope.shape[0] != plan.num_tokens
+                    or topk_indices.shape[0] != plan.rows
+                ):
+                    raise RuntimeError(
+                        "DSA PCP query rows do not match the Indexer layout"
+                    )
+                local_q = dsa_token_shard_redistribute_heads(q_nope, plan)
+                local_rope = dsa_token_shard_redistribute_heads(q_pe, plan)
+                local_output = self.do_cp_balance_attn(
+                    local_q.contiguous(),
+                    k_nope,
+                    local_rope.contiguous(),
+                    k_pe,
+                    topk_indices,
+                    layer,
+                    shard.query_ends,
+                    shard.key_lens,
+                    block_table=shard.block_table,
+                )
+                print_info_once(
+                    f"DSA PCP SFA uses {local_q.shape[0]} queries x {local_q.shape[1]} heads"
+                )
+                return dsa_token_shard_restore_tokens(
+                    local_output, plan, plan.num_tokens
+                )
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
