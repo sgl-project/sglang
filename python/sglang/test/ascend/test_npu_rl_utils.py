@@ -321,23 +321,21 @@ def generate(
     temperature: float = 0.0,
     ignore_eos: bool = True,
     return_logprob: bool = False,
+    lora_path: Optional[str] = None,
     timeout: float = 180,
 ) -> Dict[str, Any]:
-    response = post(
-        base_url,
-        "/generate",
-        {
-            "text": prompt,
-            "sampling_params": {
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "ignore_eos": ignore_eos,
-            },
-            "return_logprob": return_logprob,
+    body: Dict[str, Any] = {
+        "text": prompt,
+        "sampling_params": {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "ignore_eos": ignore_eos,
         },
-        timeout=timeout,
-    )
-    return response.json()
+        "return_logprob": return_logprob,
+    }
+    if lora_path is not None:
+        body["lora_path"] = lora_path
+    return post(base_url, "/generate", body, timeout=timeout).json()
 
 
 def stream_generate(
@@ -451,6 +449,7 @@ def logprob_signature(
     prompts: Sequence[str],
     *,
     max_new_tokens: int = 8,
+    lora_path: Optional[str] = None,
 ) -> Tuple[Tuple[Tuple[int, ...], Tuple[float, ...]], ...]:
     """Return ``(output_ids, output_token_logprobs)`` for each prompt.
 
@@ -460,7 +459,11 @@ def logprob_signature(
     signature = []
     for prompt in prompts:
         result = generate(
-            base_url, prompt, max_new_tokens=max_new_tokens, return_logprob=True
+            base_url,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            return_logprob=True,
+            lora_path=lora_path,
         )
         meta = result.get("meta_info", {})
         token_logprobs = tuple(
@@ -771,3 +774,195 @@ def update_full_checkpoint_per_rank(
             end_weight_update(base_url)
     finally:
         del keepalive, payloads
+
+
+def update_weights_from_disk(
+    base_url: str,
+    model_path: str,
+    *,
+    load_format: Optional[str] = None,
+    weight_version: Optional[str] = None,
+    keep_pause: bool = False,
+    flush_cache: bool = True,
+    timeout: float = 900,
+) -> Dict[str, Any]:
+    """Refit from a checkpoint on disk and return the response body."""
+    body: Dict[str, Any] = {
+        "model_path": model_path,
+        "flush_cache": flush_cache,
+        "keep_pause": keep_pause,
+    }
+    if load_format is not None:
+        body["load_format"] = load_format
+    if weight_version is not None:
+        body["weight_version"] = weight_version
+    result = post(base_url, "/update_weights_from_disk", body, timeout=timeout).json()
+    if not result.get("success"):
+        raise RuntimeError(
+            f"update_weights_from_disk({model_path}) failed: {result.get('message')}"
+        )
+    return result
+
+
+def update_weight_version(
+    base_url: str,
+    new_version: str,
+    *,
+    abort_all_requests: bool = False,
+    timeout: float = 120,
+) -> None:
+    post(
+        base_url,
+        "/update_weight_version",
+        {"new_version": new_version, "abort_all_requests": abort_all_requests},
+        timeout=timeout,
+    )
+
+
+def current_weight_version(base_url: str) -> str:
+    return get(base_url, "/get_model_info").json()["weight_version"]
+
+
+def abort_all_requests(base_url: str, *, timeout: float = 120) -> None:
+    post(base_url, "/abort_request", {"abort_all": True}, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Polling helpers
+# ---------------------------------------------------------------------------
+
+
+def poll_until(
+    predicate,
+    *,
+    timeout: float = 60,
+    interval: float = 0.05,
+    message: str = "condition",
+):
+    """Poll ``predicate`` until it returns a truthy value."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    raise AssertionError(f"timed out after {timeout}s waiting for {message}")
+
+
+def output_stays_frozen(
+    counter, *, window: float = 3.0, interval: float = 0.05
+) -> bool:
+    """Whether ``counter()`` keeps returning the same value for ``window`` seconds.
+
+    A negative assertion ("the engine produced nothing while paused") cannot be
+    polled for a positive state, so it is carried by a bounded observation
+    window instead of a blind sleep: the check still fails fast if a token
+    arrives, and it never asserts on a guessed duration.
+    """
+    baseline = counter()
+    deadline = time.time() + window
+    while time.time() < deadline:
+        time.sleep(interval)
+        if counter() != baseline:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# LoRA helpers
+# ---------------------------------------------------------------------------
+
+
+def load_lora_adapter(
+    base_url: str,
+    lora_name: str,
+    lora_path: str,
+    *,
+    pinned: bool = False,
+    timeout: float = 300,
+) -> None:
+    result = post(
+        base_url,
+        "/load_lora_adapter",
+        {"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned},
+        timeout=timeout,
+    ).json()
+    if not result.get("success"):
+        raise RuntimeError(
+            f"load_lora_adapter({lora_name}) failed: {result.get('error_message')}"
+        )
+
+
+def load_lora_adapter_from_tensors(
+    base_url: str,
+    lora_name: str,
+    tensors: Dict[str, torch.Tensor],
+    config_dict: Dict[str, Any],
+    *,
+    load_format: Optional[str] = None,
+    tp_size: int = 1,
+    timeout: float = 300,
+) -> None:
+    """Send one serialized copy of the adapter per TP rank.
+
+    The tensors are moved to each rank's NPU first: ``ForkingPickler`` reduces
+    CPU tensors through a shared-memory handshake whose authkey only survives
+    inside one process tree, so a server in another process cannot rebuild
+    them (it fails with ``AuthenticationError: digest sent was rejected``).
+    """
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    keepalive = []
+    payloads = []
+    try:
+        for rank in range(max(1, tp_size)):
+            device = f"npu:{rank}"
+            on_device = {
+                name: tensor.to(device).contiguous() for name, tensor in tensors.items()
+            }
+            keepalive.append(on_device)
+            if load_format == "flattened_bucket":
+                from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+                bucket = FlattenedTensorBucket(named_tensors=list(on_device.items()))
+                keepalive.append(bucket)
+                payloads.append(
+                    MultiprocessingSerializer.serialize(
+                        {
+                            "flattened_tensor": bucket.get_flattened_tensor(),
+                            "metadata": bucket.get_metadata(),
+                        },
+                        output_str=True,
+                    )
+                )
+            else:
+                payloads.append(
+                    MultiprocessingSerializer.serialize(on_device, output_str=True)
+                )
+
+        body: Dict[str, Any] = {
+            "lora_name": lora_name,
+            "config_dict": config_dict,
+            "serialized_named_tensors": payloads,
+        }
+        if load_format is not None:
+            body["load_format"] = load_format
+        result = post(
+            base_url, "/load_lora_adapter_from_tensors", body, timeout=timeout
+        ).json()
+        if not result.get("success"):
+            raise RuntimeError(
+                f"load_lora_adapter_from_tensors({lora_name}) failed: "
+                f"{result.get('error_message')}"
+            )
+    finally:
+        del keepalive, payloads
+
+
+def unload_lora_adapter(base_url: str, lora_name: str, *, timeout: float = 120) -> None:
+    post(
+        base_url,
+        "/unload_lora_adapter",
+        {"lora_name": lora_name},
+        timeout=timeout,
+    )
