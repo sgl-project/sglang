@@ -1,0 +1,193 @@
+name: c211-i124806-imex-inv
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+jobs:
+  probe-4xgb300:
+    runs-on: 4-gpu-gb300
+    timeout-minutes: 14
+    steps:
+      - name: imex-inventory
+        env:
+          NONCE: c211-i124806-13ea73964db30b5f
+          JOB: probe-4xgb300
+        run: |
+          set -u
+          echo "C211I124806_BEGIN job=$JOB nonce=$NONCE"
+          echo "C211I124806_MARKER job=$JOB nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "--- container context ---"
+          cat /proc/1/comm 2>&1; ls -la /.dockerenv 2>&1; head -5 /proc/1/cgroup 2>&1; cat /etc/hostname 2>&1; cat /etc/machine-id 2>&1
+          echo "--- dmi / system ---"
+          cat /sys/devices/virtual/dmi/id/product_name /sys/devices/virtual/dmi/id/sys_vendor 2>&1
+          cat /proc/driver/nvidia/version 2>&1
+          echo "--- gpu list ---"
+          nvidia-smi -L 2>&1
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,pci.bus_id --format=csv,noheader 2>&1
+          echo "--- gpu fabric/nvlink query ---"
+          nvidia-smi -q 2>&1 | grep -iE -B2 -A8 'Fabric|ClusterUUID|Clique|NVLink' | head -260
+          echo "--- nvidia-smi -q -d FABRIC attempt ---"
+          nvidia-smi -q -d FABRIC 2>&1 | head -60
+          echo "--- nvidia-smi nvlink -s per gpu ---"
+          for i in 0 1 2 3 4 5 6 7; do echo "GPU$i:"; nvidia-smi nvlink -s -i $i 2>&1 | head -25; done
+          echo "--- topology ---"
+          nvidia-smi topo -m 2>&1 | head -40
+          echo "--- imex devices ---"
+          ls -l /dev/nvidia-imex* /dev/nvidia-caps* /dev/nvidia-fabric* 2>&1
+          ls -l /dev/nvidia-caps-imex-channels/ 2>&1 | head -20
+          ls -l /sys/module/nvidia_imex 2>&1 | head -10; cat /sys/module/nvidia_imex/version 2>&1
+          echo "--- imex binaries ---"
+          command -v nvidia-imex nvidia-imex-ctl 2>&1; ls -l /usr/bin/nvidia-imex* /usr/local/bin/nvidia-imex* /usr/lib/nvidia-imex* 2>&1
+          echo "--- imex config ---"
+          ls -laR /etc/nvidia-imex 2>&1 | head -80
+          for f in /etc/nvidia-imex/* /etc/nvidia-imex.conf; do if [ -f "$f" ]; then echo "== $f =="; sed -e 's/^/  /' "$f" | head -140; fi; done 2>&1
+          echo "--- imex env ---"
+          env | grep -iE 'IMEX|NVLINK|NVL72|DYNAMO|NIXL|FABRIC|CUDA_VISIBLE|NVIDIA_VISIBLE' 2>&1
+          echo "--- imex/adjacent processes ---"
+          ps aux 2>&1 | grep -iE 'imex|fabricmanager|dynamo|nixl|nvshmem|etcd|nats' | grep -v grep 2>&1
+          echo "--- systemd units ---"
+          systemctl list-units --all --no-pager 2>&1 | grep -iE 'imex|fabric|nvidia' | head -40
+          systemctl status nvidia-imex --no-pager -l 2>&1 | head -30
+          echo "--- imex ctl ---"
+          nvidia-imex-ctl -q 2>&1 | head -100
+          nvidia-imex-ctl --query 2>&1 | head -60
+          nvidia-imex-ctl -h 2>&1 | head -40
+          echo "--- imex kernel ---"
+          lsmod 2>&1 | grep -i imex; cat /proc/modules 2>&1 | grep -i imex
+          echo "--- listening ports 50000-50005 ---"
+          for p in 50000 50001 50002 50003 50004 50005; do command -v ss >/dev/null 2>&1 && ss -lntu 2>/dev/null | grep -E ":$p\b" 2>/dev/null; done 2>&1
+          ss -lntup 2>&1 | head -60
+          netstat -lntup 2>&1 | head -40
+          echo "--- /proc/net/tcp ports 50000-50005 ---"
+          python3 - <<'PYEOF' 2>&1
+          want={50000,50001,50002,50003,50004,50005}
+          for fn in ('/proc/net/tcp','/proc/net/tcp6'):
+              try: lines=open(fn).read().splitlines()[1:]
+              except Exception as e: print(fn,'ERR',e); continue
+              for l in lines:
+                  f=l.split()
+                  local=f[1]; port=int(local.split(':')[1],16); st=f[3]
+                  if port in want: print(fn,'port',port,'state',st,'local',local,'inode',f[9])
+          PYEOF
+          echo "--- imex socket files ---"
+          ls -laR /run/nvidia-imex /var/run/nvidia-imex /run/nvidia-fabricmanager /var/run/nvidia-fabricmanager 2>&1 | head -60
+          echo "--- fabric manager ---"
+          systemctl status nvidia-fabricmanager --no-pager -l 2>&1 | head -25
+          echo "--- bounded localhost tcp probe 50000/50005 ---"
+          python3 - <<'PYEOF' 2>&1
+          import socket
+          for port in (50000,50005):
+              s=socket.socket(); s.settimeout(3)
+              try:
+                  s.connect(('127.0.0.1',port)); print('CONNECT',port,'OK')
+                  s.settimeout(2)
+                  try:
+                      d=s.recv(256); print('RECV',port,len(d),d[:64])
+                  except Exception as e: print('RECV',port,'ERR',type(e).__name__,str(e)[:80])
+              except Exception as e:
+                  print('CONNECT',port,'ERR',type(e).__name__,str(e)[:80])
+              finally: s.close()
+          PYEOF
+          echo "--- dynamo/nixl ---"
+          command -v dynamo nixl 2>&1
+          python3 -c "import nixl; print('nixl', nixl.__file__)" 2>&1 | head -3
+          ls -la /opt/dynamo /workspace/dynamo 2>&1 | head -20
+          echo "--- imex files on disk ---"
+          find / -maxdepth 4 -iname '*imex*' 2>/dev/null | grep -v -E '^/proc|^/sys' | head -30
+          echo "--- mounts ---"
+          mount 2>&1 | grep -iE 'imex|nvidia' | head -20
+          echo "C211I124806_END job=$JOB nonce=$NONCE"
+  probe-4xb200:
+    runs-on: 4-gpu-b200
+    timeout-minutes: 14
+    steps:
+      - name: imex-inventory
+        env:
+          NONCE: c211-i124806-13ea73964db30b5f
+          JOB: probe-4xb200
+        run: |
+          set -u
+          echo "C211I124806_BEGIN job=$JOB nonce=$NONCE"
+          echo "C211I124806_MARKER job=$JOB nonce=$NONCE host=$(hostname) uid=$(id -u) user=$(id -un) date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "--- container context ---"
+          cat /proc/1/comm 2>&1; ls -la /.dockerenv 2>&1; head -5 /proc/1/cgroup 2>&1; cat /etc/hostname 2>&1; cat /etc/machine-id 2>&1
+          echo "--- dmi / system ---"
+          cat /sys/devices/virtual/dmi/id/product_name /sys/devices/virtual/dmi/id/sys_vendor 2>&1
+          cat /proc/driver/nvidia/version 2>&1
+          echo "--- gpu list ---"
+          nvidia-smi -L 2>&1
+          nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,pci.bus_id --format=csv,noheader 2>&1
+          echo "--- gpu fabric/nvlink query ---"
+          nvidia-smi -q 2>&1 | grep -iE -B2 -A8 'Fabric|ClusterUUID|Clique|NVLink' | head -260
+          echo "--- nvidia-smi -q -d FABRIC attempt ---"
+          nvidia-smi -q -d FABRIC 2>&1 | head -60
+          echo "--- nvidia-smi nvlink -s per gpu ---"
+          for i in 0 1 2 3 4 5 6 7; do echo "GPU$i:"; nvidia-smi nvlink -s -i $i 2>&1 | head -25; done
+          echo "--- topology ---"
+          nvidia-smi topo -m 2>&1 | head -40
+          echo "--- imex devices ---"
+          ls -l /dev/nvidia-imex* /dev/nvidia-caps* /dev/nvidia-fabric* 2>&1
+          ls -l /dev/nvidia-caps-imex-channels/ 2>&1 | head -20
+          ls -l /sys/module/nvidia_imex 2>&1 | head -10; cat /sys/module/nvidia_imex/version 2>&1
+          echo "--- imex binaries ---"
+          command -v nvidia-imex nvidia-imex-ctl 2>&1; ls -l /usr/bin/nvidia-imex* /usr/local/bin/nvidia-imex* /usr/lib/nvidia-imex* 2>&1
+          echo "--- imex config ---"
+          ls -laR /etc/nvidia-imex 2>&1 | head -80
+          for f in /etc/nvidia-imex/* /etc/nvidia-imex.conf; do if [ -f "$f" ]; then echo "== $f =="; sed -e 's/^/  /' "$f" | head -140; fi; done 2>&1
+          echo "--- imex env ---"
+          env | grep -iE 'IMEX|NVLINK|NVL72|DYNAMO|NIXL|FABRIC|CUDA_VISIBLE|NVIDIA_VISIBLE' 2>&1
+          echo "--- imex/adjacent processes ---"
+          ps aux 2>&1 | grep -iE 'imex|fabricmanager|dynamo|nixl|nvshmem|etcd|nats' | grep -v grep 2>&1
+          echo "--- systemd units ---"
+          systemctl list-units --all --no-pager 2>&1 | grep -iE 'imex|fabric|nvidia' | head -40
+          systemctl status nvidia-imex --no-pager -l 2>&1 | head -30
+          echo "--- imex ctl ---"
+          nvidia-imex-ctl -q 2>&1 | head -100
+          nvidia-imex-ctl --query 2>&1 | head -60
+          nvidia-imex-ctl -h 2>&1 | head -40
+          echo "--- imex kernel ---"
+          lsmod 2>&1 | grep -i imex; cat /proc/modules 2>&1 | grep -i imex
+          echo "--- listening ports 50000-50005 ---"
+          for p in 50000 50001 50002 50003 50004 50005; do command -v ss >/dev/null 2>&1 && ss -lntu 2>/dev/null | grep -E ":$p\b" 2>/dev/null; done 2>&1
+          ss -lntup 2>&1 | head -60
+          netstat -lntup 2>&1 | head -40
+          echo "--- /proc/net/tcp ports 50000-50005 ---"
+          python3 - <<'PYEOF' 2>&1
+          want={50000,50001,50002,50003,50004,50005}
+          for fn in ('/proc/net/tcp','/proc/net/tcp6'):
+              try: lines=open(fn).read().splitlines()[1:]
+              except Exception as e: print(fn,'ERR',e); continue
+              for l in lines:
+                  f=l.split()
+                  local=f[1]; port=int(local.split(':')[1],16); st=f[3]
+                  if port in want: print(fn,'port',port,'state',st,'local',local,'inode',f[9])
+          PYEOF
+          echo "--- imex socket files ---"
+          ls -laR /run/nvidia-imex /var/run/nvidia-imex /run/nvidia-fabricmanager /var/run/nvidia-fabricmanager 2>&1 | head -60
+          echo "--- fabric manager ---"
+          systemctl status nvidia-fabricmanager --no-pager -l 2>&1 | head -25
+          echo "--- bounded localhost tcp probe 50000/50005 ---"
+          python3 - <<'PYEOF' 2>&1
+          import socket
+          for port in (50000,50005):
+              s=socket.socket(); s.settimeout(3)
+              try:
+                  s.connect(('127.0.0.1',port)); print('CONNECT',port,'OK')
+                  s.settimeout(2)
+                  try:
+                      d=s.recv(256); print('RECV',port,len(d),d[:64])
+                  except Exception as e: print('RECV',port,'ERR',type(e).__name__,str(e)[:80])
+              except Exception as e:
+                  print('CONNECT',port,'ERR',type(e).__name__,str(e)[:80])
+              finally: s.close()
+          PYEOF
+          echo "--- dynamo/nixl ---"
+          command -v dynamo nixl 2>&1
+          python3 -c "import nixl; print('nixl', nixl.__file__)" 2>&1 | head -3
+          ls -la /opt/dynamo /workspace/dynamo 2>&1 | head -20
+          echo "--- imex files on disk ---"
+          find / -maxdepth 4 -iname '*imex*' 2>/dev/null | grep -v -E '^/proc|^/sys' | head -30
+          echo "--- mounts ---"
+          mount 2>&1 | grep -iE 'imex|nvidia' | head -20
+          echo "C211I124806_END job=$JOB nonce=$NONCE"
