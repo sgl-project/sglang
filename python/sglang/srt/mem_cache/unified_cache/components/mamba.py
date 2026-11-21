@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -79,6 +80,8 @@ class MambaComponent(TreeComponent):
     family = TREE_STATE
     # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
     state_cost: Optional[StateCostStrategy] = None
+    # ...and never publish a deferred prompt end on demand.
+    publish_shared_prompts: bool = False
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -103,6 +106,7 @@ class MambaComponent(TreeComponent):
         )
         self.mamba_max_states_per_path = get_exec().mamba.mamba_path_state_cap
         self.checkpoints_level = get_exec().mamba.hybrid_cache_checkpoints_level
+        self.publish_shared_prompts = envs.SGLANG_MAMBA_PUBLISH_SHARED_PROMPTS.get()
         # --radix-eviction-policy state_cost: None keeps the LRU walk.
         self.state_cost = (
             StateCostStrategy(**(params.eviction_policy_config or {}))
@@ -958,11 +962,39 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
+    def shared_prompt_checkpoint_grid(self) -> Optional[int]:
+        """The grid a published state lands on, when the scheduler should mark
+        prompts that other live requests share (`Req.mamba_publish_prompt`);
+        None when every checkpoint is published anyway (level 3, a
+        sliding-window tree), a PD prefill worker publishes its prompt ends
+        regardless and checkpoints its chunks its own way, or the marks are
+        off."""
+        if (
+            not self.publish_shared_prompts
+            or self.checkpoints_level >= 3
+            or self.cache.is_swa_enabled
+            or get_disagg().disaggregation_mode == "prefill"
+        ):
+            return None
+        return self.mamba_checkpoint_grid
+
+    def chunk_checkpoint_len(self, req: Req) -> Optional[int]:
+        """The depth `prepare_for_caching_req` publishes ``req`` at when its
+        extend ends short of the prompt: the snapshot the extend tracked (or
+        an earlier one still kept) with the extra buffer, else the extend end,
+        where the request's own slot holds the state."""
+        if self.cache.enable_mamba_extra_buffer:
+            return req.kv.mamba_last_track_seqlen
+        return req.extend_end
+
     def _defers_checkpoint(
         self, req: Req, token_ids_len: int, checkpoint_len: int
     ) -> bool:
         """Below checkpoint level 3 a running request publishes a state only at
-        its branching point or, on a PD prefill worker, once its prompt is complete.
+        its branching point, once its prompt is complete on a PD prefill
+        worker, or at the end of an extend (a chunk or the whole prompt) the
+        scheduler marked as shared by another live request
+        (`Req.mamba_publish_prompt`).
         A sliding-window tree keeps every chunk: prefill frees window rows only
         behind a checkpoint the tree takes."""
         if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
@@ -972,6 +1004,9 @@ class MambaComponent(TreeComponent):
         # so deferred prompts currently remain private to their session.
         branching_seqlen = req.mamba_branching_seqlen
         if branching_seqlen is not None and checkpoint_len == branching_seqlen:
+            return False
+        # A request sharing the prompt can then match it while this one runs.
+        if self.publish_shared_prompts and req.mamba_publish_prompt:
             return False
         return not (
             get_disagg().disaggregation_mode == "prefill"

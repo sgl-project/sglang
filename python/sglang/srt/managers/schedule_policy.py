@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import itertools
 import os
 import random
 from collections import Counter
@@ -1004,6 +1005,68 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
         and tree_cache.window_sub_pools()
         and tree_cache.window_checkpoint_interval() > 0
     )
+
+
+def mark_shared_prompt_checkpoints(
+    reqs: Iterable[Req],
+    live_reqs: Iterable[Iterable[Req]],
+    grid: int,
+    chunk_checkpoint_len: Optional[Callable[[Req], Optional[int]]] = None,
+    max_compared: int = WAITING_QUEUE_PREFIX_MATCH_MAX,
+) -> None:
+    """Mark each of ``reqs`` to publish the checkpoint that ends its extend
+    (`Req.mamba_publish_prompt`) when another live request shares its prompt
+    deep enough for that to help. A request that defers its checkpoints to its
+    end (level 2) otherwise keeps the prompt out of the tree while it runs, and
+    every request sharing it prefills it again.
+
+    An extend that completes the prompt is marked when the share reaches the
+    first ``grid`` depth past what the tree gave the request: its KV then
+    gives a later request a branching point. A chunk short of the prompt end
+    is marked, given ``chunk_checkpoint_len`` (the depth its checkpoint would
+    publish), when that depth is new and the share reaches it, so the state
+    itself is matched.
+
+    ``live_reqs`` holds the other live requests, waiting ones first: they
+    match the published prompt when admitted. The running ones show a prefix
+    many requests share. At most ``max_compared`` of them are compared with
+    each prompt, so the cost stays bounded on a long queue.
+    """
+    for req in reqs:
+        req.mamba_publish_prompt = False
+        prompt = req.origin_input_ids
+        if req.skip_radix_cache_insert:
+            continue
+        if req.extend_end < len(prompt):
+            if chunk_checkpoint_len is None:
+                continue
+            # A branching point in a later chunk does not hold this one back.
+            depth = chunk_checkpoint_len(req)
+            if depth is None or depth <= req.kv.cache_protected_len:
+                continue
+        else:
+            # A branching point inside this prompt is published regardless.
+            cached = max(req.kv.cache_protected_len, req.mamba_branching_seqlen or 0)
+            # The shallowest depth that holds a state the tree does not.
+            depth = (cached // grid + 1) * grid
+            if depth > len(prompt):
+                continue
+        last = prompt[depth - 1]
+        head = prompt[:depth]
+        for other in itertools.islice(
+            itertools.chain.from_iterable(live_reqs), max_compared
+        ):
+            ids = other.origin_input_ids
+            if (
+                other is not req
+                and len(ids) >= depth
+                and ids[depth - 1] == last
+                and other.extra_key == req.extra_key
+                and other.cache_salt == req.cache_salt
+                and ids[:depth] == head
+            ):
+                req.mamba_publish_prompt = True
+                break
 
 
 class PrefillAdder:

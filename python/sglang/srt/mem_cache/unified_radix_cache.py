@@ -1646,6 +1646,15 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
         )
 
+    def shared_prompt_checkpoint_grid(self) -> Optional[int]:
+        mamba = self.components.get(ComponentType.MAMBA)
+        if self.disable or mamba is None:
+            return None
+        return mamba.shared_prompt_checkpoint_grid()
+
+    def chunk_checkpoint_len(self, req: Req) -> Optional[int]:
+        return self.components[ComponentType.MAMBA].chunk_checkpoint_len(req)
+
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
