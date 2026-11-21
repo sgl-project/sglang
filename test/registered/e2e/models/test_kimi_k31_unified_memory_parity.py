@@ -1,11 +1,10 @@
 """Kimi-K3.1 (first eight layers, real weights) on the unified pool matches the
 static pools in the same mode (CUDA graph, eager): a short case within the
 indexer top-k and a long case over twice the top-k, each a chunked prefill with
-decode, then a prefix-reusing request. Within the top-k, logprobs agree per
-token. Past it, sparse selection is not bitwise deterministic (static runs
-differ by about 0.03 on average, up to about 0.4), so only the mean difference
-is bounded, and greedy tokens are compared only when every context is within
-the top-k.
+decode, then a prefix-reusing request. Within the top-k, compare logprobs on
+shared histories, including both candidates at the first greedy mismatch.
+Past the top-k, static runs differ by about 0.03 on average and up to 0.4,
+so bound the mean difference on the shared prompt.
 """
 
 import json
@@ -24,6 +23,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=2600, stage="weekly", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
+DENSE_LOGPROB_DELTA = 0.01
 # The checkpoint's first eight layers, numbered from 1 as its config numbers
 # them: two MLA+DSA layers among KDA layers. Everything else is its own config.
 FULL_LAYERS = [4, 8]
@@ -104,6 +104,7 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
                     "ignore_eos": True,
                 },
                 "return_logprob": True,
+                "top_logprobs_num": 5,
                 "logprob_start_len": logprob_start_len,
             },
             timeout=300,
@@ -118,8 +119,19 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
             if lp is not None
         ]
         output = [
-            (len(input_ids) + i, lp, tid)
-            for i, (lp, tid, _) in enumerate(meta["output_token_logprobs"])
+            (
+                len(input_ids) + i,
+                lp,
+                tid,
+                {token_id: score for score, token_id, _ in top},
+            )
+            for i, ((lp, tid, _), top) in enumerate(
+                zip(
+                    meta["output_token_logprobs"],
+                    meta["output_top_logprobs"],
+                    strict=True,
+                )
+            )
         ]
         return prompt, output, meta.get("cached_tokens", 0)
 
@@ -146,30 +158,46 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
         finally:
             kill_process_tree(process.pid, wait_timeout=60)
 
+    def _assert_decode_close(self, unified, static, what):
+        for (context, u, u_id, u_top), (s_context, s, s_id, s_top) in zip(
+            unified, static, strict=True
+        ):
+            self.assertEqual(context, s_context, what)
+            where = f"{what}: output token at context {context}"
+            if u_id == s_id:
+                self.assertAlmostEqual(u, s, delta=DENSE_LOGPROB_DELTA, msg=where)
+                continue
+
+            mismatch = (
+                f"{where}: unified chose {u_id}, static chose {s_id}. "
+                f"Unified top logprobs={u_top}, static top logprobs={s_top}"
+            )
+            for token_id in (u_id, s_id):
+                self.assertIn(token_id, u_top, mismatch)
+                self.assertIn(token_id, s_top, mismatch)
+                self.assertLessEqual(
+                    abs(u_top[token_id] - s_top[token_id]),
+                    DENSE_LOGPROB_DELTA,
+                    mismatch,
+                )
+            # Subsequent steps are conditioned on different tokens.
+            break
+
     def _assert_close(self, unified, static, what):
         unified_input, unified_output, _ = unified
         static_input, static_output, _ = static
-        pairs = [
-            (context, u, s, f"prompt token at {context}")
-            for (context, u), (_, s) in zip(unified_input, static_input)
-        ]
-        if all(context <= self.index_topk for context, _, _ in static_output):
-            # Every context within the top-k: greedy decoding is deterministic.
-            self.assertEqual(
-                [tid for _, _, tid in unified_output],
-                [tid for _, _, tid in static_output],
-                f"{what}: greedy tokens diverged",
-            )
-            pairs += [
-                (context, u, s, f"output token at {context}")
-                for (context, u, _), (_, s, _) in zip(unified_output, static_output)
-            ]
         self.assertEqual(len(unified_input), len(static_input), what)
+        self.assertEqual(len(unified_output), len(static_output), what)
         sparse = []
-        for context, u, s, where in pairs:
+        for (context, u), (s_context, s) in zip(unified_input, static_input):
+            self.assertEqual(context, s_context, what)
             if context <= self.index_topk:
-                # Every token attended: the same rows, read the same way.
-                self.assertAlmostEqual(u, s, delta=0.01, msg=f"{what}: {where}")
+                self.assertAlmostEqual(
+                    u,
+                    s,
+                    delta=DENSE_LOGPROB_DELTA,
+                    msg=f"{what}: prompt token at {context}",
+                )
             else:
                 sparse.append(abs(u - s))
         if sparse:
@@ -177,6 +205,8 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
             self.assertLessEqual(
                 mean, 0.1, f"{what}: mean difference past the top-k {mean:.4f}"
             )
+        if all(context <= self.index_topk for context, _, _, _ in static_output):
+            self._assert_decode_close(unified_output, static_output, what)
 
     def test_unified_matches_static(self):
         for name, extra in (
