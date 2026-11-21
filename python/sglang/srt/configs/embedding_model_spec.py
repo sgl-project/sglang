@@ -15,6 +15,7 @@ class EmbeddingTask(str, Enum):
     NONE = "none"
     EMBED = "embed"
     CLASSIFY = "classify"
+    TOKEN_CLASSIFY = "token_classify"
 
 
 class PoolingStrategy(str, Enum):
@@ -348,10 +349,22 @@ def resolve_embedding_model_spec(
     if "EmbeddingNemotron3Model" in architecture_set:
         return _embedding_nemotron3_spec()
 
-    if architecture_set & _CLASSIFICATION_ARCHITECTURES:
+    for architecture in architectures or ():
+        # The checkpoint declares the output task. The model registry separately
+        # determines whether SGLang can load that architecture.
+        is_token_classifier = architecture.endswith("ForTokenClassification")
+        if (
+            not is_token_classifier
+            and architecture not in _CLASSIFICATION_ARCHITECTURES
+        ):
+            continue
         return EmbeddingModelSpec(
-            family="sequence_classification",
-            task=EmbeddingTask.CLASSIFY,
+            family="token_classification"
+            if is_token_classifier
+            else "sequence_classification",
+            task=EmbeddingTask.TOKEN_CLASSIFY
+            if is_token_classifier
+            else EmbeddingTask.CLASSIFY,
             execution=EmbeddingExecution.CLASSIFICATION,
             attention=AttentionPattern.NONE,
             pooling=PoolingStrategy.MODEL_DEFINED,

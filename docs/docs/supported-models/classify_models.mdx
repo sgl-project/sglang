@@ -29,6 +29,7 @@ POST /v1/classify
 - `user` (string, optional): User identifier for tracking
 - `rid` (string, optional): Request ID for tracking
 - `priority` (integer, optional): Request priority
+- `threshold` (number, optional): Minimum score for a positive label on multi-label models (0 to 1, default 0.5).
 
 ## Response Format
 
@@ -63,8 +64,8 @@ POST /v1/classify
 - `model`: The model used for classification
 - `data`: Array of classification results
   - `index`: Index of the result
-  - `label`: Predicted class label
-  - `probs`: Array of probabilities for each class
+  - `label`: Top class for single-label models, or an array of classes at or above `threshold` for multi-label models. Token models return one such entry per token.
+  - `probs`: Scores in class ID order, with one row per token for supported `*ForTokenClassification` architectures.
   - `num_classes`: Total number of classes
 - `usage`: Token usage information
   - `prompt_tokens`: Number of input tokens
@@ -76,7 +77,7 @@ POST /v1/classify
 
 When the model's `config.json` sets `"problem_type": "multi_label_classification"`, `/v1/classify` applies an elementwise sigmoid to the logits and returns an independent probability for each class in `probs`. These probabilities do not need to sum to one. For example, logits `[2.0, 2.0]` produce approximately `[0.880797, 0.880797]`, so both classes can be positive.
 
-`label` remains the top-scoring class for response compatibility. To select multiple labels, apply your chosen thresholds to the complete `probs` vector. Models with another or unspecified `problem_type` continue to use softmax.
+With the default `threshold` of 0.5, `label` includes both classes in this example. At 0.9, it is empty. Token classifiers apply the threshold separately to each token. Models configured for regression return raw scores. Single-label models and those with an unspecified `problem_type` use softmax.
 
 ## Example Usage
 
@@ -165,4 +166,4 @@ python test_classify_api.py
 
 ## Compatibility
 
-This implementation is compatible with vLLM's classification API format, allowing seamless migration from vLLM to SGLang for classification tasks.
+Single-label sequence responses use a string `label`. Clients upgrading from an earlier SGLang release or switching from vLLM should accept arrays in `label` when serving multi-label or token classifiers.

@@ -1579,6 +1579,7 @@ class EmbeddingObject(BaseModel):
 
 
 ClassifyInput = Union[str, List[str], List[int]]
+DEFAULT_CLASSIFICATION_THRESHOLD = 0.5
 
 
 class ClassifyRequest(BaseModel):
@@ -1586,6 +1587,12 @@ class ClassifyRequest(BaseModel):
     model: str = DEFAULT_MODEL_NAME
     input: ClassifyInput
     user: Optional[str] = None
+    threshold: float = Field(
+        default=DEFAULT_CLASSIFICATION_THRESHOLD,
+        ge=0.0,
+        le=1.0,
+        description="Minimum score for a positive label in multi-label classification.",
+    )
 
     # The request id.
     rid: Optional[Union[List[str], str]] = None
@@ -1595,9 +1602,22 @@ class ClassifyRequest(BaseModel):
 
 class ClassifyData(BaseModel):
     index: int
-    label: str
-    probs: List[float]
+    label: Union[str, List[str], List[List[str]]]
+    probs: Union[List[float], List[List[float]]]
     num_classes: int
+
+    @model_validator(mode="after")
+    def _validate_result_shape(self) -> ClassifyData:
+        if self.probs and isinstance(self.probs[0], list):
+            if not isinstance(self.label, list) or len(self.label) != len(self.probs):
+                raise ValueError("token results need one label entry per score row")
+        elif (
+            isinstance(self.label, list)
+            and self.label
+            and isinstance(self.label[0], list)
+        ):
+            raise ValueError("nested labels require per-token score rows")
+        return self
 
 
 class ClassifyResponse(BaseModel):
