@@ -19,6 +19,11 @@ PARAM_CLOSE = "</param>"
 FUNCTION_CLOSE = "</function>"
 PARAM_OPEN = "<param"
 
+_FUNCTION_TRANSITION_RE = re.compile(
+    re.escape(FUNCTION_CLOSE) + r"\s*" + _FUNC_OPEN_RE.pattern
+)
+_CDATA_PARAM_OPEN_RE = re.compile(_PARAM_OPEN_RE.pattern + re.escape(CDATA_START))
+
 
 def get_argument_type(
     func_name: str, arg_key: str, name_to_tool: Dict[str, Tool]
@@ -51,22 +56,22 @@ def _convert_param_value(key: str, val_text: str, props: dict) -> object:
     return parsed_val
 
 
-def _extract_param_value(text: str, start: int) -> Tuple[str, int]:
-    """Extract a param value and return (value, end_pos after value markup)."""
-    if text.startswith(CDATA_START, start):
+def _extract_param_value(text: str, start: int, block_end: int) -> Tuple[str, int]:
+    """Extract a param value within its function and return its end position."""
+    if text.startswith(CDATA_START, start, block_end):
         cdata_content_start = start + len(CDATA_START)
-        cdata_end = text.find(CDATA_END, cdata_content_start)
+        cdata_end = text.find(CDATA_END, cdata_content_start, block_end)
         if cdata_end != -1:
             value = text[cdata_content_start:cdata_end]
             end_pos = cdata_end + len(CDATA_END)
-            if text.startswith(PARAM_CLOSE, end_pos):
+            if text.startswith(PARAM_CLOSE, end_pos, block_end):
                 end_pos += len(PARAM_CLOSE)
             return value, end_pos
 
         # Broken CDATA: fall back to nearest-boundary extraction from content start.
         start = cdata_content_start
 
-    slice_text = text[start:]
+    slice_text = text[start:block_end]
     candidates = []
     for marker, consume in (
         (PARAM_CLOSE, len(PARAM_CLOSE)),
@@ -78,10 +83,7 @@ def _extract_param_value(text: str, start: int) -> Tuple[str, int]:
             candidates.append((idx, consume))
 
     if not candidates:
-        func_close = text.find(FUNCTION_CLOSE, start)
-        if func_close == -1:
-            return text[start:], len(text)
-        return text[start:func_close].strip(), func_close
+        return slice_text, block_end
 
     end_idx, consume = min(candidates, key=lambda x: x[0])
     value = slice_text[:end_idx].strip()
@@ -110,6 +112,15 @@ def _find_function_close(
         if cdata_end < idx:
             return idx
 
+        # Treat a direct transition to a function with its own CDATA parameter
+        # as a missing CDATA terminator in the preceding function.
+        for transition in _FUNCTION_TRANSITION_RE.finditer(text, idx, cdata_end):
+            body_start = transition.end()
+            next_close = text.find(FUNCTION_CLOSE, body_start, cdata_end)
+            next_body_end = cdata_end if next_close == -1 else next_close
+            if _CDATA_PARAM_OPEN_RE.search(text, body_start, next_body_end):
+                return transition.start()
+
         pos = cdata_end + len(CDATA_END)
 
 
@@ -137,6 +148,7 @@ def _parse_function_block(
         return None, len(text), False
 
     body_end = close_idx
+    end_pos = close_idx + len(FUNCTION_CLOSE)
     pos_in_body = pos
 
     while pos_in_body < body_end:
@@ -150,7 +162,7 @@ def _parse_function_block(
         if pm:
             key = pm.group(1).strip()
             val_start = pm.end()
-            val_text, val_end = _extract_param_value(text, val_start)
+            val_text, val_end = _extract_param_value(text, val_start, end_pos)
             pos_in_body = val_end
 
             if key in seen_keys:
@@ -186,7 +198,6 @@ def _parse_function_block(
 
         break
 
-    end_pos = close_idx + len(FUNCTION_CLOSE)
     call = {"name": func_name, "parameters": arguments}
     return call, end_pos, True
 
@@ -306,7 +317,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                 text, opening.end(), allow_broken_cdata=finished
             )
             if close == -1:
-                normal_parts.append(text[:start])
+                normal_parts.append(text if finished else text[:start])
                 self._buffer = "" if finished else text[start:]
                 break
 

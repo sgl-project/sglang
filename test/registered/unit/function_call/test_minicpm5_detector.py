@@ -636,5 +636,53 @@ def test_finish_releases_partial_marker_in_plain_text():
     assert streamed.calls + finished.calls == []
 
 
+def test_cdata_preserves_literal_adjacent_function_markup():
+    """Function-like text in valid CDATA remains an argument value."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    city = 'Beijing</function><function name="get_weather"><param name="city">example'
+    opening = '<function name="get_weather"><param name="city"><![CDATA['
+    first = detector.parse_streaming_increment(opening + city, tools)
+    assert first.calls == []
+    second = detector.parse_streaming_increment("]]></param></function>", tools)
+    assert [json.loads(call.parameters) for call in second.calls] == [{"city": city}]
+
+
+def test_finish_preserves_unclosed_function_text():
+    """An unfinished function and the text after its opener survive stream end."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    prefix = "Reading an example: "
+    suffix = '<function name="get_weather"> has no closing tag. Keep this text.'
+    streamed = detector.parse_streaming_increment(prefix + suffix, tools)
+    finished = detector.finish(tools)
+    assert streamed.calls + finished.calls == []
+    assert streamed.normal_text + finished.normal_text == prefix + suffix
+    assert detector.finish(tools).normal_text == ""
+
+
+def test_missing_cdata_end_does_not_consume_next_call():
+    """A later call's CDATA terminator must not be borrowed by an earlier call."""
+    tools = make_tools_weather()
+    first = (
+        '<function name="get_weather"><param name="city"><![CDATA[Beijing'
+        "</param></function>"
+    )
+    second = (
+        '\n<function name="get_weather">'
+        '<param name="city"><![CDATA[Shanghai]]></param></function>'
+    )
+    expected = [{"city": "Beijing"}, {"city": "Shanghai"}]
+    non_stream = MiniCPM5Detector().detect_and_parse(first + second, tools)
+    detector = MiniCPM5Detector()
+    first_result = detector.parse_streaming_increment(first, tools)
+    assert first_result.calls == []
+    second_result = detector.parse_streaming_increment(second, tools)
+    calls = second_result.calls + detector.finish(tools).calls
+    assert [json.loads(call.parameters) for call in calls] == expected
+    assert [call.tool_index for call in calls] == [0, 1]
+    assert [json.loads(call.parameters) for call in non_stream.calls] == expected
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
