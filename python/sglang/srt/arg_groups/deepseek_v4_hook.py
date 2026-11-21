@@ -446,7 +446,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     (get_platform().is_hip and cfg.moe_a2a_backend == "none")
                     or (
                         get_platform().is_cuda
-                        and cfg.moe_a2a_backend in ("none", "megamoe")
+                        # Both MegaMoE backends route each rank's own tail rows.
+                        and cfg.moe_a2a_backend
+                        in ("none", "megamoe", "flashinfer_megamoe")
                     )
                 )
             ),
