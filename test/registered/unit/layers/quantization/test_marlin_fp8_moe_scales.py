@@ -1,5 +1,6 @@
 """CPU regressions for Marlin FP8 scale repack and MoE block selection."""
 
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -113,10 +114,16 @@ class TestMarlinBlockSize(CustomTestCase):
             hidden_size=shape[0],
             intermediate_size=shape[1],
             num_local_experts=experts,
+            gate_up_slices=2,
             w13_qweight=SimpleNamespace(device=device),
+            w2_qweight=SimpleNamespace(shape=(experts, shape[1] // 16, shape[0] * 4)),
+        )
+        scalar_type = SimpleNamespace(
+            scalar_types=SimpleNamespace(float8_e4m3fn=mock.sentinel.fp8)
         )
         with (
-            mock.patch.object(marlin.MarlinPairProvider, "__init__", return_value=None),
+            mock.patch.dict(sys.modules, {"sgl_kernel.scalar_type": scalar_type}),
+            mock.patch.object(torch, "zeros", return_value=torch.zeros((1, 1))),
             mock.patch.object(
                 torch.cuda, "get_device_capability", return_value=capability
             ) as device_capability,

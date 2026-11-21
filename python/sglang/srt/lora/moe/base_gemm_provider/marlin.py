@@ -35,11 +35,13 @@ class MarlinPairProvider(PairRowDomainProvider):
     derived_base_weights = "the Marlin-repacked expert weights"
 
     def __init__(self, quant_info: MoeLoraMarlinQuantInfo):
+        device = quant_info.w13_qweight.device
         super().__init__(
-            quant_info,
-            gate_up_slices=quant_info.gate_up_slices,
-            device=quant_info.w13_qweight.device,
+            quant_info, gate_up_slices=quant_info.gate_up_slices, device=device
         )
+        self._device_capability = torch.cuda.get_device_capability(device)
+        # On Blackwell, LoRA blocks can delay the down GEMM over shared memory.
+        self.down_gemm_first = self._device_capability[0] >= 10
         self._padded_intermediate_size = quant_info.w2_qweight.shape[1] * 16
         from sgl_kernel.scalar_type import scalar_types
 
@@ -198,7 +200,7 @@ class MarlinFp8PairProvider(MarlinPairProvider):
     def __init__(self, quant_info: MoeLoraFp8MarlinQuantInfo):
         super().__init__(quant_info)
         device = quant_info.w13_qweight.device
-        capability = torch.cuda.get_device_capability(device)
+        capability = self._device_capability
         layer = (
             quant_info.group_size,
             quant_info.hidden_size,

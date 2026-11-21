@@ -150,8 +150,14 @@ class LoraWorkspace:
         device: torch.device,
         compute: Callable[[], _T],
         side: Callable[[], object],
+        compute_first: bool = False,
     ) -> _T:
+        """Enqueue work on two CUDA streams and join on the caller stream."""
         if device.type != "cuda":
+            if compute_first:
+                result = compute()
+                side()
+                return result
             side()
             return compute()
 
@@ -161,7 +167,6 @@ class LoraWorkspace:
         done = self.event(device, f"{name}:done")
 
         ready.record(current)
-        side_stream.wait_event(ready)
         caller_routes = self.routes.setdefault(
             (current.device, current.cuda_stream), {}
         )
@@ -170,11 +175,15 @@ class LoraWorkspace:
         )
         # Routes become visible across streams at the existing event waits.
         side_routes.update(caller_routes)
+        if compute_first:
+            result = compute()
+        side_stream.wait_event(ready)
         with torch.cuda.stream(side_stream):
             side()
             done.record(side_stream)
         completed_routes = side_routes.copy()
-        result = compute()
+        if not compute_first:
+            result = compute()
         current.wait_event(done)
         caller_routes.update(completed_routes)
         return result
