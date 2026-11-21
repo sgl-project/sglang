@@ -81,6 +81,39 @@ class TestDotsToolDetector(unittest.TestCase):
             },
         )
 
+    def test_non_stream_string_null_and_invalid_boolean_stay_literal(self):
+        # A string-typed "null" is a real string; an invalid boolean keeps
+        # its raw text instead of silently becoming false.
+        tools = [
+            _tool(
+                "search",
+                {
+                    "query": {"type": "string"},
+                    "note": {"type": ["string", "null"]},
+                    "limit": {"type": "integer"},
+                    "flag": {"type": "boolean"},
+                },
+            )
+        ]
+        parser = FunctionCallParser(tools, "dots")
+        text = (
+            "<dots_function_call>"
+            '<invoke name="search">'
+            '<parameter name="query">null</parameter>'
+            '<parameter name="note">null</parameter>'
+            '<parameter name="limit">5</parameter>'
+            '<parameter name="flag">yes</parameter>'
+            "</invoke>"
+            "</dots_function_call>"
+        )
+
+        _, calls = parser.parse_non_stream(text)
+
+        self.assertEqual(
+            json.loads(calls[0].parameters),
+            {"query": "null", "note": None, "limit": 5, "flag": "yes"},
+        )
+
     def test_non_stream_supports_multiple_invokes_and_json_fallback(self):
         tools = [
             _tool("search", {"query": {"type": "string"}}),
