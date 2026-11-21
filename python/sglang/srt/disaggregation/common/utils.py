@@ -128,7 +128,10 @@ class AuxDataCodec:
         item_len = kv_args.aux_item_lens[buffer_index]
         dst_addr = dst_aux_ptr + item_len * aux_index
         buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
-        buffer[:] = data
+        # One memcpy through the buffer protocol. Assigning a ctypes slice converts every
+        # byte to a Python int while holding the GIL (~14 ms per MiB), which stalls the
+        # scheduler thread of the receiving decode rank.
+        memoryview(buffer).cast("B")[:] = data
         return
 
 

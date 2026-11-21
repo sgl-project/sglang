@@ -89,6 +89,7 @@ from sglang.srt.speculative.spec_utils import (
     get_plan_stream,
     sample_draft_proposal,
     select_top_k_tokens,
+    use_fused_draft_sample,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cpu, is_npu
 from sglang.srt.utils.async_probe import (
@@ -97,7 +98,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import fast_topk
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import forward_nvtx_range
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -141,6 +142,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Single-CG runner samples in-graph (_sample_draft_proposal); per-step
         # runner samples worker-side between replays.
         self.use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        self.use_fused_draft_sample = self.use_rejection_sampling and (
+            use_fused_draft_sample(self.target_worker.model_config.vocab_size)
+        )
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
             "multi-layer EAGLE requires speculative_num_draft_tokens == "
             "speculative_num_steps + 1, "
@@ -704,9 +708,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
+                    # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                    forward_batch.sampling_info.top_ks
+                    if self.use_fused_draft_sample
+                    else None,
                     sampling_seed=forward_batch.sampling_info.sampling_seed,
                     positions=forward_batch.seq_lens,
                     draft_step=step,
+                    fused=self.use_fused_draft_sample,
                 )
                 draft_probs_list.append(probs)
             else:
@@ -890,7 +899,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if can_run_decode_cuda_graph:
             # Graph replay bypasses ModelRunner.forward, which emits the
             # step[...] trace span for every other phase; emit it here.
-            with profile_range(build_step_span_name(forward_batch)):
+            with forward_nvtx_range(build_step_span_name(forward_batch)):
                 cgr = self.cuda_graph_runner_for_draft_extend
                 # Populate the single shared buffer set once; each step replays
                 # against it and the chain is advanced in place between steps.
@@ -914,9 +923,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
                             forward_batch.sampling_info.temperatures,
+                            # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                            forward_batch.sampling_info.top_ks
+                            if self.use_fused_draft_sample
+                            else None,
                             sampling_seed=forward_batch.sampling_info.sampling_seed,
                             positions=forward_batch.seq_lens,
                             draft_step=step,
+                            fused=self.use_fused_draft_sample,
                         )
                         ret_draft_probs_list.append(probs)
                     if rotates_in_graph:
@@ -992,9 +1006,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                         logits_sel,
                         forward_batch.sampling_info.temperatures,
+                        # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                        forward_batch.sampling_info.top_ks
+                        if self.use_fused_draft_sample
+                        else None,
                         sampling_seed=forward_batch.sampling_info.sampling_seed,
                         positions=forward_batch.seq_lens,
                         draft_step=step,
+                        fused=self.use_fused_draft_sample,
                     )
                     ret_draft_probs_list.append(probs)
                 else:
