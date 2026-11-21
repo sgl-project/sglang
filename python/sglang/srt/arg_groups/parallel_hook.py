@@ -37,6 +37,8 @@ from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
 
+DP_ATTENTION_CONSERVATIVENESS_SCALE = 0.3
+
 
 def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
     """Resolve the token-row modes the model's forward actually enters."""
@@ -378,7 +380,9 @@ def handle_data_parallelism(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_data_parallelism",
-            schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
+            schedule_conservativeness=(
+                cfg.schedule_conservativeness * DP_ATTENTION_CONSERVATIVENESS_SCALE
+            ),
         )
         if envs.SGLANG_RUST_SERVER.get():
             declare_resolution(

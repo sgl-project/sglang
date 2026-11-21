@@ -10,6 +10,7 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.srt.arg_groups.parallel_hook import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -210,11 +211,15 @@ class SchedulerInternalStateController:
         # when it is higher (e.g. raised by a retract), so a less conservative
         # value takes effect through the usual decay and a more conservative
         # one takes effect at once.
+        # DP attention scales the startup flag; scale the live value the same way.
+        effective = float(value)
+        if get_parallel().attn_dp_enabled:
+            effective *= DP_ATTENTION_CONSERVATIVENESS_SCALE
         running = self.scheduler.new_token_ratio_tracker.current
-        tracker = NewTokenRatioTracker.from_conservativeness(float(value))
+        tracker = NewTokenRatioTracker.from_conservativeness(effective)
         tracker.current = max(tracker.current, running)
         self.scheduler.new_token_ratio_tracker = tracker
-        return {key: float(value)}
+        return {key: effective}
 
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the

@@ -3,9 +3,12 @@
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.managers.io_struct import SetInternalStateReq
+from sglang.srt.arg_groups.parallel_hook import DP_ATTENTION_CONSERVATIVENESS_SCALE
+from sglang.srt.managers.scheduler_components import internal_state
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
@@ -72,6 +75,15 @@ class TestLiveScheduleConservativeness(CustomTestCase):
         self.assertEqual(tracker.current, 0.95)
         tracker.decay_step()
         self.assertAlmostEqual(tracker.current, 0.95 - tracker.decay)
+
+    def test_dp_attention_scales_the_live_value_as_at_startup(self):
+        parallel = SimpleNamespace(attn_dp_enabled=True)
+        with mock.patch.object(internal_state, "get_parallel", return_value=parallel):
+            self.assertTrue(self._set(schedule_conservativeness=1.0))
+        scaled = 1.0 * DP_ATTENTION_CONSERVATIVENESS_SCALE
+        expected = NewTokenRatioTracker.from_conservativeness(scaled)
+        self.assertEqual(self.scheduler.new_token_ratio_tracker.init, expected.init)
+        self.assertEqual(self._readback(), scaled)
 
     def test_rejects_values_that_are_not_finite_positive_numbers(self):
         before_tracker = self.scheduler.new_token_ratio_tracker
