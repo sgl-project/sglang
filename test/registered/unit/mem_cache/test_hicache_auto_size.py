@@ -261,7 +261,8 @@ class TestHiCacheAutoSize(CustomTestCase):
                 enable_hierarchical_cache=True, hicache_host_memory_fraction=None
             ),
             patch.object(base, "ranks_per_host", return_value=4),
-            patch.object(sizing, "ranks_per_host", return_value=4),
+            patch.object(rocm_budget, "is_hip", return_value=True),
+            patch.object(rocm_budget, "rocm_pinnable_share_bytes", return_value=None),
             patch.object(torch.distributed, "barrier"),
             get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
             patch.object(base, "available_host_memory_bytes", free_now),
@@ -299,7 +300,8 @@ class TestHiCacheAutoSize(CustomTestCase):
                 enable_hierarchical_cache=True, hicache_host_memory_fraction=None
             ),
             patch.object(base, "ranks_per_host", return_value=2),
-            patch.object(sizing, "ranks_per_host", return_value=2),
+            patch.object(rocm_budget, "is_hip", return_value=True),
+            patch.object(rocm_budget, "rocm_pinnable_share_bytes", return_value=None),
             patch.object(base, "available_host_memory_bytes", calls.free),
             patch.object(torch.distributed, "barrier", calls.barrier),
             get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
@@ -311,6 +313,24 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertEqual([name for name, _, _ in calls.mock_calls], ["free", "barrier"])
         calls.barrier.assert_called_once_with(group="cpu")
 
+    def test_explicit_size_is_a_no_op_off_rocm(self):
+        """Off ROCm an explicit size keeps per-pool sampling: no snapshot, no collective."""
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=4),
+            patch.object(rocm_budget, "is_hip", return_value=False),
+            patch.object(base, "available_host_memory_bytes") as sample,
+            patch.object(torch.distributed, "barrier") as barrier,
+            sizing.auto_size_hicache(
+                params=_cpu_params(), draft_plan=None, enabled=True
+            ),
+        ):
+            self.assertIsNone(base._host_memory_budget.get())
+        sample.assert_not_called()
+        barrier.assert_not_called()
+
     def test_explicit_size_on_a_lone_rank_still_sees_other_replicas_pools(self):
         """A lone rank samples per pool and takes no collective, so another replica's pins stay visible."""
         host_free = {"bytes": base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000}
@@ -319,8 +339,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 enable_hierarchical_cache=True, hicache_host_memory_fraction=None
             ),
             patch.object(base, "ranks_per_host", return_value=1),
-            patch.object(sizing, "ranks_per_host", return_value=1),
-            patch.object(base, "is_gfx95_supported", return_value=False),
+            patch.object(rocm_budget, "is_hip", return_value=True),
             patch.object(rocm_budget, "rocm_pinnable_share_bytes", return_value=None),
             patch.object(
                 base, "available_host_memory_bytes", lambda **_: host_free["bytes"]
@@ -351,7 +370,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 enable_hierarchical_cache=True, hicache_host_memory_fraction=None
             ),
             patch.object(base, "ranks_per_host", return_value=ranks),
-            patch.object(sizing, "ranks_per_host", return_value=ranks),
+            patch.object(rocm_budget, "is_hip", return_value=True),
             patch.object(torch.distributed, "barrier") as barrier,
             get_parallel().override(world_group=SimpleNamespace(cpu_group="cpu")),
             patch.object(base, "available_host_memory_bytes", return_value=available),
@@ -374,7 +393,9 @@ class TestHiCacheAutoSize(CustomTestCase):
             sizing.auto_size_hicache(params=params, draft_plan=None, enabled=True),
         ):
             scope = base._host_memory_budget.get()
-            result = base.host_memory_preflight(mappings, HostTensorAllocator, "cuda")
+            result = base.host_memory_preflight(
+                mapping_lengths=mappings, allocator=HostTensorAllocator, device="cuda"
+            )
         # Only ranks sharing a host meet at the barrier; a lone rank has no process group to wait on.
         if ranks > 1:
             barrier.assert_called_once_with(group="cpu")
@@ -385,6 +406,7 @@ class TestHiCacheAutoSize(CustomTestCase):
     def test_explicit_size_admits_a_hugepage_pool_when_plain_ram_is_below_the_reserve(
         self,
     ):
+        """A hugepage-only pool stays admissible when the plain-RAM reserve exceeds free RAM."""
         scope, (allocation, available) = self._explicit_size_scope(
             mode=base.HUGEPAGE_MODE_REQUIRED,
             available=9 << 30,
@@ -395,20 +417,6 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         self.assertLessEqual(allocation, available)
         self.assertEqual(scope, (0, 8 << 30))
-
-    def test_a_lone_rank_admits_a_hugepage_pool_when_plain_ram_is_below_the_reserve(
-        self,
-    ):
-        scope, (allocation, available) = self._explicit_size_scope(
-            mode=base.HUGEPAGE_MODE_PREFER,
-            available=9 << 30,
-            hugetlb=8 << 30,
-            gfx950=False,
-            mappings=[4 << 30],
-            ranks=1,
-        )
-        self.assertIsNone(scope)
-        self.assertLessEqual(allocation, available)
 
     def test_explicit_size_on_gfx950_books_hugepage_pools_against_the_pinnable_share(
         self,

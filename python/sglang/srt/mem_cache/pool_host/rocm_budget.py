@@ -6,13 +6,17 @@ leaves main's behavior unchanged off gfx950."""
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import resource
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ContextManager, Optional
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host import base
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -44,6 +48,41 @@ def clamp_plain_budget(plain: int) -> int:
     if pinnable is not None:
         plain = min(plain, pinnable)
     return plain
+
+
+@contextlib.contextmanager
+def _snapshot_scope(*, allocator, device, barrier: bool):
+    plain, hugetlb = base.host_memory_budget_plain_hugetlb(
+        allocator=allocator, device=device
+    )
+    if barrier:
+        # Peers on this host must all sample before any pins a pool;
+        # ranks_per_host() is uniform, so every rank enters or skips the barrier.
+        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+    # A reserve above free RAM must not reject mappings that charge only the hugetlb pool.
+    with base.host_memory_budget_scope((max(plain, 0), hugetlb)):
+        yield
+
+
+def explicit_size_scope(
+    enabled: bool, *, allocator=None, device=None
+) -> ContextManager:
+    """With explicit HiCache sizes on ROCm, book every host pool of a rank against one
+    host memory snapshot. Per-pool sampling charges a late rank for the pools its peers
+    already pinned, so ranks sharing a host sample once, together (a CPU barrier), before
+    any pins. On gfx950 the snapshot is the pinnable share, with no hugetlb credit, so the
+    ratio-sized Mamba pool built last clamps to what the others left. A nullcontext when
+    HiCache is off, off ROCm, or for a lone rank off gfx950 (it keeps per-pool sampling,
+    which also sees other replicas' pools)."""
+    if not enabled or not is_hip():
+        return contextlib.nullcontext()
+    if rocm_pinnable_share_bytes() is not None:
+        return _snapshot_scope(
+            allocator=None, device=None, barrier=base.ranks_per_host() > 1
+        )
+    if base.ranks_per_host() == 1:
+        return contextlib.nullcontext()
+    return _snapshot_scope(allocator=allocator, device=device, barrier=True)
 
 
 def mamba_host_ratio(hicache_ratio: float) -> float:
