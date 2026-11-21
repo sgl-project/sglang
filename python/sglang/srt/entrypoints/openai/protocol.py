@@ -2140,6 +2140,11 @@ class ResponsesRequest(PDRoutingFields):
         "repetition_penalty": 1.0,
     }
 
+    @field_validator("stream", mode="before")
+    @classmethod
+    def _null_stream_is_false(cls, value: Any) -> Any:
+        return False if value is None else value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_to_thinking(cls, values):
