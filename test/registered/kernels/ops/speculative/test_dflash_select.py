@@ -196,7 +196,9 @@ def _check(lease, gamma, bs, k, seed, ties=False):
 @pytest.mark.parametrize(
     "gamma,bs,k",
     list(itertools.product([4, 7], [1, 8, 64], [16]))
-    + [(4, 8, 32), (7, 2, 32), (5, 8, 16), (5, 2, 32)],
+    + [(4, 8, 32), (7, 2, 32), (5, 8, 16), (5, 2, 32)]
+    + [(g, 8, 16) for g in (1, 2, 3, 6, 8)]
+    + [(1, 2, 32), (8, 2, 32)],
 )
 def test_select_matches_reference(ws, gamma, bs, k):
     match = _check(ws, gamma, bs, k, seed=gamma * 100 + bs + k)
@@ -240,6 +242,25 @@ def test_deterministic_and_reusable(ws):
         for x, y in zip(outs[0], o):
             assert torch.equal(x, y)
     assert clean and committed
+
+
+@pytest.mark.parametrize("nan_ranks", ["one", "all"])
+def test_nan_row_completes(ws, nan_ranks):
+    """A NaN draft row (on one rank's shard, or on every shard as a NaN hidden state gives) still publishes K words,
+    so the round completes; the other requests keep the reference candidates."""
+    gamma, bs, k = 4, 8, 16
+    inputs = _make_inputs(ws.world_size, gamma, bs, k, seed=13)
+    shards = inputs[0]
+    bad_req = 3
+    for r in [0] if nan_ranks == "one" else range(ws.world_size):
+        shards[r][bad_req * gamma + 1] = float("nan")
+    epoch = int(ws.control.epoch.item())
+    cand = _run_kernels(ws, *inputs, 1.0, k)[1]
+    clean, committed = _round_state(ws, epoch, 1)
+    assert clean and committed
+    ref_ids = reference_candidates(shards, k)[0].view(bs, gamma, k)
+    good = torch.arange(bs, device=cand.device) != bad_req
+    torch.testing.assert_close(cand[good], ref_ids[good], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("gamma,bs", [(4, 64), (7, 64)])
@@ -406,6 +427,31 @@ def test_local_topk_tilings(ws, w, k, min_blocks, kind):
         assert torch.equal(words[src], _k1_ref_words(x, k)), f"rank {src}'s words"
 
 
+@pytest.mark.parametrize("k", [32, 16])
+def test_local_topk_nan_rows(ws, k):
+    """Rows with fewer than K candidates (a NaN threshold) take the exact path: an all-NaN row publishes the reference
+    words (NaN ranks highest, then by position), and every row with NaN elements still publishes K words."""
+    w, n = _shard_width(ws.world_size), 32
+    shards = []
+    for src in range(ws.world_size):
+        x = _k1_rows(
+            "random", n, w, torch.Generator(device="cuda").manual_seed(k + 1000 * src)
+        )
+        x[0:8] = float("nan")
+        x[8:16, ::8] = float("nan")  # one NaN per 16 B chunk
+        x[16:24, : 40 * 16] = float("nan")  # whole lanes
+        shards.append(x)
+    words = _k1_round(ws, shards, k)
+    exact = list(range(0, 8)) + list(range(24, n))
+    for src, x in enumerate(shards):
+        assert bool((words[src] != 0).all()), (
+            f"rank {src}: a row published fewer than K words"
+        )
+        assert torch.equal(words[src][exact], _k1_ref_words(x, k)[exact]), (
+            f"rank {src}'s words"
+        )
+
+
 @pytest.mark.parametrize("w", [20480, 10240])
 @pytest.mark.parametrize("sms_times", [0, 1, 2])
 def test_local_topk_dispatch(ws, w, sms_times):
@@ -441,7 +487,7 @@ def _precompile(world_sizes):
     builders += [
         lambda k=k, g=g: _jit_select_walk_module(k, g)
         for k in (32, 16)
-        for g in (4, 5, 7)
+        for g in range(1, 9)
     ]
     parallel_compile(builders)
 

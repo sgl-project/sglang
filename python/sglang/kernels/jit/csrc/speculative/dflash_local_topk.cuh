@@ -192,7 +192,8 @@ SGL_DEVICE void select_exact(const bf16_t* row_src, uint32_t* s_cand, uint32_t* 
 //     reloads chunk t (an L1 hit) and writes its elements >= T as distinct u32 keys (element_key) to a shared list;
 //  4. a key's rank is the number of larger keys, ranks < K are stored.
 // A row with more than kCountCap chunks or candidates runs steps 3a / 3b on clipped lists, then select_exact
-// recomputes its K keys before step 4.
+// recomputes its K keys before step 4; so does a row with fewer than K candidates, which only a NaN lane maximum
+// causes (no element compares >= a NaN T), so that every row publishes K words.
 template <uint32_t K, uint32_t kWidth, uint32_t kMinBlocks, bool kUsePDL>
 __global__ __launch_bounds__(LocalTopKShape<K, kWidth>::kNumThreads, kMinBlocks)  //
     void local_topk_kernel(const __grid_constant__ LocalTopKParams p) {
@@ -223,10 +224,9 @@ __global__ __launch_bounds__(LocalTopKShape<K, kWidth>::kNumThreads, kMinBlocks)
   const uint32_t row = blockIdx.x;
 
   const auto row_src = assume_global(p.logits) + p.logits_stride * row;
-  // The phase before the PDL wait: the primary (the lm_head GEMM) waits for its own primary before it triggers this
-  // grid, so every earlier grid, the last committer of the phase included, has completed by now.
-  const auto publish = reinterpret_cast<uint32_t*>(p.publish_mc + p.counter->load() * p.phase_stride) + row * K;
   PDLWaitPrimary<kUsePDL>();
+  // The phase after the PDL wait: an earlier grid may trigger its dependents before it commits the phase.
+  const auto publish = reinterpret_cast<uint32_t*>(p.publish_mc + p.counter->load() * p.phase_stride) + row * K;
   AlignedVector<bf16x2_t, 8> v[kNumVecs];  // 32 B each
 #pragma unroll
   for (uint32_t i = 0; i < kNumVecs; ++i) {
@@ -362,7 +362,9 @@ __global__ __launch_bounds__(LocalTopKShape<K, kWidth>::kNumThreads, kMinBlocks)
   // PDLWaitPrimary above in every thread.
   PDLTriggerSecondary<kUsePDL>();
   uint32_t n = num_chunks + s_num_extra;
-  if (n > kCountCap) {  // uniform: the lists overflowed
+  // Uniform: the lists overflowed (n > kCountCap), or fewer than K candidates (a NaN T); one unsigned compare.
+  static_assert(kCountCap >= K);
+  if (n - K > kCountCap - K) {
     [[unlikely]] select_exact<S, K>(row_src, s_cand, s_hist, s_select);
     n = K;
   }

@@ -173,9 +173,10 @@ class FusedSelect:
         """pred_hidden [bs, gamma, H] -> tokens int64 [bs, gamma], candidate_ids int64 [bs, gamma, K],
         q fp32 [bs, gamma, K] (written into ``out`` when given)."""
         bs, gamma, hidden = pred_hidden.shape
-        # [bs * gamma, shard_width + R]: the logits shard, then hp.
+        # [bs * gamma, shard_width + R]: the logits shard, then hp. pred_hidden drops the anchor of [bs, gamma + 1, H]:
+        # for gamma >= 2 the reshape is already a copy, for gamma 1 a view with row stride 2H the GEMM rejects.
         logits_hp = lmhead_gemm(
-            pred_hidden.reshape(bs * gamma, hidden), self.merged_weight
+            pred_hidden.reshape(bs * gamma, hidden).contiguous(), self.merged_weight
         )
         dflash_local_topk(
             logits_hp[:, : self.shard_width], self.plane, self.selector.top_k
