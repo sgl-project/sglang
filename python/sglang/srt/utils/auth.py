@@ -5,10 +5,30 @@ This module is intentionally lightweight (no torch import) so it can be used in 
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Optional
+
+from sglang.srt.environ import envs
+
+# The Rust server answers with the same text (`ADMIN_KEY_MISSING`).
+ADMIN_API_KEY_MISSING_MESSAGE = (
+    "This endpoint requires admin API key, but this server was started "
+    "without one (admin-api-key). Restart with --admin-api-key to enable."
+)
+
+
+def bearer_auth_headers(key: Optional[str]) -> dict:
+    """`Authorization: Bearer <key>`, or no header when there is no key."""
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def admin_auth_headers(admin_api_key: Optional[str] = None) -> dict:
+    """Bearer headers for the admin endpoints: `admin_api_key`, else `SGLANG_ADMIN_API_KEY`."""
+    return bearer_auth_headers(admin_api_key or envs.SGLANG_ADMIN_API_KEY.get())
 
 
 @dataclass(frozen=True)
@@ -18,21 +38,31 @@ class AuthDecision:
 
 
 class AuthLevel(str, Enum):
-    """Per-endpoint auth level (attached to endpoint function via `@auth_level`)."""
+    """An endpoint's auth level, as `auth_levels.json` declares it."""
 
     NORMAL = "normal"
     ADMIN_OPTIONAL = "admin_optional"
     ADMIN_FORCE = "admin_force"
 
 
-def auth_level(level: AuthLevel):
-    """Mark endpoint with auth level (stored in endpoint metadata)."""
+def _unique_keys(pairs: list) -> dict:
+    keys = [key for key, _ in pairs]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"auth_levels.json declares {duplicates} twice")
+    return dict(pairs)
 
-    def decorator(func):
-        func._auth_level = level
-        return func
 
-    return decorator
+# Every HTTP route sglang serves, by the Python and the Rust server alike, and
+# its auth level; the Rust server compiles the same file in. A route it does not
+# declare (an extension's, or one whose path an env var sets) is NORMAL.
+AUTH_LEVELS: dict[str, AuthLevel] = {
+    path: AuthLevel(level)
+    for path, level in json.loads(
+        Path(__file__).with_name("auth_levels.json").read_text(),
+        object_pairs_hook=_unique_keys,
+    ).items()
+}
 
 
 def _iter_leaf_routes(routes, prefix: str = ""):
@@ -48,17 +78,23 @@ def _iter_leaf_routes(routes, prefix: str = ""):
         )
 
 
-def _route_auth_level(route) -> AuthLevel:
-    level = getattr(getattr(route, "endpoint", None), "_auth_level", None)
-    return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+def undeclared_routes(app: Any) -> list[str]:
+    """The routes of `app` that `auth_levels.json` does not declare."""
+    return sorted(
+        prefix + route.path
+        for prefix, route in _iter_leaf_routes(app.router.routes)
+        if prefix + route.path not in AUTH_LEVELS
+    )
 
 
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
-    """Best-effort resolve auth level by matching the request to a route."""
+    """Best-effort resolve the auth level of the route Starlette's router picks,
+    a wrong method included, so it is refused at that route's level before 405."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
+    partial = None
     for prefix, route in _iter_leaf_routes(app.router.routes):
         if not scope["path"].startswith(prefix):
             continue
@@ -69,9 +105,13 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
         except Exception:
             continue
         if match == Match.FULL:
-            return _route_auth_level(route)
+            return AUTH_LEVELS.get(prefix + route.path, AuthLevel.NORMAL)
+        if match == Match.PARTIAL and partial is None:
+            partial = prefix + route.path
 
-    return AuthLevel.NORMAL
+    if partial is None:
+        return AuthLevel.NORMAL
+    return AUTH_LEVELS.get(partial, AuthLevel.NORMAL)
 
 
 def decide_request_auth(
@@ -196,7 +236,7 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
                     "error": (
                         "Unauthorized"
                         if decision.error_status_code == 401
-                        else "Forbidden"
+                        else ADMIN_API_KEY_MISSING_MESSAGE
                     )
                 },
                 status_code=decision.error_status_code,

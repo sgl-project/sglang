@@ -1284,9 +1284,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._release_warmup_pool_before_serving = False
         if current_platform.is_cpu() or current_platform.is_mps():
             return
-        from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
-            IPC_A2A,
-        )
         from sglang.multimodal_gen.runtime.layers.usp import drop_a2a_staging_buffers
 
         IPC_A2A.drop_staging()
@@ -1784,14 +1781,66 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         List loaded LoRA adapters and current application status per module.
         """
-        from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
-            LoRAPipeline,
-        )
-
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
+
+    def start_profile(
+        self,
+        output_dir: str | None = None,
+        profile_id: str | None = None,
+        activities: list[str] | None = None,
+        with_stack: bool | None = None,
+        record_shapes: bool | None = None,
+    ) -> OutputBatch:
+        """
+        Start profiling in GPU Worker process.
+        """
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+        # Check if already profiling
+        existing_profiler = SGLDiffusionProfiler.get_instance()
+        if existing_profiler is not None:
+            return OutputBatch(error="Profiler is already running")
+
+        try:
+            profiler = SGLDiffusionProfiler(
+                request_id=profile_id,
+                rank=self.rank,
+                full_profile=True,  # Always profile all stages
+                activities=activities,
+                log_dir=output_dir,
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+            )
+            logger.info(
+                f"GPU Worker {self.rank}: Profiler started "
+                f"(profile_id={profile_id}, output_dir={output_dir})"
+            )
+            return OutputBatch()
+        except Exception as e:
+            logger.error(f"Failed to start profiler: {e}")
+            return OutputBatch(error=str(e))
+
+    def stop_profile(self, export_trace: bool = True) -> OutputBatch:
+        """
+        Stop profiling and save traces.
+        """
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler is None:
+            return OutputBatch(error="Profiler is not running")
+
+        try:
+            # dump_rank=None means all ranks save their own trace
+            profiler.stop(export_trace=export_trace, dump_rank=None)
+            logger.info(f"GPU Worker {self.rank}: Profiler stopped and trace saved")
+            return OutputBatch()
+        except Exception as e:
+            logger.error(f"Failed to stop profiler: {e}")
+            return OutputBatch(error=str(e))
 
     def release_memory_occupation(self) -> dict:
         return self._get_memory_occupation().release_memory_occupation()

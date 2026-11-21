@@ -53,10 +53,7 @@ def _sampling_info(*, greedy: bool):
         need_top_k_sampling=False,
         need_top_p_sampling=False,
         need_min_p_sampling=False,
-        watermark_keys=None,
-        watermark_context_windows=None,
-        watermark_enabled=None,
-        has_watermark_candidates=False,
+        watermark=None,
         max_top_k=None,
     )
 

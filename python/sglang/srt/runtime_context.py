@@ -520,6 +520,17 @@ def is_scheduler_io_rank() -> bool:
     )
 
 
+def is_control_broadcast_local() -> bool:
+    """Whether each attention-DP group leader receives control requests from
+    the DP controller and broadcasts them within its group, instead of the
+    first leader broadcasting them over the whole TP group."""
+    parallel = get_parallel()
+    return parallel.attn_dp_enabled and (
+        parallel.enable_dp_attention_local_control_broadcast
+        or get_exec().moe.is_ep_scale_joiner
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -2095,8 +2106,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     publisher, or `None` if publishing is disabled / misconfigured.
 
     This is the wire contract surfaced under the `kv_events` key on
-    `/server_info` so KV-aware routers (e.g. the SGLang model
-    gateway) can subscribe per-worker without operator-supplied port
+    `/server_info` so KV-aware routers (e.g. sgl-router) can
+    subscribe per-worker without operator-supplied port
     coordination. The router constructs the per-DP-rank SUB endpoint
     as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
     every rank reported in dp_size.

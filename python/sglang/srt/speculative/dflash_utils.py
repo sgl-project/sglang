@@ -14,6 +14,7 @@ from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -23,6 +24,11 @@ from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.sampling.penalties import uses_penalty
+from sglang.srt.sampling.sampling_batch_info import (
+    SamplingBatchInfo,
+    apply_acc_penalties,
+)
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -227,9 +233,8 @@ def apply_dflash_verify_logits_adjustments(
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    Per-request penalties are broadcast over the verify block instead of
+    allocating a repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
     """
     if sampling_info is None:
         return
@@ -254,8 +259,6 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
-    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
@@ -267,33 +270,20 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
-    if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or grammar_mask is not None:
-        linear_penalty = torch.zeros(
+    # Workers get the scheduler's copy_for_forward() copy, so penalties arrive only
+    # as the acc_* buffers; same order as SamplingBatchInfo.apply_logits_bias.
+    apply_acc_penalties(next_token_logits, sampling_info, draft_token_num)
+
+    if grammar_mask is not None:
+        vocab_mask_bias = torch.zeros(
             (bs, next_token_logits.shape[1]),
             dtype=torch.float32,
             device=next_token_logits.device,
         )
-        sampling_info.apply_logits_bias(linear_penalty)
+        grammar_mask.apply(vocab_mask_bias)
         get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+            vocab_mask_bias[:, None, :].to(dtype=next_token_logits.dtype)
         )
-        return
-
-    if acc_linear_penalties is not None:
-        if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
-        ):
-            acc_linear_penalties = acc_linear_penalties.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
-            )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
 
     if logit_bias is not None:
         if (
@@ -305,6 +295,19 @@ def apply_dflash_verify_logits_adjustments(
                 dtype=next_token_logits.dtype,
             )
         get_logits_3d().add_(logit_bias[:, None, :])
+
+
+def commit_block_accept_tokens_to_penalties(
+    sampling_info: SamplingBatchInfo,
+    out_tokens: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> None:
+    if sampling_info.step_penalties is not None:
+        # Guarded here: building the mask launches device work.
+        positions = torch.arange(out_tokens.shape[1], device=out_tokens.device)
+        sampling_info.step_penalties.commit(
+            out_tokens, accept_mask=positions < commit_lens[:, None]
+        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -598,6 +601,60 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
             f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
             f"got {rope_type!r}."
         )
+
+
+def mla_draft_compact_window_narrows(
+    *, dcp_size: int, page_size: int, megakernel: bool
+) -> bool:
+    return (
+        megakernel
+        # dcp_size must divide page_size so each compact slot keeps its owner.
+        and (dcp_size == 1 or page_size % dcp_size == 0)
+        and not envs.SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW.get()
+    )
+
+
+def resolve_mla_draft_compact_window(
+    draft_hf_config: Any,
+    *,
+    window_size: int,
+    dcp_size: int,
+    page_size: int = 1,
+    megakernel: bool = False,
+) -> Optional[int]:
+    """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
+    or cutedsl_mla, or None to serve the draft without the compact table."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types is not None and "sliding_attention" in layer_types:
+        if any(layer_type != "sliding_attention" for layer_type in layer_types):
+            raise ValueError(
+                "--speculative-draft-window-size with an MLA draft that mixes "
+                "full and sliding_attention layers is not supported on trtllm_mla "
+                "or cutedsl_mla: the compact draft table would narrow the full "
+                f"layers, and the native window cannot read it (layer_types="
+                f"{list(layer_types)})."
+            )
+        window_left = get_dflash_attention_sliding_window_size(draft_hf_config)
+        if window_left > window_size:
+            if mla_draft_compact_window_narrows(
+                dcp_size=dcp_size, page_size=page_size, megakernel=megakernel
+            ):
+                return window_size
+            raise ValueError(
+                f"--speculative-draft-window-size {window_size} is narrower than "
+                f"the draft's own sliding window (window_left={window_left}); "
+                "trtllm_mla and cutedsl_mla apply the draft's window and cannot "
+                "narrow it. Use a window size >= window_left or drop the flag."
+            )
+        return None
+    if dcp_size > 1:
+        raise ValueError(
+            "--speculative-draft-window-size with a full-attention MLA draft is "
+            "not supported under --dcp-size > 1: the compact draft table starts "
+            "on a page boundary, but the DCP page table walks pages of "
+            f"page_size * dcp_size positions (dcp_size={dcp_size})."
+        )
+    return window_size
 
 
 @dataclass(frozen=True)
@@ -1262,8 +1319,18 @@ def build_speculative_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, bound_runtime: bool
+) -> Optional[str]:
+    """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    if bound_runtime and uses_penalty(req.sampling_params):
+        return (
+            "DFLASH speculative decoding with the megakernel decode runtime does "
+            "not support sampling penalties (frequency_penalty, presence_penalty, "
+            "repetition_penalty, min_new_tokens)."
+        )
 
     return None
