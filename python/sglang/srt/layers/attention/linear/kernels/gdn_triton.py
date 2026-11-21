@@ -40,7 +40,6 @@ elif is_xpu():
     )
 
 
-@register_custom_op(op_name="gdn_packed_decode", mutates_args=["initial_state", "out"])
 def _gdn_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -52,7 +51,6 @@ def _gdn_packed_decode(
     out: torch.Tensor,
     ssm_state_indices: torch.Tensor,
 ) -> None:
-    # Custom op: torch.compile then mutates the state in place, no pool clone.
     fused_recurrent_gated_delta_rule_packed_decode(
         mixed_qkv=mixed_qkv,
         a=a,
@@ -65,6 +63,15 @@ def _gdn_packed_decode(
         ssm_state_indices=ssm_state_indices,
         use_qk_l2norm_in_kernel=True,
     )
+
+
+# Custom op for torch.compile, which then mutates the state in place, no pool
+# clone. Eager callers use the function above directly.
+_gdn_packed_decode_op = register_custom_op(
+    _gdn_packed_decode,
+    op_name="gdn_packed_decode",
+    mutates_args=["initial_state", "out"],
+)
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -150,7 +157,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
             )
             return out.transpose(0, 1)
 
-        _gdn_packed_decode(
+        packed_decode = (
+            _gdn_packed_decode_op
+            if torch.compiler.is_compiling()
+            else _gdn_packed_decode
+        )
+        packed_decode(
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,

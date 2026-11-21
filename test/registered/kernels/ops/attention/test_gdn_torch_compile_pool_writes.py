@@ -10,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_causal_conv1d_update_contiguous,
+    fused_qkvzba_causal_conv1d_update_contiguous_op,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -48,8 +49,8 @@ def test_conv_update_writes_one_layer_in_place():
     pool = torch.randn(LAYERS, SLOTS, qkv_dim, 3, device="cuda", dtype=dtype)
     indices = torch.arange(BATCH, device="cuda", dtype=torch.int32)
 
-    def step(pool):
-        return fused_qkvzba_causal_conv1d_update_contiguous(
+    def step(pool, update=fused_qkvzba_causal_conv1d_update_contiguous_op):
+        return update(
             qkvz,
             ba,
             pool[LAYER],
@@ -63,9 +64,10 @@ def test_conv_update_writes_one_layer_in_place():
             activation="silu",
         )
 
+    # Eager runs the function itself, as gdn_backend calls it; compiled, the op.
     expected_pool = pool.clone()
-    step(expected_pool)
-    expected = step(expected_pool)
+    step(expected_pool, fused_qkvzba_causal_conv1d_update_contiguous)
+    expected = step(expected_pool, fused_qkvzba_causal_conv1d_update_contiguous)
     actual, extra = _run_twice(step, pool)
 
     assert extra < _layer_bytes(pool[0])

@@ -566,11 +566,6 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_fake(
     )
 
 
-# Custom op: torch.compile then mutates conv_state in place, no pool clone.
-@register_custom_op(
-    mutates_args=["conv_state"],
-    fake_impl=_fused_qkvzba_causal_conv1d_update_contiguous_fake,
-)
 def fused_qkvzba_causal_conv1d_update_contiguous(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
@@ -667,6 +662,15 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         num_stages=2,
     )
     return mixed_qkv, z, b, a
+
+
+# Custom op for torch.compile, which then mutates conv_state in place, no pool
+# clone. Eager callers use the function above directly.
+fused_qkvzba_causal_conv1d_update_contiguous_op = register_custom_op(
+    fused_qkvzba_causal_conv1d_update_contiguous,
+    mutates_args=["conv_state"],
+    fake_impl=_fused_qkvzba_causal_conv1d_update_contiguous_fake,
+)
 
 
 @triton.jit

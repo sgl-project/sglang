@@ -78,6 +78,7 @@ if is_cuda() or is_hip() or is_xpu():
         fused_qkv_gating_gdn_prefill,
         fused_qkv_split_gdn_prefill,
         fused_qkvzba_causal_conv1d_update_contiguous,
+        fused_qkvzba_causal_conv1d_update_contiguous_op,
         fused_qkvzba_split_reshape_cat_contiguous,
     )
 
@@ -1140,7 +1141,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         conv_state_indices=ref_indices,
                     )
 
-                mixed_qkv, z, b, a = fused_qkvzba_causal_conv1d_update_contiguous(
+                fused_update = (
+                    fused_qkvzba_causal_conv1d_update_contiguous_op
+                    if torch.compiler.is_compiling()
+                    else fused_qkvzba_causal_conv1d_update_contiguous
+                )
+                mixed_qkv, z, b, a = fused_update(
                     projected_qkvz,
                     projected_ba,
                     conv_states,
