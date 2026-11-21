@@ -533,13 +533,15 @@ def _shared_reduce(X, XS, W, Scales, Offsets, P, Codes, Headers, Weights, Invers
     dense_rows = gl.load(Inverse + metadata_row[:, None] * 8 + route_id[None, :], metadata_row[:, None] < M, 0)
     route_weights = gl.load(Weights + metadata_row[:, None] * 8 + route_id[None, :], metadata_row[:, None] < M, 0)
     route_headers = gl.load(Headers + dense_rows * (H // 256) + column * BN // 256, metadata_row[:, None] < M, 127)
+    # The codes workspace (3 GiB at M=32768) exceeds the 2-GiB Triton buffer-op
+    # window, so it is read with global loads.
     for pair in range(route_count // 2):
         dense0, weight0, header0 = _route_metadata(dense_rows, route_weights, route_headers, 2 * pair, gl.SliceLayout(1, ep))
         dense1, weight1, header1 = _route_metadata(dense_rows, route_weights, route_headers, 2 * pair + 1, gl.SliceLayout(1, ep))
         offset0 = dense0[:, None] * PITCH + cn[None, :]
         offset1 = dense1[:, None] * PITCH + cn[None, :]
-        code0 = gl.amd.cdna4.buffer_load(Codes, offset0, mask=rm[:, None] < M, other=0, cache='.cg')
-        code1 = gl.amd.cdna4.buffer_load(Codes, offset1, mask=rm[:, None] < M, other=0, cache='.cg')
+        code0 = gl.load(Codes + offset0, rm[:, None] < M, 0, cache_modifier='.cg')
+        code1 = gl.load(Codes + offset1, rm[:, None] < M, 0, cache_modifier='.cg')
         part0 = _decode_w2_panel(P, code0, header0, offset0, rm[:, None] < M)
         value += part0 * weight0[:, None]
         part1 = _decode_w2_panel(P, code1, header1, offset1, rm[:, None] < M)
