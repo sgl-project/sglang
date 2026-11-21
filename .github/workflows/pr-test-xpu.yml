@@ -66,6 +66,7 @@ jobs:
               - "python/sglang/test/!(ascend|observability|mock_model|manual|external_models|kernels)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
               - "python/sglang/kernels/ops/speculative/@(reconstruct_tree|ngram_corpus).py"
+              - "python/sglang/kernels/ops/attention/fla/**/!(*.md)"
               - "python/sglang/kernels/jit/csrc/ngram_corpus/**"
               - "test/registered/xpu/**/!(*.md)"
               - "test/registered/e2e/xpu/**/!(*.md)"
