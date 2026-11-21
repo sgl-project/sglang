@@ -3075,18 +3075,22 @@ class ServingChatTestCase(CustomTestCase):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=True
         )
-        for reasoning_parser, template_kwargs, thinking_end in (
-            (None, None, "</think>"),
-            (None, {"enable_thinking": False}, ""),
-            ("glm45", None, ""),
+        for reasoning_parser, template_kwargs, separate, thinking_end in (
+            (None, None, True, "</think>"),
+            (None, {"enable_thinking": False}, True, ""),
+            (None, None, False, ""),
+            ("glm45", None, True, ""),
         ):
             with self.subTest(
-                reasoning_parser=reasoning_parser, template_kwargs=template_kwargs
+                reasoning_parser=reasoning_parser,
+                template_kwargs=template_kwargs,
+                separate=separate,
             ):
                 self.chat.reasoning_parser = reasoning_parser
                 _, request = self._convert_rendered_as(
                     "<assistant>",
                     chat_template_kwargs=template_kwargs,
+                    separate_reasoning=separate,
                     **self._json_answer_fields(),
                 )
                 self.assertEqual(request._response_parser_thinking_end, thinking_end)
@@ -3129,6 +3133,27 @@ class ServingChatTestCase(CustomTestCase):
                         **self._json_answer_fields(),
                     )
                     self.assertEqual(served, expected)
+
+    def test_glm_json_answer_unseparated_keeps_thinking(self):
+        """separate_reasoning=false keeps the thinking text before a tool call
+        in the content when no reasoning parser is set, as without JSON."""
+        self.chat.tool_call_parser = "glm47"
+        output = self._stopped_on_token(
+            "Plan.</think><tool_call>read_file<arg_key>path</arg_key>"
+            "<arg_value>note.txt</arg_value></tool_call>",
+            1,
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                served = self._served(
+                    output,
+                    stream,
+                    separate_reasoning=False,
+                    **self._json_answer_fields(),
+                )
+                self.assertEqual(
+                    served, ("", "Plan.</think>", [("read_file", {"path": "note.txt"})])
+                )
 
     def test_kimi_k3_json_answer_content_matches_streaming(self):
         """A Kimi-K3 answer loses only its response-channel markers: unseparated
@@ -3173,17 +3198,30 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kimi_k3_answer_without_tool_call_drops_response_markers(self):
         """With only the kimi_k3 tool parser, a JSON answer that calls no tool
-        must not carry the response-channel markers into message.content."""
+        must not carry the response-channel markers into message.content;
+        markers quoted inside the JSON are answer text and stay."""
         self.chat.tool_call_parser = "kimi_k3"
-        tool_calls, text, _ = self.chat._process_tool_calls(
-            text='{"word": "hi"}<|close|>response<|sep|><|close|>message<|sep|>',
-            tools=[{"type": "function", "function": {"name": "read_file"}}],
-            finish_reason={"type": "stop", "matched": None},
-            tool_choice="auto",
-        )
+        quoted = '{"marker": "<|open|>response<|sep|><|close|>response<|sep|>"}'
+        for raw, answer in (
+            ('{"word": "hi"}<|close|>response<|sep|><|close|>message<|sep|>', None),
+            (
+                "Plan.<|close|>think<|sep|><|open|>response<|sep|>"
+                + quoted
+                + "<|close|>response<|sep|><|close|>message<|sep|>",
+                "Plan.<|close|>think<|sep|>" + quoted,
+            ),
+            ("<|open|>response<|sep|>" + quoted + "<|close|>response", quoted),
+        ):
+            with self.subTest(raw=raw):
+                tool_calls, text, _ = self.chat._process_tool_calls(
+                    text=raw,
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    finish_reason={"type": "stop", "matched": None},
+                    tool_choice="auto",
+                )
 
-        self.assertIsNone(tool_calls)
-        self.assertEqual(text, '{"word": "hi"}')
+                self.assertIsNone(tool_calls)
+                self.assertEqual(text, answer or '{"word": "hi"}')
 
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None

@@ -56,8 +56,10 @@ def strip_response_wrappers(text: str) -> str:
 
 
 def strip_response_markers(text: str) -> str:
-    """`text` without the response-channel markers, keeping the text around
-    them, as the streaming tool-call parser emits it."""
-    for marker in (RESPONSE_OPEN, RESPONSE_CLOSE, MESSAGE_CLOSE):
-        text = text.replace(marker, "")
-    return strip_partial_marker_suffix(text)
+    """`text` without the opener and closers of its response channel, keeping
+    the text before the opener and any marker quoted inside the answer."""
+    head, opener, answer = text.partition(RESPONSE_OPEN)
+    if not opener:
+        head, answer = "", text
+    answer = strip_partial_marker_suffix(answer).removesuffix(MESSAGE_CLOSE)
+    return head + strip_partial_marker_suffix(answer).removesuffix(RESPONSE_CLOSE)

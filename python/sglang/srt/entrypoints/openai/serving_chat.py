@@ -1880,6 +1880,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if tool_call_constraint_covers_answer
                 and answer_thinking
                 and not self.reasoning_parser
+                and request.separate_reasoning
                 else ""
             )
             if tool_call_constraint is None:
