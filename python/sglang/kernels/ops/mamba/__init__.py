@@ -6,11 +6,27 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
 
+
+register_kernel(
+    KernelSpec(
+        op="mamba.flashinfer_ssd_prefill",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.flashinfer_ssd:flashinfer_ssd_prefill",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 3))}
+        ),
+    )
+)
 
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
 # never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --

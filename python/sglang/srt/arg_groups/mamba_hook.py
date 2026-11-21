@@ -10,12 +10,27 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import check_pkg_version_at_least
 
 logger = logging.getLogger(__name__)
 
 
 def handle_mamba_backend(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.mamba_prefill_backend == "flashinfer":
+        if not get_platform().is_sm100:
+            raise ValueError("FlashInfer Mamba2 SSD prefill currently requires SM100.")
+        if cfg.enable_unified_memory or cfg.enable_page_major_kv_layout:
+            raise ValueError(
+                "FlashInfer Mamba2 SSD prefill requires contiguous static state pools."
+            )
+        if not check_pkg_version_at_least("flashinfer-python", "0.7.2"):
+            raise ValueError(
+                "FlashInfer Mamba2 SSD prefill requires flashinfer-python >= 0.7.2."
+            )
+        logger.info(
+            "Mamba2 prefill uses FlashInfer SSD; decode/verify backend is unchanged"
+        )
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
@@ -118,7 +133,6 @@ def _platform_supports_mamba_cache_extra_buffer() -> bool:
 
 
 def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
-
     assert supports_mamba_cache_extra_buffer(view, hf_config), (
         f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
     )
