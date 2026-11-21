@@ -2405,6 +2405,43 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+# Checkpoint-layout expert weights that --moe-runner-backend nvfp4_w4a16_sm90
+# repacks and frees after loading.
+_NVFP4_SM90_CHECKPOINT_PARAMS = (
+    "w13_weight",
+    "w13_weight_scale",
+    "w2_weight",
+    "w2_weight_scale",
+)
+
+
+def _check_nvfp4_sm90_runner_config(config: MoeRunnerConfig) -> None:
+    """Refuse every expert variant the nvfp4_w4a16_sm90 op does not compute.
+
+    The op runs plain SiLU(gate) * up with the router weights applied after the
+    down projection. A layer that asks for a clamped or scaled SwiGLU, or for the
+    router weight on the input, would otherwise run without it and give wrong
+    output with no error.
+    """
+    if not config.is_gated or config.activation != "silu":
+        raise ValueError(
+            "--moe-runner-backend nvfp4_w4a16_sm90 supports gated SiLU experts, "
+            f"got {config.activation=} {config.is_gated=}."
+        )
+    unsupported = [
+        name
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit", "swiglu_limit")
+        if getattr(config, name) is not None
+    ]
+    if config.apply_router_weight_on_input:
+        unsupported.append("apply_router_weight_on_input")
+    if unsupported:
+        raise ValueError(
+            "--moe-runner-backend nvfp4_w4a16_sm90 does not support "
+            f"{', '.join(unsupported)} on this layer; use the default backend."
+        )
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2425,7 +2462,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not get_platform().is_blackwell and not use_marlin_fallback:
+        if moe_runner_backend.is_nvfp4_w4a16_sm90():
+            if not (is_cuda() and get_device_capability() == (9, 0)):
+                raise ValueError(
+                    "--moe-runner-backend nvfp4_w4a16_sm90 needs a Hopper (sm90) GPU."
+                )
+            runtime = get_exec()
+            # EPLB moves expert parameters between slots, and CPU offload moves
+            # parameters to the host, but the repacked experts are plain tensors
+            # that neither sees.
+            if runtime.moe.enable_eplb:
+                raise ValueError(
+                    "--moe-runner-backend nvfp4_w4a16_sm90 does not support --enable-eplb."
+                )
+            if (
+                runtime.offload.cpu_offload_gb > 0
+                or runtime.offload.offload_group_size > 0
+            ):
+                raise ValueError(
+                    "--moe-runner-backend nvfp4_w4a16_sm90 does not support CPU weight offload."
+                )
+        elif not get_platform().is_blackwell and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
@@ -2557,14 +2614,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             weight_loader = make_nvfp4_megamoe_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
+        sm90_views = (
+            self._create_nvfp4_sm90_experts(
+                layer, hidden_size, intermediate_size_per_partition
+            )
+            if moe_runner_backend.is_nvfp4_w4a16_sm90()
+            else {}
+        )
 
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                num_shards * intermediate_size_per_partition,
-                # 2 fp4 items are packed in the input dimension
-                hidden_size // 2,
-                dtype=weight_dtype,
+            data=(
+                sm90_views["w13_weight"]
+                if sm90_views
+                else torch.empty(
+                    layer.num_local_experts,
+                    num_shards * intermediate_size_per_partition,
+                    # 2 fp4 items are packed in the input dimension
+                    hidden_size // 2,
+                    dtype=weight_dtype,
+                )
             ),
             input_dim=1,
             output_dim=2,
@@ -2574,12 +2642,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 2
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                hidden_size,
-                # 2 fp4 items are packed in the input dimension
-                intermediate_size_per_partition // 2,
-                dtype=weight_dtype,
+            data=(
+                sm90_views["w2_weight"]
+                if sm90_views
+                else torch.empty(
+                    layer.num_local_experts,
+                    hidden_size,
+                    # 2 fp4 items are packed in the input dimension
+                    intermediate_size_per_partition // 2,
+                    dtype=weight_dtype,
+                )
             ),
             input_dim=1,
             output_dim=2,
@@ -2588,11 +2660,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                num_shards * intermediate_size_per_partition,
-                hidden_size // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
+            data=(
+                sm90_views["w13_weight_scale"]
+                if sm90_views
+                else torch.empty(
+                    layer.num_local_experts,
+                    num_shards * intermediate_size_per_partition,
+                    hidden_size // self.quant_config.group_size,
+                    dtype=weight_scale_dtype,
+                )
             ),
             input_dim=1,
             output_dim=2,
@@ -2607,6 +2683,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_megamoe()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_lora_marlin()
+            or moe_runner_backend.is_nvfp4_w4a16_sm90()
             or moe_runner_backend.is_auto()
         )
         if skip_swizzled_blockscales:
@@ -2617,11 +2694,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                layer.num_local_experts,
-                hidden_size,
-                intermediate_size_per_partition // self.quant_config.group_size,
-                dtype=weight_scale_dtype,
+            data=(
+                sm90_views["w2_weight_scale"]
+                if sm90_views
+                else torch.empty(
+                    layer.num_local_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.quant_config.group_size,
+                    dtype=weight_scale_dtype,
+                )
             ),
             input_dim=1,
             output_dim=2,
@@ -2787,6 +2868,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         if moe_runner_backend.is_lora_marlin():
             moe_runner_backend = MoeRunnerBackend.MARLIN
+        if moe_runner_backend.is_nvfp4_w4a16_sm90():
+            self._repack_for_nvfp4_w4a16_sm90(layer)
+            return
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -3153,6 +3237,106 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
+    def _repack_for_nvfp4_w4a16_sm90(self, layer: torch.nn.Module) -> None:
+        from sglang.kernels.ops.quantization.nvfp4_sm90_repack import (
+            repack_modelopt_nvfp4_moe_for_sm90,
+        )
+
+        _check_nvfp4_sm90_runner_config(layer.moe_runner_config)
+        if layer.params_dtype != torch.bfloat16:
+            raise ValueError(
+                "--moe-runner-backend nvfp4_w4a16_sm90 needs bfloat16 activations."
+            )
+        w13, w13_scale, w2, w2_scale = (
+            getattr(layer, name).data for name in _NVFP4_SM90_CHECKPOINT_PARAMS
+        )
+        if layer.nvfp4_sm90_experts is not None:
+            # The loader wrote into views of the repacked buffers
+            # (_nvfp4_sm90_checkpoint_views), so repack from one layer's copy.
+            w13, w13_scale, w2, w2_scale = (
+                t.clone() for t in (w13, w13_scale, w2, w2_scale)
+            )
+        layer.nvfp4_sm90_experts = repack_modelopt_nvfp4_moe_for_sm90(
+            w13,
+            w13_scale,
+            layer.w13_weight_scale_2.data,
+            w2,
+            w2_scale,
+            layer.w2_weight_scale_2.data,
+            out=layer.nvfp4_sm90_experts,
+        )
+        # The runner reads only the repacked copy, which has the checkpoint's size.
+        for name in _NVFP4_SM90_CHECKPOINT_PARAMS:
+            param = getattr(layer, name)
+            param.data = param.data.new_empty(0)
+
+    def _create_nvfp4_sm90_experts(
+        self, layer: torch.nn.Module, hidden_size: int, intermediate_size: int
+    ) -> dict:
+        """Allocate the repacked experts before any checkpoint-layout tensor and
+        return the four checkpoint-layout parameters' data as views of them. The
+        repacked layout holds exactly the checkpoint's codes and block scales, so
+        the loader writes into the bytes the kernel later reads. Nothing is
+        allocated and freed in between, so a model's later layers cannot split
+        freed segments that the KV pool would otherwise get."""
+        from sglang.kernels.ops.quantization.nvfp4_sm90_repack import (
+            Nvfp4Sm90Experts,
+        )
+
+        E, H, I = layer.num_local_experts, hidden_size, intermediate_size
+        group = self.quant_config.group_size
+        layer.nvfp4_sm90_checkpoint_layout = {
+            "w13_weight": (torch.Size((E, 2 * I, H // 2)), torch.uint8),
+            "w13_weight_scale": (
+                torch.Size((E, 2 * I, H // group)),
+                torch.float8_e4m3fn,
+            ),
+            "w2_weight": (torch.Size((E, H, I // 2)), torch.uint8),
+            "w2_weight_scale": (
+                torch.Size((E, H, I // group)),
+                torch.float8_e4m3fn,
+            ),
+        }
+        layer.nvfp4_sm90_experts = None
+        if H % 256 or I % 128 or group != 16 or not layer.moe_runner_config.is_gated:
+            return {}  # the repack refuses these with a clear error
+        layer.nvfp4_sm90_experts = Nvfp4Sm90Experts(
+            w13=torch.empty((E, 2 * I // 256, H // 64, 16, 576), dtype=torch.uint8),
+            w2=torch.empty((E, H // 256, I // 64, 16, 576), dtype=torch.uint8),
+            gs13=torch.empty(E, dtype=torch.float32),
+            gs2=torch.empty(E, dtype=torch.float32),
+            hidden=H,
+            intermediate=I,
+        )
+        return self._nvfp4_sm90_checkpoint_views(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        backend = getattr(self, "_moe_runner_backend", get_moe_runner_backend())
+        if not backend.is_nvfp4_w4a16_sm90():
+            return
+        if layer.nvfp4_sm90_experts is not None:
+            for name, view in self._nvfp4_sm90_checkpoint_views(layer).items():
+                getattr(layer, name).data = view
+
+    @staticmethod
+    def _nvfp4_sm90_checkpoint_views(layer: torch.nn.Module) -> dict:
+        experts = layer.nvfp4_sm90_experts
+        flat = {
+            "w13": experts.w13.view(-1),
+            "w2": experts.w2.view(-1),
+        }
+        offset = {"w13": 0, "w2": 0}
+        views = {}
+        for name, (shape, dtype) in layer.nvfp4_sm90_checkpoint_layout.items():
+            key = name.split("_")[0]
+            numel = shape.numel() * dtype.itemsize
+            views[name] = (
+                flat[key][offset[key] : offset[key] + numel].view(dtype).view(shape)
+            )
+            offset[key] += numel
+        assert offset == {k: v.numel() for k, v in flat.items()}
+        return views
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Only weights and block scales follow the kernel's physical row order;
@@ -3285,6 +3469,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
             )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if moe_runner_backend.is_nvfp4_w4a16_sm90():
+            from sglang.srt.layers.moe.moe_runner.nvfp4_w4a16_sm90 import (
+                Nvfp4W4a16Sm90MoeQuantInfo,
+            )
+
+            quant_info = Nvfp4W4a16Sm90MoeQuantInfo(experts=layer.nvfp4_sm90_experts)
             return self.runner.run(dispatch_output, quant_info)
 
         if moe_runner_backend.is_marlin():
