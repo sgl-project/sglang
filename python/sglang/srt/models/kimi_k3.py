@@ -122,6 +122,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    resolve_kda_conv_params_dtype,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
@@ -2219,7 +2220,7 @@ class KimiK3DeltaAttention(nn.Module):
             input_size=self.conv_size,
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=resolve_kda_conv_params_dtype(),
             parallel_group=self.head_group,
             prefix=f"{prefix}.qkv_conv1d",
         )
