@@ -229,6 +229,133 @@ class Qwen2MoeMLP(nn.Module):
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
 
+    def _can_use_silu_block_fp8_quant_fusion(self, gate_up: torch.Tensor) -> bool:
+        if (
+            not _is_cuda
+            or envs.SGLANG_DISABLE_SILU_BLOCK_FP8_QUANT_FUSION.get()
+            or torch.compiler.is_compiling()
+            or gate_up.dtype != torch.bfloat16
+            or gate_up.ndim != 2
+            or gate_up.shape[0] <= 0
+            or not gate_up.is_contiguous()
+            or gate_up.data_ptr() % 16 != 0
+        ):
+            return False
+        half_dim = gate_up.shape[1] // 2
+        if not (256 <= half_dim <= 8192 and half_dim % 256 == 0):
+            return False
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.runtime_context import get_forward, get_lora
+
+        if is_batch_invariant_mode_enabled() or get_forward().sp_active:
+            return False
+        try:
+            deterministic = get_exec().deterministic
+            if (
+                deterministic.enable_deterministic_inference
+                or deterministic.rl_on_policy_target is not None
+            ):
+                return False
+        except ValueError:
+            pass
+        try:
+            if get_lora().enable_lora:
+                return False
+        except ValueError:
+            pass
+        cached = getattr(self, "_block_fp8_down_eligible", None)
+        if cached is None:
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+            from sglang.srt.layers.quantization.fp8_utils import (
+                _deepgemm_block_fp8_supported,
+                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            )
+
+            qm = getattr(self.down_proj, "quant_method", None)
+            weight = getattr(self.down_proj, "weight", None)
+            cached = (
+                not hasattr(self.down_proj, "base_layer")
+                and isinstance(qm, Fp8LinearMethod)
+                and weight is not None
+                and weight.ndim == 2
+                and qm.block_quant
+                and not qm.use_marlin
+                and not qm.use_mxfp8
+                and not qm.block_fp8_as_mxfp8
+                and not qm.use_npu_block_fp8
+                and qm.weight_block_size is not None
+                and tuple(qm.weight_block_size) == (128, 128)
+                and qm.w8a8_block_fp8_linear
+                is deepgemm_w8a8_block_fp8_linear_with_fallback
+            )
+            if cached:
+                deepgemm_ok = _deepgemm_block_fp8_supported(
+                    weight.shape, qm.weight_block_size, torch.bfloat16
+                )
+                # SM100 DeepGEMM requires packed int32 UE8M0 scales (num_groups % 4 == 0).
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not (
+                    deepgemm_ok and (half_dim // 128) % 4 == 0
+                ):
+                    cached = False
+                else:
+                    self._block_fp8_down_act_ue8m0 = (
+                        isinstance(qm.quant_config, Fp8Config)
+                        and qm.quant_config.scale_fmt == "ue8m0"
+                    )
+                    self._block_fp8_down_deepgemm_ok = deepgemm_ok
+            self._block_fp8_down_eligible = cached
+        return cached
+
+    def _silu_and_mul_block_fp8_quant(
+        self, gate_up: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+        )
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.quantization.fp8_utils import _use_fp8_block_gemv
+
+        m, full_dim = gate_up.shape
+        half_dim = full_dim // 2
+        fp8_out = gate_up.new_empty((m, half_dim), dtype=torch.float8_e4m3fn)
+        use_gemv = _use_fp8_block_gemv(
+            fp8_out,
+            self.down_proj.weight,
+            self.down_proj.weight_scale_inv,
+            [128, 128],
+        )
+        if use_gemv or not self._block_fp8_down_deepgemm_ok:
+            scale_ue8m0 = self._block_fp8_down_act_ue8m0
+            transposed = False
+        elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            scale_ue8m0 = True
+            transposed = True
+        else:
+            scale_ue8m0 = self._block_fp8_down_act_ue8m0
+            transposed = not scale_ue8m0
+        scale = create_per_token_group_quant_fp8_output_scale(
+            x_shape=(m, half_dim),
+            device=gate_up.device,
+            group_size=128,
+            column_major_scales=transposed,
+            scale_tma_aligned=transposed,
+            scale_ue8m0=scale_ue8m0,
+        )
+        silu_and_mul_contig_post_quant(
+            input=gate_up,
+            output=fp8_out,
+            output_scale=scale,
+            quant_group_size=128,
+            scale_ue8m0=scale_ue8m0,
+            transposed=transposed,
+            round_bf16=True,
+        )
+        return fp8_out, scale
+
     def forward(
         self,
         x,
@@ -236,6 +363,9 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if can_run_silu_fp4_quant_fusion(self, gate_up):
             x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))
+            return x
+        if self._can_use_silu_block_fp8_quant_fusion(gate_up):
+            x, _ = self.down_proj(self._silu_and_mul_block_fp8_quant(gate_up))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
