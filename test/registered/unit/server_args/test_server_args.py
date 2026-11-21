@@ -265,6 +265,27 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                     ("quark_mxfp4", "triton", 0.72, False),
                 )
 
+    def test_hopper_nvfp4_attention_backend_default(self):
+        self.assertEqual(
+            self.resolve(platform="hopper").attention_backend, "trtllm_mha"
+        )
+        for options in (
+            {"platform": "blackwell"},
+            {"platform": "hopper", "checkpoint": None},
+            {"platform": "hopper", "checkpoint": "unquant"},
+            {"platform": "hopper", "attention_backend": "fa3"},
+            {"platform": "hopper", "prefill_attention_backend": "fa3"},
+            {"platform": "hopper", "decode_attention_backend": "fa3"},
+            {"platform": "hopper", "attn_cp_size": 2},
+            {"platform": "hopper", "enable_deterministic_inference": True},
+            {"platform": "hopper", "speculative_eagle_topk": 4},
+            {"platform": "hopper", "page_size": 1},
+        ):
+            with self.subTest(options=options):
+                self.assertNotEqual(
+                    self.resolve(**options).attention_backend, "trtllm_mha"
+                )
+
     def test_megamoe_conditions_and_opt_out(self):
         self.assertTrue(self.resolve().enable_megamoe_for_layernorm_sp)
         self.assertTrue(
@@ -421,6 +442,12 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
                         self.assertEqual(
                             resolution_result(args, "speculative_num_draft_tokens"), 8
                         )
+                        if platform == "hopper":
+                            self.assertEqual(
+                                resolution_result(args, "attention_backend"),
+                                "trtllm_mha",
+                            )
+                            self.assertEqual(resolution_result(args, "page_size"), 64)
                         self.assertEqual(
                             resolution_result(args, "enable_megamoe_for_layernorm_sp"),
                             platform == "blackwell",
