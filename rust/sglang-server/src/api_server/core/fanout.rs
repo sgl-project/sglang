@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -35,6 +36,14 @@ pub(crate) trait ControlTarget: Send + Sync {
 
     /// Deliver one request built by `build` and collect this target's replies.
     fn control<'a>(&'a self, build: &'a RequestBuilder<'a>) -> BoxFuture<'a, Vec<RankReply>>;
+
+    /// Hand one cross-rank weight update, as the coordinator route's JSON
+    /// body, to the coordinator on this target's listener, and return the
+    /// merged outcome's JSON. Only DP rank 0's listener coordinates; a
+    /// target with no coordinator route is unavailable.
+    fn coordinate_weight_update(&self, _body: Bytes) -> BoxFuture<'_, Result<Bytes, CoreError>> {
+        Box::pin(async { Err(CoreError::Unavailable) })
+    }
 }
 
 /// Every rank's reply to one control request, in DP-rank order.
@@ -50,6 +59,29 @@ pub(crate) async fn fan_out(
     targets: &[Arc<dyn ControlTarget>],
     build: &RequestBuilder<'_>,
 ) -> Replies {
+    fan_out_bounded(local, local_call, targets, build, None).await
+}
+
+/// [`fan_out`], with each target's replies bounded by `target_deadline`: a
+/// target that has not answered by then fails each of its ranks as
+/// `DeadlineExceeded`. The local call is not bounded.
+pub(crate) async fn fan_out_within(
+    local: RankId,
+    local_call: impl Future<Output = Result<Bytes, CoreError>>,
+    targets: &[Arc<dyn ControlTarget>],
+    build: &RequestBuilder<'_>,
+    target_deadline: Duration,
+) -> Replies {
+    fan_out_bounded(local, local_call, targets, build, Some(target_deadline)).await
+}
+
+async fn fan_out_bounded(
+    local: RankId,
+    local_call: impl Future<Output = Result<Bytes, CoreError>>,
+    targets: &[Arc<dyn ControlTarget>],
+    build: &RequestBuilder<'_>,
+    target_deadline: Option<Duration>,
+) -> Replies {
     let local_call = async move {
         vec![RankReply {
             rank: local,
@@ -58,7 +90,22 @@ pub(crate) async fn fan_out(
     };
     let target_calls = futures::future::join_all(targets.iter().map(|target| async move {
         let expected = target.ranks();
-        let mut replies = target.control(build).await;
+        let mut replies = match target_deadline {
+            None => target.control(build).await,
+            Some(deadline) => tokio::time::timeout(deadline, target.control(build))
+                .await
+                .unwrap_or_else(|_| {
+                    expected
+                        .iter()
+                        .map(|&rank| RankReply {
+                            rank,
+                            outcome: Err(CoreError::DeadlineExceeded(format!(
+                                "its listener did not answer within {deadline:?}"
+                            ))),
+                        })
+                        .collect()
+                }),
+        };
         // A target that answers for fewer ranks than it claims would otherwise
         // make the operation look like it reached fewer ranks than exist.
         for &rank in expected {

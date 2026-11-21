@@ -18,9 +18,10 @@ use sglang_api_types::api::v1 as api;
 
 use super::app::AppState;
 use super::native_api::native_error;
-use crate::api_server::core::CoreError;
+use crate::api_server::core::{CoreError, WEIGHT_UPDATE_COORDINATOR_PATH};
 use crate::api_server::handlers::{
     DiskUpdateOutcome, LORA_DISABLED, PluginUpdateOutcome, WeightGroupOutcome, WeightUpdateOutcome,
+    coordinated_route,
 };
 use crate::api_server::http::auth::DeclaredRoute;
 use crate::message::io_struct::{
@@ -77,6 +78,39 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
             "/get_remote_instance_transfer_engine_info",
             get(get_remote_instance_transfer_engine_info),
         )
+        // Listener-to-listener: another DP rank's listener hands DP rank 0's
+        // a weight update to run on every rank (see `core::peer`).
+        .declared_route(
+            WEIGHT_UPDATE_COORDINATOR_PATH,
+            post(coordinate_weight_update),
+        )
+}
+
+/// `POST /internal/weight_update` — a cross-rank weight update another DP
+/// rank's listener forwarded, as JSON; the reply is the merged outcome's
+/// JSON. Errors are plain text with their category's status, which the
+/// forwarding side maps back (`core::peer`).
+async fn coordinate_weight_update(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(route) = coordinated_route(&body) else {
+        return (StatusCode::BAD_REQUEST, "not a cross-rank weight update").into_response();
+    };
+    // As the peer relay does: without an admin key the forced admin routes
+    // refuse, so this route must refuse their updates too.
+    if state.server_args.api_keys.admin_api_key.is_none() && super::auth::is_admin_force(route) {
+        return super::auth::admin_key_missing();
+    }
+    match state.core.coordinate_forwarded_weight_update(body).await {
+        Ok(reply) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            reply,
+        )
+            .into_response(),
+        Err(error) => (error.http_status(), error.to_string()).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -953,5 +987,147 @@ mod tests {
             )))
             .unwrap();
         assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    /// The coordinator route between two real listeners: an update sent to
+    /// DP rank 1's listener runs on DP rank 0's with the origin's defaults
+    /// filled, and answers its outcome; a failure keeps its category across
+    /// the hop; any listener but DP rank 0's answers 421; and the route takes
+    /// the peer relay's key, the admin key once one is configured.
+    #[tokio::test]
+    async fn the_coordinator_route_runs_forwarded_updates_on_dp_rank_0_only() {
+        use std::future::IntoFuture;
+
+        use crate::api_server::core::{CoreErrorKind, peer_endpoints};
+        use crate::message::config::{ApiKeys, DeploymentInfo, RustServerEndpoint};
+
+        let keys = ApiKeys::new(Some("sk-api".into()), Some("sk-admin".into()));
+        let serve = |dp_rank: u32,
+                     load_format: Option<&str>,
+                     endpoints: Vec<RustServerEndpoint>| {
+            let server_args = Arc::new(ServerArgs {
+                load_format: load_format.map(Into::into),
+                api_keys: keys.clone(),
+                deployment_info: DeploymentInfo {
+                    dp_size: 2,
+                    dp_rank: Some(dp_rank),
+                    rust_server_endpoints: endpoints,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let (abort_tx, _abort_rx) = flume::unbounded();
+            let core = CoreHandle::new(
+                intake_tx,
+                abort_tx,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    multimodal: false,
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
+                    mm_limits: Default::default(),
+                    peer_endpoints: peer_endpoints(&server_args.deployment_info, dp_rank, &keys)
+                        .unwrap(),
+                    metadata: CoreMetadata::from(server_args.as_ref()),
+                },
+            );
+            let state = Arc::new(AppState {
+                core: core.clone(),
+                generation_policy: GenerationPolicy::from(server_args.as_ref()),
+                server_args,
+                chat_formatter: None,
+                generate_hook: None,
+                openai_chat: None,
+            });
+            let app = super::super::auth::apply(routes().with_state(state), &keys);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(axum::serve(listener, app).into_future());
+                (core, url, intake_rx)
+            }
+        };
+        let (_rank0, url0, intake0) = serve(0, None, Vec::new()).await;
+        let (rank1, url1, intake1) = serve(
+            1,
+            Some("safetensors"),
+            vec![RustServerEndpoint {
+                dp_rank: 0,
+                endpoint: url0.clone(),
+            }],
+        )
+        .await;
+
+        let update = DiskWeightUpdate {
+            model_path: "/models/new".into(),
+            ..Default::default()
+        };
+        let (outcome, items) = tokio::join!(rank1.update_weights_from_disk(update), async {
+            let TmEvent::Intake { request, admission } = intake0.recv_async().await.unwrap() else {
+                panic!("expected a fresh intake request");
+            };
+            assert!(admission.try_accept());
+            let crate::message::request::RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            let rmpv::Value::Array(items) =
+                rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+            else {
+                panic!("positional wire");
+            };
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(&serde_json::json!({
+                        "success": true, "message": "applied", "num_paused_requests": 3
+                    }))
+                    .unwrap(),
+                )))
+                .unwrap();
+            items
+        });
+        assert_eq!(items[3].as_str(), Some("/models/new"));
+        assert_eq!(
+            items[4].as_str(),
+            Some("safetensors"),
+            "the origin's launch load_format"
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            DiskUpdateOutcome {
+                success: true,
+                message: "applied".into(),
+                num_paused_requests: vec![3],
+            }
+        );
+        assert!(
+            intake1.try_recv().is_err(),
+            "rank 1 has no peer to relay to here"
+        );
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let post = |url: &str, key: &str| {
+            client
+                .post(format!("{url}{WEIGHT_UPDATE_COORDINATOR_PATH}"))
+                .bearer_auth(key)
+                .body(r#"{"kind": "end_weight_update"}"#)
+                .send()
+        };
+        let misdirected = post(&url1, "sk-admin").await.unwrap();
+        assert_eq!(misdirected.status().as_u16(), 421);
+        let unauthorized = post(&url0, "sk-api").await.unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert!(intake0.try_recv().is_err() && intake1.try_recv().is_err());
+
+        // DP rank 0's scheduler is gone: its 503 is unavailable on rank 1 too.
+        drop(intake0);
+        let error = rank1.end_weight_update().await.unwrap_err();
+        assert_eq!(error.kind(), CoreErrorKind::Unavailable, "{error}");
     }
 }

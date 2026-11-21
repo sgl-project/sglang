@@ -588,7 +588,7 @@ impl CoreHandle {
         }
         let effect = RelayedEffect::for_tag(&forwarded.tag);
         // A weight update holds this listener too while its scheduler runs
-        // it (the origin holds its own), released once the reply is in.
+        // it (the coordinator holds its own), released once the reply is in.
         let hold = match effect {
             RelayedEffect::WeightUpdate => Some(self.inner.frontend.hold_for_update().await),
             _ => None,

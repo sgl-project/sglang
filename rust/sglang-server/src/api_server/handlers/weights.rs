@@ -1,8 +1,9 @@
 //! Weight management: process-group setup, remote-instance sends, parameter
 //! reads, and the weight updates. An update holds the frontend's update lock
 //! on every listener while it runs (`FrontendState::hold_for_update`): the
-//! origin listener holds its own, and the peer relay holds each other
-//! listener's around its scheduler's copy.
+//! listener running it holds its own, and the peer relay holds each other
+//! listener's around its scheduler's copy. The updates that reach every DP
+//! rank run on DP rank 0's listener (see `weight_coordinator`).
 
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
@@ -18,6 +19,7 @@ use crate::message::io_struct::{
 use super::generate::AbortEnding;
 
 use super::handle::CoreHandle;
+use super::weight_coordinator::{CrossRankOutcome, CrossRankUpdate, PEER_REPLY_DEADLINE};
 use crate::api_server::core::CoreError;
 use crate::api_server::core::fanout::{self, RequestBuilder};
 
@@ -150,8 +152,10 @@ fn check_selector(selector: &str) -> Result<(), CoreError> {
 impl CoreHandle {
     /// Run one weight update under this listener's update hold, as Python's
     /// `_weight_update_session_replies`: aborts first when asked (Python's
-    /// `abort_request(abort_all=True)`), then nothing is admitted here until
-    /// the scheduler ranks have answered.
+    /// `abort_request(abort_all=True)`, which reaches every DP rank), then
+    /// nothing is admitted here until the scheduler ranks have answered. A
+    /// peer that has not answered within [`PEER_REPLY_DEADLINE`] fails the
+    /// update; ranks that applied it keep it.
     async fn weight_update<T: serde::de::DeserializeOwned>(
         &self,
         what: &str,
@@ -160,11 +164,59 @@ impl CoreHandle {
     ) -> Result<Vec<T>, CoreError> {
         if abort_all_requests {
             self.abort(None, AbortEnding::AbortFinishReason);
+            self.abort_peers(String::new(), true).await;
         }
         let hold = self.inner.frontend.hold_for_update().await;
-        let outcomes = self.control(build).await.decode::<T>(what);
+        let outcomes = fanout::fan_out_within(
+            self.inner.dp_rank,
+            self.submit_control_req(build()),
+            &self.inner.peer_endpoints,
+            build,
+            PEER_REPLY_DEADLINE,
+        )
+        .await
+        .decode::<T>(what);
         drop(hold);
         outcomes
+    }
+
+    /// Run a cross-rank weight update on every DP rank; the coordinator's
+    /// side of [`CoreHandle::cross_rank_update`].
+    pub(super) async fn apply_cross_rank_update(
+        &self,
+        update: CrossRankUpdate,
+    ) -> Result<CrossRankOutcome, CoreError> {
+        match update {
+            CrossRankUpdate::UpdateWeightsFromDisk { update } => self
+                .apply_disk_update(update)
+                .await
+                .map(|outcome| CrossRankOutcome::UpdateWeightsFromDisk { outcome }),
+            CrossRankUpdate::BeginWeightUpdate { selector } => {
+                let outcomes: Vec<WeightUpdateOutcome> = self
+                    .weight_update("begin-weight-update", false, &|| {
+                        ControlRequest::BeginWeightUpdateReqInput(BeginWeightUpdateReqInput::new(
+                            Rid::new().to_string(),
+                            selector.clone(),
+                        ))
+                    })
+                    .await?;
+                Ok(CrossRankOutcome::Session {
+                    outcome: merge_update(&outcomes),
+                })
+            }
+            CrossRankUpdate::EndWeightUpdate => {
+                let outcomes: Vec<WeightUpdateOutcome> = self
+                    .weight_update("end-weight-update", false, &|| {
+                        ControlRequest::EndWeightUpdateReqInput(EndWeightUpdateReqInput::new(
+                            Rid::new().to_string(),
+                        ))
+                    })
+                    .await?;
+                Ok(CrossRankOutcome::Session {
+                    outcome: merge_update(&outcomes),
+                })
+            }
+        }
     }
 
     /// Reload the weights from disk on every DP rank. `load_format` falls
@@ -183,6 +235,15 @@ impl CoreHandle {
         if update.load_format.is_none() {
             update.load_format = self.inner.metadata.load_format.clone();
         }
+        self.cross_rank_update(CrossRankUpdate::UpdateWeightsFromDisk { update })
+            .await?
+            .into_disk()
+    }
+
+    async fn apply_disk_update(
+        &self,
+        update: DiskWeightUpdate,
+    ) -> Result<DiskUpdateOutcome, CoreError> {
         let abort_all = update.abort_all_requests;
         let outcomes: Vec<DiskUpdateOutput> = self
             .weight_update("update-weights-from-disk", abort_all, &|| {
@@ -288,27 +349,16 @@ impl CoreHandle {
         selector: String,
     ) -> Result<WeightUpdateOutcome, CoreError> {
         check_selector(&selector)?;
-        let outcomes: Vec<WeightUpdateOutcome> = self
-            .weight_update("begin-weight-update", false, &|| {
-                ControlRequest::BeginWeightUpdateReqInput(BeginWeightUpdateReqInput::new(
-                    Rid::new().to_string(),
-                    selector.clone(),
-                ))
-            })
-            .await?;
-        Ok(merge_update(&outcomes))
+        self.cross_rank_update(CrossRankUpdate::BeginWeightUpdate { selector })
+            .await?
+            .into_session()
     }
 
     /// Close the session opened by [`CoreHandle::begin_weight_update`].
     pub(crate) async fn end_weight_update(&self) -> Result<WeightUpdateOutcome, CoreError> {
-        let outcomes: Vec<WeightUpdateOutcome> = self
-            .weight_update("end-weight-update", false, &|| {
-                ControlRequest::EndWeightUpdateReqInput(EndWeightUpdateReqInput::new(
-                    Rid::new().to_string(),
-                ))
-            })
-            .await?;
-        Ok(merge_update(&outcomes))
+        self.cross_rank_update(CrossRankUpdate::EndWeightUpdate)
+            .await?
+            .into_session()
     }
 
     /// Run the platform's named weight-update handler; merged as Python's
@@ -411,7 +461,7 @@ struct DiskUpdateOutput {
 
 /// `/update_weights_from_disk`'s merged outcome: Python's
 /// `{success, message, num_paused_requests}`, the count per DP rank.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DiskUpdateOutcome {
     pub(crate) success: bool,
     pub(crate) message: String,
@@ -420,7 +470,7 @@ pub(crate) struct DiskUpdateOutcome {
 
 /// The `{success, message}` output of the other weight updates and the
 /// session calls, on the wire and merged.
-#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub(crate) struct WeightUpdateOutcome {
     pub(crate) success: bool,
     #[serde(default)]

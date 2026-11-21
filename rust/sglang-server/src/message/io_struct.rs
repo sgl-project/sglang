@@ -639,8 +639,9 @@ impl Serialize for WireBytes {
 
 /// The `/update_weights_from_disk` fields; the owned form of
 /// `api::UpdateWeightsFromDiskRequest` after the frontend resolved
-/// `load_format` from the launch.
-#[derive(Debug, Clone, Default)]
+/// `load_format` from the launch. Serialized as JSON when a listener hands
+/// the update to DP rank 0's to coordinate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiskWeightUpdate {
     pub model_path: String,
     pub load_format: Option<String>,

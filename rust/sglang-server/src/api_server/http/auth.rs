@@ -310,6 +310,11 @@ mod tests {
             level(crate::api_server::core::FORWARD_PEER_PATH),
             AuthLevel::AdminOptional
         );
+        assert_eq!(
+            level(crate::api_server::core::WEIGHT_UPDATE_COORDINATOR_PATH),
+            AuthLevel::AdminOptional,
+            "the same level as the peer relay"
+        );
         assert_eq!(level("/nope"), AuthLevel::Normal);
         // A declared template serves its parameterized paths at its level.
         assert_eq!(level("/dumper/status"), AuthLevel::AdminForce);
