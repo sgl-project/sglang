@@ -56,6 +56,12 @@ logger = logging.getLogger(__name__)
 SWA_MODEL_TYPES = frozenset({"granite_swa", "granitemoe_swa"})
 
 
+def get_attention_sliding_window_size(config: PretrainedConfig) -> int:
+    # HF `sliding_window` counts the current token; SGLang's window size counts
+    # only the tokens before it, hence `- 1` (matching gpt_oss).
+    return config.sliding_window - 1
+
+
 def granite_layer_attn_params(
     config: PretrainedConfig, layer_id: int
 ) -> Tuple[int, float, bool]:
@@ -63,9 +69,8 @@ def granite_layer_attn_params(
     if config.model_type not in SWA_MODEL_TYPES:
         return -1, config.rope_parameters["rope_theta"], False
 
-    # SGLang's window bound is exclusive, hence `- 1` (matching gpt_oss).
     sliding_window_size = (
-        config.sliding_window - 1
+        get_attention_sliding_window_size(config)
         if config.layer_types[layer_id] == "sliding_attention"
         else -1
     )
@@ -548,7 +553,9 @@ class GraniteForCausalLM(nn.Module):
 
 
 class GraniteSWAForCausalLM(GraniteForCausalLM):
-    pass
+    def get_attention_sliding_window_size(self) -> int:
+        # Must match the layers' window; the runner bounds SWA KV reads by it.
+        return get_attention_sliding_window_size(self.config)
 
 
 EntryClass = [GraniteForCausalLM, GraniteSWAForCausalLM]
