@@ -8,7 +8,9 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     IncLockRefResult,
+    InitLoadBackParams,
     InsertResult,
     MatchResult,
 )
@@ -176,6 +178,88 @@ def test_external_slots_on_a_shared_memory_reclaim_the_load_demand(
     cache.evict_for_alloc.assert_called_once_with(
         KVDemand(full_tokens=8, window_tokens=window)
     )
+
+
+@pytest.mark.parametrize(
+    ("local_hit", "peer_lost_prefix"),
+    [(1, False), (2, True), (2, False)],
+    ids=["local-prefix-loss", "peer-prefix-loss", "resident-prefix"],
+)
+def test_external_load_declines_if_any_rank_lost_its_prefix(
+    cache_class, local_hit, peer_lost_prefix
+):
+    cache, req, flow = _cache_and_request(cache_class, swa_enabled=False)
+    flow.load = None
+    flow.local_hit_tokens = 2
+    flow.lookup = SimpleNamespace(request_id=req.rid, lock_start=2)
+    req.cache_request_handle = CacheRequestHandle(req.rid, 0)
+    req.storage_hit_length = 6
+    req.host_hit_length = 8 - local_hit
+    req.matched_window_host_hit_lengths = {FIRST: 6}
+    req.mamba_host_hit_length = 1
+    cache.prefetch_loaded_tokens_by_reqid = {req.cache_request_handle: 6}
+    cache.prefetch_loaded_storage_start_by_reqid = {req.cache_request_handle: 2}
+    cache._mamba_component = None
+    cache._forward_stream = None
+    cache.inc_lock_ref = mock.Mock(return_value=IncLockRefResult(node_id=42))
+    cache.dec_lock_ref = mock.Mock()
+    device_indices = torch.arange(6)
+    cache._allocate_external_slots = mock.Mock(return_value=device_indices)
+    cache.token_to_kv_pool_allocator = mock.Mock()
+    cache.lmcache_connector = mock.Mock(chunk_size=2)
+    cache.lmcache_connector.prepare_load_on_stream.return_value = True
+
+    def reduce_validity(valid, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        if peer_lost_prefix:
+            valid.zero_()
+
+    cache.lmcache_connector.parallel_all_reduce.side_effect = reduce_validity
+    matched = MatchResult(
+        device_prefix_len=local_hit,
+        last_device_node=42,
+        last_host_node=42,
+        best_match_node=42,
+    )
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=matched):
+        loaded, _ = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=42, host_hit_length=req.host_hit_length, req=req
+            )
+        )
+
+    cache.lmcache_connector.parallel_all_reduce.assert_called_once()
+    if local_hit < flow.local_hit_tokens or peer_lost_prefix:
+        assert loaded == 0
+        cache.lmcache_connector.submit_load.assert_not_called()
+        assert req.rid not in cache._external_flows
+        cache.lmcache_connector.free_lookup_locks.assert_called_with(
+            req.rid, start=2, end=8
+        )
+        assert flow.anchor_node is None and flow.anchor_lock is None
+        cache.dec_lock_ref.assert_called_once_with(
+            42, IncLockRefResult(node_id=42).to_dec_params()
+        )
+        assert req.host_hit_length == req.storage_hit_length == 0
+        assert req.matched_window_host_hit_lengths == {}
+        assert req.mamba_host_hit_length == 0
+        assert req.cache_request_handle not in cache.prefetch_loaded_tokens_by_reqid
+        assert (
+            req.cache_request_handle not in cache.prefetch_loaded_storage_start_by_reqid
+        )
+        if local_hit < flow.local_hit_tokens:
+            cache._allocate_external_slots.assert_not_called()
+            cache.token_to_kv_pool_allocator.free.assert_not_called()
+        else:
+            freed = cache.token_to_kv_pool_allocator.free.call_args.args[0]
+            assert freed is device_indices
+    else:
+        assert loaded == req.host_hit_length == 6
+        assert cache._external_flows[req.rid] is flow
+        submitted = cache.lmcache_connector.submit_load.call_args.kwargs
+        assert submitted["local_hit_tokens"] == 2
+        cache.token_to_kv_pool_allocator.free.assert_not_called()
+        cache.dec_lock_ref.assert_not_called()
 
 
 if __name__ == "__main__":
