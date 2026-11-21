@@ -1735,10 +1735,14 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
             buffers=MLASplitBuffers(
                 k=torch.empty((0, 1, 640), dtype=torch.bfloat16),
                 v=torch.empty((0, 1, 64), dtype=torch.bfloat16),
-                index_k=torch.empty((2, 0, index_page_size, 1, 128))
+                index_k=torch.empty(
+                    (2, 0, index_page_size, 1, 128), dtype=torch.bfloat16
+                )
                 if indexer
                 else None,
-                index_scales=torch.empty((2, 0, index_page_size, 1))
+                index_scales=torch.empty(
+                    (2, 0, index_page_size, 1), dtype=torch.float32
+                )
                 if indexer
                 else None,
                 index_layer_indices=(0, 1) if indexer else (),

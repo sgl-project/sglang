@@ -466,12 +466,15 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         pool.v_buffer = [torch.empty(4, 8, 1, 1)]
         pool.dcp_size = 4
         pool.is_draft_worker = False
-        pool.dsa_kv_cache_store_fp8 = False
+        pool.dsa_kv_cache_store_c8 = False
         pool.index_head_dim = 2
         pool.page_size = 8
         pool.index_page_size = 8
         pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
+        pool.start_layer = 0
+        pool.layer_num = 1
+        pool.indexer_layer_ids = (0,)
 
         ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
         buffers = (
