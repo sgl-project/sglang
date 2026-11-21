@@ -3480,6 +3480,12 @@ class DeepseekSparseAttnBackend(
             # helpers keep them aligned); fall back to full-width compute if
             # they ever diverge.
             topk_length = None
+        if (
+            topk_length is not None
+            and self.dsa_index_topk is not None
+            and page_table_1.shape[-1] < self.dsa_index_topk
+        ):
+            topk_length = topk_length.clamp(max=page_table_1.shape[-1])
 
         if use_small_heads:
             o, _, _ = self._call_flash_mla_sparse_fwd_small_heads(
@@ -4839,7 +4845,14 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.attn_dcp_size > 1 and (not self.dsa_shards_index_k or dcp_partial):
+        if dcp_partial:
+            # The sharded indexer already returns this rank's compacted slots and
+            # their counts; remapping them as global slots selects the wrong KV.
+            seq_lens = metadata.dcp_topk_length[: page_table_1.shape[0]]
+            pad = page_table_1.shape[0] - seq_lens.shape[0]
+            if pad > 0:  # padded rows (DP / attention-TP padding) select nothing
+                seq_lens = torch.nn.functional.pad(seq_lens, (0, pad))
+        elif replicated_dcp:
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,

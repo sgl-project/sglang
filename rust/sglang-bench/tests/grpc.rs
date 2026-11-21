@@ -65,6 +65,7 @@ impl SglangService for Mock {
                             finish_reason: done.then_some(api::FinishReason {
                                 kind: Some(api::finish_reason::Kind::Length(api::FinishLength {
                                     length: Some(want as u64),
+                                    ignored_stop: None,
                                 })),
                             }),
                             ..Default::default()

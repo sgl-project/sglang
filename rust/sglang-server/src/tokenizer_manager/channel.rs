@@ -56,6 +56,12 @@ impl ToSchedulerTx {
     pub fn push_priority(&self, msg: SchedulerRequest) -> bool {
         self.priority_tx.send(msg).is_ok()
     }
+
+    /// The request ring, held weakly: a handle that reads its depth without
+    /// keeping it open.
+    pub fn downgrade(&self) -> flume::WeakSender<SchedulerRequest> {
+        self.tx.downgrade()
+    }
 }
 
 impl ToSchedulerRx {

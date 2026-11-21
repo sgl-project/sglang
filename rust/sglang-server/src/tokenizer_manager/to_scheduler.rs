@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
-use crate::message::request::{Request, RequestKind, SchedulerRequest};
+use crate::message::request::{GenerateRequest, Request, RequestKind, SchedulerRequest};
 use crate::message::response::ResponseItem;
+use crate::message::sampling::SamplingParams;
+use crate::message::types::OneOrMany;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
@@ -16,7 +18,7 @@ use crate::tokenizer_manager::to_scheduler_validation::{
 };
 use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 use crate::utils::{
-    error::Error,
+    error::{Error, QueueStage},
     fsm::{Event, RequestState, ValidationOutcome},
 };
 
@@ -170,6 +172,16 @@ impl Intake {
             self.request_states.remove(&req.rid),
             Some(RequestState::Aborted)
         ) {
+            // Back with its ids tokenized (and expanded, from the mm pool), its
+            // abort reports them once fitted to the context, as Python's does
+            // for a request aborted once tokenized. One still bound for the mm
+            // pool, or whose ids fail the checks, reports none.
+            if let (RequestState::PreSendValidating, RequestKind::Generate(g)) =
+                (&req.state, &mut req.kind)
+                && self.check_final_ids(g).is_ok()
+            {
+                g.report_prompt_token_ids();
+            }
             tracing::debug!(rid = %req.rid, "dropping request aborted");
             return;
         }
@@ -284,7 +296,9 @@ impl Intake {
                         }
                         Err(e) => {
                             let (err, mut req) = match e {
-                                flume::TrySendError::Full(req) => (Error::QueueFull, req),
+                                flume::TrySendError::Full(req) => {
+                                    (Error::QueueFull(QueueStage::Mm), req)
+                                }
                                 flume::TrySendError::Disconnected(req) => {
                                     (Error::Internal("mm worker pool gone".into()), req)
                                 }
@@ -321,8 +335,7 @@ impl Intake {
                 // a text request has no ids yet.
                 RequestState::PreSendValidating => {
                     if let RequestKind::Generate(g) = &mut req.kind
-                        && let Err(e) = validate_input_ids(g, self.limits.vocab_size)
-                            .and_then(|()| check_total_tokens(g, &self.limits))
+                        && let Err(e) = self.check_final_ids(g)
                     {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
@@ -362,26 +375,36 @@ impl Intake {
         }
     }
 
+    /// Check a request's final ids, as the scheduler will get them, and fit
+    /// them to the context.
+    fn check_final_ids(&self, g: &mut GenerateRequest) -> Result<(), Error> {
+        validate_input_ids(g, self.limits.vocab_size)
+            .and_then(|()| check_total_tokens(g, &self.limits))
+    }
+
     /// Register the response sink with the owning detok shard (by id) so the response
     /// has a home. Carries the per-request detok flags — `return_text_in_logprobs`
     /// (decode logprob text on this shard) and `no_stop_trim` (keep the matched
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
-            RequestKind::Generate(g) => (
-                g.return_text_in_logprobs.unwrap_or(false),
-                g.sampling_params.no_stop_trim,
-                g.sampling_params.skip_special_tokens,
-            ),
-            RequestKind::Control(_)
-            | RequestKind::Detokenize { .. }
-            | RequestKind::Tokenize { .. } => (
-                false, /* decode_logprob_text */
-                false, /* no_stop_trim */
-                true,  /* skip_special_tokens */
-            ),
-        };
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens, has_stop_strs) =
+            match &req.kind {
+                RequestKind::Generate(g) => (
+                    g.return_text_in_logprobs.unwrap_or(false),
+                    g.sampling_params.no_stop_trim,
+                    g.sampling_params.skip_special_tokens,
+                    has_stop_strings(&g.sampling_params),
+                ),
+                RequestKind::Control(_)
+                | RequestKind::Detokenize { .. }
+                | RequestKind::Tokenize { .. } => (
+                    false, /* decode_logprob_text */
+                    false, /* no_stop_trim */
+                    true,  /* skip_special_tokens */
+                    false, /* has_stop_strs */
+                ),
+            };
         self.senders
             .detok_for(&req.rid)
             .send(DetokMsg::Register {
@@ -390,6 +413,7 @@ impl Intake {
                 decode_logprob_text,
                 no_stop_trim,
                 skip_special_tokens,
+                has_stop_strs,
             })
             .is_ok()
     }
@@ -444,7 +468,7 @@ impl Intake {
         // Flume hands the request back on either failure.
         let (err, mut req) = match self.senders.tokenizer_tx.try_send(req) {
             Ok(()) => return true,
-            Err(flume::TrySendError::Full(req)) => (Error::QueueFull, req),
+            Err(flume::TrySendError::Full(req)) => (Error::QueueFull(QueueStage::Tokenizer), req),
             // Pool gone (workers exited).
             Err(flume::TrySendError::Disconnected(req)) => {
                 (Error::Internal("tokenizer pool gone".into()), req)
@@ -477,7 +501,7 @@ impl Intake {
             buffers: Vec::new(),
             pipeline_guard: req.pipeline_guard.take(),
         }) {
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
     }
 
@@ -550,9 +574,12 @@ impl Intake {
         // buffers out; the resulting values own their data, so no borrow
         // outlives a `fail(&mut req)`.
         let serialized = match &mut req.kind {
-            RequestKind::Generate(g) if g.already_tokenized() => g
-                .encode_header()
-                .map(|header| (header, g.take_buffers(), g.dispatch_finish_time.clone())),
+            RequestKind::Generate(g) if g.already_tokenized() => {
+                // Final here, and before the buffers take them.
+                g.report_prompt_token_ids();
+                g.encode_header()
+                    .map(|header| (header, g.take_buffers(), g.dispatch_finish_time.clone()))
+            }
             RequestKind::Generate(_) => Err(Error::Tokenize("empty input_ids".into())),
             _ => Err(Error::Internal(
                 "non-generate request reached push_to_channel".into(),
@@ -575,12 +602,26 @@ impl Intake {
             pipeline_guard: req.pipeline_guard.take(),
         }) {
             dispatch_finish_time.clear();
-            self.fail(&mut req, Error::QueueFull, true); // registered
+            self.fail(&mut req, Error::QueueFull(QueueStage::Scheduler), true); // registered
         }
         // On success the scheduler owns the request (response arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink. The P/D
         // pipeline guard moved onto the SchedulerRequest above.
     }
+}
+
+/// Whether a request has stop strings or regexes, before or after `normalize`
+/// moves them from the API aliases into `stop_strs` / `stop_regex_strs`.
+fn has_stop_strings(p: &SamplingParams) -> bool {
+    let set = |v: &Option<OneOrMany<String>>| match v {
+        Some(OneOrMany::One(s)) => !s.is_empty(),
+        Some(OneOrMany::Many(v)) => v.iter().any(|s| !s.is_empty()),
+        None => false,
+    };
+    set(&p.stop)
+        || set(&p.stop_regex)
+        || p.stop_strs.iter().any(|s| !s.is_empty())
+        || p.stop_regex_strs.iter().any(|s| !s.is_empty())
 }
 
 #[cfg(test)]

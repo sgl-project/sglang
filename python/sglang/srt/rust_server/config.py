@@ -50,7 +50,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
