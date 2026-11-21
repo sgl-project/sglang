@@ -3,7 +3,11 @@ import argparse
 
 import torch
 import triton
-from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
+from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    fused_experts as fused_experts_vllm,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 
 from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.distributed.parallel_state import (
@@ -35,37 +39,19 @@ def fused_moe_vllm_api(
     a2_scale=None,
     block_shape=None,
 ):
-    if block_shape is not None:
-        return fused_moe_vllm(
-            x,
-            w1,
-            w2,
-            input_gating,
-            topk,
-            renormalize=True,
-            inplace=True,
-            use_fp8_w8a8=use_fp8_w8a8,
+    topk_weights, topk_ids, _ = fused_topk(x, input_gating, topk, renormalize=True)
+    quant_config = None
+    if use_fp8_w8a8:
+        quant_config = fp8_w8a8_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
         )
-    else:
-        return fused_moe_vllm(
-            x,
-            w1,
-            w2,
-            input_gating,
-            topk,
-            renormalize=True,
-            inplace=True,
-            use_fp8_w8a8=use_fp8_w8a8,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-        )
+    return fused_experts_vllm(
+        x, w1, w2, topk_weights, topk_ids, quant_config=quant_config
+    )
 
 
 def fused_moe_sglang_api(
@@ -92,7 +78,8 @@ def fused_moe_sglang_api(
         w1,
         w2,
         topk_output,
-        moe_runner_config=MoeRunnerConfig(inplace=True),
+        # vLLM's fused_experts also allocates a separate output tensor.
+        moe_runner_config=MoeRunnerConfig(inplace=False),
         use_fp8_w8a8=use_fp8_w8a8,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
