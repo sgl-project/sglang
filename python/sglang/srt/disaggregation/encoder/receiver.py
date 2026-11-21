@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -127,6 +128,8 @@ class EncoderBootstrapServer:
         health_check_interval: Optional[float] = None,
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
+        *,
+        admin_api_key: Optional[str] = None,
     ):
         self.host = host
         self.port = port
@@ -175,6 +178,8 @@ class EncoderBootstrapServer:
         self.app = FastAPI(
             lifespan=lifespan, openapi_url=None, **fastapi_telemetry_disabled_kwargs()
         )
+
+        add_api_key_middleware(self.app, get_keys=lambda: (None, admin_api_key))
 
         @self.app.get("/health")
         async def _health() -> Response:

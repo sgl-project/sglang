@@ -58,7 +58,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_logger
-from sglang.srt.utils.auth import add_api_key_middleware
+from sglang.srt.utils.auth import add_api_key_middleware, bearer_auth_headers
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,7 @@ def _register_encoder_url_with_bootstrap():
     if not bootstrap_urls:
         return
 
+    headers = bearer_auth_headers(get_serving().admin_api_key)
     max_retries = 30
     retry_interval = 5.0
     request_timeout = 5.0
@@ -132,6 +133,7 @@ def _register_encoder_url_with_bootstrap():
             resp = http_requests.post(
                 f"{bootstrap_url}/register_encoder_url",
                 json=payload,
+                headers=headers,
                 timeout=request_timeout,
             )
             if resp.status_code == 200:
@@ -186,6 +188,7 @@ def _unregister_encoder_url_from_bootstrap():
             resp = http_requests.delete(
                 f"{bootstrap_url}/unregister_encoder_url",
                 json=payload,
+                headers=bearer_auth_headers(get_serving().admin_api_key),
                 timeout=2.0,
             )
             if resp.status_code == 200:

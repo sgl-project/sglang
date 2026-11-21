@@ -14,8 +14,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
+    get_serving,
     remote_instance_transfer_engine_enabled,
 )
+from sglang.srt.utils.auth import bearer_auth_headers
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -101,7 +103,12 @@ class RemoteInstanceWeightTransporter:
         }
 
         try:
-            resp = http_requests.put(url, json=payload, timeout=5)
+            resp = http_requests.put(
+                url,
+                json=payload,
+                headers=bearer_auth_headers(get_serving().admin_api_key),
+                timeout=5,
+            )
             if resp.status_code == 200:
                 logger.info(
                     f"Registered transfer engine info for tp_rank={self.tp_rank} "

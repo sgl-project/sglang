@@ -980,6 +980,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 host=get_serving().host,
                 port=get_disagg().encoder_bootstrap_port,
                 urls=self.encoder_urls,
+                admin_api_key=get_serving().admin_api_key,
             )
             self.mm_receiver = create_mm_receiver(
                 self.server_args,

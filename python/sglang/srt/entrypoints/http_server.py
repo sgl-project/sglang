@@ -215,7 +215,7 @@ from sglang.srt.utils import (
     is_mps,
     kill_process_tree,
 )
-from sglang.srt.utils.auth import add_api_key_middleware
+from sglang.srt.utils.auth import add_api_key_middleware, bearer_auth_headers
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -1423,6 +1423,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
         resp = requests.get(
             f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
             params={"rank": rank},
+            headers=bearer_auth_headers(get_serving().admin_api_key),
             timeout=5,
         )
         if resp.status_code == 200:
