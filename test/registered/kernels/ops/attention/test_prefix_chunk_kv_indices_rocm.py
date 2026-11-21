@@ -26,8 +26,8 @@ _MAX_SEQ_LEN = 128
 
 
 class _Batch(ForwardBatch):
-    def __init__(self, capacity, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *, capacity, **kwargs):
+        super().__init__(**kwargs)
         self._capacity = capacity
 
     def get_max_chunk_capacity(self):
@@ -67,13 +67,14 @@ class TestPackedPrefixChunkKvIndices(CustomTestCase):
                 device=self.device,
             ),
         )
-        set_forward_context(ForwardContext(attn_backend=backend))
+        previous = set_forward_context(ForwardContext(attn_backend=backend))
+        self.addCleanup(set_forward_context, previous)
 
-    def _prepare(self, prefix_lens, capacity):
+    def _prepare(self, *, prefix_lens, capacity):
         bs = len(prefix_lens)
         seq_lens_cpu = [_EXTEND_LEN + prefix for prefix in prefix_lens]
         batch = _Batch(
-            capacity,
+            capacity=capacity,
             batch_size=bs,
             input_ids=torch.zeros((bs, _EXTEND_LEN), dtype=torch.int64, device="cuda"),
             out_cache_loc=torch.arange(bs * _EXTEND_LEN, device="cuda"),
@@ -89,13 +90,12 @@ class TestPackedPrefixChunkKvIndices(CustomTestCase):
         return batch
 
     def test_packed_chunks_gather_the_cached_tokens_of_each_request(self):
-        """Packing needs 3 chunks where request-major needs 4; each gathers its own cached slice."""
         for prefix_lens, capacity, num_chunks in (
             ([16, 32, 48, 64], 64, 3),
             ([1, 64], 31, 3),
         ):
             with self.subTest(prefix_lens=prefix_lens, capacity=capacity):
-                batch = self._prepare(prefix_lens, capacity)
+                batch = self._prepare(prefix_lens=prefix_lens, capacity=capacity)
                 self.assertEqual(batch.num_prefix_chunks, num_chunks)
                 self.assertEqual(batch.prefix_chunk_len, capacity)
                 for chunk in range(batch.num_prefix_chunks):
