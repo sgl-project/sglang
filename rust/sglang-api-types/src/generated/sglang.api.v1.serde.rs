@@ -6478,10 +6478,54 @@ impl<'de> ::serde::Deserialize<'de> for FinishStop {
     }
 }
 
+impl ::serde::Serialize for IgnoredStop {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "position", &self.position)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for IgnoredStop {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = IgnoredStop;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct IgnoredStop")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_position = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "position" => {
+                            if f_position.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("position"));
+                            }
+                            f_position = Some(map.next_value::<u64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(IgnoredStop {
+                    position: f_position.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for FinishLength {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", &self.length)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "ignored_stop", &self.ignored_stop)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -6499,6 +6543,7 @@ impl<'de> ::serde::Deserialize<'de> for FinishLength {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut f_length = None;
+                let mut f_ignored_stop = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "length" => {
@@ -6507,6 +6552,12 @@ impl<'de> ::serde::Deserialize<'de> for FinishLength {
                             }
                             f_length = Some(map.next_value::<Option<u64>>()?);
                         }
+                        "ignored_stop" => {
+                            if f_ignored_stop.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("ignored_stop"));
+                            }
+                            f_ignored_stop = Some(map.next_value::<Option<IgnoredStop>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -6514,6 +6565,7 @@ impl<'de> ::serde::Deserialize<'de> for FinishLength {
                 }
                 Ok(FinishLength {
                     length: f_length.flatten(),
+                    ignored_stop: f_ignored_stop.flatten(),
                 })
             }
         }
@@ -6597,6 +6649,11 @@ impl ::serde::Serialize for FinishReason {
                 let mut map = serializer.serialize_map(None)?;
                 ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "length")?;
                 ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", &v.length)?;
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "ignored_stop",
+                    &v.ignored_stop,
+                )?;
                 ::serde::ser::SerializeMap::end(map)
             }
             Some(finish_reason::Kind::Abort(v)) => {
@@ -6656,6 +6713,13 @@ impl<'de> ::serde::Deserialize<'de> for FinishReason {
                         None => None,
                         Some(::serde_json::Value::Null) => None,
                         Some(v) => match ::serde_json::from_value::<u64>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                    ignored_stop: match raw.get("ignored_stop") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<IgnoredStop>(v.clone()) {
                             Ok(v) => Some(v),
                             Err(_) => return fallback(raw),
                         },
