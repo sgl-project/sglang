@@ -1076,6 +1076,123 @@ def test_mamba_chunk_scan_nonfinite_input_does_not_reach_other_requests(
         torch.testing.assert_close(packed_state, alone_state, rtol=1e-3, atol=1e-3)
 
 
+def test_mamba_chunk_scan_offender_x_matches_its_own_standalone_run():
+    """BBuf review (pullrequestreview-6005666966, line 524): with lengths [5, 30]
+    and an infinite x at token 2 of request 0, the old blanket x sanitize
+    (`x = tl.where((x - x) == 0.0, x, 0.0)`) replaced every non-finite x in a
+    boundary chunk, including request 0's own, so request 0's token 4 came out
+    finite even though its own carried state is non-finite. The classification
+    (nan / +inf / -inf / finite) of a packed request's own output must match
+    its unpacked reference, not just stay isolated from other requests.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    lens, chunk_size = [5, 30], 16
+    offender = (0, 2, "x", torch.inf)
+    results = _packed_vs_independent(lens, chunk_size, offender)
+    packed_out, _packed_state, alone_out, _alone_state = results[0]
+
+    def classify(t):
+        return torch.isnan(t), torch.isposinf(t), torch.isneginf(t)
+
+    for packed_flag, alone_flag in zip(classify(packed_out), classify(alone_out)):
+        assert torch.equal(packed_flag, alone_flag), (
+            "request 0's own non-finite classification diverged from its standalone run"
+        )
+    # The healthy request must still be finite and match its own reference.
+    healthy_out, healthy_state, healthy_alone_out, healthy_alone_state = results[1]
+    assert healthy_out.isfinite().all()
+    assert healthy_state.isfinite().all()
+    torch.testing.assert_close(healthy_out, healthy_alone_out, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(healthy_state, healthy_alone_state, rtol=1e-3, atol=1e-3)
+
+
+def test_mamba_chunk_scan_offender_dt_underflowed_cb_matches_standalone():
+    """BBuf review (pullrequestreview-6005666966, line 505): with A = -1, an
+    infinite first dt, and 128 subsequent unit-step decays in one chunk, cb
+    underflows to exact 0 by the end of the run (exp(-128) rounds to 0 in
+    fp32). The old `cb = tl.where(cb != 0.0, cb * dt_k, cb)` treated that
+    underflowed-but-same-sequence 0 the same as a cross-sequence 0 and skipped
+    the multiply, so the offending request's own infinite dt got silently
+    dropped and its last token came out finite instead of nan. A healthy
+    request packed right after it must stay exact.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state = 1, 8, 8
+    chunk_size = 256
+    offender_len, healthy_len = 129, 20
+    lens = [offender_len, healthy_len]
+    total = sum(lens)
+
+    gen = torch.Generator(device=device).manual_seed(1)
+    x = torch.randn(1, total, n_heads, d_head, device=device, generator=gen)
+    dt = torch.ones(1, total, n_heads, device=device)
+    dt[0, 0, 0] = torch.inf
+    A = torch.full((n_heads,), -1.0, device=device)
+    B = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    C = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+
+    assert float(torch.exp(torch.tensor(-128.0, dtype=torch.float32))) == 0.0, (
+        "this reproduction depends on exp(-128) underflowing to exact 0 in fp32"
+    )
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, offender_len, offender_len + healthy_len], dtype=torch.int32, device=device
+    )
+    packed_out = torch.empty_like(x)
+    packed_states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        return_varlen_states=True,
+    )
+
+    def run_alone(start, n):
+        xs, dts, Bs, Cs = (
+            x[:, start : start + n],
+            dt[:, start : start + n],
+            B[:, start : start + n],
+            C[:, start : start + n],
+        )
+        out = torch.empty_like(xs)
+        state = mamba_chunk_scan_combined(
+            xs, dts, A, Bs, Cs, chunk_size, out=out, return_final_states=True
+        )[0]
+        return out, state
+
+    alone_off_out, _alone_off_state = run_alone(0, offender_len)
+    alone_healthy_out, alone_healthy_state = run_alone(offender_len, healthy_len)
+
+    packed_off_last = packed_out[0, offender_len - 1]
+    assert torch.isnan(packed_off_last).all(), "offender's last token should be nan"
+    assert torch.equal(
+        torch.isnan(packed_off_last), torch.isnan(alone_off_out[0, -1])
+    ), "offender's own non-finite classification diverged from its standalone run"
+
+    healthy_out = packed_out[:, offender_len:]
+    assert healthy_out.isfinite().all()
+    assert packed_states[1].isfinite().all()
+    torch.testing.assert_close(healthy_out, alone_healthy_out, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(
+        packed_states[1], alone_healthy_state, rtol=1e-3, atol=1e-3
+    )
+
+
 if __name__ == "__main__":
     import sys
 
