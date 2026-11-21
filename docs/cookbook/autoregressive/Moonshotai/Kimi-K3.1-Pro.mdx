@@ -172,6 +172,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 - **MegaMoE.** Non-prefill roles must set `--max-running-requests`; do not add `--enable-symm-mem` (it deadlocks).
 - **PP prefill.** Keep `SGLANG_PP_LAYER_PARTITION=24,24,24,21` and `CUDA_MODULE_LOADING=EAGER` (both in the High-Throughput prefill cell).
 - **HiCache.** Use `--hicache-io-backend direct --hicache-mem-layout page_first_direct` with `--mamba-max-states-per-path 1` (the HiCache overlay adds them).
+- **NVFP4 KV (opt-in, not in the generated commands).** With the `Prims-TS` backend (B300, GB300, B200, GB200), `--kv-cache-dtype nvfp4_ds_mla` on every role stores the MLA KV as 352 B NVFP4 records instead of 576 B FP8 rows, about 1.46x more cached tokens. On GB300 PD serving it raised the GPU prefix-cache hit rate by about 13 points and throughput by 1.5-3.9%, with GSM8K unchanged; see [DSA NVFP4 MLA records](/docs/advanced_features/quantized_kv_cache#dsa-nvfp4-mla-records).
 
 <a id="amd-tips" />
 
