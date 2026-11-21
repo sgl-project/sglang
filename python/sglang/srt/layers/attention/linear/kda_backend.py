@@ -24,7 +24,11 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
-    ragged_verify_dense_scatter_indices,
+)
+from sglang.srt.layers.attention.linear.utils import (
+    ragged_verify_dense_scatter_indices as ragged_verify_dense_scatter_indices,
+)
+from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
