@@ -6,7 +6,10 @@ from typing import List, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_token_shard import get_dsa_token_shard_plan
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    build_dsa_pcp_query_shard,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     cumulative,
     plan_dsa_token_shard,
@@ -613,18 +616,38 @@ class DSANPUIndexerMixin:
             and forward_batch.attn_cp_metadata is not None
             and not use_quant_indexer
         ):
-            if use_quant_indexer:
-                raise RuntimeError(
-                    "DSANPUIndexerMixin.do_npu_cp_balance_indexer is not implemented for quantized indexer cache"
+            query = q.view(-1, self.n_heads, self.head_dim)
+            pcp_shard = None
+            if (
+                getattr(forward_batch, "npu_dsa_pcp_query_shard_allowed", False)
+                and getattr(forward_batch, "dsa_cp_metadata_prepared", False)
+                and block_table is not None
+                and weights.shape[0] == query.shape[0]
+            ):
+                pcp_shard = build_dsa_pcp_query_shard(
+                    query.shape[0],
+                    actual_seq_lengths_q,
+                    actual_seq_lengths_kv,
+                    block_table,
+                    parallel.attn_tp_size,
+                    parallel.attn_tp_rank,
                 )
+            if pcp_shard is not None:
+                rows = slice(pcp_shard.plan.local_start, pcp_shard.plan.local_end)
+                query, weights = query[rows], weights[rows]
+                actual_seq_lengths_q = pcp_shard.query_ends
+                actual_seq_lengths_kv = pcp_shard.key_lens
+                block_table = pcp_shard.block_table
+                print_info_once("DSA PCP keeps rank-local Top-K for query-sharded SFA")
             topk_indices = self.do_npu_cp_balance_indexer(
-                q.view(-1, self.n_heads, self.head_dim),
+                query,
                 past_key_states,
                 weights,
                 actual_seq_lengths_q,
                 actual_seq_lengths_kv,
                 block_table,
             )
+            forward_batch.npu_dsa_pcp_query_shard = pcp_shard
             return topk_indices
         else:
             if is_prefill and uses_prefill_cp:

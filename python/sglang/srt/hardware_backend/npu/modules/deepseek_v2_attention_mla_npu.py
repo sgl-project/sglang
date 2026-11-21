@@ -32,7 +32,10 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
-from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+    maybe_capture_indexer_topk,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -514,15 +517,29 @@ def forward_dsa_prepare_npu(
 
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
-        topk_indices = m.indexer(
-            hidden_states,
-            q_lora,
-            positions,
-            forward_batch,
-            m.layer_id,
-            input_on_attn_tp_slices,
-            dynamic_scale,
+        forward_batch.npu_dsa_pcp_query_shard = None
+        forward_batch.npu_dsa_pcp_query_shard_allowed = (
+            envs.SGLANG_NPU_DSA_PCP_QUERY_SHARD.get()
+            and not input_on_attn_tp_slices
+            and not get_attn_tp_context().input_scattered
+            and m.num_heads.bit_count() == 1
+            and get_global_indexer_capturer() is None
+            and getattr(backend, "can_shard_pcp_dsa_queries", lambda _: False)(
+                forward_batch
+            )
         )
+        try:
+            topk_indices = m.indexer(
+                hidden_states,
+                q_lora,
+                positions,
+                forward_batch,
+                m.layer_id,
+                input_on_attn_tp_slices,
+                dynamic_scale,
+            )
+        finally:
+            forward_batch.npu_dsa_pcp_query_shard_allowed = False
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
