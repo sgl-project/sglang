@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         FlashinferCombineInput,
         FlashinferDispatchOutput,
     )
+    from sglang.srt.layers.muse_spark.muse_eplb_ring import RingLayout
 
 # 1 / (fp8_e4m3_max * 6)
 _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
@@ -96,8 +97,12 @@ class MuseSpark1xFp4Experts(nn.Module):
         top_k: int,
         quant_config: QuantizationConfig,
         params_dtype: Optional[torch.dtype] = None,
+        eplb_ring: Optional[RingLayout] = None,
     ) -> None:
         super().__init__()
+        # With the ring the weights hold [home | buddy] slots; the counts below
+        # stay the home (logical) view used by SP prefill.
+        self.eplb_ring = eplb_ring
         # create_weights sizes the activation scales from ``num_experts``, so it
         # must be the LOCAL count; the kernel separately wants the global count.
         self.num_experts = num_local_experts
@@ -184,9 +189,11 @@ class MuseSpark1xFp4Experts(nn.Module):
                 "Launch with --moe-runner-backend flashinfer_trtllm."
             )
         self.quant_method._moe_runner_backend = self.moe_runner_backend
+        if eplb_ring is not None and self.use_marlin:
+            raise ValueError("--ep-dispatch-algorithm ring needs the TRT-LLM FP4 MoE.")
         self.quant_method.create_weights(
             layer=self,
-            num_experts=num_local_experts,
+            num_experts=num_local_experts if eplb_ring is None else eplb_ring.num_slots,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size,
             params_dtype=self.params_dtype,
@@ -285,14 +292,15 @@ class MuseSpark1xFp4Experts(nn.Module):
             FlashinferCombineInput,
         )
 
+        home = self._home_view
         quant_info = FlashInferTrtllmFp4MoeQuantInfo(
-            w13_weight=self.gate_up_proj,
-            w2_weight=self.down_proj,
-            w13_weight_scale=self.gate_up_proj_weight_scale,
-            w2_weight_scale=self.down_proj_weight_scale,
-            g1_scale_c=self.g1_scale_c,
-            g1_alphas=self.g1_alphas,
-            g2_alphas=self.g2_alphas,
+            w13_weight=home(self.gate_up_proj),
+            w2_weight=home(self.down_proj),
+            w13_weight_scale=home(self.gate_up_proj_weight_scale),
+            w2_weight_scale=home(self.down_proj_weight_scale),
+            g1_scale_c=home(self.g1_scale_c),
+            g1_alphas=home(self.g1_alphas),
+            g2_alphas=home(self.g2_alphas),
             w13_input_scale_quant=self.w13_input_scale_quant,
             global_num_experts=self.global_num_experts,
             local_expert_offset=self.local_expert_offset,
@@ -324,6 +332,11 @@ class MuseSpark1xFp4Experts(nn.Module):
             out_dtype=torch.bfloat16,
         )
         return FlashinferCombineInput(combine_payload)
+
+    def _home_view(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.eplb_ring is None or tensor.dim() == 0:
+            return tensor
+        return tensor[: self.num_local_experts]
 
     def _finalize_deferred_output(
         self,
@@ -670,6 +683,20 @@ class MuseSpark1xFp4Experts(nn.Module):
                 topk_ids.to(torch.int32).contiguous(),
                 topk_scores.to(torch.float32).contiguous(),
             )
+        num_experts, local_offset, local_num = (
+            self.global_num_experts,
+            self.local_expert_offset,
+            self.num_local_experts,
+        )
+        if self.eplb_ring is not None:
+            # Ring packed ids are physical ids (muse_eplb_ring.route_and_pick).
+            assert packed_topk_ids is not None
+            ring = self.eplb_ring
+            num_experts, local_offset, local_num = (
+                ring.num_physical,
+                ring.phys_offset,
+                ring.num_slots,
+            )
 
         gemm2_out, expert_weights, expanded_idx_to_permuted_idx = (
             trtllm_fp4_block_scale_routed_moe(
@@ -694,13 +721,13 @@ class MuseSpark1xFp4Experts(nn.Module):
                 output1_scale_gate_scalar=self.g1_alphas,
                 output2_scale_scalar=self.g2_alphas,
                 per_token_scale=per_token_scale,
-                num_experts=self.global_num_experts,
+                num_experts=num_experts,
                 top_k=topk_ids.shape[1],
                 n_group=0,
                 topk_group=0,
                 intermediate_size=self.intermediate_size_per_partition,
-                local_expert_offset=self.local_expert_offset,
-                local_num_experts=self.num_local_experts,
+                local_expert_offset=local_offset,
+                local_num_experts=local_num,
                 # Muse folds its route_scale into the top-k weights, so the
                 # kernel applies none of its own -- but it wants 1.0, not None.
                 routed_scaling_factor=1.0,
