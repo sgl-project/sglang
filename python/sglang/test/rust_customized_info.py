@@ -135,6 +135,7 @@ async def _stream_one_response(
 
     manager = object.__new__(TokenizerManager)
     manager.incremental_streaming_output = False
+    manager.tokenizer = None
     manager.request_logger = Mock()
     manager.request_metrics_exporter_manager = Mock()
     manager.request_metrics_exporter_manager.exporter_enabled.return_value = False

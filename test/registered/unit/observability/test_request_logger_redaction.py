@@ -2,11 +2,17 @@
 bounded by max_length instead of the prompt length. With watermarking off, only
 requests that carry a watermark field are redacted."""
 
+import dataclasses
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import msgspec
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -205,6 +211,95 @@ class TestRequestLogRedaction(CustomTestCase):
         self.assertIs(redact_watermark_secrets(ids_tuple), ids_tuple)
         redacted = redact_watermark_secrets([{"watermark_key": SECRET}])
         self.assertEqual(redacted, [{"watermark_key": "<redacted>"}])
+
+
+class _RecordingTokenizer:
+    def __init__(self):
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel({"[UNK]": 0, "head": 1, "尾": 2}, unk_token="[UNK]")
+            ),
+            unk_token="[UNK]",
+        )
+        self.decoded_tokens = 0
+
+    def decode(self, ids, **kwargs):
+        self.decoded_tokens += len(ids)
+        return self.tokenizer.decode(ids, **kwargs)
+
+
+class TestRequestLogPreview(CustomTestCase):
+    def make_logger(self, directory, *, level=2, fmt="json", enabled=True):
+        return request_logger.RequestLogger(
+            log_requests=enabled,
+            log_requests_level=level,
+            log_requests_format=fmt,
+            log_requests_target=[directory],
+        )
+
+    def read_log(self, directory):
+        return next(Path(directory).glob("*.log")).read_text()
+
+    def test_partial_preview_bounds_decode_without_changing_request(self):
+        """Partial logging must not decode the entire prompt or rewrite it."""
+        row = [1] * 4096 + [2] * 4096
+        for fmt in ("text", "json"):
+            for ids in (row, [row, row, row], [[1, 2]] * 4096):
+                with self.subTest(fmt=fmt, batch=isinstance(ids[0], list)):
+                    req = GenerateReqInput(input_ids=ids, rid="preview")
+                    original = dataclasses.asdict(req)
+                    tokenizer = _RecordingTokenizer()
+                    with tempfile.TemporaryDirectory() as directory:
+                        logger = self.make_logger(directory, fmt=fmt)
+                        logger.log_received_request(req, tokenizer)
+                        self.assertLessEqual(tokenizer.decoded_tokens, 2048)
+                        self.assertEqual(dataclasses.asdict(req), original)
+                        logged = self.read_log(directory)
+                        if ids is row or ids[0] is row:
+                            self.assertIn("head", logged)
+                        self.assertIn("尾", logged)
+
+    def test_finished_preview_keeps_token_request_unchanged(self):
+        req = GenerateReqInput(input_ids=[1] * 4096 + [2] * 4096, rid="finish")
+        tokenizer = _RecordingTokenizer()
+        with tempfile.TemporaryDirectory() as directory:
+            logger = self.make_logger(directory)
+            logger.log_finished_request(
+                req,
+                {"text": "done", "meta_info": {"e2e_latency": 1}},
+                tokenizer=tokenizer,
+            )
+            record = json.loads(self.read_log(directory).split("] ", 1)[1])
+            self.assertIn("head", record["obj"]["text"])
+            self.assertIn("尾", record["obj"]["text"])
+            self.assertLessEqual(tokenizer.decoded_tokens, 2048)
+            self.assertIsNone(req.text)
+            self.assertEqual(len(req.input_ids), 8192)
+
+    def test_full_preview_preserves_text_without_changing_request(self):
+        req = GenerateReqInput(input_ids=[1] * 4096 + [2] * 4096, rid="full")
+        tokenizer = _RecordingTokenizer()
+        with tempfile.TemporaryDirectory() as directory:
+            logger = self.make_logger(directory, level=3)
+            logger.log_received_request(req, tokenizer)
+            record = json.loads(self.read_log(directory).split("] ", 1)[1])
+            self.assertEqual(
+                record["obj"]["text"], tokenizer.tokenizer.decode(req.input_ids)
+            )
+            self.assertIsNone(req.text)
+
+    def test_metadata_and_supplied_text_do_not_decode_token_ids(self):
+        for level in (0, 1, 2):
+            for text in (None, "supplied"):
+                if level == 2 and text is None:
+                    continue
+                req = GenerateReqInput(input_ids=[1, 2], text=text, rid="metadata")
+                tokenizer = _RecordingTokenizer()
+                with tempfile.TemporaryDirectory() as directory:
+                    logger = self.make_logger(directory, level=level)
+                    logger.log_received_request(req, tokenizer)
+                    self.assertEqual(tokenizer.decoded_tokens, 0)
+                    self.assertEqual(req.text, text)
 
 
 if __name__ == "__main__":
