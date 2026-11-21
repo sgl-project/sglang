@@ -90,5 +90,14 @@ def test_nested_scope_preserves_outer_dispatch(
     _assert_mode(True, enable_bmm, native_bmm)
 
 
+@pytest.mark.parametrize("kwargs", [{}, {"dim": None}])
+def test_mean_over_all_elements(native_bmm, kwargs):
+    """With no dim given, mean averages over every element:
+    x.mean() must not return the sum and x.mean(dim=None) must not raise."""
+    x = torch.arange(1.0, 9.0).reshape(2, 4)
+    with ops.set_batch_invariant_mode():
+        assert x.mean(**kwargs).item() == 4.5
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
