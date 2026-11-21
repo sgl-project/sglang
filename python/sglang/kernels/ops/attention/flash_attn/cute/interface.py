@@ -593,9 +593,10 @@ def _flash_attn_fwd(
             torch.float8_e5m2,
         ], "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
 
-    # SM90 has no FP8 MMA path here: fp16/bf16 Q with an fp8 KV cache is cast to
-    # fp16 in-kernel instead. bf16 Q is narrowed to fp16 too, so |q| above 65504
-    # overflows to inf (Gemma-4's QK-norm keeps Q far below that).
+    # SM90 with fp16/bf16 Q and an fp8 KV cache: head_dim 512 runs FP8 WGMMA
+    # (fp8_kv_mma below); otherwise K/V are cast to fp16 in-kernel. bf16 Q is
+    # narrowed to fp16 on the cast path, so |q| above 65504 overflows to inf
+    # (Gemma-4's QK-norm keeps Q far below that).
     fp8_kv_dequant = (
         arch // 10 == 9
         and q is not None
@@ -863,6 +864,15 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    # head_dim 512 runs QK and PV as FP8 WGMMA (e4m3 Q and P pairs) when the KV
+    # pages are TMA-loadable and the intra-WG overlap loop is on; otherwise the
+    # fp16 cast serves it.
+    fp8_kv_mma = (
+        fp8_kv_dequant
+        and head_dim == 512
+        and bool(intra_wg_overlap)
+        and page_size == tile_n
+    )
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -1431,6 +1441,7 @@ def _flash_attn_fwd(
         # dtype is the MMA dtype; FP8-KV also varies the Q/O and K/V tensor dtypes.
         q_dtype,
         v.dtype,
+        fp8_kv_mma,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1560,6 +1571,7 @@ def _flash_attn_fwd(
                 bias_block_size=tile_bias,
                 rel_extent_padded=rel_extent_padded,
                 fp8_kv_dequant=fp8_kv_dequant,
+                fp8_kv_mma=fp8_kv_mma,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
