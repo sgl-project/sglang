@@ -208,7 +208,7 @@ class ForwardBatchDeepSeekMHAMixin:
 
         # chunk_capacity is the maximum number of tokens in each chunk
         chunk_capacity = self.get_max_chunk_capacity()
-        if chunk_capacity <= 0:
+        if _is_hip and chunk_capacity <= 0:
             raise ValueError(
                 f"SGLANG_MAX_KV_CHUNK_CAPACITY={chunk_capacity} must be positive."
             )
@@ -217,20 +217,15 @@ class ForwardBatchDeepSeekMHAMixin:
             # chunk_capacity. One request-major chunk gives the fused kernel the
             # same per-request layout described by prefix_chunk_cu_seq_lens[0].
             self.prefix_chunk_len = max(self.extend_prefix_lens_cpu)
-        elif chunk_capacity >= self.batch_size:
-            self.prefix_chunk_len = chunk_capacity // self.batch_size
-        elif _is_hip:
+        elif _is_hip and chunk_capacity < self.batch_size:
             # No request-major chunk fits fewer keys than requests; only packing does.
             self.prefix_chunk_len = 0
         else:
-            raise ValueError(
-                f"SGLANG_MAX_KV_CHUNK_CAPACITY={chunk_capacity} is smaller than the "
-                f"batch size {self.batch_size}; chunked prefix cache needs at least "
-                "one key per request in each chunk."
-            )
+            self.prefix_chunk_len = chunk_capacity // self.batch_size
 
         compute_prefix_chunk_seq_lens = self.get_prefix_chunk_seq_lens
-        if self.prefix_chunk_len:
+        packing_only = _is_hip and self.prefix_chunk_len == 0
+        if not packing_only:
             self.num_prefix_chunks = (
                 max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
             ) // self.prefix_chunk_len
@@ -242,9 +237,7 @@ class ForwardBatchDeepSeekMHAMixin:
             )
             # Packing leaves keyless rows, which keep aiter off its fp8 PS prefill;
             # take it only when it saves chunks.
-            if not self.prefix_chunk_len or (
-                num_packed_prefix_chunks < self.num_prefix_chunks
-            ):
+            if packing_only or (num_packed_prefix_chunks < self.num_prefix_chunks):
                 self.prefix_chunk_len = chunk_capacity
                 self.num_prefix_chunks = num_packed_prefix_chunks
                 compute_prefix_chunk_seq_lens = get_packed_prefix_chunk_seq_lens

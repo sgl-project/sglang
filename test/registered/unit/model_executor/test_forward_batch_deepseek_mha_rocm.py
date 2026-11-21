@@ -147,8 +147,8 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         )
 
     def test_hip_keeps_request_major_when_packing_saves_no_chunk(self):
-        # Equal prefixes need 4 chunks either way; packing would only add keyless
-        # rows, which keep aiter off its fp8 PS prefill.
+        # Equal prefixes need 4 chunks either way;
+        # packing would only add keyless rows, which keep aiter off its fp8 PS prefill.
         prefix_lens, capacity = [64, 64, 64], 48
         with mock.patch.object(mix, "_is_hip", True):
             fb = _prepare(prefix_lens=prefix_lens, capacity=capacity)
@@ -156,19 +156,16 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
         self.assertEqual(fb.prefix_chunk_len, capacity // len(prefix_lens))
         self.assertFalse(any(fb.prefix_chunk_has_zero_kv))
 
-    def test_capacity_below_batch_size_packs_on_hip_and_raises_elsewhere(self):
-        """Capacity <= 0 raises everywhere; 0 < capacity < batch size packs on HIP, raises elsewhere."""
+    def test_capacity_below_batch_size_packs_on_hip(self):
+        """On HIP, capacity <= 0 raises ValueError; 0 < capacity < batch size packs."""
         prefix_lens, capacity = [5, 1, 1], 2
-        for is_hip, bad_capacity in itertools.product((False, True), (0, -2)):
+        for bad_capacity in (0, -2):
             with (
-                self.subTest(is_hip=is_hip, capacity=bad_capacity),
-                mock.patch.object(mix, "_is_hip", is_hip),
+                self.subTest(capacity=bad_capacity),
+                mock.patch.object(mix, "_is_hip", True),
                 self.assertRaisesRegex(ValueError, "must be positive"),
             ):
                 _prepare(prefix_lens=prefix_lens, capacity=bad_capacity)
-        with mock.patch.object(mix, "_is_hip", False):
-            with self.assertRaisesRegex(ValueError, "SGLANG_MAX_KV_CHUNK_CAPACITY"):
-                _prepare(prefix_lens=prefix_lens, capacity=capacity)
         with mock.patch.object(mix, "_is_hip", True):
             fb = _prepare(prefix_lens=prefix_lens, capacity=capacity)
         self.assertEqual(fb.prefix_chunk_len, capacity)
@@ -178,6 +175,11 @@ class TestPackedPrefixChunkLayout(CustomTestCase):
             starts=fb.prefix_chunk_starts,
             seq_lens=fb.prefix_chunk_seq_lens,
         )
+
+    def test_non_hip_capacity_below_batch_size_keeps_main_failure(self):
+        with mock.patch.object(mix, "_is_hip", False):
+            with self.assertRaises(ZeroDivisionError):
+                _prepare(prefix_lens=[5, 1, 1], capacity=2)
 
 
 if __name__ == "__main__":
