@@ -137,6 +137,10 @@ class TestBootstrapRoomOwner(CustomTestCase):
                 self.assertNotIn(ROOM, manager.transfer_infos)
                 self.assertEqual(manager.request_status[ROOM], KVPoll.Bootstrapping)
                 self.assertEqual(self._rejected_targets(manager), [B_ENDPOINT])
+                self.assertIn(
+                    "different transfer fingerprint",
+                    manager.send_kv_status_message.call_args.kwargs["failure_reason"],
+                )
 
                 _run_bootstrap_loop(manager, _metadata(manager_type, A_ENDPOINT, FP_A))
                 (info,) = manager.transfer_infos[ROOM].values()

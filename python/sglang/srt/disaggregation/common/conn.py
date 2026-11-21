@@ -1020,15 +1020,19 @@ class CommonKVManager(BaseKVManager):
                 targets.append(target)
         logger.warning(
             "Rejected decode destinations from %s for bootstrap_room %s: "
-            "the room belongs to another request",
+            "their transfer fingerprint differs from the prefill request's",
             [(info.endpoint, info.dst_port) for info in infos],
             bootstrap_room,
         )
+        # The decode may be another request's, or the owner's with other inputs.
         self.send_kv_status_message(
             targets=targets,
             bootstrap_room=bootstrap_room,
             status=KVPoll.Failed,
-            failure_reason=room_in_use_reason(bootstrap_room),
+            failure_reason=(
+                f"the prefill request on bootstrap_room {bootstrap_room} has a "
+                "different transfer fingerprint"
+            ),
         )
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
