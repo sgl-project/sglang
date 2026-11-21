@@ -591,6 +591,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    media_gateway_key_file: str | None = None
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -638,7 +639,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Logging
     log_level: str = "info"
     log_requests: bool = False
-    log_requests_level: int = 2
+    log_requests_level: int = 0
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
@@ -3283,6 +3284,11 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.otlp_service_name,
             help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
             "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
+        )
+        parser.add_argument(
+            "--media-gateway-key-file",
+            help="Require a trusted gateway for OpenAI image, video and mesh jobs. "
+            "Read its 64-digit hex key from this file; scope jobs by its verified X-SGLang-Tenant.",
         )
         parser.add_argument(
             "--log-requests",

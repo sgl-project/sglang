@@ -7,7 +7,7 @@ import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -341,7 +341,7 @@ def test_mesh_upload_is_temporary_when_input_saving_is_disabled(monkeypatch, tmp
     monkeypatch.setattr(
         mesh_api,
         "get_global_server_args",
-        lambda: SimpleNamespace(input_save_path=None),
+        lambda: SimpleNamespace(input_save_path=None, output_path=str(tmp_path)),
     )
     monkeypatch.setattr(mesh_api, "generate_request_id", lambda: "request")
     monkeypatch.setattr(
@@ -418,7 +418,7 @@ def test_mesh_completion_requires_a_downloadable_file(
 
     async def run_test():
         await store.upsert("mesh", {"status": "queued", "file_path": str(path)})
-        await mesh_api._dispatch_job_async("mesh", None, resources=AsyncExitStack())
+        await mesh_api._dispatch_job_async("mesh", None)
         job = await store.get("mesh")
         assert job["status"] == ("completed" if output_exists else "failed")
         if output_exists:
@@ -436,7 +436,7 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
     monkeypatch.setattr(
         mesh_api,
         "get_global_server_args",
-        lambda: SimpleNamespace(input_save_path=None),
+        lambda: SimpleNamespace(input_save_path=None, output_path=str(tmp_path)),
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(

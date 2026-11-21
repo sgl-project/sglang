@@ -2225,9 +2225,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         num_frames = self.pipeline_config.adjust_num_frames(num_frames)
         batch.num_frames = num_frames
         self.log_info(
-            "SANA-WM prepare: seed=%s, size=%dx%d, frames=%d, "
-            "vae_stride=%s, diagnostics=%s",
-            getattr(batch, "seed", None),
+            "SANA-WM prepare: size=%dx%d, frames=%d, vae_stride=%s, diagnostics=%s",
             batch.width,
             batch.height,
             num_frames,

@@ -861,7 +861,4 @@ class TextEncodingStage(ConditionEncodingStage):
                 or V.list_of_tensors_with_min_dims(x, 2)
             ),
         )
-        if batch.debug:
-            logger.debug(f"{batch.prompt_embeds=}")
-            logger.debug(f"{batch.negative_prompt_embeds=}")
         return result

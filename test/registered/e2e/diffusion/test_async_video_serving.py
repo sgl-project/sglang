@@ -203,7 +203,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
         wait([failed_save], expected="failed")
         call("GET", f"/v1/videos/{failed_save}/content", expected=404)
         job = call("GET", f"/v1/videos/{failed_save}").json()
-        assert str(bad_output) in job["error"]["message"], job
+        assert job["error"]["message"] == "Video generation failed", job
     finally:
         bad_output.unlink()
 
@@ -219,7 +219,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
         for job_id in timed_out:
             call("GET", f"/v1/videos/{job_id}/content", expected=404)
             job = call("GET", f"/v1/videos/{job_id}").json()
-            assert "Scheduler did not respond in time" in job["error"]["message"], job
+            assert job["error"]["message"] == "Video generation failed", job
             failed_jobs[job_id] = job
 
     # timeout ends the RPC, not GPU work: late results must not revive failed jobs

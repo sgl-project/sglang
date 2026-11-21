@@ -232,9 +232,46 @@ families and examples.
 ### Request logging
 
 - `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
-- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `2`). 0: Log metadata (request id). 1: Log metadata and sampling config (seed, steps, guidance, resolution, frames, fps, ...). 2: Log metadata, sampling config and prompt (truncated to 2 KiB). 3: Log metadata, sampling config and full prompt.
+- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `0`). 0: Log metadata (request id). 1: Also log sampling config, **including the seed**. 2: Also log prompt and negative prompt (truncated to 2 KiB). 3: Include full prompts. Enable levels 1–3 only when their contents are permitted in your logging system.
 - `--log-requests-format &#123;text|json&#125;`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
 - `--log-requests-target &#123;TARGET...&#125;`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
+
+### Private media serving
+
+Treat the diffusion worker as a trusted internal service, not an Internet-facing
+authentication boundary. By default its in-memory media jobs share one namespace.
+For mutually untrusted workloads, use separate worker deployments and storage
+credentials unless you have isolated all other data and control paths.
+
+- **Job ownership:** Behind an authenticating gateway, enable
+  `--media-gateway-key-file /run/secrets/media-gateway-key` on every HTTP replica.
+  Mount a random 32-byte key encoded as 64 hex digits in the gateway and worker.
+  The gateway must **strip all incoming `X-SGLang-Gateway-Key` and
+  `X-SGLang-Tenant` headers**, then inject the key and one stable, opaque tenant ID
+  derived from the authenticated principal (1–128 letters, digits, underscores or
+  hyphens). Never send the key to clients or log these headers. Restrict network
+  access to the gateway, use TLS on the hop, and roll replicas on key rotation.
+  Invalid keys, missing IDs and ambiguous headers are rejected. Image,
+  video and mesh job operations are tenant-scoped; other tenants' IDs return
+  the same 404 as unknown IDs. Jobs are process-local: route subsequent
+  requests to the owning replica. In this mode only the OpenAI image, video
+  and mesh HTTP route families are accessible. Only health and liveness probes
+  are unauthenticated. Realtime WebSockets, administrative endpoints and
+  the metrics endpoint are not exposed on this listener.
+- **Ingress:** Publish only the required media routes. Do not expose scheduler,
+  admin, profiling, weight-loading, or realtime endpoints through the same
+  public catch-all. Gateway mode accepts common scalar sampling options and
+  multipart media uploads; client-selected paths, remote media URLs, diagnostics
+  and backend-specific kwargs are not accepted. Independently limit input bytes,
+  decoded pixels/frames, runtime and concurrency at ingress.
+- **Data retention:** Leave request logging off (or explicitly use level 0).
+  Treat seeds, reference media, embeddings, signed URLs, enhanced prompts and
+  outputs as customer data. Disable body capture in proxies, traces and error
+  reporting. Do not export inputs into evaluation datasets by default. Use
+  `--input-save-path ""` and `--output-path ""` where the chosen API supports
+  ephemeral output; otherwise use restricted encrypted storage, private buckets
+  and lifecycle deletion. Media job deletion is not a guarantee of physical or
+  backup erasure. HTTP and S3 cache directives are not access controls.
 
 ## Configuration Files
 

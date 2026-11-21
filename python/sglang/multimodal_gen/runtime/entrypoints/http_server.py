@@ -11,9 +11,11 @@ import httpx
 import psutil
 import pybase64
 import torch
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
@@ -24,6 +26,12 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     StopProfileReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai.media_privacy import (
+    PRIVATE_CACHE_CONTROL,
+    MediaGatewayMiddleware,
+    read_gateway_key,
+    validate_gateway_payload,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     PromptEnhancer,
 )
@@ -254,7 +262,7 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     error = async_scheduler_client.failure_reason or _backend_failure(request.app)
     if error is not None:
-        return orjson_response({"status": "unhealthy", "error": error}, status_code=503)
+        return orjson_response({"status": "unhealthy"}, status_code=503)
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
     return {"status": "ok"}
@@ -662,6 +670,36 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     return orjson_response({"predictions": results})
 
 
+class _ServingHTTPMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_private(message: Message):
+            # Attach before the response starts, including file streaming and metrics mode.
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = PRIVATE_CACHE_CONTROL
+            await send(message)
+
+        # Keep GETs available for completed results and failure diagnostics.
+        if scope["method"] == "POST" and async_scheduler_client.failure_reason:
+            response = orjson_response(
+                {"error": "Inference backend unavailable"}, status_code=503
+            )
+            return await response(scope, receive, send_private)
+        warmup_done = getattr(scope["app"].state, "server_warmup_done", None)
+        if (
+            warmup_done is not None
+            and not warmup_done.is_set()
+            and scope["path"] not in SERVER_WARMUP_BYPASS_PATHS
+        ):
+            await warmup_done.wait()
+        await self.app(scope, receive, send_private)
+
+
 def create_app(
     server_args: ServerArgs,
     *,
@@ -689,38 +727,35 @@ def create_app(
         allow_headers=["*"],
     )
 
-    @app.middleware("http")
-    async def wait_for_server_warmup(request: Request, call_next):
-        # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
-            return orjson_response(
-                {"error": async_scheduler_client.failure_reason}, status_code=503
-            )
-        warmup_done = getattr(request.app.state, "server_warmup_done", None)
-        if (
-            warmup_done is not None
-            and not warmup_done.is_set()
-            and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
-        ):
-            await warmup_done.wait()
-        return await call_next(request)
+    app.add_middleware(_ServingHTTPMiddleware)
+    gateway = server_args.media_gateway_key_file is not None
+    if gateway:
+        app.add_middleware(
+            MediaGatewayMiddleware,
+            key=read_gateway_key(server_args.media_gateway_key_file),
+        )
+        app.add_api_route("/liveness", liveness, methods=["GET"])
+        app.add_api_route("/health", health, methods=["GET"])
+    else:
+        from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
 
-    app.include_router(health_router)
-    app.include_router(vertex_router)
+        app.include_router(health_router)
+        app.include_router(vertex_router)
+        app.include_router(common_api.router)
+        app.include_router(realtime_video_api.router)
+        if server_args.pipeline_config.supports_action_endpoint():
+            app.include_router(action_api.router)
+        if server_args.pipeline_config.supports_openpi_endpoint():
+            app.include_router(openpi.router)
+        app.include_router(weights_api.router)
+        app.include_router(rollout_api.router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import mesh_api
 
-    app.include_router(common_api.router)
-    app.include_router(image_api.router)
-    app.include_router(video_api.router)
-    app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.supports_action_endpoint():
-        app.include_router(action_api.router)
-    if server_args.pipeline_config.supports_openpi_endpoint():
-        app.include_router(openpi.router)
-    app.include_router(mesh_api.router)
-    app.include_router(weights_api.router)
-    app.include_router(rollout_api.router)
+    media_dependencies = [Depends(validate_gateway_payload)] if gateway else []
+    app.include_router(image_api.router, dependencies=media_dependencies)
+    app.include_router(video_api.router, dependencies=media_dependencies)
+    app.include_router(mesh_api.router, dependencies=media_dependencies)
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None

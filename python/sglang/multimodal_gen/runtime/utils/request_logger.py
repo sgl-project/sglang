@@ -101,7 +101,8 @@ class DiffusionRequestLogger:
             e2e_latency = getattr(metrics, "total_duration_s", 0.0) or 0.0
         return {
             "meta_info": {"e2e_latency": e2e_latency},
-            "error": getattr(result, "error", None) if result is not None else None,
+            # Backend exception strings can contain input text, media URLs and credentials.
+            "error": "generation failed" if getattr(result, "error", None) else None,
         }
 
     def _emit(self, msg: str) -> None:
