@@ -1362,6 +1362,16 @@ class ModelRunner:
 
         warmup_bf16_gemms(self.model, max_m)
 
+    def _non_intrusive_dumper_tags(self) -> Optional[dict[str, str]]:
+        """Tags that tell the draft and target dumps apart under speculative decoding.
+
+        The draft block forward can run as TARGET_VERIFY, so the forward mode does not
+        say which model a dump came from; the runner does.
+        """
+        if not self.spec_algorithm.is_speculative():
+            return None
+        return {"runner": "draft" if self.is_draft_worker else "target"}
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1498,7 +1508,9 @@ class ModelRunner:
 
         if dumper.may_enable:
             dumper.apply_source_patches()
-            dumper.register_non_intrusive_dumper(self.model)
+            dumper.register_non_intrusive_dumper(
+                self.model, tags=self._non_intrusive_dumper_tags()
+            )
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
