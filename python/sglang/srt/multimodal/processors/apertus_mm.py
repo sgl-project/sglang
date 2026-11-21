@@ -7,16 +7,12 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from sglang.srt.managers.multimodal_processor import (
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.models.apertus_mm import Apertus1p5ForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
-from sglang.srt.models.apertus_mm import Apertus1p5ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
