@@ -70,6 +70,7 @@ from sglang.srt.arg_groups.moe_hook import (
     resolve_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
+    validate_xpu_deepep_low_latency_budget,
 )
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
@@ -5898,6 +5899,147 @@ class TestPagedExpertsNumResident(unittest.TestCase):
         for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 _paged_experts_num_resident(bad)
+
+
+def _handle_xpu_deepep(**server_arg_values):
+    """Run handle_a2a_moe for --moe-a2a-backend deepep as if on XPU; returns the view."""
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    server_args = ServerArgs(
+        model_path="dummy",
+        moe_a2a_backend="deepep",
+        **{"deepep_mode": "normal", "chunked_prefill_size": 1024, **server_arg_values},
+    )
+    server_args.cuda_graph_config = CudaGraphConfig()
+    with (
+        patch(
+            "sglang.srt.arg_groups.moe_hook.get_platform",
+            return_value=SimpleNamespace(is_xpu=True),
+        ),
+        patch(
+            "sglang.srt.hardware_backend.xpu.deepsymm.import_deepsymm_moe_ep",
+            return_value=SimpleNamespace(),
+        ),
+    ):
+        handle_a2a_moe(server_args)
+        validate_xpu_deepep_low_latency_budget(server_args)
+    return resolving_view(server_args)
+
+
+class TestXpuDeepEPOverlap(CustomTestCase):
+    """TBO/SBO are refused on XPU: deep_symm.moe_ep cannot overlap them with compute."""
+
+    def test_two_batch_and_single_batch_overlap_are_refused(self):
+        for flag in ("enable_two_batch_overlap", "enable_single_batch_overlap"):
+            with self.subTest(flag=flag):
+                with self.assertRaisesRegex(ValueError, "does not overlap"):
+                    _handle_xpu_deepep(**{flag: True})
+
+
+class TestXpuDeepEPLowLatencyCapacity(CustomTestCase):
+    """XPU low-latency dispatch must stay within its per-rank token capacity.
+
+    deep_symm.moe_ep does not bound-check it, so an overflow on some ranks at
+    runtime would leave the others waiting; the launch must refuse it instead.
+    """
+
+    def setUp(self):
+        self.enterContext(
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128)
+        )
+
+    def test_auto_mode_does_not_bound_prefill_by_the_low_latency_capacity(self):
+        _handle_xpu_deepep(deepep_mode="auto", tp_size=4, chunked_prefill_size=8192)
+
+    def test_low_latency_prefill_above_capacity_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency", tp_size=4, chunked_prefill_size=1024
+            )
+
+    def test_low_latency_prefill_bound_counts_tokens_per_dp_rank(self):
+        # With DP attention chunked_prefill_size is per DP rank, and here each DP
+        # rank is one TP rank, so all 512 tokens go to one rank.
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency",
+                tp_size=4,
+                attn_dp_size=4,
+                chunked_prefill_size=512,
+            )
+
+    def test_decode_requests_are_capped_to_the_capacity_when_unset(self):
+        for deepep_mode in ("auto", "low_latency"):
+            with self.subTest(deepep_mode=deepep_mode):
+                view = _handle_xpu_deepep(
+                    deepep_mode=deepep_mode, tp_size=4, chunked_prefill_size=512
+                )
+                self.assertEqual(view.max_running_requests, 128 * 4)
+
+    def test_decode_requests_above_capacity_are_refused(self):
+        with self.assertRaisesRegex(ValueError, "--max-running-requests"):
+            _handle_xpu_deepep(deepep_mode="auto", tp_size=4, max_running_requests=1024)
+
+    def test_decode_bound_counts_speculative_draft_tokens(self):
+        # Each verify request dispatches its draft tokens, so the cap shrinks by that.
+        view = _handle_xpu_deepep(
+            deepep_mode="auto",
+            tp_size=4,
+            chunked_prefill_size=512,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+        )
+        self.assertEqual(view.max_running_requests, 128 * 4 // 4)
+
+    def test_explicit_request_limit_within_capacity_is_kept(self):
+        view = _handle_xpu_deepep(
+            deepep_mode="auto",
+            tp_size=4,
+            chunked_prefill_size=512,
+            max_running_requests=48,
+        )
+        self.assertEqual(view.max_running_requests, 48)
+
+    def test_low_latency_without_chunked_prefill_is_bounded_by_max_prefill_tokens(self):
+        # With chunked prefill off a whole prompt goes through the fixed buffer.
+        with self.assertRaisesRegex(ValueError, "--max-prefill-tokens"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency",
+                tp_size=4,
+                chunked_prefill_size=-1,
+                max_prefill_tokens=8192,
+            )
+
+    def test_low_latency_prefill_bound_uses_dynamic_chunking_ceiling(self):
+        # PP dynamic chunking can grow a chunk to max_prefill_tokens.
+        with self.assertRaisesRegex(ValueError, "--chunked-prefill-size"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency",
+                tp_size=4,
+                pp_size=2,
+                enable_dynamic_chunking=True,
+                chunked_prefill_size=256,
+                max_prefill_tokens=4096,
+            )
+
+    def test_low_latency_mixed_chunk_counts_running_decodes(self):
+        # 256 prefill tokens + 300 decodes over 4 ranks is 64 + 75 > 128 per rank.
+        with self.assertRaisesRegex(ValueError, "--enable-mixed-chunk"):
+            _handle_xpu_deepep(
+                deepep_mode="low_latency",
+                tp_size=4,
+                chunked_prefill_size=256,
+                enable_mixed_chunk=True,
+                max_running_requests=300,
+            )
+
+    def test_normal_mode_has_no_low_latency_bound(self):
+        view = _handle_xpu_deepep(
+            deepep_mode="normal", tp_size=4, chunked_prefill_size=8192
+        )
+        self.assertIsNone(view.max_running_requests)
 
 
 if __name__ == "__main__":
