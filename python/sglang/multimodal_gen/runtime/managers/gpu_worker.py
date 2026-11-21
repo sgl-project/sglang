@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Callable, Iterator, List, Union
@@ -844,7 +844,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # every rank is here: an expired Ulysses peer wait that no denoising
             # stage reported (a stage outside the denoiser role) still fails
             # this request, before its output is saved or returned
-            IPC_A2A_MULTI.check_timeout()
+            try:
+                IPC_A2A_MULTI.check_timeout()
+            except IpcPeerTimeoutError:
+                # a decode that encodes while it decodes (Cosmos 3) has already
+                # written the request's file
+                if isinstance(result, OutputBatch):
+                    for path in result.output_file_paths or ():
+                        with suppress(FileNotFoundError):
+                            os.remove(path)
+                raise
             # still on the scheduler thread, before saving or handing off to a thread
             raise_if_cancelled(log_reqs)
 

@@ -8,6 +8,7 @@ import asyncio
 import json
 import sys
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -134,9 +135,9 @@ def test_ranks_that_skip_a_main_rank_stage_still_join_the_check(monkeypatch) -> 
         assert out == stages_run and check.call_count == 1
 
 
-@pytest.mark.parametrize("reported_by_a_stage", [True, False])
+@pytest.mark.parametrize("reported_by", ["stage", "forward", "forward_after_streamed"])
 def test_timed_out_request_fails_before_saving(
-    monkeypatch, reported_by_a_stage
+    monkeypatch, tmp_path, reported_by
 ) -> None:
     worker = GPUWorker.__new__(GPUWorker)
     worker.is_output_rank = True
@@ -146,12 +147,17 @@ def test_timed_out_request_fails_before_saving(
     monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
     error = describe_peer_timeouts([TIMEOUT_EXCHANGE] * 2, [0, 1], 10.0)
     timeout = Mock(side_effect=IpcPeerTimeoutError(error))
-    if reported_by_a_stage:
+    # a decode that encodes while it decodes writes the file inside the forward
+    streamed = tmp_path / "r1.mp4"
+    if reported_by == "stage":
         # the executor's check after a denoising stage raises inside the forward
         forward = timeout
     else:
         # no stage reported it, so the check after the forward does
         forward = OutputBatch
+        if reported_by == "forward_after_streamed":
+            streamed.write_bytes(b"incomplete")
+            forward = partial(OutputBatch, output_file_paths=[str(streamed)])
         monkeypatch.setattr(executor_module.IPC_A2A_MULTI, "check_timeout", timeout)
 
     save = Mock()
@@ -165,6 +171,7 @@ def test_timed_out_request_fails_before_saving(
     )
     timeout.assert_called_once()
     save.assert_not_called()
+    assert not streamed.exists()
     assert result.error == f"Error executing request r1: {error}"
     assert result.fatal_error == error
 
