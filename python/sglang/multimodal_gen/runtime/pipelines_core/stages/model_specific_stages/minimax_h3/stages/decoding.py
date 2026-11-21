@@ -483,9 +483,13 @@ class MiniMaxH3DecodingStage(DecodingStage):
             ):
                 pixels = video_vae.decode_image_raw(raw)
         # decode_image_raw already applies the ImageNet inverse normalization.
-        pixels = pixels.detach().float().cpu()
+        pixels = pixels.detach().float()
         shape = plan.shape
-        if shape["output_width"] is not None:
+        # The resize quantizes (and, when verified exact, resizes) on the device
+        # and returns a host tensor, so only 8-bit pixels cross to the host.
+        if shape["output_width"] is None:
+            pixels = pixels.cpu()
+        else:
             width, height = int(shape["output_width"]), int(shape["output_height"])
             logger.info(
                 "MiniMax H3 image: generated %dx%d (min_generation_area), resized "

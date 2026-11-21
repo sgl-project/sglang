@@ -54,6 +54,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU: bool = True
+    SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS: int = 4
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
@@ -347,6 +349,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # adaln_proj weights; keep off until an e2e trajectory gate clears it.
     "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
         "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
+    # MiniMax-H3 image: quantize and LANCZOS-resize the decoded canvas on the
+    # GPU (byte-identical to Pillow, verified once per geometry at first use,
+    # with a Pillow fallback on any difference). Set 0 to always use Pillow.
+    "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU", "true"
+    ),
+    # Threads for the Pillow fallback resize (byte-identical to one call).
+    "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS", 4
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
