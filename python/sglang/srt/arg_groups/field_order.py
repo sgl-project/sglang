@@ -588,5 +588,7 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "gc_freeze_after_batches",
+    "gc_freeze_every_batches",
 )
 # fmt: on

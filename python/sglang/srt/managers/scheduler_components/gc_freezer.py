@@ -13,8 +13,18 @@ HEAP_GROWTH_WARN_RATIO = 1.5
 
 
 class GCFreezer:
-    def __init__(self, *, freeze_on_idle_secs: float):
+    def __init__(
+        self,
+        *,
+        freeze_on_idle_secs: float,
+        freeze_after_batches: int = 0,
+        freeze_every_batches: int = 0,
+    ):
         self._freeze_on_idle_secs = freeze_on_idle_secs
+        self._freeze_after_batches = freeze_after_batches
+        self._freeze_every_batches = freeze_every_batches
+        self._next_batch_freeze = freeze_after_batches or math.inf
+        self._batch_froze = False
         self._seen_forward_ct = -1
         self._next_freeze = math.inf
         now = time.monotonic()
@@ -23,9 +33,39 @@ class GCFreezer:
         self._heap_warn_above = None
 
     def on_cache_reset(self) -> None:
-        if self._freeze_on_idle_secs > 0:
+        if self._freeze_on_idle_secs > 0 or self._freeze_after_batches > 0:
             gc.unfreeze()
+        if self._freeze_on_idle_secs > 0:
             self._next_freeze = time.monotonic()
+        if self._batch_froze:
+            self._next_batch_freeze = 0
+
+    def on_batch(self, forward_ct: int) -> None:
+        if forward_ct < self._next_batch_freeze:
+            return
+        self._next_batch_freeze = (
+            forward_ct + self._freeze_every_batches
+            if self._freeze_every_batches > 0
+            else math.inf
+        )
+        start = time.monotonic()
+        # Young generations only: a full collection on a busy scheduler is the
+        # pause this freeze exists to avoid.
+        gc.collect(1)
+        gc.freeze()
+        elapsed_ms = (time.monotonic() - start) * 1e3
+        if self._batch_froze:
+            logger.debug(
+                f"Froze the scheduler heap at batch {forward_ct} in {elapsed_ms:.1f} ms"
+            )
+            return
+        self._batch_froze = True
+        # gc.get_freeze_count() walks the frozen list: only at the first freeze.
+        logger.info(
+            f"Froze the scheduler heap at batch {forward_ct} in {elapsed_ms:.1f} ms: "
+            f"{gc.get_freeze_count()} objects; next every "
+            f"{self._freeze_every_batches or 'never'} batches"
+        )
 
     def on_idle(self, forward_ct: int) -> None:
         now = time.monotonic()

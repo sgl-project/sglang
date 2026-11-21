@@ -94,3 +94,17 @@ class Device(msgspec.Struct):
         "timer. At most every 10 minutes, an idle freeze also unfreezes first, so frozen "
         "garbage is freed and logged. Set to 0 to disable.",
     ] = 0.0
+    gc_freeze_after_batches: A[
+        int,
+        "Once the scheduler has launched this many forward batches, collect the young "
+        "garbage-collection generations and freeze the surviving objects, so full "
+        "collections stop scanning the long-lived heap. Unlike --gc-freeze-on-idle-secs it "
+        "never runs a full collection, so it also works on a scheduler that is never idle. "
+        "Repeats every --gc-freeze-every-batches batches. A cache flush or PD role switch "
+        "unfreezes the heap until the next freeze. Set to 0 to disable.",
+    ] = 0
+    gc_freeze_every_batches: A[
+        int,
+        "With --gc-freeze-after-batches, freeze again every this many batches, so objects "
+        "that became long-lived since are frozen too. Set to 0 to freeze once.",
+    ] = 0
