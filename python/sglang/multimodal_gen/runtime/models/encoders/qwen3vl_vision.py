@@ -30,6 +30,11 @@ class Qwen3VLVisionOutput:
 
 class Qwen3VLVisionRotaryEmbedding(nn.Module):
     recompute_on_device_change = False
+    # Transformers initializes inv_freq on the host. CPU and GPU pow differ by
+    # an ulp, which the 27-block bf16 tower amplifies to a few percent.
+    host_inv_freq = False
+    # device the host-initialized inv_freq was last placed on
+    _host_inv_freq_device: torch.device | None = None
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
@@ -39,8 +44,17 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._inv_freq_device = inv_freq.device
 
+    def _host_value(self) -> torch.Tensor:
+        indices = torch.arange(0, self.dim, 2, dtype=torch.float32, device="cpu")
+        return 1.0 / (self.theta ** (indices / self.dim))
+
     def forward(self, sequence_length: int) -> torch.Tensor:
-        if (
+        if self.host_inv_freq:
+            if self._host_inv_freq_device != self.inv_freq.device:
+                self.inv_freq = self._host_value().to(self.inv_freq.device)
+                self._host_inv_freq_device = self.inv_freq.device
+                self._inv_freq_device = self.inv_freq.device
+        elif (
             self.recompute_on_device_change
             and self.inv_freq.device != self._inv_freq_device
         ):
@@ -67,6 +81,8 @@ class Qwen3VLVisionBlock(nn.Module):
         layer_idx: int,
         quant_config: Any = None,
         prefix: str = "visual",
+        parallel_group: str = "tp",
+        allow_cudnn_sdp: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -76,6 +92,8 @@ class Qwen3VLVisionBlock(nn.Module):
             prefix=f"{prefix}.blocks.{layer_idx}.attn",
             model_name="Qwen3-VL",
             quant_config=quant_config,
+            parallel_group=parallel_group,
+            allow_cudnn_sdp=allow_cudnn_sdp,
         )
         self.mlp = Qwen3_VisionMLP(
             config.hidden_size,
@@ -84,7 +102,7 @@ class Qwen3VLVisionBlock(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"{prefix}.blocks.{layer_idx}.mlp",
             quant_config=quant_config,
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
 
     def forward(
@@ -133,26 +151,59 @@ def _vision_position_ids(
     return torch.cat(position_ids)
 
 
+def _transformers_axis_positions(
+    size: int, side: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Source floor tap and the two bilinear weights along one axis, rounded as
+    transformers.vision_utils._interpolation_axis_taps_weights (align_corners)
+    rounds them.
+
+    The divisor is a full tensor on purpose: CUDA divides by a scalar as a
+    multiply by its reciprocal, which puts 47 * (1 / 47) just below 1 and
+    moves the floor tap.
+    """
+    index = torch.arange(size, device=device, dtype=torch.float32)
+    divisor = torch.full_like(index, float(max(size - 1, 1)))
+    source = index * (side - 1) / divisor
+    floor = torch.floor(source)
+    weight0 = (1 - (source - floor).abs()).clamp(min=0)
+    weight1 = (1 - (source - floor - 1).abs()).clamp(min=0)
+    return floor.int().clamp(0, side - 1), weight0, weight1
+
+
 def _vision_bilinear_indices_and_weights(
     grid_thw: torch.Tensor,
     num_grid_per_side: int,
     spatial_merge_size: int,
+    transformers_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     index_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
     weight_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
     device = grid_thw.device
 
     for temporal, height, width in grid_thw.tolist():
-        height_positions = torch.linspace(
-            0, num_grid_per_side - 1, height, device=device
-        )
-        width_positions = torch.linspace(0, num_grid_per_side - 1, width, device=device)
-        height_floor = height_positions.int()
-        width_floor = width_positions.int()
+        if transformers_weights:
+            height_floor, h0, h1 = _transformers_axis_positions(
+                height, num_grid_per_side, device
+            )
+            width_floor, w0, w1 = _transformers_axis_positions(
+                width, num_grid_per_side, device
+            )
+        else:
+            height_positions = torch.linspace(
+                0, num_grid_per_side - 1, height, device=device
+            )
+            width_positions = torch.linspace(
+                0, num_grid_per_side - 1, width, device=device
+            )
+            height_floor = height_positions.int()
+            width_floor = width_positions.int()
+            height_fraction = height_positions - height_floor
+            width_fraction = width_positions - width_floor
+            h0, h1 = 1 - height_fraction, height_fraction
+            w0, w1 = 1 - width_fraction, width_fraction
         height_ceil = (height_floor + 1).clip(max=num_grid_per_side - 1)
         width_ceil = (width_floor + 1).clip(max=num_grid_per_side - 1)
-        height_fraction = height_positions - height_floor
-        width_fraction = width_positions - width_floor
         base_height = height_floor * num_grid_per_side
         base_height_ceil = height_ceil * num_grid_per_side
 
@@ -163,10 +214,10 @@ def _vision_bilinear_indices_and_weights(
             (base_height_ceil[:, None] + width_ceil[None]).flatten(),
         )
         corner_weights = (
-            ((1 - height_fraction)[:, None] * (1 - width_fraction)[None]).flatten(),
-            ((1 - height_fraction)[:, None] * width_fraction[None]).flatten(),
-            (height_fraction[:, None] * (1 - width_fraction)[None]).flatten(),
-            (height_fraction[:, None] * width_fraction[None]).flatten(),
+            (h0[:, None] * w0[None]).flatten(),
+            (h0[:, None] * w1[None]).flatten(),
+            (h1[:, None] * w0[None]).flatten(),
+            (h1[:, None] * w1[None]).flatten(),
         )
 
         height_order = torch.arange(height, device=device).view(
@@ -199,14 +250,27 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 class Qwen3VLVisionTransformer(nn.Module):
     fp32_position_interpolation = True
+    transformers_numerics = False
 
     def __init__(
         self,
         config: Any,
         quant_config: Any = None,
         prefix: str = "visual",
+        replicated: bool = False,
+        transformers_numerics: bool = False,
     ) -> None:
+        """
+        replicated: keep the whole tower on every encoder-TP rank (no head
+            sharding, no partial-sum all-reduce), so its output does not depend
+            on the encoder TP width.
+        transformers_numerics: follow the Transformers reference's rounding
+            (host-initialized rotary inv_freq, closed-form interpolation
+            weights, PyTorch-default SDPA kernel per image).
+        """
         super().__init__()
+        parallel_group = "replicated" if replicated else "tp"
+        self.transformers_numerics = transformers_numerics
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = config.spatial_merge_size**2
@@ -218,8 +282,16 @@ class Qwen3VLVisionTransformer(nn.Module):
         self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb.host_inv_freq = transformers_numerics
         self.blocks = nn.ModuleList(
-            Qwen3VLVisionBlock(config, layer_idx, quant_config, prefix)
+            Qwen3VLVisionBlock(
+                config,
+                layer_idx,
+                quant_config,
+                prefix,
+                parallel_group=parallel_group,
+                allow_cudnn_sdp=transformers_numerics,
+            )
             for layer_idx in range(config.depth)
         )
         self.merger = Qwen3VLMoeVisionPatchMerger(
@@ -229,7 +301,7 @@ class Qwen3VLVisionTransformer(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
             use_postshuffle_norm=False,
             prefix="visual.merger",
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
         self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(
@@ -240,7 +312,7 @@ class Qwen3VLVisionTransformer(nn.Module):
                 spatial_merge_size=config.spatial_merge_size,
                 use_postshuffle_norm=True,
                 prefix=f"visual.deepstack_merger_list.{merger_idx}",
-                parallel_group="tp",
+                parallel_group=parallel_group,
             )
             for merger_idx, _ in enumerate(self.deepstack_visual_indexes)
         )
@@ -262,7 +334,11 @@ class Qwen3VLVisionTransformer(nn.Module):
             grid_thw,
             num_grid_per_side=self.num_grid_per_side,
             spatial_merge_size=self.spatial_merge_size,
+            transformers_weights=self.transformers_numerics,
         )
+        if self.transformers_numerics:
+            # the [patches, taps] layout and reduction Transformers uses
+            return (self.pos_embed(indices.T) * weights.T[:, :, None]).sum(1)
         if self.fp32_position_interpolation:
             return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
         # Transformers 4.57 rounds each corner and each addition in the weight dtype

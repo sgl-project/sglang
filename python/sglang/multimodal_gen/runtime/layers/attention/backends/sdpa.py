@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.cudnn_composite_sdpa import (
+    cudnn_composite_sdpa,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
 )
@@ -84,6 +87,12 @@ class SDPAImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        # Run cuDNN SDPA through a plan pinned to the COMPOSITE engine: the
+        # plan PyTorch builds (AUTO -> UNIFIED) is not reproducible across
+        # builds, so outputs would depend on the process/thread that built it.
+        self.cudnn_composite_sdp = self.allow_cudnn_sdp and bool(
+            extra_impl_args.get("cudnn_composite_sdp", False)
+        )
 
     def _sdpa_context(self, query: torch.Tensor):
         if self.allow_cudnn_sdp and query.device.type == "cuda":
@@ -123,6 +132,16 @@ class SDPAImpl(AttentionImpl):
         }
         if query.shape[1] != key.shape[1]:
             attn_kwargs["enable_gqa"] = True
+        if (
+            self.cudnn_composite_sdp
+            and attn_mask is None
+            and not is_causal
+            and self.dropout == 0.0
+            and query.shape[1] == key.shape[1]
+        ):
+            output = cudnn_composite_sdpa(query, key, value, self.softmax_scale)
+            if output is not None:
+                return output.transpose(1, 2)
         with self._sdpa_context(query):
             output = torch.nn.functional.scaled_dot_product_attention(
                 query, key, value, **attn_kwargs

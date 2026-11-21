@@ -66,10 +66,15 @@ class QwenVLVisionAttention(nn.Module):
         prefix: str,
         model_name: str,
         quant_config: Any = None,
+        parallel_group: str = "tp",
+        allow_cudnn_sdp: bool = False,
     ) -> None:
         super().__init__()
         parallel = get_parallel()
-        self.num_heads = config.num_heads // parallel.tp_size
+        # "replicated" keeps every head on every rank, so the tower's arithmetic
+        # does not depend on the encoder TP width.
+        shards = parallel.tp_size if parallel_group == "tp" else 1
+        self.num_heads = config.num_heads // shards
         self.head_dim = config.hidden_size // config.num_heads
         self.scaling = self.head_dim**-0.5
         self.qkv_proj = QKVParallelLinear(
@@ -79,7 +84,7 @@ class QwenVLVisionAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
         self.proj = RowParallelLinear(
             input_size=config.hidden_size,
@@ -87,12 +92,19 @@ class QwenVLVisionAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
 
         backend = get_attn_backend(self.head_dim, torch.get_default_dtype())
         self._attention_impl = None
         if backend.supports_packed_varlen():
+            extra = {}
+            if allow_cudnn_sdp and backend.get_enum().name == "TORCH_SDPA":
+                # PyTorch's default CUDA SDPA order (cuDNN first on sm90+), i.e.
+                # the kernel the Transformers reference runs per image.
+                extra["allow_cudnn_sdp"] = True
+                # deterministic cuDNN plan (see cudnn_composite_sdpa.py)
+                extra["cudnn_composite_sdp"] = True
             self._attention_impl = backend.get_impl_cls()(
                 num_heads=self.num_heads,
                 head_size=self.head_dim,
@@ -100,6 +112,7 @@ class QwenVLVisionAttention(nn.Module):
                 softmax_scale=self.scaling,
                 causal=False,
                 prefix=prefix,
+                **extra,
             )
         else:
             logger.warning_once(

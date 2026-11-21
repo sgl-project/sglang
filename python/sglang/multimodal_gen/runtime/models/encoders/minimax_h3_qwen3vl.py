@@ -276,6 +276,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             quant_config=config.quant_config,
             use_tensor_parallel=True,
             prefix="model",
+            # read while the tower's layers are built, so the release decides
+            # them in its encoder config (see MiniMaxH3Qwen3VLConfig)
+            vision_replicated=config.vision_replicated,
+            vision_transformers_numerics=config.vision_transformers_numerics,
         )
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
         self.model.language_model.norm = nn.Identity()

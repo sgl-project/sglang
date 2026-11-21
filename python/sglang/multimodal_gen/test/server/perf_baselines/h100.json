@@ -3737,7 +3737,7 @@
             "expected_median_denoise_ms": 2332.99,
             "load_peak_vram_mb": 45428.0,
             "runtime_peak_vram_mb": 63312.0,
-            "load_peak_allocated_mb": 3330.01,
+            "load_peak_allocated_mb": 3486.25,
             "runtime_peak_allocated_mb": 18182.98,
             "estimated_full_test_time_s": 150.0
         },

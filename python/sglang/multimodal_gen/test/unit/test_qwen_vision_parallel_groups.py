@@ -93,3 +93,65 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
                     torch.testing.assert_close(layer.weight, weight, rtol=0, atol=0)
                 attn.all_reduce.assert_not_called()
                 tp.all_reduce.assert_called_once()
+
+    def test_replicated_vision_projection_keeps_whole_weights_and_reload(self):
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            global_force_attn_backend_context_manager,
+        )
+        from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_vision import (
+            QwenVLVisionAttention,
+        )
+        from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+        server = ServerArgs(model_path="dummy", device="cpu", tp_size=4, attn_dp_size=1)
+        publish(server, role="test", ranks=SpawnRanks(world_rank=3))
+        initialize_dp_attention_flags(server)
+        with global_force_attn_backend_context_manager(AttentionBackendEnum.TORCH_SDPA):
+            module = QwenVLVisionAttention(
+                SimpleNamespace(hidden_size=32, num_heads=8),
+                prefix="visual",
+                model_name="Qwen",
+                parallel_group="replicated",
+            )
+        # every head stays on this rank, whatever the TP width
+        self.assertEqual(module.num_heads, 8)
+        tp = Mock(all_reduce=Mock(side_effect=AssertionError("replicated reduce")))
+        attn = Mock(all_reduce=Mock(side_effect=AssertionError("wrong group")))
+        for layer in (module.qkv_proj, module.proj):
+            self.assertEqual(rank_size(layer), (0, 1))
+            full = (
+                torch.arange(32 * 32, dtype=layer.weight.dtype).reshape(32, 32) / 1024
+            )
+            bias = torch.arange(32, dtype=layer.weight.dtype) / 64
+            qkv = isinstance(layer, QKVParallelLinear)
+            # the encoder hands each parameter the whole checkpoint tensor; a
+            # replicated layer keeps all of it on rank 3 of 4
+            with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+                for shard in ("q", "k", "v") if qkv else (None,):
+                    args = (shard,) if qkv else ()
+                    layer.weight.weight_loader(layer.weight, full, *args)
+                    layer.bias.weight_loader(layer.bias, bias, *args)
+            weight = torch.cat([full] * 3) if qkv else full
+            expected_bias = torch.cat([bias] * 3) if qkv else bias
+            inputs = (
+                torch.arange(2 * weight.shape[1], dtype=weight.dtype).reshape(2, -1)
+                / 64
+            )
+            with (
+                parallel_scope(tp_group=tp, attn_tp_group=attn),
+                patch(
+                    "sglang.srt.layers.linear.is_allocation_symmetric",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.linear.use_symmetric_memory",
+                    return_value=nullcontext(),
+                ),
+            ):
+                torch.testing.assert_close(
+                    layer(inputs)[0], F.linear(inputs, weight, expected_bias)
+                )
+            torch.testing.assert_close(layer.weight, weight, rtol=0, atol=0)
+            torch.testing.assert_close(layer.bias, expected_bias, rtol=0, atol=0)
+        tp.all_reduce.assert_not_called()
+        attn.all_reduce.assert_not_called()

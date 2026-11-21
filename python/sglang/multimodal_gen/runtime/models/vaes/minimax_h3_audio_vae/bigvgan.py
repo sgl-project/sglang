@@ -23,7 +23,10 @@ def get_padding(kernel_size, dilation=1):
 
 
 # Adapted from https://github.com/EdwardDixon/snake under the MIT license.
-@torch.jit.script
+# Plain eager on purpose: under @torch.jit.script the profiling executor runs the
+# first call(s) of each shape signature unfused and later ones through a fused
+# kernel with different rounding, so the first audio decode of a process (and
+# any decode that hits a new shape signature) produced different samples.
 def snakebeta(x, alpha, beta):
     shape = x.shape
     x = x.reshape(shape[0], shape[1], -1)
