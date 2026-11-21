@@ -566,6 +566,11 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             if (
                 head_dims in cutlass_supported_head_dims
+                # CUTLASS replanning replaces buffers read by captured graphs.
+                and not (
+                    self.is_dllm_model
+                    and check_cuda_graph_backend(Phase.DECODE, Backend.FULL)
+                )
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"

@@ -33,6 +33,7 @@ class DllmAlgorithm:
 
     supported_architectures: Tuple[str, ...] = ()
     requires_separate_context_encoding = False
+    retains_causal_prefix = False
     required_attention_backend: Optional[str] = None
     reuse_forward_metadata: bool = False
     supported_attention_backends: Tuple[str, ...] = ()
@@ -82,8 +83,8 @@ class DllmAlgorithm:
 
         Algorithms that retain generated-block KV must not report completion
         until a forward has persisted their final tokens. Algorithms with a
-        separate context pass may emit immediately because that block KV is
-        discarded and encoded causally in the next round.
+        separate context pass may emit immediately when block KV is discarded
+        and the committed tokens are encoded causally in the next round.
         """
         raise NotImplementedError
 
