@@ -269,13 +269,12 @@ impl PendingAssistant {
         self.reasoning.is_none() && self.content.is_none() && self.tool_calls.is_empty()
     }
 
-    /// Whether an assistant message in `phase` continues this turn. As the
-    /// engine's own `/v1/responses` merges adjacent assistant messages: within
-    /// one phase, or onto a turn that holds only reasoning. A phase change
-    /// otherwise starts a new message, so the template sees the boundary.
+    /// The first text supplies the phase for pending reasoning or calls. A
+    /// worker can stream a call before its accompanying text, and its tool
+    /// result must still follow the assistant turn that made the call.
+    /// Once text is present, a change of phase starts another message.
     fn continues_with(&self, phase: Option<&str>) -> bool {
-        let only_reasoning = self.content.is_none() && self.tool_calls.is_empty();
-        only_reasoning || self.phase.as_deref() == phase
+        self.content.is_none() || self.phase.as_deref() == phase
     }
 
     fn flush(&mut self, messages: &mut Vec<Value>) {
@@ -1139,6 +1138,24 @@ mod tests {
             json!({"role": "assistant", "content": "done", "reasoning_content": "think",
                    "phase": "final_answer"})
         );
+    }
+
+    #[test]
+    fn phased_text_after_a_call_preserves_tool_result_pairing() {
+        for phase in ["commentary", "final_answer"] {
+            let c = chat(json!({"model":"m","input":[
+                {"type":"function_call","call_id":"a","name":"f","arguments":"{}"},
+                {"role":"assistant","phase":phase,"content":"text"},
+                {"type":"function_call_output","call_id":"a","output":"ok"}
+            ]}));
+            let messages = c["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0]["phase"], phase);
+            assert_eq!(
+                messages[0]["tool_calls"][0]["id"],
+                messages[1]["tool_call_id"]
+            );
+        }
     }
 
     #[test]
