@@ -27,9 +27,9 @@ pub enum Error {
     #[error("detokenize failed: {0}")]
     Detokenize(String),
 
-    /// To-scheduler channel full. Surfaced as backpressure.
+    /// A stage queue was full. Surfaced as backpressure.
     #[error("to_scheduler channel full")]
-    QueueFull,
+    QueueFull(QueueStage),
 
     /// Client went away mid-stream. Drives `Aborted`, not `Failed`.
     #[error("client disconnected")]
@@ -65,6 +65,29 @@ impl Error {
                 Some(message)
             }
             _ => None,
+        }
+    }
+}
+
+/// The stage queue a request found full: the `stage` label of
+/// `sglang:frontend_queue_full_total`. Intake has none: a request waits for
+/// room in its inbox rather than being refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueStage {
+    Tokenizer,
+    Mm,
+    Scheduler,
+}
+
+impl QueueStage {
+    pub const ALL: [QueueStage; 3] = [Self::Tokenizer, Self::Mm, Self::Scheduler];
+
+    /// The `stage` label, as `sglang:frontend_queue_depth` names the queue.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tokenizer => "tokenizer",
+            Self::Mm => "mm",
+            Self::Scheduler => "scheduler",
         }
     }
 }

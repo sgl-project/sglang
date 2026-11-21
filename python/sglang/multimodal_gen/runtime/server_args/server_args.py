@@ -83,7 +83,6 @@ from sglang.multimodal_gen.runtime.utils.argparse import (
 )
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
-    is_valid_ipv6_address,
     normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -95,6 +94,7 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
 
@@ -3913,6 +3913,16 @@ class ServerArgs(DisaggServerArgsMixin):
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
+                if arg_name not in destinations and arg_name not in vars(args):
+                    # argparse also accepts an unambiguous prefix of a flag; a
+                    # flag spelled in full (also one registered later) wins.
+                    abbreviated = {
+                        dest
+                        for name, dest in destinations.items()
+                        if name.startswith(arg_name)
+                    }
+                    if len(abbreviated) == 1:
+                        arg_name = abbreviated.pop()
                 provided_arg_names.add(destinations.get(arg_name, arg_name))
 
         # Populate provided_args if the argument from the namespace was on the command line.

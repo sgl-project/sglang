@@ -235,6 +235,25 @@ def _canonical_output_audio_waveform(
     return audio_waveform.permute(1, 0, 2).contiguous()
 
 
+def _trim_audio_to_video_duration(
+    audio_waveform: torch.Tensor, batch: Req, sample_rate: int
+) -> torch.Tensor:
+    """Cut ``[1, C, L]`` audio to the video's duration, as the reference does.
+
+    The audio latents cover whole hops, so the decoded waveform runs past the
+    last video frame (e.g. 165600 samples for 124 frames at 24 fps and 32 kHz,
+    whose duration is 165333 samples). Same rule as the Diffusers Pika H3 Flex
+    audio decode step: ``round(num_frames / fps * sample_rate)``. The base
+    MiniMax-H3 reference keeps the full waveform.
+    """
+    if not batch.num_frames or not batch.fps:
+        return audio_waveform
+    num_samples = round(int(batch.num_frames) / float(batch.fps) * int(sample_rate))
+    if 0 < num_samples < int(audio_waveform.shape[-1]):
+        audio_waveform = audio_waveform[..., :num_samples].contiguous()
+    return audio_waveform
+
+
 _MINIMAX_H3_DECODER_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
 # Video tiles of the audio decoder's rank that the other ranks decode while it
 # decodes the audio beside them (8 x B300, t2va 16:9 768p at 5 / 10 / 15 s:
@@ -498,7 +517,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 torch.no_grad(),
             ):
                 payload = self._run_audio_vae(audio_vae, audio_latent, server_args)
-                waveform = finish(payload["waveform"])
+                waveform = finish(payload["waveform"], payload["sample_rate"])
                 return payload, waveform, waveform[0].cpu()
 
         return self._audio_thread.submit(run)
@@ -636,6 +655,12 @@ class MiniMaxH3DecodingStage(DecodingStage):
             raise RuntimeError("MiniMax H3 tasks require the video_vae output decoder")
         batch_size = int(visual_latent.shape[0])
 
+        def finish_audio(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+            waveform = _canonical_output_audio_waveform(waveform, batch_size=batch_size)
+            if server_args.pipeline_config.trim_audio_to_video:
+                waveform = _trim_audio_to_video_duration(waveform, batch, sample_rate)
+            return waveform
+
         # Replica rank 0 decodes the audio, alongside its video tiles on CUDA
         # or before them while the other ranks start theirs; everyone else
         # receives it after the video decode.
@@ -645,9 +670,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
             audio_job = self._start_owner_audio(
                 audio_latent,
                 server_args,
-                functools.partial(
-                    _canonical_output_audio_waveform, batch_size=batch_size
-                ),
+                finish_audio,
             )
         else:
             owner_audio, owner_exception = self._decode_owner_audio(
@@ -658,9 +681,9 @@ class MiniMaxH3DecodingStage(DecodingStage):
         encoder_audio = None
         if owner_audio is not None:
             audio_sample_rate = int(owner_audio["sample_rate"])
-            output_audio_waveform = _canonical_output_audio_waveform(
+            output_audio_waveform = finish_audio(
                 _required_tensor(owner_audio.get("waveform"), "audio_vae.decode"),
-                batch_size=batch_size,
+                audio_sample_rate,
             )
             encoder_audio = output_audio_waveform[0]
         elif audio_job is not None:
@@ -743,8 +766,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
                         owner_audio, owner_exception
                     )
                     if output_audio_waveform is None:
-                        output_audio_waveform = _canonical_output_audio_waveform(
-                            audio_waveform, batch_size=batch_size
+                        output_audio_waveform = finish_audio(
+                            audio_waveform, audio_sample_rate
                         )
                     if stream is not None:
                         output_file_paths = stream.finish()

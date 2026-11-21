@@ -58,6 +58,7 @@ def decoder_setup(monkeypatch):
                     latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
                 )
             ),
+            trim_audio_to_video=False,
             post_decoding=lambda x, _args: x,
         ),
     )
@@ -98,22 +99,32 @@ def test_audio_decoded_first_is_shared_after_the_video(monkeypatch, decoder_setu
     assert output.audio_sample_rate == 32000
 
 
+@pytest.mark.parametrize("trim_audio", [False, True])
 def test_overlapped_audio_feeds_the_encoder_and_is_shared_before_it_closes(
-    monkeypatch, decoder_setup
+    monkeypatch, decoder_setup, trim_audio
 ):
     stage, batch, args, frames, events = decoder_setup
-    waveform = torch.randn(2, 1, 16)
+    batch.num_frames, batch.fps = 1, 10
+    args.pipeline_config.trim_audio_to_video = trim_audio
+    waveform = torch.randn(2, 1, 3216)
     output_waveform = waveform.permute(1, 0, 2)
+    if trim_audio:
+        output_waveform = output_waveform[..., :3200]
     payload = {"waveform": waveform, "sample_rate": 32000}
     job = Future()
-    job.set_result((payload, output_waveform, output_waveform[0]))
-    start = Mock(return_value=job)
+
+    def start_decode(_latent, _args, finish):
+        decoded = finish(waveform, payload["sample_rate"])
+        job.set_result((payload, decoded, decoded[0]))
+        return job
+
+    start = Mock(side_effect=start_decode)
     monkeypatch.setattr(stage, "_overlaps_audio_decode", lambda _args: True)
     monkeypatch.setattr(stage, "_start_owner_audio", start)
     monkeypatch.setattr(
         stage,
         "_join_owner_audio",
-        lambda started: events.append("join") or (payload, output_waveform, None),
+        lambda started: events.append("join") or (payload, started.result()[1], None),
     )
     monkeypatch.setattr(
         stage,
