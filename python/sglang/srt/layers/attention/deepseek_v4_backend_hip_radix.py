@@ -101,6 +101,7 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
     flash_mla_with_kvcache_entrypoint,
     hip_attn_kv_splits,
+    hip_kv_layout_interleaved,
     resolve_hip_flashmla_backend,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -3476,6 +3477,12 @@ class DeepseekV4HipRadixBackend(
             )
             if inv_rope is not None:
                 input_dict["inv_rope"] = inv_rope
+            if backend == "aiter_sparse" and hip_kv_layout_interleaved():
+                if core_attn_metadata._aiter_sparse_masked_indices is None:
+                    core_attn_metadata._aiter_sparse_masked_indices = {}
+                input_dict["csr_cache"] = (
+                    core_attn_metadata._aiter_sparse_masked_indices
+                )
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)
