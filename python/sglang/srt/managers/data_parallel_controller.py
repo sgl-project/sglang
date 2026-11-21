@@ -38,6 +38,7 @@ from sglang.srt.elastic_ep.topology import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -68,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    is_control_broadcast_local,
     publish,
 )
 from sglang.srt.server_args import (
@@ -247,8 +249,9 @@ class DataParallelController:
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
-            self.control_message_step = 1 if local_ctrl else get_parallel().tp_size
+            self.control_message_step = (
+                1 if is_control_broadcast_local() else get_parallel().tp_size
+            )
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
@@ -394,6 +397,9 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                # A scheduler ignores an abort for a rid it has not received yet,
+                # so every DP rank gets the abort on the socket its requests use.
+                (AbortReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
@@ -826,6 +832,9 @@ class DataParallelController:
                     for info in self._scheduler_init_infos
                 ]
             )
+            for info in self._scheduler_init_infos:
+                if info.get("router_l3_layout"):
+                    init_info["router_l3_layout"] = info["router_l3_layout"]
         if layout is not None:
             init_info["hicache_object_layout"] = layout
         return init_info
@@ -971,9 +980,7 @@ def run_data_parallel_controller_process(
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             init_info["kv_event_sources"] = sorted(
                 controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )

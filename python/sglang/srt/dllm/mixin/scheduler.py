@@ -59,6 +59,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
+        self._ack_waiting_health_checks()
         self.waiting_queue.reorder(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
@@ -188,7 +189,12 @@ class SchedulerDllmMixin:
             not req.finished()
             and req.seqlen + self.dllm_config.block_size > self.model_config.context_len
         ):
-            req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
+            req.finish_outside_step(
+                FINISH_LENGTH(
+                    length=len(req.output_ids),
+                    ignored_stop_position=req.ignored_stop_token_len,
+                )
+            )
 
         if req.finished():
             self.request_retirer.release(

@@ -8,6 +8,7 @@ frontier per band in place, so the two are independent derivations.
 
 import random
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     FLUSH_ENDS,
@@ -245,6 +246,8 @@ class TestChainPlan(CustomTestCase):
                 got = plan(chain, demands, step) is not None
                 counts[step][expected] += 1
                 self.assertEqual(got, expected, (step, chain, demands))
+                if step == RELAYOUT:
+                    self.assertEqual(feasible(chain, demands), expected)
         # Both answers occur at every step: the generator exercises the edges.
         for step, (no, yes) in counts.items():
             self.assertGreater(min(no, yes), 200, step)
@@ -311,6 +314,19 @@ class TestChainPlan(CustomTestCase):
                             span[0] < blocks[name][1] and blocks[name][0] < span[1]
                         )
                 done.add(name)
+
+    def test_feasibility_never_lays_a_layout_out(self):
+        """Whether a demand fits is decided by the planner's walk over the
+        bands left in place; placing a segment's floats, which only a take
+        needs, is never done to answer it."""
+        with patch(
+            "sglang.srt.mem_cache.kv.alloc.pricing._segment_blocks",
+            side_effect=AssertionError("feasibility laid a layout out"),
+        ):
+            answers = {
+                feasible(chain, demands) for chain, demands, _ in _instances(5, 500)
+            }
+        self.assertEqual(answers, {True, False})
 
     def test_feasibility_is_downward_closed(self):
         for chain, demands, rng in _instances(4, 2000):
