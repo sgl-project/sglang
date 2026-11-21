@@ -477,6 +477,7 @@ fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
 /// (Python `TokenizerManager._validate_one_request`).
 #[test]
 fn hidden_states_gated_on_server_support() {
+    use HiddenStatesMode::{Full, Last, Null};
     let req = |want| {
         let mut r = generate_req(31, SamplingParams::default());
         if let RequestKind::Generate(g) = &mut r.kind {
@@ -484,8 +485,30 @@ fn hidden_states_gated_on_server_support() {
         }
         r
     };
+    // Request mode x server mode: refused exactly when the request is above
+    // the server, `not configured` on a server that captures nothing.
+    for server in [Null, Last, Full] {
+        let limits = Limits {
+            return_hidden_states_mode: server,
+            ..test_limits()
+        };
+        for want in [Null, Last, Full] {
+            let got = validate(&mut req(want), &limits).map_err(|e| e.to_string());
+            match (want > server, server) {
+                (false, _) => assert!(got.is_ok(), "{want:?} on {server:?}: {got:?}"),
+                (true, Null) => assert!(
+                    got.as_ref().is_err_and(|e| e.contains("not configured")),
+                    "{want:?} on {server:?}: {got:?}"
+                ),
+                (true, _) => assert!(
+                    got.as_ref().is_err_and(|e| e.contains("exceeds")),
+                    "{want:?} on {server:?}: {got:?}"
+                ),
+            }
+        }
+    }
     let disabled = test_limits();
-    let err = validate(&mut req(true), &disabled).unwrap_err();
+    let err = validate(&mut req(Full), &disabled).unwrap_err();
     assert!(matches!(err, Error::Validation(_)));
     assert!(
         err.to_string().contains(
@@ -496,25 +519,25 @@ fn hidden_states_gated_on_server_support() {
     // Not asking for them (the client sent `false`, or sent nothing and
     // `into_requests` resolved the default), or asking on a server that
     // supports them, is fine.
-    assert!(validate(&mut req(false), &disabled).is_ok());
+    assert!(validate(&mut req(Null), &disabled).is_ok());
     let enabled = Limits {
         return_hidden_states_mode: HiddenStatesMode::Full,
         ..test_limits()
     };
-    assert!(validate(&mut req(true), &enabled).is_ok());
+    assert!(validate(&mut req(Full), &enabled).is_ok());
     // `true` asks for `full`, above a server launched with `last`.
     let last = Limits {
         return_hidden_states_mode: HiddenStatesMode::Last,
         ..test_limits()
     };
-    let err = validate(&mut req(true), &last).unwrap_err();
+    let err = validate(&mut req(Full), &last).unwrap_err();
     assert!(matches!(err, Error::Validation(_)));
     assert!(
         err.to_string()
             .contains("exceeds the server maximum `last`. Please launch with `--return-hidden-states-mode full`"),
         "message must name the mode and the flag: {err}"
     );
-    assert!(validate(&mut req(false), &last).is_ok());
+    assert!(validate(&mut req(Null), &last).is_ok());
 }
 
 /// The server's hidden-state mode survives the handoff from Python's resolved `server_args`

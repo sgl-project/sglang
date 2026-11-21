@@ -16,7 +16,7 @@ use super::response::ResponseSink;
 use super::sampling::SamplingParams;
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use super::wire;
-use crate::message::config::ServerArgs;
+use crate::message::config::{HiddenStatesMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
@@ -160,7 +160,10 @@ pub fn into_requests(
     let logprob_start_len = logprob_start_len.and_then(wire::int64_or_list);
     let top_logprobs_num = top_logprobs_num.and_then(wire::int64_or_list);
     let token_ids_logprob = token_ids_logprob.and_then(wire::token_ids_or_list);
-    let return_hidden_states = return_hidden_states.and_then(wire::bool_or_list);
+    let return_hidden_states = return_hidden_states
+        .map(wire::return_hidden_states_or_list)
+        .transpose()?
+        .flatten();
     let bootstrap_host = bootstrap_host.and_then(wire::optional_string_or_list);
     let bootstrap_port = bootstrap_port.and_then(wire::optional_int64_or_list);
     let bootstrap_room = bootstrap_room.and_then(wire::optional_int64_or_list);
@@ -514,7 +517,7 @@ pub fn into_requests(
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
                 // A client that asks for the mask is refused above.
                 return_sampling_mask: false,
-                return_hidden_states: return_hidden_states.unwrap_or(false),
+                return_hidden_states: return_hidden_states.unwrap_or_default(),
                 return_text_in_logprobs,
                 bootstrap_host,
                 bootstrap_port,
@@ -713,7 +716,7 @@ pub struct GenerateRequest {
     /// Rides the ring as the `token_ids_logprob` buffer, nil in the header.
     pub token_ids_logprob: Option<TokenIds>,
     pub return_sampling_mask: bool,
-    pub return_hidden_states: bool,
+    pub return_hidden_states: HiddenStatesMode,
     /// Decode logprob token ids to text in each `[logprob, token_id, text]` tuple
     /// (default leaves the text slot null). Deliberately NOT in the scheduler
     /// header — Python's `TokenizedGenerateReqInput` has no such field either;
@@ -1030,6 +1033,11 @@ pub(super) trait HeapBytes {
     fn heap_bytes(&self) -> usize;
 }
 impl HeapBytes for bool {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+impl HeapBytes for HiddenStatesMode {
     fn heap_bytes(&self) -> usize {
         0
     }
@@ -1506,6 +1514,64 @@ mod tests {
         }
     }
 
+    /// `return_hidden_states` is a mode per item: `false`, `true` (every
+    /// position) or `"last"`, alone or in a batch list. Any other string is
+    /// Python's error.
+    #[test]
+    fn return_hidden_states_is_a_mode_per_item() {
+        use HiddenStatesMode::{Full, Last, Null};
+        let modes = |body: &str| {
+            let (ps, _) = requests(body).unwrap();
+            ps.iter()
+                .map(|p| p.return_hidden_states)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(modes(r#"{"text": "hi"}"#), [Null]);
+        assert_eq!(
+            modes(r#"{"text": "hi", "return_hidden_states": true}"#),
+            [Full]
+        );
+        assert_eq!(
+            modes(r#"{"text": "hi", "return_hidden_states": "last"}"#),
+            [Last]
+        );
+        assert_eq!(
+            modes(r#"{"text": "hi", "return_hidden_states": ["last"]}"#),
+            [Last]
+        );
+        assert_eq!(
+            modes(r#"{"text": ["a", "b"], "return_hidden_states": [false, "last"]}"#),
+            [Null, Last]
+        );
+        assert_eq!(
+            modes(r#"{"text": ["a", "b"], "return_hidden_states": "last"}"#),
+            [Last, Last]
+        );
+        let err = requests(r#"{"text": "hi", "return_hidden_states": "full"}"#)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "return_hidden_states must be a boolean or the string literal 'last'."
+        );
+        // The HTTP handler asks for the same error before a stream starts.
+        let contract_error = |body: &str| {
+            let body: sglang_api_types::api::v1::GenerateRequest =
+                serde_json::from_str(body).unwrap();
+            body.return_hidden_states
+                .as_ref()
+                .and_then(wire::return_hidden_states_contract_error)
+        };
+        assert_eq!(
+            contract_error(r#"{"text": "hi", "return_hidden_states": ["last", "full"]}"#),
+            Some(err.as_str())
+        );
+        assert_eq!(
+            contract_error(r#"{"text": ["a", "b"], "return_hidden_states": [true, "last"]}"#),
+            None
+        );
+    }
+
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a
     /// single string passes through for a single request, fans out as
     /// `{rid}_{i}` for a batch, and a list must match the batch length. An
@@ -1776,7 +1842,8 @@ mod tests {
         assert!(!ps[1].return_logprob);
         assert_eq!(ps[0].logprob_start_len, 0);
         assert_eq!(ps[1].logprob_start_len, 2);
-        assert!(ps[1].return_hidden_states);
+        assert_eq!(ps[0].return_hidden_states, HiddenStatesMode::Null);
+        assert_eq!(ps[1].return_hidden_states, HiddenStatesMode::Full);
 
         let err = requests(r#"{"text": ["a", "b"], "return_logprob": [true]}"#).unwrap_err();
         assert!(

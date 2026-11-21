@@ -946,11 +946,37 @@ pub enum DisaggregationMode {
 
 /// How much of the hidden states a request asks for or a server allows,
 /// ordered like Python's `CaptureHiddenMode`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HiddenStatesMode {
+    #[default]
     Null,
     Last,
     Full,
+}
+
+impl HiddenStatesMode {
+    /// Why a server whose limit is `self` refuses a request for `requested`,
+    /// if it does (Python `TokenizerManager._validate_one_request`).
+    pub fn refusal(self, requested: Self) -> Option<&'static str> {
+        if requested <= self {
+            return None;
+        }
+        Some(match self {
+            Self::Null => {
+                "The server is not configured to return hidden states. \
+                 Please set `--return-hidden-states-mode last`, \
+                 `--return-hidden-states-mode full`, or the legacy \
+                 `--enable-return-hidden-states` flag."
+            }
+            // Nothing is above `full`, so the exceeded maximum is `last`.
+            Self::Last | Self::Full => {
+                "The requested return_hidden_states mode exceeds the server \
+                 maximum `last`. Please launch with \
+                 `--return-hidden-states-mode full` to allow \
+                 return_hidden_states=True."
+            }
+        })
+    }
 }
 
 impl DisaggregationMode {
@@ -960,6 +986,17 @@ impl DisaggregationMode {
             Self::Null => "null",
             Self::Prefill => "prefill",
             Self::Decode => "decode",
+        }
+    }
+}
+
+/// Python's `ReturnHiddenStatesMode`: `false`, `"last"` or `true`.
+impl Serialize for HiddenStatesMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_bool(false),
+            Self::Last => serializer.serialize_str("last"),
+            Self::Full => serializer.serialize_bool(true),
         }
     }
 }

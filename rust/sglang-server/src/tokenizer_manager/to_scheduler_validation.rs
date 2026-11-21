@@ -82,28 +82,11 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // Python `TokenizerManager._validate_one_request`.
     // A request above the server's mode raises in a CUDA graph captured for the lower mode.
     let requested = match &req.kind {
-        RequestKind::Generate(g) if g.return_hidden_states => HiddenStatesMode::Full,
+        RequestKind::Generate(g) => g.return_hidden_states,
         _ => HiddenStatesMode::Null,
     };
-    if requested > limits.return_hidden_states_mode {
-        return Err(Error::Validation(
-            match limits.return_hidden_states_mode {
-                HiddenStatesMode::Null => {
-                    "The server is not configured to return hidden states. \
-                     Please set `--return-hidden-states-mode last`, \
-                     `--return-hidden-states-mode full`, or the legacy \
-                     `--enable-return-hidden-states` flag."
-                }
-                // Nothing is above `full`, so the exceeded maximum is `last`.
-                HiddenStatesMode::Last | HiddenStatesMode::Full => {
-                    "The requested return_hidden_states mode exceeds the server \
-                     maximum `last`. Please launch with \
-                     `--return-hidden-states-mode full` to allow \
-                     return_hidden_states=True."
-                }
-            }
-            .into(),
-        ));
+    if let Some(message) = limits.return_hidden_states_mode.refusal(requested) {
+        return Err(Error::Validation(message.into()));
     }
 
     Ok(())

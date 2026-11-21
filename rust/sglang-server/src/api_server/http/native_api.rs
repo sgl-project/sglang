@@ -29,7 +29,9 @@ use crate::message::ids::Rid;
 use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
 use crate::message::response::{CustomizedInfo, RequestStats};
-use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
+use crate::message::wire::{
+    ClientMaxNewTokens, merge_preferred_sampling, return_hidden_states_contract_error,
+};
 use crate::utils::{
     environ,
     response::{error_response, error_value, sse_error_response, sse_response},
@@ -789,6 +791,15 @@ pub(super) fn generate_requests(
         Ok(body) => body,
         Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string(), false)),
     };
+    // A `return_hidden_states` string other than `"last"` is outside the
+    // contract too: a plain 400 even for a stream, as Python's is.
+    if let Some(message) = body
+        .return_hidden_states
+        .as_ref()
+        .and_then(return_hidden_states_contract_error)
+    {
+        return Err((StatusCode::BAD_REQUEST, message.into(), false));
+    }
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
@@ -914,10 +925,13 @@ pub(super) async fn drain_unary_frame(
 /// then either (unary) drain them concurrently into a request-ordered JSON array,
 /// or (streaming) multiplex their streams into one SSE response, each frame carrying
 /// its `index`.
-/// Each submitted call owns its own cancellation. A failed unary item is its
-/// own `{ "error": … }` entry; the batch response is 200. This differs from
-/// Python on purpose: there, one item failing validation fails the whole batch
-/// with a single 400.
+/// Each submitted call owns its own cancellation. A unary item that fails
+/// after admission is its own `{ "error": … }` entry; the batch response is
+/// 200. This differs from Python on purpose: there, one item failing
+/// validation fails the whole batch with a single 400. A refusal at the core's
+/// admission (a DP rank, a `return_hidden_states` above the server's mode, the
+/// launch's validator) fails the whole batch here too, before any item is
+/// submitted.
 async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
@@ -2953,7 +2967,7 @@ mod tests {
             input_top_logprobs: vec![Default::default()],
             output_token_ids_logprobs: vec![Default::default()],
             input_token_ids_logprobs: vec![Default::default()],
-            hidden_states: vec![Default::default()],
+            hidden_states: Some(Default::default()),
             e2e_latency: Some(0.0),
             cached_tokens: 0,
             reasoning_tokens: 0,

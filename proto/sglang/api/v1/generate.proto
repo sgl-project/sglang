@@ -30,7 +30,9 @@ message GenerateRequest {
   Int64OrList logprob_start_len = 7;
   Int64OrList top_logprobs_num = 8;
   TokenIdsOrList token_ids_logprob = 9;
-  BoolOrList return_hidden_states = 10;
+  // true: every position. false: none. "last": the final position's
+  // vector only. The schema takes any string; the server checks it.
+  BoolOrStringOrList return_hidden_states = 10;
   optional bool return_text_in_logprobs = 11;
   // PD bootstrap columns: a batch mixes bootstrapped and plain requests, so
   // elements are individually nullable.
@@ -176,6 +178,37 @@ message HiddenStateRow {
   repeated double values = 1;
 }
 
+message HiddenStateRows {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated HiddenStateRow rows = 1;
+}
+
+// One entry of a `return_hidden_states: true` list: the prefill step gives
+// one row per token (`matrix`), a decode step gives one row (`vector`).
+message HiddenStateItem {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    HiddenStateRow vector = 1;
+    HiddenStateRows matrix = 2;
+  }
+}
+
+message HiddenStateItems {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated HiddenStateItem items = 1;
+}
+
+// `meta_info.hidden_states`: `return_hidden_states: true` gives a list of
+// items, `"last"` gives the final position's vector alone. Both are JSON
+// arrays; the first element (an array or a number) tells them apart.
+message HiddenStates {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    HiddenStateItems items = 1;
+    HiddenStateRow last = 2;
+  }
+}
+
 message GenerateMetaInfo {
   // The client's rid, byte-for-byte (`Rid::client_facing`).
   string id = 1;
@@ -192,7 +225,7 @@ message GenerateMetaInfo {
   repeated NullableTopLogprobs input_top_logprobs = 8;
   repeated NullableTopLogprobs output_token_ids_logprobs = 9;
   repeated NullableTopLogprobs input_token_ids_logprobs = 10;
-  repeated HiddenStateRow hidden_states = 11;
+  HiddenStates hidden_states = 11;
   // Seconds from normalized-request acceptance to the terminal output; only
   // on the terminal frame.
   optional double e2e_latency = 12;

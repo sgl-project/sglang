@@ -1513,7 +1513,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     logprob_start_len: Optional[Int64OrList] = None
     top_logprobs_num: Optional[Int64OrList] = None
     token_ids_logprob: Optional[TokenIdsOrList] = None
-    return_hidden_states: Optional[BoolOrList] = None
+    return_hidden_states: Optional[BoolOrStringOrList] = None
     return_text_in_logprobs: Optional[bool] = None
     bootstrap_host: Optional[OptionalStringOrList] = None
     bootstrap_port: Optional[OptionalInt64OrList] = None
@@ -1635,7 +1635,7 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     input_top_logprobs: List[NullableTopLogprobs] = []
     output_token_ids_logprobs: List[NullableTopLogprobs] = []
     input_token_ids_logprobs: List[NullableTopLogprobs] = []
-    hidden_states: List[HiddenStateRow] = []
+    hidden_states: Optional[HiddenStates] = None
     e2e_latency: Optional[float] = None
     cached_tokens: int = 0
     reasoning_tokens: int = 0
@@ -4369,6 +4369,12 @@ StringListList = List[StringList]
 # sglang.api.v1.BoolList: JSON bare array.
 BoolList = List[bool]
 
+# sglang.api.v1.BoolOrString: JSON: the value's shape picks the arm.
+BoolOrString = Union[bool, str]
+
+# sglang.api.v1.BoolOrStringList: JSON bare array.
+BoolOrStringList = List[BoolOrString]
+
 # sglang.api.v1.Int64List: JSON bare array.
 Int64List = List[int]
 
@@ -4440,6 +4446,18 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
+
+# sglang.api.v1.HiddenStateRows: JSON bare array.
+HiddenStateRows = List[HiddenStateRow]
+
+# sglang.api.v1.HiddenStateItem: JSON: the value's shape picks the arm.
+HiddenStateItem = Union[HiddenStateRow, HiddenStateRows]
+
+# sglang.api.v1.HiddenStateItems: JSON bare array.
+HiddenStateItems = List[HiddenStateItem]
+
+# sglang.api.v1.HiddenStates: JSON: the value's shape picks the arm.
+HiddenStates = Union[HiddenStateItems, HiddenStateRow]
 
 # sglang.api.v1.ImageGridThw: JSON bare array.
 ImageGridThw = List[Int64List]
@@ -4527,6 +4545,9 @@ StringListOrList = Union[StringList, StringListList]
 
 # sglang.api.v1.BoolOrList: JSON: one value or an array of values.
 BoolOrList = Union[bool, BoolList]
+
+# sglang.api.v1.BoolOrStringOrList: JSON: the value's shape picks the arm.
+BoolOrStringOrList = Union[BoolOrString, BoolOrStringList]
 
 # sglang.api.v1.Int64OrList: JSON: one value or an array of values.
 Int64OrList = Union[int, Int64List]
@@ -4625,6 +4646,48 @@ def decode_BoolList(value: Any) -> BoolList:
 
 def encode_BoolList(v: BoolList) -> List[Any]:
     return list(v)
+
+
+def decode_BoolOrString(value: Any) -> BoolOrString:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value
+    raise _invalid_type(value, expected="one of the BoolOrString shapes")
+
+
+def encode_BoolOrString(v: BoolOrString) -> Any:
+    if isinstance(v, (bool,)):
+        return v
+    if isinstance(v, (str,)):
+        return v
+    return v
+
+
+def decode_BoolOrStringOrList(value: Any) -> BoolOrStringOrList:
+    if isinstance(value, bool):
+        return decode_BoolOrString(value)
+    if isinstance(value, str):
+        return decode_BoolOrString(value)
+    if isinstance(value, list):
+        return decode_BoolOrStringList(value)
+    raise _invalid_type(value, expected="one of the BoolOrStringOrList shapes")
+
+
+def encode_BoolOrStringOrList(v: BoolOrStringOrList) -> Any:
+    if isinstance(v, (bool, str,)):
+        return encode_BoolOrString(v)
+    if isinstance(v, (list,)):
+        return encode_BoolOrStringList(v)
+    return v
+
+
+def decode_BoolOrStringList(value: Any) -> BoolOrStringList:
+    return [decode_BoolOrString(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_BoolOrStringList(v: BoolOrStringList) -> List[Any]:
+    return [encode_BoolOrString(e) for e in v]
 
 
 def decode_Int64OrList(value: Any) -> Int64OrList:
@@ -7027,7 +7090,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "token_ids_logprob":
             kw["token_ids_logprob"] = None if x is None else decode_TokenIdsOrList(x)
         elif key == "return_hidden_states":
-            kw["return_hidden_states"] = None if x is None else decode_BoolOrList(x)
+            kw["return_hidden_states"] = None if x is None else decode_BoolOrStringOrList(x)
         elif key == "return_text_in_logprobs":
             kw["return_text_in_logprobs"] = None if x is None else _expect_bool(x, expected="a boolean")
         elif key == "bootstrap_host":
@@ -7110,7 +7173,7 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
     if v.token_ids_logprob is not None:
         d["token_ids_logprob"] = encode_TokenIdsOrList(v.token_ids_logprob)
     if v.return_hidden_states is not None:
-        d["return_hidden_states"] = encode_BoolOrList(v.return_hidden_states)
+        d["return_hidden_states"] = encode_BoolOrStringOrList(v.return_hidden_states)
     if v.return_text_in_logprobs is not None:
         d["return_text_in_logprobs"] = v.return_text_in_logprobs
     if v.bootstrap_host is not None:
@@ -7335,6 +7398,62 @@ def encode_HiddenStateRow(v: HiddenStateRow) -> List[Any]:
     return [float(e) for e in v]
 
 
+def decode_HiddenStateRows(value: Any) -> HiddenStateRows:
+    return [decode_HiddenStateRow(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_HiddenStateRows(v: HiddenStateRows) -> List[Any]:
+    return [encode_HiddenStateRow(e) for e in v]
+
+
+def decode_HiddenStateItem(value: Any) -> HiddenStateItem:
+    if isinstance(value, list):
+        if not value:
+            return decode_HiddenStateRow(value)
+        if _is_int(value[0]) or _is_number(value[0]):
+            return decode_HiddenStateRow(value)
+        if isinstance(value[0], list):
+            return decode_HiddenStateRows(value)
+        raise _invalid_type(value, expected="one of the HiddenStateItem list shapes")
+    raise _invalid_type(value, expected="one of the HiddenStateItem shapes")
+
+
+def encode_HiddenStateItem(v: HiddenStateItem) -> Any:
+    if isinstance(v, list) and (not v or _is_int(v[0]) or _is_number(v[0])):
+        return encode_HiddenStateRow(v)
+    if isinstance(v, list) and bool(v) and (isinstance(v[0], list)):
+        return encode_HiddenStateRows(v)
+    return v
+
+
+def decode_HiddenStateItems(value: Any) -> HiddenStateItems:
+    return [decode_HiddenStateItem(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_HiddenStateItems(v: HiddenStateItems) -> List[Any]:
+    return [encode_HiddenStateItem(e) for e in v]
+
+
+def decode_HiddenStates(value: Any) -> HiddenStates:
+    if isinstance(value, list):
+        if not value:
+            return decode_HiddenStateItems(value)
+        if isinstance(value[0], list):
+            return decode_HiddenStateItems(value)
+        if _is_int(value[0]) or _is_number(value[0]):
+            return decode_HiddenStateRow(value)
+        raise _invalid_type(value, expected="one of the HiddenStates list shapes")
+    raise _invalid_type(value, expected="one of the HiddenStates shapes")
+
+
+def encode_HiddenStates(v: HiddenStates) -> Any:
+    if isinstance(v, list) and (not v or isinstance(v[0], list)):
+        return encode_HiddenStateItems(v)
+    if isinstance(v, list) and bool(v) and (_is_int(v[0]) or _is_number(v[0])):
+        return encode_HiddenStateRow(v)
+    return v
+
+
 def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
     m = _expect_map(value, expected="struct GenerateMetaInfo")
     kw: Dict[str, Any] = {}
@@ -7360,7 +7479,7 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
         elif key == "input_token_ids_logprobs":
             kw["input_token_ids_logprobs"] = [] if x is None else [decode_NullableTopLogprobs(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "hidden_states":
-            kw["hidden_states"] = [] if x is None else [decode_HiddenStateRow(e) for e in _expect_seq(x, expected="a sequence")]
+            kw["hidden_states"] = None if x is None else decode_HiddenStates(x)
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
         elif key == "cached_tokens":
@@ -7404,8 +7523,8 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["output_token_ids_logprobs"] = [encode_NullableTopLogprobs(e) for e in v.output_token_ids_logprobs]
     if v.input_token_ids_logprobs:
         d["input_token_ids_logprobs"] = [encode_NullableTopLogprobs(e) for e in v.input_token_ids_logprobs]
-    if v.hidden_states:
-        d["hidden_states"] = [encode_HiddenStateRow(e) for e in v.hidden_states]
+    if v.hidden_states is not None:
+        d["hidden_states"] = encode_HiddenStates(v.hidden_states)
     if v.e2e_latency is not None:
         d["e2e_latency"] = float(v.e2e_latency)
     d["cached_tokens"] = v.cached_tokens
