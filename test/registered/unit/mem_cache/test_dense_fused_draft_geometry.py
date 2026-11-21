@@ -198,12 +198,12 @@ class TestDraftPartAlignment(unittest.TestCase):
             self.assertTrue(torch.all(tensor[:, 6] == 0))
 
 
-class TestDraftMHAView(unittest.TestCase):
+class TestDraftMHAView(CustomTestCase):
     PS = 2
     PAGES = 8
 
-    def _pool(self):
-        spec = _host_spec(_draft_region())
+    def _pool(self, region=None):
+        spec = _host_spec(region or _draft_region())
         swa = MHASubPoolSpec(
             name="swa",
             layer_num=1,
@@ -246,6 +246,25 @@ class TestDraftMHAView(unittest.TestCase):
         self.assertEqual(
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), spec.entry_bytes()
         )
+
+    def test_stacked_draft_buffers_follow_the_bound_lanes(self):
+        region = DenseDraftRegion(
+            lane_num=5, head_num=2, head_dim=8, store_dtype=_DTYPE
+        )
+        pool = self._pool(region)
+        view = DraftMHAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
+            layer_lanes={4: 3, 5: 1, 6: 2},
+            page_size=self.PS,
+        )
+        self.assertIsNone(view.stacked_kv_buffers([4, 5, 6]))
+        k, v = view.stacked_kv_buffers([5, 6, 4])
+        keys, values = pool.spec("full").draft_views(pool)
+        for i, lane in enumerate((1, 2, 3)):
+            for stack, rows in ((k, keys), (v, values)):
+                self.assertEqual(stack[i].data_ptr(), rows[lane].data_ptr())
+                self.assertEqual(stack[i].stride(), rows[lane].stride())
 
     def test_host_page_move_carries_the_draft_bytes(self):
         # Compaction relocates whole page envelopes on the HOST pool: a draft
@@ -807,6 +826,7 @@ class TestRoutedDraftPool(CustomTestCase):
 
         arena, pool, full, swa, values = self._write_fixture(symmetric=True)
         worker = object.__new__(DFlashWorkerV2)
+        worker._draft_kv_cache_buffers = None
         worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
         worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
         worker.draft_parallel_layout = None
@@ -859,6 +879,141 @@ class TestRoutedDraftPool(CustomTestCase):
                         )
                     self.assertTrue(torch.equal(arena.raw, expected))
                     self.assertEqual(worker._use_fused_kv_materialize, fused)
+
+    def test_dflash_direct_prefix_stores_use_the_pool_writers_ids(self):
+        """A draft bound for direct prefix stores must commit the rows, at the IDs, its pool writer does."""
+        from sglang.srt.speculative import dflash_worker_v2
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        full_ids = torch.tensor([[14, 15, 16], [17, 18, 19]], dtype=torch.int64)
+        swa_ids = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.int64)
+        commit_lens = torch.tensor([2, 1], dtype=torch.int32)
+        values = [
+            tuple(
+                sign * (torch.arange(48, dtype=_DTYPE).view(6, 1, 8) + 1 + 64 * layer)
+                for sign in (1, -1)
+            )
+            for layer in range(2)
+        ]
+
+        class Materializer:
+            num_kv_heads, head_dim = 1, 8
+
+            def __init__(self, dtype):
+                self.flat_kv_weight = torch.empty(0, dtype=dtype)
+
+            def materialize(
+                self,
+                ctx_hidden,
+                positions,
+                write_layer_kv=None,
+                *,
+                cache_buffers=None,
+                cache_locs=None,
+                commit_lens=None,
+            ):
+                if cache_buffers is None:
+                    for layer_id, (k, v) in enumerate(values):
+                        write_layer_kv(layer_id, k, v)
+                    return
+                valid = (
+                    torch.arange(cache_locs.shape[1])[None, :] < commit_lens[:, None]
+                )
+                for buffer, rows in zip(cache_buffers, zip(*values)):
+                    for layer_id, source in enumerate(rows):
+                        buffer[layer_id][cache_locs[valid]] = source[valid.flatten()]
+
+        def bind(worker):
+            with patch.object(
+                dflash_worker_v2,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=1),
+            ):
+                worker._bind_draft_kv_cache_buffers()
+            return worker._draft_kv_cache_buffers
+
+        for host in ("full", "swa"):
+            with self.subTest(host=host):
+                region = DenseDraftRegion(
+                    lane_num=2, head_num=1, head_dim=8, store_dtype=_DTYPE
+                )
+                specs = [
+                    MHASubPoolSpec(
+                        name=name,
+                        layer_num=1,
+                        head_num=2,
+                        head_dim=4,
+                        store_dtype=_DTYPE,
+                        grow_direction=grow,
+                        draft_region=region if name == host else None,
+                    )
+                    for name, grow in (("full", "down"), ("swa", "up"))
+                ]
+                arena = arena_of(
+                    total_bytes=self.PAGES
+                    * self.PS
+                    * sum(spec.entry_bytes() for spec in specs),
+                    sub_pool_specs=specs,
+                    device=_DEV,
+                    page_size=self.PS,
+                    fused_draft=FusedDraftPlacement.from_counts(
+                        counts={host: [2]},
+                        regions={host: region},
+                        hosted={"swa": "window"},
+                    ),
+                )
+                worker = object.__new__(DFlashWorkerV2)
+                worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
+                worker.draft_model_runner = SimpleNamespace(
+                    token_to_kv_pool=routed_draft_pool(
+                        arena=arena,
+                        plan=plan_stand_in(arena),
+                        owner="full",
+                        page_size=self.PS,
+                        lanes_by_host={host: {0: 0, 1: 1}},
+                    )
+                )
+                worker.draft_parallel_layout = None
+                worker.lilicorr = None
+                worker.draft_model = SimpleNamespace(
+                    layers=self._draft_layers(values),
+                    project_target_hidden=lambda hidden: hidden,
+                )
+                worker._use_fused_kv_materialize = True
+                worker._fused_kv_helper = Materializer(torch.float16)
+                self.assertIsNone(bind(worker))
+                worker._fused_kv_helper = Materializer(_DTYPE)
+                self.assertIsNotNone(bind(worker))
+
+                written = []
+                for buffers in (worker._draft_kv_cache_buffers, None):
+                    worker._draft_kv_cache_buffers = buffers
+                    arena.raw.fill_(0x5A)
+                    with (
+                        patch.multiple(
+                            mem_pool,
+                            _is_cuda=False,
+                            _is_hip=False,
+                            _cpu_has_amx_support=False,
+                        ),
+                        patch.object(
+                            dflash_worker_v2,
+                            "draft_tp_context",
+                            return_value=nullcontext(),
+                        ),
+                    ):
+                        worker._append_target_hidden_to_draft_kv_by_loc(
+                            target_hidden=torch.ones((6, 8), dtype=_DTYPE),
+                            cache_loc=full_ids.flatten(),
+                            swa_cache_loc=swa_ids.flatten(),
+                            positions=torch.arange(6),
+                            cache_loc_2d=full_ids,
+                            commit_lens=commit_lens,
+                        )
+                    self.assertTrue(worker._use_fused_kv_materialize)
+                    written.append(arena.raw.clone())
+                self.assertFalse(torch.all(written[1] == 0x5A))
+                self.assertTrue(torch.equal(written[0], written[1]))
 
     def test_dspark_context_injector_uses_both_plan_id_spaces(self):
         """DSpark's projected context must commit into both routed hosts without touching rejected rows."""
