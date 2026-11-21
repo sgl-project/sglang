@@ -462,36 +462,6 @@ def selective_state_update(
         assert state_batch_indices.shape == (batch,)
     assert out.shape == x.shape
 
-    if x.device.type == "cpu":
-        if (
-            intermediate_states_buffer is not None
-            or retrieve_parent_token is not None
-            or intermediate_state_indices is not None
-            or enable_stochastic_rounding
-        ):
-            raise NotImplementedError(
-                "The native CPU selective state update does not support speculative-state caching"
-            )
-        import sgl_kernel  # noqa: F401
-
-        torch.ops.sgl_kernel.selective_state_update_cpu(
-            state,
-            x,
-            dt,
-            A,
-            B,
-            C,
-            D,
-            z,
-            dt_bias,
-            dt_softplus,
-            state_batch_indices,
-            pad_slot_id,
-            disable_state_update,
-            out,
-        )
-        return
-
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3))

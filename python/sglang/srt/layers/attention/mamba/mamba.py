@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
@@ -48,10 +48,13 @@ if is_cuda() or is_hip():
         causal_conv1d_update,
     )
 elif is_cpu():
-    from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
+    import importlib
 
-    causal_conv1d_fn = causal_conv1d_fn_cpu
-    causal_conv1d_update = causal_conv1d_update_cpu
+    _sgl_kernel_mamba = importlib.import_module("sgl_kernel.mamba")
+    causal_conv1d_fn = _sgl_kernel_mamba.causal_conv1d_fn_cpu
+    causal_conv1d_update = _sgl_kernel_mamba.causal_conv1d_update_cpu
+    mamba_chunk_scan_combined_cpu = _sgl_kernel_mamba.mamba_chunk_scan_combined
+    selective_state_update_cpu = _sgl_kernel_mamba.selective_state_update
 
 elif is_npu():
     from sgl_kernel_npu.operators.mamba import causal_conv1d_fn, causal_conv1d_update
@@ -626,35 +629,74 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
-                hidden_states_p.view(
-                    1, num_prefill_tokens, local_num_heads, self.head_dim
-                ),
-                dt_p.unsqueeze(0),
-                self.A,
-                B_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                C_p.view(1, num_prefill_tokens, local_num_groups, -1),
-                chunk_size=mixed_metadata.chunk_size,
-                D=self.D,
-                z=None,
-                dt_bias=self.dt_bias,
-                seq_idx=mixed_metadata.seq_idx,
-                chunk_indices=mixed_metadata.chunk_indices,
-                chunk_offsets=mixed_metadata.chunk_offsets,
-                cu_seqlens=query_start_loc_p,
-                initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
-                return_track_states=True,
-                track_seq_idx=metadata.track_ssm_seq_idx,
-                track_end_locs=metadata.track_ssm_end_locs,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
-                out=preallocated_ssm_out_p.view(
-                    1, num_prefill_tokens, -1, self.head_dim
-                ),
-                state_dtype=ssm_state.dtype,
-            )
+            if is_cpu():
+                cpu_scan_ret = mamba_chunk_scan_combined_cpu(
+                        hidden_states_p.view(
+                            1, num_prefill_tokens, local_num_heads, self.head_dim
+                        ),
+                        dt_p.unsqueeze(0),
+                        self.A,
+                        B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                        C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                        chunk_size=mixed_metadata.chunk_size,
+                        D=self.D,
+                        z=None,
+                        dt_bias=self.dt_bias,
+                        seq_idx=mixed_metadata.seq_idx,
+                        chunk_indices=mixed_metadata.chunk_indices,
+                        chunk_offsets=mixed_metadata.chunk_offsets,
+                        cu_seqlens=query_start_loc_p,
+                        initial_states=initial_states,
+                        return_varlen_states=True,
+                        return_final_states=False,
+                        return_track_states=True,
+                        track_seq_idx=metadata.track_ssm_seq_idx,
+                        track_end_locs=metadata.track_ssm_end_locs,
+                        dt_softplus=True,
+                        dt_limit=(0.0, float("inf")),
+                        out=preallocated_ssm_out_p.view(
+                            1, num_prefill_tokens, -1, self.head_dim
+                        ),
+                        state_dtype=ssm_state.dtype,
+                    )
+                intermediate_states, varlen_state, track_states = cast(
+                    Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
+                    cpu_scan_ret,
+                )
+            else:
+                triton_scan_ret = mamba_chunk_scan_combined(
+                        hidden_states_p.view(
+                            1, num_prefill_tokens, local_num_heads, self.head_dim
+                        ),
+                        dt_p.unsqueeze(0),
+                        self.A,
+                        B_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                        C_p.view(1, num_prefill_tokens, local_num_groups, -1),
+                        chunk_size=mixed_metadata.chunk_size,
+                        D=self.D,
+                        z=None,
+                        dt_bias=self.dt_bias,
+                        seq_idx=mixed_metadata.seq_idx,
+                        chunk_indices=mixed_metadata.chunk_indices,
+                        chunk_offsets=mixed_metadata.chunk_offsets,
+                        cu_seqlens=query_start_loc_p,
+                        initial_states=initial_states,
+                        return_varlen_states=True,
+                        return_final_states=False,
+                        return_track_states=True,
+                        track_seq_idx=metadata.track_ssm_seq_idx,
+                        track_end_locs=metadata.track_ssm_end_locs,
+                        dt_softplus=True,
+                        dt_limit=(0.0, float("inf")),
+                        out=preallocated_ssm_out_p.view(
+                            1, num_prefill_tokens, -1, self.head_dim
+                        ),
+                        state_dtype=ssm_state.dtype,
+                    )
+                intermediate_states, varlen_state, track_states = cast(
+                    Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
+                    triton_scan_ret,
+                )
 
             # update ssm states
             # - varlen state is a (num_prefills, nheads, headdim, dstate) tensor
@@ -730,8 +772,11 @@ class MambaMixer2(torch.nn.Module):
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(-1, local_num_heads, self.head_dim)
 
+            selective_state_update_impl = (
+                selective_state_update_cpu if is_cpu() else selective_state_update
+            )
             if is_target_verify:
-                selective_state_update(
+                selective_state_update_impl(
                     ssm_state,
                     hidden_states_d.view(
                         num_decodes,
@@ -766,7 +811,7 @@ class MambaMixer2(torch.nn.Module):
                     intermediate_state_indices=self.intermediate_state_indices,
                 )
             else:
-                selective_state_update(
+                selective_state_update_impl(
                     ssm_state,
                     hidden_states_d,
                     dt_d,
