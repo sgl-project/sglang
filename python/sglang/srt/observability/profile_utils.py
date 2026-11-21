@@ -17,6 +17,7 @@ from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
+from sglang.srt.observability.kernel_profile import export_kernel_summary
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
@@ -372,9 +373,9 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 + ".trace.json.gz"
             )
 
-            self.torch_profiler.export_chrome_trace(
-                os.path.join(self.output_dir, filename)
-            )
+            trace_path = Path(self.output_dir) / filename
+            self.torch_profiler.export_chrome_trace(str(trace_path))
+            export_kernel_summary(trace_path)
         torch.distributed.barrier(self.cpu_group)
 
         # TODO: migrate `_merge_profile_traces`
