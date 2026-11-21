@@ -96,8 +96,15 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track: bool,
         cache_index_dtype: torch.dtype,
         device: torch.device,
+        request_slots: Optional[int] = None,
     ) -> GDNPrefillGraphMetadata:
-        max_seqs = max(1, min(num_tokens, max_seqs_cap))
+        # A full prefill CUDA graph pads its request axis to a fixed slot count,
+        # which may exceed a small bucket's token count.
+        max_seqs = (
+            request_slots
+            if request_slots is not None
+            else max(1, min(num_tokens, max_seqs_cap))
+        )
         max_chunks = triton.cdiv(num_tokens, GDN_CHUNK_SIZE) + max_seqs
         max_conv_blocks = triton.cdiv(num_tokens, CAUSAL_CONV1D_FWD_BLOCK_M) + max_seqs
         sizes = [
