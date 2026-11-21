@@ -34,7 +34,11 @@ from sglang.srt.layers.moe.utils import AscendOpsConfig
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import get_bool_env_var, parse_connector_type
-from sglang.srt.utils.device import is_gfx1250_supported, is_sm100_supported
+from sglang.srt.utils.device import (
+    get_device_sm,
+    is_gfx1250_supported,
+    is_sm100_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +267,21 @@ def validate_flashinfer_megamoe_envs() -> None:
         )
 
 
+def validate_flashinfer_megamoe_w4a4(server_args: Any) -> None:
+    """On this backend, --enable-w4a4-mxfp4-megamoe runs FP4-expert layers on
+    FlashInfer's SM107 MXFP4 x MXFP4 MegaMoE."""
+    if not model_config_of(server_args).is_fp4_experts:
+        raise ValueError(
+            "--enable-w4a4-mxfp4-megamoe with --moe-a2a-backend flashinfer_megamoe "
+            "needs an FP4-expert (MXFP4) checkpoint."
+        )
+    if get_device_sm() != 107:
+        raise ValueError(
+            "--enable-w4a4-mxfp4-megamoe with --moe-a2a-backend flashinfer_megamoe "
+            "needs an SM107 GPU: FlashInfer's MXFP4 x MXFP4 MegaMoE is SM107-only."
+        )
+
+
 def validate_flashinfer_megamoe_model(server_args: Any) -> None:
     model_config = model_config_of(server_args)
     architectures = model_config.hf_config.architectures or []
@@ -435,6 +454,8 @@ def handle_a2a_moe(server_args: Any):
                 "FlashInfer MegaMOE currently requires an SM100-family "
                 "CUDA device for all supported quantization formats."
             )
+        if cfg.enable_w4a4_mxfp4_megamoe:
+            validate_flashinfer_megamoe_w4a4(server_args)
         if cfg.nnodes == 1 and (
             cfg.speculative_algorithm is None
             or cfg.speculative_moe_a2a_backend in (None, "none")

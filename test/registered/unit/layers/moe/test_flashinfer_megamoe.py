@@ -850,5 +850,234 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         assert layer._flashinfer_megamoe_input_norm_const == 1.0
 
 
+_SM107_WEIGHTS = (
+    "flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl.weights"
+)
+
+
+def _install_fake_fp4_moe_ep(monkeypatch, calls, *, with_sm107=True):
+    """flashinfer.moe_ep with the FP8 x FP4 (DeepGEMM) and, optionally, the SM107
+    MXFP4 x MXFP4 MegaMoE pieces the FP4-expert path uses."""
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+
+    def deepgemm_preprocess(weights, *, intermediate_size, hidden_size):
+        calls.append(("deepgemm", weights, intermediate_size, hidden_size))
+        return (weights.w13, weights.w13_scale), (weights.w2, weights.w2_scale)
+
+    def deepgemm_config(*, intermediate_size, top_k, activation_clamp=None):
+        return types.SimpleNamespace(
+            kernel_name="sm100_fp8_fp4_bf16_deepgemm",
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            activation_clamp=activation_clamp,
+        )
+
+    class Mega:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_moe_ep.MoEWeightPack = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    fake_moe_ep.preprocess_mega_weights = deepgemm_preprocess
+    fake_moe_ep.DeepGemmMegaMoeConfig = deepgemm_config
+    fake_moe_ep.BootstrapConfig = types.SimpleNamespace
+    fake_moe_ep.FleetParams = types.SimpleNamespace
+    fake_moe_ep.MegaConfig = types.SimpleNamespace
+    fake_moe_ep.MoEEpMegaLayer = Mega
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    if not with_sm107:
+        return
+
+    def sm107_config(*, intermediate_size, top_k, gate_up_clamp=None, knobs=None):
+        return types.SimpleNamespace(
+            kernel_name="sm107_mxfp4_mxfp4_bf16_cutedsl",
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            gate_up_clamp=gate_up_clamp,
+            knobs=knobs,
+        )
+
+    def expert_major(like, value_offset, dtype):
+        # Expert-major like FlashInfer's tensors, each expert's slice one dense
+        # block with the two inner dims stored transposed.
+        num_experts, rows, cols = like.shape
+        values = torch.arange(num_experts * rows * cols) + value_offset
+        storage = values.remainder(251).to(torch.uint8).view(num_experts, cols, rows)
+        return storage.transpose(1, 2).view(dtype)
+
+    def sm107_preprocess(weights, *, intermediate_size, hidden_size):
+        calls.append(("sm107", weights, intermediate_size, hidden_size))
+        return (
+            (
+                expert_major(weights.w13, 0, torch.uint8),
+                expert_major(weights.w13_sf, 1, torch.float8_e8m0fnu),
+            ),
+            (
+                expert_major(weights.w2, 2, torch.uint8),
+                expert_major(weights.w2_sf, 3, torch.float8_e8m0fnu),
+            ),
+        )
+
+    fake_moe_ep.PrequantizedMoEWeights = lambda w13, w2, w13_sf, w2_sf: (
+        types.SimpleNamespace(w13=w13, w2=w2, w13_sf=w13_sf, w2_sf=w2_sf)
+    )
+    fake_moe_ep.Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig = sm107_config
+    parts = _SM107_WEIGHTS.split(".")
+    for end in range(3, len(parts)):
+        name = ".".join(parts[:end])
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    weights_module = types.ModuleType(_SM107_WEIGHTS)
+    weights_module.preprocess_mega_weights = sm107_preprocess
+    monkeypatch.setitem(sys.modules, _SM107_WEIGHTS, weights_module)
+
+
+def _fp4_expert_layer(*, w4a4, num_local=2, hidden=64, intermediate=32):
+    param = lambda t: torch.nn.Parameter(t, requires_grad=False)  # noqa: E731
+    return types.SimpleNamespace(
+        layer_id=3,
+        hidden_size=hidden,
+        num_experts=2 * num_local,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+        intermediate_size_per_partition=intermediate,
+        top_k=2,
+        _mega_moe_w4a4=w4a4,
+        moe_runner_config=types.SimpleNamespace(
+            is_gated=True, activation="silu", swiglu_limit=10.0
+        ),
+        # FP4 weights packed two per byte; FP32 power-of-two scales per 32 values.
+        w13_weight=param(
+            torch.zeros(num_local, 2 * intermediate, hidden // 2, dtype=torch.uint8)
+        ),
+        w2_weight=param(
+            torch.zeros(num_local, hidden, intermediate // 2, dtype=torch.uint8)
+        ),
+        w13_weight_scale_inv=param(
+            torch.full((num_local, 2 * intermediate, hidden // 32), 0.5)
+        ),
+        w2_weight_scale_inv=param(
+            torch.full((num_local, hidden, intermediate // 32), 4.0)
+        ),
+    )
+
+
+def test_mxfp4_w4a4_runs_sm107_megamoe_on_expert_byte_views(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    calls = []
+    _install_fake_fp4_moe_ep(monkeypatch, calls)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    layer = _fp4_expert_layer(w4a4=True)
+
+    module.prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
+
+    ((kind, weights, intermediate, hidden),) = calls
+    assert (kind, intermediate, hidden) == ("sm107", 32, 64)
+    # FP32 scales reach FlashInfer as E8M0 exponents: 0.5 -> 126, 4.0 -> 129.
+    assert weights.w13_sf.dtype == weights.w2_sf.dtype == torch.float8_e8m0fnu
+    assert bool((weights.w13_sf.view(torch.uint8) == 126).all())
+    assert bool((weights.w2_sf.view(torch.uint8) == 129).all())
+
+    # Each routed-expert parameter is an (E, bytes) view of FlashInfer's tensor,
+    # so an EPLB copy into one expert's row moves the kernel's weights.
+    transformed = layer._flashinfer_megamoe_mxfp4_weights
+    (l1_w, l1_sf), (l2_w, l2_sf) = transformed
+    for name, tensor in (
+        ("w13_weight", l1_w),
+        ("w13_weight_scale_inv", l1_sf),
+        ("w2_weight", l2_w),
+        ("w2_weight_scale_inv", l2_sf),
+    ):
+        view = getattr(layer, name)
+        assert view.dtype == torch.uint8
+        assert tuple(view.shape) == (2, tensor[0].numel())
+        assert view.is_contiguous()
+        for expert in range(2):
+            assert view[expert].data_ptr() == tensor[expert].data_ptr()
+        view.data[1].fill_(7)
+        assert bool((tensor[1].view(torch.uint8) == 7).all())
+        assert not bool((tensor[0].view(torch.uint8) == 7).all())
+
+    mega = module.ensure_fp4_moe_layer_for_flashinfer_megamoe(layer)
+    config = mega.backend.megakernel
+    assert config.kernel_name == "sm107_mxfp4_mxfp4_bf16_cutedsl"
+    assert (config.intermediate_size, config.top_k) == (32, 2)
+    assert config.gate_up_clamp == 10.0
+    # knobs=None: the backend's startup tuning picks them per capacity profile.
+    assert config.knobs is None
+    assert isinstance(layer._flashinfer_megamoe_forward, module.MegaMoeTunedForward)
+    # The kernel gets FlashInfer's own tensors, not the byte views.
+    assert mega.backend.transformed_weights is transformed
+    assert mega.backend.preprocess_weights is False
+    assert mega.fleet_params.max_tokens_per_rank == 2048
+    assert module.ensure_fp4_moe_layer_for_flashinfer_megamoe(layer) is mega
+
+
+def test_fp4_experts_without_w4a4_keep_deepgemm_megamoe(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    calls = []
+    _install_fake_fp4_moe_ep(monkeypatch, calls)
+    common = types.ModuleType("sglang.srt.layers.utils.common")
+
+    def copy_or_rebind_param(owner, name, value):
+        getattr(owner, name).data = value
+
+    common.copy_or_rebind_param = copy_or_rebind_param
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.utils",
+        types.ModuleType("sglang.srt.layers.utils"),
+    )
+    monkeypatch.setitem(sys.modules, common.__name__, common)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    layer = _fp4_expert_layer(w4a4=False)
+    w13 = layer.w13_weight.data
+
+    module.prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
+    mega = module.ensure_fp4_moe_layer_for_flashinfer_megamoe(layer)
+
+    assert [call[0] for call in calls] == ["deepgemm"]
+    assert not hasattr(layer, "_flashinfer_megamoe_mxfp4_weights")
+    assert mega.backend.megakernel.kernel_name == "sm100_fp8_fp4_bf16_deepgemm"
+    assert mega.backend.megakernel.activation_clamp == 10.0
+    (fc1_w, _), _ = mega.backend.transformed_weights
+    assert fc1_w.data_ptr() == w13.data_ptr()
+
+
+def test_mxfp4_w4a4_needs_flashinfer_sm107_megamoe(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    _install_fake_fp4_moe_ep(monkeypatch, [], with_sm107=False)
+    with pytest.raises(ImportError, match="FlashInfer 0.7.5 or later"):
+        module.prepare_fp4_moe_weights_for_flashinfer_megamoe(
+            _fp4_expert_layer(w4a4=True)
+        )
+
+
+def test_mxfp4_scales_convert_to_e8m0(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    for dtype in (torch.float32, torch.bfloat16):
+        scales = torch.tensor([1.0, 0.5, 4.0, 2.0**-20], dtype=dtype)
+        assert module._as_e8m0(scales).view(torch.uint8).tolist() == [
+            127,
+            126,
+            129,
+            107,
+        ]
+    raw = torch.tensor([127, 3], dtype=torch.uint8)
+    assert module._as_e8m0(raw).data_ptr() == raw.data_ptr()
+    for bad in (torch.tensor([3.0]), torch.tensor([-1.0])):
+        with pytest.raises(ValueError, match="powers of two"):
+            module._as_e8m0(bad)
+
+
+def test_expert_byte_views_need_dense_expert_slices(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    with pytest.raises(ValueError, match="is not dense"):
+        module._expert_byte_slabs(
+            torch.zeros(2, 4, 8, dtype=torch.uint8)[:, :, :4], 2, "w13_weight"
+        )
+    with pytest.raises(ValueError, match="unexpected"):
+        module._expert_byte_slabs(torch.zeros(2, 4), 2, "w13_weight_scale_inv")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

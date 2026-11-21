@@ -1002,9 +1002,10 @@ class ExecMoe(msgspec.Struct):
     ] = "none"
     enable_w4a4_mxfp4_megamoe: A[
         bool,
-        "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "
-        "mxf4xmxf4 MMA type. Use with "
-        "--moe-a2a-backend megamoe.",
+        "Enable the W4A4 MXFP4 MegaMoE path: DeepGEMM's mxf4xmxf4 MMA type "
+        "with --moe-a2a-backend megamoe, or FlashInfer's SM107 MXFP4 x MXFP4 "
+        "MegaMoE for FP4-expert checkpoints with --moe-a2a-backend "
+        "flashinfer_megamoe.",
     ] = False
     deepep_v2_mode: A[
         Literal["direct", "hybrid"],

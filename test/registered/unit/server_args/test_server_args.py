@@ -2449,12 +2449,14 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         *,
         is_fp4_experts=False,
         nvfp4_moe_meta=None,
+        enable_w4a4_mxfp4_megamoe=False,
     ):
         server_args = ServerArgs(
             model_path="dummy",
             quantization=quantization,
             moe_a2a_backend="flashinfer_megamoe",
             moe_runner_backend="flashinfer_megamoe",
+            enable_w4a4_mxfp4_megamoe=enable_w4a4_mxfp4_megamoe,
             attn_dp_size=4,
             tp_size=4,
         )
@@ -2512,6 +2514,33 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
     def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
         with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
             handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
+
+    @patch("sglang.srt.arg_groups.moe_hook.get_device_sm", return_value=107)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_w4a4_accepts_fp4_experts_on_sm107(self, *_):
+        handle_a2a_moe(
+            self._make_args(
+                quantization="fp8", is_fp4_experts=True, enable_w4a4_mxfp4_megamoe=True
+            )
+        )
+
+    @patch("sglang.srt.arg_groups.moe_hook.get_device_sm", return_value=100)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_w4a4_requires_sm107(self, *_):
+        with self.assertRaisesRegex(ValueError, "needs an SM107 GPU"):
+            handle_a2a_moe(
+                self._make_args(
+                    quantization="fp8",
+                    is_fp4_experts=True,
+                    enable_w4a4_mxfp4_megamoe=True,
+                )
+            )
+
+    @patch("sglang.srt.arg_groups.moe_hook.get_device_sm", return_value=107)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_w4a4_requires_fp4_experts(self, *_):
+        with self.assertRaisesRegex(ValueError, "needs an FP4-expert"):
+            handle_a2a_moe(self._make_args(enable_w4a4_mxfp4_megamoe=True))
 
     @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
