@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="base-a-test-npu")
+register_npu_ci(est_time=1, suite="extra-a-test-npu")
 
 # Initialize the quantization package before the NPU backend to avoid its
 # base_config / linear_method_npu circular import on a cold interpreter.

@@ -23,7 +23,8 @@ struct Mock {
     id_requests: Arc<AtomicUsize>,
 }
 
-type ItemStream = Pin<Box<dyn Stream<Item = Result<api::GenerateStreamItem, Status>> + Send>>;
+type ItemStreamOf<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+type ItemStream = ItemStreamOf<api::GenerateStreamItem>;
 
 #[tonic::async_trait]
 impl SglangService for Mock {
@@ -57,6 +58,7 @@ impl SglangService for Mock {
                             finish_reason: done.then_some(api::FinishReason {
                                 kind: Some(api::finish_reason::Kind::Length(api::FinishLength {
                                     length: Some(want as u64),
+                                    ignored_stop: None,
                                 })),
                             }),
                             ..Default::default()
@@ -154,6 +156,413 @@ impl SglangService for Mock {
         _: Request<api::ClearHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
         Err(Status::unimplemented("clear_hi_cache_storage"))
+    }
+
+    async fn set_internal_state(
+        &self,
+        _: Request<api::SetInternalStateRequest>,
+    ) -> Result<Response<api::SetInternalStateResponse>, Status> {
+        Err(Status::unimplemented("set_internal_state"))
+    }
+    async fn start_profile(
+        &self,
+        _: Request<api::StartProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        Err(Status::unimplemented("start_profile"))
+    }
+    async fn stop_profile(
+        &self,
+        _: Request<api::StopProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        Err(Status::unimplemented("stop_profile"))
+    }
+    async fn start_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("start_expert_distribution_record"))
+    }
+    async fn stop_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("stop_expert_distribution_record"))
+    }
+    async fn dump_expert_distribution_record(
+        &self,
+        _: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        Err(Status::unimplemented("dump_expert_distribution_record"))
+    }
+    async fn slow_down(
+        &self,
+        _: Request<api::SlowDownRequest>,
+    ) -> Result<Response<api::SlowDownResponse>, Status> {
+        Err(Status::unimplemented("slow_down"))
+    }
+    async fn release_memory_occupation(
+        &self,
+        _: Request<api::ReleaseMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        Err(Status::unimplemented("release_memory_occupation"))
+    }
+    async fn resume_memory_occupation(
+        &self,
+        _: Request<api::ResumeMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        Err(Status::unimplemented("resume_memory_occupation"))
+    }
+    async fn get_weights_by_name(
+        &self,
+        _: Request<api::GetWeightsByNameRequest>,
+    ) -> Result<Response<api::GetWeightsByNameResponse>, Status> {
+        Err(Status::unimplemented("get_weights_by_name"))
+    }
+    async fn init_weights_update_group(
+        &self,
+        _: Request<api::InitWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("init_weights_update_group"))
+    }
+    async fn destroy_weights_update_group(
+        &self,
+        _: Request<api::DestroyWeightsUpdateGroupRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("destroy_weights_update_group"))
+    }
+    async fn init_weights_send_group_for_remote_instance(
+        &self,
+        _: Request<api::InitWeightsSendGroupForRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented(
+            "init_weights_send_group_for_remote_instance",
+        ))
+    }
+    async fn send_weights_to_remote_instance(
+        &self,
+        _: Request<api::SendWeightsToRemoteInstanceRequest>,
+    ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        Err(Status::unimplemented("send_weights_to_remote_instance"))
+    }
+    async fn get_remote_instance_transfer_engine_info(
+        &self,
+        _: Request<api::RemoteInstanceTransferEngineInfoRequest>,
+    ) -> Result<Response<api::RemoteInstanceTransferEngineInfoResponse>, Status> {
+        Err(Status::unimplemented(
+            "get_remote_instance_transfer_engine_info",
+        ))
+    }
+    async fn parse_function_call(
+        &self,
+        _: Request<api::ParseFunctionCallRequest>,
+    ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
+        Err(Status::unimplemented("parse_function_call"))
+    }
+    type OllamaChatStream = ItemStreamOf<api::OllamaChatResponse>;
+
+    async fn ollama_chat(
+        &self,
+        _: Request<api::OllamaChatRequest>,
+    ) -> Result<Response<Self::OllamaChatStream>, Status> {
+        unimplemented!()
+    }
+
+    type OllamaGenerateStream = ItemStreamOf<api::OllamaGenerateResponse>;
+
+    async fn ollama_generate(
+        &self,
+        _: Request<api::OllamaGenerateRequest>,
+    ) -> Result<Response<Self::OllamaGenerateStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn ollama_tags(
+        &self,
+        _: Request<api::OllamaTagsRequest>,
+    ) -> Result<Response<api::OllamaTagsResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn ollama_show(
+        &self,
+        _: Request<api::OllamaShowRequest>,
+    ) -> Result<Response<api::OllamaShowResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn anthropic_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        unimplemented!()
+    }
+
+    type AnthropicStreamMessagesStream = ItemStreamOf<api::AnthropicStreamEvent>;
+
+    async fn anthropic_stream_messages(
+        &self,
+        _: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        _: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_embeddings(
+        &self,
+        _: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_score(
+        &self,
+        _: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_responses(
+        &self,
+        _: Request<api::OpenAiResponsesRequest>,
+    ) -> Result<Response<api::OpenAiResponsesResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_list_models(
+        &self,
+        _: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamCompletionsStream = ItemStreamOf<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamChatCompletionsStream = ItemStreamOf<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
+    async fn separate_reasoning(
+        &self,
+        _: Request<api::SeparateReasoningRequest>,
+    ) -> Result<Response<api::SeparateReasoningResponse>, Status> {
+        Err(Status::unimplemented("separate_reasoning"))
+    }
+    async fn add_external_corpus(
+        &self,
+        _: Request<api::AddExternalCorpusRequest>,
+    ) -> Result<Response<api::AddExternalCorpusResponse>, Status> {
+        Err(Status::unimplemented("add_external_corpus"))
+    }
+    async fn remove_external_corpus(
+        &self,
+        _: Request<api::RemoveExternalCorpusRequest>,
+    ) -> Result<Response<api::RemoveExternalCorpusResponse>, Status> {
+        Err(Status::unimplemented("remove_external_corpus"))
+    }
+    async fn list_external_corpora(
+        &self,
+        _: Request<api::ListExternalCorporaRequest>,
+    ) -> Result<Response<api::ListExternalCorporaResponse>, Status> {
+        Err(Status::unimplemented("list_external_corpora"))
+    }
+    async fn update_weights_from_disk(
+        &self,
+        _: Request<api::UpdateWeightsFromDiskRequest>,
+    ) -> Result<Response<api::UpdateWeightsFromDiskResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_disk"))
+    }
+    async fn update_weights_from_distributed(
+        &self,
+        _: Request<api::UpdateWeightsFromDistributedRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_distributed"))
+    }
+    async fn update_weights_from_tensor(
+        &self,
+        _: Request<api::UpdateWeightsFromTensorRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_tensor"))
+    }
+    async fn update_weights_from_ipc(
+        &self,
+        _: Request<api::UpdateWeightsFromIpcRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("update_weights_from_ipc"))
+    }
+    async fn begin_weight_update(
+        &self,
+        _: Request<api::BeginWeightUpdateRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("begin_weight_update"))
+    }
+    async fn end_weight_update(
+        &self,
+        _: Request<api::EndWeightUpdateRequest>,
+    ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("end_weight_update"))
+    }
+    async fn plugin_weight_update(
+        &self,
+        _: Request<api::PluginWeightUpdateRequest>,
+    ) -> Result<Response<api::PluginWeightUpdateResponse>, Status> {
+        Err(Status::unimplemented("plugin_weight_update"))
+    }
+    async fn load_lora_adapter(
+        &self,
+        _: Request<api::LoadLoraAdapterRequest>,
+    ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        Err(Status::unimplemented("load_lora_adapter"))
+    }
+    async fn load_lora_adapter_from_tensors(
+        &self,
+        _: Request<api::LoadLoraAdapterFromTensorsRequest>,
+    ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        Err(Status::unimplemented("load_lora_adapter_from_tensors"))
+    }
+    async fn unload_lora_adapter(
+        &self,
+        _: Request<api::UnloadLoraAdapterRequest>,
+    ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        Err(Status::unimplemented("unload_lora_adapter"))
+    }
+    async fn get_hi_cache_l3_cache_layout(
+        &self,
+        _: Request<api::GetHiCacheL3CacheLayoutRequest>,
+    ) -> Result<Response<api::GetHiCacheL3CacheLayoutResponse>, Status> {
+        Err(Status::unimplemented("get_hi_cache_l3_cache_layout"))
+    }
+    async fn configure_logging(
+        &self,
+        _: Request<api::ConfigureLoggingRequest>,
+    ) -> Result<Response<api::ConfigureLoggingResponse>, Status> {
+        Err(Status::unimplemented("configure_logging"))
+    }
+    async fn dumper_control(
+        &self,
+        _: Request<api::DumperControlRequest>,
+    ) -> Result<Response<api::DumperControlResponse>, Status> {
+        Err(Status::unimplemented("dumper_control"))
+    }
+    async fn scale_elastic_ep(
+        &self,
+        _: Request<api::ScaleElasticEpRequest>,
+    ) -> Result<Response<api::ScaleElasticEpResponse>, Status> {
+        Err(Status::unimplemented("scale_elastic_ep"))
+    }
+    async fn get_elastic_ep_state(
+        &self,
+        _: Request<api::ElasticEpStateRequest>,
+    ) -> Result<Response<api::ElasticEpStateResponse>, Status> {
+        Err(Status::unimplemented("get_elastic_ep_state"))
+    }
+    async fn open_session(
+        &self,
+        _: Request<api::OpenSessionRequest>,
+    ) -> Result<Response<api::OpenSessionResponse>, Status> {
+        Err(Status::unimplemented("open_session"))
+    }
+    async fn close_session(
+        &self,
+        _: Request<api::CloseSessionRequest>,
+    ) -> Result<Response<api::CloseSessionResponse>, Status> {
+        Err(Status::unimplemented("close_session"))
+    }
+    async fn freeze_gc(
+        &self,
+        _: Request<api::FreezeGcRequest>,
+    ) -> Result<Response<api::FreezeGcResponse>, Status> {
+        Err(Status::unimplemented("freeze_gc"))
+    }
+    async fn pause_generation(
+        &self,
+        _: Request<api::PauseGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        Err(Status::unimplemented("pause_generation"))
+    }
+    async fn continue_generation(
+        &self,
+        _: Request<api::ContinueGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        Err(Status::unimplemented("continue_generation"))
+    }
+    async fn pd_role_switch(
+        &self,
+        _: Request<api::PdRoleSwitchRequest>,
+    ) -> Result<Response<api::PdRoleSwitchResponse>, Status> {
+        Err(Status::unimplemented("pd_role_switch"))
+    }
+    async fn update_weight_version(
+        &self,
+        _: Request<api::UpdateWeightVersionRequest>,
+    ) -> Result<Response<api::UpdateWeightVersionResponse>, Status> {
+        Err(Status::unimplemented("update_weight_version"))
     }
 }
 

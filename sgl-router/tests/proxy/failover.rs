@@ -56,6 +56,7 @@ async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
             decode_policy: Default::default(),
             dp_aware: false,
             dp_rank_policy: Default::default(),
+            decode_dp_rank_policy: None,
             bucket_config: None,
             reorg_buckets: None,
             reorg_admission: Default::default(),

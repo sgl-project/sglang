@@ -80,6 +80,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -97,6 +98,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
+_is_gfx942 = is_gfx942_supported()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -151,8 +153,11 @@ def _use_rocm_triton_softmax_topk(
 
 _use_aiter_topk_gating = not envs.SGLANG_ROCM_DISABLE_AITER_TOPK_GATING.get()
 
-# Above this, topk_gating is slower than fused_topk on GPU time.
+# Above this, topk_gating is slower than fused_topk on GPU time. On gfx942 aiter's
+# shared-memory kernel (used above 1024 rows) already loses: 17.0 vs 13.5 us at 4096
+# rows, while the E=512 kernel wins at 1024 (6.5 vs 10.8 us).
 _AITER_TOPK_GATING_MAX_ROWS = 4096
+_AITER_TOPK_GATING_MAX_ROWS_GFX942 = 1024
 
 
 def _use_aiter_topk_gating_softmax(
@@ -164,19 +169,22 @@ def _use_aiter_topk_gating_softmax(
     packed_out: Optional[torch.Tensor],
 ) -> bool:
     # fused_topk has no ASM router for (512, 10); topk_gating has an E=512
-    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8) and 2560
-    # (Qwen3.8-Flash-Next) limit this to those two models.
+    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8), 2560
+    # (Qwen3.8-Flash-Next) and 4096 (Qwen3.5-397B-A17B) limit this to those models.
+    max_rows = (
+        _AITER_TOPK_GATING_MAX_ROWS if _is_gfx95 else _AITER_TOPK_GATING_MAX_ROWS_GFX942
+    )
     return (
         _use_aiter
         and _use_aiter_topk_gating
-        and _is_gfx95
-        and hidden_states.shape[1] in (2560, 8192)
+        and (_is_gfx95 or _is_gfx942)
+        and hidden_states.shape[1] in (2560, 4096, 8192)
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[1] == 512
         and gating_output.dtype == torch.bfloat16
         and topk == 10
         and gating_output.is_contiguous()
-        and gating_output.shape[0] <= _AITER_TOPK_GATING_MAX_ROWS
+        and gating_output.shape[0] <= max_rows
         and correction_bias is None
         and num_fused_shared_experts == 0
         and packed_out is None

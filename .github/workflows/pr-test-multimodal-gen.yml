@@ -77,7 +77,9 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-1-gpu-h100
+      stage: base-b-diffusion
+      runner_config: 1-gpu-large
+      job_display_name: diffusion-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 240
       run_timeout_minutes: 240
@@ -91,7 +93,9 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-1-gpu-5090
+      stage: base-b-diffusion
+      runner_config: 1-gpu-small
+      job_display_name: diffusion-1-gpu-5090
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 180
       run_timeout_minutes: 120
@@ -100,19 +104,6 @@ jobs:
         (cd python && python3 -m pytest -v -rs \
           sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py \
           sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py::TestSubBlockNumerics)
-    secrets: inherit
-
-  bcg-diffusion:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true' &&
-      inputs.multimodal_gen_server == 'true'
-    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
-    with:
-      runner_config: diffusion-bcg-1-gpu-h100
-      caller_inputs: ${{ toJson(inputs) }}
-      job_timeout_minutes: 90
-      run_timeout_minutes: 60
     secrets: inherit
 
   multimodal-gen-test-2-gpu:
@@ -126,25 +117,14 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-2-gpu-h100
+      stage: base-b-diffusion
+      runner_config: 2-gpu-large
+      job_display_name: diffusion-2-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 55
       run_timeout_minutes: 55
       retry_deadline_seconds: 3000
       partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
-    secrets: inherit
-
-  multimodal-gen-component-accuracy:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true' &&
-      inputs.multimodal_gen_server == 'true'
-    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
-    with:
-      runner_config: diffusion-component-2-gpu-h100
-      caller_inputs: ${{ toJson(inputs) }}
-      job_timeout_minutes: 240
-      run_timeout_minutes: 240
     secrets: inherit
 
   multimodal-gen-test-4-gpu-b200:
@@ -154,7 +134,9 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-1-gpu-b200
+      stage: base-b-diffusion
+      runner_config: 4-gpu-b200
+      job_display_name: diffusion-4-gpu-b200
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 240
       run_timeout_minutes: 240
@@ -190,7 +172,9 @@ jobs:
       inputs.multimodal_gen == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-unit-1-gpu-h100
+      stage: base-b-diffusion-unit
+      runner_config: 1-gpu-large
+      job_display_name: diffusion-unit-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 120
       run_timeout_minutes: 60
@@ -208,7 +192,9 @@ jobs:
       inputs.diffusion_sm103 == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-unit-1-gpu-b300
+      stage: base-b-diffusion-unit
+      runner_config: 1-gpu-b300
+      job_display_name: diffusion-sm103-1-gpu-b300
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 120
       run_timeout_minutes: 60
@@ -242,7 +228,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: reports/
-          pattern: diffusion-report-diffusion-?-gpu-h100-*
+          pattern: diffusion-report-base-b-diffusion-test-?-gpu-large-*
           merge-multiple: false
 
       - name: Verify coverage
