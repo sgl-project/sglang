@@ -87,7 +87,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
-from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.common import add_prefix, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -811,6 +811,16 @@ class LongcatFlashForCausalLM(nn.Module):
                                     weight_block_size,
                                     torch.bfloat16,
                                 )
+                        elif _is_npu:
+                            # NPU MLA BMMs consume unscaled BF16 weights. Dequantize
+                            # the derived weights without a tensor-FP8 round trip;
+                            # kv_b_proj itself retains its block-FP8 parameters.
+                            w = block_quant_dequant(
+                                weight,
+                                weight_scale,
+                                weight_block_size,
+                                torch.bfloat16,
+                            )
                         else:
                             w, scale = block_quant_to_tensor_quant(
                                 weight, weight_scale, weight_block_size
@@ -973,9 +983,12 @@ class LongcatFlashForCausalLM(nn.Module):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
-                use_async_loading = should_async_load(loaded_weight)
                 if "mtp" in name:
                     continue
+                layer_id = get_layer_id(name)
+                if layer_id is not None and layer_id >= self.config.num_hidden_layers:
+                    continue
+                use_async_loading = should_async_load(loaded_weight)
                 if self.use_ngram_embedding:
                     # Original LongCat-2.0 checkpoints number OE branches from zero.
                     name = re.sub(
