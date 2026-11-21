@@ -6,10 +6,14 @@ import threading
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
+    can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
 )
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
+)
+from sglang.kernels.ops.kvcache.hicache import (
+    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -198,6 +202,11 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.layout,
             )
         self.init_kv_buffer()
+        # Each index page is one row for the transfer kernels, so the row size
+        # is the page stride, not a per-token size.
+        self.can_use_jit = (_is_cuda or _is_hip) and can_use_hicache_jit_kernel(
+            element_size=self.indexer_page_stride_size * self.indexer_dtype.itemsize,
+        )
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
@@ -379,13 +388,22 @@ class DSAIndexerPoolHost(HostKVCache):
         use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
         if use_kernel:
             if self.layout == "layer_first":
-                transfer_kv_per_layer_mla(
-                    src=self.index_k_with_scale_buffer[host_layer_id],
-                    dst=self.packed_device_index_buffers[host_layer_id],
-                    src_indices=host_page_indices,
-                    dst_indices=device_page_indices,
-                    item_size=self.indexer_page_stride_size,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=self.packed_device_index_buffers[host_layer_id],
+                        indices_dst=device_page_indices,
+                        cache_src=self.index_k_with_scale_buffer[host_layer_id],
+                        indices_src=host_page_indices,
+                        element_dim=self.indexer_page_stride_size,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=self.index_k_with_scale_buffer[host_layer_id],
+                        dst=self.packed_device_index_buffers[host_layer_id],
+                        src_indices=host_page_indices,
+                        dst_indices=device_page_indices,
+                        item_size=self.indexer_page_stride_size,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,
