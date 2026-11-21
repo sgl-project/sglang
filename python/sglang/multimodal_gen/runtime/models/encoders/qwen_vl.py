@@ -74,7 +74,6 @@ class QwenVLModelBase(nn.Module):
             special_image_mask = input_ids == self.config.image_token_id
             special_video_mask = input_ids == self.config.video_token_id
 
-        n_image_tokens = special_image_mask.sum()
         special_image_mask = (
             special_image_mask.unsqueeze(-1)
             .expand_as(inputs_embeds)
@@ -82,13 +81,12 @@ class QwenVLModelBase(nn.Module):
         )
         if (
             image_features is not None
-            and inputs_embeds[special_image_mask].numel() != image_features.numel()
+            and special_image_mask[..., 0].sum().item() != image_features.shape[0]
         ):
             raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {image_features.shape[0]}"
+                f"Image features and image tokens do not match: tokens: {special_image_mask[..., 0].sum()}, features {image_features.shape[0]}"
             )
 
-        n_video_tokens = special_video_mask.sum()
         special_video_mask = (
             special_video_mask.unsqueeze(-1)
             .expand_as(inputs_embeds)
@@ -96,10 +94,10 @@ class QwenVLModelBase(nn.Module):
         )
         if (
             video_features is not None
-            and inputs_embeds[special_video_mask].numel() != video_features.numel()
+            and special_video_mask[..., 0].sum().item() != video_features.shape[0]
         ):
             raise ValueError(
-                f"Videos features and video tokens do not match: tokens: {n_video_tokens}, features {video_features.shape[0]}"
+                f"Videos features and video tokens do not match: tokens: {special_video_mask[..., 0].sum().item()}, features {video_features.shape[0]}"
             )
 
         return special_image_mask, special_video_mask
