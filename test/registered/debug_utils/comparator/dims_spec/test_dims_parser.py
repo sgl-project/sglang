@@ -72,6 +72,19 @@ class TestSingletonDimUtilSanitizeNames:
     def test_empty(self) -> None:
         assert _SingletonDimUtil.sanitize_names([]) == []
 
+    def test_avoids_collision_with_existing_singleton_name(self) -> None:
+        assert _SingletonDimUtil.sanitize_names(["singleton0", "1", "h"]) == [
+            "singleton0",
+            "singleton1",
+            "h",
+        ]
+        assert resolve_dim_names("singleton0 1 singleton2 1") == [
+            "singleton0",
+            "singleton1",
+            "singleton2",
+            "singleton3",
+        ]
+
 
 class TestParseDims:
     def test_multi_dims(self) -> None:
@@ -112,6 +125,12 @@ class TestParseDims:
     def test_duplicate_name_raises(self) -> None:
         with pytest.raises(ValueError, match="Duplicate"):
             parse_dims("h h")
+
+    def test_duplicate_parallel_axis_across_dims_raises(self) -> None:
+        with pytest.raises(ValueError, match="Duplicate parallel axis"):
+            parse_dims("s[tp] h[tp]")
+        with pytest.raises(ValueError, match="Duplicate parallel axis"):
+            parse_dims("(a*b)[tp] c[tp]")
 
     def test_with_squeeze_dims(self) -> None:
         dims: list[DimSpec] = parse_dims("t 1 h").dims
