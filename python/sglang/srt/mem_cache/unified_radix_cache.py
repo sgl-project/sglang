@@ -3017,8 +3017,12 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.prefetch_stop_policy == "timeout"
             and self.ongoing_prefetch
         ):
+            # Sort by handle for deterministic iteration order across TP ranks.
+            # The digest includes a CRC of the live prefetch set; all ranks
+            # must compute it in the same order to produce matching digests.
             live = "\0".join(
-                f"{handle.rid}\0{handle.attempt_id}" for handle in self.ongoing_prefetch
+                f"{handle.rid}\0{handle.attempt_id}"
+                for handle in sorted(self.ongoing_prefetch, key=lambda h: (h.rid, h.attempt_id))
             )
             digest = digest * 1000003 + zlib.crc32(live.encode()) + 1
         return digest
