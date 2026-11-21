@@ -77,6 +77,16 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
+    if envs.SGLANG_MORI_CUSTOM_MEM_POOL.get() is not None:
+        if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+            raise ValueError(
+                "Set only one of SGLANG_MORI_CUSTOM_MEM_POOL and "
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+            )
+        from sglang.srt.disaggregation.mori.utils import init_mori_custom_mem_pool
+
+        return init_mori_custom_mem_pool(device)
+
     enable_custom_mem_pool = (
         True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
     )

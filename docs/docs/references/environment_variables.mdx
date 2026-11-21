@@ -686,6 +686,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Configure the custom memory pool type for Mooncake. Supports <code>NVLINK</code>, <code>BAREX</code>, <code>INTRA_NODE_NVLINK</code>. If set to <code>true</code>, it defaults to <code>NVLINK</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_CUSTOM_MEM_POOL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Custom memory pool for KV caches transferred with <code>--disaggregation-transfer-backend mori</code>. <code>AMD_GEM</code> (ROCm) allocates them as amdgpu GEM BOs: amdgpu-dkms counts <code>hipMalloc</code> memory that a NIC pins twice in the KFD allocation limit (30.x for dma-buf registrations, 31.10 through 31.60 for every registration), so after a large KV cache is registered every later device allocation fails; GEM BOs are counted once. Needs a mori build with <code>mori.io.HipGemAllocator</code> and RDMA NICs whose dma-buf registrations pin memory (ionic, bnxt_re; not mlx5). These buffers have no HIP IPC handle: all KV transfers use RDMA, and components that open the KV cache from another process, such as the UMBP standalone server, cannot use them.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+    </tr>
 </tbody>
 </table>
 
