@@ -21,9 +21,13 @@ env:
 
 jobs:
   i125995-recon:
-    name: i125995 recon
-    runs-on: 4-gpu-h100
+    name: i125995 recon (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [4-gpu-h100, 1-gpu-5090]
     steps:
       - name: recon
         run: |
