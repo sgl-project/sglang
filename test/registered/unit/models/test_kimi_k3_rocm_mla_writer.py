@@ -61,8 +61,8 @@ class TestKimiK3RocmMlaQCacheWriter(CustomTestCase):
 
     def test_writer_matches_split_chain_bytes(self):
         """K3's KV scale is 1, so the fused write must store the split chain's bytes,
-        also for -0.0, inf and NaN lanes (inf and NaN in k: BF16 cache only). A slot < 0 token skips only its cache write;
-        its Q row is still written."""
+        also for -0.0, inf and NaN lanes (inf and NaN in k: BF16 cache only).
+        A slot < 0 token skips only its cache write; its Q row is still written."""
         for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for tokens in (1, 33, 256):
                 with self.subTest(cache_dtype=cache_dtype, tokens=tokens):
