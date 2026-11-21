@@ -243,7 +243,9 @@ def prefill_layouts(chunk_size: int) -> list[tuple[int, ...]]:
             layouts.append(tuple(base + (i < extra) for i in range(num_seqs)))
     layouts.append((c + 44, 2 * c + 7))
     layouts.append((c + 44, 2 * c + 7, 3 * c))
-    for num_tokens in token_counts:
+    # 17 tokens: the only way to get 16 logical chunks in one chunk with a
+    # token count that is neither 1 nor a multiple of 16.
+    for num_tokens in token_counts + (17,):
         num_chunks = -(-num_tokens // c)
         for num_logical in (1, 16, 32, num_chunks + 1, num_chunks + 2):
             # Each 1-token request in front ends off the chunk grid and adds

@@ -64,17 +64,26 @@ class TestPrefillLayouts(CustomTestCase):
                     _int_class(num_tokens),
                 )
             )
-        # (logical chunks, chunks, tokens). The first entry is a 5-request
-        # batch of 2988 tokens: 12 chunks plus 4 boundaries inside chunks.
+        # (logical chunks, chunks, tokens): every combination a batch of up to
+        # 16 chunks can produce. The last entry needs 16 requests in a single
+        # chunk with a token count that is neither 1 nor a multiple of 16,
+        # such as 15 1-token requests and one 2-token request.
         required = {
-            ("div16", "other", "other"),
-            ("div16", "other", "div16"),
-            ("other", "other", "other"),
+            ("div16", "div16", "div16"),
             ("div16", "div16", "other"),
-            ("other", "div16", "div16"),
             ("div16", "one", "div16"),
-            ("other", "one", "other"),
+            ("div16", "other", "div16"),
+            ("div16", "other", "other"),
+            ("one", "one", "div16"),
             ("one", "one", "one"),
+            ("one", "one", "other"),
+            ("other", "div16", "div16"),
+            ("other", "div16", "other"),
+            ("other", "one", "div16"),
+            ("other", "one", "other"),
+            ("other", "other", "div16"),
+            ("other", "other", "other"),
+            ("div16", "one", "other"),
         }
         self.assertLessEqual(required, covered)
 

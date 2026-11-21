@@ -100,9 +100,10 @@ def test_no_kernel_loads_after_sweep():
     try:
         rng = random.Random(0)
         with torch.inference_mode():
-            for seq_lens, with_initial_states, with_track in _serving_like_batches(
-                rng=rng, count=60
-            ):
+            # A rare shape first: 16 logical chunks in one chunk, 17 tokens.
+            batches = [((1,) * 15 + (2,), True, False)]
+            batches += _serving_like_batches(rng=rng, count=60)
+            for seq_lens, with_initial_states, with_track in batches:
                 run_mamba2_prefill(
                     dims=dims,
                     params=params,
