@@ -594,25 +594,9 @@ class FP8MQALogitsKernel:
         is_umma_warp_0 = warp_idx == 10
         is_umma_warp_1 = warp_idx == 11
 
-        # Early schedule metadata load: issue global loads ASAP so their
-        # ~200-cycle L2 latency overlaps with subsequent prologue setup
-        # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
         NUM_MATH_WG = 2  # kNumMathWarpGroups
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
         sm_idx = bidz
-        start_q = mScheduleMeta[(sm_idx, 0)]
-        start_kv_half = mScheduleMeta[(sm_idx, 1)]
-        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
-        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
-        # Early mContextLens load: overlap ~200-cycle L2 latency with the
-        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
-        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
-        # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (
-            mContextLens[start_q_clamped] + self.block_kv - 1
-        ) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -924,7 +908,26 @@ class FP8MQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        # The schedule metadata and context lens are written by the preceding
+        # kernels, so under PDL they may only be read after griddepcontrol_wait.
+        start_q = mScheduleMeta[(sm_idx, 0)]
+        start_kv_half = mScheduleMeta[(sm_idx, 1)]
+        end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
+        end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
+        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
+        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
+        # element), but it is never used because has_work will be False.
+        start_q_clamped = min(start_q, batch_size - 1)
+        current_num_kv = (
+            mContextLens[start_q_clamped] + self.block_kv - 1
+        ) // self.block_kv
+
+        # ===== SCHEDULER: derive values from the schedule metadata =====
         end_kv_idx = end_kv_half * NUM_MATH_WG
 
         # Convert start to KV block units (matching DeepGEMM)
@@ -934,7 +937,7 @@ class FP8MQALogitsKernel:
         # ===== COMMON SCHEDULER STATE (before warp branches) =====
         # Each warp role independently maintains its own copy of these
         # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
+        # Pre-fetch first task
         next_q_idx = current_q_idx
         next_kv_idx = current_kv_idx
         next_num_kv = current_num_kv
@@ -943,11 +946,6 @@ class FP8MQALogitsKernel:
         # While-loop termination flag (matches DeepGEMM's fetch_next_task pattern).
         # True if this CTA has work assigned (start != end in schedule_meta).
         has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
-
-        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
-
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_wait()
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
