@@ -82,7 +82,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    PIPELINED_ATTENTION_BACKENDS,
+    supports_pipelined_attention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     ComponentAttentionBackendNotAppliedError,
@@ -813,7 +813,7 @@ def _minimax_h3_pad_only_tail(
     )
 
 
-def _minimax_h3_sequential_dense_attention(
+def _minimax_h3_sequential_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -822,9 +822,15 @@ def _minimax_h3_sequential_dense_attention(
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
+    sparse_query_block_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The exchange-attend-exchange the pipelined dense attention replaces."""
+    """The exchange-attend-exchange the pipelined attention replaces."""
     impl = attention._attention_impl
+    attention_kwargs = {}
+    if attention._attention_backend_enum is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+        attention_kwargs["first_segment_sparse_query_block_mask"] = (
+            sparse_query_block_mask
+        )
     # once per shape: leave no staging behind that later calls never use
     with uncached_a2a_staging():
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
@@ -835,6 +841,7 @@ def _minimax_h3_sequential_dense_attention(
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             cu_seqlens_host=cu_seqlens_host,
+            **attention_kwargs,
         )
         out = _usp_output_all_to_all(out[None], head_dim=2)[0]
     if _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen):
@@ -844,7 +851,7 @@ def _minimax_h3_sequential_dense_attention(
     return out
 
 
-def _minimax_h3_pipelined_dense_attention(
+def _minimax_h3_pipelined_attention(
     attention: MiniMaxH3Attention,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -855,11 +862,12 @@ def _minimax_h3_pipelined_dense_attention(
     max_seqlen: int,
     sequential,
     fill=None,
+    sparse_query_block_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Dense attention with the Ulysses exchange pipelined over head groups.
+    """Attention with the Ulysses exchange pipelined over head groups.
 
     Returns None (caller keeps the sequential exchange) unless head-group
-    pipelining is enabled and a dense backend that runs a head group exactly
+    pipelining is enabled and a backend that runs a head group exactly
     as it runs those heads in the full call would serve it. ``sequential()``
     returns what the sequential exchange gives for this call; the first call
     of each shape checks the pipeline against it.
@@ -867,12 +875,18 @@ def _minimax_h3_pipelined_dense_attention(
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
     if groups in (0, 1) or torch.compiler.is_compiling():
         return None
-    if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
+    backend = attention._attention_backend_enum
+    if not supports_pipelined_attention(backend, attention._attention_impl, q.device):
         return None
     impl = attention._attention_impl
     skip_softmax = getattr(impl, "_request_skip_softmax_threshold", None)
     if skip_softmax is not None and skip_softmax()[0]:
         return None
+    attention_kwargs = {}
+    if backend is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN:
+        attention_kwargs["first_segment_sparse_query_block_mask"] = (
+            sparse_query_block_mask
+        )
     from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
         ulysses_pipelined_attention,
     )
@@ -882,6 +896,7 @@ def _minimax_h3_pipelined_dense_attention(
         cu_seqlens=cu_seqlens,
         cu_seqlens_host=cu_seqlens_host,
         max_seqlen=max_seqlen,
+        **attention_kwargs,
     )
     return ulysses_pipelined_attention(
         q,
@@ -905,6 +920,7 @@ def _minimax_h3_group_attend(
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
+    **attention_kwargs,
 ):
     """One head group's attention over the gathered packed sequence.
 
@@ -914,8 +930,25 @@ def _minimax_h3_group_attend(
     """
     used = max_seqlen
     pad_only_tail = _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen)
+    missing_sparse_mask = (
+        "first_segment_sparse_query_block_mask" in attention_kwargs
+        and attention_kwargs["first_segment_sparse_query_block_mask"] is None
+    )
 
     def attend(q_group, k_group, v_group):
+        if (
+            missing_sparse_mask
+            and cu_seqlens_host is not None
+            and impl._sparse_ready(q_group, k_group)
+            and any(
+                stop - start >= impl.schedule.min_seq_len
+                for start, stop in itertools.pairwise(cu_seqlens_host)
+            )
+        ):
+            raise ValueError(
+                "MiniMax H3 requires subblock_sparse_query_block_mask "
+                "when SubBlock sparse attention is active"
+            )
         if not pad_only_tail:
             return impl.forward_varlen(
                 q_group,
@@ -924,6 +957,7 @@ def _minimax_h3_group_attend(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
+                **attention_kwargs,
             )
         out = torch.empty_like(q_group)
         real = [t[:used].unsqueeze(0) for t in (q_group, k_group, v_group)]
@@ -999,6 +1033,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
+    sparse_query_block_mask: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """The pipelined attention with QK-norm + RoPE writing into the exchange.
 
@@ -1023,6 +1058,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
         cu_seqlens=cu_seqlens,
         cu_seqlens_host=cu_seqlens_host,
         max_seqlen=max_seqlen,
+        sparse_query_block_mask=sparse_query_block_mask,
     )
 
     def sequential():
@@ -1041,7 +1077,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
         )
-        return _minimax_h3_sequential_dense_attention(
+        return _minimax_h3_sequential_attention(
             attention, q_normed, k_normed, v, **pipeline_kwargs
         )
 
@@ -1065,7 +1101,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
             round_norm_before_rope=True,
         )
 
-    return _minimax_h3_pipelined_dense_attention(
+    return _minimax_h3_pipelined_attention(
         attention, q, k, v, **pipeline_kwargs, sequential=sequential, fill=fill
     )
 
@@ -1099,15 +1135,21 @@ def _minimax_h3_attention_core_impl(
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        out = _minimax_h3_pipelined_dense_attention(
+        out = _minimax_h3_pipelined_attention(
             attention,
             q,
             k,
             v,
             **pipeline_kwargs,
-            sequential=lambda: _minimax_h3_sequential_dense_attention(
-                attention, q, k, v, **pipeline_kwargs
+            sequential=lambda: _minimax_h3_sequential_attention(
+                attention,
+                q,
+                k,
+                v,
+                **pipeline_kwargs,
+                sparse_query_block_mask=subblock_sparse_query_block_mask,
             ),
+            sparse_query_block_mask=subblock_sparse_query_block_mask,
         )
         if out is None:
             out = _minimax_h3_collective_pipelined_attention(
@@ -1696,6 +1738,7 @@ class MiniMaxH3Attention(nn.Module):
                         cu_seqlens=cu_seqlens,
                         cu_seqlens_host=cu_seqlens_host,
                         max_seqlen=max_seqlen,
+                        sparse_query_block_mask=subblock_sparse_query_block_mask,
                     )
                     if out is not None:
                         return out.reshape(total, self.num_heads * self.head_dim)
