@@ -2380,7 +2380,7 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
 
     def test_mamba_share_is_the_same_in_every_spec_mode(self):
         # (model, cache params, KV bytes, Mamba slots, draft tokens, bytes per slot,
-        #  {spec mode: Mamba GiB})
+        #  {spec mode: Mamba GB})
         cases = (
             (
                 # TP4; 1M tokens of 12 GQA layers, one 256-dim bf16 KV head per rank.
@@ -2423,7 +2423,7 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
             kv_pool = SimpleNamespace(
                 host_capacity_bytes=None, get_kv_size_bytes=lambda b=kv_bytes: b
             )
-            for mode, after_gib in shares.items():
+            for mode, after_gb in shares.items():
                 with self.subTest(model=model, mode=mode):
                     spec = (
                         {}
@@ -2446,7 +2446,7 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
                         hicache_size=self.HICACHE_SIZE_GB,
                         kv_pools=(kv_pool, mamba_pool),
                     )
-                    self.assertAlmostEqual(mamba_share, after_gib, places=2)
+                    self.assertAlmostEqual(mamba_share, after_gb, places=2)
                     if mode != "none":
                         self.assertLess(
                             mamba_pool.host_capacity_bytes,
