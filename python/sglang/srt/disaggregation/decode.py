@@ -4269,11 +4269,17 @@ class SchedulerDisaggregationDecodeMixin:
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
         # EAGLE's seed uses pinned async_h2d_stack already. Other seed paths,
         # host restores and grammar may read device results back to the host.
-        return (
+        eagle = (
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and self.spec_algorithm.is_eagle()
+        )
+        # DSpark's seed writes the bonus tokens and seq lens into the FutureMap
+        # and reads nothing back; it takes no hidden states or DSA top-k indices.
+        dspark = self.spec_algorithm.is_dspark()
+        return (
+            (eagle or dspark)
             and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
             and self.enable_overlap
-            and self.spec_algorithm.is_eagle()
             and not self.enable_hisparse
             # Cache checkpointing may free/rebind allocator pages on this stream;
             # keep that work ordered with the scheduler's subsequent allocations.
@@ -4281,9 +4287,14 @@ class SchedulerDisaggregationDecodeMixin:
             and get_disagg().disaggregation_decode_host_receive_threshold == 1
             and all(
                 req.grammar is None
-                and req.output_dsa_topk_indices is None
                 and req.kv.retraction_backup is None
-                and req.hidden_states_tensor is not None
+                and (
+                    dspark
+                    or (
+                        req.output_dsa_topk_indices is None
+                        and req.hidden_states_tensor is not None
+                    )
+                )
                 for req in batch.reqs
             )
         )
