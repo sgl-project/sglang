@@ -45,6 +45,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling.sampling_batch_info import has_acc_penalties
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -113,7 +114,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+    if has_acc_penalties(sampling_info):
         return False
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-import sglang.srt.sampling.penaltylib as penaltylib
+import sglang.srt.sampling.penalties as penalties
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarMask,
@@ -22,7 +22,6 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.interface import (
     WatermarkRows,
@@ -94,6 +93,30 @@ def _filler_seeds(n: int, device: str) -> torch.Tensor:
     )
 
 
+def has_acc_penalties(info) -> bool:
+    """Whether `info` (a SamplingBatchInfo or a view with the same acc_* fields)
+    carries accumulated penalties."""
+    return (
+        info.acc_additive_penalties is not None
+        or info.acc_scaling_penalties is not None
+    )
+
+
+def apply_acc_penalties(logits: torch.Tensor, info, rows_per_request: int = 1):
+    """Apply `info`'s accumulated penalties to `logits` in place: additive, then
+    scaling. `logits` holds `rows_per_request` consecutive rows per request (the
+    verify rows in speculative decoding), which share that request's penalties."""
+    if not has_acc_penalties(info):
+        return
+    by_request = logits.view(-1, rows_per_request, logits.shape[-1])
+    if info.acc_additive_penalties is not None:
+        by_request.add_(info.acc_additive_penalties[:, None, :])
+    if info.acc_scaling_penalties is not None:
+        penalties.apply_scaling_penalties(
+            by_request, info.acc_scaling_penalties[:, None, :]
+        )
+
+
 @dataclasses.dataclass
 class ProcessorEntry:
     """A custom logit processor and the batch rows it applies to."""
@@ -133,7 +156,7 @@ class SamplingBatchInfo:
     grammar_mask: Optional[GrammarMask] = None
 
     # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+    penalizer_orchestrator: Optional[penalties.BatchedPenalizerOrchestrator] = None
     acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
@@ -317,14 +340,14 @@ class SamplingBatchInfo:
         # While we can choose not to even create the class instances if they are not required, this
         # could add additional complexity to the {ScheduleBatch} class, especially we need to
         # handle {filter_batch()} and {merge_batch()} cases as well.
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
+        penalizer_orchestrator = penalties.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
             penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
+                penalties.BatchedFrequencyPenalizer,
+                penalties.BatchedMinNewTokensPenalizer,
+                penalties.BatchedPresencePenalizer,
+                penalties.BatchedRepetitionPenalizer,
             },
         )
 
@@ -455,13 +478,8 @@ class SamplingBatchInfo:
             self.acc_scaling_penalties = None
 
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
-        if self.acc_additive_penalties is not None:
-            # Used in the overlap mode
-            logits.add_(self.acc_additive_penalties)
-
-        if self.acc_scaling_penalties is not None:
-            # Used in the overlap mode
-            apply_scaling_penalties(logits, self.acc_scaling_penalties)
+        # Used in the overlap mode
+        apply_acc_penalties(logits, self)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
