@@ -43,12 +43,14 @@ class _ThreadGroup:
         self._barrier = threading.Barrier(world_size)
         self._parts = [None] * world_size
         self._local = threading.local()
+        self.wire_dtypes = set()
 
     def bind(self, rank: int) -> None:
         self._local.rank = rank
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         assert dim == 0
+        self.wire_dtypes.add(input_.dtype)
         self._parts[self._local.rank] = input_.clone()
         self._barrier.wait()
         out = torch.cat(self._parts, dim=0)
@@ -81,7 +83,7 @@ def _run_ranks(fn, *, num_tokens: int, nope: int):
 
     with get_parallel().override(dcp_group=group):
         with ThreadPoolExecutor(max_workers=_WORLD) as pool:
-            return list(pool.map(run, range(_WORLD)))
+            return list(pool.map(run, range(_WORLD))), group.wire_dtypes
 
 
 class TestDcpFp8QueryGather(CustomTestCase):
@@ -106,8 +108,17 @@ class TestDcpFp8QueryGather(CustomTestCase):
                             q_nope_out=q_nope_out, q_pe=q_pe, fp8_dtype=fp8_dtype
                         )
 
-                    want = _run_ranks(bf16_then_cast, num_tokens=num_tokens, nope=nope)
-                    got = _run_ranks(fp8_gather, num_tokens=num_tokens, nope=nope)
+                    want, _ = _run_ranks(
+                        bf16_then_cast, num_tokens=num_tokens, nope=nope
+                    )
+                    got, wire_dtypes = _run_ranks(
+                        fp8_gather, num_tokens=num_tokens, nope=nope
+                    )
+                    # The custom all-gather rejects fp8: pair bytes into bf16, else send uint8.
+                    odd_row = (nope + _ROPE) % 2 == 1
+                    self.assertEqual(
+                        wire_dtypes, {torch.uint8 if odd_row else torch.bfloat16}
+                    )
                     for rank in range(_WORLD):
                         self.assertEqual(
                             got[rank].shape,
