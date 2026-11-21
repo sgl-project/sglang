@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.weight_sync.tensor_bucket import is_bucket_view
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -141,17 +142,21 @@ def _validate_gluon_quant_method(layer, quant_method) -> None:
     validate_gluon_quant_method(layer, quant_method)
 
 
+def _owns_storage(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` spans exactly the storage it points at."""
+    return (
+        tensor.is_contiguous()
+        and tensor.storage_offset() == 0
+        and tensor.untyped_storage().nbytes()
+        == tensor.numel() * tensor.element_size()
+    )
+
+
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     """Copy a CPU tensor view into independent contiguous storage."""
     if loaded_weight.device.type != "cpu":
         return loaded_weight
-    tensor_bytes = loaded_weight.numel() * loaded_weight.element_size()
-    needs_copy = not (
-        loaded_weight.is_contiguous()
-        and loaded_weight.storage_offset() == 0
-        and loaded_weight.untyped_storage().nbytes() == tensor_bytes
-    )
-    if not needs_copy:
+    if _owns_storage(loaded_weight):
         return loaded_weight
     return loaded_weight.clone(memory_format=torch.contiguous_format)
 
@@ -162,6 +167,30 @@ def _maybe_copy_weight_view_before_h2d(
     if not envs.SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D.get():
         return loaded_weight
     return _copy_weight_view_before_h2d(loaded_weight)
+
+
+def _materialize_bucket_view(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Detach a flattened-bucket payload view before it is copied.
+
+    ``FlattenedTensorBucket.reconstruct_tensors`` hands every payload tensor
+    over as ``uint8 buffer -> view(dtype) -> reshape``.  A routed expert copies
+    it into ``param.data[expert_id].narrow(...)``, i.e. a destination with a
+    non-zero offset, and on Ascend that copy reads the wrong addresses: about
+    half of the elements land as independent draws (CANN reports
+    ``[Check][offset] ... result is untrustworthy``) while the source and the
+    destination are both exact before it.  Tensor geometry cannot identify such
+    a source - a single-tensor bucket owns its whole storage - so the loader
+    keys off the flag ``reconstruct_tensors`` sets instead.
+
+    Materializing costs one device copy per expert tensor.  Tensors that own
+    their storage (every per-tensor refit, every startup load) and non-Ascend
+    platforms are untouched.
+    """
+    if not is_bucket_view(loaded_weight):
+        return loaded_weight
+    if not (_is_npu and envs.SGLANG_MOE_MATERIALIZE_BUCKET_VIEWS.get()):
+        return loaded_weight
+    return loaded_weight.clone(memory_format=torch.contiguous_format)
 
 
 def _weight_layout_method(layer):
@@ -1236,6 +1265,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # if expert_id is None, then
         # all the experts are loaded at the same time
+        loaded_weight = _materialize_bucket_view(loaded_weight)
         if (
             expert_id is None
             and self.quant_config is not None
@@ -1614,6 +1644,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
+        loaded_weight = _materialize_bucket_view(loaded_weight)
         method = _weight_layout_method(self)
         if isinstance(method, KTEPWrapperMethod):
             method = method.gpu_method

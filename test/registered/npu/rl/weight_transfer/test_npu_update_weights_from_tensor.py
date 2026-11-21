@@ -91,6 +91,9 @@ class _TensorSuite:
             for name, _, _ in cls.manifest
             if ".mlp.experts." in name and "down_proj" in name
         ]
+        # gate/up land in the first half of the fused w13 weight, i.e. in a
+        # narrowed destination - the shape that exposes the bucket-view copy.
+        cls.w13_tensor = _pick_tensor(cls.manifest, [".mlp.experts.0.gate_proj.weight"])
         env = {**npu_rl_env(), "HCCL_NPU_SOCKET_PORT_RANGE": HCCL_PORT_RANGE}
         with npu_server(
             cls.checkpoint, extra_args=_server_args(case, dummy=False), env=env
@@ -208,6 +211,40 @@ class _TensorSuite:
             self.lane_url, [(self.subset, original)], TP_SIZE
         )
         self._assert_reference("restoring the subset did not restore the output")
+
+    def test_05_packed_refit_of_whole_checkpoint(self):
+        """The whole checkpoint as one flattened bucket, i.e. what an RL trainer sends.
+
+        Every tensor arrives as a view into one shared transfer buffer; a
+        no-op refit of it has to reproduce startup loading byte for byte, for
+        routed experts included.
+        """
+        for round_idx in range(UPDATE_ROUNDS):
+            update_full_checkpoint_per_rank(
+                self.lane_url, self.checkpoint, TP_SIZE, flattened_bucket=True
+            )
+            self._assert_reference(
+                f"packed refit round {round_idx + 1} did not reproduce startup loading"
+            )
+
+    def test_06_packed_single_expert_tensor(self):
+        """One w13 tensor in its own bucket: the cheapest form of the same copy.
+
+        A single-tensor bucket owns its whole storage (offset 0, storage of
+        exactly ``numel * itemsize``), so only the payload's provenance - not
+        its geometry - tells the loader that the source is a view of the
+        transfer buffer.
+        """
+        original = load_checkpoint_tensor(self.tensor_index, self.w13_tensor)
+        update_weights_from_tensor_per_rank(
+            self.lane_url,
+            [(self.w13_tensor, original)],
+            TP_SIZE,
+            flattened_bucket=True,
+        )
+        self._assert_reference(
+            "single-expert packed refit did not reproduce startup loading"
+        )
 
 
 def _make_suite(case):

@@ -3,6 +3,18 @@ from typing import List, Tuple
 
 import torch
 
+# Set on every tensor ``reconstruct_tensors`` hands out: such a tensor is a
+# ``uint8`` buffer seen through ``view(dtype)`` and ``reshape``, not a tensor
+# that owns storage.  The two are geometrically identical (a single-tensor
+# bucket has offset 0 and a storage of exactly ``numel * itemsize``), so a
+# loader cannot tell them apart without this flag.
+BUCKET_VIEW_FLAG = "_sglang_flattened_bucket_view"
+
+
+def is_bucket_view(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor`` was reconstructed out of a flattened transfer bucket."""
+    return getattr(tensor, BUCKET_VIEW_FLAG, False)
+
 
 @dataclass
 class FlattenedTensorMetadata:
@@ -129,6 +141,7 @@ class FlattenedTensorBucket:
                 .view(meta.dtype)
                 .reshape(meta.shape)
             )
+            setattr(tensor, BUCKET_VIEW_FLAG, True)
 
             reconstructed[i] = (meta.name, tensor)
 
