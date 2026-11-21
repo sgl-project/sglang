@@ -163,31 +163,36 @@ def _hip_runtime() -> Optional[ctypes.CDLL]:
         ]
         return hip
     except (OSError, AttributeError):
-        logger.warning("hipExtStreamGetCUMask unavailable; assuming the whole device")
+        logger.warning(
+            "hipExtStreamGetCUMask unavailable; the fused MoE sort stays off"
+        )
         return None
 
 
-# The last CU count read for a stream, for a graph capture that cannot ask.
+# The last CU count read for a stream, for a graph capture that cannot ask. A probe that fails
+# answers None (the unfused router), never the whole device.
 _enabled_cus_by_stream: dict[tuple[int, int], int] = {}
 
 
 def _enabled_cus(device: torch.device) -> Optional[int]:
-    # The CUs the current stream may run on: its CU mask (hipExtStreamGetCUMask), else the device's.
+    # The CUs the current stream may run on, from its CU mask (hipExtStreamGetCUMask); None when unknown.
     # Eager calls ask every time, since a stream handle can be reused after its stream is destroyed;
     # a capture answers from the last read of its stream, or None.
+    hip = _hip_runtime()
+    if hip is None:
+        return None
     device = torch.device(device)
     index = device.index if device.index is not None else torch.cuda.current_device()
     stream = torch.cuda.current_stream(device).cuda_stream
     key = (index, stream)
     if torch.cuda.is_current_stream_capturing():
         return _enabled_cus_by_stream.get(key)
-    count = current_arch().num_sms
-    hip = _hip_runtime()
-    if hip is not None:
-        words = (count + 31) // 32
-        mask = (ctypes.c_uint32 * words)()
-        if hip.hipExtStreamGetCUMask(ctypes.c_void_p(stream), words, mask) == 0:
-            count = sum(bin(word).count("1") for word in mask)
+    words = (current_arch().num_sms + 31) // 32
+    mask = (ctypes.c_uint32 * words)()
+    if hip.hipExtStreamGetCUMask(ctypes.c_void_p(stream), words, mask) != 0:
+        _enabled_cus_by_stream.pop(key, None)
+        return None
+    count = sum(bin(word).count("1") for word in mask)
     _enabled_cus_by_stream[key] = count
     return count
 
