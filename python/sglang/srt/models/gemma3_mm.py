@@ -47,7 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
-from sglang.srt.utils import flatten_nested_list, is_xpu
+from sglang.srt.utils import flatten_nested_list, is_cuda, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,68 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 backend.bidirectional_block_ids = self._build_xpu_image_block_ids(
                     forward_batch=forward_batch, device=input_ids.device
                 )
+        elif (fa_backend := self._flash_attention_prefill_backend(backend)) is not None:
+            assert forward_batch.forward_mode == ForwardMode.EXTEND
+            fa_backend.forward_metadata.image_token_ranges = (
+                self._build_image_token_ranges(
+                    forward_batch=forward_batch, device=input_ids.device
+                )
+            )
+        else:
+            logger.warning_once(
+                f"{type(backend).__name__} does not support bidirectional "
+                "attention among image tokens; Gemma 3 falls back to causal "
+                "attention, which lowers image accuracy. Use --attention-backend "
+                "triton, or fa3 on SM90+."
+            )
+
+    @staticmethod
+    def _flash_attention_prefill_backend(backend):
+        if not is_cuda():
+            return None
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+        if isinstance(backend, HybridAttnBackend):
+            backend = backend.prefill_backend
+        if (
+            isinstance(backend, FlashAttentionBackend)
+            and backend.supports_image_masks()
+        ):
+            return backend
+        return None
+
+    @staticmethod
+    def _build_image_token_ranges(forward_batch: ForwardBatch, device):
+        lengths = forward_batch.extend_seq_lens_cpu
+        prefixes = forward_batch.extend_prefix_lens_cpu
+        ranges = torch.full((sum(lengths), 2), -1, dtype=torch.int32)
+        offset = 0
+        split_images = 0
+        for i, (length, prefix) in enumerate(zip(lengths, prefixes)):
+            mm_inputs = forward_batch.mm_inputs[i]
+            if mm_inputs is not None:
+                for mm_item in mm_inputs.mm_items:
+                    if not mm_item.is_image():
+                        continue
+                    for begin, end in mm_item.offsets:
+                        if end < prefix or begin >= prefix + length:
+                            continue
+                        if begin < prefix or end >= prefix + length:
+                            split_images += 1
+                            continue
+                        ranges[offset + begin - prefix : offset + end + 1 - prefix] = (
+                            torch.tensor([begin, end], dtype=torch.int32)
+                        )
+            offset += length
+        if split_images:
+            logger.warning_once(
+                "Images split across prefill chunks use causal attention; "
+                "disable chunked prefill for bidirectional image attention."
+            )
+        return ranges.to(device, non_blocking=True)
 
     @staticmethod
     def _build_xpu_image_block_ids(forward_batch: ForwardBatch, device):

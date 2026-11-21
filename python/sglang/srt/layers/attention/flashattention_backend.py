@@ -451,7 +451,7 @@ class FlashAttentionBackend(AttentionBackend):
     # Every kernel call goes through these two with the layer's version from
     # _ver_for; a subclass swaps the FA build in self._fa_kernels.
     def flash_attn_varlen_func(self, *args, ver: int, **kwargs):
-        return self._fa_kernels[ver][0](*args, **kwargs)
+        return self._kernels(ver)[0](*args, **kwargs)
 
     def flash_attn_with_kvcache(self, *args, ver: int, **kwargs):
         # The FP8 k/v descales are one per-layer scalar expanded over the request
@@ -466,7 +466,22 @@ class FlashAttentionBackend(AttentionBackend):
             if k_descale.shape[0] != batch:
                 kwargs["k_descale"] = k_descale[:1].expand(batch, -1)
                 kwargs["v_descale"] = kwargs["v_descale"][:1].expand(batch, -1)
-        return self._fa_kernels[ver][1](*args, **kwargs)
+        return self._kernels(ver)[1](*args, **kwargs)
+
+    def _kernels(self, ver: int):
+        if ver not in self._fa_kernels:
+            self._fa_kernels[ver] = _load_fa4_kernels(get_device_capability())[:2]
+        return self._fa_kernels[ver]
+
+    def supports_image_masks(self) -> bool:
+        if self.fa_impl_ver == 4 or self.fa3_upgrades_to_fa4:
+            return True
+        return (
+            type(self) is FlashAttentionBackend
+            and not self.use_mla
+            and self.kv_cache_dtype == torch.bfloat16
+            and get_device_capability()[0] >= 9
+        )
 
     def _ver_for(self, layer: RadixAttention, *, needs_fa4: bool = False) -> int:
         # FA3 kernels stop at head_dim 256; image masks exist only in FA4.
