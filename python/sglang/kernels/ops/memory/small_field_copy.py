@@ -145,6 +145,28 @@ class SmallFieldCopyPlan:
         return _run_host_desc(dsts[0], self._desc)
 
 
+_PLANS: dict = {}
+# try_small_copy's per-field bound: a larger field copies faster through torch._foreach_copy_.
+_MAX_PLAN_FIELD_NUMEL = 8192
+
+
+def cached_small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    """One-launch copy through a SmallFieldCopyPlan per destination layout (pointer,
+    shape, stride, dtype of every destination); False when a field is not supported."""
+    if len(dsts) > _MAX_FIELDS:
+        return False
+    for d in dsts:
+        if d.numel() > _MAX_PLAN_FIELD_NUMEL:
+            return False
+    key = tuple((d.data_ptr(), d.shape, d.stride(), d.dtype) for d in dsts)
+    plan = _PLANS.get(key)
+    if plan is None:
+        if len(_PLANS) >= 256:
+            _PLANS.clear()
+        plan = _PLANS[key] = SmallFieldCopyPlan()
+    return plan(dsts, srcs)
+
+
 def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     module = _jit_small_field_copy_module()
     run = (
@@ -155,4 +177,4 @@ def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
     return run(anchor, desc) == 0
 
 
-__all__ = ["SmallFieldCopyPlan"]
+__all__ = ["SmallFieldCopyPlan", "cached_small_field_copy"]
