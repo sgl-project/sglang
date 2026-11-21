@@ -6,10 +6,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components import dspark_verify
+from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkStepObservers,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
