@@ -12,9 +12,11 @@ import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.environ import envs
+from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.moe import route_quant_handoff, route_sort
 from sglang.srt.layers.moe.moe_runner import aiter_route_sort
 from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
+from sglang.srt.models import kimi_k3 as kimi_k3_module
 from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK3LinearForCausalLM,
@@ -216,6 +218,31 @@ class TestKimiK3MoERouteSortLifetime(CustomTestCase):
             traced = torch.compile(forward, fullgraph=True, backend="eager")
             self.assertEqual(traced(torch.zeros(1)).item(), 1.0)
         runner.route_sort_consumer.assert_not_called()
+
+    def test_routing_publishes_the_latent_only_for_the_experts_off_rocm(self):
+        """Off ROCm, routing runs before the latent is published, as it always did;
+        on ROCm the fused sort launch needs it published while routing."""
+        seen = []
+
+        def route(hidden_states, router_logits):
+            seen.append(zero_copy_context.ctx.moe_output)
+            return None
+
+        for is_hip in (False, True):
+            seen.clear()
+            latent = torch.zeros(2, 4)
+            moe = SimpleNamespace(
+                _route_quant_fuse_eligible=False,
+                topk=route,
+                experts=lambda x, topk_output: latent,
+            )
+            with (
+                self.subTest(is_hip=is_hip),
+                patch.object(kimi_k3_module, "_is_hip", is_hip),
+                patch.object(kimi_k3_module, "_is_gfx95", False),
+            ):
+                KimiK3MoE._forward_routed(moe, None, None, None, latent)
+                self.assertEqual([published is latent for published in seen], [is_hip])
 
     def test_nested_layer_scope_restores_the_outer_request(self):
         """The SP pass re-enters the layer's forward inside its own scope: the

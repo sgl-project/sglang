@@ -222,6 +222,17 @@ class TestSortTailResidency(CustomTestCase):
         with self._device_with(32):
             self.assertTrue(radix4.sort_tail_fits(1024, cpu))
 
+    def test_direct_launch_refuses_a_tail_whose_stream_mask_is_unknown(self):
+        """A capture on a stream whose CU mask was never read must not launch a tail sort."""
+        radix4 = route_sort.moe_route_radix4
+        scores = torch.zeros((300, NUM_EXPERTS))
+        bias = torch.zeros(NUM_EXPERTS)
+        with patch.object(radix4, "_enabled_cus", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "too few CUs"):
+                radix4.route_radix4_with_sort(
+                    scores, bias, TOPK, True, 2.5, sort_ws=torch.zeros(4)
+                )
+
     def test_routing_declines_without_launching_when_the_tail_cannot_fit(self):
         consumer = aiter_route_sort.AiterRouteSortConsumer()
         consumer.takes_sort = lambda m: True
