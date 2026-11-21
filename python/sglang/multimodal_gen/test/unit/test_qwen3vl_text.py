@@ -108,7 +108,7 @@ def test_qwen3vl_auxiliary_component_falls_back_from_global_backend(monkeypatch)
         f"{_SELECTOR}.get_global_server_args", lambda: _ExplicitServerArgs()
     )
     monkeypatch.setattr(
-        "sglang.multimodal_gen.runtime.platforms.current_platform", _FakePlatform
+        "sglang.multimodal_gen.runtime.platforms._current_platform", _FakePlatform
     )
     monkeypatch.setattr(f"{_SELECTOR}.resolve_name", lambda _name: _FakeFABackend)
     _cached_get_attn_backend.cache_clear()
