@@ -90,17 +90,11 @@ class LLaDAImageRMSNorm(SGLangRMSNorm):
 def affine_free_rms_norm(
     dim: int, eps: float, elementwise_affine: bool = False
 ) -> nn.Module:
-    """NPU reuses the no-weight RMS op; other backends keep diffusers RMSNorm.
+    """NPU reuses the no-weight RMS op; other backends keep diffusers RMSNorm."""
 
-    The text_projection checkpoint stores these norms without a weight, so a
-    weight-bearing norm breaks the strict plain state-dict validation.
-    ``elementwise_affine`` is forwarded to the diffusers branch only; the NPU
-    no-weight op is inherently weight-less.
-    """
     if _is_npu:
         return BoundRMSNormNoWeight(eps=eps)
-    # The committed diffusers norm keeps GPU parity: F.rms_norm rounds
-    # differently and shifted bf16 outputs on H200.
+
     return RMSNorm(dim, eps=eps, elementwise_affine=elementwise_affine)
 
 
@@ -174,7 +168,7 @@ class LLaDAImageRopeEmbedder(nn.Module):
         for axis, axis_frequencies in enumerate(self.freqs_cis):
             if _is_npu:
                 # NPU's advanced-indexing kernel does not support complex64, so
-                # gather the real and imaginary (float32) parts separately.
+                # gather the real and imaginary parts separately.
                 idx = position_ids[:, axis]
                 frequencies.append(
                     torch.complex(
@@ -1043,16 +1037,13 @@ class LLaDAImageQueryAttention(nn.Module):
                 biases,
             )
         )
+
+        attn_mask = attention_mask[:, None, None, :]
+
         if _is_npu:
-            # NPU fused SDPA misreads broadcast masks (stride-0 query dim);
-            # materialize [B, 1, S_q, L] contiguous before dispatch.
-            attn_mask = (
-                attention_mask[:, None, None, :]
-                .expand(-1, -1, query.shape[1], -1)
-                .contiguous()
-            )
-        else:
-            attn_mask = attention_mask[:, None, None, :]
+            # NPU fused SDPA requires a contiguous mask
+            attn_mask = attn_mask.expand(-1, -1, query.shape[1], -1).contiguous()
+
         hidden_states = dispatch_attention_fn(query, key, value, attn_mask=attn_mask)
         return self.out_proj(hidden_states.flatten(2, 3))
 

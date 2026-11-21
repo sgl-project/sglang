@@ -225,12 +225,7 @@ def is_deepseek_dsa(config) -> bool:
 
 
 def is_llada_image_text_encoder(config) -> bool:
-    """Whether ``config`` is LLaDA-Image's conditioning text encoder.
-
-    LLaDA-Image serves its CFG conditioning through a LLaDA2 text encoder whose
-    HF ``model_type`` is the image-conditional ``llada2_moe_veomni`` variant;
-    the stock LLaDA2 checkpoint reports ``llada2_moe``.
-    """
+    """Whether ``config`` is LLaDA-Image's conditioning text encoder."""
     return (
         _hf_arch(config) == "LLaDA2MoeModelLM"
         and _hf_attr(config, "model_type") == "llada2_moe_veomni"
