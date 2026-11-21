@@ -216,8 +216,8 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
 
     def test_default_ratio_leaves_room_for_the_mamba_host_padding_row(self):
-        """The Mamba host pool pads by one slot; the default ratio must leave room
-        for it, or startup fails on a tight budget."""
+        """The Mamba host pool pads by one slot;
+        the default ratio must leave room for it, or startup fails on a tight budget."""
         target = MambaPool(
             size=8,
             spec_state_size=8,

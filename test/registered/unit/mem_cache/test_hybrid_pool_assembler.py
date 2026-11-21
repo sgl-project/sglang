@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+from contextlib import ExitStack
 from functools import partial
 from queue import Queue
 from types import SimpleNamespace
@@ -2190,29 +2191,26 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
 
 
 class TestMambaHostShare(CustomTestCase):
-    def test_explicit_size_weighs_mamba_by_what_its_host_pool_mirrors(self):
-        """--hicache-size gives the Mamba host pool the share of the bytes it mirrors:
-        draft layers and side states registered after the pool, never spec scratch."""
+    @staticmethod
+    def _make_pool(layer_ids, draft_tokens=None):
+        return MambaPool(
+            size=8,
+            spec_state_size=8,
+            cache_params=InklingConvCacheParams(
+                shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
+                layers=list(layer_ids),
+                dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
+            ),
+            mamba_layer_ids=list(layer_ids),
+            speculative_num_draft_tokens=draft_tokens,
+            device="cpu",
+        )
 
-        def make_pool(layer_ids, draft_tokens=None):
-            return MambaPool(
-                size=8,
-                spec_state_size=8,
-                cache_params=InklingConvCacheParams(
-                    shape=InklingConvStateShape(conv=[(2, 2)], temporal=(2, 2, 2)),
-                    layers=list(layer_ids),
-                    dtype=InklingStateDType(conv=torch.float32, temporal=torch.float32),
-                ),
-                mamba_layer_ids=list(layer_ids),
-                speculative_num_draft_tokens=draft_tokens,
-                device="cpu",
-            )
-
-        mamba_pool = make_pool([0, 1], draft_tokens=4)
+    def _device_pools(self):
+        mamba_pool = self._make_pool([0, 1], draft_tokens=4)
         mamba_pool.register_slot_state(
             NGramPool(size=8, context_len=3, eos_token_id=0, device="cpu")
         )
-        drafts = (make_pool([2]),)
         kv = MHATokenToKVPool(
             size=8,
             page_size=1,
@@ -2223,9 +2221,12 @@ class TestMambaHostShare(CustomTestCase):
             device="cpu",
             enable_memory_saver=False,
         )
-        kv_bytes = sum(kv.get_kv_size_bytes())
+        return mamba_pool, (self._make_pool([2]),), kv
+
+    @staticmethod
+    def _cache_params(drafts):
         allocator = SimpleNamespace(alloc=MagicMock(), free=MagicMock())
-        params = SimpleNamespace(
+        return SimpleNamespace(
             page_size=1,
             mtp_draft_device_pools=(),
             mtp_draft_mamba_pools=drafts,
@@ -2237,47 +2238,70 @@ class TestMambaHostShare(CustomTestCase):
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
         )
+
+    def _enter_host_patches(self, stack):
+        """Enter the context managers that let the stack build real Mamba host pools on CPU."""
+        stack.enter_context(
+            get_context().override_server_args(
+                enable_hierarchical_cache=True,
+                hicache_ratio=2,
+                hicache_mem_layout="page_first_direct",
+                hicache_write_policy="write_through",
+                hicache_io_backend="direct",
+            )
+        )
+        stack.enter_context(get_memory().override(hicache_size=1e-5))
+        stack.enter_context(
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            )
+        )
+        build_kv_host_pool = stack.enter_context(
+            patch.object(
+                hybrid_pool_assembler,
+                "build_kv_host_pool",
+                return_value=SimpleNamespace(
+                    layer_num=1,
+                    layout="page_first_direct",
+                    page_size=1,
+                    device="cpu",
+                    size=17,
+                    logical_size=17,
+                    can_use_write_back_jit=False,
+                ),
+            )
+        )
+        build_mamba_host_pool = stack.enter_context(
+            patch.object(
+                hybrid_pool_assembler,
+                "build_mamba_host_pool",
+                wraps=hybrid_pool_assembler.build_mamba_host_pool,
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                hybrid_pool_assembler,
+                "MambaPoolHost",
+                partial(MambaPoolHost, pin_memory=False),
+            )
+        )
+        stack.enter_context(
+            patch.object(hybrid_pool_assembler, "HybridCacheController")
+        )
+        return build_kv_host_pool, build_mamba_host_pool
+
+    def test_explicit_size_weighs_mamba_by_what_its_host_pool_mirrors(self):
+        """--hicache-size gives the Mamba host pool the share of the bytes it mirrors:
+        draft layers and side states registered after the pool, never spec scratch."""
+        mamba_pool, drafts, kv = self._device_pools()
+        kv_bytes = sum(kv.get_kv_size_bytes())
         for tri_pool in (False, True):
-            with (
-                self.subTest(tri_pool=tri_pool),
-                get_context().override_server_args(
-                    enable_hierarchical_cache=True,
-                    hicache_ratio=2,
-                    hicache_mem_layout="page_first_direct",
-                    hicache_write_policy="write_through",
-                    hicache_io_backend="direct",
-                ),
-                get_memory().override(hicache_size=1e-5),
-                patch.object(
-                    hybrid_pool_assembler, "_get_allocator_type", return_value="default"
-                ),
-                patch.object(
-                    hybrid_pool_assembler,
-                    "build_kv_host_pool",
-                    return_value=SimpleNamespace(
-                        layer_num=1,
-                        layout="page_first_direct",
-                        page_size=1,
-                        device="cpu",
-                        size=17,
-                        logical_size=17,
-                        can_use_write_back_jit=False,
-                    ),
-                ) as build_kv_host_pool,
-                patch.object(
-                    hybrid_pool_assembler,
-                    "build_mamba_host_pool",
-                    wraps=hybrid_pool_assembler.build_mamba_host_pool,
-                ) as build_mamba_host_pool,
-                patch.object(
-                    hybrid_pool_assembler,
-                    "MambaPoolHost",
-                    partial(MambaPoolHost, pin_memory=False),
-                ),
-                patch.object(hybrid_pool_assembler, "HybridCacheController"),
-            ):
+            with self.subTest(tri_pool=tri_pool), ExitStack() as stack:
+                build_kv_host_pool, build_mamba_host_pool = self._enter_host_patches(
+                    stack
+                )
                 common = dict(
-                    params=params,
+                    params=self._cache_params(drafts),
                     mamba_pool=mamba_pool,
                     full_layer_mapping={0: 0},
                     start_layer=0,
@@ -2316,12 +2340,11 @@ class TestMambaHostShare(CustomTestCase):
 
 
 class TestMambaHostShareForModelGeometries(CustomTestCase):
-    """--hicache-size weighs the Mamba host pool by checkpoint bytes for real hybrid
-    geometries, whatever spec verify scratch sits beside them.
+    """--hicache-size weighs the Mamba host pool by checkpoint bytes,
+    whatever spec verify scratch sits beside them.
 
-    "mtp" is the recurrent verify with per-draft-token snapshots; "replayssm" is
-    --enable-linear-replayssm-spec. Pools are on the meta device; the KV side is a
-    byte count.
+    "mtp" uses per-draft-token snapshots; "replayssm" uses --enable-linear-replayssm-spec.
+    Pools live on the meta device; the KV side is a byte count.
     """
 
     HICACHE_SIZE_GB = 100
@@ -2357,7 +2380,6 @@ class TestMambaHostShareForModelGeometries(CustomTestCase):
         )
 
     def test_mamba_share_is_the_same_in_every_spec_mode(self):
-        gib = 1024**3
         # (model, cache params, KV bytes, Mamba slots, draft tokens, bytes per slot,
         #  {spec mode: Mamba GiB})
         cases = (
