@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
     _require_e8m0_dtype,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+    prepare_mxfp4_moe_weight,
     prepare_w4a8_mxfp_weight,
 )
 
@@ -217,6 +218,59 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
             bias = getattr(quant_info, f"{weight_prefix}_weight_bias", None)
         return {"bias": [bias]} if bias is not None else {}
 
+    @staticmethod
+    def _quantize_weight_online(
+        weight: torch.Tensor, fp4_dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize FP16/BF16 experts; activation policies remain independent."""
+        if weight.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"Online MXFP4 loading requires FP16/BF16 weights, got {weight.dtype}."
+            )
+        if not weight.is_npu:
+            weight = weight.to(f"npu:{torch.npu.current_device()}")
+        return torch.ops.npu.npu_dynamic_mx_quant(
+            weight,
+            dst_type=fp4_dtype,
+            round_mode="rint",
+            scale_alg=2,
+            dst_type_max=7.25,
+        )
+
+    def _fused_gmm1_swiglu_mx(
+        self,
+        quant_info,
+        hidden_states,
+        expert_tokens,
+        pertoken_scale,
+        group_list_type,
+        *,
+        weight_dtype,
+        act_dtype,
+        x_dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        e8m0_dtype = _require_e8m0_dtype()
+        return self.fused_matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            quant_dtype=act_dtype,
+            x_dtype=x_dtype,
+            weight_dtype=weight_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+        )
+
 
 # ---------------------------------------------------------------------------
 #  NPUW4A8MXFP4MoEMethod
@@ -262,17 +316,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             fp4_dtype = _get_float4_e2m1fn_x2_dtype()
             if fp4_dtype is None:
                 raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
-            source = weight.data
-            if not source.is_npu:
-                source = source.to(f"npu:{torch.npu.current_device()}")
-            packed, block_scale = torch.ops.npu.npu_dynamic_mx_quant(
-                source,
-                dst_type=fp4_dtype,
-                round_mode="rint",
-                scale_alg=2,
-                dst_type_max=7.25,
-            )
-            del source
+            packed, block_scale = self._quantize_weight_online(weight.data, fp4_dtype)
             # Normalize online [E, N, K/64, 2] scales to the checkpoint layout.
             if block_scale.dim() == 4:
                 block_scale = block_scale.flatten(-2)
@@ -340,35 +384,20 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
         if fp4_dtype is None:
             raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
-        e8m0_dtype = _require_e8m0_dtype()
-
-        if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-        else:
-            # flat [T, K//32] -> pair form [T, K//64, 2]; identity if already
-            # pair-split.
+        if pertoken_scale is not None:
+            # Incoming MXFP8 scales may be flat or already pair-split.
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 64, 2
             )
-
-        return self.fused_matmul.forward(
+        return self._fused_gmm1_swiglu_mx(
             quant_info,
-            "w13",
             hidden_states,
-            expert_tokens.to(torch.int64),
-            group_list_type=group_list_type,
-            transposed=True,
-            weight_scale=[quant_info.w13_weight_scale],
-            x_scale=pertoken_scale,
-            dequant_mode=2,
-            quant_mode=2,
-            dequant_dtype=torch.float32,
-            quant_dtype=torch.float8_e4m3fn,
-            # e4m3 is implicit for x; FP4 must be passed for the weight.
-            x_dtype=None,
+            expert_tokens,
+            pertoken_scale,
+            group_list_type,
             weight_dtype=fp4_dtype,
-            weight_scale_dtype=e8m0_dtype,
-            x_scale_dtype=e8m0_dtype,
+            act_dtype=torch.float8_e4m3fn,
+            x_dtype=None,
         )
 
 
@@ -376,9 +405,15 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
 #  NPUW4A4MXFP4MoEMethod
 # ---------------------------------------------------------------------------
 class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
-    """ModelSlim W4A4 MXFP4 MoE with single-level FP4 weights and activations."""
+    """Online and ModelSlim W4A4 MoE with single-level FP4 weights/activations.
 
-    def __init__(self):
+    BF16/FP16 expert weights are quantized after loading; packed offline weights
+    retain the existing layout-only preparation path.
+    """
+
+    def __init__(
+        self, weight_prefix: Optional[str] = None, use_fused_gmm1: bool = False
+    ):
         super().__init__(quant_config=None)
         self.matmul = GroupedMatmul()
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
@@ -388,6 +423,8 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
             quant_dtype=fp4_dtype,
             use_mx_quant=True,
         )
+        self.use_fused_gmm1 = use_fused_gmm1 and weight_prefix != "w2"
+        self.fused_matmul = GroupedMatmulSwigluQuant() if self.use_fused_gmm1 else None
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -395,21 +432,50 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
-        weight.data = npu_format_cast(weight.data).transpose(-1, -2)
+        if weight.dtype != torch.uint8:
+            # Only packed uint8 is an offline checkpoint, not arbitrary dtypes.
+            packed, block_scale = self._quantize_weight_online(
+                weight.data, self.hidden_states_quantizer.quant_dtype
+            )
+            if block_scale.dim() == 4:
+                block_scale = block_scale.flatten(-2)
+            weight = Parameter(packed, requires_grad=False)
+            layer.register_parameter(f"{weight_prefix}_weight", weight)
+            layer.register_parameter(
+                f"{weight_prefix}_weight_scale",
+                Parameter(block_scale, requires_grad=False),
+            )
 
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        scale = weight_scale.data.reshape(
-            weight_scale.shape[0],
-            weight_scale.shape[1],
-            weight_scale.shape[2] // 2,
-            2,
-        ).transpose(1, 2)
-        weight_scale.data = scale
+        weight.data, weight_scale.data = prepare_mxfp4_moe_weight(
+            weight.data, weight_scale.data, customize_dtype=None
+        )
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
-        # Keep dispatch in BF16 and quantize immediately before each GMM.
+        # There is no FP4 dispatch path, including under DeepEP low latency.
+        # Keep BF16 dispatch and quantize immediately before each GMM.
         if weight_prefix == "w13":
             self._set_moe_dispatch_dtype(layer, "bf16")
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return FP4 activations and paired block scales ready for GMM2."""
+        fp4_dtype = self.hidden_states_quantizer.quant_dtype
+        return self._fused_gmm1_swiglu_mx(
+            quant_info,
+            hidden_states,
+            expert_tokens,
+            pertoken_scale,
+            group_list_type,
+            weight_dtype=fp4_dtype,
+            act_dtype=fp4_dtype,
+            x_dtype=fp4_dtype,
+        )
 
     def apply(
         self,
@@ -426,7 +492,8 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
 
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-        elif pertoken_scale is not None:
+        elif pertoken_scale.dim() == 2:
+            # Fused GMM1 already returns the paired form; do not reshape it.
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 32, 2
             )

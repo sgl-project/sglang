@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
+    NPUW4A4MXFP4MoEMethod,
     NPUW4A8MXFP4MoEMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
@@ -73,8 +74,13 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         self._aiter_runner = None
 
 
-class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
-    """Online W4A8 MXFP with lazy, independent W13/W2 loading and conversion."""
+class _NPUOnlineMXFP4MoEMethodBase(UnquantizedFusedMoEMethod):
+    """Shared online MXFP4 loading; each scheme selects its per-matmul kernels."""
+
+    scheme_name: str
+
+    def _make_kernel(self, weight_prefix: str):
+        raise NotImplementedError
 
     def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
         super().__init__()
@@ -127,14 +133,32 @@ class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
         if not (backend.is_auto() or backend.is_ascend()):
             # Other runners may swap gate/up shards during loading.
             raise ValueError(
-                "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
-                f"'ascend', got {backend.value!r}."
+                f"{self.scheme_name} MoE on Ascend requires --moe-runner-backend "
+                f"'auto' or 'ascend', got {backend.value!r}."
             )
 
         self.moe_runner_config = moe_runner_config
         self.runner = create_ascend_moe_runner(
             layer,
             moe_runner_config,
-            w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
-            w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
+            w13_kernel=self._make_kernel("w13"),
+            w2_kernel=self._make_kernel("w2"),
         )
+
+
+class NPUW4A8MXFP4OnlineMoEMethod(_NPUOnlineMXFP4MoEMethodBase):
+    """Online W4A8 MXFP with lazy, independent W13/W2 conversion."""
+
+    scheme_name = "W4A8 MXFP"
+
+    def _make_kernel(self, weight_prefix: str):
+        return NPUW4A8MXFP4MoEMethod(weight_prefix=weight_prefix)
+
+
+class NPUW4A4MXFP4OnlineMoEMethod(_NPUOnlineMXFP4MoEMethodBase):
+    """Online single-level W4A4 experts (``--quantization mxfp4``)."""
+
+    scheme_name = "W4A4 MXFP4"
+
+    def _make_kernel(self, weight_prefix: str):
+        return NPUW4A4MXFP4MoEMethod(weight_prefix, use_fused_gmm1=True)
