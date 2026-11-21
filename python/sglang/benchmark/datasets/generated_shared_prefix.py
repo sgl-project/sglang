@@ -141,12 +141,7 @@ def get_gen_prefix_cache_path(
     ordered: bool = False,
     fast_prepare: bool = False,
 ):
-    """Create cache directory under ~/.cache/sglang/benchmark.
-
-    The uniform-mode filename is preserved exactly as before so existing
-    on-disk caches remain valid. Non-default sampling modes get an extra
-    suffix encoding the parameters that affect the cached payload.
-    """
+    """Use a versioned key because legacy caches mixed ordered and fast modes."""
     cache_dir = Path.home() / ".cache" / "sglang" / "benchmark"
 
     suffix = ""
@@ -163,7 +158,7 @@ def get_gen_prefix_cache_path(
         suffix += "_fast"
 
     cache_key = (
-        f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
+        f"gen_shared_prefix_v2_{seed}_{num_groups}_{prompts_per_group}_"
         f"{system_prompt_len}_{question_len}_{output_len}{suffix}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )

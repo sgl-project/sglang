@@ -10,6 +10,7 @@ import io
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.choices import REMOVED_CHOICES
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -170,6 +171,40 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "unsupported",
                 ]
             )
+
+    def test_continuous_decode_steps_is_a_deprecated_noop(self):
+        from sglang.srt.entrypoints.engine import Engine
+
+        flag = "--num-continuous-decode-steps"
+        field = "num_continuous_decode_steps"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "config.yaml")
+            with open(config, "w") as handle:
+                handle.write("num-continuous-decode-steps: 2\n")
+            yaml_args = ConfigArgumentMerger(self.parser).merge_config_with_args(
+                ["--config", config]
+            )
+            for source, argv in (("CLI", [flag, "2"]), ("YAML", yaml_args)):
+                with self.subTest(source=source):
+                    with self.assertLogs() as logs:
+                        args = self._parse(argv)
+                    self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
+                    self.assertIsNone(resolution_result(args, field))
+
+        # Stop the offline Engine at the subprocess boundary.
+        with (
+            patch("sglang.srt.entrypoints.engine.atexit.register"),
+            patch.object(
+                Engine, "_launch_subprocesses", side_effect=StopIteration
+            ) as launch,
+            self.assertRaises(StopIteration),
+        ):
+            Engine(model_path="dummy", num_continuous_decode_steps=2)
+        args = launch.call_args.kwargs["server_args"]
+        with self.assertLogs() as logs:
+            args.resolve_once()
+        self.assertIn(f"{field} is deprecated", "\n".join(logs.output))
+        self.assertIsNone(resolution_result(args, field))
 
     def test_removed_flags_name_their_replacement(self):
         """A flag removed in SGLang 1.0 stops the launch with a message naming

@@ -238,7 +238,6 @@ REMOVED_FLAGS = {
     "--disable-outlines-disk-cache": "it had no effect, drop it",
     "--show-time-cost": "it had no effect, drop it",
     "--triton-attention-reduce-in-fp32": "it had no effect, drop it",
-    "--num-continuous-decode-steps": "it had no effect, drop it",
 }
 
 

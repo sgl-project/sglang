@@ -125,20 +125,15 @@ class OpenAI(BaseBackend):
         num_api_spec_tokens: int,
         spec_var_name: str,
     ):
-        if "max_tokens" not in self.spec_kwargs:
-            self.spec_kwargs["max_tokens"] = num_api_spec_tokens
-        else:
-            assert self.spec_kwargs["max_tokens"] == num_api_spec_tokens
-
         params = self._openai_kwargs(sampling_params)
         for key, value in params.items():
             if key in ["stop"]:
                 continue
-            if key in ["max_tokens"]:
+            if key in ("max_tokens", "max_completion_tokens"):
                 warnings.warn(
-                    "The parameter max_tokens will be overwritten by speculated number of tokens."
+                    f"The parameter {key} will be overwritten by speculated number of tokens."
                 )
-                continue
+                value = num_api_spec_tokens
             if key not in self.spec_kwargs:
                 self.spec_kwargs[key] = value
             else:

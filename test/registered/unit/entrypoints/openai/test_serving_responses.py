@@ -2572,7 +2572,8 @@ def test_pd_builtin_tool_admission(response_serving):
     serving.tokenizer_manager.generate_request.assert_not_called()
 
 
-def test_standalone_builtin_tools_without_storage(response_serving):
+@pytest.mark.parametrize("stream", [False, True])
+def test_standalone_builtin_tools_without_storage(response_serving, stream):
     serving = response_serving(harmony=True)
     tool_session = Mock()
     tool_session.call_tool = AsyncMock(
@@ -2599,7 +2600,7 @@ def test_standalone_builtin_tools_without_storage(response_serving):
         chunk["output_ids"] = get_encoding().render_conversation(
             Conversation.from_messages([next(turns)])
         )
-        if serving.tokenizer_manager.generate_request.call_count == 1:
+        if stream or serving.tokenizer_manager.generate_request.call_count == 1:
             # The parser starts inside the prompt's open assistant header.
             chunk["output_ids"] = chunk["output_ids"][2:]
         chunk["meta_info"]["completion_tokens"] = len(chunk["output_ids"])
@@ -2612,7 +2613,13 @@ def test_standalone_builtin_tools_without_storage(response_serving):
         name="browser", description="Browser", tools=[]
     )
     serving.supports_browsing = True
-    request = ResponsesRequest(model="x", input="hi", tools=[{"type": "web_search"}])
+    request = ResponsesRequest(
+        model="x",
+        instructions="Use the search tool.",
+        input="What is the answer?",
+        tools=[{"type": "web_search"}],
+        stream=stream,
+    )
     response = asyncio.run(create_response_result(serving, request))
     assert isinstance(response, ResponsesResponse), response.body
     tool_session.call_tool.assert_awaited_once_with("search", {"query": "answer"})
@@ -2620,7 +2627,10 @@ def test_standalone_builtin_tools_without_storage(response_serving):
     assert response.output[-1].content[0].text == "The answer is 42."
     assert serving.tokenizer_manager.generate_request.call_count == 2
     continuation = serving.tokenizer_manager.generate_request.call_args_list[1].args[0]
-    assert "Search result: 42" in get_encoding().decode(continuation.input_ids)
+    prompt = get_encoding().decode(continuation.input_ids)
+    assert request.instructions in prompt
+    assert request.input in prompt
+    assert "Search result: 42" in prompt
     assert not serving.msg_store and not serving.response_store
 
 

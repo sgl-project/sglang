@@ -1180,24 +1180,23 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
-    def test_gsp_uniform_cache_path_format_unchanged(self):
-        # The uniform-mode cache filename keeps its existing
-        # gen_shared_prefix_<seed>_<N>_<P>_<sysL>_<qL>_<outL>_<TokenizerCls>.pkl
-        # shape. The trailing class name is a transformers/tokenizers internal
-        # detail (TokenizersBackend / PreTrainedTokenizerFast depending on
-        # version), so we only pin the deterministic numeric portion.
-        path = get_gen_prefix_cache_path(
-            seed=7,
-            num_groups=3,
-            prompts_per_group=4,
-            system_prompt_len=16,
-            question_len=8,
-            output_len=4,
-            tokenizer=self.tokenizer,
+    def test_gsp_default_ignores_legacy_fast_cache(self):
+        common = dict(num_groups=3, prompts_per_group=4, seed=7)
+        fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
+        legacy_path = (
+            self.tmpdir_path
+            / ".cache"
+            / "sglang"
+            / "benchmark"
+            / f"gen_shared_prefix_7_3_4_4_3_2_{type(self.tokenizer).__name__}.pkl"
         )
-        self.assertTrue(path.name.startswith("gen_shared_prefix_7_3_4_16_8_4_"))
-        self.assertTrue(path.name.endswith(".pkl"))
-        self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
+        with legacy_path.open("wb") as handle:
+            pickle.dump(fast_rows, handle)
+
+        rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertEqual(len(rows), len(fast_rows))
+        for row in rows:
+            self.assertEqual(row.prompt_len, len(self.tokenizer.encode(row.prompt)))
 
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,

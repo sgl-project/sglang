@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 from sglang.srt.utils.common import human_readable_int
 
 
@@ -233,7 +234,13 @@ class Schedule(msgspec.Struct):
         ),
     ] = False
     num_continuous_decode_steps: A[
-        Optional[int], Arg(help="Deprecated. Has no effect.", no_cli=True)
+        Optional[int],
+        Arg(
+            help="Deprecated. Has no effect.",
+            action=DeprecatedAction,
+            action_kwargs={"nargs": None, "type": int},
+            resolvable=True,
+        ),
     ] = None
     scheduler_recv_interval: A[
         int,

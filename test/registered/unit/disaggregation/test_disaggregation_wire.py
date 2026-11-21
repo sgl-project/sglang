@@ -143,8 +143,7 @@ class TestBatchStagingReservations(CustomTestCase):
         run(scheduler, batch)
 
     def test_lazy_prefetch_hook_reaches_nixl_manager(self):
-        """With lazy staging prefetch on, the prefill scheduler's hook must not
-        raise on a NIXL manager; NIXL still requests every chunk of the room."""
+        """Scheduler and sender reserve each NIXL chunk once as prefill advances."""
         session = SimpleNamespace(
             is_dummy=False,
             agent_name="decode-0",
@@ -159,6 +158,9 @@ class TestBatchStagingReservations(CustomTestCase):
         manager.transfer_infos = {7: {"decode-0": session}}
         manager.decode_kv_args_table = {"decode-0": SimpleNamespace(decode_tp_size=2)}
         manager.attn_tp_size = 1
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status = {7: KVPoll.Transferring}
+        manager.transfer_queues = [FastQueue()]
         scheduler = SimpleNamespace(
             disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
         )
@@ -173,8 +175,15 @@ class TestBatchStagingReservations(CustomTestCase):
             SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
                 scheduler, batch
             )
+            self.assertEqual(socket.send_multipart.call_count, 1)
+            manager.add_transfer_request(7, np.array([0]), slice(0, 1), False)
+            self.assertEqual(socket.send_multipart.call_count, 1)
+            batch.reqs[0].extend_end = 33
+            SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
+                scheduler, batch
+            )
         messages = [c.args[0] for c in socket.send_multipart.call_args_list]
-        self.assertEqual([int(m[2]) for m in messages], list(range(5)))
+        self.assertEqual([int(m[2]) for m in messages], [0, 1])
 
 
 class TestRequestWindowRetention(CustomTestCase):

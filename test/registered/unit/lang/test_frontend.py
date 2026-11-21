@@ -247,17 +247,25 @@ class TestOpenAIBackendTokenLimit(_OpenAIBackendTestCase):
                 self._assert_only_max_tokens(4)
 
     def test_api_speculative_execution_on_a_chat_model(self):
-        backend = self._backend("gpt-4", is_chat_model=True)
-
         @sgl.function(num_api_spec_tokens=8)
         def program(s):
             s += sgl.user("q")
             s += sgl.assistant("A: " + sgl.gen("v", max_tokens=4, stop="\n"))
 
-        state = program.run(backend=backend, use_thread=False)
-
-        self.assertEqual(state["v"], "yes")
-        self._assert_only_max_tokens(8)
+        for model, limit in [
+            ("gpt-4", "max_tokens"),
+            ("o1", "max_completion_tokens"),
+            ("o3", "max_completion_tokens"),
+        ]:
+            with self.subTest(model=model):
+                backend = self._backend(model, is_chat_model=True)
+                state = program.run(backend=backend, use_thread=False)
+                self.assertEqual(state["v"], "yes")
+                body = self.bodies[-1]
+                self.assertEqual(body[limit], 8)
+                self.assertEqual(
+                    body.keys() & {"max_tokens", "max_completion_tokens"}, {limit}
+                )
 
 
 class TestOpenAIBackendAccounting(_OpenAIBackendTestCase):
