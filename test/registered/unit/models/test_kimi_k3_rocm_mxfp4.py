@@ -153,10 +153,8 @@ class TestLatentMXFP4Runtime(CustomTestCase):
 
     @torch.inference_mode()
     def test_gfx950_forward_runs_mxfp4_batches_off_the_hip_tails(self):
-        """gfx950's _forward_fused_hip and its row-sharded tail run the BF16
-        latent projections, so taking them for an MXFP4-eligible batch would
-        silently ignore --enable-kimi-k3-latent-mxfp4. Such batches must run
-        the MXFP4 pair on every row; smaller batches keep the gfx950 path."""
+        """MXFP4-eligible batches run the MXFP4 pair on every row;
+        smaller batches keep the gfx950 path."""
         with (
             _toy_runtime(),
             mock.patch.object(kimi_k3, "_is_gfx95", True),
@@ -198,9 +196,8 @@ class TestLatentMXFP4Runtime(CustomTestCase):
 
     @torch.inference_mode()
     def test_mxfp4_front_routes_on_the_same_logits(self):
-        """MXFP4 replaces only the routed input. The router logits must keep the
-        merged front's dtype (fp32 on gfx950 + AITER), or the top-k picks can
-        differ from a run without the flag."""
+        """The router logits keep the merged front's dtype,
+        so the top-k picks match a run without the flag."""
         moe = _moe(prepared=True)
         moe._front_w = moe._front_w.bfloat16()
         moe._latent_mxfp4.down_weight = moe._latent_mxfp4.down_weight.bfloat16()
@@ -284,9 +281,8 @@ class TestLatentMXFP4Runtime(CustomTestCase):
         self.assertEqual(len(loaded), 1)
 
     def test_prepare_raises_on_weights_it_cannot_pack(self):
-        """The user asked for MXFP4, so a checkpoint whose latent weights are not
-        the BF16 (3584, 7168) / (7168, 3584) pair fails at load time instead of
-        silently serving BF16."""
+        """Latent weights that are not the BF16 pair fail at load time,
+        instead of silently serving BF16."""
         down = torch.empty((3584, 7168), dtype=torch.bfloat16, device="meta")
         up = torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta")
         projections = LatentMXFP4Projections()
@@ -305,10 +301,7 @@ class TestLatentMXFP4Runtime(CustomTestCase):
             projections.up(x=torch.ones(1, 3584))
 
     def test_builder_raises_where_the_flag_cannot_apply(self):
-        """SGLANG_USE_AITER=0, quantized latent projections, an MoE a2a backend,
-        deterministic inference (the token-count switch to lossy MXFP4 would make
-        outputs batch dependent) and CP-TP group sharing (its CP shard path keeps
-        the BF16 projections) each fail the explicit opt-in loudly."""
+        """Each configuration the flag cannot apply to fails the opt-in loudly."""
         ok = dict(
             use_aiter=True,
             latent_quantized=False,
