@@ -45,6 +45,7 @@ def _three_window_observer():
             _usage("window_64", "window", 200, 120),
             _usage("window_128", "window", 400, 100),
         ),
+        memory_stats=lambda: None,
     )
     evictable = {"window_128": 100, "window_64": 30, "window_32": 10}
     tree_cache = SimpleNamespace(

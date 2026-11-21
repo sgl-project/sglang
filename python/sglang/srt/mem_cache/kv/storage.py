@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.kv.alloc.signals import (
     NetworkWaiter,
     ReceiveHold,
 )
+from sglang.srt.mem_cache.kv.alloc.stats import ChainStats
 from sglang.srt.mem_cache.kv.decl import Region, StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
@@ -780,6 +781,15 @@ class KVStorage:
                 available=units[s.name][1],
             )
             for s in self._plan.owner_first()
+        )
+
+    def memory_stats(self) -> ChainStats:
+        """The chain's layout and cumulative work, bands under the label each
+        sub-pool's usage is published by."""
+        stats = self._allocator.stats()
+        labels = {s.name: s.external.label for s in self._sub_pools}
+        return msgspec.structs.replace(
+            stats, bands={labels[name]: b for name, b in stats.bands.items()}
         )
 
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:

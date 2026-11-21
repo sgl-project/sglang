@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.kv.alloc.signals import (
     unreleased_transfers,
     wait_signals,
 )
+from sglang.srt.mem_cache.kv.alloc.stats import BandCounters
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.invariants import expect, expect_host, resolve_level
@@ -530,6 +531,8 @@ class Band:
         self._stats_n_emits: int = 0
         self._stats_last_emit_ts: float = _time_mod.monotonic()
         self._stats_final_emitted: bool = False
+        # Compactions by urgency and float relocations, for metrics; never reset.
+        self.counters = BandCounters()
         if _LAZY_COMPACTION_STATS_ENABLED:
             atexit.register(self._emit_stats_final, reason="atexit")
             _STATS_INSTANCES.add(self)
@@ -2808,6 +2811,7 @@ class Band:
             if n_moves > 0:
                 self._stats_n_flush_did_work += 1
                 self._stats_n_flush_moves += n_moves
+                self.counters.note_compaction(urgent=urgent, moves=n_moves)
             self._maybe_emit_stats()
             return n_moves
 
@@ -2949,6 +2953,7 @@ class Band:
             self._stats_n_device_packs += 1
             # The frontier moves from ``end - first`` pages to the live count.
             self._stats_n_pages_absorbed += end - first - live
+            self.counters.note_device_pack(end - first - live)
             self._maybe_emit_stats()
 
     def _move_packed_pages(
@@ -3606,6 +3611,7 @@ class FloatBand(Band):
             torch.empty(0, dtype=torch.int64, device=self.device), host=[]
         )
         self.release(self._to_device(new_holes), Release.VACATED, host=new_holes)
+        self.counters.note_relocation(len(srcs))
         return len(srcs)
 
     def _byte_accounting_violations(self) -> List[str]:

@@ -685,6 +685,10 @@ class StaticKVStorage:
     def accounting_violations(self) -> List[str]:
         return self._allocator.verify_byte_accounting()
 
+    def memory_stats(self) -> None:
+        """Static pools keep no chain layout to report."""
+        return None
+
     def usage(self) -> Tuple[SubPoolUsage, ...]:
         shape, allocator = self._shape, self._allocator
         if shape.has_window:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import time
 from contextlib import contextmanager
 from typing import (
     Any,
@@ -78,6 +79,13 @@ from sglang.srt.mem_cache.kv.alloc.stage_capacity import (
     check_stage_pools,
     simulated_snapshot,
     stage_geometry,
+)
+from sglang.srt.mem_cache.kv.alloc.stats import (
+    REFUSED,
+    BandLayout,
+    ChainCounters,
+    ChainStats,
+    free_gaps,
 )
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
@@ -411,6 +419,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # `max_new_tokens_for_memory`'s answers by question: an empty pool's,
         # so they change only with the pool's geometry (`_reset_geometry_memo`).
         self._max_new_tokens_memo: Dict[tuple, Optional[int]] = {}
+        # Plans by step and planned-take host time, for metrics; never reset.
+        self.counters = ChainCounters()
         self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._set_token_shares(full_max_total_num_tokens, swa_max_total_num_tokens)
 
@@ -1147,6 +1157,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             usage[name] = (band.allocated_count() + free, free)
         return usage
 
+    def stats(self) -> ChainStats:
+        """Each band's pages as the planner prices them now, the free gaps
+        between bands, and the cumulative counters. Observers only."""
+        snapshot = self.pricing_snapshot()
+        gaps = free_gaps(snapshot)
+        bands = {}
+        for band, snap in zip(self.bands, snapshot.bands):
+            bands[band.sub_pool_name] = BandLayout(
+                live_pages=snap.live,
+                hole_pages=snap.holes - snap.pending,
+                pending_pages=snap.pending,
+                counters=msgspec.structs.replace(band.counters),
+            )
+        return ChainStats(
+            bands=bands,
+            gap_bytes=sum(gaps),
+            largest_gap_bytes=max(gaps, default=0),
+            counters=msgspec.structs.replace(
+                self.counters, plans=dict(self.counters.plans)
+            ),
+        )
+
     def _ceiling_windows(self, sliding_window_size: int | None) -> Dict[str, int]:
         """The tail a lone request keeps of each window: the storage's retained
         lengths once bound, else the window's stated length or the scheduler's."""
@@ -1730,17 +1762,22 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         demands = {name: n for name, n in demands.items() if n > 0}
         if not demands:
             return {}
-        # Before the operation: a take of any band sees the state slots an
-        # open free group holds back as free, as an immediate free would.
-        self._settle_state_free_group()
-        with allocator_operation(self.members) as op:
-            op.declare_takes(demands)
-            with self._relief(demands) as plan:
-                if plan is None:
-                    return None
-                return self.realize(
-                    plan, bind_at_frontier=bind_at_frontier, consumer=consumer
-                )
+        start = time.perf_counter()
+        try:
+            # Before the operation: a take of any band sees the state slots an
+            # open free group holds back as free, as an immediate free would.
+            self._settle_state_free_group()
+            with allocator_operation(self.members) as op:
+                op.declare_takes(demands)
+                with self._relief(demands) as plan:
+                    if plan is None:
+                        return None
+                    return self.realize(
+                        plan, bind_at_frontier=bind_at_frontier, consumer=consumer
+                    )
+        finally:
+            self.counters.takes += 1
+            self.counters.take_seconds += time.perf_counter() - start
 
     @_one_operation
     def realize(
@@ -1812,14 +1849,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.held_snapshot(), demands, NO_MOVE, growth=self._growth
         )
         if in_place is not None:
+            self.counters.note_plan(in_place.step)
             yield in_place
             return
         if not feasible(self.pricing_snapshot(), demands):
             # No layout serves it: refused before any pending page settles.
+            self.counters.note_plan(REFUSED)
             yield None
             return
         packed = self._pack_ends_on_device(demands)
         if packed is not None:
+            self.counters.note_plan(packed.step)
             yield packed
             return
         # Settle pending pages first, so the plan and its realization see holes
@@ -1878,6 +1918,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 else None
             )
             if found is None and held:
+                self.counters.unpinned_network_reliefs += 1
                 for band in self.bands:
                     band.unfix_pages(_NETWORK_ROWS)
                     band.holds_fixed = False
@@ -1886,6 +1927,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 found = first_plan(
                     self.pricing_snapshot(), demands, growth=self._growth
                 )
+            self.counters.note_plan(REFUSED if found is None else found.step)
             yield found
         finally:
             for band in self.bands:
