@@ -20,42 +20,21 @@ ARG SG_LANG_KERNEL_SOURCE=wheel
 
 USER root
 
-# Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
-# Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
-ARG IGC_VERSION=2.38.2+22051
-ARG GMM_VERSION=22.10.0
+# Versioned Intel GPU stack instead of the base image's rolling PPA (see sgl-kernel-xpu#296).
+ARG INTEL_OMIX_VERSION=0.4.1
 
-RUN apt-get update && apt-get install -y software-properties-common curl && \
-    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
-    apt-get update && \
-    # Loader + media/metrics from the PPA; the GPU driver is pinned below.
+RUN rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*.sources && \
+    apt-get update && apt-get install -y curl gpg && \
+    curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | \
+        gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble/intel-omix/${INTEL_OMIX_VERSION} unified" \
+        > /etc/apt/sources.list.d/intel-gpu-noble.list && \
+    # Fail here if the omix channel can't be fetched.
+    apt-get update -o APT::Update::Error-Mode=any && \
     apt-get install -y \
-        libze1 intel-metrics-discovery clinfo intel-gsc \
+        intel-gpu-compute intel-metrics-discovery clinfo \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
-        libze-dev \
         ffmpeg && \
-    cd /tmp && \
-    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
-    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
-    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on its exact version.
-    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
-    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
-    apt-get install -y --allow-downgrades \
-        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
-        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
-        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
-        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
-        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
-        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
-    rm -f /tmp/*.deb && \
-    # Hold so later apt upgrades can't pull the rolling PPA version back.
-    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
-        intel-igc-core-2 intel-igc-opencl-2 && \
     rm -rf /var/lib/apt/lists/*
 
 
@@ -111,7 +90,7 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
 ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
 # Base image already applies setvars.sh in its own layers (SETVARS_COMPLETED=1,
 # icpx on PATH, LIBRARY_PATH/CPATH populated), so re-sourcing here is redundant.
-RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
+RUN TMS_PLATFORM=xpu uv pip install --no-cache --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
 # Mooncake transfer engine for PD disaggregation, built with icpx (the XPU TUs
@@ -175,9 +154,9 @@ ARG ABSEIL_PREFIX=/opt/abseil
 # Record which NIXL build tools the venv lacks, so only those are removed after the
 # NIXL build; ones sglang already depends on (ninja, pyyaml) stay.
 RUN for pkg in meson ninja pybind11 meson-python patchelf pyyaml tomlkit; do \
-        pip show -q "$pkg" >/dev/null 2>&1 || echo "$pkg"; \
+        uv pip show -q "$pkg" >/dev/null 2>&1 || echo "$pkg"; \
     done > /tmp/nixl-build-only.txt && \
-    pip install --no-cache-dir meson ninja pybind11 && \
+    uv pip install --no-cache meson ninja pybind11 && \
     curl -fsSL https://github.com/abseil/abseil-cpp/releases/download/${ABSEIL_VERSION}/abseil-cpp-${ABSEIL_VERSION}.tar.gz \
         | tar xz -C /tmp && \
     cmake -S /tmp/abseil-cpp-${ABSEIL_VERSION} -B /tmp/absl_build -G Ninja \
@@ -202,11 +181,11 @@ ARG NIXL_REPO=https://github.com/ai-dynamo/nixl.git
 ARG NIXL_COMMIT=466ebb1ccc5a6e4e8cbaf954c94020400c9ae876
 ARG NIXL_PREFIX=/opt/nixl
 RUN export PKG_CONFIG_PATH=${ABSEIL_PREFIX}/lib/pkgconfig:${UCX_INSTALL_DIR}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}} && \
-    pip install --no-cache-dir meson-python patchelf pyyaml tomlkit && \
+    uv pip install --no-cache meson-python patchelf pyyaml tomlkit && \
     git clone ${NIXL_REPO} /tmp/nixl && \
     cd /tmp/nixl && \
     git checkout ${NIXL_COMMIT} && \
-    pip install --no-cache-dir --no-deps --no-build-isolation . \
+    uv pip install --no-cache --no-deps --no-build-isolation . \
         --config-settings=setup-args="-Dprefix=${NIXL_PREFIX}" \
         --config-settings=setup-args="-Ducx_path=${UCX_INSTALL_DIR}" \
         --config-settings=setup-args="-Denable_plugins=UCX,POSIX" \
@@ -215,8 +194,8 @@ RUN export PKG_CONFIG_PATH=${ABSEIL_PREFIX}/lib/pkgconfig:${UCX_INSTALL_DIR}/lib
         -Dinstall_headers=true -Ducx_path=${UCX_INSTALL_DIR} \
         -Denable_plugins=UCX,POSIX -Dbuild_examples=false && \
     ninja -C build install && \
-    pip install --no-cache-dir --no-deps build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl && \
-    xargs -r pip uninstall -y < /tmp/nixl-build-only.txt && \
+    uv pip install --no-cache --no-deps build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl && \
+    xargs -r uv pip uninstall < /tmp/nixl-build-only.txt && \
     cd / && rm -rf /tmp/nixl /tmp/nixl-build-only.txt
 RUN python -c "import nixl; nixl.nixl_agent('agent1')"
 
