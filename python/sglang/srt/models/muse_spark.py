@@ -93,6 +93,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -771,6 +772,18 @@ class MuseSpark1xMoE(nn.Module):
         dp_scatter(local_output, output, forward_batch)
         return local_output
 
+    def _routing_metadata(self, packed_topk_ids: Optional[torch.Tensor]):
+        if not (
+            self.nvfp4_checkpoint
+            and packed_topk_ids is not None
+            # Graph capture sees a fixed set of token counts; eager shapes would each cache routing metadata.
+            and get_is_capture_mode()
+        ):
+            return None
+        return self.experts.populate_routing_metadata(
+            packed_topk_ids, tp_size=self.tp_size
+        )
+
     def _forward_experts(
         self,
         hidden_states: torch.Tensor,
@@ -846,6 +859,9 @@ class MuseSpark1xMoE(nn.Module):
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
+            routing_metadata = (
+                None if sp_active else self._routing_metadata(packed_topk_ids)
+            )
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -880,6 +896,7 @@ class MuseSpark1xMoE(nn.Module):
                 pre_expert_norm=self.pre_expert_norm,
                 prepared_input=prepared_input,
                 packed_topk_ids=packed_topk_ids,
+                routing_metadata=routing_metadata,
                 ar_workspace=ar_workspace,
             )
         else:
