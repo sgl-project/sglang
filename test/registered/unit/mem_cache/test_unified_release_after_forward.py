@@ -11,6 +11,7 @@ anything, and non-urgent compaction leaves it in place.
 
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,6 +50,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_mamba_cache,
     build_swa_cache,
     build_swa_pool,
+    build_test_unified_pools,
     build_tri_pool,
     build_unified_bundle,
     largest_take,
@@ -1137,6 +1140,118 @@ class TestCacheOperationsOverPendingFrees(CustomTestCase):
         steps.forward_processed(launch)
         self.assertEqual(_pending(window), set())
         cache.unlock(lock)
+
+    def test_a_lazy_cow_source_release_then_its_eviction_stays_pending(self):
+        """Out of state slots, a running request's checkpoint drops its lock on
+        the state it copied and evicts it: that page waits for the forward."""
+        override = get_context().override_server_args(
+            device="cpu",
+            _mamba_cache_chunk_size=4,
+            disable_radix_cache=False,
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            hybrid_cache_checkpoints_level=3,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        for backend in ("python", "rust"):
+            with self.subTest(backend=backend):
+                bundle = build_test_unified_pools(
+                    device="cpu",
+                    kv_cache_dtype=torch.float16,
+                    head_num=1,
+                    head_dim=8,
+                    page_size=4,
+                    start_layer=0,
+                    end_layer=2,
+                    full_attention_layer_ids=[0],
+                    mamba_layer_ids=[1],
+                    mamba2_cache_params=SimpleNamespace(
+                        shape=SimpleNamespace(conv=[(3, 8)], temporal=(1, 4, 8)),
+                        dtype=SimpleNamespace(
+                            conv=torch.bfloat16, temporal=torch.float32
+                        ),
+                        layers=[1],
+                    ),
+                    max_mamba_cache_size=8,
+                    full_max_total_num_tokens=64,
+                    model_context_len=32,
+                    enable_mamba_extra_buffer=True,
+                    enable_mamba_extra_buffer_lazy=True,
+                    disable_overlap_schedule=False,
+                )
+                allocator = bundle.token_to_kv_pool_allocator
+                table = bundle.req_to_token_pool
+                cache = UnifiedRadixCache(
+                    CacheInitParams(
+                        disable=False,
+                        req_to_token_pool=table,
+                        token_to_kv_pool_allocator=allocator,
+                        page_size=4,
+                        tree_slots=storage_tree_slots(
+                            allocator.storage,
+                            components=(ComponentType.FULL, ComponentType.MAMBA),
+                        ),
+                        enable_mamba_extra_buffer=True,
+                        enable_mamba_extra_buffer_lazy=True,
+                        tree_core_backend=backend,
+                    )
+                )
+                if cache._tree_core_backend != backend:
+                    self.skipTest(f"the {backend} TreeCore is unavailable here")
+                state = allocator.mamba_allocator
+                prefix_ids = allocator.alloc(8)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", range(100, 108))),
+                        value=prefix_ids,
+                        mamba_value=allocator.state_slots.alloc(1),
+                    )
+                )
+                tokens = array("q", [*range(100, 108), *range(1, 13)])
+                req = Req(
+                    rid="running",
+                    origin_input_text="",
+                    origin_input_ids=tokens,
+                    sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+                )
+                # Admission copies the prefix's state and locks its node.
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(tokens), cow_mamba=True, req=req)
+                )
+                source = int(state.ids.virtual_to_physical[req.kv.mamba_cow_src_index])
+                req.lock = cow_lock = cache.lock(match.last_device_node)
+                req.last_node = match.last_device_node
+                acquire_rows(table, allocator.state, [req])
+                row = torch.cat([prefix_ids, allocator.alloc(12)])
+                table.write((req.kv.req_pool_idx, slice(0, 20)), row)
+                req.output_ids = array("q")
+                req.full_untruncated_fill_ids = tokens
+                # The chunk [16, 20) runs; the state at 16 is the latest checkpoint.
+                req.extend_end = req.kv.kv_committed_len = req.kv.kv_allocated_len = 20
+                req.kv.cache_protected_len = 8
+                req.kv.mamba_last_track_seqlen = 16
+                # No state slot is left: the checkpoint's take has to evict.
+                while allocator.state_slots.alloc(1) is not None:
+                    pass
+                forward_done = mock.Mock(spec=["query"])
+                forward_done.query.return_value = False  # the forward still runs
+                launch = _launch(allocator.forward_steps, forward_done)
+
+                with mock.patch.object(band_module, "wait_signals") as wait:
+                    checkpoint_kv_cache(req, cache)
+
+                self.assertIn(
+                    ComponentType.MAMBA, cow_lock.receipt.skipped_lock_components
+                )
+                # The donated checkpoint's replacement slot is the evicted
+                # source's page, taken only behind a wait on the forward.
+                wait.assert_called_once_with((forward_done,))
+                tracking = req.kv.mamba_ping_pong_track_buffer
+                tracking = state.ids.virtual_to_physical[tracking[tracking >= 0]]
+                self.assertIn(source, tracking.tolist())
+                allocator.forward_steps.forward_processed(launch)
+                self.assertNotIn(source, state._free_phys_pages.tolist())
+                self.assertEqual(allocator.storage.accounting_violations(), [])
 
 
 if __name__ == "__main__":

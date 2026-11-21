@@ -812,6 +812,76 @@ class TestThreeWindowTree(CustomTestCase):
         self.assertEqual(full.lock_ref, 0)
         cache.sanity_check()
 
+    def test_windows_released_under_a_running_forward_evict_to_pending_pages(self):
+        """The forward in flight still reads the windows its request has just
+        passed: when eviction takes their rows, the pages wait for that forward."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.kv.alloc import band as band_module
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        key = RadixKey(array("q", range(16)))
+        ids = a.alloc(16).clone()
+        cache.insert(InsertParams(key=key, value=ids))
+        pages = ids[::4].to(torch.int64) // 4
+        lock = cache.lock(
+            cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        )
+        req = SimpleNamespace(
+            session=None,
+            lock=lock,
+            decode_batch_idx=10,
+            kv=ReqKvInfo(req_pool_idx=1, cache_protected_len=16),
+        )
+        bands = a.window_allocators
+        physical = {
+            n: set(b.ids.virtual_to_physical[pages].tolist()) for n, b in bands.items()
+        }
+        forward_done = mock.Mock(spec=["query"])
+        forward_done.query.return_value = False  # the forward still runs
+        launch = a.forward_steps.forward_launched()
+        a.forward_steps.forward_recorded(forward_done)
+
+        # Past the 8- and 4-token windows only: those two let go and are evicted.
+        cache.release_swa_prefix_lock(req)
+        cache.evict(EvictParams(window_num_tokens={"window_8": 64, "window_4": 64}))
+
+        released = (bands["window_8"], bands["window_4"])
+        for band in released:
+            pending = {
+                p for c in band._pending_until_retire.pages() for p in c.tolist()
+            }
+            self.assertTrue(bool((band.ids.virtual_to_physical[pages] < 0).all()))
+            self.assertEqual(pending, physical[band.sub_pool_name])
+            self.assertFalse(pending & set(band._free_phys_pages.tolist()))
+        window_16 = bands["window_16"]
+        self.assertEqual(
+            set(window_16.ids.virtual_to_physical[pages].tolist()),
+            physical["window_16"],
+        )
+        with mock.patch.object(band_module, "wait_signals") as wait:
+            taken = a.alloc(16)[::4].to(torch.int64) // 4
+        self.assertEqual(wait.call_args_list, [mock.call((forward_done,))] * 2)
+        for band in released:
+            reused = set(band.ids.virtual_to_physical[taken].tolist())
+            self.assertEqual(reused, physical[band.sub_pool_name])
+        a.forward_steps.forward_processed(launch)
+        for band in released:
+            self.assertFalse(
+                physical[band.sub_pool_name] & set(band._free_phys_pages.tolist())
+            )
+        self.assertEqual(storage.accounting_violations(), [])
+        cache.unlock(lock)
+
     def test_first_window_is_one_window_among_others(self):
         """The tree's first window is read, evicted and reclaimed through the
         same per-slot interface as every further window."""
