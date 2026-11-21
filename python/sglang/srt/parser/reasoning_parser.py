@@ -101,6 +101,7 @@ class BaseReasoningFormatDetector:
 
         self._force_nonempty_content = force_nonempty_content
         self._accumulated_reasoning = ""
+        self._normal_text_seen = False
 
         self.continue_final_message = continue_final_message
         if self.continue_final_message:
@@ -172,9 +173,27 @@ class BaseReasoningFormatDetector:
 
         # The text is considered to be in a reasoning block.
         think_start_text = self.think_start_token + self.think_start_self_label
+        normal_prefix = ""
         processed_text = text
+        start_idx = text.find(think_start_text)
+        if self._in_reasoning and start_idx != -1:
+            # An opener after the block has ended belongs to the answer.
+            boundary_indices = (
+                text.find(self.think_end_token),
+                self._find_tool_start(text),
+            )
+            if any(0 <= idx < start_idx for idx in boundary_indices):
+                start_idx = -1
+        if start_idx != -1:
+            prefix = text[:start_idx]
+            processed_text = text[start_idx:]
+            if not self._in_reasoning:
+                normal_prefix = prefix
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
+        if start_idx != -1 and self._in_reasoning:
+            # The template (or continued message) already opened reasoning.
+            processed_text = prefix + processed_text
 
         end_idx = processed_text.find(self.think_end_token)
         if self.think_end_token not in self.previous_content:
@@ -184,28 +203,29 @@ class BaseReasoningFormatDetector:
             if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
-                normal_text = processed_text[tool_idx:]
+                normal_text = normal_prefix + processed_text[tool_idx:]
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if end_idx == -1:
                 # Assume reasoning was truncated before end token
                 return StreamingParseResult(
-                    reasoning_text=self._strip_partial_tool_start(processed_text)
+                    normal_text=normal_prefix,
+                    reasoning_text=self._strip_partial_tool_start(processed_text),
                 )
 
         # Extract reasoning content
         if end_idx != -1:
             splits = processed_text.split(self.think_end_token, maxsplit=1)
             reasoning_text = splits[0]
-            normal_text = splits[1]
+            normal_text = normal_prefix + splits[1]
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
-            return StreamingParseResult(normal_text=processed_text)
+            return StreamingParseResult(normal_text=normal_prefix + processed_text)
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -219,7 +239,8 @@ class BaseReasoningFormatDetector:
         """
         ret = self._parse_streaming_increment_impl(new_text)
         if self._force_nonempty_content:
-            if self._in_reasoning:
+            self._normal_text_seen |= bool(ret.normal_text)
+            if self._in_reasoning and not self._normal_text_seen:
                 self._accumulated_reasoning += ret.reasoning_text
             else:
                 self._accumulated_reasoning = ""
@@ -242,8 +263,13 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult()
 
         # Strip `<think>` token if present
+        normal_prefix = ""
         if not self.stripped_think_start and think_start_text in current_text:
-            current_text = current_text.replace(think_start_text, "", 1)
+            prefix, current_text = current_text.split(think_start_text, 1)
+            if self._in_reasoning:
+                current_text = prefix + current_text
+            else:
+                normal_prefix = prefix
             # Write back, or stream_reasoning=False carries the token into finish().
             self._buffer = current_text
             self.stripped_think_start = True
@@ -263,7 +289,9 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
+            normal_text = (
+                normal_prefix + current_text[end_idx + len(self.think_end_token) :]
+            )
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
@@ -275,7 +303,7 @@ class BaseReasoningFormatDetector:
             if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
-                normal_text = current_text[tool_idx:]
+                normal_text = normal_prefix + current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
                 return StreamingParseResult(
@@ -297,14 +325,25 @@ class BaseReasoningFormatDetector:
                 reasoning_text = current_text[: len(current_text) - holdback]
                 if reasoning_text:
                     self._streamed_reasoning_tail = reasoning_text[-1]
-                return StreamingParseResult(reasoning_text=reasoning_text)
+                return StreamingParseResult(
+                    normal_text=normal_prefix, reasoning_text=reasoning_text
+                )
             else:
-                return StreamingParseResult()
+                return StreamingParseResult(normal_text=normal_prefix)
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
-            self._buffer = ""
-            return StreamingParseResult(normal_text=current_text)
+            # Keep a possible opener even when ordinary content precedes it in
+            # this chunk. Otherwise its remaining characters leak as content.
+            holdback = (
+                self._ends_with_partial_token(current_text, think_start_text)
+                if not self.stripped_think_start
+                else 0
+            )
+            self._buffer = current_text[len(current_text) - holdback :]
+            return StreamingParseResult(
+                normal_text=current_text[: len(current_text) - holdback]
+            )
 
         return StreamingParseResult()
 
@@ -343,7 +382,8 @@ class BaseReasoningFormatDetector:
         """Flush reasoning still buffered when the stream ends before the end token
         (e.g. max_tokens cut it short), instead of dropping it: the whole block under
         stream_reasoning=False, the held-back token suffix under stream_reasoning=True.
-        force_nonempty_content emits it as normal_text, else as reasoning_text."""
+        force_nonempty_content emits it as normal_text only if no normal text was
+        emitted already; otherwise it remains reasoning_text."""
         if not self._in_reasoning:
             # Same as the reasoning-side flush below: a held-back slice that never
             # became a token is content.
@@ -357,7 +397,7 @@ class BaseReasoningFormatDetector:
         buffer = self._strip_partial_tool_start(buffer, self._streamed_reasoning_tail)
         self._buffer = ""
 
-        if self._force_nonempty_content:
+        if self._force_nonempty_content and not self._normal_text_seen:
             normal_text = self._accumulated_reasoning + buffer
             self._accumulated_reasoning = ""
             if normal_text:
@@ -1204,8 +1244,19 @@ class GraniteThinkingDetector(BaseReasoningFormatDetector):
         self._content_started = False
         self._reasoning_seen = False
 
+    def _normal_prefix_length(self, text: str) -> int:
+        if self._in_reasoning or self.stripped_think_start:
+            return 0
+        start = self.think_start_token + self.think_start_self_label
+        return max(text.find(start), 0)
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
+        prefix_length = self._normal_prefix_length(text)
         ret = self._detect_and_parse_impl(text)
+        # The base result joins pre-reasoning content and the answer. Only the
+        # answer is subject to Granite's leading-newline policy.
+        prefix = ret.normal_text[:prefix_length]
+        ret.normal_text = ret.normal_text[prefix_length:]
         think_end_present = self.think_end_token in text
         # HF plugin swaps when parsed content is absent (text ends at </think>);
         # newline-only content the plugin strips itself, without swapping.
@@ -1214,15 +1265,20 @@ class GraniteThinkingDetector(BaseReasoningFormatDetector):
             ret.normal_text = ret.normal_text.lstrip("\n")
         if (
             self._force_nonempty_content
+            and not prefix
             and not ret.normal_text
             and (content_absent or not think_end_present)
         ):
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        ret.normal_text = prefix + ret.normal_text
         return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         was_in_reasoning = self._in_reasoning
+        prefix_length = self._normal_prefix_length(self._buffer + new_text)
         ret = super().parse_streaming_increment(new_text)
+        prefix = ret.normal_text[:prefix_length]
+        ret.normal_text = ret.normal_text[prefix_length:]
         # Sampling only the pre-call state misses a whole think block arriving
         # in one chunk; post-call evidence keeps stripping chunk-independent.
         if (
@@ -1236,6 +1292,7 @@ class GraniteThinkingDetector(BaseReasoningFormatDetector):
             ret.normal_text = ret.normal_text.lstrip("\n")
             if ret.normal_text:
                 self._content_started = True
+        ret.normal_text = prefix + ret.normal_text
         return ret
 
 

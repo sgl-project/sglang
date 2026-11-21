@@ -1019,16 +1019,22 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
 
     Speculative decoding and stream_interval > 1 deliver multiple tokens per
     step, which splits multi-character tokens like `</think>` across chunk
-    boundaries. The two `_is_chunk_dependent` tests pin known exceptions.
+    boundaries.
     """
 
     CHUNK_SIZES = [1, 2, 3, 5, 7, 11, 23, 1000]
     DSML = "｜DSML｜"
 
     def _feed(self, detector, text, chunk_size):
+        return self._feed_chunks(
+            detector,
+            (text[i : i + chunk_size] for i in range(0, len(text), chunk_size)),
+        )
+
+    def _feed_chunks(self, detector, chunks):
         reasoning = normal = ""
-        for i in range(0, len(text), chunk_size):
-            result = detector.parse_streaming_increment(text[i : i + chunk_size])
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk)
             reasoning += result.reasoning_text
             normal += result.normal_text
         result = detector.finish()
@@ -1101,24 +1107,152 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             ("thinking", f"{tool_call}</think>answer"),
         )
 
-    def test_text_before_think_token_is_chunk_dependent(self):
-        """Accepted divergence, inherited from main: text before `<think>` lands
-        in reasoning or content depending on where the chunk boundary falls."""
-        text = "lead<think>r</think>tail"
-        variants = {
-            self._feed(Qwen3Detector(), text, chunk_size)
-            for chunk_size in self.CHUNK_SIZES
-        }
+    def _assert_prefix_invariant(self, make_detector, text, expected):
+        self._assert_invariant(make_detector, text, expected)
+        for split in range(len(text) + 1):
+            with self.subTest(split=split):
+                self.assertEqual(
+                    self._feed_chunks(make_detector(), [text[:split], text[split:]]),
+                    expected,
+                )
 
-        self.assertEqual(
-            variants,
-            {("r", "leadtail"), ("", text), ("leadr", "tail")},
-        )
-        # And the non-streaming path produces yet a fourth split.
-        one_shot = Qwen3Detector().detect_and_parse(text)
-        self.assertEqual(
-            (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
-        )
+    def test_text_before_think_token_is_content(self):
+        """A leading newline or content must not leak the opening marker or
+        route reasoning to content when a decode chunk splits that marker."""
+        for detector_cls in (Qwen3Detector, Glm45Detector, Gemma4Detector):
+            for stream_reasoning in (True, False):
+                make_detector = lambda: detector_cls(stream_reasoning=stream_reasoning)
+                detector = make_detector()
+                start = detector.think_start_token + detector.think_start_self_label
+                for prefix in ("Sure.", "\n"):
+                    for suffix in (detector.think_end_token + "Done.", ""):
+                        with self.subTest(
+                            detector=detector_cls.__name__,
+                            stream_reasoning=stream_reasoning,
+                            prefix=prefix,
+                            suffix=suffix,
+                        ):
+                            self._assert_prefix_invariant(
+                                make_detector,
+                                prefix + start + "checking" + suffix,
+                                ("checking", prefix + ("Done." if suffix else "")),
+                            )
+
+    def test_text_before_think_token_in_open_reasoning(self):
+        """A template or continued assistant message may already have opened
+        reasoning; text before an emitted opener must then stay reasoning."""
+        for stream_reasoning in (True, False):
+            for make_detector in (
+                lambda: DeepSeekR1Detector(stream_reasoning=stream_reasoning),
+                lambda: Qwen3Detector(
+                    force_reasoning=True, stream_reasoning=stream_reasoning
+                ),
+                lambda: Qwen3Detector(
+                    continue_final_message=True,
+                    previous_content="<think>previous reasoning",
+                    stream_reasoning=stream_reasoning,
+                ),
+            ):
+                self._assert_prefix_invariant(
+                    make_detector,
+                    "lead<think>checking</think>Done.",
+                    ("leadchecking", "Done."),
+                )
+
+    def test_content_prefix_prevents_truncated_reasoning_fallback(self):
+        """An already emitted content prefix makes the nonempty-content fallback
+        unnecessary; flushing must neither move nor duplicate reasoning."""
+        for detector_cls in (Qwen3Detector, Gemma4Detector, GraniteThinkingDetector):
+            for stream_reasoning in (True, False):
+                make_detector = lambda: detector_cls(
+                    force_nonempty_content=True, stream_reasoning=stream_reasoning
+                )
+                detector = make_detector()
+                start = detector.think_start_token + detector.think_start_self_label
+                self._assert_prefix_invariant(
+                    make_detector, "lead" + start + "checking", ("checking", "lead")
+                )
+
+    def test_granite_strips_only_post_reasoning_newlines(self):
+        """Content before reasoning must not hide the answer's leading newline
+        from Granite's stripping policy when they share a decode chunk."""
+        for stream_reasoning in (True, False):
+            for force_nonempty_content in (True, False):
+                make_detector = lambda: GraniteThinkingDetector(
+                    stream_reasoning=stream_reasoning,
+                    force_nonempty_content=force_nonempty_content,
+                )
+                for prefix in ("lead", "\nlead"):
+                    self._assert_prefix_invariant(
+                        make_detector,
+                        prefix + "<think>checking</think>\n\nanswer\nnext",
+                        ("checking", prefix + "answer\nnext"),
+                    )
+
+    def test_content_prefix_survives_tool_interruption(self):
+        """An implicit tool close must retain content emitted before reasoning,
+        including when all three sections arrive in one chunk."""
+        for detector_cls in (Qwen3Detector, Glm45Detector, HunyuanDetector):
+            for stream_reasoning in (True, False):
+                make_detector = lambda: detector_cls(stream_reasoning=stream_reasoning)
+                detector = make_detector()
+                for suffix in ("", detector.think_end_token + "Done."):
+                    tool_text = detector.tool_start_token + "call" + suffix
+                    self._assert_prefix_invariant(
+                        make_detector,
+                        "lead" + detector.think_start_token + "checking" + tool_text,
+                        ("checking", "lead" + tool_text),
+                    )
+
+    def test_forced_reasoning_keeps_opening_marker_after_close(self):
+        """Removing an opener inside forced reasoning must not remove a literal
+        opener in the answer after an explicit or implicit close."""
+        for boundary in ("</think>", "<tool_call>"):
+            detector = Qwen3Detector(force_reasoning=True)
+            result = detector.detect_and_parse("checking" + boundary + "<think>literal")
+            self.assertEqual(result.reasoning_text, "checking")
+            self.assertEqual(
+                result.normal_text,
+                (boundary if boundary == "<tool_call>" else "") + "<think>literal",
+            )
+
+    def test_content_prefix_preserves_line_start_tool_policy(self):
+        """Moving the content prefix must preserve both quoted tool markers and
+        the line-start context used for interruptions and truncated tools."""
+        for stream_reasoning in (True, False):
+            make_detector = lambda: BaseReasoningFormatDetector(
+                "<think>",
+                "</think>",
+                stream_reasoning=stream_reasoning,
+                tool_start_token="<tool_call>",
+                tool_start_at_line_start=True,
+            )
+            reasoning = "Quoted <tool_call> stays reasoning.\n"
+            for tool, normal in (
+                ("<tool_call>call", "<tool_call>call"),
+                ("<tool_", ""),
+            ):
+                self._assert_prefix_invariant(
+                    make_detector,
+                    "lead<think>" + reasoning + tool,
+                    (reasoning, "lead" + normal),
+                )
+
+    def test_incomplete_opening_marker_after_content(self):
+        """Holdback must preserve an opener cut short at end of generation or
+        a lookalike that turns out to be ordinary content."""
+        for detector_cls in (Qwen3Detector, Gemma4Detector):
+            detector = detector_cls()
+            start = detector.think_start_token + detector.think_start_self_label
+            for length in range(1, len(start)):
+                for suffix in ("", "x"):
+                    text = "lead" + start[:length] + suffix
+                    # A complete channel token without its self-label retains
+                    # Gemma's existing one-shot policy; check streaming flush here.
+                    for chunk_size in self.CHUNK_SIZES:
+                        self.assertEqual(
+                            self._feed(detector_cls(), text, chunk_size), ("", text)
+                        )
 
 
 class TestGptOssDetector(CustomTestCase):
