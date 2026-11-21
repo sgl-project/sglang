@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.environ import envs
 
@@ -58,6 +59,46 @@ def log_mla_gluon_capability(log: logging.Logger | None = None) -> None:
         "aiter mla gluon is %s",
         "enabled" if ready else "disabled; falling back to zero-pad mla_decode_fwd",
     )
+
+
+def mla_gluon_dcp_unsupported_reason(
+    *,
+    gathered_num_head: int,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> str | None:
+    """Why aiter's Gluon MLA cannot run a DCP decode or verify here, or None if it can.
+
+    Mirrors mla_gluon's asserts for its bh16 regimes as of ROCm/aiter@285579b62
+    (aiter/ops/triton/gluon/mla_gluon.py); update it when aiter relaxes them. Its
+    bh64 regime (64 or 128 heads) also needs batch % 64 and a long min_kv_seq_len,
+    which DCP cannot promise.
+    """
+    mla_gluon = _gluon_fn()
+    if mla_gluon is None:
+        return "Gluon MLA is unavailable (see the 'aiter mla gluon' log)"
+    if "return_lse" not in inspect.signature(mla_gluon).parameters:
+        return "this aiter's mla_gluon cannot return the lse the DCP merge needs"
+    hip = current_arch().hip
+    if hip is None or hip.gcn_arch != "gfx950":
+        return "mla_gluon runs only on gfx950"
+    if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+        return (
+            "mla_gluon needs kv_lora_rank 512 and qk_rope_head_dim 64, "
+            f"got {kv_lora_rank} and {qk_rope_head_dim}"
+        )
+    if not 1 <= gathered_num_head <= 96 or gathered_num_head == 64:
+        return (
+            "mla_gluon runs at most 96 gathered heads other than 64, "
+            f"got {gathered_num_head}"
+        )
+    if q_dtype != torch.bfloat16:
+        return f"mla_gluon needs a bf16 query, got {q_dtype}"
+    if kv_cache_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        return f"mla_gluon needs a bf16 or fp8 e4m3fn KV cache, got {kv_cache_dtype}"
+    return None
 
 
 def prefer_mla_gluon_decode(
