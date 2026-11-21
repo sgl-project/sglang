@@ -472,9 +472,10 @@ impl ResponsesStream {
     /// Open items are closed as incomplete so `response.failed` keeps them.
     fn emit_failed(&mut self, message: &str, out: &mut Vec<u8>) {
         self.ensure_started(out);
-        self.held.clear();
         self.close_open(Finish::Aborted, out);
         self.close_calls(Finish::Aborted, out);
+        self.flush_held(out);
+        self.close_open(Finish::Aborted, out);
         let mut resp = self.response("failed");
         resp["error"] = failed_error(message);
         self.emit("response.failed", json!({ "response": resp }), out);
@@ -876,6 +877,27 @@ mod tests {
         assert_eq!(done["status"], "incomplete");
         assert_eq!(done["output"][0]["status"], "completed");
         assert_eq!(done["output"][1]["status"], "incomplete");
+    }
+
+    #[test]
+    fn failed_stream_retains_text_received_after_a_call() {
+        for (field, part) in [
+            ("content", "output_text"),
+            ("reasoning_content", "reasoning_text"),
+        ] {
+            let evs = run(&[
+                chunk(indexed(0, Some("f"), "{}"), None),
+                chunk(json!({(field): "partial"}), None),
+            ]);
+            assert_framing(&evs);
+            let response = &evs.last().unwrap().1["response"];
+            assert_eq!(response["status"], "failed");
+            let output = &response["output"];
+            assert_eq!(output[0]["type"], "function_call");
+            assert_eq!(output[1]["status"], "incomplete");
+            assert_eq!(output[1]["content"][0]["type"], part);
+            assert_eq!(output[1]["content"][0]["text"], "partial");
+        }
     }
 
     #[test]
