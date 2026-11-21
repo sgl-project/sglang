@@ -66,14 +66,14 @@ class TestOotCustomOpDispatch(unittest.TestCase):
     def test_registered_forward_is_used(self):
         forward = MagicMock(return_value=("registered", 7))
         CustomOp.register_oot_forward(_TestOp, fn=forward, platform_key="test")
-        with patch.object(custom_op.platforms, "_current_platform", _OotPlatform()):
+        with patch.object(custom_op.platforms, "current_platform", _OotPlatform()):
             op = _TestOp()
             self.assertEqual(op(7), ("registered", 7))
         forward.assert_called_once_with(op, 7)
 
     def test_missing_registration_uses_native_fallback(self):
         CustomOp.register_oot_forward(_TestOp, fn=MagicMock(), platform_key="other")
-        with patch.object(custom_op.platforms, "_current_platform", _OotPlatform()):
+        with patch.object(custom_op.platforms, "current_platform", _OotPlatform()):
             op = _TestOp()
             self.assertEqual(op(7), ("native", 7))
 
@@ -97,7 +97,7 @@ class TestOotCustomOpDispatch(unittest.TestCase):
                     return graph_module.forward
 
                 with patch.object(
-                    custom_op.platforms, "_current_platform", _OotPlatform()
+                    custom_op.platforms, "current_platform", _OotPlatform()
                 ):
                     op = factory()
                 selected_forward = op._forward_method
@@ -112,14 +112,14 @@ class TestOotCustomOpDispatch(unittest.TestCase):
     def test_platform_dispatch_key_can_reuse_an_existing_forward(self):
         platform = _OotPlatform()
         platform.get_dispatch_key_name = lambda: "cuda"
-        with patch.object(custom_op.platforms, "_current_platform", platform):
+        with patch.object(custom_op.platforms, "current_platform", platform):
             self.assertEqual(_CudaCompatibleTestOp()(7), ("cuda", 7))
 
     def test_platform_dispatch_key_must_be_nonempty(self):
         platform = _OotPlatform()
         platform.get_dispatch_key_name = lambda: " "
         with (
-            patch.object(custom_op.platforms, "_current_platform", platform),
+            patch.object(custom_op.platforms, "current_platform", platform),
             self.assertRaisesRegex(ValueError, "non-empty"),
         ):
             _TestOp()(7)
@@ -315,7 +315,7 @@ class TestOotRuntimeHooks(unittest.TestCase):
 
             with (
                 self.subTest(supported=supported),
-                patch.object(runtime_platforms, "_current_platform", platform),
+                patch.object(runtime_platforms, "current_platform", platform),
                 patch.object(parallel_state, "_WORLD", SimpleNamespace(world_size=1)),
                 patch.object(
                     parallel_state.torch.distributed,
