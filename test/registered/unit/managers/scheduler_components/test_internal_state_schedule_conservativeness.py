@@ -6,8 +6,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt import runtime_context as rc
+from sglang.srt.constants import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.managers.io_struct import SetInternalStateReq
-from sglang.srt.arg_groups.parallel_hook import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.managers.scheduler_components import internal_state
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
@@ -75,6 +75,22 @@ class TestLiveScheduleConservativeness(CustomTestCase):
         self.assertEqual(tracker.current, 0.95)
         tracker.decay_step()
         self.assertAlmostEqual(tracker.current, 0.95 - tracker.decay)
+
+    def test_less_conservative_value_does_not_raise_a_decayed_ratio(self):
+        # Under load the running ratio decays to min. Lowering the value must
+        # not lift it back up to the new (higher) init.
+        old = self.scheduler.new_token_ratio_tracker
+        old.current = old.min
+        self.assertTrue(self._set(schedule_conservativeness=0.3))
+        tracker = self.scheduler.new_token_ratio_tracker
+        self.assertLess(old.min, tracker.init)
+        self.assertEqual(tracker.current, max(old.min, tracker.min))
+
+    def test_less_conservative_value_floors_at_the_new_min(self):
+        self.scheduler.new_token_ratio_tracker.current = 0.0
+        self.assertTrue(self._set(schedule_conservativeness=0.3))
+        tracker = self.scheduler.new_token_ratio_tracker
+        self.assertEqual(tracker.current, tracker.min)
 
     def test_dp_attention_scales_the_live_value_as_at_startup(self):
         parallel = SimpleNamespace(attn_dp_enabled=True)

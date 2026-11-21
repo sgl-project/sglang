@@ -10,7 +10,7 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
-from sglang.srt.arg_groups.parallel_hook import DP_ATTENTION_CONSERVATIVENESS_SCALE
+from sglang.srt.constants import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -22,7 +22,12 @@ from sglang.srt.managers.scheduler_components.memory_usage import build_memory_u
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -207,17 +212,19 @@ class SchedulerInternalStateController:
             )
 
     def _apply_schedule_conservativeness(self, key: str, value: Any) -> Dict[str, Any]:
-        # Re-derive init, min and decay as at startup. Keep the running ratio
-        # when it is higher (e.g. raised by a retract), so a less conservative
-        # value takes effect through the usual decay and a more conservative
-        # one takes effect at once.
+        # Re-derive init, min and decay as at startup. A more conservative
+        # value raises the running ratio to at least the new init at once. A
+        # less conservative value keeps the running ratio (e.g. one a retract
+        # raised) and lets it decay, never below the new min.
         # DP attention scales the startup flag; scale the live value the same way.
         effective = float(value)
         if get_parallel().attn_dp_enabled:
             effective *= DP_ATTENTION_CONSERVATIVENESS_SCALE
+        previous = get_schedule().schedule_conservativeness
         running = self.scheduler.new_token_ratio_tracker.current
         tracker = NewTokenRatioTracker.from_conservativeness(effective)
-        tracker.current = max(tracker.current, running)
+        floor = tracker.init if effective >= previous else tracker.min
+        tracker.current = max(running, floor)
         self.scheduler.new_token_ratio_tracker = tracker
         return {key: effective}
 

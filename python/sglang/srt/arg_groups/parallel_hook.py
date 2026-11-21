@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
+from sglang.srt.constants import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import (
@@ -36,8 +37,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import parse_connector_type
 
 logger = logging.getLogger(__name__)
-
-DP_ATTENTION_CONSERVATIVENESS_SCALE = 0.3
 
 
 def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> dict:
