@@ -1392,6 +1392,7 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.invariant_checker = Mock()
         self.forward_ct = 0
         self._sched_idled = False
+        self.gc_freezer = None
         self.processed_tokens_counter = 0
         self.scripted_scheduler_hook = None
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())

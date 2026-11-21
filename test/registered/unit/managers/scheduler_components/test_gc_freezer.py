@@ -85,6 +85,46 @@ class TestGCFreezer(CustomTestCase):
             [call.unfreeze(), call.freeze_gc("Scheduler")],
         )
 
+    def _batch_gc_calls(self):
+        names = ("collect", "freeze", "freeze_gc", "refreeze_gc", "unfreeze")
+        return [c for c in self.gc_ops.mock_calls if c[0] in names]
+
+    def test_batch_freeze_collects_young_generations_only_and_repeats(self):
+        """A busy scheduler is never idle; its freeze must not run the full
+        collection whose pause it removes, and must not walk the frozen list
+        (gc.get_freeze_count) on every re-freeze."""
+        freezer = GCFreezer(
+            freeze_on_idle_secs=0.0, freeze_after_batches=10, freeze_every_batches=4
+        )
+        frozen_at = []
+        for forward_ct in range(1, 19):
+            before = len(self._batch_gc_calls())
+            freezer.on_batch(forward_ct)
+            if len(self._batch_gc_calls()) > before:
+                frozen_at.append(forward_ct)
+        self.assertEqual(frozen_at, [10, 14, 18])
+        self.assertEqual(self._batch_gc_calls(), [call.collect(1), call.freeze()] * 3)
+        self.gc_ops.get_freeze_count.assert_called_once()
+
+    def test_batch_freeze_is_off_by_default(self):
+        freezer = self._freezer(freeze_on_idle_secs=0.0)
+        for forward_ct in range(1, 100):
+            freezer.on_batch(forward_ct)
+        self.assertEqual(self._batch_gc_calls(), [])
+
+    def test_cache_reset_unfreezes_and_the_next_batch_freezes_again(self):
+        freezer = GCFreezer(freeze_on_idle_secs=0.0, freeze_after_batches=5)
+        for forward_ct in range(1, 8):
+            freezer.on_batch(forward_ct)
+        freezer.on_cache_reset()
+        freezer.on_batch(8)
+        freezer.on_batch(9)
+        self.assertEqual(
+            self._batch_gc_calls(),
+            [call.collect(1), call.freeze(), call.unfreeze()]
+            + [call.collect(1), call.freeze()],
+        )
+
     def test_heap_growth_warns_at_each_half_again(self):
         freezer = self._freezer(freeze_on_idle_secs=0.0)
         self.gc_ops.get_freeze_count.return_value = 0
