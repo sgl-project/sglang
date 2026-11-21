@@ -115,6 +115,18 @@ sglang:spec_num_steps{model_name="meta-llama/Llama-3.1-8B-Instruct"} 3.0
 sglang:spec_num_draft_tokens{model_name="meta-llama/Llama-3.1-8B-Instruct"} 4.0
 ```
 
+## Detokenizer router throughput
+
+With `--enable-metrics` and multiple detokenizer workers, the router exposes these counters:
+
+| Metric | Meaning |
+| --- | --- |
+| `sglang:detokenizer_router_messages_received_total` | Messages received from the scheduler, including control messages and idle batches. |
+| `sglang:detokenizer_router_request_outputs_received_total` | Request entries in received output batches. Streaming outputs for the same request count again. Control messages and idle batches contribute zero. |
+| `sglang:detokenizer_router_messages_sent_total` | Successful sends to detokenizer workers after grouping or broadcasting. |
+
+Use `rate()` to inspect throughput alongside `sglang:process_cpu_seconds_total{component="detokenizer_router"}`. Received and sent message counts can differ because the router groups outputs by worker and broadcasts control messages. These counters do not measure queue depth or completed requests.
+
 ## Request-level time per output token (TPOT)
 
 `sglang:request_time_per_output_token_seconds` records TPOT once per successfully finished request:
