@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     use_mla_backend,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,22 @@ def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
         )
 
 
+def _reject_unsupported_hyv4_flash(cfg: Any) -> None:
+    unsupported = {
+        "speculative decoding": cfg.speculative_algorithm is not None,
+        "DP attention": attn_dp_enabled_of(cfg),
+        "--moe-a2a-backend": cfg.moe_a2a_backend != "none" or cfg.enable_waterfill,
+        "--enable-hierarchical-cache": cfg.enable_hierarchical_cache,
+        "--enable-hisparse": cfg.enable_hisparse,
+        "two-batch overlap": cfg.enable_two_batch_overlap,
+        "single-batch overlap": cfg.enable_single_batch_overlap,
+        "PD disaggregation": cfg.disaggregation_mode != "null",
+    }
+    names = [name for name, enabled in unsupported.items() if enabled]
+    if names:
+        raise ValueError(f"Hy4-Flash does not support {', '.join(names)}.")
+
+
 @_register_for(
     "DeepseekV3ForCausalLM",
     "DeepseekV32ForCausalLM",
@@ -139,6 +155,7 @@ def cap_glm_split_index_k_dcp_context_length(server_args: Any) -> None:
     "Glm5NextForConditionalGeneration",
     "HYV4ForCausalLM",
     "HYV4ForCausalLMNextN",
+    "HYV4FlashForConditionalGeneration",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
@@ -157,7 +174,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     )
 
     model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
-    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+    if model_arch in (
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
+        "HYV4FlashForConditionalGeneration",
+    ):
         if cfg.enable_prefill_cp:
             raise ValueError(
                 "--enable-prefill-cp is not supported for HYV4 because its "
@@ -173,6 +194,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 "provide single-owner semantics for learnable attention sinks. "
                 f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
             )
+        if model_arch == "HYV4FlashForConditionalGeneration":
+            _reject_unsupported_hyv4_flash(cfg)
 
     overrides: Dict[str, Any] = {}
 
