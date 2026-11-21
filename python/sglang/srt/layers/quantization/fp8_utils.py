@@ -63,6 +63,7 @@ from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -837,6 +838,37 @@ def torch_w8a8_block_fp8_linear(
         output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
     return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def can_use_xpu_fp8_moe(
+    config: MoeRunnerConfig,
+    weight_block_size: Optional[List[int]],
+    *,
+    use_mxfp8: bool = False,
+) -> bool:
+    """Check FP8 layouts and runner options supported by native XPU MoE."""
+    valid_block = (
+        weight_block_size in (None, [1, 32])
+        if use_mxfp8
+        else weight_block_size in (None, [128, 128])
+    )
+    supported_act = (config.activation, config.is_gated) in (
+        ("silu", True),
+        ("gelu_tanh", True),
+        ("relu2", False),
+    )
+    is_ep = (
+        config.num_experts is not None
+        and config.num_local_experts is not None
+        and config.num_experts != config.num_local_experts
+    )
+    return (
+        valid_block
+        and supported_act
+        and not config.apply_router_weight_on_input
+        and not config.no_combine
+        and not is_ep
+    )
 
 
 def prepare_xpu_block_scale_for_scaled_mm(
@@ -2283,6 +2315,26 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
+    if _is_xpu:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        q_input = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale_u8 = torch.empty(
+            (x.shape[0], k // 32), device=x.device, dtype=torch.uint8
+        )
+        if x.shape[0] > 0:
+            sgl_per_token_group_quant_8bit(
+                input=x,
+                output_q=q_input,
+                output_s=scale_u8,
+                group_size=32,
+                eps=1e-10,
+                fp8_min=fp8_info.min,
+                fp8_max=fp8_info.max,
+                scale_ue8m0=True,
+            )
+        return q_input, scale_u8
     if _is_cuda:
         from sglang.kernels.ops.quantization.mxfp8_group_quant import (
             mxfp8_group_quant,
