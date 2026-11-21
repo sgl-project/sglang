@@ -212,6 +212,9 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
+        # The loader reads the checkpoint path from model_config, so keep the
+        # served path to restore it, and to roll back to, if this update fails.
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         # PP stages handle disk updates sequentially, unlike cold startup.
         load_config = LoadConfig(
@@ -221,6 +224,7 @@ class WeightUpdater:
         # Only support DefaultModelLoader for now
         loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
+            self.model_config.model_path = original_model_path
             message = f"Failed to get model loader: {loader}."
             return False, message
 
@@ -248,18 +252,33 @@ class WeightUpdater:
             try:
                 iter = get_weight_iter(self.model_config)
             except Exception as e:
+                self.model_config.model_path = original_model_path
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
                 model = model_load_weights(self.get_model(), iter)
             except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
+                logger.exception("Failed to update weights from %s.", model_path)
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                # The failed load may have written part of the new checkpoint;
+                # reload every weight from the checkpoint served before.
+                self.model_config.model_path = original_model_path
+                try:
+                    iter = get_weight_iter(self.model_config)
+                    model_load_weights(self.get_model(), iter)
+                except Exception as rollback_error:
+                    logger.exception("Failed to roll back to %s.", original_model_path)
+                    message = (
+                        f"Failed to update weights: {e}.\n"
+                        f"Failed to roll back to original weights: {rollback_error}. "
+                        f"The model weights are now in an unknown state; "
+                        f"reload a full checkpoint before serving."
+                    )
+                    return False, message
+                message = (
+                    f"Failed to update weights: {e}.\nRolled back to original weights."
+                )
                 return False, message
 
         self.update_model_fields(
