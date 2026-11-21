@@ -33,7 +33,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # but do not flatten and copy every transferred prompt to the GPU only to
         # discard it before the first decode step.
         seq_lens = []
-        pre_lens = []
         req_pool_indices = []
 
         # Pre-calculate total size
@@ -86,7 +85,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     req.cached_tokens_storage += storage
                 req.already_computed = seq_len
             req.is_retracted = False
-            pre_lens.append(pre_len)
 
         # Set fields
         # The first decode input and speculative extras are seeded by
