@@ -209,8 +209,9 @@ class GuidanceBackend(BaseGrammarBackend):
         whitespace_pattern: Optional[str] = None,
         n_vocab: Optional[int] = None,
         eos_token_ids: Optional[Union[int, Iterable[int]]] = None,
+        cache_limit_bytes: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(cache_limit_bytes=cache_limit_bytes)
 
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace

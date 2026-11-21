@@ -159,6 +159,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_ulimit,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -923,6 +924,9 @@ class Engine(EngineScoreMixin, EngineBase):
         prelaunched_schedulers = {}
         rust_listener_procs = []
 
+        # Foundry (--cuda-graph-persistence) is activated here at the latest;
+        # it wraps every spawn below with its hook preload and environment pins.
+        foundry_adapter = activate_foundry(server_args)
         if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -961,6 +965,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         proc = mp.Process(target=target, args=args)
                         with (
                             memory_saver_adapter.configure_subprocess(),
+                            foundry_adapter.configure_subprocess(server_args),
                             numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
@@ -992,7 +997,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 ),
             )
             try:
-                proc.start()
+                # The controller passes the hook preload on to its schedulers.
+                with foundry_adapter.configure_subprocess(server_args):
+                    proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
@@ -1925,7 +1932,8 @@ class Engine(EngineScoreMixin, EngineBase):
         result = self.loop.run_until_complete(
             self.tokenizer_manager.collective_rpc(obj)
         )
-        assert result.success, result.message
+        if not result.success:
+            raise RuntimeError(f"collective_rpc {method!r} failed: {result.message}")
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
