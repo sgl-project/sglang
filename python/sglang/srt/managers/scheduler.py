@@ -3094,6 +3094,7 @@ class Scheduler(
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
         # Keep this bound consistent with PrefillAdder's admission budget.
+        before_len_bound = max_new_tokens
         max_new_tokens = max(
             0,
             min(
@@ -3101,6 +3102,12 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
+        # max_req_len is below the context window only when the KV pool is.
+        clipped_by_pool = (
+            max_new_tokens < before_len_bound
+            and self.max_req_len < self.model_config.context_len - 1
+        )
+        before_memory_bound = max_new_tokens
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
         token_capacity = (
@@ -3138,6 +3145,18 @@ class Scheduler(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."
             )
             max_new_tokens = 0
+        elif req.sampling_params.max_new_tokens is not None and (
+            clipped_by_pool or max_new_tokens < before_memory_bound
+        ):
+            logger.warning(
+                f"Lowering max_new_tokens of request {req.rid} from "
+                f"{req.sampling_params.max_new_tokens} to {max_new_tokens}: the KV "
+                f"cache pool ({self.max_total_num_tokens} tokens) cannot hold "
+                f"{input_len} input tokens plus the requested output, so the "
+                "output may end early with finish_reason 'length'. Raise "
+                "--mem-fraction-static (or --max-total-tokens), or free memory "
+                "taken before the pool is sized."
+            )
 
         req.sampling_params.max_new_tokens = max(0, max_new_tokens)
         # Clipping above can push max_new_tokens below min_new_tokens, which
