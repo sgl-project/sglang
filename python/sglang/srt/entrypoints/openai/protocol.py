@@ -86,6 +86,16 @@ logger = logging.getLogger(__name__)
 # OpenAI's limit on n; SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ still applies after it.
 OPENAI_MAX_N = 128
 
+
+def _validate_top_k(value: Optional[int]) -> Optional[int]:
+    # -1 disables top-k; SamplingParams.verify() accepts -1 or any k >= 1.
+    if value is not None and value != -1 and value < 1:
+        raise ValueError("top_k must be -1 (disable) or at least 1")
+    return value
+
+
+TopK = Annotated[int, AfterValidator(_validate_top_k)]
+
 DEFAULT_MODEL_NAME = "default"
 
 
@@ -398,7 +408,9 @@ class CompletionRequest(PDRoutingFields):
     echo: bool = False
     frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[int] = None
+    # OpenAI caps this at 5; SGLang serves up to vocab_size (checked in
+    # OpenAIServingCompletion._validate_request), so only bound the lower side.
+    logprobs: Optional[int] = Field(default=None, ge=0)
     max_tokens: int = 16
     n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
@@ -418,7 +430,7 @@ class CompletionRequest(PDRoutingFields):
     return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    top_k: int = -1
+    top_k: TopK = -1
     min_p: float = 0.0
     min_tokens: int = 0
     json_schema: Optional[str] = None
@@ -1083,7 +1095,7 @@ class ChatCompletionRequest(PDRoutingFields):
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    top_k: Optional[int] = None
+    top_k: Optional[TopK] = None
     min_p: Optional[float] = None
     min_tokens: int = 0
     regex: Optional[str] = None
@@ -2102,7 +2114,7 @@ class ResponsesRequest(PDRoutingFields):
     text: Optional[ResponseTextConfig] = None
     tool_choice: Union[Literal["auto", "required", "none"], Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
-    top_logprobs: Optional[int] = 0
+    top_logprobs: Optional[int] = Field(default=0, ge=0)
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None
@@ -2127,7 +2139,7 @@ class ResponsesRequest(PDRoutingFields):
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     stop: Optional[Union[str, List[str]]] = None
-    top_k: Optional[int] = None
+    top_k: Optional[TopK] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
 
