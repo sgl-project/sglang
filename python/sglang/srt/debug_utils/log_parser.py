@@ -15,7 +15,7 @@ _PATTERN_DECODE = (
     r"token usage:\s*(?P<token_usage>[0-9.]+),\s+"
     r".*?"
     r"gen throughput \(token/s\):\s*(?P<gen_throughput>[0-9.]+),\s+"
-    r"#queue-req:\s*(?P<queue_req>\d+),"
+    r"#queue-req:\s*(?P<queue_req>\d+)(?:,|$)"
 )
 
 
