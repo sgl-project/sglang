@@ -223,6 +223,19 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+def is_llada_image_text_encoder(config) -> bool:
+    """Whether ``config`` is LLaDA-Image's conditioning text encoder.
+
+    LLaDA-Image serves its CFG conditioning through a LLaDA2 text encoder whose
+    HF ``model_type`` is the image-conditional ``llada2_moe_veomni`` variant;
+    the stock LLaDA2 checkpoint reports ``llada2_moe``.
+    """
+    return (
+        _hf_arch(config) == "LLaDA2MoeModelLM"
+        and _hf_attr(config, "model_type") == "llada2_moe_veomni"
+    )
+
+
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
 

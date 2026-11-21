@@ -94,7 +94,6 @@ ATTENTION_BACKEND_CHOICES = [
     "fa4",
     "flashinfer",
     "llada2_cfg_flashinfer",
-    "llada2_cfg_ascend",
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
