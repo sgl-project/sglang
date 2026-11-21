@@ -452,7 +452,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
         dst_indices_raw = select_verify_intermediate_state_indices(
             None,
             forward_batch.req_pool_indices,
-            batch.lengths.ne(0),
+            lambda: batch.lengths.ne(0),
             pool.size,
         )
         ngram.set_intermediate_context(
@@ -1398,7 +1398,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 dst_indices_raw = select_verify_intermediate_state_indices(
                     None,
                     forward_batch.req_pool_indices,
-                    batch.lengths.ne(0),
+                    lambda: batch.lengths.ne(0),
                     get_req_to_token_pool().size,
                 )
                 if dst_indices_raw is None:

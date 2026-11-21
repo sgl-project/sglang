@@ -6,16 +6,25 @@ from unittest.mock import patch
 
 import torch
 from test_declared_parts import _build
+from torch.overrides import TorchFunctionMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.ple_state_pool import (
+    NGRAM_PART,
+    SHORT_CONV_PART,
+    NGramPool,
+    ShortConvPool,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
     _commit_ple_batch,
+    _PLEBatch,
     _prepare_ple_batch,
 )
 from sglang.srt.runtime_context import reset_context
@@ -164,13 +173,6 @@ class TestPLEStateCoordinates(unittest.TestCase):
     def test_ascend_graph_metadata_checkpoints_static_ple_state(self):
         """Capture and replay save both PLE parts to the recurrent checkpoint rows."""
         from sglang.srt.mem_cache.kv.decl import STATE_PART
-        from sglang.srt.mem_cache.kv.router import KVLayerRouter
-        from sglang.srt.mem_cache.ple_state_pool import (
-            NGRAM_PART,
-            SHORT_CONV_PART,
-            NGramPool,
-            ShortConvPool,
-        )
         from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
         setup_allocator_context()
@@ -309,6 +311,108 @@ class TestPLEStateCoordinates(unittest.TestCase):
                     _commit_ple_batch(batch, fb)
                     torch.testing.assert_close(conv, expected_conv)
                     torch.testing.assert_close(ngram.context, expected_ngram)
+
+    def test_verify_rows_build_the_row_mask_only_for_stable_rows(self):
+        """Without PP spec stable rows the N-gram commit and the short conv write
+        positional verify rows and compute no row mask; with them, request rows
+        and the padding row."""
+
+        class CountNe(TorchFunctionMode):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                if func is torch.Tensor.ne:
+                    self.calls += 1
+                return func(*args, **(kwargs or {}))
+
+        # Request 0 verifies two tokens; request 1 is a padding row.
+        batch = _PLEBatch(
+            mode=ForwardMode.TARGET_VERIFY,
+            use_decode_fast_path=False,
+            physical_tokens=4,
+            processed_tokens=2,
+            lengths=torch.tensor([2, 0]),
+            row_width=2,
+            req_indices=torch.tensor([0, 0]),
+            token_offsets=torch.tensor([0, 1]),
+            valid_tokens=torch.tensor([True, True, False, False]),
+            state_indices=torch.tensor([0, 0]),
+            query_start_loc=None,
+            ngram_context=torch.tensor([[5, 6, 7, 8], [17, 17, 17, 17]]),
+            ngram_eos_token_id=17,
+        )
+        fb = SimpleNamespace(req_pool_indices=torch.tensor([3, 1]))
+        ple = SimpleNamespace(
+            layer_id=0,
+            conv_channels=1,
+            short_conv_dilation=1,
+            short_conv_state_len=2,
+            conv1d=SimpleNamespace(weight=torch.ones(1, 1, 3)),
+        )
+        x = torch.tensor([[1.0], [2.0]])
+        ngram = NGramPool(
+            size=4,
+            context_len=2,
+            eos_token_id=17,
+            device="cpu",
+            spec_state_size=4,
+            speculative_num_draft_tokens=2,
+        )
+        conv = ShortConvPool(
+            size=4,
+            state_shape=(1, 2),
+            layer_ids=[0],
+            dtype=torch.float32,
+            device="cpu",
+            spec_state_size=4,
+            speculative_num_draft_tokens=2,
+        )
+        pool = SimpleNamespace(layer_transfer_counter=None)
+        pool.layer_router = KVLayerRouter(pool, sub_pools=(), views={}, layers={})
+        for part, view in ((NGRAM_PART, ngram), (SHORT_CONV_PART, conv)):
+            pool.layer_router.bind_part(
+                sub_pool="mamba", part=part, view=view, indices={0: 0}
+            )
+        sites = (
+            (
+                "ngram commit",
+                lambda: _commit_ple_batch(batch, fb),
+                ngram.intermediate_context,
+                torch.tensor([[[6, 7], [7, 8]], [[17, 17], [17, 17]]]),
+            ),
+            (
+                "short conv",
+                lambda: Qwen4ExpPLELayer._short_conv(ple, x, fb, batch),
+                conv.layer_intermediate_cache(0),
+                # Windows over the zero conv state followed by x.
+                torch.tensor(
+                    [[[[0.0, 1.0]], [[1.0, 2.0]]], [[[0.0, 0.0]], [[0.0, 0.0]]]]
+                ),
+            ),
+        )
+        with forward_context(
+            ForwardContext(
+                attn_backend=SimpleNamespace(
+                    req_to_token_pool=SimpleNamespace(size=4),
+                    token_to_kv_pool=pool,
+                )
+            )
+        ):
+            for stable_rows, rows in ((False, [0, 1]), (True, [3, 4])):
+                for site, run, cache, step_states in sites:
+                    with self.subTest(site=site, stable_rows=stable_rows):
+                        cache.fill_(-1)
+                        expected = cache.clone()
+                        expected[rows] = step_states
+                        with (
+                            envs.SGLANG_ENABLE_PP_SPEC.override(stable_rows),
+                            CountNe() as count_ne,
+                        ):
+                            run()
+                        torch.testing.assert_close(cache, expected)
+                        self.assertEqual(count_ne.calls, int(stable_rows))
 
 
 if __name__ == "__main__":
