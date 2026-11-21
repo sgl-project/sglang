@@ -1,5 +1,6 @@
 import enum
 import functools
+import inspect
 import json
 import os
 import random
@@ -414,6 +415,23 @@ class _Dumper:
             extra_imports=["from sglang.srt.debug_utils.dumper import dumper"],
         )
 
+    def _check_tag_keys(self, tags: dict[str, Any]) -> None:
+        non_str = [k for k in tags if not isinstance(k, str)]
+        if non_str:
+            raise TypeError(f"dumper tag names must be strings, got {non_str}")
+        # Tags reach dump() as keyword arguments and then a dict built next to
+        # `name` and `recompute_status` and the set_ctx values, so any of these
+        # names would raise a TypeError on the first dump, inside the forward.
+        reserved = (set(inspect.signature(self.dump).parameters) - {"kwargs"}) | {
+            "recompute_status"
+        }
+        clash = sorted(set(tags) & (reserved | set(self._state.global_ctx)))
+        if clash:
+            raise ValueError(
+                f"dumper tag names {clash} collide with dump() arguments or "
+                f"set_ctx keys; use other names"
+            )
+
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
@@ -431,9 +449,16 @@ class _Dumper:
         and target forwards can share a ``ForwardMode`` (DSPARK's draft block
         runs as ``TARGET_VERIFY``). With ``tags=None`` dump names are unchanged.
 
+        Tag names must be strings, must not be a ``dump()`` argument or
+        ``recompute_status``, and must not already be a ``set_ctx`` key; these raise
+        here instead of failing inside the model's forward. Do not ``set_ctx`` a
+        name that a registered tag uses afterwards.
+
         Returns None when ``non_intrusive_mode`` is ``off``.
         """
         self._http_manager  # noqa: B018
+        if tags:
+            self._check_tag_keys(tags)
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None

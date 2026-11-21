@@ -2437,6 +2437,40 @@ class TestNonIntrusiveTags(_NonIntrusiveTestBase):
 
         assert captured["input_ids"]["meta"]["runner"] == "target"
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "name",
+            "value",
+            "save",
+            "dims",
+            "dims_grad",
+            "grafter_extras",
+            "recompute_status",
+        ],
+    )
+    def test_tag_named_like_a_dump_argument_is_rejected(self, tmp_path, key):
+        d = self._make_dumper(tmp_path)
+        model = self._build_model()
+        with pytest.raises(ValueError, match=key):
+            d.register_non_intrusive_dumper(model, tags={key: "x"})
+
+        # Nothing was hooked, so the forward still works and dumps nothing.
+        with d.capture_output() as captured:
+            model(torch.randn(2, 4))
+        assert len(captured) == 0
+
+    def test_tag_named_like_a_ctx_key_is_rejected(self, tmp_path):
+        d = self._make_dumper(tmp_path)
+        d.set_ctx(layer_id=3)
+        with pytest.raises(ValueError, match="layer_id"):
+            d.register_non_intrusive_dumper(self._build_model(), tags={"layer_id": "x"})
+
+    def test_non_string_tag_name_is_rejected(self, tmp_path):
+        d = self._make_dumper(tmp_path)
+        with pytest.raises(TypeError, match="strings"):
+            d.register_non_intrusive_dumper(self._build_model(), tags={1: "x"})
+
 
 class TestDumperE2E:
     def test_step_and_non_intrusive_hooks(self, tmp_path):
