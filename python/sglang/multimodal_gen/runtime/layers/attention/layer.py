@@ -27,6 +27,12 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     sequence_model_parallel_all_to_all_4D,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_kv_gather import (
+    ENABLED as _IPC_KV_GATHER_ENABLED,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_kv_gather import (
+    ipc_kv_gather as _ipc_kv_gather,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_rank,
     get_ring_parallel_world_size,
@@ -1850,16 +1856,23 @@ class USPAttention(nn.Module):
             )
 
         kv_prefix = num_replicated_prefix or num_replicated_kv_prefix
-        k = self._gather_sharded_sequence(
-            k,
-            num_replicated_prefix=kv_prefix,
-            num_replicated_suffix=num_replicated_suffix,
-        )
-        v = self._gather_sharded_sequence(
-            v,
-            num_replicated_prefix=kv_prefix,
-            num_replicated_suffix=num_replicated_suffix,
-        )
+        gathered = None
+        if _IPC_KV_GATHER_ENABLED and not kv_prefix and not num_replicated_suffix:
+            # Opt-in: one IPC exchange for K and V instead of two NCCL gathers.
+            gathered = _ipc_kv_gather(k, v, get_sp_world_size())
+        if gathered is not None:
+            k, v = gathered
+        else:
+            k = self._gather_sharded_sequence(
+                k,
+                num_replicated_prefix=kv_prefix,
+                num_replicated_suffix=num_replicated_suffix,
+            )
+            v = self._gather_sharded_sequence(
+                v,
+                num_replicated_prefix=kv_prefix,
+                num_replicated_suffix=num_replicated_suffix,
+            )
 
         if attn_mask is None and attn_mask_meta is None:
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
