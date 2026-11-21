@@ -14,10 +14,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.communication.all_reduce_fusion import (
-    all_reduce_residual_norm,
-    moe_finalize_all_reduce_residual_norm,
-)
+from sglang.srt.layers.communication import ar_fusion
 from sglang.srt.layers.layer_boundary import (
     FfnInputFusion,
     SumGroup,
@@ -135,13 +132,12 @@ class CustomAllReduceFusion:
             return None
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
-        return all_reduce_residual_norm(
-            owed.partial,
-            residual,
-            gamma,
-            plan.norm.variance_epsilon,
+        return ar_fusion.all_reduce_residual_norm(
             world_size=get_parallel().tp_size,
-            residual_out=torch.empty_like(residual),
+            partial=owed.partial,
+            residual=residual,
+            norm_weight=gamma,
+            eps=plan.norm.variance_epsilon,
         )
 
     def _ffn_input_add_norm(self, plan, hidden_states, residual, forward_batch):
@@ -154,28 +150,24 @@ class CustomAllReduceFusion:
             or not self._eligible(plan, forward_batch, int(hidden_states.shape[0]))
         ):
             return None
-        return all_reduce_residual_norm(
-            hidden_states,
-            residual,
-            gamma,
-            plan.norm.variance_epsilon,
+        return ar_fusion.all_reduce_residual_norm(
             world_size=get_parallel().tp_size,
-            residual_out=torch.empty_like(residual),
+            partial=hidden_states,
+            residual=residual,
+            norm_weight=gamma,
+            eps=plan.norm.variance_epsilon,
         )
 
     def _run_finalize(self, handoff, residual, gamma, eps):
-        return moe_finalize_all_reduce_residual_norm(
-            handoff.routed_output,
-            handoff.permuted_indices.reshape(-1),
-            handoff.expert_weights,
-            handoff.expert_weights.shape[1],
-            handoff.gated_shared_output,
-            residual,
-            gamma,
-            eps,
+        return ar_fusion.moe_finalize_all_reduce_residual_norm(
             world_size=get_parallel().tp_size,
-            hidden_dim=self.hidden_size,
-            residual_out=torch.empty_like(residual),
+            gemm2_out=handoff.routed_output,
+            expanded_idx_to_permuted_idx=handoff.permuted_indices.reshape(-1),
+            expert_weights=handoff.expert_weights,
+            shared_output=handoff.gated_shared_output,
+            residual=residual,
+            norm_weight=gamma,
+            eps=eps,
         )
 
     def _eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:

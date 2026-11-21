@@ -27,13 +27,17 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.marker.timing import _calculate_rotation_count
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.communication import gemma4_ar_fusion
+from sglang.kernels.ops.communication import fused_all_reduce
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_rmsnorm_residual_scalar
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+    get_all_reduce_config,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication.gemma4_ar_fusion import GROUP
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -46,7 +50,6 @@ register_cuda_ci(
 
 HIDDEN = 5376  # Gemma-4 31B
 EPS = 1e-6
-GROUP = gemma4_ar_fusion.GROUP
 NUM_TOKENS = get_benchmark_range(
     [1, 4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048, 4096, 8192], [32, 512, 4096]
 )
@@ -77,7 +80,6 @@ def _init():
     # fused kernel borrows this plane's barriers, as it does in the model.
     comm = CustomAllReduceV2(coord.cpu_group, torch.device(f"cuda:{local_rank}"))
     assert not comm.disabled and comm.has_multicast, "needs NVLink multicast"
-    gemma4_ar_fusion.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return coord, comm
 
@@ -147,6 +149,9 @@ def benchmark(num_tokens: int, provider: str):
         scales = s_t.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
 
         rotations, step = _rotations(num_tokens), [0]
+        num_blocks = get_all_reduce_config(
+            world_size
+        ).num_pull_blocks  # the model's grid
 
         def fn(x):
             # do_bench rotates x through cold copies; the fused site reads its own
@@ -156,22 +161,23 @@ def benchmark(num_tokens: int, provider: str):
             partial_i = p_t[i * num_tokens : (i + 1) * num_tokens]
             if copy:
                 partial_i.copy_(x)  # the staging copy the model path pays
-            gemma4_ar_fusion.site(
+            fused_all_reduce.pull.all_reduce_norm_residual_norm_quant(
+                comm.obj,
                 partial_i,
                 p_mc + partial_i.data_ptr() - p_t.data_ptr(),
-                o_t[:num_tokens],
-                o_mc,
-                scales,
-                s_mc,
                 mine,
                 w_a,
                 w_b,
                 scalar,
                 EPS,
-                row0,
-                rows,
-                False,
-                world_size=world_size,
+                o_t[:num_tokens],
+                o_mc,
+                scales,
+                s_mc,
+                row0=row0,
+                rows=rows,
+                num_blocks=num_blocks,
+                rows_per_group=1,
             )
             return o_t[:num_tokens], scales
 

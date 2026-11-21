@@ -1076,10 +1076,8 @@ class Gemma4TextModel(PreTrainedModel):
 
         This rank keeps only its own rows of the residual stream; each site
         returns the next GEMM's FP8 input for all rows. o_proj and down_proj
-        write their partial sums straight into the site's symmetric buffer. Same math as
-        Gemma4DecoderLayer.forward: the attention site rounds the
-        post-attention norm to bf16 before the add, the MLP site adds in fp32
-        and scales.
+        write their partial sums straight into the site's symmetric buffer. Rounded
+        to bf16 where Hugging Face's layer rounds.
         """
         fusion = self._ar_fusion
         kind = "decode" if forward_batch.forward_mode.is_decode() else "extend"
@@ -1111,7 +1109,6 @@ class Gemma4TextModel(PreTrainedModel):
                 layer.post_attention_layernorm.weight,
                 layer.pre_feedforward_layernorm.weight,
                 None,
-                round_a=True,
             )
             h = layer.mlp(x, output_tensor=partial_out)
             if idx + 1 < self.end_layer:
@@ -1121,7 +1118,6 @@ class Gemma4TextModel(PreTrainedModel):
                     layer.post_feedforward_layernorm.weight,
                     self.layers[idx + 1].input_layernorm.weight,
                     layer.layer_scalar,
-                    round_a=False,
                 )
             else:
                 x = fusion.final(

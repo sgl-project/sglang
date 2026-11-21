@@ -7,15 +7,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.ops.communication.all_reduce_fusion import (
-    moe_finalize_shared_gate_all_reduce,
-)
+from sglang.kernels.ops.communication import fused_all_reduce
 from sglang.kernels.ops.moe.shared_expert_gate import shared_expert_gate
 from sglang.srt.distributed.device_communicators.symm_workspace import (
     WorkspaceLease,
     WorkspaceRequest,
     request_group_workspace,
 )
+from sglang.srt.layers.communication import ar_fusion
 from sglang.srt.layers.dp_attention import is_enable_moe_cp_allgather
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_spec
@@ -75,11 +74,12 @@ def qwen4_decode_moe(
         gate = shared_expert_gate(hidden, mlp.shared_expert_gate.weight)
         shared = mlp._forward_shared_experts(hidden, apply_gate=False)
         deferred = mlp._forward_router_experts(hidden, defer_finalize=True)
-    return moe_finalize_shared_gate_all_reduce(
+    return fused_all_reduce.push.moe_finalize_shared_gate_all_reduce(
+        comm.get_communicator(),
         deferred.gemm2_out,
         deferred.expanded_idx_to_permuted_idx,
         deferred.expert_weights,
         shared,
         gate,
-        comm.get_communicator(),
+        cluster_size=ar_fusion.get_cluster_size(shared.shape[1]),
     )

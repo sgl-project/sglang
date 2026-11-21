@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.communication.all_reduce import Communicator
 
 
-_PRIMITIVES: Final = ["all_gather"]
+_PRIMITIVES: Final = ["all_gather", "all_reduce"]
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
@@ -87,6 +87,43 @@ def all_gather_pull(
         input,
         output,
         residual,
+        out_mc_ptr or get_multicast_ptr(output),
+        num_blocks_hint,
+    )
+
+
+def all_reduce_push(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> None:
+    """``output = allreduce(input) [+ residual]``; ``output`` may be ``input``. The
+    whole ``[T, H]`` tensor must fit one push slot."""
+    _jit_push_module(input.dtype, comm.world_size).all_reduce(
+        comm, input, output, residual
+    )
+
+
+def all_reduce_pull(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    *,
+    in_mc_ptr: int = 0,
+    out_mc_ptr: int = 0,
+    num_unroll=4,
+    num_blocks_hint: int = 0,
+) -> None:
+    """``output = allreduce(input) [+ residual]`` over symmetric ``input`` / ``output``
+    (may be the same tensor), reduce-scattered in the switch and multicast back."""
+    _jit_pull_module(input.dtype, num_unroll).all_reduce(
+        comm,
+        input,
+        output,
+        residual,
+        in_mc_ptr or get_multicast_ptr(input),
         out_mc_ptr or get_multicast_ptr(output),
         num_blocks_hint,
     )

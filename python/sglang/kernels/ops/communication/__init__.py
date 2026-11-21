@@ -15,23 +15,47 @@ from sglang.kernels.spec import (
 
 __all__ = []
 
-register_kernel(
-    KernelSpec(
-        op="communication.moe_finalize_shared_gate_all_reduce",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_shared_gate_all_reduce",
-        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
-    )
-)
+# Fused all-reduce: cluster push (1-shot / 2-shot) and NVLS pull, named in compute order.
+for _mod, _fns in (
+    (
+        "push",
+        (
+            "all_reduce_residual_norm",
+            "moe_finalize_all_reduce_residual_norm",
+            "moe_finalize_shared_gate_all_reduce",
+            "all_reduce_mhc_post_combine_norm",
+            "moe_finalize_all_reduce_mhc_post",
+            "moe_finalize_all_reduce_mhc_post_combine_norm",
+            "moe_finalize_all_reduce_mhc_post_combine_norm_quant",
+            "all_reduce_norm_prefix",
+            "moe_finalize_all_reduce_norm",
+            "all_reduce_sandwich_norm",
+            "topk_sum_all_reduce_sandwich_norm",
+        ),
+    ),
+    (
+        "pull",
+        (
+            "all_reduce_norm_prefix",
+            "all_reduce_norm_residual_norm_quant",
+            "all_reduce_norm_residual",
+        ),
+    ),
+):
+    for _fn in _fns:
+        register_kernel(
+            KernelSpec(
+                op=f"communication.{_mod}.{_fn}",
+                backend=KernelBackend.JIT,
+                target=f"sglang.kernels.ops.communication.fused_all_reduce.{_mod}:{_fn}",
+                capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+            )
+        )
+del _mod, _fns, _fn
 
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 for _mod, _fn in [
-    ("all_reduce_residual", "all_reduce_push_res"),
-    ("all_reduce_residual", "all_reduce_push_norm"),
-    ("all_reduce_residual", "finalize_all_reduce_push_norm"),
-    ("all_reduce_residual", "all_reduce_pull_res"),
-    ("all_reduce_residual", "all_reduce_pull_norm"),
     ("gemm_ag", "gemm_ag_up_proj"),
     ("moe_front_ag", "moe_front_all_gather"),
     ("sp_collective", "reduce_scatter_res"),
@@ -60,14 +84,6 @@ register_kernel(
     )
 )
 
-register_kernel(
-    KernelSpec(
-        op="communication.beam_all_reduce_norm",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.communication.beam_all_reduce:beam_all_reduce_norm",
-        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
-    )
-)
 
 # Muse Spark collectives. The MoE finalize op (with its optional fused TP
 # all-reduce) is built per layer: inventoried through its class methods.

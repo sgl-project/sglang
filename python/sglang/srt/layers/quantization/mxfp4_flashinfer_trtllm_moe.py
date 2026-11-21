@@ -11,6 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.communication import ar_fusion
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.layers.utils.common import set_weight_attrs
@@ -654,16 +655,12 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     The deferred-finalize handle type carries its own numeric contract (every
     producer folds the routed scaling; no consumer rescales)."""
     global _fused_all_reduce_registered
-    from sglang.kernels.ops.communication import all_reduce_fusion
-
     lease = _fused_all_reduce_lease
     if lease is None or lease.world_size != get_parallel().tp_size:
         return False
     if not _fused_all_reduce_registered:
-        all_reduce_fusion.register_comm(
-            lease.get_communicator, world_size=lease.world_size
-        )
+        ar_fusion.register_comm(lease.get_communicator, world_size=lease.world_size)
         _fused_all_reduce_registered = True
-    return num_tokens <= 384 and all_reduce_fusion.fits_push_slot(
+    return num_tokens <= 384 and ar_fusion.fits_push_slot(
         lease.request.push_slot_bytes, num_tokens, hidden_dim
     )

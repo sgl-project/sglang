@@ -43,6 +43,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communication import ar_fusion
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_scatter,
@@ -830,7 +831,7 @@ class BeamDecoderLayer(nn.Module):
         when `next_norm_weight` is None, on the last layer of a pipeline stage
         that does not own the final norm) and the new residual stream.
         Each boundary takes at most one replacement for its TP all-reduce:
-        `*_beam_ar_comm` fuses the all-reduce and norm in `beam_all_reduce_norm`
+        `*_beam_ar_comm` fuses the all-reduce and norm in `all_reduce_sandwich_norm`
         (`mlp_beam_ar_topk_comm` also sums the top-k expert outputs, and wins
         when it applies); `*_flashinfer_ar` runs FlashInfer's all-reduce ahead
         of the unfused norm.
@@ -900,11 +901,7 @@ class BeamDecoderLayer(nn.Module):
         """Reduce `branch` by the given replacement (or not at all, when it was
         reduced already) and apply the sandwich norm and residual combine."""
         if beam_ar_comm is not None:
-            from sglang.kernels.ops.communication.beam_all_reduce import (
-                beam_all_reduce_norm,
-            )
-
-            return beam_all_reduce_norm(
+            combined, normalized = ar_fusion.all_reduce_sandwich_norm(
                 beam_ar_comm,
                 branch,
                 residual,
@@ -914,6 +911,7 @@ class BeamDecoderLayer(nn.Module):
                 scales,
                 routed_scale=routed_scale,
             )
+            return normalized, combined
         if flashinfer_ar is not None:
             branch = flashinfer_ar(branch)
         return self.sandwich_residual_norm(

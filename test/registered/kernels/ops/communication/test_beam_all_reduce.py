@@ -7,20 +7,17 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
+from sglang.kernels.ops.communication import fused_all_reduce
 from sglang.kernels.ops.communication.all_reduce import (
     AllReduceAlgo,
     Communicator,
     PushPlane,
 )
-from sglang.kernels.ops.communication.beam_all_reduce import (
-    _cluster_size,
-    _module,
-    beam_all_reduce_norm,
-)
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication import ar_fusion
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -34,9 +31,20 @@ ROWS = (1, 8, 16, 32, 64, 128)
 
 def _precompile(num_gpus):
     for world in num_gpus:
-        for cluster in {_cluster_size(world, rows) for rows in ROWS}:
-            for topk in (1, 8):
-                _module(world, 5120, cluster, topk)
+        for cluster in {
+            ar_fusion.get_sandwich_cluster_size(world, rows) for rows in ROWS
+        }:
+            fused_all_reduce.push._module(
+                "sandwich_norm", "all_reduce_sandwich_norm", world, 5120, cluster
+            )
+            fused_all_reduce.push._module(
+                "sandwich_norm",
+                "topk_sum_all_reduce_sandwich_norm",
+                world,
+                5120,
+                cluster,
+                8,
+            )
 
 
 class TestBeamAllReduce(CustomTestCase):
@@ -136,7 +144,10 @@ class TestBeamAllReduce(CustomTestCase):
     def test_rounding_graph_replay_and_interleaved_collectives(self):
         if dist.get_world_size() == 8:
             # Both TP8 launch shapes (5-CTA clusters and one CTA per row) must run.
-            self.assertEqual({_cluster_size(8, rows) for rows in ROWS}, {1, 5})
+            self.assertEqual(
+                {ar_fusion.get_sandwich_cluster_size(8, rows) for rows in ROWS},
+                {1, 5},
+            )
         owned = self.comm.obj
         try:
             for name, plane in self.planes:
@@ -164,7 +175,7 @@ class TestBeamAllReduce(CustomTestCase):
                 for next_weight in (None, weight):
 
                     def fused():
-                        return beam_all_reduce_norm(
+                        return ar_fusion.all_reduce_sandwich_norm(
                             self.comm.obj,
                             x,
                             residual,
@@ -178,9 +189,9 @@ class TestBeamAllReduce(CustomTestCase):
                     fused()  # Compile before capture.
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph):
-                        normed, combined = fused()
+                        combined, normed = fused()
                         reduced = self.comm.custom_all_reduce(self.local_sum(x))
-                        normed2, combined2 = fused()
+                        combined2, normed2 = fused()
                     # Reuse graph storage with different payloads and several epochs.
                     for change in (1.0, -0.5, 2.0):
                         x.mul_(change)
